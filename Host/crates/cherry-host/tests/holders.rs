@@ -1696,6 +1696,7 @@ fn a_refresh_that_meets_a_resize_the_program_repaints_for_still_gets_the_screens
                 rows: 20,
                 cell_width: None,
                 cell_height: None,
+                viewport: false,
             },
         );
         let resize = holder.expect(link::RESIZE);
@@ -1782,6 +1783,7 @@ fn only_a_holder_of_version_9_is_asked_for_a_viewports_images() {
                 rows: 20,
                 cell_width: None,
                 cell_height: None,
+                viewport: false,
             },
         );
         holder.expect(link::RESIZE);

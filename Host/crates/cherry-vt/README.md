@@ -253,8 +253,12 @@ For a physical terminal whose size differs from the canonical grid:
 - Of the kitty images, only those of the active screen's placements on
   screen are re-sent (`graphics_replay`, after a snapshot's or
   `refresh_with`'s content; `viewport_graphics` for a window that shows
-  part of the screen); see the
-  [host guide](../../README.md#kitty-graphics) for what is not.
+  part of the screen, and `viewport_placements` for one that places only
+  what changed from frame to frame); see the
+  [host guide](../../README.md#kitty-graphics) for what is not. `kitty`
+  reads a graphics command's control data as Ghostty's parser does (its
+  tests check that against libghostty-vt), for the host and `cherry
+  attach` to tell which commands name a file.
 - Palette and dynamic colour changes (OSC 4/10/11/12), the working directory
   (OSC 7) and the title are not exported; `title()` and `pwd()` give the
   last two.

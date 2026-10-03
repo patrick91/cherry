@@ -12,6 +12,8 @@ pub struct DisplayStream {
     escaped: bool,
     utf8_left: usize,
     discarding: bool,
+    /// In `Mode::String`: what began it (`P`, `X`, `^` or `_`).
+    string: u8,
 }
 #[derive(Default, PartialEq, Eq)]
 enum Mode {
@@ -159,6 +161,19 @@ impl DisplayStream {
                 batch.append(self.feed(&[b]));
                 continue;
             }
+            if matches!(self.mode, Mode::Escape | Mode::Csi | Mode::String) && b >= 0x7f {
+                match b {
+                    0x80..=0x9f => {
+                        self.eight_bit_control(b, &mut batch);
+                        continue;
+                    }
+                    // DEL is a string's data.
+                    0x7f if self.mode == Mode::String => {}
+                    // Ghostty ignores DEL in a sequence, and 0xa0 and up
+                    // anywhere but in an OSC string.
+                    _ => continue,
+                }
+            }
             if !self.discarding {
                 self.pending.push(b);
             }
@@ -174,6 +189,7 @@ impl DisplayStream {
                     }
                     b'P' | b'_' | b'^' | b'X' => {
                         self.mode = Mode::String;
+                        self.string = b;
                         false
                     }
                     0x20..=0x2f => false,
@@ -202,6 +218,57 @@ impl DisplayStream {
         batch
     }
 
+    /// An 8-bit C1 control (0x80 to 0x9f) inside an escape sequence, a
+    /// control sequence or a string other than OSC (whose data it is):
+    /// Ghostty acts on it as on its 7-bit form (`ESC` and the byte less
+    /// 0x40), so it is made that form, and the host's terminal, every
+    /// renderer and this stream read one sequence. ST (0x9c) ends a string;
+    /// in SOS, PM or APC a string's own introducer is ignored, as Ghostty
+    /// ignores it; anything else abandons what came so far (which had no
+    /// display effect, as when ESC does) and begins its own sequence. A
+    /// kitty graphics command so begun is routed as any other, never
+    /// passed as text a renderer would take for one.
+    fn eight_bit_control(&mut self, b: u8, batch: &mut Batch) {
+        if self.mode == Mode::String {
+            if b == 0x9c {
+                if self.discarding {
+                    self.pending.clear();
+                    self.reset();
+                } else {
+                    self.pending.extend_from_slice(b"\x1b\\");
+                    self.finish(batch);
+                }
+                return;
+            }
+            if matches!(b, 0x98 | 0x9e | 0x9f) && matches!(self.string, b'X' | b'^' | b'_') {
+                return;
+            }
+        }
+        self.pending.clear();
+        self.reset();
+        let seven = [0x1b, b - 0x40];
+        match b {
+            0x9c => {}
+            0x90 | 0x98 | 0x9e | 0x9f => {
+                self.pending.extend_from_slice(&seven);
+                self.mode = Mode::String;
+                self.string = b - 0x40;
+            }
+            0x9b => {
+                self.pending.extend_from_slice(&seven);
+                self.mode = Mode::Csi;
+            }
+            0x9d => {
+                self.pending.extend_from_slice(&seven);
+                self.mode = Mode::Osc;
+            }
+            _ => {
+                self.pending.extend_from_slice(&seven);
+                self.finish(batch);
+            }
+        }
+    }
+
     fn limit(&self) -> usize {
         if self.mode == Mode::Osc && self.pending.starts_with(CLIPBOARD) {
             MAX_CLIPBOARD
@@ -211,6 +278,14 @@ impl DisplayStream {
     }
 
     fn finish(&mut self, batch: &mut Batch) {
+        if self.mode == Mode::String
+            && matches!(self.string, b'X' | b'^')
+            && self.pending.get(2) == Some(&b'G')
+        {
+            // Ghostty reads SOS and PM as it reads APC: a kitty graphics
+            // command in one is one, and is routed as one.
+            self.pending[1] = b'_';
+        }
         if !self.discarding {
             if self.pending.starts_with(KITTY_NOTIFICATION) {
                 batch
@@ -567,7 +642,8 @@ fn host_answers_capability(name: &[u8]) -> bool {
 }
 
 /// Kitty graphics: the host answers `a=q` probes and acknowledges other
-/// commands; the renderer draws images but must stay silent (`q=2`).
+/// commands; the renderer draws images but must stay silent (`q=2`), and
+/// gets only what `cherry_vt::kitty::for_renderers` gives it.
 fn route_graphics(token: &[u8]) -> Route {
     let Some(body) = token
         .strip_prefix(b"\x1b_G")
@@ -575,26 +651,12 @@ fn route_graphics(token: &[u8]) -> Route {
     else {
         return Route::Both;
     };
-    let control_end = body.iter().position(|&b| b == b';').unwrap_or(body.len());
-    let (control, payload) = body.split_at(control_end);
-    let keys: Vec<&[u8]> = control
-        .split(|&b| b == b',')
-        .filter(|key| !key.is_empty())
-        .collect();
-    if keys.contains(&&b"a=q"[..]) {
-        return Route::Host;
-    }
-    let mut quiet = b"\x1b_G".to_vec();
-    for key in keys.iter().filter(|key| !key.starts_with(b"q=")) {
-        quiet.extend(*key);
-        quiet.push(b',');
-    }
-    quiet.extend(b"q=2");
-    quiet.extend(payload);
-    quiet.extend(b"\x1b\\");
-    Route::Split {
-        display: quiet,
-        query: Vec::new(),
+    match cherry_vt::kitty::for_renderers(body) {
+        Some(display) => Route::Split {
+            display,
+            query: Vec::new(),
+        },
+        None => Route::Host,
     }
 }
 

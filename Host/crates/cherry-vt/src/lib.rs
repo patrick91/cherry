@@ -5,11 +5,12 @@ use std::{ffi::c_void, io::Write, marker::PhantomData, ptr::NonNull};
 
 mod events;
 mod graphics;
+pub mod kitty;
 pub use events::{
     parse_osc99, Osc99, ProgressState, VtEvent, MAX_PENDING_EVENTS, MAX_PENDING_EVENT_BYTES,
 };
 pub use graphics::{
-    base64, decode_rgba, GraphicsReplay, IMAGE_RESET, MAX_DECODED_BYTES, MAX_IMAGE_SIDE,
+    base64, decode_rgba, GraphicsReplay, Placement, IMAGE_RESET, MAX_DECODED_BYTES, MAX_IMAGE_SIDE,
 };
 
 type Handle = *mut c_void;
@@ -725,7 +726,24 @@ impl Terminal {
         self.replay_within(Some(cols.min(self.cols)), rows.min(self.rows), budget)
     }
 
-    fn replay_within(&self, cols: Option<u16>, rows: u16, budget: usize) -> Result<GraphicsReplay> {
+    /// The placements `viewport_graphics` re-sends for a window that shows
+    /// the top-left `cols` by `rows` cells: the virtual ones, and the
+    /// direct ones that lie wholly there, of images whose data is here; in
+    /// no particular order. Cheap when there are none: a window compares
+    /// them from frame to frame, to place only what changed.
+    pub fn viewport_placements(&self, cols: u16, rows: u16) -> Result<Vec<Placement>> {
+        let placements = self.placements()?;
+        Ok(
+            graphics::candidates(&placements, Some(cols.min(self.cols)), rows.min(self.rows))
+                .into_iter()
+                .flat_map(|candidate| candidate.placements)
+                .map(Placement)
+                .collect(),
+        )
+    }
+
+    /// Every placement on the active screen.
+    fn placements(&self) -> Result<Vec<graphics::RawPlacement>> {
         let handle = self.handle.as_ptr();
         let mut placements = vec![graphics::RawPlacement::default(); 16];
         loop {
@@ -743,10 +761,15 @@ impl Terminal {
             )?;
             if count <= placements.len() {
                 placements.truncate(count);
-                break;
+                return Ok(placements);
             }
             placements = vec![graphics::RawPlacement::default(); count];
         }
+    }
+
+    fn replay_within(&self, cols: Option<u16>, rows: u16, budget: usize) -> Result<GraphicsReplay> {
+        let handle = self.handle.as_ptr();
+        let placements = self.placements()?;
         let mut replay = GraphicsReplay::default();
         let mut cache = self.graphics_cache.borrow_mut();
         let candidates = graphics::candidates(&placements, cols, rows);

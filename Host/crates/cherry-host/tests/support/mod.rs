@@ -386,6 +386,7 @@ impl Host {
                 client_id: None,
                 cell_width: None,
                 cell_height: None,
+                viewport: false,
             },
         )
         .unwrap();

@@ -29,6 +29,7 @@ fn attach_as(
             client_id: client.map(str::to_owned),
             cell_width: None,
             cell_height: None,
+            viewport: false,
         },
     );
     match receive(&mut socket) {
@@ -149,6 +150,7 @@ fn a_client_that_attaches_again_replaces_its_stale_attachment() {
             client_id: Some("x".repeat(MAX_CLIENT_ID_BYTES + 1)),
             cell_width: None,
             cell_height: None,
+            viewport: false,
         },
     );
     match receive(&mut socket) {
@@ -303,6 +305,7 @@ fn a_lone_window_resizes_the_grid_at_once_and_a_full_screen_program_repaints_it(
                 rows,
                 cell_width: None,
                 cell_height: None,
+                viewport: false,
             },
         );
     }
@@ -327,6 +330,7 @@ fn a_lone_window_resizes_the_grid_at_once_and_a_full_screen_program_repaints_it(
             rows: 20,
             cell_width: None,
             cell_height: None,
+            viewport: false,
         },
     );
     screen.wait_size(&mut socket, 70, 20);
@@ -356,6 +360,7 @@ fn a_window_that_waits_for_other_windows_still_gets_its_new_grid() {
             rows: 24,
             cell_width: None,
             cell_height: None,
+            viewport: false,
         },
     );
     small_screen.wait_size(&mut small, 70, 24);
@@ -482,6 +487,7 @@ fn a_window_that_follows_a_new_grid_gets_it_before_the_programs_repaint() {
                 rows: 40,
                 cell_width: None,
                 cell_height: None,
+                viewport: false,
             },
         );
         wait_for_the_repaint(&host, &id, &mut b, &mut b_screen, (100, 30));
@@ -494,6 +500,7 @@ fn a_window_that_follows_a_new_grid_gets_it_before_the_programs_repaint() {
                     rows: 24,
                     cell_width: None,
                     cell_height: None,
+                    viewport: false,
                 },
             );
             wait_for_the_repaint(&host, &id, &mut b, &mut b_screen, (80, 24));

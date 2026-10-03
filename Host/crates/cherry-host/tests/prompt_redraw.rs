@@ -130,6 +130,7 @@ fn resize_through(integration: &str, script: &str, dir: &Path, sizes: &[u16], pa
                 rows: 30,
                 cell_width: None,
                 cell_height: None,
+                viewport: false,
             },
         );
         // The window takes its new size before the host's replacement.

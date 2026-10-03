@@ -122,6 +122,9 @@ pub enum Command {
         /// The client's cell size in pixels, when it gave one (see
         /// `Worker::cell_source`).
         cell: Option<(u32, u32)>,
+        /// It paints a viewport whatever the grid's size (see
+        /// `ClientMessage::Attach::viewport`).
+        viewport: bool,
         outbox: Arc<Outbox>,
         abort: UnixStream,
         cancelled: Arc<AtomicBool>,
@@ -161,6 +164,8 @@ pub enum Command {
         rows: u16,
         /// The window's new cell size in pixels; None keeps the one it had.
         cell: Option<(u32, u32)>,
+        /// It paints a viewport whatever the grid's size.
+        viewport: bool,
     },
     /// The attachment asks for a replacement of the grid
     /// (`ClientMessage::Refresh`).
@@ -271,14 +276,23 @@ struct Attachment {
     client_id: Option<String>,
     /// Its cell size in pixels, when it gave one.
     cell: Option<(u32, u32)>,
+    /// Its window is beyond the size limits: it paints a viewport whatever
+    /// the grid's size (see `ClientMessage::Attach::viewport`).
+    viewport: bool,
 }
 
 impl Attachment {
+    /// Whether the window shows a grid of `size` as it is, rather than
+    /// painting a viewport of it.
+    fn matches(&self, size: (u16, u16)) -> bool {
+        (self.cols, self.rows) == size && !self.viewport
+    }
+
     /// Whether a replacement for a grid of `size` must be a full snapshot:
     /// the window rendered a viewport and now matches the grid, or it
     /// supersedes a full one (see `Worker::send_resized`).
     fn needs_full(&self, size: (u16, u16)) -> bool {
-        ((self.cols, self.rows) == size && !self.direct) || self.outbox.full_replacement_queued()
+        (self.matches(size) && !self.direct) || self.outbox.full_replacement_queued()
     }
 }
 
@@ -955,6 +969,7 @@ struct PendingAttach {
     answers_queries: bool,
     client_id: Option<String>,
     cell: Option<(u32, u32)>,
+    viewport: bool,
     outbox: Arc<Outbox>,
     abort: UnixStream,
     cancelled: Arc<AtomicBool>,
@@ -977,6 +992,7 @@ impl PendingAttach {
             answers_queries: self.answers_queries,
             client_id: self.client_id,
             cell: self.cell,
+            viewport: self.viewport,
             outbox: self.outbox,
             abort: self.abort,
             cancelled: self.cancelled,
@@ -1407,7 +1423,7 @@ impl Worker {
                 && self
                     .attached
                     .iter()
-                    .any(|a| a.lease == *lease && (a.cols, a.rows) != size)
+                    .any(|a| a.lease == *lease && !a.matches(size))
         });
         for (leases, graphics) in [(streams, false), (viewports, true)] {
             if leases.is_empty() {
@@ -1441,7 +1457,7 @@ impl Worker {
                 continue;
             }
             attachment.outbox.push_resized(frame.clone());
-            attachment.direct = (attachment.cols, attachment.rows) == size;
+            attachment.direct = attachment.matches(size);
         }
     }
 
@@ -1482,7 +1498,7 @@ impl Worker {
             match &reply {
                 Ok(frame) => {
                     attachment.outbox.push_replacement(frame.clone(), full);
-                    attachment.direct = (attachment.cols, attachment.rows) == size;
+                    attachment.direct = attachment.matches(size);
                 }
                 Err(error) => {
                     if let Some(frame) = frame(&ServerMessage::error(
@@ -1635,7 +1651,7 @@ impl Worker {
                 Ok(replacement) => {
                     replacement.push_to(&attachment.outbox);
                     attachment.resync_after = None;
-                    attachment.direct = (attachment.cols, attachment.rows) == size;
+                    attachment.direct = attachment.matches(size);
                 }
                 Err(error) => {
                     if let Some(frame) = self::frame(&ServerMessage::error(
@@ -1709,6 +1725,7 @@ impl Worker {
                 answers_queries,
                 client_id,
                 cell,
+                viewport,
                 outbox,
                 abort,
                 cancelled,
@@ -1721,6 +1738,7 @@ impl Worker {
                 answers_queries,
                 client_id,
                 cell,
+                viewport,
                 outbox,
                 abort,
                 cancelled,
@@ -1805,6 +1823,7 @@ impl Worker {
                 cols,
                 rows,
                 cell,
+                viewport,
             } => {
                 if !valid_size(cols, rows) {
                     self.send_to(
@@ -1821,9 +1840,11 @@ impl Worker {
                     return;
                 };
                 let attachment = &mut self.attached[index];
-                let changed = (attachment.cols, attachment.rows) != (cols, rows);
+                let changed = (attachment.cols, attachment.rows, attachment.viewport)
+                    != (cols, rows, viewport);
                 attachment.cols = cols;
                 attachment.rows = rows;
+                attachment.viewport = viewport;
                 if cell.is_some() {
                     attachment.cell = cell;
                 }
@@ -1842,9 +1863,9 @@ impl Worker {
                 self.schedule_grid();
                 let size = self.size();
                 let target = self.grid_due.map_or(size, |(_, target)| target);
-                if (cols, rows) != target {
+                if !self.attached[index].matches(target) {
                     // The client renders a viewport once it stops waiting
-                    // for the grid.
+                    // for the grid (at once, beyond the size limits).
                     self.attached[index].direct = false;
                 } else if target == size && changed {
                     // The grid keeps its size (another client set it, or
@@ -2208,6 +2229,7 @@ impl Worker {
             answers_queries,
             client_id,
             cell,
+            viewport,
             outbox,
             abort,
             cancelled,
@@ -2303,7 +2325,7 @@ impl Worker {
             lease,
             cols,
             rows,
-            direct: (cols, rows) == shown,
+            direct: (cols, rows) == shown && !viewport,
             outbox,
             abort,
             cancelled,
@@ -2311,6 +2333,7 @@ impl Worker {
             answers_queries,
             client_id,
             cell,
+            viewport,
         });
         self.update_attached_flag();
         self.schedule_grid();

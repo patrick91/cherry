@@ -1,6 +1,7 @@
 mod attach;
 mod control;
 mod diagnose;
+mod guard;
 mod handover;
 mod input;
 mod passthrough;

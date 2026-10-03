@@ -1596,10 +1596,14 @@ or another attach does not compress them again, and logs the images a
 snapshot left out at most once a minute. A screens-only replacement (a
 resize, `Refresh`) keeps the renderer's history and images and re-sends
 none, but for a window that paints a viewport (its size is not the
-grid's): its screens re-send the images on screen as a full snapshot does,
-after `a=d,d=R,x=1,y=4294967295,q=2`, which deletes every image the
-receiver holds (a refresh has no reset), so the copy it paints from has
-them (holder link version 9; an older holder sends the screens alone).
+grid's, or it is beyond the size limits and says so: `viewport` in
+`Attach` and `Resize`, see [Protocol](#protocol)): its screens re-send the
+images on screen as a full snapshot does, after
+`a=d,d=R,x=1,y=4294967295,q=2`, which deletes every image the receiver
+holds (a refresh has no reset), so the copy it paints from has them
+(holder link version 9; an older holder sends the screens alone, and so
+does an older host to a window beyond the limits, which it does not know
+of).
 
 `cherry attach`'s own copy of the screen (the one a window of another size
 is painted from) keeps images too, sized in the window's own cells (from
@@ -1617,20 +1621,32 @@ frames), virtual placements (`U=1`, which the placeholder cells the frames
 paint show wherever they are), deletions, and the animation commands
 (`a=a`, `a=c`). `a=T` passes as `a=t`: the image is transmitted, not placed
 at the window's cursor. A placement at the session's cursor (`a=p` without
-`U=1`) and a deletion at it (`d=c`) do not pass; instead, as when the
-window enters viewport mode, gets a replacement, changes size or its cell
-size, or the grid changes size, the next frame brings the window's images
-in line with the copy: it deletes them all (`a=d,d=R,x=1,y=4294967295`),
-then sends the copy's images whose placements the window shows, the
-virtual ones and the direct ones that lie wholly in the region it shows,
-placed at their cell (in a top-left viewport the session's cell is the
-window's), and then the chunks so far of a transmission on its way, which
+`U=1`) and a deletion at it (`d=c`) do not pass. Instead each frame
+compares the direct placements the window shows (those that lie wholly in
+the region it shows) with the copy's, and brings the window in line with
+what changed, without sending an image again (each reached the window as
+it was transmitted): a new placement is placed at its cell (`CSI row;col
+H`, then `a=p,i=…,C=1,q=2`; in a top-left viewport the session's cell is
+the window's); an image any of whose placements moved (its rows scrolled)
+or went has its placements deleted on the window (`a=d,d=i,i=…`, which
+keeps its data) and placed again where the copy has them, virtual ones
+too, and then come the chunks so far of a transmission on its way, which
 the deletion abandoned on the window, so the chunks still to come complete
-it. So a direct placement is translated, not dropped, when the window shows
-all of it, and dropped when it shows only part. The graphics go after the
-frame's modes (each screen has images of its own) and before its rows, in
-its synchronized update; a frame sends none while neither the window nor
-the copy has any.
+it. So a program that shows one thumbnail after another costs the window
+a placement for each, not every earlier thumbnail again. All of the
+window's images are sent again instead when the window enters viewport
+mode, gets a replacement, changes size or its cell size, the grid changes
+size, the window changes screens (each screen has images of its own), or
+an image to place reached the window without an ID (`i=`, so the window
+may know it by an ID of its own): the next frame deletes them all
+(`a=d,d=R,x=1,y=4294967295`), then sends the copy's images whose
+placements the window shows, the virtual ones and the direct ones in the
+region it shows, placed at their cell, and then the chunks so far of a
+transmission on its way. So a direct placement is translated, not dropped,
+when the window shows all of it, and dropped when it shows only part. The
+graphics go after the frame's modes and before its rows, in its
+synchronized update; a frame sends none while neither the window nor the
+copy has any.
 
 Programs may also transmit an image from a file (`t=f`), a temporary file
 (`t=t`) or POSIX shared memory (`t=s`). The holder reads the data, on the
@@ -1638,9 +1654,55 @@ machine the session runs on (over SSH too, which is where the program left
 it), before the display stream, and passes the command on as a direct
 transmission (`t=d`) in chunks of 4096 base64 bytes (`m=1` but on the
 last; a query, `a=q`, in one command), with the command's other keys
-(`t=`, `S=`, `O=` and `m=` dropped), to its terminal and every renderer
-alike: neither ever reads a file, and the display stream keeps from the
-renderers a command that still names one. What it reads:
+(`t=`, `S=`, `O=` and `m=` dropped; the later chunks carry `q=` as the
+command did, and `a=f` for an animation frame, as kitty asks, and Ghostty
+takes either), to its terminal and every renderer alike. Each chunk is
+framed as it goes out: the holder keeps the data it read, not that data
+again in base64. Neither the terminal nor a renderer ever reads a file,
+a temporary file or shared memory:
+
+- Keys are read as Ghostty reads them (`cherry_vt::kitty`, from Ghostty's
+  own parser, and checked against libghostty-vt): a value of one byte that
+  is not a digit is that byte, and any other a number in base 10, with an
+  optional sign, leading zeros and `_` between digits, so `t=102`,
+  `t=0102`, `t=+102` and `t=1_02` are `t=f`, `t=116` is `t=t`, `a=84` is
+  `a=T` and `a=+116` is `a=t`. The holder reads a medium so written as one
+  written in letters. A key or value Ghostty ignores (a key of another
+  length than one byte, a value over 11 bytes, and what follows either)
+  is ignored, and a command Ghostty refuses (a value that is no such
+  number, an action, medium, compression or deletion it does not know) is
+  read by neither.
+- Renderers get a kitty graphics command only as Ghostty reads it, written
+  again (`k=v`, letters for `a`, `t`, `o` and `d`, numbers for the rest,
+  with nothing Ghostty ignored), and only when it is not a query, its `t`
+  is absent or `d`, its `o` absent or `z` and its `f` one Ghostty knows,
+  and no item of its control data, read loosely as another terminal might
+  (a key or value with spaces around it, in either case), names a medium.
+  Everything else (a query, a medium however written, a command Ghostty
+  refuses) goes to the host's terminal alone, which reads no file and
+  refuses it.
+- The display stream reads output as Ghostty does where that decides
+  what is a command: an 8-bit control (0x80 to 0x9f) inside an escape
+  sequence, a control sequence or a device control, SOS, PM or APC string
+  (Ghostty acts on it there: 0x9f begins an APC inside a control sequence,
+  0x9c ends one) is made its 7-bit form, so the host's terminal, every
+  renderer and the display stream read the same sequence; DEL and bytes
+  from 0xa0 up, which Ghostty ignores there (`ESC 0xa0 _` begins an APC),
+  are dropped; and a `G` command in an SOS or PM string, which Ghostty
+  reads as APC, is routed as one.
+- `cherry attach` checks everything it writes to its terminal, in either
+  mode, snapshots and queries included (`MediaGuard`), as Ghostty's parser
+  would read it (7-bit and 8-bit introducers and terminators, ignored
+  bytes): it drops any kitty graphics command whose control data may name
+  a medium, read as Ghostty reads it or loosely, writing CAN in its place
+  (which ends the string its introducer began, without a command). The
+  terminal runs on the machine `cherry attach` runs on, and the session's
+  output may come from another (an SSH host's), so whatever holder sends
+  it, older ones included (which passed numeric forms through), this
+  machine's files and shared memory are never read, deleted or unlinked
+  for it, nor their existence told.
+
+What the holder reads:
 
 - regular files only: never a device, FIFO, socket or directory, and
   nothing under `/proc`, `/sys` or `/dev` (but `/dev/shm`), as kitty and
@@ -1652,7 +1714,12 @@ renderers a command that still names one. What it reads:
   and lies in a temporary directory (`/tmp`, `/dev/shm`, the holder's and
   the session's `TMPDIR` and, on macOS, the user's temporary directory),
   and which is not itself a symbolic link. It is deleted once read,
-  whether or not that worked.
+  whether or not that worked: its directory is opened once (not following
+  a link), the path checked is the one the system gives that open
+  directory, and the file is looked at, read and deleted in it
+  (`unlinkat`), only while its name still holds the file read, so neither
+  a link put in the path meanwhile nor another file put in its place is
+  ever deleted.
 - `t=s`: a POSIX name (`/name`), mapped (macOS) or read (Linux), and
   unlinked once read.
 - from `O=` bytes in, `S=` bytes exactly when given, otherwise to the end
@@ -1689,7 +1756,10 @@ placement (a viewport's resync deletes those the window had, so a later
 virtual placement of one shows nothing there until the next resync),
 placement IDs (above) and animation frames other than the current one are
 not re-sent; a viewport places a direct placement at the next frame, not
-as it comes; sixel and iTerm2 images are not supported (nor by Ghostty).
+as it comes; the holder reads no medium for a command an 8-bit control
+begins, or one in an SOS or PM string (the host's terminal alone gets it,
+and refuses it); sixel and iTerm2 images are not supported (nor by
+Ghostty).
 
 When an attachment's size matches the shared grid, it uses the ordinary
 terminal stream and its own scrollback. A larger attachment is repainted from a
@@ -1914,7 +1984,13 @@ a terminal whose replies it reads as input. The host sends no queries to a
 client that sets it false. `Attach` and `Resize` may carry the window's cell
 size in pixels (`cell_width`, `cell_height`; additive, so protocol 7 is
 unchanged and an older host ignores them); a `Resize` may change only
-them. Errors carry a code: `version_mismatch`,
+them. They may also carry `viewport: true` (additive too, and sent only
+when true): the client's window is beyond the size limits (500 columns by
+200 rows, at least 2 by 1), which `cols` and `rows` are brought within, so
+it paints a viewport even when they are the grid's; the host serves it as
+a window of another size than the grid's (its screens carry the kitty
+images on screen, see [kitty graphics](#kitty-graphics)), and a `Resize`
+may change only it. `cherry attach` sets it. Errors carry a code: `version_mismatch`,
 `request_failed`, `taken_over`, `replaced` (protocol 5: a newer attachment
 of the same `client_id` replaced this one), `resize_failed`, `snapshot_failed`,
 `unsupported_operation`, `unknown_session` (no session has that ID),

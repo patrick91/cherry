@@ -2195,6 +2195,108 @@ fn a_resize_that_sets_the_shared_grid_switches_straight_to_the_new_snapshot() {
     server.join().unwrap();
 }
 
+/// A window beyond the size limits attaches and resizes at the largest
+/// size the host takes, and says it paints a viewport all the same; within
+/// them it says nothing of the sort (the field is left out, so an older host
+/// reads what it always did), also at that very size.
+#[test]
+fn a_window_beyond_the_size_limits_says_it_paints_a_viewport() {
+    let (_directory, listener, mut command) = listener();
+    let (step_tx, step_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut stream = accept(listener);
+        let next = |stream: &mut UnixStream| loop {
+            match read_client(stream) {
+                Some(ClientMessage::Ping) => {}
+                other => return other,
+            }
+        };
+        let attach = next(&mut stream);
+        assert!(
+            matches!(
+                attach,
+                Some(ClientMessage::Attach {
+                    cols: 500,
+                    rows: 200,
+                    viewport: true,
+                    ..
+                })
+            ),
+            "{attach:?}"
+        );
+        write_frame(
+            &mut stream,
+            &ServerMessage::Attached {
+                reason: AttachReason::Attach,
+                session: sized_session(500, 200),
+                offset: 0,
+                snapshot: b"ready".to_vec(),
+                refreshes: false,
+            },
+        )
+        .unwrap();
+        step_tx.send(()).unwrap();
+        for viewport in [false, true] {
+            let resize = next(&mut stream);
+            assert!(
+                matches!(
+                    resize,
+                    Some(ClientMessage::Resize {
+                        cols: 500,
+                        rows: 200,
+                        viewport: v,
+                        ..
+                    }) if v == viewport
+                ),
+                "{resize:?}"
+            );
+            step_tx.send(()).unwrap();
+        }
+        write_frame(
+            &mut stream,
+            &ServerMessage::Exit {
+                id: "test-session".into(),
+                exit_code: 0,
+                signal: None,
+            },
+        )
+        .unwrap();
+    });
+    let pty = Pty::open(600, 250);
+    pty.read_in_background();
+    let mut child = command
+        .args(["attach", "test-session"])
+        .stdin(pty.slave.try_clone().unwrap())
+        .stdout(pty.slave.try_clone().unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let step = |child: &mut Child| {
+        if step_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            let _ = child.kill();
+            panic!("the host was not told");
+        }
+    };
+    step(&mut child);
+    pty.wait_for_raw_mode();
+    for (cols, rows) in [(500, 200), (600, 250)] {
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe { libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+            0
+        );
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGWINCH) }, 0);
+        step(&mut child);
+    }
+    assert!(wait_within(&mut child, Duration::from_secs(10)).success());
+    server.join().unwrap();
+}
+
 #[test]
 fn a_repeated_resize_signal_keeps_waiting_for_the_grid() {
     let (_directory, listener, mut command) = listener();
@@ -7570,7 +7672,7 @@ fn without_a_copy_the_client_asks_the_host_for_one_to_paint_a_viewport() {
         }
         assert_eq!(
             asked,
-            ["Some(Resize { cols: 101, rows: 41, cell_width: None, cell_height: None })"]
+            ["Some(Resize { cols: 101, rows: 41, cell_width: None, cell_height: None, viewport: false })"]
         );
         for frame in [
             ServerMessage::Attached {

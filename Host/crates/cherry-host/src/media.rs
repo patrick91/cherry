@@ -8,6 +8,11 @@
 //! Neither ever reads a file itself (`stream::route_graphics` keeps a
 //! command that names one from the renderers).
 //!
+//! A command's keys are read as Ghostty reads them (`cherry_vt::kitty`):
+//! `t=102` is `t=f` and `a=84` is `a=T`, and a command Ghostty refuses (or
+//! that names its image by both ID and number, which it refuses before
+//! reading) is not read.
+//!
 //! What is read, and how:
 //! - regular files only, never a device, FIFO, socket or directory, and
 //!   nothing under `/proc`, `/sys` or `/dev` (but `/dev/shm`), as kitty and
@@ -20,7 +25,8 @@
 //!   `tty-graphics-protocol` and lies in a temporary directory (`/tmp`,
 //!   `/dev/shm`, the holder's and the session's `TMPDIR` and, on macOS, the
 //!   user's temporary directory), and it is not itself a symbolic link. It
-//!   is deleted once read, whether or not that worked;
+//!   is deleted once read, whether or not that worked: in the directory it
+//!   was read in, only while its name holds the file read;
 //! - shared memory (`t=s`) by its POSIX name (`/name`), and unlinked once
 //!   read (opened or not);
 //! - from `O=` bytes in, `S=` bytes exactly when given, else to the end
@@ -43,11 +49,16 @@
 //! once.
 //!
 //! The scanner follows the display stream's tokenizer: only `ESC _` begins
-//! a graphics command (APC), which ends at ST; CAN or SUB abort it, and an
-//! ESC followed by anything but `\` abandons it and begins a new sequence.
+//! a graphics command (APC), which ends at ST (`ESC \` or 0x9c); CAN, SUB
+//! or another 8-bit control abort it, an ESC followed by anything but `\`
+//! abandons it and begins a new sequence, and bytes from 0xa0 up, which
+//! Ghostty ignores in it, are ignored. (A command an 8-bit control begins,
+//! or in SOS or PM, is not read: the display stream gives it to the host
+//! alone.)
 //! Everything but a media command passes through byte for byte, in order,
 //! and a command split across reads is found whole.
 use crate::signals::{self, Wake};
+use cherry_vt::kitty::{self, Control};
 use std::{
     ffi::{CString, OsStr},
     fs::{File, OpenOptions},
@@ -219,30 +230,17 @@ pub struct Source {
 impl Source {
     /// The source a media command's control data and payload (the path,
     /// in base64) name.
-    fn parse(control: &[u8], payload: &[u8]) -> Result<Self, Refusal> {
-        let medium = medium(control).ok_or_else(|| Refusal::new("EINVAL", "no medium"))?;
+    fn parse(control: &Control, payload: &[u8]) -> Result<Self, Refusal> {
+        let medium = medium_of(control).ok_or_else(|| Refusal::new("EINVAL", "no medium"))?;
         let invalid = |key: &str| Refusal::new("EINVAL", format!("invalid {key}"));
-        let number = |value: &[u8], key: &str| -> Result<u64, Refusal> {
-            std::str::from_utf8(value)
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .ok_or_else(|| invalid(key))
-        };
-        let (mut offset, mut size, mut format, mut width, mut height) = (0, 0, 32, 0, 0);
-        let (mut compressed, mut query) = (false, false);
-        for (key, value) in keys(control) {
-            match key {
-                b"O" => offset = number(value, "offset (O)")?,
-                b"S" => size = number(value, "size (S)")?,
-                b"f" => format = number(value, "format (f)")?,
-                b"s" => width = number(value, "width (s)")?,
-                b"v" => height = number(value, "height (v)")?,
-                b"o" => compressed = !value.is_empty(),
-                b"a" => query = value == b"q",
-                _ => {}
-            }
-        }
-        let path = decode_base64(payload).ok_or_else(|| invalid("path (not base64)"))?;
+        let value = |key: u8| u64::from(control.get(key).unwrap_or(0));
+        // Ghostty's default format is RGBA (32), as is 0.
+        let format = control.get(b'f').filter(|&f| f != 0).unwrap_or(32);
+        let (width, height) = (value(b's'), value(b'v'));
+        let compressed = control.get(b'o').is_some();
+        // Ghostty ignores bytes from 0xa0 up in a command.
+        let payload: Vec<u8> = payload.iter().copied().filter(|&b| b < 0xa0).collect();
+        let path = decode_base64(&payload).ok_or_else(|| invalid("path (not base64)"))?;
         if path.is_empty() {
             return Err(Refusal::new("EINVAL", "no path"));
         }
@@ -257,51 +255,49 @@ impl Source {
         let pixels = bytes_per_pixel
             .filter(|_| !compressed && width > 0 && height > 0)
             .and_then(|bytes| width.checked_mul(height)?.checked_mul(bytes));
+        let size = value(b'S');
         Ok(Self {
             medium,
             path,
-            offset,
+            offset: value(b'O'),
             size: (size > 0).then_some(size),
             pixels,
-            limit: if query { MAX_QUERY } else { MAX_BYTES },
+            limit: if control.action() == b'q' {
+                MAX_QUERY
+            } else {
+                MAX_BYTES
+            },
         })
     }
 }
 
-/// The keys of a command's control data (`k=v,k=v`), in order; a key
-/// given twice counts as the last one.
-fn keys(control: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
-    control
-        .split(|&b| b == b',')
-        .filter(|item| !item.is_empty())
-        .map(|item| match item.iter().position(|&b| b == b'=') {
-            Some(at) => (&item[..at], &item[at + 1..]),
-            None => (item, &[][..]),
-        })
+/// The medium of a command whose control data (as Ghostty reads it) names
+/// one to read: one that transmits (`a=t`, the default, `T`, `q`, or `f`,
+/// an animation frame) from a file, a temporary file or shared memory, and
+/// names its image by ID or number, not both (Ghostty refuses that before
+/// it reads anything).
+fn medium_of(control: &Control) -> Option<Medium> {
+    let both = control.get(b'i').is_some_and(|i| i > 0) && control.get(b'I').is_some_and(|n| n > 0);
+    match control.medium()? {
+        _ if both => None,
+        kitty::Medium::Direct => None,
+        kitty::Medium::File => Some(Medium::File),
+        kitty::Medium::Temporary => Some(Medium::Temporary),
+        kitty::Medium::Shared => Some(Medium::Shared),
+    }
 }
 
 /// The medium a graphics command's control data names, when it carries
-/// data from anywhere but the output: its action transmits (`a=t`, the
-/// default, `T`, `q`, or `f`, an animation frame) and its `t=` is `f`, `t`
-/// or `s`.
+/// data from anywhere but the output (see `medium_of`), read as Ghostty
+/// reads it (`cherry_vt::kitty`): `t=102` is `t=f`, and a command Ghostty
+/// refuses names none (tests).
+#[cfg(test)]
 pub fn medium(control: &[u8]) -> Option<Medium> {
-    let mut medium = None;
-    let mut transmits = true;
-    for (key, value) in keys(control) {
-        match key {
-            b"t" => {
-                medium = match value {
-                    b"f" => Some(Medium::File),
-                    b"t" => Some(Medium::Temporary),
-                    b"s" => Some(Medium::Shared),
-                    _ => None,
-                }
-            }
-            b"a" => transmits = matches!(value, b"t" | b"T" | b"q" | b"f"),
-            _ => {}
-        }
+    let mut parser = kitty::Parser::new();
+    for &byte in control {
+        parser.feed(byte);
     }
-    medium.filter(|_| transmits)
+    medium_of(&parser.finish()?)
 }
 
 /// Read what `source` names (see the module's documentation).
@@ -330,12 +326,31 @@ fn read_file(path: &Path, source: &Source) -> Result<Vec<u8>, Refusal> {
 }
 
 fn read_temporary(path: &Path, source: &Source, places: &Places) -> Result<Vec<u8>, Refusal> {
+    read_temporary_with(path, source, places, |_| {})
+}
+
+/// `read_temporary`, with `between` run after the read and before the
+/// deletion (tests change the file system there).
+fn read_temporary_with(
+    path: &Path,
+    source: &Source,
+    places: &Places,
+    between: impl FnOnce(&Path),
+) -> Result<Vec<u8>, Refusal> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(Refusal::new("EINVAL", "not a file's path"));
     };
-    let canonical = std::fs::canonicalize(parent)
-        .map_err(|error| Refusal::io(&error, "cannot open the file"))?
-        .join(name);
+    let opening = |error: io::Error| Refusal::io(&error, "cannot open the file");
+    let parent = std::fs::canonicalize(parent).map_err(opening)?;
+    // The directory, opened once: the file is looked at, read and deleted
+    // in it, whatever its path comes to name meanwhile; and where it is is
+    // asked of the directory itself.
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&parent)
+        .map_err(opening)?;
+    let canonical = directory_path(&dir, &parent)?.join(name);
     if !contains(canonical.as_os_str().as_bytes(), TEMPORARY_MARK) {
         return Err(Refusal::new("EINVAL", "temporary file not named correctly"));
     }
@@ -345,29 +360,137 @@ fn read_temporary(path: &Path, source: &Source, places: &Places) -> Result<Vec<u
             "temporary file not in a temporary directory",
         ));
     }
-    let metadata = std::fs::symlink_metadata(&canonical)
+    if system_file(&canonical) {
+        return Err(Refusal::new("EBADF", "a system file is never read"));
+    }
+    let name = CString::new(name.as_bytes()).map_err(|_| Refusal::new("EINVAL", "not a name"))?;
+    let looked = stat_at(&dir, &name).map_err(opening)?;
+    match looked.st_mode & libc::S_IFMT {
+        libc::S_IFREG => {}
+        libc::S_IFLNK => {
+            return Err(Refusal::new(
+                "ELOOP",
+                "the temporary file is a symbolic link",
+            ))
+        }
+        _ => return Err(Refusal::not_regular()),
+    }
+    // The program handed it over: deleted however the read goes, but only
+    // the file looked at, never one put in its place.
+    let read = open_at(&dir, &name, &looked).and_then(|file| read_range(&file, source));
+    between(&canonical);
+    if stat_at(&dir, &name)
+        .is_ok_and(|now| (now.st_dev, now.st_ino) == (looked.st_dev, looked.st_ino))
+    {
+        unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+    }
+    read
+}
+
+/// The path of the opened directory `dir`, as the system has it now (it
+/// was found at `path`): one a link put in its path since cannot change.
+fn directory_path(dir: &File, path: &Path) -> Result<PathBuf, Refusal> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut buffer = vec![0u8; libc::PATH_MAX as usize + 1];
+        if unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == 0 {
+            if let Some(len) = buffer.iter().position(|&b| b == 0) {
+                buffer.truncate(len);
+                return Ok(PathBuf::from(std::ffi::OsString::from_vec(buffer)));
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(found) = std::fs::read_link(format!("/proc/self/fd/{}", dir.as_raw_fd())) {
+            // A directory removed meanwhile is " (deleted)" there.
+            return if found.is_absolute() && found.exists() {
+                Ok(found)
+            } else {
+                Err(Refusal::new("ENOENT", "the directory was removed"))
+            };
+        }
+    }
+    // Without either: the path, if it still names the directory opened.
+    let opened = dir
+        .metadata()
         .map_err(|error| Refusal::io(&error, "cannot open the file"))?;
-    if metadata.file_type().is_symlink() {
+    let named = std::fs::symlink_metadata(path)
+        .map_err(|error| Refusal::io(&error, "cannot open the file"))?;
+    if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
         return Err(Refusal::new(
-            "ELOOP",
-            "the temporary file is a symbolic link",
+            "EBADF",
+            "the directory changed while it was opened",
         ));
     }
-    if !metadata.file_type().is_file() {
-        return Err(Refusal::not_regular());
+    Ok(path.to_path_buf())
+}
+
+/// `name` in `dir`, not following a link.
+fn stat_at(dir: &File, name: &CString) -> io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    let done = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if done != 0 {
+        return Err(io::Error::last_os_error());
     }
-    // The program handed it over: deleted however the read goes.
-    let read = open_regular(&canonical).and_then(|file| read_range(&file, source));
-    let _ = std::fs::remove_file(&canonical);
-    read
+    Ok(unsafe { stat.assume_init() })
+}
+
+/// Open `name` in `dir`, which was `looked` at as a regular file, read-only
+/// and as `open_regular` does: it must still be that file.
+fn open_at(dir: &File, name: &CString, looked: &libc::stat) -> Result<File, Refusal> {
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(Refusal::io(
+            &io::Error::last_os_error(),
+            "cannot open the file",
+        ));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let opened = file
+        .metadata()
+        .map_err(|error| Refusal::io(&error, "cannot read the file"))?;
+    if !opened.file_type().is_file() || (opened.dev(), opened.ino()) != identity(looked) {
+        return Err(Refusal::new(
+            "EBADF",
+            "the file changed while it was opened",
+        ));
+    }
+    Ok(file)
+}
+
+/// A file's device and inode, as `MetadataExt` gives them (the types of
+/// `stat`'s differ between systems).
+#[allow(clippy::unnecessary_cast)]
+fn identity(stat: &libc::stat) -> (u64, u64) {
+    (stat.st_dev as u64, stat.st_ino as u64)
+}
+
+/// Under `/proc`, `/sys` or `/dev` (but `/dev/shm`): never read.
+fn system_file(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_bytes();
+    let under = |dir: &[u8]| bytes.starts_with(dir);
+    under(b"/proc/") || under(b"/sys/") || (under(b"/dev/") && !under(b"/dev/shm/"))
 }
 
 /// Open `path`, canonical (no link in it), read-only as a regular file
 /// (see the module's documentation).
 fn open_regular(path: &Path) -> Result<File, Refusal> {
-    let bytes = path.as_os_str().as_bytes();
-    let under = |dir: &[u8]| bytes.starts_with(dir);
-    if under(b"/proc/") || under(b"/sys/") || (under(b"/dev/") && !under(b"/dev/shm/")) {
+    if system_file(path) {
         return Err(Refusal::new("EBADF", "a system file is never read"));
     }
     let looked = std::fs::symlink_metadata(path)
@@ -535,105 +658,132 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     memchr::memmem::find(haystack, needle).is_some()
 }
 
+/// Raw bytes per chunk of a converted transmission: `CHUNK` in base64.
+const CHUNK_DATA: usize = CHUNK / 4 * 3;
+
 /// The command a media command becomes once its data is read: a direct
-/// transmission of `data`, with the command's other keys (not `t=`, `S=`,
-/// `O=` or `m=`; `a=t` when it had no action), in base64 chunks of `CHUNK`
-/// bytes, `m=1` on all but the last, which carry `q=` as the command did.
-/// A query goes in one command.
-pub fn direct(control: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut first = Vec::with_capacity(control.len() + 8);
-    let mut query = false;
-    let mut quiet = None;
-    let mut action = false;
-    for item in control
-        .split(|&b| b == b',')
-        .filter(|item| !item.is_empty())
-    {
-        let key = item.split(|&b| b == b'=').next().unwrap_or_default();
-        match key {
-            b"t" | b"S" | b"O" | b"m" => continue,
-            b"a" => {
-                action = true;
-                query = item == b"a=q";
-            }
-            b"q" => quiet = Some(item),
-            _ => {}
+/// transmission of the data, with the command's other keys as Ghostty
+/// reads them (not `t=`, `S=`, `O=` or `m=`; `a=t` when it had no action),
+/// in base64 chunks of `CHUNK` bytes, `m=1` on all but the last. The
+/// chunks after the first carry `q=` as the command did, and `a=f` too for
+/// an animation frame, as kitty's protocol asks (Ghostty takes either). A
+/// query goes in one command.
+///
+/// Each chunk is framed as it goes out (`next_chunk`): the data is kept
+/// once, not again in base64 and framed.
+struct Ready {
+    /// The first chunk's control data.
+    first: Vec<u8>,
+    /// The later chunks' control data after `m=`.
+    rest: Vec<u8>,
+    /// Their own action (`a=f,`), before `m=`.
+    action: &'static [u8],
+    data: Vec<u8>,
+    /// Raw bytes per chunk (all of them for a query).
+    step: usize,
+    /// Where the next chunk begins in `data`; None once the last is out.
+    at: Option<usize>,
+}
+
+impl Ready {
+    fn new(control: &Control, data: Vec<u8>) -> Self {
+        let mut first = Vec::with_capacity(32);
+        if control.get(b'a').is_none() {
+            first.extend_from_slice(b"a=t");
         }
-        if !first.is_empty() {
+        let keys = control.encode(|key| !matches!(key, b't' | b'S' | b'O' | b'm'));
+        if !first.is_empty() && !keys.is_empty() {
             first.push(b',');
         }
-        first.extend_from_slice(item);
-    }
-    if !action {
-        first.splice(
-            0..0,
-            if first.is_empty() {
-                &b"a=t"[..]
+        first.extend(keys);
+        let rest = control
+            .get(b'q')
+            .map(|_| control.encode(|key| key == b'q'))
+            .unwrap_or_default();
+        let query = control.action() == b'q';
+        Self {
+            first,
+            rest,
+            action: if control.action() == b'f' {
+                b"a=f,"
             } else {
-                b"a=t,"
-            }
-            .iter()
-            .copied(),
-        );
+                b""
+            },
+            step: if query { data.len().max(1) } else { CHUNK_DATA },
+            data,
+            at: Some(0),
+        }
     }
-    let payload = cherry_vt::base64(data);
-    let chunks: Vec<&[u8]> = if payload.is_empty() || query {
-        vec![&payload]
-    } else {
-        payload.chunks(CHUNK).collect()
-    };
-    let mut out = Vec::with_capacity(payload.len() + chunks.len() * 24 + first.len());
-    for (index, chunk) in chunks.iter().enumerate() {
-        let more = index + 1 < chunks.len();
+
+    /// The next chunk, framed; None once all went.
+    fn next_chunk(&mut self) -> Option<Vec<u8>> {
+        let at = self.at?;
+        let end = self.data.len().min(at + self.step);
+        let more = end < self.data.len();
+        let payload = cherry_vt::base64(&self.data[at..end]);
+        let mut out = Vec::with_capacity(payload.len() + self.first.len() + 16);
         out.extend_from_slice(b"\x1b_G");
-        if index == 0 {
-            out.extend_from_slice(&first);
+        if at == 0 {
+            out.extend_from_slice(&self.first);
             if more {
-                out.extend_from_slice(b",m=1");
+                out.extend_from_slice(if self.first.is_empty() {
+                    b"m=1"
+                } else {
+                    b",m=1"
+                });
             }
         } else {
+            out.extend_from_slice(self.action);
             out.extend_from_slice(if more { b"m=1" } else { b"m=0" });
-            if let Some(quiet) = quiet {
+            if !self.rest.is_empty() {
                 out.push(b',');
-                out.extend_from_slice(quiet);
+                out.extend_from_slice(&self.rest);
             }
         }
         out.push(b';');
-        out.extend_from_slice(chunk);
+        out.extend_from_slice(&payload);
         out.extend_from_slice(b"\x1b\\");
+        self.at = more.then_some(end);
+        Some(out)
     }
-    out
 }
 
-/// What a terminal answers a command it refused for `refusal`, as its
-/// `q=` allows (`q=2` silences errors too) and only when it names its
-/// image (`i=` or `I=`), as Ghostty encodes it.
-pub fn refusal_reply(control: &[u8], refusal: &Refusal) -> Option<Vec<u8>> {
+/// All of a converted command (see `Ready`) at once (tests).
+#[cfg(test)]
+pub fn direct(control: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut parser = kitty::Parser::new();
+    for &byte in control {
+        parser.feed(byte);
+    }
+    let mut ready = Ready::new(&parser.finish().expect("control data"), data.to_vec());
+    std::iter::from_fn(|| ready.next_chunk())
+        .flatten()
+        .collect()
+}
+
+/// What a terminal answers a command it refused for `refusal`, as Ghostty
+/// encodes it: only when it names its image (`i=` or `I=`, then `p=`, and
+/// `r=` for an animation frame), and as its `q=` allows (1 answers errors,
+/// more silences them too).
+pub fn refusal_reply(control: &Control, refusal: &Refusal) -> Option<Vec<u8>> {
+    let positive = |key: u8| control.get(key).filter(|&value| value > 0);
+    if (positive(b'i').is_none() && positive(b'I').is_none()) || control.quiet() >= 2 {
+        return None;
+    }
+    let frame = (control.action() == b'f').then(|| positive(b'r')).flatten();
     let mut named = Vec::new();
-    for key in [&b"i"[..], b"I", b"p"] {
-        let value = keys(control)
-            .filter(|(k, _)| *k == key)
-            .last()
-            .and_then(|(_, value)| std::str::from_utf8(value).ok()?.parse::<u32>().ok())
-            .filter(|&value| value > 0);
+    for (key, value) in [
+        ("i", positive(b'i')),
+        ("I", positive(b'I')),
+        ("p", positive(b'p')),
+        ("r", frame),
+    ] {
         if let Some(value) = value {
-            if key == b"p" && named.is_empty() {
-                break;
-            }
             if !named.is_empty() {
                 named.push(b',');
             }
-            named.extend_from_slice(key);
-            named.push(b'=');
-            named.extend_from_slice(value.to_string().as_bytes());
+            named.extend_from_slice(format!("{key}={value}").as_bytes());
         }
-    }
-    let quiet = keys(control)
-        .filter(|(k, _)| *k == b"q")
-        .last()
-        .map(|(_, v)| v);
-    if named.is_empty() || quiet == Some(b"2") {
-        return None;
     }
     let mut reply = b"\x1b_G".to_vec();
     reply.extend(named);
@@ -672,7 +822,7 @@ type Outcome = Arc<Mutex<Option<Result<Vec<u8>, Refusal>>>>;
 
 /// A read under way, for a command's control data.
 struct Job {
-    control: Vec<u8>,
+    control: Control,
     outcome: Outcome,
     deadline: Instant,
 }
@@ -691,10 +841,14 @@ pub struct Media {
     token: Vec<u8>,
     /// In `Control` or `Payload`: the last byte was ESC.
     escaped: bool,
+    /// In `Control`: reads the control data as Ghostty does.
+    parser: kitty::Parser,
     job: Option<Job>,
-    /// A read's command, converted, going out.
-    ready: Vec<u8>,
-    ready_at: usize,
+    /// A read's command, converted, going out: the chunks still to frame,
+    /// and the one going out.
+    ready: Option<Ready>,
+    chunk: Vec<u8>,
+    chunk_at: usize,
     /// The program's output after the command, not looked at yet.
     after: Vec<u8>,
     after_at: usize,
@@ -714,9 +868,11 @@ impl Media {
             scan: Scan::Ground,
             token: Vec::new(),
             escaped: false,
+            parser: kitty::Parser::new(),
             job: None,
-            ready: Vec::new(),
-            ready_at: 0,
+            ready: None,
+            chunk: Vec::new(),
+            chunk_at: 0,
             after: Vec::new(),
             after_at: 0,
             places: Arc::new(places),
@@ -740,7 +896,18 @@ impl Media {
     /// Output waits here (a read under way, its command's chunks, the
     /// output after it): the PTY is not read until it went on.
     pub fn holds_output(&self) -> bool {
-        self.job.is_some() || self.ready_at < self.ready.len() || self.after_at < self.after.len()
+        self.job.is_some() || self.converting() || self.after_at < self.after.len()
+    }
+
+    /// A read command's chunks are going out.
+    fn converting(&self) -> bool {
+        self.ready.is_some() || self.chunk_at < self.chunk.len()
+    }
+
+    /// Bytes of converted output held, framed, for `resume` (tests).
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.chunk.len() - self.chunk_at
     }
 
     /// A read is under way (or finished, and not taken by `finish` yet).
@@ -752,7 +919,7 @@ impl Media {
     pub fn due(&self, now: Instant) -> bool {
         match &self.job {
             Some(job) => now >= job.deadline || job.outcome().is_some(),
-            None => self.ready_at < self.ready.len() || self.after_at < self.after.len(),
+            None => self.converting() || self.after_at < self.after.len(),
         }
     }
 
@@ -814,8 +981,7 @@ impl Media {
         let job = self.job.take()?;
         match outcome {
             Ok(data) => {
-                self.ready = direct(&job.control, &data);
-                self.ready_at = 0;
+                self.ready = Some(Ready::new(&job.control, data));
                 None
             }
             Err(refusal) => refusal_reply(&job.control, &refusal),
@@ -829,14 +995,30 @@ impl Media {
         if self.job.is_some() {
             return 0;
         }
-        if self.ready_at < self.ready.len() {
-            let end = self.ready.len().min(self.ready_at + max.max(1));
-            pass(&self.ready[self.ready_at..end]);
-            let went = end - self.ready_at;
-            self.ready_at = end;
-            if end == self.ready.len() {
-                self.ready = Vec::new();
-                self.ready_at = 0;
+        if self.chunk_at == self.chunk.len() {
+            if let Some(ready) = &mut self.ready {
+                match ready.next_chunk() {
+                    Some(chunk) => {
+                        self.chunk = chunk;
+                        self.chunk_at = 0;
+                    }
+                    None => {
+                        self.ready = None;
+                        self.chunk = Vec::new();
+                        self.chunk_at = 0;
+                    }
+                }
+            }
+        }
+        if self.chunk_at < self.chunk.len() {
+            let end = self.chunk.len().min(self.chunk_at + max.max(1));
+            pass(&self.chunk[self.chunk_at..end]);
+            let went = end - self.chunk_at;
+            self.chunk_at = end;
+            if end == self.chunk.len() && self.ready.as_ref().is_none_or(|r| r.at.is_none()) {
+                self.ready = None;
+                self.chunk = Vec::new();
+                self.chunk_at = 0;
             }
             return went;
         }
@@ -938,6 +1120,10 @@ impl Media {
                 if byte == b'G' {
                     self.token.push(byte);
                     self.scan = Scan::Control;
+                    self.parser = kitty::Parser::new();
+                } else if byte >= 0xa0 {
+                    // Ghostty ignores it there (and so does the display
+                    // stream): it is left out.
                 } else {
                     self.release(pass);
                     return self.step(byte, pass);
@@ -958,8 +1144,14 @@ impl Media {
                     return self.step(byte, pass);
                 }
                 match byte {
-                    // CAN and SUB abort it.
-                    0x18 | 0x1a => {
+                    // The 8-bit ST ends it, as `ESC \` does.
+                    0x9c => {
+                        self.token.extend_from_slice(b"\x1b\\");
+                        return self.complete(pass);
+                    }
+                    // CAN and SUB abort it, and so does any other 8-bit
+                    // control (the display stream makes it a 7-bit one).
+                    0x18 | 0x1a | 0x80..=0x9f => {
                         self.token.push(byte);
                         self.release(pass);
                     }
@@ -967,10 +1159,11 @@ impl Media {
                         self.token.push(byte);
                         self.escaped = true;
                     }
-                    b';' if self.scan == Scan::Control => {
+                    _ if self.scan == Scan::Control && self.parser.feed(byte) => {
+                        // The payload begins: a media command's is read.
                         self.token.push(byte);
-                        let control = &self.token[3..self.token.len() - 1];
-                        if medium(control).is_some() {
+                        let reads = self.parser.clone().finish().as_ref().and_then(medium_of);
+                        if reads.is_some() {
                             self.scan = Scan::Payload;
                         } else {
                             self.release(pass);
@@ -997,20 +1190,21 @@ impl Media {
     /// starts its read; any other goes on.
     fn complete(&mut self, pass: &mut impl FnMut(&[u8])) -> bool {
         let body = &self.token[3..self.token.len() - 2];
-        let (control, payload) = match body.iter().position(|&b| b == b';') {
-            Some(at) => (&body[..at], &body[at + 1..]),
-            None => (body, &[][..]),
-        };
-        if medium(control).is_none() {
+        let Some((control, source)) = kitty::parse(body)
+            .filter(|command| medium_of(&command.control).is_some())
+            .map(|command| {
+                let source = Source::parse(&command.control, command.payload.unwrap_or_default());
+                (command.control, source)
+            })
+        else {
             self.release(pass);
             return false;
-        }
+        };
         let job = Job {
-            control: control.to_vec(),
+            control,
             outcome: Arc::default(),
             deadline: Instant::now() + self.timeout,
         };
-        let source = Source::parse(control, payload);
         self.token.clear();
         self.scan = Scan::Ground;
         self.escaped = false;

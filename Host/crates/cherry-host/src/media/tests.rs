@@ -576,3 +576,231 @@ fn a_read_that_takes_too_long_is_refused_and_the_output_goes_on() {
     assert!(started.elapsed() < Duration::from_millis(150));
     assert!(String::from_utf8_lossy(replies.last().unwrap()).starts_with("\x1b_Gi=1;EBUSY: "));
 }
+
+/// Ghostty takes a one-byte value that is not a digit as that byte, and
+/// any other as a number: `t=102` is `t=f`, `a=84` is `a=T`. The holder
+/// reads keys as Ghostty does (`cherry_vt::kitty`), so a medium written in
+/// numbers is one too, and a renderer never gets it to read.
+#[test]
+fn keys_are_read_as_ghostty_reads_them() {
+    for control in [
+        "t=102",
+        "t=0102",
+        "t=+102",
+        "t=1_02",
+        "a=84,t=f",
+        "a=+116,t=102",
+        "a=113,t=f",
+    ] {
+        assert_eq!(medium(control.as_bytes()), Some(Medium::File), "{control}");
+    }
+    assert_eq!(medium(b"t=116"), Some(Medium::Temporary));
+    assert_eq!(medium(b"a=84,t=115"), Some(Medium::Shared));
+    // What Ghostty refuses, or never reads as `t`, names none: no
+    // terminal reads anything for it.
+    for control in [
+        "t=F",
+        "T=f",
+        " t=f",
+        "t= f",
+        "t=f ",
+        "t=358",
+        "a=t,,t=f",
+        "i=123456789012,t=f",
+        "a=112,t=f",
+        "t=f,o=x",
+        "t=100",
+    ] {
+        assert_eq!(medium(control.as_bytes()), None, "{control:?}");
+    }
+}
+
+#[test]
+fn media_written_in_numbers_are_read_like_letters() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("image");
+    let data = noise(5000, 21);
+    fs::write(&file, &data).unwrap();
+    for control in [
+        "a=84,t=102,i=5",
+        "a=+116,t=0102,i=5",
+        "t=1_02,i=5,O=1_0,S=+20",
+    ] {
+        let mut media = media(&[]);
+        let (out, replies) = run(&mut media, &command(control, path_bytes(&file)), 4096);
+        assert!(replies.is_empty(), "{control}: {replies:?}");
+        let (controls, payload) = transmitted(&out);
+        let expected = if control.contains("O=") {
+            &data[10..30]
+        } else {
+            &data[..]
+        };
+        assert_eq!(payload, expected, "{control}");
+        // A direct transmission, its keys as Ghostty reads them.
+        assert!(
+            controls
+                .iter()
+                .all(|c| !c.contains("t=") && !c.contains("O=") && !c.contains("S=")),
+            "{controls:?}"
+        );
+        assert!(controls[0].starts_with(if control.starts_with("a=84") {
+            "a=T,i=5"
+        } else {
+            "a=t,i=5"
+        }));
+    }
+    // A temporary file (`t=116`), deleted once read.
+    let temporary = tempfile::tempdir().unwrap();
+    let file = temporary.path().join("tty-graphics-protocol-n");
+    fs::write(&file, &data).unwrap();
+    let mut media = media(&[temporary.path()]);
+    let (out, replies) = run(&mut media, &command("t=116,i=2", path_bytes(&file)), 4096);
+    assert!(replies.is_empty(), "{replies:?}");
+    assert_eq!(transmitted(&out).1, data);
+    assert!(!file.exists());
+    // Shared memory (`t=115`), unlinked.
+    let name = shared_memory(&data);
+    // (Its size: macOS rounds the object up to pages.)
+    let (out, replies) = run(
+        &mut media,
+        &command(
+            &format!("t=115,i=2,f=100,S={}", data.len()),
+            name.as_bytes(),
+        ),
+        4096,
+    );
+    assert!(replies.is_empty(), "{replies:?}");
+    assert_eq!(transmitted(&out).1, data);
+    assert!(unlinked(&name));
+    // Refused as Ghostty answers: `i=+7` is image 7, `q=3` silences all.
+    let mut reply = |control: &str| {
+        let (_, replies) = run(&mut media, &command(control, "/nonexistent/cherry"), 4096);
+        replies
+            .into_iter()
+            .next()
+            .map(|r| String::from_utf8(r).unwrap())
+    };
+    assert!(reply("a=84,t=102,i=+7")
+        .unwrap()
+        .starts_with("\x1b_Gi=7;ENOENT: "));
+    assert_eq!(reply("t=102,i=7,q=3"), None);
+    assert!(reply("t=102,i=7,q=1").is_some());
+}
+
+/// Kitty's protocol asks for `a=f` on every chunk of an animation frame
+/// (Ghostty takes either); a converted one carries it.
+#[test]
+fn a_converted_animation_frame_says_so_on_every_chunk() {
+    let data = noise(10_000, 4);
+    let (controls, payload) = transmitted(&direct(b"a=f,t=f,i=3,r=2,q=1", &data));
+    assert_eq!(payload, data);
+    assert_eq!(
+        controls,
+        [
+            "a=f,i=3,r=2,q=1,m=1",
+            "a=f,m=1,q=1",
+            "a=f,m=1,q=1",
+            "a=f,m=0,q=1"
+        ]
+    );
+}
+
+/// A converted transmission is framed as it goes out, not all at once:
+/// the holder keeps the data read and the chunk going out, not the data
+/// again in base64 and framed.
+#[test]
+fn a_converted_transmission_is_framed_as_it_goes() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("big");
+    let data = noise(1 << 20, 8);
+    fs::write(&file, &data).unwrap();
+    let mut media = media(&[]);
+    let mut out = Vec::new();
+    media.feed(
+        &command("a=T,t=f,f=100,i=9", path_bytes(&file)),
+        &mut |bytes: &[u8]| out.extend_from_slice(bytes),
+    );
+    media.wait(Instant::now() + Duration::from_secs(10));
+    assert_eq!(media.finish(Instant::now()), None);
+    assert!(
+        media.held() <= 2 * CHUNK + 64,
+        "{} bytes held for {} read",
+        media.held(),
+        data.len()
+    );
+    let mut replies = Vec::new();
+    drain(&mut media, &mut out, &mut replies);
+    assert_eq!(transmitted(&out).1, data);
+    assert_eq!(media.held(), 0);
+}
+
+/// A temporary file is deleted from the directory it was read in, and only
+/// when the name still holds the file read.
+#[test]
+fn a_temporary_file_is_deleted_only_as_it_was_read() {
+    let temporary = tempfile::tempdir().unwrap();
+    let data = noise(300, 17);
+    let places = Places::only(vec![temporary.path().to_path_buf()]);
+    let file = temporary.path().join("tty-graphics-protocol-swap");
+    let source = |path: &Path| Source {
+        medium: Medium::Temporary,
+        path: path_bytes(path).to_vec(),
+        offset: 0,
+        size: None,
+        pixels: None,
+        limit: MAX_BYTES,
+    };
+    // Another file put in its place after the read is left alone.
+    fs::write(&file, &data).unwrap();
+    let read = read_temporary_with(&file, &source(&file), &places, |name| {
+        let other = name.with_extension("other");
+        fs::write(&other, b"someone else's").unwrap();
+        fs::rename(&other, name).unwrap();
+    });
+    assert_eq!(read.unwrap(), data);
+    assert_eq!(fs::read(&file).unwrap(), b"someone else's");
+    fs::remove_file(&file).unwrap();
+    // A directory moved away after the read, and a link to another put in
+    // its place: the file is deleted where it was read, never through the
+    // link.
+    let inner = temporary.path().join("tty-graphics-protocol-dir");
+    let moved = temporary.path().join("moved");
+    let elsewhere = tempfile::tempdir().unwrap();
+    fs::create_dir(&inner).unwrap();
+    fs::write(inner.join("x"), &data).unwrap();
+    fs::write(elsewhere.path().join("x"), b"elsewhere").unwrap();
+    let read = read_temporary_with(&inner.join("x"), &source(&inner.join("x")), &places, |_| {
+        fs::rename(&inner, &moved).unwrap();
+        symlink(elsewhere.path(), &inner).unwrap();
+    });
+    assert_eq!(read.unwrap(), data);
+    assert_eq!(fs::read(elsewhere.path().join("x")).unwrap(), b"elsewhere");
+    assert!(!moved.join("x").exists(), "the file read is deleted");
+}
+
+/// Bytes Ghostty ignores inside a command (0xa0 and up) are ignored here
+/// too, and the 8-bit ST ends one as `ESC \` does: such a command is read
+/// as Ghostty would read it.
+#[test]
+fn a_command_is_read_through_the_bytes_ghostty_ignores() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("image");
+    let data = noise(100, 2);
+    fs::write(&file, &data).unwrap();
+    let path = b64(path_bytes(&file));
+    for stream in [
+        format!("\x1b_\u{a0}Ga=T,t=\u{e9}f,i=5;{path}\x1b\\"),
+        format!("\x1b_Ga=T,t=f,i=5;{path}\u{9c}"),
+    ] {
+        let stream = stream
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).unwrap())
+            .collect::<Vec<u8>>();
+        for step in [1, 3, stream.len()] {
+            let mut media = media(&[]);
+            let (out, replies) = run(&mut media, &stream, step);
+            assert!(replies.is_empty(), "{replies:?}");
+            assert_eq!(transmitted(&out).1, data, "{stream:?} every {step}");
+        }
+    }
+}

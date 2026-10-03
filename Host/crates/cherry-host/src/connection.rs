@@ -728,6 +728,7 @@ impl Connection {
                 client_id,
                 cell_width,
                 cell_height,
+                viewport,
             } => {
                 if self.attached.is_some() {
                     bail!("connection already attached");
@@ -753,6 +754,7 @@ impl Connection {
                     client_id,
                     // A cell size out of range is no cell size.
                     cell: cherry_protocol::valid_cell_size(cell_width, cell_height),
+                    viewport,
                     outbox: self.outbox.clone(),
                     abort: self.stream.try_clone()?,
                     cancelled: self.cancelled.clone(),
@@ -804,6 +806,7 @@ impl Connection {
                 rows,
                 cell_width,
                 cell_height,
+                viewport,
             } => {
                 self.attached
                     .as_ref()
@@ -813,6 +816,7 @@ impl Connection {
                         cols,
                         rows,
                         cell: cherry_protocol::valid_cell_size(cell_width, cell_height),
+                        viewport,
                     })?;
                 return Ok((None, Flow::Continue));
             }

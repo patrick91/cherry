@@ -105,6 +105,7 @@ impl Window {
                 rows,
                 cell_width: None,
                 cell_height: None,
+                viewport: false,
             },
         );
         self.terminal.resize(cols, rows).unwrap();
@@ -265,6 +266,7 @@ fn resizes_send_screens_without_history_and_full_snapshots_where_needed() {
             rows: 40,
             cell_width: None,
             cell_height: None,
+            viewport: false,
         },
     );
     let (session_info, offset, snapshot) = first_window.until_attached(&mut first);
@@ -298,6 +300,7 @@ fn resizes_send_screens_without_history_and_full_snapshots_where_needed() {
             rows: 30,
             cell_width: None,
             cell_height: None,
+            viewport: false,
         },
     );
     let (session_info, _, snapshot) = second_window.until_attached(&mut second);
@@ -346,6 +349,7 @@ fn a_lone_clients_own_resizes_send_only_the_screens() {
             rows: 20,
             cell_width: None,
             cell_height: None,
+            viewport: false,
         },
     );
     window.terminal.resize(70, 20).unwrap();
@@ -449,6 +453,7 @@ fn a_resize_leaves_a_client_that_keeps_up_all_of_its_queued_output() {
                 rows,
                 cell_width: None,
                 cell_height: None,
+                viewport: false,
             },
         );
         fast_screen.wait_size(&mut fast, cols, rows);
@@ -607,6 +612,7 @@ fn an_attach_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
             client_id: None,
             cell_width: None,
             cell_height: None,
+            viewport: false,
         },
     );
     thread::sleep(Duration::from_millis(300));
@@ -618,6 +624,7 @@ fn an_attach_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
             rows: 25,
             cell_width: None,
             cell_height: None,
+            viewport: false,
         },
     );
     host.wait(&session.id, |info| (info.cols, info.rows) == (90, 25));
@@ -678,6 +685,7 @@ fn a_resync_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
             rows: 25,
             cell_width: None,
             cell_height: None,
+            viewport: false,
         },
     );
     host.wait(&session.id, |info| (info.cols, info.rows) == (90, 25));
@@ -775,6 +783,7 @@ fn a_cell_size_reaches_size_reports_and_the_pty() {
             rows: 24,
             cell_width: Some(10),
             cell_height: Some(21),
+            viewport: false,
         },
     );
     thread::sleep(Duration::from_millis(200));
@@ -788,6 +797,7 @@ fn a_cell_size_reaches_size_reports_and_the_pty() {
             rows: 30,
             cell_width: Some(9),
             cell_height: Some(18),
+            viewport: false,
         },
     );
     screen.wait_size(&mut socket, 100, 30);
@@ -803,6 +813,7 @@ fn a_cell_size_reaches_size_reports_and_the_pty() {
                 rows: 30,
                 cell_width: width,
                 cell_height: Some(18),
+                viewport: false,
             },
         );
     }
@@ -825,6 +836,7 @@ fn a_cell_size_reaches_size_reports_and_the_pty() {
             client_id: None,
             cell_width: Some(12),
             cell_height: Some(25),
+            viewport: false,
         },
     );
     assert!(matches!(
@@ -848,6 +860,7 @@ fn a_cell_size_reaches_size_reports_and_the_pty() {
             rows: 20,
             cell_width: Some(12),
             cell_height: Some(25),
+            viewport: false,
         },
     );
     screen.wait_size(&mut socket, 70, 20);
@@ -933,6 +946,7 @@ fn a_session_created_for_a_window_has_its_pixels_and_that_window_attaching_chang
             client_id: None,
             cell_width: Some(10),
             cell_height: Some(21),
+            viewport: false,
         },
     );
     let ServerMessage::Attached {
@@ -955,6 +969,7 @@ fn a_session_created_for_a_window_has_its_pixels_and_that_window_attaching_chang
             rows: 24,
             cell_width: Some(9),
             cell_height: Some(18),
+            viewport: false,
         },
     );
     thread::sleep(Duration::from_millis(200));
@@ -1087,6 +1102,67 @@ fn the_holder_reads_images_in_files_and_sends_them_on_directly() {
     host.kill(&session.id);
 }
 
+/// Keys written as numbers are read as Ghostty reads them (`t=102` is
+/// `t=f`, `a=84` is `a=T`): the holder reads such a file, and a command
+/// that 8-bit controls hide from a 7-bit reader (APC 0x9f inside a control
+/// sequence, ST 0x9c) is still found and kept from the renderers.
+#[test]
+fn the_holder_reads_media_named_in_numbers_and_renderers_never_get_a_file() {
+    let host = Host::new();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("image.png");
+    std::fs::write(&file, PNG).unwrap();
+    let path = String::from_utf8(cherry_vt::base64(file.to_str().unwrap().as_bytes())).unwrap();
+    let read_reply = r#"perl -e 'my $r = ""; while (sysread(STDIN, my $c, 1)) { $r .= $c; last if $r =~ /\e\\$/ } $r =~ s/\e/^/g; print "REPLY:$r\r\n"'"#;
+    let session = host.create(shell(&format!(
+        "stty -echo; IFS= read -r go; stty raw; \
+         printf '\\033_Ga=84,t=102,i=5,f=100;{path}\\033\\\\'; {read_reply}; \
+         printf '\\033[\\237Ga=113,i=6,s=1,v=1,f=24,t=0102;{path}\\234'; {read_reply}; \
+         printf 'DONE\\r\\n'; exec sleep 60",
+    )));
+    let (mut socket, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut renderer = image_renderer(80, 24, &snapshot);
+    let mut received = Vec::new();
+    let mut at = offset;
+    input(&mut socket, b"go\n");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !renderer.screen_text().unwrap().contains("DONE") {
+        assert!(
+            Instant::now() < deadline,
+            "no DONE: {:?}",
+            renderer.screen_text()
+        );
+        match receive(&mut socket) {
+            ServerMessage::Output { offset, data } => {
+                assert_eq!(offset, at);
+                at += data.len() as u64;
+                assert!(renderer.feed(&data).is_empty(), "q=2");
+                received.extend_from_slice(&data);
+            }
+            ServerMessage::Pong => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let text = renderer.screen_text().unwrap();
+    // The holder read the file for image 5; the host's terminal, which
+    // reads none, refused the hidden query, which it alone got.
+    assert!(text.contains("REPLY:^_Gi=5;OK^\\"), "{text}");
+    assert!(
+        text.contains("REPLY:^_Gi=6;EINVAL: unsupported medium^\\"),
+        "{text}"
+    );
+    let direct = format!(
+        "\x1b_Ga=T,i=5,f=100,q=2;{}\x1b\\",
+        String::from_utf8(cherry_vt::base64(&PNG)).unwrap()
+    );
+    let received = String::from_utf8_lossy(&received);
+    assert!(received.contains(&direct), "{received:?}");
+    assert_eq!(received.matches("\x1b_G").count(), 1, "{received:?}");
+    assert!(!received.contains("\u{fffd}G"), "{received:?}");
+    assert!(!received.contains("t=0102"), "{received:?}");
+    host.kill(&session.id);
+}
+
 /// The snapshot of the next `Attached` on `socket`, with its reason.
 fn next_replacement(socket: &mut UnixStream) -> (AttachReason, Vec<u8>) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1124,6 +1200,7 @@ fn a_window_that_paints_a_viewport_gets_the_images_with_its_screens() {
             rows: 20,
             cell_width: None,
             cell_height: None,
+            viewport: false,
         },
     );
     let (reason, viewport) = next_replacement(&mut large);
@@ -1139,6 +1216,65 @@ fn a_window_that_paints_a_viewport_gets_the_images_with_its_screens() {
     assert!(at(b"\x1b_Ga=t,i=9,") < at(b"\x1b_Ga=p,U=1,i=9,c=1,r=1,q=2\x1b\\"));
     let (_, streamed) = next_replacement(&mut small);
     assert!(!contains(&streamed, b"\x1b_G"), "{streamed:?}");
+    host.kill(&session.id);
+}
+
+/// A window beyond the size limits gives the host its size brought within
+/// them, which may be the grid's, but paints a viewport all the same, and
+/// says so (`viewport` on `Attach` and `Resize`): its screens bring the
+/// images on screen, as any viewport's do. Once within them, at the grid's
+/// size, it shows the stream and keeps its own.
+#[test]
+fn a_window_beyond_the_size_limits_gets_the_images_with_its_screens() {
+    let host = Host::new();
+    let session = host.create(shell(
+        "stty -echo; printf '\\033_Ga=T,U=1,f=24,s=1,v=1,i=9,c=1,r=1;AQID\\033\\\\'; \
+         printf '\\033[38;5;9m\\364\\216\\273\\256\\314\\205\\314\\205\\033[m READY\\r\\n'; exec sleep 60",
+    ));
+    let mut socket = host.connect();
+    send(
+        &mut socket,
+        &ClientMessage::Attach {
+            id: session.id.clone(),
+            cols: 80,
+            rows: 24,
+            takeover: false,
+            answers_queries: true,
+            client_id: None,
+            cell_width: None,
+            cell_height: None,
+            viewport: true,
+        },
+    );
+    let (offset, snapshot) = match receive(&mut socket) {
+        ServerMessage::Attached {
+            offset, snapshot, ..
+        } => (offset, snapshot),
+        other => panic!("attach failed {other:?}"),
+    };
+    let mut screen = Screen::new(80, 24, offset, &snapshot);
+    screen.wait_text(&mut socket, "READY");
+    send(&mut socket, &ClientMessage::Refresh);
+    let (_, screens) = next_replacement(&mut socket);
+    assert!(!is_full(&screens));
+    assert!(contains(&screens, cherry_vt::IMAGE_RESET), "{screens:?}");
+    assert!(contains(&screens, b"\x1b_Ga=t,i=9,"), "{screens:?}");
+    // Within the limits: the stream, which a full replacement begins.
+    send(
+        &mut socket,
+        &ClientMessage::Resize {
+            cols: 80,
+            rows: 24,
+            cell_width: None,
+            cell_height: None,
+            viewport: false,
+        },
+    );
+    let (_, full) = next_replacement(&mut socket);
+    assert!(is_full(&full));
+    send(&mut socket, &ClientMessage::Refresh);
+    let (_, screens) = next_replacement(&mut socket);
+    assert!(!contains(&screens, b"\x1b_G"), "{screens:?}");
     host.kill(&session.id);
 }
 

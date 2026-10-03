@@ -543,6 +543,14 @@ pub enum ClientMessage {
         cell_width: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cell_height: Option<u32>,
+        /// The client paints a viewport of the grid whatever the grid's
+        /// size: its window is beyond the size limits (`valid_size`), which
+        /// `cols` and `rows` are brought within. The host serves it as a
+        /// window of another size than the grid's (its screens carry the
+        /// kitty images on screen, see `Attached`). Sent only when true; a
+        /// host older than the field ignores it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        viewport: bool,
     },
     /// Terminal input for the attached session, at most `MAX_INPUT_BYTES`.
     /// A binary frame only (`binary_kind::INPUT`).
@@ -560,6 +568,9 @@ pub enum ClientMessage {
         cell_width: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cell_height: Option<u32>,
+        /// As in `Attach`, for the window's new size.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        viewport: bool,
     },
     /// Ask for a replacement snapshot of the grid (`Attached{Resize}`),
     /// queued behind the attachment's output like any replacement; the host
@@ -2229,9 +2240,57 @@ mod tests {
             client_id: None,
             cell_width: None,
             cell_height: None,
+            viewport: false,
         })
         .contains("client_id"));
     }
+    /// A window beyond the size limits says it paints a viewport; any other
+    /// sends what it always did, and a host older than the field, which
+    /// ignores fields it does not know as this one does, reads it as it
+    /// always did.
+    #[test]
+    fn the_viewport_flag_is_sent_only_when_true() {
+        let resize = |viewport| ClientMessage::Resize {
+            cols: 500,
+            rows: 200,
+            cell_width: None,
+            cell_height: None,
+            viewport,
+        };
+        assert_eq!(
+            json(&resize(false)),
+            r#"{"op":"resize","cols":500,"rows":200}"#
+        );
+        let with = json(&resize(true));
+        assert_eq!(
+            with,
+            r#"{"op":"resize","cols":500,"rows":200,"viewport":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&with).unwrap(),
+            resize(true)
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(r#"{"op":"resize","cols":500,"rows":200}"#)
+                .unwrap(),
+            resize(false)
+        );
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"op":"attach","id":"a","cols":80,"rows":24,"takeover":false,"answers_queries":true,"viewport":true}"#
+            ),
+            Ok(ClientMessage::Attach { viewport: true, .. })
+        ));
+        // Fields a host does not know are ignored.
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"op":"resize","cols":500,"rows":200,"a_later_field":true}"#
+            )
+            .unwrap(),
+            resize(false)
+        );
+    }
+
     #[test]
     fn cell_sizes_are_optional_and_sent_only_when_known() {
         let attach = |cell_width, cell_height| ClientMessage::Attach {
@@ -2243,6 +2302,7 @@ mod tests {
             client_id: None,
             cell_width,
             cell_height,
+            viewport: false,
         };
         let without = json(&attach(None, None));
         assert!(!without.contains("cell_"), "{without}");
@@ -2268,6 +2328,7 @@ mod tests {
                 rows: 30,
                 cell_width: None,
                 cell_height: None,
+                viewport: false,
             }
         );
         let resize = ClientMessage::Resize {
@@ -2275,6 +2336,7 @@ mod tests {
             rows: 30,
             cell_width: Some(10),
             cell_height: Some(21),
+            viewport: false,
         };
         assert_eq!(
             json(&resize),
@@ -2609,6 +2671,7 @@ mod tests {
                 client_id: None,
                 cell_width: None,
                 cell_height: None,
+                viewport: false,
             },
             ClientMessage::Attach {
                 id: "s".into(),
@@ -2619,6 +2682,7 @@ mod tests {
                 client_id: Some("6d1f0c2e-3b4a-4c5d-8e9f-0a1b2c3d4e5f".into()),
                 cell_width: Some(16),
                 cell_height: Some(34),
+                viewport: false,
             },
             ClientMessage::Input {
                 data: bytes.clone(),
@@ -2628,12 +2692,14 @@ mod tests {
                 rows: 1,
                 cell_width: None,
                 cell_height: None,
+                viewport: false,
             },
             ClientMessage::Resize {
                 cols: 80,
                 rows: 24,
                 cell_width: Some(9),
                 cell_height: Some(18),
+                viewport: false,
             },
             ClientMessage::Refresh,
             ClientMessage::Detach,

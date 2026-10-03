@@ -25,7 +25,7 @@ pub(crate) struct SysImage {
 
 /// `CherryPlacement` in shim.c.
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) struct RawPlacement {
     pub image_id: u32,
     pub placement_id: u32,
@@ -385,6 +385,32 @@ pub(crate) fn candidates(
         });
     }
     images
+}
+
+/// A placement that a viewport shows (`Terminal::viewport_placements`):
+/// two are equal when they show the same image the same way, at the same
+/// cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placement(pub(crate) RawPlacement);
+
+impl Placement {
+    /// Its image's ID.
+    pub fn image(&self) -> u32 {
+        self.0.image_id
+    }
+
+    /// A virtual placement (unicode placeholders), shown wherever its
+    /// placeholder cells are.
+    pub fn is_virtual(&self) -> bool {
+        self.0.is_virtual
+    }
+
+    /// The command that places it on a receiver that has its image under
+    /// the same ID, quietly; a direct one at its cell, which the cursor is
+    /// moved to and left at (as `Terminal::viewport_graphics` places it).
+    pub fn place(&self) -> Vec<u8> {
+        place(&self.0)
+    }
 }
 
 /// `rgba` pixels zlib-compressed and in base64: the payload of `transmit`.

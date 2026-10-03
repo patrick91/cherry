@@ -10,14 +10,22 @@
 //! renderer (`ServerMessage::Query`), whose terminal answers. They are not
 //! part of the offset-accounted output, so neither snapshots nor a lagging
 //! client's resync repeat them. Kitty graphics commands reach the renderers
-//! with `q=2`, so only the host replies.
+//! with `q=2`, so only the host replies, and only as Ghostty reads them,
+//! never one that names a file (see `route_graphics`).
+//!
+//! Where Ghostty acts on 8-bit controls (inside an escape sequence, a
+//! control sequence or a string other than OSC) they are made their 7-bit
+//! forms, and bytes Ghostty ignores there are dropped
+//! (`eight_bit_control`), so no renderer reads a sequence the tokenizer did
+//! not see: a kitty graphics command begun by 0x9f inside a control
+//! sequence is one, routed as any other.
 //!
 //! Output floods are mostly text and short CSI sequences, so the ground
 //! state passes runs of text through whole and routes a CSI or OSC sequence
 //! that arrives complete without buffering it; everything else goes through
 //! the byte-at-a-time state machine (`step`), which the fast paths match
 //! exactly.
-use cherry_vt::Terminal;
+use cherry_vt::{kitty, Terminal};
 use std::{borrow::Cow, collections::HashMap, sync::Mutex};
 
 #[derive(Default)]
@@ -27,6 +35,8 @@ pub struct DisplayStream {
     escaped: bool,
     utf8_left: usize,
     discarding: bool,
+    /// In `Mode::String`: what began it (`P`, `X`, `^` or `_`).
+    string: u8,
     transfer: Transfer,
     /// OSC 52 clipboard writes dropped for exceeding `MAX_CLIPBOARD` since
     /// `take_dropped_clipboard_writes` last read it.
@@ -58,30 +68,29 @@ impl Transfer {
         else {
             return;
         };
-        let control = body.split(|&b| b == b';').next().unwrap_or_default();
-        let keys: Vec<&[u8]> = control
-            .split(|&b| b == b',')
-            .filter(|k| !k.is_empty())
-            .collect();
-        let more = keys.contains(&&b"m=1"[..]);
-        let continues = keys
-            .iter()
-            .all(|key| key.starts_with(b"m=") || key.starts_with(b"q="));
+        // One Ghostty refuses does nothing.
+        let Some(command) = kitty::parse(body) else {
+            return;
+        };
+        let control = &command.control;
+        let more = control.more();
+        // A chunk says only whether more follow (and `a=f`, which kitty
+        // asks for on every chunk of an animation frame).
+        let continues = control.keys().all(|key| match key {
+            b'm' | b'q' => true,
+            b'a' => control.action() == b'f',
+            _ => false,
+        });
         if continues {
             if self.chunks.is_empty() && !self.dropped {
                 return;
             }
         } else {
-            let action = keys
-                .iter()
-                .rev()
-                .find_map(|key| key.strip_prefix(b"a="))
-                .unwrap_or(b"t");
-            match action {
+            match control.action() {
                 // A new transmission replaces it.
-                b"t" | b"T" | b"f" => {}
+                b't' | b'T' | b'f' => {}
                 // A deletion abandons it, as it does on a terminal.
-                b"d" => {
+                b'd' => {
                     *self = Self::default();
                     return;
                 }
@@ -101,7 +110,7 @@ impl Transfer {
         if self.dropped {
             return;
         }
-        let Route::Split { display, .. } = route_graphics(token) else {
+        let Some(display) = kitty::for_renderers(body) else {
             return;
         };
         if self.chunks.len() + display.len() > cherry_protocol::MAX_SNAPSHOT_GRAPHICS_BYTES {
@@ -406,6 +415,19 @@ impl DisplayStream {
                 self.step(&[b], batch);
                 continue;
             }
+            if matches!(self.mode, Mode::Escape | Mode::Csi | Mode::String) && b >= 0x7f {
+                match b {
+                    0x80..=0x9f => {
+                        self.eight_bit_control(b, batch);
+                        continue;
+                    }
+                    // DEL is a string's data.
+                    0x7f if self.mode == Mode::String => {}
+                    // Ghostty ignores DEL in a sequence, and 0xa0 and up
+                    // anywhere but in an OSC string.
+                    _ => continue,
+                }
+            }
             if !self.discarding {
                 self.pending.push(b);
             }
@@ -421,6 +443,7 @@ impl DisplayStream {
                     }
                     b'P' | b'_' | b'^' | b'X' => {
                         self.mode = Mode::String;
+                        self.string = b;
                         false
                     }
                     0x20..=0x2f => false,
@@ -451,6 +474,57 @@ impl DisplayStream {
         }
     }
 
+    /// An 8-bit C1 control (0x80 to 0x9f) inside an escape sequence, a
+    /// control sequence or a string other than OSC (whose data it is):
+    /// Ghostty acts on it as on its 7-bit form (`ESC` and the byte less
+    /// 0x40), so it is made that form, and the host's terminal, every
+    /// renderer and this stream read one sequence. ST (0x9c) ends a string;
+    /// in SOS, PM or APC a string's own introducer is ignored, as Ghostty
+    /// ignores it; anything else abandons what came so far (which had no
+    /// display effect, as when ESC does) and begins its own sequence. A
+    /// kitty graphics command so begun is routed as any other, never
+    /// passed as text a renderer would take for one.
+    fn eight_bit_control(&mut self, b: u8, batch: &mut Batch) {
+        if self.mode == Mode::String {
+            if b == 0x9c {
+                if self.discarding {
+                    self.pending.clear();
+                    self.reset();
+                } else {
+                    self.pending.extend_from_slice(b"\x1b\\");
+                    self.finish(batch);
+                }
+                return;
+            }
+            if matches!(b, 0x98 | 0x9e | 0x9f) && matches!(self.string, b'X' | b'^' | b'_') {
+                return;
+            }
+        }
+        self.pending.clear();
+        self.reset();
+        let seven = [0x1b, b - 0x40];
+        match b {
+            0x9c => {}
+            0x90 | 0x98 | 0x9e | 0x9f => {
+                self.pending.extend_from_slice(&seven);
+                self.mode = Mode::String;
+                self.string = b - 0x40;
+            }
+            0x9b => {
+                self.pending.extend_from_slice(&seven);
+                self.mode = Mode::Csi;
+            }
+            0x9d => {
+                self.pending.extend_from_slice(&seven);
+                self.mode = Mode::Osc;
+            }
+            _ => {
+                self.pending.extend_from_slice(&seven);
+                self.finish(batch);
+            }
+        }
+    }
+
     fn limit(&self) -> usize {
         if self.mode == Mode::Osc && self.pending.starts_with(CLIPBOARD) {
             MAX_CLIPBOARD
@@ -460,6 +534,14 @@ impl DisplayStream {
     }
 
     fn finish(&mut self, batch: &mut Batch) {
+        if self.mode == Mode::String
+            && matches!(self.string, b'X' | b'^')
+            && self.pending.get(2) == Some(&b'G')
+        {
+            // Ghostty reads SOS and PM as it reads APC: a kitty graphics
+            // command in one is one, and is routed as one.
+            self.pending[1] = b'_';
+        }
         if !self.discarding {
             batch.token(&self.pending);
             self.transfer.observe(&self.pending);
@@ -857,10 +939,13 @@ fn host_answers_capability(name: &[u8]) -> bool {
 
 /// Kitty graphics: the host answers `a=q` probes and acknowledges other
 /// commands; the renderer draws images but must stay silent (`q=2`). A
-/// renderer never reads a file or shared memory for an image: the holder
-/// reads those and passes the command on as a direct transmission (see
-/// `media`), so one that names a medium still (one the holder took for no
-/// command) goes to the host alone, which refuses it.
+/// renderer never reads a file, a temporary file or shared memory for an
+/// image: the holder reads those and passes the command on as a direct
+/// transmission (see `media`), so one that names a medium still (one the
+/// holder took for no command), however it is written, goes to the host
+/// alone, which refuses it. Renderers get a command only as Ghostty reads
+/// it, written again (`cherry_vt::kitty::for_renderers`); one Ghostty
+/// refuses, and a query, the host alone.
 fn route_graphics(token: &[u8]) -> Route {
     let Some(body) = token
         .strip_prefix(b"\x1b_G")
@@ -868,26 +953,12 @@ fn route_graphics(token: &[u8]) -> Route {
     else {
         return Route::Both;
     };
-    let control_end = body.iter().position(|&b| b == b';').unwrap_or(body.len());
-    let (control, payload) = body.split_at(control_end);
-    let keys: Vec<&[u8]> = control
-        .split(|&b| b == b',')
-        .filter(|key| !key.is_empty())
-        .collect();
-    if keys.contains(&&b"a=q"[..]) || crate::media::medium(control).is_some() {
-        return Route::Host;
-    }
-    let mut quiet = b"\x1b_G".to_vec();
-    for key in keys.iter().filter(|key| !key.starts_with(b"q=")) {
-        quiet.extend(*key);
-        quiet.push(b',');
-    }
-    quiet.extend(b"q=2");
-    quiet.extend(payload);
-    quiet.extend(b"\x1b\\");
-    Route::Split {
-        display: quiet,
-        query: Vec::new(),
+    match kitty::for_renderers(body) {
+        Some(display) => Route::Split {
+            display,
+            query: Vec::new(),
+        },
+        None => Route::Host,
     }
 }
 
@@ -1696,7 +1767,10 @@ mod tests {
         assert!(host_replies(&batch.display).is_empty());
         let chunk = split(b"\x1b_Gm=0;\x1b\\");
         assert_eq!(chunk.display, b"\x1b_Gm=0,q=2;\x1b\\");
-        assert_eq!(split(b"\x1b_G\x1b\\").display, b"\x1b_Gq=2\x1b\\");
+        assert_eq!(split(b"\x1b_G;AAAA\x1b\\").display, b"\x1b_Gq=2;AAAA\x1b\\");
+        // One Ghostty refuses (here, without control data or payload) is
+        // the host's alone.
+        assert!(split(b"\x1b_G\x1b\\").display.is_empty());
     }
 
     #[test]
@@ -1713,8 +1787,231 @@ mod tests {
             assert!(batch.display.is_empty(), "{command:?}");
             assert!(batch.answered);
         }
-        // A medium on a command that carries no data is no file to read.
+        // Nor does a medium on a command that carries no data (Ghostty
+        // reads none for it, but another terminal might).
         let place = split(b"\x1b_Ga=p,t=f,i=1\x1b\\");
-        assert_eq!(place.display, b"\x1b_Ga=p,t=f,i=1,q=2\x1b\\");
+        assert!(place.display.is_empty());
+    }
+
+    /// Ghostty reads `t=102` as `t=f` and `a=84` as `a=T` (see
+    /// `cherry_vt::kitty`): renderers get a command only as Ghostty reads
+    /// it, and never one that names a medium, however it is written.
+    #[test]
+    fn renderers_get_graphics_only_as_ghostty_reads_them() {
+        for command in [
+            &b"\x1b_Ga=T,t=102,i=1;L3RtcC94\x1b\\"[..],
+            b"\x1b_Ga=T,t=0102,i=1;L3RtcC94\x1b\\",
+            b"\x1b_Ga=T,t=+102,i=1;L3RtcC94\x1b\\",
+            b"\x1b_Ga=T,t=1_02,i=1;L3RtcC94\x1b\\",
+            b"\x1b_Gt=116,i=1;L3RtcC94\x1b\\",
+            b"\x1b_Ga=84,t=115,i=1;L3g=\x1b\\",
+            b"\x1b_Ga=+116,t=f,i=1;L3RtcC94\x1b\\",
+            b"\x1b_Ga=T,t=f,aaaaaaaaaaaaa;x=1;L3RtcC94\x1b\\",
+            // A medium as another terminal might read it.
+            b"\x1b_Ga=T,T=f,i=1;L3RtcC94\x1b\\",
+            b"\x1b_Ga=T, t=f ,i=1;L3RtcC94\x1b\\",
+            // A medium on any action, a query, a compression or format
+            // Ghostty does not know, and a command it refuses: the host's
+            // alone.
+            b"\x1b_Ga=p,t=f,i=1\x1b\\",
+            b"\x1b_Ga=113,i=1,s=1,v=1,f=24;AAAA\x1b\\",
+            b"\x1b_Ga=T,o=x,i=1;AAAA\x1b\\",
+            b"\x1b_Ga=T,f=7,i=1;AAAA\x1b\\",
+            b"\x1b_Ga=T,i=1,x=junk;AAAA\x1b\\",
+            b"\x1b_G\x1b\\",
+        ] {
+            let batch = split(command);
+            assert_eq!(batch.terminal, command);
+            assert!(
+                batch.display.is_empty(),
+                "{:?}: {:?}",
+                String::from_utf8_lossy(command),
+                String::from_utf8_lossy(&batch.display)
+            );
+        }
+        // The keys as Ghostty reads them, with `q=2`; and only those.
+        assert_eq!(
+            split(b"\x1b_Ga=84,i=+05,f=100,q=0,t=100,!=3;AAAA\x1b\\").display,
+            b"\x1b_Ga=T,i=5,f=100,t=d,q=2;AAAA\x1b\\"
+        );
+        // What Ghostty ignores is not passed on (and a `t` among it, which
+        // another terminal might read, keeps the command from renderers).
+        assert_eq!(
+            split(b"\x1b_Ga=t,i=5,hello=world,x=7;AAAA\x1b\\").display,
+            b"\x1b_Ga=t,i=5,q=2;AAAA\x1b\\"
+        );
+        assert!(split(b"\x1b_Ga=t,i=5,hello=world,t=f;AAAA\x1b\\")
+            .display
+            .is_empty());
+    }
+
+    /// Kitty graphics commands that Ghostty reads as such, but a 7-bit
+    /// tokenizer would not: begun or ended by 8-bit C1 controls (APC 0x9f,
+    /// ST 0x9c) in an escape, control or device control sequence, or behind
+    /// bytes Ghostty ignores there (DEL, 0xa0 to 0xff). Each asks (`a=q`)
+    /// for a file, so a terminal that executes it answers.
+    const SMUGGLED: &[&[u8]] = &[
+        b"\x1b[\x9fGa=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x9c",
+        b"\x1b[?\x9fGa=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x9c",
+        b"\x1b(\x9fGa=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x9c",
+        b"\x1b\x9fGa=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x9c",
+        b"\x1bP1;2\x9fGa=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x9c",
+        b"\x1b\xa0_Ga=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x1b\\",
+        b"\x1b\x7f_Ga=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x1b\\",
+        b"\x1b\xff\x7f\xc3_Ga=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x1b\\",
+        b"\x1b_\xa0Ga=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x1b\\",
+        b"\x1b_Ga=q,i=1,s=1,v=1,f=24,t=\xc3f;L2V0Yw==\x1b\\",
+        b"\x1b_Ga=p,i=1;\x9c\x1b[\x9fGa=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x9c\x1b\\",
+        b"\x1b_Ga=q,i=1,s=1,v=1,f=24,t=102;L2V0Yw==\x9cmore\x1b\\",
+    ];
+
+    /// What libghostty-vt, a renderer that reads no file, answers `bytes`.
+    fn renderer_replies(bytes: &[u8]) -> Vec<u8> {
+        host_replies(bytes)
+    }
+
+    #[test]
+    fn graphics_in_8_bit_controls_never_reach_a_renderer() {
+        for &command in SMUGGLED {
+            let text = String::from_utf8_lossy(command).into_owned();
+            // As one read, and byte after byte.
+            for batch in [DisplayStream::default().feed(command), split(command)] {
+                assert!(
+                    renderer_replies(&batch.display).is_empty(),
+                    "{text:?}: {:?}",
+                    String::from_utf8_lossy(&batch.display)
+                );
+            }
+        }
+    }
+
+    /// Random output made of the pieces that begin, fill and end kitty
+    /// graphics commands in every way Ghostty reads them (7-bit and 8-bit
+    /// introducers and terminators, bytes it ignores, keys in letters and
+    /// numbers): libghostty-vt, reading what renderers get, never answers,
+    /// so no command reaches them that the host did not silence, and none
+    /// names a medium.
+    fn smuggling_output(next: &mut impl FnMut(usize) -> usize) -> Vec<u8> {
+        const BEFORE: &[&[u8]] = &[
+            b"",
+            b"text",
+            b"\x1b[",
+            b"\x1b[?",
+            b"\x1b[1;",
+            b"\x1b(",
+            b"\x1b",
+            b"\x1bP1;2",
+            b"\x1bP",
+            b"\x1b]0;x",
+            b"\x1b_X",
+            b"\x1b^",
+            b"\x1b_Ga=p,U=1,i=1;AA",
+            b"\x1b_G",
+            b"\xc3",
+            b"\x9c",
+        ];
+        const OPEN: &[&[u8]] = &[
+            b"\x1b_",
+            b"\x9f",
+            b"\x1b\x9f",
+            b"\x1b\xa0_",
+            b"\x1b\x7f_",
+            b"\x1b\x01_",
+            b"\x1b_\xa0",
+            b"\x1b\xff\x7f_",
+            b"\x98",
+            b"\x90",
+            b"\x9d",
+            b"\x9b",
+            b"",
+            b"\x1bX",
+            b"\x1b^",
+            b"\x9e",
+            b"\x1b\x9e",
+        ];
+        const KEYS: &[&[u8]] = &[
+            b"a=q", b"a=113", b"a=+113", b"a=T", b"a=84", b"a=t", b"i=1", b"i=+1", b"s=1", b"v=1",
+            b"f=24", b"t=f", b"t=102", b"t=0102", b"t=1_02", b"t=\xc3f", b"t=d", b"t=115", b"q=0",
+            b"x=1", b"\xa0", b"T=f", b" t=f", b"m=1",
+        ];
+        const PAYLOAD: &[&[u8]] = &[
+            b";AAAA",
+            b";L2V0Yw==",
+            b";AA\xc3AA",
+            b"",
+            b";",
+            b";AA\x9cAA",
+        ];
+        const CLOSE: &[&[u8]] = &[
+            b"\x1b\\",
+            b"\x9c",
+            b"\x18",
+            b"\x1a",
+            b"\x1bX",
+            b"\x85",
+            b"\x07",
+            b"",
+            b"\x1b[",
+            b"\x1b\\\x9c",
+            b"\xc3\x9c",
+        ];
+        let mut out = Vec::new();
+        for _ in 0..1 + next(4) {
+            out.extend_from_slice(BEFORE[next(BEFORE.len())]);
+            out.extend_from_slice(OPEN[next(OPEN.len())]);
+            if next(4) != 0 {
+                out.push(b'G');
+            }
+            // A query, which renderers never get, and pixels for it.
+            out.extend_from_slice(b"a=q,i=1,s=1,v=1,f=24");
+            for _ in 0..next(4) {
+                out.push(b',');
+                out.extend_from_slice(KEYS[next(KEYS.len())]);
+            }
+            out.extend_from_slice(PAYLOAD[next(PAYLOAD.len())]);
+            out.extend_from_slice(CLOSE[next(CLOSE.len())]);
+        }
+        out
+    }
+
+    #[test]
+    fn no_renderer_ever_answers_a_kitty_command() {
+        let mut state = 0x2545_f491_u32;
+        let mut next = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % n
+        };
+        for _ in 0..3000 {
+            let output = smuggling_output(&mut next);
+            let mut stream = DisplayStream::default();
+            let mut batch = Batch::default();
+            let mut at = 0;
+            while at < output.len() {
+                let end = output.len().min(at + 1 + next(16));
+                batch.append(stream.feed(&output[at..end]));
+                at = end;
+            }
+            assert!(
+                renderer_replies(&batch.display).is_empty(),
+                "{:?}: {:?}",
+                String::from_utf8_lossy(&output),
+                String::from_utf8_lossy(&batch.display)
+            );
+        }
+    }
+
+    #[test]
+    fn an_animation_frames_chunks_continue_it() {
+        let mut stream = DisplayStream::default();
+        stream.feed(b"\x1b_Ga=f,i=3,r=2,f=24,s=1,v=1,m=1;AAAA\x1b\\");
+        stream.feed(b"\x1b_Ga=f,m=1;BBBB\x1b\\");
+        assert_eq!(
+            stream.unfinished_transfer(),
+            b"\x1b_Ga=f,i=3,r=2,f=24,s=1,v=1,m=1,q=2;AAAA\x1b\\\x1b_Ga=f,m=1,q=2;BBBB\x1b\\"
+        );
+        stream.feed(b"\x1b_Ga=102,m=0;CCCC\x1b\\");
+        assert!(stream.unfinished_transfer().is_empty());
     }
 }

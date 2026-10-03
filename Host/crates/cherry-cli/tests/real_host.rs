@@ -2569,7 +2569,12 @@ exec sleep 60"#;
             "{control:?} in {received:?}"
         );
     }
-    assert!(received.contains("\x1b_Ga=d,d=R,x=1,y=4294967295,q=2\x1b\\"));
+    // Each placed alone, where the session has it: no image is deleted or
+    // sent again for it.
+    assert!(!received.contains("d=R"), "{received:?}");
+    for transmitted in ["i=7,C=1,q=2;AQID", "i=9,q=2;AQIDBAUG"] {
+        assert_eq!(received.matches(transmitted).count(), 1, "{received:?}");
+    }
     for attached in [&mut tall, &mut short] {
         attached.master.write_all(&[0x1d]).unwrap();
         assert!(attached.wait().success());

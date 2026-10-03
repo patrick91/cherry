@@ -14,16 +14,19 @@
 //! `q=2`. What places an image at the session's cursor does not: the
 //! window's cursor is not there. `a=T` passes as `a=t` (the image is
 //! transmitted, not placed), and `a=p` without `U=1`, or a deletion at the
-//! cursor (`d=c`), is dropped. Either one asks for the window's images to
-//! be brought in line with the screen copy at the next frame
-//! (`take_placed`; see `Renderer`), which places them where the copy has
-//! them, when the window shows them whole.
+//! cursor (`d=c`), is dropped: the next frame places (or deletes) on the
+//! window what the copy of the screen placed (see `Renderer`), when the
+//! window shows it whole. Keys are read as Ghostty reads them
+//! (`cherry_vt::kitty`): `a=84` is `a=T`; and a command that may name a
+//! medium never passes (see `MediaGuard`).
 //!
 //! The scanner follows the host's tokenizer (`DisplayStream`): ESC restarts
 //! an unfinished escape or CSI sequence, CAN and SUB abort any control, C0
 //! controls inside an escape or CSI sequence execute at once, and an OSC ends
 //! at BEL or ST while other strings end at ST only. It keeps its state across
 //! calls, so a sequence split across output frames is found whole.
+
+use cherry_vt::kitty;
 
 /// Longest control sequence kept, as the host limits them.
 const MAX_CONTROL: usize = 64 * 1024;
@@ -54,11 +57,8 @@ pub struct Passthrough {
     transferring: bool,
     /// Its chunks were too many to keep.
     transfer_dropped: bool,
-    /// It places its image at the session's cursor once complete (`a=T`).
-    transfer_places: bool,
-    /// A kitty placement at the session's cursor was dropped since
-    /// `take_placed`.
-    placed: bool,
+    /// A transmission without an image ID passed since `take_unnamed`.
+    unnamed: bool,
     /// Kitty graphics passed since `take_graphics`.
     graphics: bool,
 }
@@ -110,10 +110,11 @@ impl Passthrough {
         &self.transfer
     }
 
-    /// Whether a kitty placement at the session's cursor was dropped since
-    /// last asked.
-    pub fn take_placed(&mut self) -> bool {
-        std::mem::take(&mut self.placed)
+    /// Whether a transmission without an image ID (`i=`) passed since last
+    /// asked: the window gives the image an ID of its own, which may not be
+    /// the one the screen copy gave it.
+    pub fn take_unnamed(&mut self) -> bool {
+        std::mem::take(&mut self.unnamed)
     }
 
     /// Whether kitty graphics passed since last asked.
@@ -191,81 +192,66 @@ impl Passthrough {
     }
 
     /// A whole kitty graphics command (`ESC _ G … ESC \`): what of it
-    /// passes (see the module's documentation), with `q=2`.
+    /// passes (see the module's documentation), with `q=2`, its keys as
+    /// Ghostty reads them (`cherry_vt::kitty`). Never one whose control
+    /// data may name a medium (see `MediaGuard`), nor one Ghostty refuses.
     fn graphics(&mut self, token: &[u8]) -> Option<Vec<u8>> {
         let body = &token[GRAPHICS.len()..token.len() - 2];
-        let (control, payload) = match body.iter().position(|&b| b == b';') {
-            Some(at) => (&body[..at], &body[at..]),
-            None => (body, &[][..]),
-        };
-        let keys: Vec<&[u8]> = control
-            .split(|&b| b == b',')
-            .filter(|key| !key.is_empty())
-            .collect();
-        let value = |name: &[u8]| {
-            keys.iter()
-                .rev()
-                .find_map(|key| key.strip_prefix(name)?.strip_prefix(b"="))
-        };
-        let more = value(b"m") == Some(b"1");
-        // A chunk, which only says whether more follow: of the transmission
-        // on its way, or of none this one saw begin (not kept).
-        let only_chunk = keys
-            .iter()
-            .all(|key| key.starts_with(b"m=") || key.starts_with(b"q="));
+        let raw = &body[..body.iter().position(|&b| b == b';').unwrap_or(body.len())];
+        if kitty::may_name_medium(raw) {
+            return None;
+        }
+        let command = kitty::parse(body)?;
+        // Ghostty ends a command at an 8-bit control: not one to pass.
+        if body.iter().any(|b| (0x80..=0x9f).contains(b)) {
+            return None;
+        }
+        let mut control = command.control;
+        let more = control.more();
+        let virtual_placement = control.get(b'U').is_some_and(|u| u != 0);
+        // A chunk, which only says whether more follow (and `a=f`, which
+        // kitty asks for on every chunk of a frame): of the transmission on
+        // its way, or of none this one saw begin (not kept).
+        let only_chunk = control.keys().all(|key| match key {
+            b'm' | b'q' => true,
+            b'a' => control.action() == b'f',
+            _ => false,
+        });
         let chunk = only_chunk && self.transferring;
-        let action = if only_chunk {
-            &b"t"[..]
-        } else {
-            value(b"a").unwrap_or(b"t")
-        };
-        let mut rewritten = None;
+        let action = if only_chunk { b't' } else { control.action() };
         match action {
-            b"t" | b"f" | b"a" | b"c" => {}
-            b"T" if value(b"U") == Some(b"1") => {}
+            b't' | b'f' | b'a' | b'c' => {}
+            b'T' if virtual_placement => {}
             // Transmitted, not placed at the session's cursor (which the
             // session does once its last chunk came).
-            b"T" => {
-                self.placed |= !more;
-                rewritten = Some(b"a=t".as_slice());
-            }
-            b"p" if value(b"U") == Some(b"1") => {}
-            b"d" => {
+            b'T' => control.set(b'a', u32::from(b't')),
+            b'p' if virtual_placement => {}
+            b'd' => {
                 // Every deletion abandons a transmission on its way.
                 self.end_transfer();
-                if matches!(value(b"d"), Some(b"c" | b"C")) {
-                    self.placed = true;
+                if matches!(control.byte(b'd'), Some(b'c' | b'C')) {
                     return None;
                 }
             }
             // A placement at the session's cursor.
-            b"p" => {
-                self.placed = true;
-                return None;
-            }
+            b'p' => return None,
             // A query (the host answers those), or what is not known.
             _ => return None,
         }
-        let mut out = GRAPHICS.to_vec();
-        for key in keys.iter().filter(|key| !key.starts_with(b"q=")) {
-            out.extend_from_slice(match rewritten {
-                Some(action) if key.starts_with(b"a=") => action,
-                _ => key,
-            });
-            out.push(b',');
+        if !control.for_renderers() {
+            return None;
         }
-        out.extend_from_slice(b"q=2");
-        out.extend_from_slice(payload);
-        out.extend_from_slice(b"\x1b\\");
+        let out = kitty::silenced(&control, command.payload);
         // Placements and animation commands leave it alone, as a terminal
         // does (only deletions abandon it).
-        if chunk || (!only_chunk && matches!(action, b"t" | b"T" | b"f")) {
-            // The last chunk of an `a=T` places its image.
-            self.placed |= chunk && !more && self.transfer_places;
+        if chunk || (!only_chunk && matches!(action, b't' | b'T' | b'f')) {
             self.follow_transfer(chunk, more, &out);
-            if !chunk && more {
-                self.transfer_places = rewritten.is_some();
-            }
+        }
+        if !only_chunk
+            && matches!(action, b't' | b'T')
+            && control.get(b'i').is_none_or(|id| id == 0)
+        {
+            self.unnamed = true;
         }
         self.graphics = true;
         Some(out)
@@ -297,7 +283,6 @@ impl Passthrough {
         self.transfer = Vec::new();
         self.transferring = false;
         self.transfer_dropped = false;
-        self.transfer_places = false;
     }
 
     fn push(&mut self, byte: u8) {
@@ -568,14 +553,15 @@ mod tests {
         assert!(scanner.pending.is_empty());
     }
 
-    /// What passes of each command, and whether a placement was dropped.
+    /// What passes of each command, and whether an image passed without
+    /// an ID.
     fn graphics(commands: &[&[u8]]) -> (Vec<Vec<u8>>, bool) {
         let mut scanner = Passthrough::default();
         let passed = commands
             .iter()
             .flat_map(|command| passed_by(&mut scanner, command))
             .collect();
-        (passed, scanner.take_placed())
+        (passed, scanner.take_unnamed())
     }
 
     fn passed_by(scanner: &mut Passthrough, bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -590,7 +576,7 @@ mod tests {
 
     #[test]
     fn kitty_transmissions_virtual_placements_and_deletions_pass_quietly() {
-        let (passed, placed) = graphics(&[
+        let (passed, unnamed) = graphics(&[
             b"\x1b_Ga=t,f=24,s=1,v=1,i=7;AQID\x1b\\",
             b"\x1b_Gf=100,i=8,q=0;AAAA\x1b\\",
             b"\x1b_Ga=T,U=1,f=24,s=1,v=1,i=9,c=2,r=1,q=1;AQID\x1b\\",
@@ -600,7 +586,7 @@ mod tests {
             b"\x1b_Ga=f,i=9,r=2,f=24,s=1,v=1;AQID\x1b\\",
             b"\x1b_Ga=a,i=9,s=3\x1b\\",
         ]);
-        assert!(!placed);
+        assert!(!unnamed);
         assert_eq!(
             passed,
             [
@@ -618,27 +604,42 @@ mod tests {
 
     #[test]
     fn kitty_placements_at_the_sessions_cursor_do_not_pass() {
-        // Transmitted and not placed.
-        let (passed, placed) = graphics(&[b"\x1b_Ga=T,f=24,s=1,v=1,i=7,C=1;AQID\x1b\\"]);
-        assert_eq!(
-            passed,
-            [b"\x1b_Ga=t,f=24,s=1,v=1,i=7,C=1,q=2;AQID\x1b\\".to_vec()]
-        );
-        assert!(placed);
+        // Transmitted and not placed, as Ghostty reads it in letters or
+        // numbers.
+        for command in [
+            &b"\x1b_Ga=T,f=24,s=1,v=1,i=7,C=1;AQID\x1b\\"[..],
+            b"\x1b_Ga=84,f=24,s=1,v=1,i=+7,C=1;AQID\x1b\\",
+        ] {
+            let (passed, unnamed) = graphics(&[command]);
+            assert_eq!(
+                passed,
+                [b"\x1b_Ga=t,f=24,s=1,v=1,i=7,C=1,q=2;AQID\x1b\\".to_vec()]
+            );
+            assert!(!unnamed);
+        }
         for command in [
             &b"\x1b_Ga=p,i=7,p=3,c=2\x1b\\"[..],
             b"\x1b_Ga=p,I=4\x1b\\",
+            b"\x1b_Ga=112,i=7\x1b\\",
             b"\x1b_Ga=d,d=c\x1b\\",
             b"\x1b_Ga=d,d=C\x1b\\",
+            b"\x1b_Ga=d,d=99\x1b\\",
         ] {
-            let (passed, placed) = graphics(&[command]);
+            let (passed, _) = graphics(&[command]);
             assert!(passed.is_empty(), "{command:?}");
-            assert!(placed, "{command:?}");
         }
         // Queries are the host's, and unknown actions are not passed.
         for command in [&b"\x1b_Ga=q,i=1,s=1,v=1;AAAA\x1b\\"[..], b"\x1b_Ga=z\x1b\\"] {
-            let (passed, placed) = graphics(&[command]);
-            assert!(passed.is_empty() && !placed, "{command:?}");
+            let (passed, _) = graphics(&[command]);
+            assert!(passed.is_empty(), "{command:?}");
+        }
+        // An image without an ID gets one of the window's own.
+        for command in [
+            &b"\x1b_Ga=T,f=24,s=1,v=1;AQID\x1b\\"[..],
+            b"\x1b_Ga=t,I=3,f=24,s=1,v=1;AQID\x1b\\",
+            b"\x1b_Gf=24,s=1,v=1,i=0;AQID\x1b\\",
+        ] {
+            assert!(graphics(&[command]).1, "{command:?}");
         }
     }
 
@@ -656,15 +657,12 @@ mod tests {
             scanner.unfinished_transfer(),
             [&first[..], b"\x1b_Gm=1,q=2;BBBB\x1b\\"].concat()
         );
-        // Its last chunk ends it, and places its image (`a=T`) on the
-        // session: the window's images are brought in line then, not before.
-        assert!(!scanner.take_placed());
+        // Its last chunk ends it.
         assert_eq!(
             scanner.feed(b"\x1b_Gm=0;CCCC\x1b\\"),
             b"\x1b_Gm=0,q=2;CCCC\x1b\\"
         );
         assert!(scanner.unfinished_transfer().is_empty());
-        assert!(scanner.take_placed());
         // A chunk of none this scanner saw begin passes, and is not kept.
         assert_eq!(
             scanner.feed(b"\x1b_Gm=1;DDDD\x1b\\"),

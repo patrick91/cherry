@@ -19,7 +19,7 @@ import Testing
     #expect(identity.urlScheme == "cherry-sessions")
     #expect(warnings.isEmpty)
     #expect(MCPInstallCommandBuilder.commands(identity: identity).allSatisfy {
-        $0.command.contains(" cherry-sessions -- ")
+        $0.command.contains(" cherry-sessions -- ") || $0.command.contains(" cherry-sessions --exposure direct -- ")
     })
 
     // Absent keys are the standard build and are not worth a warning.

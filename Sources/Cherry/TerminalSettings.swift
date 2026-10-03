@@ -167,6 +167,12 @@ struct SessionBackendPolicy {
     /// adapter gave up and the host answers again. Nil keeps such a tab
     /// disconnected until Reconnect.
     var hostReconnects: HostedReconnects?
+    /// How long a new persistent tab's Create waits for the terminal grid of
+    /// the window that shows it to settle (`TerminalWindowGridWait`), so its
+    /// program starts at that window's size. The app's windows wait; nil (a
+    /// test's workspace, which no window shows) takes the grid the tab has
+    /// at once.
+    var windowGridWait: TerminalWindowGridWait?
 
     static let native = SessionBackendPolicy(settings: { .native })
 
@@ -175,7 +181,8 @@ struct SessionBackendPolicy {
         localSessions: .shared,
         rememberLocalSessionsOnQuit: { TerminalSettings.shared.localSessionsOnQuit = $0 },
         sessionDetached: { ProjectWindowRegistry.shared.backgroundSessionsNotice?.noteTold([$0]) },
-        hostReconnects: .shared
+        hostReconnects: .shared,
+        windowGridWait: .standard
     )
 
     /// Whether new local tabs should be persistent sessions (the setting;
@@ -187,18 +194,21 @@ struct SessionBackendPolicy {
     }
 
     /// A device's window (docs/specs/remote-devices.md): its tabs run on
-    /// another Mac's host, `localSessions`.
+    /// another Mac's host, `localSessions`. `windowGridWait`: the app's
+    /// device windows wait as This Mac's do (`.standard`).
     static func remote(
         _ hosting: PersistentHostSessions,
         settings: @escaping @MainActor () -> SessionPersistenceSettings = { TerminalSettings.shared.sessionPersistenceSettings },
-        hostReconnects: HostedReconnects? = .shared
+        hostReconnects: HostedReconnects? = .shared,
+        windowGridWait: TerminalWindowGridWait? = nil
     ) -> SessionBackendPolicy {
         precondition(!hosting.profile.allowsNativeFallback, "a device's hosting never falls back to native tabs")
         return SessionBackendPolicy(
             settings: settings,
             localSessions: hosting,
             rememberLocalSessionsOnQuit: { TerminalSettings.shared.localSessionsOnQuit = $0 },
-            hostReconnects: hostReconnects
+            hostReconnects: hostReconnects,
+            windowGridWait: windowGridWait
         )
     }
 

@@ -128,6 +128,16 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case unsubscribe(UnsubscribeRequest)
     case waitForEvents(WaitForEventsRequest)
     case listSubscriptions
+    /// Tasks (`AgentTasksProtocol.swift`): the worker's side, identified
+    /// by its own tab, never a selector.
+    case getMyTask
+    case reportResult(ReportResultRequest)
+    case reportProgress(ReportProgressRequest)
+    /// Tasks: the orchestrator's side.
+    case waitForTasks(WaitForTasksRequest)
+    case getTask(GetTaskRequest)
+    case listTasks(ListTasksRequest)
+    case cancelTasks(CancelTasksRequest)
     case getProcessPorts(GetProcessPortsRequest)
     case servicesList(ServicesListRequest)
     case waitForBoundPort(WaitForBoundPortRequest)
@@ -344,6 +354,17 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
     public let parentAgentID: String?
     public let waitMilliseconds: Int?
     public let lineLimit: Int?
+    /// Agents only: the worker's brief, as a task (exclusive with `text`
+    /// and `rawBase64`). Cherry types a kickoff line into the agent, which
+    /// reads the brief with `get_my_task` and answers with `report_result`.
+    public let task: String?
+    /// The task's short name (the sidebar shows it).
+    public let label: String?
+    public let phase: String?
+    /// The run to add the task to; nil for the caller's current run.
+    public let runID: String?
+    /// The JSON Schema (`TaskResultSchema`'s subset) the result must match.
+    public let resultSchema: JSONValue?
 
     public init(
         kind: String,
@@ -356,7 +377,12 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
         submit: Bool? = nil,
         parentAgentID: String? = nil,
         waitMilliseconds: Int? = nil,
-        lineLimit: Int? = nil
+        lineLimit: Int? = nil,
+        task: String? = nil,
+        label: String? = nil,
+        phase: String? = nil,
+        runID: String? = nil,
+        resultSchema: JSONValue? = nil
     ) {
         self.kind = kind
         self.name = name
@@ -369,6 +395,11 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
         self.parentAgentID = parentAgentID
         self.waitMilliseconds = waitMilliseconds
         self.lineLimit = lineLimit
+        self.task = task
+        self.label = label
+        self.phase = phase
+        self.runID = runID
+        self.resultSchema = resultSchema
     }
 }
 
@@ -847,6 +878,13 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case unsubscribe(UnsubscribeResult)
     case waitForEvents(WaitForEventsResult)
     case listSubscriptions(ListSubscriptionsResult)
+    case getMyTask(GetMyTaskResult)
+    case reportResult(ReportResultResult)
+    case reportProgress(ReportProgressResult)
+    case waitForTasks(WaitForTasksResult)
+    case getTask(AgentTaskDetail)
+    case listTasks(ListTasksResult)
+    case cancelTasks(CancelTasksResult)
     case getProcessPorts(ServicesResult)
     case servicesList(ServicesResult)
     case waitForBoundPort(WaitForBoundPortResult)
@@ -901,11 +939,15 @@ public struct CherryControlError: Codable, Equatable, Error, Sendable {
     public let code: String
     public let message: String
     public let serviceCandidates: [ServiceRecord]?
+    /// Each problem, when there are several (`schema_mismatch`: where the
+    /// value does not match the task's result schema).
+    public let details: [String]?
 
-    public init(code: String, message: String, serviceCandidates: [ServiceRecord]? = nil) {
+    public init(code: String, message: String, serviceCandidates: [ServiceRecord]? = nil, details: [String]? = nil) {
         self.code = code
         self.message = message
         self.serviceCandidates = serviceCandidates
+        self.details = details
     }
 }
 
@@ -1259,6 +1301,15 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     /// Agents only: `not_started`, `active`, `completed` or
     /// `user_interrupted`, for the latest turn.
     public let agentTurnState: String?
+    /// A worker of a Cherry task (MCP `spawn_agent` with `task`): its
+    /// task, the task's state (`AgentTaskState`), run, phase and label,
+    /// and its latest result's summary.
+    public let taskID: String?
+    public let taskState: String?
+    public let runID: String?
+    public let phase: String?
+    public let label: String?
+    public let resultSummary: String?
 
     public init(
         id: String,
@@ -1289,7 +1340,13 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         contentVersion: Int? = nil,
         failureMessage: String? = nil,
         agentTurn: Int? = nil,
-        agentTurnState: String? = nil
+        agentTurnState: String? = nil,
+        taskID: String? = nil,
+        taskState: String? = nil,
+        runID: String? = nil,
+        phase: String? = nil,
+        label: String? = nil,
+        resultSummary: String? = nil
     ) {
         self.id = id
         self.link = link
@@ -1320,6 +1377,12 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         self.failureMessage = failureMessage
         self.agentTurn = agentTurn
         self.agentTurnState = agentTurnState
+        self.taskID = taskID
+        self.taskState = taskState
+        self.runID = runID
+        self.phase = phase
+        self.label = label
+        self.resultSummary = resultSummary
     }
 }
 
@@ -1503,11 +1566,14 @@ public struct SpawnProcessResult: Codable, Equatable, Sendable {
     public let process: ProcessSummary
     public let sentBytes: Int
     public let output: TerminalOutputResult?
+    /// The task, when the agent was spawned with one.
+    public let task: AgentTaskInfo?
 
-    public init(process: ProcessSummary, sentBytes: Int, output: TerminalOutputResult?) {
+    public init(process: ProcessSummary, sentBytes: Int, output: TerminalOutputResult?, task: AgentTaskInfo? = nil) {
         self.process = process
         self.sentBytes = sentBytes
         self.output = output
+        self.task = task
     }
 }
 

@@ -7940,6 +7940,19 @@ private struct SidebarTabRow: View {
                 SidebarAgentWorkingIndicator(isSelected: isSelected, palette: palette)
             }
 
+            // Cherry tasks (MCP spawn_agent with task): an orchestrator's
+            // open runs as settled/total, a worker's task state.
+            if let progress = rowState.runProgress {
+                Text(progress.text)
+                    .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                    .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.6))
+                    .accessibilityLabel("\(progress.settled) of \(progress.total) tasks settled")
+            }
+
+            if let badge = rowState.taskBadge {
+                SidebarTaskStateGlyph(state: badge.state, isSelected: isSelected, palette: palette)
+            }
+
             if let machine = rowState.remoteMachineName {
                 RemoteDeviceChip(name: machine, isSelected: isSelected)
             }
@@ -8027,6 +8040,10 @@ private final class SidebarTabRowState: ObservableObject {
     @Published private(set) var isShared = false
     /// The device its program runs on (docs/specs/remote-devices.md).
     let remoteMachineName: String?
+    /// Its task, when it is a Cherry task's worker (`AgentTaskBoard`).
+    @Published private(set) var taskBadge: AgentTaskBadge?
+    /// Its open runs' progress, when it handed out tasks.
+    @Published private(set) var runProgress: AgentRunProgress?
 
     private weak var session: TerminalSession?
     private var pathDisplayMode: SidebarTerminalPathDisplayMode
@@ -8065,6 +8082,15 @@ private final class SidebarTabRowState: ObservableObject {
         }
         if let nixShellEnvironment {
             lines.append(nixShellEnvironment.tooltip)
+        }
+        if let taskBadge {
+            lines.append("Task: \(taskBadge.label)\(taskBadge.phase.map { " (\($0))" } ?? "") · \(taskBadge.state.displayName)")
+            if let summary = taskBadge.summary {
+                lines.append(summary)
+            }
+        }
+        if let runProgress {
+            lines.append("Tasks: \(runProgress.settled) of \(runProgress.total) settled")
         }
         return lines.joined(separator: "\n")
     }
@@ -8154,6 +8180,27 @@ private final class SidebarTabRowState: ObservableObject {
                 }
             }
             .store(in: &cancellables)
+
+        let sessionID = session.id
+        AgentTaskBoard.shared.$badges
+            .map { $0[sessionID] }
+            .removeDuplicates()
+            .sink { [weak self] badge in
+                Task { @MainActor [weak self] in
+                    self?.taskBadge = badge
+                }
+            }
+            .store(in: &cancellables)
+
+        AgentTaskBoard.shared.$runProgress
+            .map { $0[sessionID] }
+            .removeDuplicates()
+            .sink { [weak self] progress in
+                Task { @MainActor [weak self] in
+                    self?.runProgress = progress
+                }
+            }
+            .store(in: &cancellables)
     }
 
     private func refreshLabel() {
@@ -8167,6 +8214,30 @@ private final class SidebarTabRowState: ObservableObject {
         let nextLabel = SidebarSessionLabel.label(for: session, pathDisplayMode: pathDisplayMode)
         guard label != nextLabel else { return }
         label = nextLabel
+    }
+}
+
+/// A Cherry task worker's state in its sidebar row (`AgentTaskState`).
+private struct SidebarTaskStateGlyph: View {
+    let state: AgentTaskState
+    let isSelected: Bool
+    let palette: SidebarPalette
+
+    var body: some View {
+        Image(systemName: state.symbolName)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(color)
+            .accessibilityLabel("Task: \(state.displayName)")
+    }
+
+    private var color: Color {
+        switch state {
+        case .reported: .green
+        case .failed: .red
+        case .needsInput: .orange
+        case .noReport: .yellow
+        case .queued, .working, .cancelled: (isSelected ? palette.selectedText : palette.rowText).opacity(0.5)
+        }
     }
 }
 

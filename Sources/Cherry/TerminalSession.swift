@@ -1222,8 +1222,24 @@ final class TerminalWorkspace: ObservableObject {
                 guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return nil }
                 return self.terminalCell(forGrid: grid)
             }
+            session.surfaceShowedWindowGrid = { [weak self, weak session] grid, window in
+                guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return }
+                self.windowGrid.note(grid, in: window)
+            }
+            if let wait = backendPolicy.windowGridWait {
+                session.windowGridForCreate = (wait, { [weak self, weak session] in
+                    guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return nil }
+                    return self.windowGrid.observation()
+                })
+            }
         }
     }
+
+    /// The grid this workspace's window gives its terminals, and since when
+    /// (`TerminalWindowGrid`): what a new persistent tab's Create starts its
+    /// program at once it settled (`TerminalWindowGridWait`). A repository's
+    /// worktrees share their window's (`RepositoryWorkspace`).
+    var windowGrid = TerminalWindowGrid()
 
     /// The cell size, in pixels, that a terminal of `grid` in this
     /// workspace's window reports to its program, from a tab whose surface
@@ -3888,6 +3904,25 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// adapter attaching changes nothing (new pixels alone signal the
     /// program, which may redraw).
     var windowTerminalCell: (@MainActor (TerminalViewportSize) -> TerminalCellSize?)?
+    /// Set by the workspace showing the tab, as `detachedSurfaceSize`: this
+    /// tab's surface, laid out in a window, has a grid
+    /// (`TerminalWindowGrid.note`).
+    var surfaceShowedWindowGrid: (@MainActor (TerminalViewportSize, NSWindow) -> Void)?
+    /// Set by the workspace showing the tab, as `detachedSurfaceSize`: how
+    /// long a persistent tab's Create waits for the terminal grid of the
+    /// window that shows it to settle (`SessionBackendPolicy.windowGridWait`),
+    /// and that grid now (`TerminalWindowGrid.observation`). Nil: the Create
+    /// takes the grid the tab has.
+    var windowGridForCreate: (
+        wait: TerminalWindowGridWait,
+        observe: @MainActor () -> TerminalWindowGridWait.Observation?
+    )?
+
+    /// This tab's surface, laid out in `window`, has `grid`
+    /// (`GhosttySessionBridge.reportWindowGrid`).
+    func surfaceDidShowWindowGrid(_ grid: TerminalViewportSize, in window: NSWindow) {
+        surfaceShowedWindowGrid?(grid, window)
+    }
 
     /// The cell size this tab's terminal reports to a program at `grid`
     /// (`GhosttySessionBridge.terminalWindowSize`), while its surface has
@@ -6049,15 +6084,16 @@ final class TerminalSession: ObservableObject, Identifiable {
                     // program exited: this launch starts nothing.
                     guard let self, self.activeLaunchID == launchID, self.persistentHosting === hosting else { return }
                     self.schedulePersistentCreationDeadline(launchID, hosting: hosting)
-                    // At the size the tab has now: its surface may have
-                    // reported its grid since the request was made.
-                    var request = request
-                    request.columns = self.viewportSize.columns
-                    request.rows = self.viewportSize.rows
-                    // With the pixels its window's terminal of that grid
-                    // reports, which its adapter will.
-                    request.cell = self.windowTerminalCell?(self.viewportSize)
-                    launch = try await hosting.create(request, configuration: configuration)
+                    // At the grid the window that shows the tab settled at,
+                    // asked for only once the host is reached and the launch
+                    // spec is ready: a new window settles meanwhile.
+                    let startedAt = ContinuousClock.now
+                    launch = try await hosting.create(request, configuration: configuration) { [weak self] in
+                        guard let self else { throw CancellationError() }
+                        return try await self.persistentCreateGrid(
+                            launchID: launchID, hosting: hosting, claim: claim, startedAt: startedAt
+                        )
+                    }
                 }
             } catch {
                 guard let self else { return }
@@ -6182,6 +6218,66 @@ final class TerminalSession: ObservableObject, Identifiable {
                 launchID: launchID
             )
         }
+    }
+
+    /// The grid, and the pixels of its cells, a persistent tab's Create
+    /// starts its program at (`PersistentHostSessions.create`): the grid of
+    /// the window that shows the tab once it settled
+    /// (`TerminalWindowGridWait`, when its workspace waits), so the program
+    /// starts at the size it is shown at instead of being resized a moment
+    /// later (a new window's first tab has no grid until its window lays it
+    /// out, and a tiling window manager may then move the window), which an
+    /// inline program such as Claude Code redraws for. The tab's attach
+    /// adapter attaches at that grid too (`HostedAttachmentSizeFile`).
+    /// Throws `CancellationError` when the tab stopped, closed or started
+    /// again meanwhile: no Create goes out, unless the tab keeps what its
+    /// Create makes (`PersistentLaunchClaim.keepsSession`: it closed or
+    /// detached keeping its session, which its saved record names), which
+    /// then goes out at once.
+    private func persistentCreateGrid(
+        launchID: UUID,
+        hosting: PersistentLocalSessions,
+        claim: PersistentLaunchClaim,
+        startedAt: ContinuousClock.Instant
+    ) async throws -> (grid: TerminalViewportSize, cell: TerminalCellSize?) {
+        let grid: TerminalViewportSize
+        if let source = windowGridForCreate {
+            var observation = source.observe()
+            var sawSettling = observation?.settling == true
+            var decision = source.wait.decision(for: observation, startedAt: startedAt, now: .now, sawSettling: sawSettling)
+            while case .wait(let until) = decision {
+                let pause = min(until - ContinuousClock.now, source.wait.pollInterval)
+                try await Task.sleep(for: max(pause, .milliseconds(1)))
+                guard activeLaunchID == launchID, persistentHosting === hosting else {
+                    guard claim.keepsSession else { throw CancellationError() }
+                    decision = .giveUp
+                    break
+                }
+                observation = source.observe()
+                sawSettling = sawSettling || observation?.settling == true
+                decision = source.wait.decision(for: observation, startedAt: startedAt, now: .now, sawSettling: sawSettling)
+            }
+            // The window's grid as last seen (a tab detached meanwhile is
+            // no longer its window's).
+            observation = source.observe() ?? observation
+            grid = TerminalWindowGridWait.grid(own: mountedTerminalGrid, window: observation?.grid, tab: viewportSize)
+            let waited = (ContinuousClock.now - startedAt).components
+            let milliseconds = waited.seconds * 1_000 + waited.attoseconds / 1_000_000_000_000_000
+            if decision == .giveUp {
+                SessionLog.notice(
+                    "tab \(id.uuidString) creates its session at \(grid.columns)x\(grid.rows): its window's terminal grid did not settle within \(milliseconds) ms"
+                )
+            } else {
+                SessionLog.debug("tab \(id.uuidString) creates its session at its window's grid \(grid.columns)x\(grid.rows) after \(milliseconds) ms")
+            }
+        } else {
+            // At the size the tab has now: its surface may have reported its
+            // grid since the launch began.
+            grid = viewportSize
+        }
+        // With the pixels its window's terminal of that grid reports, which
+        // its adapter will.
+        return (grid, windowTerminalCell?(grid))
     }
 
     private static func isExistingDirectory(_ path: String) -> Bool {

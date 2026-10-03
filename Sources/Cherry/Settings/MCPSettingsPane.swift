@@ -6,6 +6,7 @@ struct MCPSettingsPane: View {
     @State private var copiedHarness: MCPHarness?
     @State private var socketExists = FileManager.default.fileExists(atPath: CherryControl.socketURL.path)
     @AppStorage(AgentMonitorRegistry.wakeLinesDefaultsKey) private var monitorWakeLines = true
+    @StateObject private var piRegistration = PiMCPRegistrationModel()
 
     private var commands: [MCPInstallCommand] {
         MCPInstallCommandBuilder.commands()
@@ -59,6 +60,10 @@ struct MCPSettingsPane: View {
                         copy(installCommand)
                     }
 
+                    if installCommand.harness == .pi {
+                        PiMCPRegistrationRow(model: piRegistration)
+                    }
+
                     if installCommand.id != commands.last?.id {
                         SettingsDivider()
                     }
@@ -67,6 +72,7 @@ struct MCPSettingsPane: View {
         }
         .onAppear {
             socketExists = FileManager.default.fileExists(atPath: CherryControl.socketURL.path)
+            piRegistration.refresh()
         }
     }
 
@@ -146,5 +152,42 @@ private struct MCPInstallCommandRow: View {
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
+    }
+}
+
+/// Pi's registration under its command: whether Pi's mcp.json has it (read
+/// only), and Add, which runs `pi mcp add` only when clicked.
+private struct PiMCPRegistrationRow: View {
+    @ObservedObject var model: PiMCPRegistrationModel
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Label(model.statusText, systemImage: model.status == .registered ? "checkmark.circle.fill" : "info.circle")
+                    .font(.callout)
+                    .foregroundStyle(model.status == .registered ? Color.green : Color.secondary)
+                if let message = model.message {
+                    Text(message)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(model.lastRunFailed ? Color.orange : Color.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(4)
+                }
+            }
+
+            Spacer()
+
+            if model.isRunning {
+                ProgressView().controlSize(.small)
+            }
+            Button(model.status == .registered ? "Add Again" : "Add to Pi") {
+                Task { await model.register() }
+            }
+            .settingsGlassButtonStyle()
+            .disabled(model.isRunning || model.helperPath == nil)
+            .help("Runs the command above (pi mcp add); Pi writes its own settings.")
+        }
+        .padding(.horizontal, 18)
+        .padding(.bottom, 12)
     }
 }

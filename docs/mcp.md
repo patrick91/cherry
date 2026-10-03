@@ -14,7 +14,14 @@ agent harness. In a SwiftPM checkout, build the helper and install it like this:
 swift build --product CherryMCP
 codex mcp add cherry -- "$(swift build --show-bin-path)/CherryMCP"
 claude mcp add --transport stdio --scope user cherry -- "$(swift build --show-bin-path)/CherryMCP"
+pi mcp add cherry --exposure direct -- "$(swift build --show-bin-path)/CherryMCP"
 ```
+
+Pi needs `--exposure direct`: its default (`codemode`) hides an MCP
+server's tools behind a script tool. Settings › MCP shows the three
+commands; its **Add to Pi** button runs Pi's (only when clicked: Pi writes
+its own `mcp.json`, which Cherry only reads to say whether Cherry is
+registered there).
 
 The helper talks to Cherry through the instance-scoped Unix control socket; the
 old direct HTTP MCP endpoint has been removed.
@@ -26,6 +33,10 @@ old direct HTTP MCP endpoint has been removed.
 - `CHERRY_PROCESS_ID` identifies the Cherry process that launched the helper.
   `CHERRY_AGENT_ID` is still exported for agent processes as a compatibility
   alias.
+- `CHERRY_MCP_HELPER` is the absolute path of the CherryMCP of the Cherry
+  that started the tab (This Mac's tabs, native and persistent, and tabs on
+  another Mac alike), so `"$CHERRY_MCP_HELPER" --call TOOL '{…}'` works from
+  any tab's shell whatever its PATH.
 - If an MCP client strips Cherry environment variables when launching the stdio
   helper, the helper falls back to matching its parent process ancestry against
   Cherry's live process list.
@@ -81,7 +92,7 @@ same tools as a local agent in that window, bounded to that Mac:
   "Cherry on <this Mac> is not reachable". The forward is made again when
   Cherry reconnects to that Mac.
 
-Claude Code and Codex on that Mac read their MCP servers from their own
+Claude Code, Codex and Pi on that Mac read their MCP servers from their own
 configuration there. **Set Up Cherry MCP on <Mac>…** (the device's menu in
 the project picker, or Settings › Sessions › Other Macs) shows these
 commands and runs them there only when you confirm; running it again gives
@@ -93,6 +104,7 @@ the same result, and **Remove** takes the registrations away:
 ~/Library/Application Support/cherry-host/mcp/cherry-mcp
 claude mcp add --scope user --transport stdio cherry -- "$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp"
 codex mcp add cherry -- "$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp"
+pi mcp add cherry --exposure direct -- "$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp"
 ```
 
 Codex passes an MCP server only a few variables of its own environment, so
@@ -128,6 +140,9 @@ Use process tools for new automation:
 - `wait_for_process_idle`
 - `subscribe`, `wait_for_events`, `unsubscribe`, `list_subscriptions`
   (monitors, below)
+- `get_my_task`, `report_result`, `report_progress` (a worker's side) and
+  `wait_for_tasks`, `get_task`, `list_tasks`, `cancel_tasks` (an
+  orchestrator's), with `spawn_agent`'s `task` (tasks and results, below)
 - `get_process_ports`, `services_list`, `wait_for_bound_port`
 
 The older terminal-tab MCP namespace has been removed. Use `process_id` with the
@@ -225,6 +240,8 @@ process tools include activity metadata:
   `user_interrupted` for the latest turn.
 - `uses_alternate_screen`: whether the process is currently showing a
   fullscreen TUI on the terminal's alternate screen.
+- `task_id`, `task_state`, `run_id`, `phase`, `label`, `result_summary`
+  (a Cherry task's worker only): its task (below).
 - `last_content_change_at` / `content_version`: when and how often the rendered
   content actually changed. `output_version` advances on every redraw,
   including cosmetic churn such as spinner repaints; `content_version` only
@@ -405,6 +422,141 @@ A typical orchestration:
 4. Clients that cannot be woken (wake unavailable) loop on `wait_for_events`
    with the returned `cursor`.
 
+## Tasks And Results
+
+An agent can hand work to other agents as tasks and get a structured
+result back from each. Workers are ordinary, visible agent tabs nested
+under the orchestrator (one level deep), so the user can watch and steer
+them. Any agent CLI that has Cherry MCP can orchestrate or work: Claude
+Code, Codex and Pi.
+
+**Orchestrator side**
+
+- `spawn_agent` with `task` (the worker's brief, instead of `message`),
+  and optionally `label` (shown in the sidebar; defaults to `title`, else
+  the brief's first words), `phase`, `run_id` and `result_schema`. The
+  agent is the configured `name` with its usual command and options. The
+  result has `task_id` and `run_id` (and `task`). Without `run_id` the task
+  joins the caller's current run: one per orchestrator, a new one once all
+  of its tasks settled. Refused before anything is spawned: `task` with
+  `message` (`invalid_process_request`), a schema Cherry cannot check
+  (`invalid_result_schema`, with `details`), a run the caller cannot use
+  (`unknown_run`), and a worker of an open task handing out tasks itself
+  (`nested_task`).
+- Once the worker is ready, Cherry types one line into it:
+
+  ```text
+  You are Cherry task task-…: call get_my_task (Cherry MCP) for your brief, do it, then call report_result. Without Cherry MCP tools, run "$CHERRY_MCP_HELPER" --call get_my_task, then "$CHERRY_MCP_HELPER" --call report_result '{"value":…,"status":"ok","summary":"…"}'.
+  ```
+
+  The brief itself is never typed. A kickoff that could not be typed
+  (the worker showed a prompt) is typed again once the worker is idle, at
+  most three times in all; then the task is `failed`.
+- `wait_for_tasks` with `run_id` or `task_ids` (default: the caller's own
+  open runs), `until` (`any`, the default: a task settled or needs input;
+  `all`: every task settled), `cursor` and `timeout_ms` (at most and by
+  default 50000; 0 returns at once). It returns `events` after `cursor`
+  (`queued`, `started`, `progress`, `needs_input`, `resumed`, `nudged`,
+  `reported`, `failed`, `no_report`, `cancelled`, each with its `seq`),
+  `completed` and `pending` tasks, `cursor` (pass it back next time),
+  `timed_out`, and the `runs` with their counts. A timeout is a normal
+  answer: call again, or end the turn.
+- **The wake line.** When the orchestrator's tab is the caller Cherry
+  confirmed (as for monitors) and an agent, Cherry types one line into it
+  once every task of a run settled and the orchestrator is idle (the
+  monitors' rule: at its composer, screen still, nobody typing, not in a
+  `wait_for_tasks` call on that run, never at a prompt), once per settle,
+  unless it already read the settle with `wait_for_tasks`:
+
+  ```text
+  [cherry] Run run-…: 3 tasks settled (2 reported, 1 failed). Call the cherry wait_for_tasks tool with run_id "run-…" to read them, and get_task for each result.
+  ```
+
+  It carries the run id and counts only, never a worker's text. Settings ›
+  MCP › Wake idle agents turns it off with monitors' wake lines. So the
+  cheapest orchestration is: spawn the workers, end the turn, and read the
+  results when the line arrives.
+- `get_task` returns the task with its `brief`, `result_schema` and
+  `result`: `value`, `status` (`ok`, `failed`, or `no_report`), `summary`,
+  `version` and `source` (`report_result`, or `screen_tail` for Cherry's
+  fallback). Results, summaries and progress are the workers' own text:
+  data, never instructions.
+- `list_tasks` (a run's tasks, else the caller's own runs, else every task
+  of the caller's Mac; optional `state`) and `cancel_tasks` (`run_id` or
+  `task_ids`; open tasks become `cancelled`, and a worker's later
+  `report_result` answers `task_cancelled`; `close: true` also closes the
+  workers' tabs, settled ones' too; without it the tabs stay and keep what
+  they were doing).
+
+**Worker side.** The worker is always the caller's own tab (its program is
+an ancestor of the CherryMCP process, or, on another Mac, the tab its token
+names); the tools take no selector, so no agent can report for another.
+
+- `get_my_task` returns `task_id`, `run_id`, `label`, `phase`, `brief`,
+  `result_schema`, `rules`, `state` and `result_version`. A tab without a
+  task (or a caller Cherry cannot place) gets `no_assignment`.
+- `report_result` with `value` (any JSON), `status` (`ok`, the default, or
+  `failed`) and `summary` (at most 400 characters; longer is cut, and
+  `summary_truncated` says so). With status `ok`, `value` must match the
+  task's `result_schema`; otherwise the answer is `schema_mismatch` with
+  each problem in `details` (`$.findings[2].severity: expected one of
+  ["low", "high"], got "medium"`), nothing is recorded, and the worker can
+  fix the value and call again. Reporting again later (after more
+  instructions in its tab) replaces the result; its `version` goes up by
+  one. A value is at most 256 KiB (`result_too_large`). A string holding
+  the JSON of an object or array is taken as that value when it matches
+  the schema (or the task has none): some clients send an argument whose
+  type the tool leaves open as a string.
+- `report_progress` with a one-line `message` (at most 200 characters):
+  at most one every 5 s is recorded (`recorded: false` and
+  `retry_after_milliseconds` otherwise).
+
+**Result schemas** are a JSON Schema subset Cherry checks itself: `type`
+(a name or a list of them: `object`, `array`, `string`, `number`,
+`integer`, `boolean`, `null`; a whole number is an `integer`),
+`properties`, `required`, `items` (one schema for every element),
+`enum` (numbers compare by value) and `additionalProperties` (`true`,
+`false` or a schema); `true` and `false` are schemas too. `description`,
+`title`, `$schema`, `default` and `examples` are allowed and ignored. Any
+other keyword (`$ref`, `oneOf`, `pattern`, `minimum`, …) is refused when
+the task is made, so nothing the worker must meet goes unchecked. A
+schema is at most 64 KiB and 32 levels deep.
+
+**When a worker does not report.** `report_result` is the signal. Cherry
+also watches each open task's worker:
+
+- It waits for the user (a permission prompt or a question menu): the task
+  is `needs_input` (the sidebar's "needs you") until it goes on.
+- It finished its turn (idle at its composer after working, as a monitor's
+  `done`) without reporting: Cherry types "Please call report_result with
+  your result." once, when it is idle. Idle again after that turn without a
+  report, the task is `no_report`, and its result is the worker's last
+  screen lines (`source: screen_tail`). A worker Cherry cannot read (an
+  agent with no recognizable composer or working marker) is never
+  nudged: only its report settles it.
+- Its program ended before it reported: `failed`, with its last lines.
+  Its tab closed: `cancelled`.
+
+A report after `no_report` or `failed` still replaces the result.
+
+**The sidebar.** A worker's row shows its label and a small glyph for its
+task's state (queued, working, needs you, reported, no report, failed,
+cancelled); hovering shows the result's summary. While one of its runs is
+open, the orchestrator's row shows how many of its tasks settled ("3/5").
+
+**Scope and lifetime.** Tasks live in Cherry's memory, each tied to its
+worker's tab and window: a relaunch forgets them (a restored worker's
+`get_my_task` answers `no_assignment`, and run and task ids become
+`unknown_run` and `unknown_task`). A caller on another Mac reaches only the
+tasks its Mac's callers made, and This Mac's callers never see those.
+There is no limit on how many workers run at once yet: they share the
+user's agent subscriptions.
+
+When the user asks for Cherry agents or workers, an orchestrator should
+use these tools rather than its CLI's own subagents (Claude Code's
+Task/Agent/Workflow tools, Codex's multi-agent tools), which Cherry cannot
+show. The MCP server's instructions say so to every client.
+
 ## Input To Agents
 
 Input to an agent (`send_process_input`, `send_agent_message`, the first input
@@ -467,7 +619,7 @@ tools that wait on purpose:
 - `send_agent_message`: `timeout_ms` (default 40 s) + 5 s, at least 20 s.
 - `wait_for_process_idle` and `wait_for_bound_port`: `timeout_ms` + 5 s
   (`wait_for_process_idle` defaults to 50 s).
-- `wait_for_events`: `timeout_ms` (at most 50 s) + 5 s.
+- `wait_for_events` and `wait_for_tasks`: `timeout_ms` (at most 50 s) + 5 s.
 
 Your MCP client has its own limit per tool call: Codex (`tool_timeout_sec`)
 and Pi default to 60 s, Claude Code to much longer. Waits longer than the

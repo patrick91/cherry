@@ -43,9 +43,11 @@ final class CherryControlServer: @unchecked Sendable {
         agentSettings: AgentSettings = .shared,
         serviceDetector: any ServiceDetecting = MacOSServiceDetector(),
         remoteServiceDetector: (any RemoteServiceDetecting)? = nil,
-        monitorDefaults: UserDefaults = .standard
+        monitorDefaults: UserDefaults = .standard,
+        taskBoard: AgentTaskBoard? = nil
     ) {
         self.monitors = AgentMonitorRegistry(defaults: monitorDefaults)
+        self.tasks = AgentTaskRegistry(board: taskBoard ?? .shared)
         self.workspace = workspace
         self.noteStore = noteStore
         self.todoStore = todoStore
@@ -74,6 +76,7 @@ final class CherryControlServer: @unchecked Sendable {
         self.serviceDetector = serviceDetector
         self.remoteServiceDetector = remoteServiceDetector ?? DeviceServiceDetector()
         self.socketURL = socketURL
+        tasks.wakeLinesEnabled = { [monitors] in monitors.wakeLinesEnabled }
     }
 
     @MainActor
@@ -108,9 +111,11 @@ final class CherryControlServer: @unchecked Sendable {
         agentSettings: AgentSettings = .shared,
         serviceDetector: any ServiceDetecting = MacOSServiceDetector(),
         remoteServiceDetector: (any RemoteServiceDetecting)? = nil,
-        monitorDefaults: UserDefaults = .standard
+        monitorDefaults: UserDefaults = .standard,
+        taskBoard: AgentTaskBoard? = nil
     ) {
         self.monitors = AgentMonitorRegistry(defaults: monitorDefaults)
+        self.tasks = AgentTaskRegistry(board: taskBoard ?? .shared)
         self.workspace = nil
         self.noteStore = nil
         self.todoStore = nil
@@ -129,6 +134,7 @@ final class CherryControlServer: @unchecked Sendable {
         self.serviceDetector = serviceDetector
         self.remoteServiceDetector = remoteServiceDetector ?? DeviceServiceDetector()
         self.socketURL = socketURL
+        tasks.wakeLinesEnabled = { [monitors] in monitors.wakeLinesEnabled }
     }
 
     deinit {
@@ -533,6 +539,10 @@ final class CherryControlServer: @unchecked Sendable {
     /// Monitors (`subscribe`, `wait_for_events`, wake lines).
     let monitors: AgentMonitorRegistry
 
+    /// Tasks (`spawn_agent` with `task`, `report_result`, `wait_for_tasks`):
+    /// in memory, each tied to its worker's tab and window.
+    let tasks: AgentTaskRegistry
+
     /// Tests: the caller's own tab, in place of the peer's process ancestry.
     @MainActor var callerSessionResolverForTesting: ((Int32?) -> TerminalSession?)?
 
@@ -592,7 +602,7 @@ final class CherryControlServer: @unchecked Sendable {
     /// The tabs of `workspace` the caller may see (`callerReaches`): every
     /// listing, name lookup, count and scan goes through this.
     @MainActor
-    private func callerSessions(_ workspace: TerminalWorkspace) -> [TerminalSession] {
+    func callerSessions(_ workspace: TerminalWorkspace) -> [TerminalSession] {
         guard Self.remoteDevice != nil else { return workspace.sessions }
         return workspace.sessions.filter { callerReaches($0, in: workspace) }
     }
@@ -831,6 +841,20 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .waitForEvents(try await waitForEvents(request)))
         case .listSubscriptions:
             return .init(result: .listSubscriptions(listSubscriptions()))
+        case .getMyTask:
+            return .init(result: .getMyTask(try getMyTask()))
+        case .reportResult(let request):
+            return .init(result: .reportResult(try reportResult(request)))
+        case .reportProgress(let request):
+            return .init(result: .reportProgress(try reportProgress(request)))
+        case .waitForTasks(let request):
+            return .init(result: .waitForTasks(try await waitForTasks(request)))
+        case .getTask(let request):
+            return .init(result: .getTask(try getTask(request)))
+        case .listTasks(let request):
+            return .init(result: .listTasks(try listTasks(request)))
+        case .cancelTasks(let request):
+            return .init(result: .cancelTasks(try cancelTasks(request)))
         case .getProcessPorts(let request):
             let (session, sessionWorkspace) = try resolveProcessWithWorkspace(workspace: workspace, processID: request.processID, processName: request.processName)
             return .init(result: .getProcessPorts(try await servicesResult(
@@ -858,7 +882,9 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .spawnProcess(.init(
                 process: processInfo(for: session, workspace: workspace),
                 sentBytes: sentBytes,
-                output: output
+                output: output,
+                task: tasks.latestTask(forWorker: session.id)
+                    .flatMap { $0.device == Self.remoteDevice ? tasks.info(for: $0) : nil }
             )))
         case .startProcess(let request):
             let session = try await startProcess(request, workspace: workspace)
@@ -1618,7 +1644,10 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func processInfo(for session: TerminalSession, workspace: TerminalWorkspace) -> ProcessSummary {
-        ProcessSummary(
+        // The worker's task, when it has one the caller may see (made from
+        // the caller's Mac).
+        let task = tasks.latestTask(forWorker: session.id).flatMap { $0.device == Self.remoteDevice ? $0 : nil }
+        return ProcessSummary(
             id: session.id.uuidString,
             link: link(for: session, workspace: workspace),
             name: processName(for: session),
@@ -1650,7 +1679,13 @@ final class CherryControlServer: @unchecked Sendable {
             contentVersion: session.contentVersion,
             failureMessage: session.state.failureMessage,
             agentTurn: session.kind == .agent ? session.agentSubmittedTurnCount : nil,
-            agentTurnState: session.kind == .agent ? session.agentTurnState.rawValue : nil
+            agentTurnState: session.kind == .agent ? session.agentTurnState.rawValue : nil,
+            taskID: task?.id,
+            taskState: task?.state.rawValue,
+            runID: task?.runID,
+            phase: task?.phase,
+            label: task?.label,
+            resultSummary: task?.result?.summary
         )
     }
 
@@ -1765,6 +1800,12 @@ final class CherryControlServer: @unchecked Sendable {
         let kind = try requiredProcessKind(from: request.kind)
         let session: TerminalSession
         let agent: AgentToolDefinition?
+        // A task's worker (`spawn_agent` with `task`): its kickoff line is
+        // the agent's first input.
+        var task: AgentTask?
+        if kind != .agent, request.task != nil {
+            throw CherryControlError(code: "invalid_process_request", message: "Only agent processes take a task.")
+        }
         switch kind {
         case .terminal:
             guard request.name == nil else {
@@ -1784,13 +1825,19 @@ final class CherryControlServer: @unchecked Sendable {
                 throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(resolvedAgent.name)' is not launchable.")
             }
             let agentDefinition = try agentDefinition(resolvedAgent.definition, overridingModel: request.model)
+            let parentID = try parentAgentID(from: request.parentAgentID, workspace: workspace)
+            // Checked (its schema too) before anything is spawned.
+            let taskPlan = try prepareTaskSpawn(request, parentAgentID: parentID, workspace: workspace)
             session = workspace.addAgentSession(
                 agent: agentDefinition,
                 projectRoot: projectRoot,
-                title: request.title,
-                parentAgentID: try parentAgentID(from: request.parentAgentID, workspace: workspace),
+                title: request.title ?? taskPlan?.label,
+                parentAgentID: parentID,
                 select: false
             )
+            if let taskPlan {
+                task = registerTask(taskPlan, worker: session, workspace: workspace)
+            }
             agent = agentDefinition
         case .command:
             guard request.model == nil else {
@@ -1809,18 +1856,22 @@ final class CherryControlServer: @unchecked Sendable {
 
         mcpControlDebugLog("spawned process session=\(session.id.uuidString) kind=\(session.kind.rawValue) name=\(processName(for: session)) parent=\(session.parentAgentID?.uuidString ?? "nil") submit=\(String(describing: request.submit))")
 
-        if (request.text != nil || request.rawBase64 != nil || request.submit == true), let agent {
+        let text = task?.kickoffLine ?? request.text
+        let submit = task != nil ? true : request.submit
+        if (text != nil || request.rawBase64 != nil || submit == true), let agent {
             await waitForAgentInitialInputReadiness(session: session, agent: agent)
         }
 
         let sentBytes: Int
         if session.kind == .agent, let agent {
             let input = try agentInputPayload(
-                text: request.text,
+                text: text,
                 rawBase64: request.rawBase64,
-                submit: request.submit,
+                submit: submit,
                 keyboardProtocolFlags: session.keyboardProtocolFlags
             )
+            var inputError: CherryControlError?
+            let typedSince = Date()
             if let input, !input.isEmpty {
                 // The process exists either way: sentBytes says whether its
                 // first input reached it.
@@ -1828,10 +1879,14 @@ final class CherryControlServer: @unchecked Sendable {
                     sentBytes = try await sendInitialAgentInput(input, to: session, agent: agent)
                 } catch {
                     mcpControlDebugLog("agent initial input not delivered session=\(session.id.uuidString): \(error)")
+                    inputError = error as? CherryControlError
                     sentBytes = 0
                 }
             } else {
                 sentBytes = 0
+            }
+            if let task {
+                noteKickoff(task, delivered: sentBytes > 0, error: inputError, typedSince: typedSince)
             }
         } else {
             let input = try optionalTerminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
@@ -2253,7 +2308,7 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func closeFromControl(
+    func closeFromControl(
         _ session: TerminalSession,
         workspace: TerminalWorkspace,
         agentClosePolicy: AgentClosePolicy?

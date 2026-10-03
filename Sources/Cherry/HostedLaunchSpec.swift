@@ -114,7 +114,8 @@ struct HostedLaunchSpec: Equatable, Sendable {
             for: configuration,
             shellIntegration: isZsh ? context.zshBootstrap : nil,
             inheritedEnvironment: context.processEnvironment,
-            terminfoDirectories: resources?.terminfoDirectory
+            terminfoDirectories: resources?.terminfoDirectory,
+            mcpHelperPath: context.mcpHelperPath
         )
         let command = if let resources {
             ghosttyShellIntegration(
@@ -400,7 +401,8 @@ extension ShellProcessController {
 enum CherryTabEnvironment {
     static let keys: Set<String> = [
         CherryControl.projectRootEnvironmentKey, CherryControl.processIDEnvironmentKey,
-        CherryControl.agentIDEnvironmentKey, "CHERRY_SESSION_ID", "CHERRY_BOOTSTRAP_ZDOTDIR",
+        CherryControl.agentIDEnvironmentKey, CherryControl.mcpHelperEnvironmentKey,
+        "CHERRY_SESSION_ID", "CHERRY_BOOTSTRAP_ZDOTDIR",
         "CHERRY_ORIGINAL_ZDOTDIR", "CHERRY_STARTUP_COMMAND", "CHERRY_EMIT_OSC133",
         "CHERRY_TERM_PROGRAM", "INSIDE_CHERRY"
     ]
@@ -499,6 +501,9 @@ struct HostedLaunchContext: Equatable, Sendable {
     var terminalProgramVersion: String?
     /// GHOSTTY_SHELL_FEATURES, as Ghostty derives it from its configuration.
     var shellFeatures: String
+    /// CHERRY_MCP_HELPER: the app's CherryMCP, when `executableDirectory`
+    /// has one (as a native tab's, `ShellProcessController.appMCPHelperPath`).
+    var mcpHelperPath: String? = nil
 
     /// Ghostty's defaults as Cherry configures it: cursor, path and title on;
     /// sudo, ssh-env and ssh-terminfo off. The cursor feature follows the
@@ -540,10 +545,11 @@ struct HostedLaunchContext: Equatable, Sendable {
     ) async -> HostedLaunchContext {
         let shellPath = configuration.shellPath
         let resources = try? await stager.resolve()
-        let (bootstrap, account) = await stager.perform {
+        let (bootstrap, account, mcpHelperPath) = await stager.perform {
             (
                 try? ShellIntegrationBootstrap.prepare(shellPath: shellPath, homeDirectory: homeDirectory),
-                HostedLaunchAccount.current()
+                HostedLaunchAccount.current(),
+                executableDirectory.map { "\($0)/CherryMCP" }.flatMap { FileManager.default.isExecutableFile(atPath: $0) ? $0 : nil }
             )
         }
         return HostedLaunchContext(
@@ -558,7 +564,8 @@ struct HostedLaunchContext: Equatable, Sendable {
             zshBootstrap: bootstrap,
             executableDirectory: executableDirectory,
             terminalProgramVersion: embeddedGhosttyVersion,
-            shellFeatures: ghosttyShellFeatures(cursorBlink: cursorBlink)
+            shellFeatures: ghosttyShellFeatures(cursorBlink: cursorBlink),
+            mcpHelperPath: mcpHelperPath
         )
     }
 }

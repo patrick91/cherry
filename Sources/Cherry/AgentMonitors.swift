@@ -464,13 +464,17 @@ extension CherryControlServer {
 
     // MARK: Sampling
 
+    /// Starts the sampler while subscriptions exist or tasks need watching
+    /// (`AgentTaskRegistry.needsSampling`: open tasks, a settled run's
+    /// wake line not typed yet).
     @MainActor
     func startMonitorSamplerIfNeeded() {
-        guard monitors.samplerTask == nil, !monitors.subscriptions.isEmpty else { return }
+        guard monitors.samplerTask == nil, !monitors.subscriptions.isEmpty || tasks.needsSampling else { return }
         monitors.samplerTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                guard let self, !self.monitors.subscriptions.isEmpty else { break }
+                guard let self, !self.monitors.subscriptions.isEmpty || self.tasks.needsSampling else { break }
                 await self.sampleMonitors()
+                await self.sampleTasks()
                 let interval = self.monitors.sampleInterval
                 try? await Task.sleep(for: interval)
             }
@@ -530,7 +534,15 @@ extension CherryControlServer {
     /// The watched process's status now (`MonitorProcessStatus.status`).
     @MainActor
     func monitorStatus(of watched: WatchedProcess, now: Date = Date()) -> String {
-        guard let session = watched.session, let workspace = watched.workspace, isOpen(session, in: workspace) else {
+        monitorStatus(session: watched.session, workspace: watched.workspace, now: now)
+    }
+
+    /// `session`'s status as a monitor sees it now (`closed` when it is
+    /// gone or no longer a tab of an open window): tasks watch their
+    /// workers with it too.
+    @MainActor
+    func monitorStatus(session: TerminalSession?, workspace: TerminalWorkspace?, now: Date = Date()) -> String {
+        guard let session, let workspace, isOpen(session, in: workspace) else {
             return "closed"
         }
         switch session.state {
@@ -647,7 +659,8 @@ extension CherryControlServer {
            now.timeIntervalSince(lastWakeAt) < monitors.wakeMinimumInterval {
             return
         }
-        guard subscriberTakesWakeLine(subscriber, now: now) else { return }
+        // One line at a time into a tab: never while a run's is typed.
+        guard !isTypingWakeLine(into: subscriber), subscriberTakesWakeLine(subscriber, now: now) else { return }
         let line = AgentMonitorRegistry.wakeLine(for: subscription, unread: unread)
         subscription.isWaking = true
         Task { @MainActor [weak self] in

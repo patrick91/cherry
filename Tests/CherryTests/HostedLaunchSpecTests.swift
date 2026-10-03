@@ -364,6 +364,33 @@ func hostedLaunchMatchesNativeLaunchForEveryTabKind(shell: String) throws {
     #expect(hosted.environment["PWD"] == "/tmp")
 }
 
+/// Every tab of This Mac names the app's CherryMCP in CHERRY_MCP_HELPER,
+/// native and hosted alike, so `"$CHERRY_MCP_HELPER" --call …` works
+/// whatever the tab's PATH; one the app inherited is never passed on.
+@Test func hostedAndNativeLaunchesNameTheAppsCherryMCP() {
+    let helper = "\(binDirectory)/CherryMCP"
+    var inherited = processEnvironment
+    inherited[CherryControl.mcpHelperEnvironmentKey] = "/elsewhere/CherryMCP"
+    var hostedContext = context(processEnvironment: inherited)
+    hostedContext.mcpHelperPath = helper
+    for kind in TabKind.allCases {
+        let hosted = HostedLaunchSpec.make(for: configuration(kind, shell: "/bin/zsh"), context: hostedContext)
+        #expect(hosted.environment[CherryControl.mcpHelperEnvironmentKey] == helper, Comment(rawValue: kind.rawValue))
+        let native = ShellProcessController.nativeExecLaunch(
+            for: configuration(kind, shell: "/bin/bash"),
+            shellIntegration: nil,
+            inheritedEnvironment: inherited,
+            terminfoDirectories: nil,
+            mcpHelperPath: helper
+        )
+        #expect(native.environment[CherryControl.mcpHelperEnvironmentKey] == helper, Comment(rawValue: kind.rawValue))
+    }
+    // Without a CherryMCP next to the app: none, not the inherited one.
+    let without = HostedLaunchSpec.make(for: configuration(.agent, shell: "/bin/zsh"), context: context(processEnvironment: inherited))
+    #expect(without.environment[CherryControl.mcpHelperEnvironmentKey] == nil)
+    #expect(CherryTabEnvironment.keys.contains(CherryControl.mcpHelperEnvironmentKey))
+}
+
 @Test func hostedLaunchNeverPassesOnACherryTabsVariables() {
     var environment = processEnvironment
     for key in CherryTabEnvironment.keys { environment[key] = "leaked" }

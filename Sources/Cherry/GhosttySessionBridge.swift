@@ -553,6 +553,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
         // In a window that may be settling, or no longer.
         announceAdapterWindowSize()
+        reportWindowGrid()
         if terminalView.window != nil {
             activateOutputFeedWhenSurfaceIsReady()
         }
@@ -999,6 +1000,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         hasRenderedSinceSettledRenderRequest = false
         gridMetrics = size
         announceAdapterWindowSize()
+        reportWindowGrid()
         scrollContainer?.synchronizeScrollState()
         activateOutputFeedWhenSurfaceIsReady()
     }
@@ -2451,6 +2453,21 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             columns: Int(gridMetrics.columns),
             rows: Int(gridMetrics.rows)
         )))
+    }
+
+    /// Tells the tab's workspace which grid the window showing this surface
+    /// gives a terminal (`TerminalWindowGrid`), once the surface is laid out
+    /// at its view's size (`isMountedViewportReadyForReveal`): whatever its
+    /// backend, so a persistent tab still being created learns its window's
+    /// grid from its own in-memory surface.
+    private func reportWindowGrid() {
+        guard !isReleased, let session = proxy.session, let window = terminalView.window,
+              isMountedViewportReadyForReveal, let gridMetrics
+        else { return }
+        session.surfaceDidShowWindowGrid(
+            TerminalViewportSize(columns: Int(gridMetrics.columns), rows: Int(gridMetrics.rows)),
+            in: window
+        )
     }
 
     /// The window size this tab's terminal reports to a program: its PTY's

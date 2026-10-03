@@ -9440,6 +9440,10 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         MCPInstallCommand(
             harness: .claude,
             command: "claude mcp add --transport stdio --scope user cherry -- \(helperCommand)"
+        ),
+        MCPInstallCommand(
+            harness: .pi,
+            command: "pi mcp add cherry --exposure direct -- \(helperCommand)"
         )
     ])
 }

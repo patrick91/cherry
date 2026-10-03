@@ -713,9 +713,16 @@ final class PersistentHostSessions {
     /// again: once by `HostControl.create`, then `lostCreateRetries` times.
     /// If it still gets no answer, the host is listed later to end a session
     /// the request may have started (`endSessionOfLostCreate`).
+    ///
+    /// `grid`, when given, is asked last, once the host is reached and the
+    /// launch spec is ready: the session's grid and cell pixels instead of
+    /// the request's (the tab waits for its window's terminal grid to settle
+    /// meanwhile, `TerminalWindowGridWait`). An error it throws (the tab no
+    /// longer wants the session) ends the Create before anything is sent.
     func create(
         _ request: PersistentSessionRequest,
-        configuration launch: ShellProcessController.Configuration
+        configuration launch: ShellProcessController.Configuration,
+        grid: (@MainActor () async throws -> (grid: TerminalViewportSize, cell: TerminalCellSize?))? = nil
     ) async throws -> PersistentSessionLaunch {
         if let reason = instanceUnavailableReason { throw HostedSessionError.unavailable(reason) }
         // Another Mac's tab fails at once when this app cannot reach it at
@@ -737,6 +744,13 @@ final class PersistentHostSessions {
         }
         let loginEnvironment = control.loginEnvironment?.environment
         let spec = await launchSpec(launch, loginEnvironment)
+        var request = request
+        if let grid {
+            let size = try await grid()
+            request.columns = size.grid.columns
+            request.rows = size.grid.rows
+            request.cell = size.cell
+        }
         let requestID = request.requestID
         let createRequest = HostCreateRequest(
             requestID: requestID,

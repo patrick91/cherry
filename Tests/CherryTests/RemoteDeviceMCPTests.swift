@@ -565,6 +565,72 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     #expect(stillThere.error == nil, "\(stillThere)")
 }
 
+/// Tasks keep to the caller's Mac: a caller on another Mac hands out tasks
+/// in its own window and sees only the tasks and runs its Mac's callers
+/// made; This Mac's callers never see those, nor it theirs. Its tab, which
+/// has no task, has no assignment.
+@Test @MainActor func RemoteDeviceMCPTasksReachOnlyTheCallersMac() async throws {
+    let harness = try DeviceMCPHarness()
+    defer { harness.stop() }
+    let listener = try harness.server.addDeviceListener(deviceID: harness.deviceID)
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Worker", command: "/bin/cat"))
+
+    let remote = try await harness.send(
+        .spawnProcess(.init(kind: "agent", name: "Worker", task: "Review there", label: "there")),
+        to: listener, credentials: harness.credentials
+    )
+    guard case .spawnProcess(let remoteSpawn)? = remote.result, let remoteTask = remoteSpawn.task else {
+        Issue.record("Expected a task spawn, got \(remote)")
+        return
+    }
+    #expect(harness.deviceWorkspace.session(id: remoteSpawn.process.id) != nil, "the worker is in the caller's window")
+    let local = try await harness.send(
+        .scoped(.init(projectRoot: harness.localRoot.path, request: .spawnProcess(.init(kind: "agent", name: "Worker", task: "Review here")))),
+        credentials: nil
+    )
+    guard case .spawnProcess(let localSpawn)? = local.result, let localTask = localSpawn.task else {
+        Issue.record("Expected a task spawn, got \(local)")
+        return
+    }
+
+    // The caller on another Mac: its Mac's task only.
+    let own = try await harness.send(.getTask(.init(taskID: remoteTask.taskID)), to: listener, credentials: harness.credentials)
+    guard case .getTask(let detail)? = own.result else {
+        Issue.record("Expected getTask, got \(own)")
+        return
+    }
+    #expect(detail.brief == "Review there")
+    let thisMacTask = try await harness.send(.getTask(.init(taskID: localTask.taskID)), to: listener, credentials: harness.credentials)
+    #expect(thisMacTask.error?.code == "unknown_task", "\(thisMacTask)")
+    let thisMacRun = try await harness.send(.waitForTasks(.init(runID: localTask.runID, timeoutMilliseconds: 0)), to: listener, credentials: harness.credentials)
+    #expect(thisMacRun.error?.code == "unknown_run", "\(thisMacRun)")
+    let cancel = try await harness.send(.cancelTasks(.init(taskIDs: [localTask.taskID], close: true)), to: listener, credentials: harness.credentials)
+    #expect(cancel.error?.code == "unknown_task", "\(cancel)")
+    let listed = try await harness.send(.listTasks(.init()), to: listener, credentials: harness.credentials)
+    guard case .listTasks(let remoteList)? = listed.result else {
+        Issue.record("Expected listTasks, got \(listed)")
+        return
+    }
+    #expect(remoteList.tasks.map(\.taskID) == [remoteTask.taskID])
+    #expect(remoteList.runs.first?.ownerProcessID == harness.tab.id.uuidString, "its run is its token's tab's")
+    let assignment = try await harness.send(.getMyTask, to: listener, credentials: harness.credentials)
+    #expect(assignment.error?.code == "no_assignment")
+
+    // This Mac's callers: never the other Mac's task.
+    let fromThisMac = try await harness.send(.getTask(.init(taskID: remoteTask.taskID)), credentials: nil)
+    #expect(fromThisMac.error?.code == "unknown_task")
+    let localList = try await harness.send(
+        .scoped(.init(projectRoot: harness.localRoot.path, request: .listTasks(.init()))),
+        credentials: nil
+    )
+    guard case .listTasks(let thisMacList)? = localList.result else {
+        Issue.record("Expected listTasks, got \(localList)")
+        return
+    }
+    #expect(thisMacList.tasks.map(\.taskID) == [localTask.taskID])
+    #expect(harness.localWorkspace.session(id: localSpawn.process.id) != nil, "the other Mac's cancel closed nothing here")
+}
+
 @Test @MainActor func RemoteDeviceMCPEnvelopeIsOneLineAndAPlainRequestStaysPlain() throws {
     let credentials = CherryControlCredentials(token: "ab", processID: UUID().uuidString)
     let data = try JSONEncoder().encode(CherryControlEnvelope(cherryAuth: credentials, request: .listProjects))
@@ -757,7 +823,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     try "model = \"o3\"\n\n[mcp_servers.other]\ncommand = \"other\"\n".write(to: realConfig, atomically: true, encoding: .utf8)
     chmod(realConfig.path, 0o640)
     try FileManager.default.createSymbolicLink(at: codexConfig, withDestinationURL: realConfig)
-    for tool in ["claude", "codex"] {
+    for tool in ["claude", "codex", "pi"] {
         let config = tool == "codex" ? """
           add) printf '\\n[mcp_servers.%s]\\ncommand = "%s"\\nenv_vars = [\\n  "OLD",\\n]\\nargs = []\\n' "$3" "$5" >> "$HOME/.codex/config.toml" ;;
         """ : ""
@@ -809,6 +875,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     let checked = try run(.check)
     #expect(checked.claude == stubs.appendingPathComponent("claude").path)
     #expect(checked.codex == stubs.appendingPathComponent("codex").path)
+    #expect(checked.pi == stubs.appendingPathComponent("pi").path)
     #expect(checked.helperVersion == "{\"name\":\"CherryMCP\"}")
     #expect(!checked.launcherInstalled)
     #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("claude.log").path))
@@ -821,7 +888,10 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     for _ in 0..<2 {
         let report = try run(.install)
         #expect(report.failures.isEmpty, "\(report.failures)")
-        #expect(report.claudeResult == "ok" && report.codexResult == "ok" && report.launcherInstalled)
+        #expect(report.claudeResult == "ok" && report.codexResult == "ok" && report.piResult == "ok" && report.launcherInstalled)
+        // Pi: direct exposure, so the model sees Cherry's tools themselves.
+        #expect(try String(contentsOf: root.appendingPathComponent("pi.registered"), encoding: .utf8)
+            == "mcp add cherry --exposure direct -- \(launcher)\n")
         #expect(try String(contentsOf: root.appendingPathComponent("claude.registered"), encoding: .utf8)
             == "mcp add --scope user --transport stdio cherry -- \(launcher)\n")
         #expect(try String(contentsOf: root.appendingPathComponent("codex.registered"), encoding: .utf8)
@@ -873,7 +943,8 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     #expect(try launch(["HOME": home.path]) == (0, "20250101000000.b --call x\n"))
     // Remove: both registrations go.
     let removed = try run(.remove)
-    #expect(removed.claudeResult == "ok" && removed.codexResult == "ok")
+    #expect(removed.claudeResult == "ok" && removed.codexResult == "ok" && removed.piResult == "ok")
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("pi.registered").path))
     #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("claude.registered").path))
     #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("codex.registered").path))
     #expect(try String(contentsOf: codexConfig, encoding: .utf8).contains("[mcp_servers.other]"))

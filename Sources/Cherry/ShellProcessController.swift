@@ -444,9 +444,20 @@ final class ShellProcessController: @unchecked Sendable {
             for: configuration,
             shellIntegration: try? ShellIntegrationBootstrap.prepare(shellPath: configuration.shellPath),
             inheritedEnvironment: ProcessInfo.processInfo.environment,
-            terminfoDirectories: Self.preferredTerminfo.additionalDirs
+            terminfoDirectories: Self.preferredTerminfo.additionalDirs,
+            mcpHelperPath: Self.appMCPHelperPath
         )
     }
+
+    /// This app's CherryMCP (next to its executable), when it is there:
+    /// every tab's `CHERRY_MCP_HELPER`, so an agent without Cherry MCP
+    /// tools (or a script) can run `"$CHERRY_MCP_HELPER" --call …`,
+    /// whatever its PATH. Device tabs get their install's (`RemoteMCPLaunch`).
+    static let appMCPHelperPath: String? = {
+        guard let directory = Bundle.main.executableURL?.deletingLastPathComponent() else { return nil }
+        let helper = directory.appendingPathComponent("CherryMCP", isDirectory: false).path
+        return FileManager.default.isExecutableFile(atPath: helper) ? helper : nil
+    }()
 
     /// `nativeExecLaunch(for:)` with its inputs explicit and no file I/O:
     /// the zsh bootstrap (nil for other shells, or when it could not be
@@ -458,7 +469,8 @@ final class ShellProcessController: @unchecked Sendable {
         for configuration: Configuration,
         shellIntegration: ShellIntegrationBootstrap?,
         inheritedEnvironment: [String: String],
-        terminfoDirectories: String?
+        terminfoDirectories: String?,
+        mcpHelperPath: String? = appMCPHelperPath
     ) -> (command: String, environment: [String: String]) {
         let shellPath = configuration.shellPath
 
@@ -494,6 +506,9 @@ final class ShellProcessController: @unchecked Sendable {
         }
         if let agentID = configuration.agentID, !agentID.isEmpty {
             environment[CherryControl.agentIDEnvironmentKey] = agentID
+        }
+        if let mcpHelperPath, !mcpHelperPath.isEmpty {
+            environment[CherryControl.mcpHelperEnvironmentKey] = mcpHelperPath
         }
 
         let command: String
@@ -900,6 +915,7 @@ final class ShellProcessController: @unchecked Sendable {
         let environment = configuration.environment
         let term = configuration.term
         let startupCommand = configuration.startupCommand
+        let mcpHelperPath = Self.appMCPHelperPath
         let inheritedZDOTDIR = ProcessInfo.processInfo.environment["ZDOTDIR"]
         let inheritedCherryBootstrapZDOTDIR = ProcessInfo.processInfo.environment["CHERRY_BOOTSTRAP_ZDOTDIR"]
         let originalZDOTDIR = if inheritedZDOTDIR == inheritedCherryBootstrapZDOTDIR {
@@ -958,6 +974,11 @@ final class ShellProcessController: @unchecked Sendable {
                 _ = setenv(CherryControl.agentIDEnvironmentKey, agentID, 1)
             } else {
                 _ = unsetenv(CherryControl.agentIDEnvironmentKey)
+            }
+            if let mcpHelperPath {
+                _ = setenv(CherryControl.mcpHelperEnvironmentKey, mcpHelperPath, 1)
+            } else {
+                _ = unsetenv(CherryControl.mcpHelperEnvironmentKey)
             }
             if let shellIntegration {
                 _ = setenv("CHERRY_BOOTSTRAP_ZDOTDIR", shellIntegration.zdotdir, 1)

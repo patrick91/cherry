@@ -37,7 +37,8 @@ final class ControlAgentWaitHarness {
             workspace: workspace,
             socketURL: socketURL,
             agentSettings: settings,
-            monitorDefaults: defaults
+            monitorDefaults: defaults,
+            taskBoard: AgentTaskBoard()
         )
     }
 

@@ -4,7 +4,7 @@ import Foundation
 import SwiftUI
 
 // "Set Up Cherry MCP on <Mac>…" (docs/specs/remote-devices.md, phase 4b):
-// Claude Code and Codex on another Mac read their MCP servers from their own
+// Claude Code, Codex and Pi on another Mac read their MCP servers from their own
 // configuration there, which Cherry never edits by itself. The sheet shows
 // the exact commands, and runs them over SSH only when the user confirms:
 // it writes a stable launcher there (`RemoteMCPPaths.launcherRelativePath`)
@@ -16,7 +16,7 @@ enum RemoteMCPSetup {
         /// Looks for the agent CLIs and CherryMCP there (reads no agent
         /// configuration).
         case check
-        /// Writes the launcher and registers it with Claude Code and Codex.
+        /// Writes the launcher and registers it with Claude Code, Codex and Pi.
         case install
         /// Removes the registrations (the launcher stays: another Cherry
         /// may use it).
@@ -30,8 +30,8 @@ enum RemoteMCPSetup {
     /// The launcher as the commands name it there.
     static let launcherExpression = "\"$HOME/\(RemoteMCPPaths.launcherRelativePath)\""
 
-    /// The commands the sheet shows, as the script runs them (`claude` and
-    /// `codex` from that Mac's login PATH).
+    /// The commands the sheet shows, as the script runs them (`claude`,
+    /// `codex` and `pi` from that Mac's login PATH).
     static func commands(mode: Mode, name: String = serverName) -> [String] {
         switch mode {
         case .check:
@@ -43,11 +43,13 @@ enum RemoteMCPSetup {
                 "codex mcp remove \(name); codex mcp add \(name) -- \(launcherExpression)",
                 "# Codex passes an MCP server only the variables it lists: adds",
                 "#   env_vars = \(codexEnvVars) to [mcp_servers.\(name)] in ~/.codex/config.toml",
+                "pi mcp add \(name) --exposure direct -- \(launcherExpression)",
             ]
         case .remove:
             return [
                 "claude mcp remove --scope user \(name)",
                 "codex mcp remove \(name)",
+                "pi mcp remove \(name)",
             ]
         }
     }
@@ -120,12 +122,14 @@ enum RemoteMCPSetup {
             // login shell's PATH.
             "lp=$(\"${SHELL:-/bin/sh}\" -l -c 'printf \"%s\" \"$PATH\"' </dev/null 2>/dev/null | tail -n 1)",
             "[ -n \"$lp\" ] && PATH=\"$lp:$PATH\"",
-            "PATH=\"$PATH:$HOME/.local/bin:$HOME/.claude/local:/opt/homebrew/bin:/usr/local/bin\"",
+            "PATH=\"$PATH:$HOME/.local/bin:$HOME/.claude/local:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin\"",
             "export PATH",
             "claude=$(command -v claude 2>/dev/null)",
             "codex=$(command -v codex 2>/dev/null)",
+            "pi=$(command -v pi 2>/dev/null)",
             "printf 'claude=%s\\n' \"$claude\"",
             "printf 'codex=%s\\n' \"$codex\"",
+            "printf 'pi=%s\\n' \"$pi\"",
             "if [ -n \"$helper\" ]; then",
             "  if [ -x \"$helper\" ]; then",
             "    if v=$(\"$helper\" --version 2>&1 </dev/null); then printf 'helper_version=%s\\n' \"$(printf '%s' \"$v\" | tr '\\n' ' ')\"; else printf 'helper_error=%s\\n' \"$(printf '%s' \"$v\" | tr '\\n' ' ' | cut -c1-300)\"; fi",
@@ -172,11 +176,17 @@ enum RemoteMCPSetup {
                 "  fi",
                 "  printf 'codex_result=%s\\n' \"$codex_result\"",
                 "fi",
+                // Pi replaces a server of the same name, and passes its
+                // whole environment to it.
+                "if [ -n \"$pi\" ]; then",
+                "  printf 'pi_result=%s\\n' \"$(result \"$pi\" mcp add \"$name\" --exposure direct -- \"$launcher\")\"",
+                "fi",
             ]
         case .remove:
             lines += [
                 "if [ -n \"$claude\" ]; then printf 'claude_result=%s\\n' \"$(result \"$claude\" mcp remove --scope user \"$name\")\"; fi",
                 "if [ -n \"$codex\" ]; then printf 'codex_result=%s\\n' \"$(result \"$codex\" mcp remove \"$name\")\"; fi",
+                "if [ -n \"$pi\" ]; then printf 'pi_result=%s\\n' \"$(result \"$pi\" mcp remove \"$name\")\"; fi",
             ]
         }
         lines += [
@@ -190,6 +200,7 @@ enum RemoteMCPSetup {
     struct Report: Equatable, Sendable {
         var claude: String?
         var codex: String?
+        var pi: String?
         var launcherInstalled = false
         var helperVersion: String?
         var helperError: String?
@@ -197,6 +208,7 @@ enum RemoteMCPSetup {
         /// "ok", or why a command failed.
         var claudeResult: String?
         var codexResult: String?
+        var piResult: String?
         var launcherError = false
 
         init(fields: [(key: String, value: String)]) {
@@ -205,12 +217,14 @@ enum RemoteMCPSetup {
                 switch key {
                 case "claude": claude = value.nilIfEmpty
                 case "codex": codex = value.nilIfEmpty
+                case "pi": pi = value.nilIfEmpty
                 case "launcher": launcherInstalled = true
                 case "helper_version": helperVersion = value.nilIfEmpty
                 case "helper_error": helperError = value.nilIfEmpty ?? "it did not run"
                 case "helper_missing": helperMissing = true
                 case "claude_result": claudeResult = value
                 case "codex_result": codexResult = value
+                case "pi_result": piResult = value
                 case "launcher_error": launcherError = true
                 default: break
                 }
@@ -223,6 +237,7 @@ enum RemoteMCPSetup {
             if launcherError { failures.append("The launcher could not be written.") }
             if let claudeResult, claudeResult != "ok" { failures.append("claude: \(claudeResult)") }
             if let codexResult, codexResult != "ok" { failures.append("codex: \(codexResult)") }
+            if let piResult, piResult != "ok" { failures.append("pi: \(piResult)") }
             return failures
         }
     }
@@ -306,6 +321,7 @@ final class RemoteMCPSetupModel: ObservableObject {
         var lines: [String] = []
         lines.append(report.claude.map { "Claude Code: \($0)" } ?? "Claude Code: not found on \(device.name)")
         lines.append(report.codex.map { "Codex: \($0)" } ?? "Codex: not found on \(device.name)")
+        lines.append(report.pi.map { "Pi: \($0)" } ?? "Pi: not found on \(device.name)")
         if let version = report.helperVersion {
             lines.append("CherryMCP runs there (\(version)).")
         } else if let helperError = report.helperError {
@@ -318,7 +334,7 @@ final class RemoteMCPSetupModel: ObservableObject {
 
     var canSetUp: Bool {
         guard let report, !isRunning else { return false }
-        return report.claude != nil || report.codex != nil
+        return report.claude != nil || report.codex != nil || report.pi != nil
     }
 }
 
@@ -330,7 +346,7 @@ struct RemoteMCPSetupSheet: View {
         let name = model.device?.name ?? "Mac"
         VStack(alignment: .leading, spacing: 12) {
             Text("Set Up Cherry MCP on \(name)").font(.title2.weight(.semibold))
-            Text("Agents that run in this Cherry's tabs on \(name) can use Cherry's MCP tools, scoped to their window as on this Mac. Claude Code and Codex there read their MCP servers from their own settings on \(name): Set Up runs these commands there.")
+            Text("Agents that run in this Cherry's tabs on \(name) can use Cherry's MCP tools, scoped to their window as on this Mac. Claude Code, Codex and Pi there read their MCP servers from their own settings on \(name): Set Up runs these commands there.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -354,7 +370,7 @@ struct RemoteMCPSetupSheet: View {
                 Label(
                     done == .remove
                         ? "Removed Cherry MCP from the agents on \(name)."
-                        : "Claude Code and Codex on \(name) now start Cherry MCP (in new agent sessions).",
+                        : "The agents on \(name) now start Cherry MCP (in new agent sessions).",
                     systemImage: "checkmark.circle.fill"
                 )
                 .foregroundStyle(.green)

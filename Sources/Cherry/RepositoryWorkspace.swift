@@ -45,6 +45,10 @@ final class RepositoryWorkspace: ObservableObject {
     private let sessionRestorer: WorkspaceSessionRestorer
     private let autoStartCommands: @MainActor (String) -> [ProjectCommandDefinition]
     private var workspaces: [String: TerminalWorkspace]
+    /// The grid this window gives its terminals (`TerminalWindowGrid`), the
+    /// same for each worktree's workspace: a worktree's first tab starts at
+    /// it as the window's other tabs do.
+    private let windowGrid = TerminalWindowGrid()
     private var resolvedPathsByInput: [String: String]
     private var autoStartedRoots: Set<String> = []
     private var selectionByRoot: [String: WorktreeSelectionState] = [:]
@@ -263,6 +267,7 @@ final class RepositoryWorkspace: ObservableObject {
             backendPolicy: backendPolicy
         )
         initialWorkspace.restoredTabLaunchQueue = restoredTabLaunchQueue
+        initialWorkspace.windowGrid = windowGrid
         workspaces = [initialRoot: initialWorkspace]
         var initialResolvedPaths = [root: initialRoot]
         initialResolvedPaths[initialRoot] = initialRoot
@@ -995,6 +1000,7 @@ final class RepositoryWorkspace: ObservableObject {
             backendPolicy: backendPolicy
         )
         workspace.restoredTabLaunchQueue = restoredTabLaunchQueue
+        workspace.windowGrid = windowGrid
         workspaces[root] = workspace
         loadedWorktreeRoots.insert(root)
         closeTabsAfterCleanExit(in: workspace)

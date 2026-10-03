@@ -315,3 +315,82 @@ private func resizeInlineTabs(_ host: RealLocalHost, _ tabs: [InlineTab], height
     workspace.closeAllSessions(intent: .windowClosed)
     await host.tearDown()
 }
+
+/// A new window's first tab exists before its window lays it out, at the
+/// window's first frame, and a tiling window manager moves the window soon
+/// after (AeroSpace re-tiles a new window 90 to 290 ms after its terminal is
+/// first laid out); a window restored into full screen passes through sizes
+/// on the way (`TerminalWindowSettling`). The tab's Create waits for its
+/// window's grid to settle (`TerminalWindowGridWait`), so its program starts
+/// at the size the window settles at and is never resized: not 120x32, not
+/// the window's first grid, and no SIGWINCH once it runs. Each adapter
+/// starts with its terminal at another size, as Ghostty starts a new
+/// surface's child (`adapterTerminalStartsAt`), which the session never
+/// sees either.
+@Test(.enabled(if: inlineResizeRealHostEnabled))
+@MainActor func PersistentLocalRealHostNewWindowsFirstTabsProgramSeesOnlyTheGridItsWindowSettlesAt() async throws {
+    let host = try await RealLocalHost(adapterTerminalStartsAt: (rows: 16, columns: 45))
+    var policy = host.policy
+    policy.windowGridWait = .standard
+    var workspaces: [TerminalWorkspace] = []
+    var holds: [@MainActor () -> Void] = []
+    func tearDown() async {
+        holds.forEach { $0() }
+        for workspace in workspaces { workspace.closeAllSessions(intent: .windowClosed) }
+        await host.tearDown()
+    }
+    do {
+        for fullScreen in [false, true] {
+            let label = fullScreen ? "full-screen" : "tiled"
+            let workspace = TerminalWorkspace(projectRoot: host.home.path, createInitialSession: false, backendPolicy: policy)
+            workspaces.append(workspace)
+            let log = host.root.appendingPathComponent("first-tab-\(label).log")
+            let tab = workspace.addCommandSession(
+                command: ProjectCommandDefinition(
+                    name: "first-\(label)", command: "/usr/bin/python3",
+                    arguments: "'\(inlineMimic.path)' claude-cursor 40 '\(log.path)'"
+                ),
+                projectRoot: host.home.path
+            )
+            #expect(tab.isPersistentLocalSession)
+            // Its window lays it out a moment later.
+            try await Task.sleep(for: .milliseconds(60))
+            host.show(tab)
+            if fullScreen {
+                let window = try #require(tab.ghosttyBridge.terminalView.window)
+                holds.append(TerminalWindowSettling.shared.hold(window))
+            }
+            try await host.waitFor("the \(label) tab to be laid out") { tab.mountedTerminalGrid != nil }
+            if fullScreen {
+                for size in [NSSize(width: 900, height: 600), NSSize(width: 1100, height: 750), NSSize(width: 1300, height: 900)] {
+                    try await Task.sleep(for: .milliseconds(200))
+                    host.resize(tab, to: size)
+                }
+                try await Task.sleep(for: .milliseconds(100))
+                holds.removeLast()()
+            } else {
+                // The window manager's re-tile, in two steps.
+                try await Task.sleep(for: .milliseconds(150))
+                host.resize(tab, to: NSSize(width: 560, height: 720))
+                try await Task.sleep(for: .milliseconds(20))
+                host.resize(tab, to: NSSize(width: 560, height: 800))
+            }
+            try await host.waitFor("the \(label) mimic to draw") {
+                tab.adapterLiveStatus?.followsProgram == true
+                    && inlineLines(host.screen(tab)).contains { $0.hasPrefix("LIVE footer two") }
+            }
+            let metrics = try #require(tab.ghosttyBridge.gridMetrics)
+            // Past the adapter's interim terminal size, and anything after.
+            try await Task.sleep(for: .milliseconds(700))
+            #expect(mimicSizes(log) == ["\(metrics.rows)x\(metrics.columns)"], "\(label)")
+            let sessionID = try #require(tab.persistentSession?.sessionID)
+            let info = try #require(try await host.hostSession(sessionID))
+            #expect(info.cols == Int(metrics.columns), "\(label)")
+            #expect(info.rows == Int(metrics.rows), "\(label)")
+        }
+    } catch {
+        await tearDown()
+        throw error
+    }
+    await tearDown()
+}

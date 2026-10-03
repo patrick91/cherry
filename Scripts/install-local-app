@@ -11,7 +11,18 @@ APPLICATION_SUPPORT_NAME="${CHERRY_APPLICATION_SUPPORT_NAME:-Cherry}"
 CUSTOM_ICON="${CHERRY_ICON_PATH:-}"
 SKIP_HOST="${CHERRY_SKIP_HOST:-0}"
 INSTALL_DIR="${CHERRY_INSTALL_DIR:-$HOME/Applications}"
-CODE_SIGN_IDENTITY="${CHERRY_CODESIGN_IDENTITY:--}"
+# macOS keeps privacy grants (Downloads, Documents, …) for the app's
+# designated requirement. Ad hoc signing (`-`) makes that the binary's hash,
+# so every rebuild asks again; a certificate makes it stable across builds.
+# Default: the first "Apple Development" identity in the keychain, else ad
+# hoc. CHERRY_CODESIGN_IDENTITY overrides it (`-` forces ad hoc).
+if [ -n "${CHERRY_CODESIGN_IDENTITY:-}" ]; then
+  CODE_SIGN_IDENTITY="$CHERRY_CODESIGN_IDENTITY"
+else
+  CODE_SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+    | sed -n 's/^ *[0-9][0-9]*) \([0-9A-F]\{40\}\) "Apple Development: .*"$/\1/p' | head -n 1)"
+  CODE_SIGN_IDENTITY="${CODE_SIGN_IDENTITY:--}"
+fi
 BUILD_DIR="$ROOT/.build/install"
 APP_PATH="$BUILD_DIR/$APP_NAME.app"
 INSTALL_PATH="$INSTALL_DIR/$APP_NAME.app"
@@ -268,7 +279,11 @@ PLIST
 plutil -lint "$APP_PATH/Contents/Info.plist" >/dev/null
 
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign "$CODE_SIGN_IDENTITY" "$APP_PATH" >/dev/null
+  # No secure timestamp: a local build needs no network round trip.
+  codesign --force --deep --timestamp=none --sign "$CODE_SIGN_IDENTITY" "$APP_PATH" >/dev/null
+  if [ "$CODE_SIGN_IDENTITY" = "-" ]; then
+    echo "Signed ad hoc: macOS asks again for privacy access after each install (set CHERRY_CODESIGN_IDENTITY to keep it)."
+  fi
 fi
 
 mkdir -p "$INSTALL_DIR"

@@ -434,6 +434,42 @@ private func pwnedFiles(under root: URL) -> [String] {
     #expect(OmniLocalFolders.list(root.appendingPathComponent("file").path) == .missing)
 }
 
+/// Records the paths whose existence is asked.
+private final class RecordingFileManager: FileManager, @unchecked Sendable {
+    var asked: [String] = []
+    override func fileExists(atPath path: String) -> Bool {
+        asked.append(path)
+        return super.fileExists(atPath: path)
+    }
+}
+
+@Test func omniLocalListingOfTheHomeFolderNeverLooksInsidePrivacyProtectedFolders() throws {
+    // Looking for a `.git` inside ~/Downloads (or Desktop, Documents…) makes
+    // macOS ask "would like to access files in your Downloads folder".
+    let home = FileManager.default.temporaryDirectory.appendingPathComponent("omni-home-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: home) }
+    for path in ["Downloads/.git", "Documents", "Desktop", "code/.git"] {
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(path), withIntermediateDirectories: true)
+    }
+    let files = RecordingFileManager()
+    guard case .listed(let contents) = OmniLocalFolders.list(home.path, fileManager: files, home: home.path) else {
+        Issue.record("not listed")
+        return
+    }
+    #expect(Set(contents.entries.map(\.name)) == ["code", "Desktop", "Documents", "Downloads"])
+    #expect(contents.entries.first { $0.name == "code" }?.isRepository == true)
+    #expect(contents.entries.first { $0.name == "Downloads" }?.isRepository == false)
+    for folder in OmniLocalFolders.privacyProtectedHomeFolders {
+        #expect(!files.asked.contains { $0.hasPrefix(home.path + "/" + folder + "/") })
+    }
+    // Inside a protected folder the user entered, it is looked for as usual.
+    guard case .listed(let inside) = OmniLocalFolders.list(home.appendingPathComponent("Downloads").path, home: home.path) else {
+        Issue.record("not listed")
+        return
+    }
+    #expect(inside.isRepository)
+}
+
 // MARK: - Asking only connected Macs
 
 @MainActor

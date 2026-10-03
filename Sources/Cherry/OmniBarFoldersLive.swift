@@ -15,7 +15,19 @@ enum OmniLocalFolders {
     /// The folders at `path` (hidden ones too; the bar filters them), each
     /// marked when it has a `.git`, at most `OmniFolderListingLimits.entries`
     /// (visible ones first). Blocking: call it off the main thread.
-    static func list(_ path: String, fileManager: FileManager = .default) -> OmniFolderListing {
+    /// Folders of the home folder that macOS guards with a privacy prompt
+    /// ("would like to access files in your Downloads folder"): listing the
+    /// home folder never looks inside them for a `.git`, so typing `~/` asks
+    /// nothing; entering one is the user's own choice, and asks then.
+    static let privacyProtectedHomeFolders: Set<String> = [
+        "Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures",
+    ]
+
+    static func list(
+        _ path: String,
+        fileManager: FileManager = .default,
+        home: String = NSHomeDirectory()
+    ) -> OmniFolderListing {
         var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else { return .missing }
         let names: [String]
@@ -39,7 +51,11 @@ enum OmniLocalFolders {
                 truncated = true
                 break
             }
-            entries.append(OmniFolderEntry(name: name, isRepository: fileManager.fileExists(atPath: base + "/" + name + "/.git")))
+            let isProtected = base == home && privacyProtectedHomeFolders.contains(name)
+            entries.append(OmniFolderEntry(
+                name: name,
+                isRepository: !isProtected && fileManager.fileExists(atPath: base + "/" + name + "/.git")
+            ))
         }
         return .listed(OmniFolderContents(
             path: path,

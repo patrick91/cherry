@@ -247,7 +247,7 @@ struct HostedLaunchSpec: Equatable, Sendable {
         inheritedTerminalKeys.contains(key) || key.hasPrefix("GHOSTTY_") || key.hasPrefix("XPC_")
     }
 
-    private static let inheritedTerminalKeys = CherryTabEnvironment.keys.union([
+    private static let inheritedTerminalKeys = CherryTabEnvironment.keys.union(CherryTabEnvironment.agentChildMarkers).union([
         // The shell or terminal that started Cherry.
         "PWD", "OLDPWD", "SHLVL", "_", "LINES", "COLUMNS",
         "TERM", "TERMINFO", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "VTE_VERSION",
@@ -405,11 +405,22 @@ enum CherryTabEnvironment {
         "CHERRY_TERM_PROGRAM", "INSIDE_CHERRY"
     ]
 
-    /// Clears `keys` from this process, for the app launched from inside a
-    /// Cherry tab: everything it starts inherits its environment, including
-    /// the native and adapter surfaces Ghostty spawns.
+    /// What an agent CLI sets for the programs it runs (Claude Code's Bash
+    /// tool, Codex's shell): passed on, a Claude in a new tab takes itself
+    /// for a child session and stops saving its transcript.
+    static let agentChildMarkers: Set<String> = [
+        "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_SSE_PORT", "CLAUDE_PID", "AI_AGENT",
+        "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED", "CODEX_THREAD_ID",
+    ]
+
+    /// Clears `keys` and `agentChildMarkers` from this process, for the app
+    /// launched from inside a Cherry tab or an agent's shell: everything it
+    /// starts inherits its environment, including the native and adapter
+    /// surfaces Ghostty spawns and the sessions it creates.
     static func removeFromProcess() {
-        for key in keys { unsetenv(key) }
+        for key in keys.union(agentChildMarkers) { unsetenv(key) }
     }
 }
 

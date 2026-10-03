@@ -1133,7 +1133,10 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 
 @Test func theAppDropsATabsIdentityItWasLaunchedWith() {
     // `open` from a Cherry tab passes that tab's environment to the app.
-    let keys = ["CHERRY_SESSION_ID", CherryControl.processIDEnvironmentKey, CherryControl.agentIDEnvironmentKey]
+    let keys = [
+        "CHERRY_SESSION_ID", CherryControl.processIDEnvironmentKey, CherryControl.agentIDEnvironmentKey,
+        "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION",
+    ]
     for key in keys { setenv(key, "from-a-tab", 1) }
     setenv("CHERRY_HOST_SOCKET_PROBE_KEEP", "kept", 1)
     CherryTabEnvironment.removeFromProcess()

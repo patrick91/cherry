@@ -4,6 +4,7 @@ mod diagnose;
 mod handover;
 mod input;
 mod passthrough;
+mod settle;
 mod status;
 mod stderr_relay;
 mod sys;
@@ -151,6 +152,13 @@ enum Action {
         /// run or a lost connection, is dropped when this one attaches.
         #[arg(long, value_parser = validate_client_id)]
         client_id: Option<String>,
+        /// A file the app that runs this attachment in its window keeps the
+        /// window's settled grid in (`{"cols":C,"rows":R}`, or
+        /// `{"hold":true}` while its size changes): attach once the terminal
+        /// has that grid, and after a hold resize once it has it again, each
+        /// within 3 s.
+        #[arg(long)]
+        size_file: Option<PathBuf>,
     },
     /// Terminate a session on the host.
     Kill { id: String },
@@ -521,6 +529,8 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
                 owner,
                 tags: tags.into_iter().collect(),
                 colors: None,
+                cell_width: None,
+                cell_height: None,
             })?;
             match transport.receive(RPC_TIMEOUT)? {
                 ServerMessage::Created { session } => {
@@ -546,6 +556,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
             takeover,
             detach_key,
             client_id,
+            size_file,
             ..
         } => {
             // Connecting again finds the same host (the identity it welcomed
@@ -576,6 +587,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
                     id: &id,
                     takeover,
                     client_id: client_id.as_deref(),
+                    size_file: size_file.map(settle::SizeFile::new),
                 },
                 detach_key,
                 status,
@@ -1815,6 +1827,12 @@ mod tests {
         }
         let longest = "x".repeat(MAX_CLIENT_ID_BYTES);
         assert!(Cli::try_parse_from(["cherry", "attach", "S", "--client-id", &longest]).is_ok());
+        let cli = Cli::try_parse_from(["cherry", "attach", "S", "--size-file", "/tmp/size.json"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Action::Attach { size_file: Some(path), .. } if path == Path::new("/tmp/size.json")
+        ));
     }
 
     fn terminal_environment() -> impl Iterator<Item = (OsString, OsString)> {

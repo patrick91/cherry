@@ -55,6 +55,7 @@ use crate::{
     input::{DetachInput, DetachKey, Leftover, DEVICE_ATTRIBUTES, PASTE_END, PASTE_START},
     is_unresolvable, message_kind,
     passthrough::Passthrough,
+    settle::{self, Settled, SizeFile},
     status::{Live, StatusFile},
     sys::{self, interrupted, poll, pollfd, read_some, set_nonblocking},
     timing::timing,
@@ -193,6 +194,9 @@ pub struct Target<'a> {
     /// Names this client (`ClientMessage::Attach::client_id`), on every
     /// connection.
     pub client_id: Option<&'a str>,
+    /// Where the app running this attachment says which size its window
+    /// settled at (`--size-file`, see `settle`).
+    pub size_file: Option<SizeFile>,
 }
 
 pub fn attach(
@@ -206,6 +210,12 @@ pub fn attach(
     // this thread starts meanwhile (ssh, a host) starts at the default.
     priority::prepare_process();
     let id = target.id;
+    // The session takes the size it is attached at: the one the window
+    // settled at, not one its terminal passes through first.
+    let hold_expired = match &target.size_file {
+        Some(size_file) => wait_until_settled(size_file)?,
+        None => false,
+    };
     let (physical, cell) = physical_size();
     let sent_size = protocol_size(physical);
     let first = request_attach(
@@ -239,6 +249,9 @@ pub fn attach(
         streak: None,
         terminal_paste: PasteMarkers::default(),
         paste_tail: None,
+        size_file: target.size_file.as_ref(),
+        settling: None,
+        hold_expired,
     }
     .run(slot, reconnect, first, sent_size, cell);
     // Before the reset changes the copy's modes.
@@ -359,6 +372,14 @@ struct Attachment<'a> {
     /// The rest of a paste the terminal began before this connection is
     /// being discarded: since when, or since the last of it arrived.
     paste_tail: Option<Instant>,
+    /// Where the app says which size its window settled at (`settle`).
+    size_file: Option<&'a SizeFile>,
+    /// Since when resizes wait for the window to settle: the size file
+    /// said `hold`, and has not named the window's grid since.
+    settling: Option<Instant>,
+    /// A hold outlasted `size_file_wait`: the file's `hold` is ignored
+    /// until it names a grid again.
+    hold_expired: bool,
 }
 
 /// One reconnection: from a loss after a connection that lasted
@@ -542,6 +563,34 @@ impl Attachment<'_> {
         })
     }
 
+    /// While the app settles the window's size (its size file said `hold`,
+    /// see `settle`): when to look again, instead of telling the host of the
+    /// window's `grid` now. None once the file names `grid`, after
+    /// `size_file_wait`, and without a hold.
+    fn settling(&mut self, grid: (u16, u16), now: Instant) -> Option<Instant> {
+        let settled = self.size_file?.read();
+        match settled {
+            Some(Settled::Hold) if !self.hold_expired => {
+                self.settling.get_or_insert(now);
+            }
+            Some(Settled::Grid(_)) => self.hold_expired = false,
+            _ => {}
+        }
+        let since = self.settling?;
+        if settle::settled_at(settled, grid) {
+            self.settling = None;
+            return None;
+        }
+        if now >= since + timing().size_file_wait {
+            // The app never said: what the terminal reports goes, and a
+            // `hold` it leaves in the file holds nothing more.
+            self.settling = None;
+            self.hold_expired = settled == Some(Settled::Hold);
+            return None;
+        }
+        Some(now + settle::SIZE_FILE_POLL)
+    }
+
     /// Write the status file's live state, when it changed.
     fn publish(&mut self, reconnecting: bool) {
         self.status.live(Live {
@@ -598,9 +647,18 @@ impl Attachment<'_> {
                 // A cell size the host has not been sent; a window that no
                 // longer reports one keeps the last.
                 let new_cell = cell.filter(|&cell| Some(cell) != connection.sent_cell);
-                // The host reads nothing after Detach; the window is repainted
-                // from the local copy instead.
-                if size != connection.sent_size && connection.detach.is_none() {
+                let held = (connection.detach.is_none()
+                    && (size != connection.sent_size || new_cell.is_some()))
+                .then(|| self.settling(physical, now))
+                .flatten();
+                if let Some(next) = held {
+                    // The window's size is changing (the app said `hold`):
+                    // the host hears of it once it settled, so the program
+                    // is not resized to the sizes on the way.
+                    connection.resize_at = Some(next);
+                } else if size != connection.sent_size && connection.detach.is_none() {
+                    // The host reads nothing after Detach; the window is
+                    // repainted from the local copy instead.
                     transport.queue(&resize_message(size, cell))?;
                     // The host may change the grid at once.
                     transport.write_ready()?;
@@ -2214,6 +2272,29 @@ fn flush_for(transport: &mut Transport, wait: Duration) -> Result<bool> {
         }
         let mut fds = [pollfd(transport.write_fd(), libc::POLLOUT)];
         poll(&mut fds, deadline - now)?;
+    }
+}
+
+/// Before attaching with a size file (`settle`): wait until the terminal
+/// reports the grid the file names, at most `size_file_wait`; a resize of
+/// the terminal ends a pause at once. True when the wait ran out while the
+/// file said `hold` (see `Attachment::hold_expired`).
+fn wait_until_settled(size_file: &SizeFile) -> Result<bool> {
+    let deadline = Instant::now() + timing().size_file_wait;
+    loop {
+        interrupted()?;
+        // Taken before the size is read: a resize after the read signals
+        // again, and the attachment passes it on.
+        let _ = sys::take_resize();
+        let settled = size_file.read();
+        if settle::settled_at(settled, physical_size().0) {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(settled == Some(Settled::Hold));
+        }
+        poll(&mut [], settle::SIZE_FILE_POLL.min(deadline - now))?;
     }
 }
 

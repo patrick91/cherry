@@ -13,6 +13,9 @@ struct PersistentSessionRequest: Equatable, Sendable {
     var projectRoot: String?
     var columns: Int
     var rows: Int
+    /// The pixels of one cell of the window the session is created for
+    /// (`HostCreateRequest.cell`), when the tab knows them.
+    var cell: TerminalCellSize?
     /// The Create's `request_id`, chosen by the tab before it asks (and
     /// saved with it), so a relaunch can find the session a Create whose
     /// answer was lost started (`HostedSessionInfo.requestID`).
@@ -747,7 +750,9 @@ final class PersistentHostSessions {
             tags: Self.tags(for: request, requestID: requestID, resourcesCopy: spec.resourcesCopy),
             // A program that asks sees the colours of the terminal it is
             // shown in, as in a native tab.
-            colors: terminalColors()
+            colors: terminalColors(),
+            // And its pixels.
+            cell: request.cell
         )
         var retries = 0
         var answerWasLost = false

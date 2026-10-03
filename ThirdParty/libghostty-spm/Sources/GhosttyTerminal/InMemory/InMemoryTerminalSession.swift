@@ -12,6 +12,7 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
     private let lock = NSLock()
     private var surface: ghostty_surface_t?
     private var lastResize: InMemoryTerminalViewport?
+    private var lastTerminalResize: InMemoryTerminalViewport?
     private let writeHandler: @Sendable (Data) -> Void
     private let resizeHandler: @Sendable (InMemoryTerminalViewport) -> Void
     private let writeBuffer: (ghostty_surface_t, Data) -> Void
@@ -80,6 +81,15 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return surface
+    }
+
+    /// The grid and pixels Ghostty last gave this session's terminal: its
+    /// text area, without the padding, as an EXEC surface gives its PTY
+    /// (`TIOCGWINSZ`). Nil until a surface sized it.
+    public var terminalSize: InMemoryTerminalViewport? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastTerminalResize
     }
 
     func updateViewport(_ size: TerminalGridMetrics) {
@@ -183,12 +193,16 @@ public final class InMemoryTerminalSession: @unchecked Sendable {
             .metrics,
             "receive resize cols=\(cols) rows=\(rows) pixels=\(widthPx)x\(heightPx)"
         )
-        session.dispatchResize(InMemoryTerminalViewport(
+        let viewport = InMemoryTerminalViewport(
             columns: cols,
             rows: rows,
             widthPixels: widthPx,
             heightPixels: heightPx
-        ))
+        )
+        session.lock.lock()
+        session.lastTerminalResize = viewport
+        session.lock.unlock()
+        session.dispatchResize(viewport)
     }
 
     private func dispatchResize(_ resize: InMemoryTerminalViewport) {

@@ -409,6 +409,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private var lastReplayedGridSize: TerminalViewportSize?
     private var activeColorScheme: ColorScheme?
     private nonisolated(unsafe) var settingsObserver: Any?
+    private nonisolated(unsafe) var windowSettlingObserver: Any?
     private(set) var gridMetrics: TerminalGridMetrics?
     private(set) var scrollbarMetrics: TerminalScrollbarMetrics?
     private weak var scrollContainer: GhosttyTerminalContainerView?
@@ -497,6 +498,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         terminalView.controller = controller
         proxy.bridge = self
         observeSettingsChanges()
+        observeWindowSettling()
     }
 
     static func resolvedColorScheme() -> ColorScheme {
@@ -549,6 +551,8 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             container.synchronizeScrollState(forceTerminalFrame: true)
             synchronizeMountedSurfaceGeometry()
         }
+        // In a window that may be settling, or no longer.
+        announceAdapterWindowSize()
         if terminalView.window != nil {
             activateOutputFeedWhenSurfaceIsReady()
         }
@@ -564,6 +568,8 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         container.uninstall(terminalView: terminalView)
         terminalView.removeFromSuperview()
         scrollContainer = nil
+        // Out of a window that may be settling: its size is the one it keeps.
+        announceAdapterWindowSize()
         if isNativePTYBacked {
             // EXEC surface == live child process. Never free it on detach (that
             // would kill a running agent/command); keep it parked and alive so a
@@ -695,6 +701,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         pendingFeedActivation = false
         uninstallOutputObserver()
         uninstallSettingsObserver()
+        uninstallWindowSettlingObserver()
         if let scrollContainer {
             terminalView.setSurfaceVisible(false)
             scrollContainer.uninstall(terminalView: terminalView)
@@ -991,6 +998,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         settledRenderTask = nil
         hasRenderedSinceSettledRenderRequest = false
         gridMetrics = size
+        announceAdapterWindowSize()
         scrollContainer?.synchronizeScrollState()
         activateOutputFeedWhenSurfaceIsReady()
     }
@@ -1113,6 +1121,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         MainActor.assumeIsolated {
             releaseResources()
             uninstallSettingsObserver()
+            uninstallWindowSettlingObserver()
         }
     }
 
@@ -2397,6 +2406,69 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         guard let settingsObserver else { return }
         NotificationCenter.default.removeObserver(settingsObserver)
         self.settingsObserver = nil
+    }
+
+    /// A window starting or ending a change of size
+    /// (`TerminalWindowSettling`): the adapter of the tab it shows holds
+    /// its resizes meanwhile, and resizes the session to the size the
+    /// window settled at.
+    private func observeWindowSettling() {
+        windowSettlingObserver = NotificationCenter.default.addObserver(
+            forName: TerminalWindowSettling.didChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            let window = notification.object as? NSWindow
+            MainActor.assumeIsolated {
+                guard let self, let window, self.terminalView.window === window else { return }
+                self.announceAdapterWindowSize()
+            }
+        }
+        // AppKit's full-screen transitions are followed from now on.
+        _ = TerminalWindowSettling.shared
+    }
+
+    private func uninstallWindowSettlingObserver() {
+        guard let windowSettlingObserver else { return }
+        NotificationCenter.default.removeObserver(windowSettlingObserver)
+        self.windowSettlingObserver = nil
+    }
+
+    /// What the tab's attach adapter is told of its window's size
+    /// (`HostedAttachmentSizeFile`): the surface's grid, or that the size
+    /// is changing while the window that shows it settles
+    /// (`TerminalWindowSettling`). A surface no window shows (a tab
+    /// attaching in the background) has the size its window's terminal has
+    /// (`TerminalSession.detachedSurfaceSize`), which it keeps.
+    func announceAdapterWindowSize() {
+        guard !isReleased, isNativePTYBacked, let session = proxy.session else { return }
+        if TerminalWindowSettling.shared.isSettling(terminalView.window) {
+            session.announceAdapterWindowSize(.hold)
+            return
+        }
+        guard let gridMetrics, gridMetrics.columns > 0, gridMetrics.rows > 0 else { return }
+        session.announceAdapterWindowSize(.grid(TerminalViewportSize(
+            columns: Int(gridMetrics.columns),
+            rows: Int(gridMetrics.rows)
+        )))
+    }
+
+    /// The window size this tab's terminal reports to a program: its PTY's
+    /// (`TIOCGWINSZ`) while a native (EXEC) surface runs its program or
+    /// attach adapter, else the size Ghostty last gave its in-memory
+    /// surface's terminal, which is what it gives a PTY at that size.
+    var terminalWindowSize: TerminalTTYWindowSize? {
+        guard !isReleased else { return nil }
+        if isNativePTYBacked {
+            return terminalView.ttyName.flatMap(TerminalTTYWindowSize.init(ttyName:))
+        }
+        guard let size = inMemorySession.terminalSize, size.columns > 0, size.rows > 0 else { return nil }
+        return TerminalTTYWindowSize(
+            columns: Int(size.columns),
+            rows: Int(size.rows),
+            widthPixels: Int(size.widthPixels),
+            heightPixels: Int(size.heightPixels)
+        )
     }
 
     private func applyTerminalSettings() {

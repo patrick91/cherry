@@ -111,6 +111,29 @@ private func decode(_ text: String) throws -> HostResponse {
     #expect(HostTerminalColors(foreground: "#ａｂｃ", background: "#000000", dark: true) == nil)
 }
 
+@Test func HostControlCreateCarriesTheCellSizeOfItsWindowOnlyWhenItHasOne() throws {
+    var create = HostCreateRequest(requestID: UUID(), name: "n", cwd: "/", owner: nil, tags: [:])
+    // Left out without one, so the host's PTY reports no pixels until a
+    // window gives some, as before.
+    let without = try body(of: HostRequest(req: 1, message: .create(create)))
+    #expect(without["cell_width"] == nil && without["cell_height"] == nil)
+    create.cell = TerminalCellSize(width: 17, height: 33)
+    let with = try body(of: HostRequest(req: 1, message: .create(create)))
+    #expect(with["cell_width"] as? Int == 17)
+    #expect(with["cell_height"] as? Int == 33)
+    // Sizes the host would not take are none.
+    #expect(TerminalCellSize(width: 0, height: 33) == nil)
+    #expect(TerminalCellSize(width: 17, height: 1025) == nil)
+}
+
+/// A PTY's report gives the cell size `cherry attach` derives from it: its
+/// pixels over its grid, rounded down; none without pixels.
+@Test func HostControlCellSizeOfAWindowIsTheOneItsAdapterReports() {
+    let window = TerminalTTYWindowSize(columns: 92, rows: 28, widthPixels: 1568, heightPixels: 944)
+    #expect(window.cell == TerminalCellSize(width: 17, height: 33))
+    #expect(TerminalTTYWindowSize(columns: 80, rows: 24, widthPixels: 0, heightPixels: 0).cell == nil)
+}
+
 @Test func HostControlDecodesTheProgramsBracketedPasteMode() throws {
     let on = try decode("""
     {"type":"event","event":{"kind":"changed","session":{"id":"s1","name":"n","cwd":"/","command":[],"cols":80,"rows":24,

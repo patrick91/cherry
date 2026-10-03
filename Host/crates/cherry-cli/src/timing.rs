@@ -37,6 +37,8 @@ pub struct Timing {
     pub reconnect_attempt_ssh: Duration,
     /// See `attach::PASTE_TAIL_WAIT`.
     pub paste_tail_wait: Duration,
+    /// See `settle::SIZE_FILE_WAIT`.
+    pub size_file_wait: Duration,
     /// See `attach::INPUT_HIGH_WATER` (bytes).
     pub input_high_water: usize,
 }
@@ -92,6 +94,10 @@ pub fn timing() -> &'static Timing {
             paste_tail_wait: millis(
                 "CHERRY_CLI_PASTE_TAIL_WAIT_MS",
                 crate::attach::PASTE_TAIL_WAIT,
+            ),
+            size_file_wait: millis(
+                "CHERRY_CLI_SIZE_FILE_WAIT_MS",
+                crate::settle::SIZE_FILE_WAIT,
             ),
             input_high_water: std::env::var("CHERRY_CLI_INPUT_HIGH_WATER")
                 .ok()

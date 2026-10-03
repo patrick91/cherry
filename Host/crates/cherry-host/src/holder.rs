@@ -235,7 +235,7 @@ fn panic_report(session: Option<&str>, at: SystemTime, panic: &str) -> String {
 }
 
 /// The PTY's size: its pixels are the grid's in cells of `cell` pixels, or
-/// 0×0 while no client has given a cell size.
+/// 0×0 while neither the Create nor a client gave a cell size.
 fn size(cols: u16, rows: u16, cell: Option<(u32, u32)>) -> PtySize {
     let (width, height) = cell.unwrap_or((0, 0));
     let pixels = |cells: u16, side: u32| u16::try_from(u32::from(cells) * side).unwrap_or(u16::MAX);
@@ -296,16 +296,15 @@ fn with_ssh_tty(env: &[(Vec<u8>, Vec<u8>)], tty: &Path) -> Vec<(Vec<u8>, Vec<u8>
         .collect()
 }
 
-/// Start the session's program on a new PTY. Returns the master and the
-/// session leader.
+/// Start the session's program on a new PTY of `size`. Returns the master
+/// and the session leader.
 fn spawn(
     command: &[String],
     cwd: &[u8],
     env: &[(Vec<u8>, Vec<u8>)],
-    cols: u16,
-    rows: u16,
+    size: PtySize,
 ) -> Result<(Box<dyn MasterPty + Send>, libc::pid_t)> {
-    let pair = native_pty_system().openpty(size(cols, rows, None))?;
+    let pair = native_pty_system().openpty(size)?;
     let fd = pair
         .master
         .as_raw_fd()
@@ -783,6 +782,7 @@ impl Holder {
         env: &[(Vec<u8>, Vec<u8>)],
         stream: UnixStream,
     ) -> Result<Self> {
+        let cell = launch.cell();
         let link::Launch {
             id,
             name,
@@ -796,6 +796,7 @@ impl Holder {
             kill_grace_ms,
             receipt,
             colors,
+            ..
         } = launch;
         if !valid_size(cols, rows) {
             bail!("terminal size must be 2–500 columns and 1–200 rows");
@@ -804,6 +805,11 @@ impl Holder {
             bail!("no command to launch");
         }
         let mut terminal = Terminal::new(cols, rows, screen::SCROLLBACK_BYTES)?;
+        // The window the session is created for: its program sees that
+        // window's pixels from the start (see `size`).
+        if let Some((width, height)) = cell {
+            terminal.resize_cells(cols, rows, width, height)?;
+        }
         // Kitty images, which snapshots re-send (see `snapshot`).
         terminal.set_image_storage_limit(IMAGE_STORAGE_BYTES)?;
         // What the program is told of its terminal's colours: the app's.
@@ -812,7 +818,7 @@ impl Holder {
         }
         // Before the child exists, so its exit always wakes us.
         let child_exits = signals::child_exits().context("installing the child-exit handler")?;
-        let (master, pid) = spawn(&command, cwd, env, cols, rows)?;
+        let (master, pid) = spawn(&command, cwd, env, size(cols, rows, cell))?;
         let manifest = paths::Manifest {
             id: id.clone(),
             holder_pid: std::process::id(),
@@ -865,7 +871,7 @@ impl Holder {
             display: DisplayStream::default(),
             offset: 0,
             resized_at: None,
-            cell: None,
+            cell,
             images_logged: None,
             pending_input: PendingInput::default(),
             eof: false,

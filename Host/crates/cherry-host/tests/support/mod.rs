@@ -662,6 +662,8 @@ pub fn create_request(request_id: String, command: Vec<String>) -> ClientMessage
         owner: None,
         tags: BTreeMap::new(),
         colors: None,
+        cell_width: None,
+        cell_height: None,
     }
 }
 

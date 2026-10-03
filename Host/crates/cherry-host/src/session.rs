@@ -91,6 +91,9 @@ pub struct Launch {
     /// What the session's terminal reports of its colours (see
     /// `link::Launch`).
     pub colors: Option<cherry_protocol::TerminalColors>,
+    /// The cell size in pixels its terminal and PTY start with (see
+    /// `link::Launch`).
+    pub cell: Option<(u32, u32)>,
 }
 
 pub struct Session {
@@ -594,6 +597,7 @@ impl Session {
             agent_link,
             receipt,
             colors,
+            cell,
         } = launch;
         if !valid_size(cols, rows) {
             bail!("terminal size must be 2–500 columns and 1–200 rows");
@@ -630,11 +634,15 @@ impl Session {
             kill_grace_ms: daemon::config().kill_grace.as_millis() as u64,
             receipt: Some(receipt),
             colors,
+            cell_width: cell.map(|(width, _)| width),
+            cell_height: cell.map(|(_, height)| height),
         };
         let (stream, hello) = start_holder(&host.socket, &launch, &cwd, &env)?;
         let version = hello.version;
-        // A new holder has kept nothing to report.
-        let (session, _) = Self::adopt(host, stream, hello.meta()?, version)?;
+        // A new holder has kept nothing to report. It started with the
+        // cell size of the Create, if it takes one.
+        let cell = cell.filter(|_| version >= link::CELL_SIZE_VERSION);
+        let (session, _) = Self::adopt_with_cell(host, stream, hello.meta()?, version, cell)?;
         Ok(session)
     }
 
@@ -647,6 +655,18 @@ impl Session {
         stream: UnixStream,
         hello: link::HolderHello,
         version: u16,
+    ) -> Result<(Arc<Self>, Vec<SessionEvent>)> {
+        Self::adopt_with_cell(host, stream, hello, version, None)
+    }
+
+    /// `adopt`, for a holder known to have cells of `cell` pixels (one this
+    /// daemon just started with them).
+    fn adopt_with_cell(
+        host: &Arc<Host>,
+        stream: UnixStream,
+        hello: link::HolderHello,
+        version: u16,
+        cell: Option<(u32, u32)>,
     ) -> Result<(Arc<Self>, Vec<SessionEvent>)> {
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(None)?;
@@ -743,7 +763,7 @@ impl Session {
             grid_due: None,
             grid_changed: None,
             typist: None,
-            cell_sent: None,
+            cell_sent: cell,
             next_req: 1,
             requests: BTreeMap::new(),
             waiting: VecDeque::new(),

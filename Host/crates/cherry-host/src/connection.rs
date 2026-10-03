@@ -674,8 +674,20 @@ impl Connection {
                 owner,
                 tags,
                 colors,
+                cell_width,
+                cell_height,
             } => self.create(
-                request_id, name, cwd, command, env, cols, rows, owner, tags, colors,
+                request_id,
+                name,
+                cwd,
+                command,
+                env,
+                cols,
+                rows,
+                owner,
+                tags,
+                colors,
+                cherry_protocol::valid_cell_size(cell_width, cell_height),
             )?,
             ClientMessage::ClearHistory { id } => {
                 let session = self.session(&id)?;
@@ -957,6 +969,7 @@ impl Connection {
         owner: Option<String>,
         tags: BTreeMap<String, String>,
         colors: Option<cherry_protocol::TerminalColors>,
+        cell: Option<(u32, u32)>,
     ) -> Result<ServerMessage> {
         Uuid::parse_str(&request_id).context("request_id must be a UUID")?;
         if name.len() > 256 || cwd.len() > 4096 {
@@ -971,7 +984,8 @@ impl Connection {
         cherry_protocol::check_tags(&tags).map_err(anyhow::Error::msg)?;
         // The size is attachment state, not part of what was launched: a
         // retry from a resized terminal is still the same request. So are
-        // the colours (the app's appearance may change between tries).
+        // the colours (the app's appearance may change between tries), and
+        // the cell size.
         let fingerprint = serde_json::to_string(&(&name, &cwd, &command, &env, &owner, &tags))?;
         if let Some(created) = self.receipt(&request_id, &fingerprint)? {
             return Ok(created);
@@ -1009,6 +1023,7 @@ impl Connection {
                 tags,
                 agent_link: self.host.agent_link(),
                 colors,
+                cell,
                 receipt: link::Receipt {
                     request_id: request_id.clone(),
                     fingerprint: fingerprint.clone(),

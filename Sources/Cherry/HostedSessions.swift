@@ -542,13 +542,26 @@ struct HostedSessionAttachment: Equatable, Sendable {
     /// an adapter launched again (a relaunched surface, a reconnect, an app
     /// that quit without detaching) never leaves a stale client pinning the
     /// session's grid.
-    func arguments(statusFile: URL?, takeover: Bool, sshControlPath: String?, clientID: String? = nil) -> [String] {
+    ///
+    /// `sizeFile` is where the tab says which grid its window settled at
+    /// (`HostedAttachmentSizeFile`): the adapter attaches once its terminal
+    /// has that grid, not at the size Ghostty starts a new surface's child
+    /// at, and passes no resize on while the tab says the window's size is
+    /// changing (a full-screen transition).
+    func arguments(
+        statusFile: URL?,
+        takeover: Bool,
+        sshControlPath: String?,
+        clientID: String? = nil,
+        sizeFile: URL? = nil
+    ) -> [String] {
         var arguments = host.arguments(sshControlPath: sshControlPath)
             + ["--expected-host-id", hostID, "attach", sessionID]
         if takeover { arguments.append("--takeover") }
         arguments += ["--detach-key", "none"]
         if let clientID { arguments += ["--client-id", clientID] }
         if let statusFile { arguments += ["--status-file", statusFile.path] }
+        if let sizeFile { arguments += ["--size-file", sizeFile.path] }
         return arguments
     }
 
@@ -559,9 +572,19 @@ struct HostedSessionAttachment: Equatable, Sendable {
 
     /// `execCommand` for a launch registered with `registerAdapterLaunch`.
     /// Pure: computing it again gives the same command.
-    func execCommand(statusFile: URL?, takeover: Bool, sshControlPath: String?, clientID: String? = nil) -> String {
+    func execCommand(
+        statusFile: URL?,
+        takeover: Bool,
+        sshControlPath: String?,
+        clientID: String? = nil,
+        sizeFile: URL? = nil
+    ) -> String {
         ([executablePath] + arguments(
-            statusFile: statusFile, takeover: takeover, sshControlPath: sshControlPath, clientID: clientID
+            statusFile: statusFile,
+            takeover: takeover,
+            sshControlPath: sshControlPath,
+            clientID: clientID,
+            sizeFile: sizeFile
         ))
             .map(Self.shellQuote).joined(separator: " ")
     }
@@ -723,6 +746,56 @@ struct HostedAdapterLiveStatus: Equatable, Sendable {
     var showsWholeScreen: Bool { !reconnecting && !viewport }
 }
 
+/// `cherry attach --size-file`: what a tab tells its attach adapter of its
+/// window's size, in the adapter's launch directory. A terminal reports
+/// sizes its window never settles at (Ghostty starts a new surface's child
+/// at a default size and gives it the view's a moment later; a window going
+/// into or out of full screen lays its views out on the way), and each one
+/// the adapter passed on would resize the session, which an inline program
+/// such as Claude Code redraws for, leaving blank or repeated rows. The
+/// adapter attaches once its terminal has the grid the file names, and,
+/// after the file said `hold`, resizes the session only once its terminal
+/// has the grid the file names again (each within 3 s).
+enum HostedAttachmentSizeFile {
+    static let fileName = "size.json"
+
+    /// What the file says.
+    enum Content: Equatable, Sendable {
+        /// The window settled at this grid.
+        case grid(TerminalViewportSize)
+        /// The window's size is changing (`TerminalWindowSettling`).
+        case hold
+
+        var json: Data {
+            switch self {
+            case .grid(let size):
+                Data(#"{"cols":\#(size.columns),"rows":\#(size.rows)}"#.utf8)
+            case .hold:
+                Data(#"{"hold":true}"#.utf8)
+            }
+        }
+    }
+
+    /// Replaces the file at `url` with `content`, whole (a temporary file in
+    /// its directory, then a rename): the adapter never reads half of it.
+    /// False when it could not be written (its launch directory is gone).
+    @discardableResult
+    static func write(_ content: Content, to url: URL) -> Bool {
+        let temporary = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(fileName).\(UUID().uuidString)")
+        do {
+            try content.json.write(to: temporary)
+            guard rename(temporary.path, url.path) == 0 else {
+                try? FileManager.default.removeItem(at: temporary)
+                return false
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+}
+
 /// `cherry attach --status-file` reports the adapter's live state while it
 /// runs (`outcome` "attached", with `viewport` and `reconnecting`), and why
 /// it exited (any other outcome) when it ends. Each adapter launch gets a
@@ -801,6 +874,12 @@ enum HostedAttachmentStatusFile {
 
     static func statusFileURL(in directory: URL) -> URL {
         directory.appendingPathComponent(fileName)
+    }
+
+    /// Where a launch's tab tells its adapter which size its window settled
+    /// at (`HostedAttachmentSizeFile`).
+    static func sizeFileURL(in directory: URL) -> URL {
+        directory.appendingPathComponent(HostedAttachmentSizeFile.fileName)
     }
 
     /// Names one adapter launch: its private directory.

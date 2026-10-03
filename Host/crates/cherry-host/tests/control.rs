@@ -190,6 +190,8 @@ fn create(
         owner: None,
         tags: BTreeMap::new(),
         colors: None,
+        cell_width: None,
+        cell_height: None,
     })
 }
 
@@ -902,6 +904,8 @@ exec sleep 60"#,
             owner: None,
             tags: BTreeMap::new(),
             colors,
+            cell_width: None,
+            cell_height: None,
         }))
     };
     let light = colored(
@@ -965,6 +969,8 @@ fn sessions_are_renamed_and_retagged_and_keep_it_across_daemons() {
         owner: Some("tester".into()),
         tags: tags.clone(),
         colors: None,
+        cell_width: None,
+        cell_height: None,
     }));
     let id = session.id.clone();
     let mut control = Control::subscribe(&host);

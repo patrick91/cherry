@@ -59,6 +59,8 @@ fn create_retries_are_idempotent_whatever_the_terminal_size() {
         owner: None,
         tags: BTreeMap::new(),
         colors: None,
+        cell_width: None,
+        cell_height: None,
     };
     let a = match host.call(request(80, 24, "sleep 60")) {
         ServerMessage::Created { session } => session,
@@ -1306,6 +1308,8 @@ fn a_session_created_as_reached_over_ssh_names_its_terminal_in_ssh_tty() {
             owner,
             tags,
             colors,
+            cell_width: None,
+            cell_height: None,
         }) {
             ServerMessage::Created { session } => session,
             other => panic!("create failed: {other:?}"),
@@ -1479,6 +1483,8 @@ fn invalid_protocol_and_launch_do_not_create_sessions() {
         owner: None,
         tags: BTreeMap::new(),
         colors: None,
+        cell_width: None,
+        cell_height: None,
     };
     let error = |message: ServerMessage| match message {
         ServerMessage::Error { message, .. } => message,
@@ -1534,6 +1540,8 @@ fn invalid_protocol_and_launch_do_not_create_sessions() {
         owner: None,
         tags: BTreeMap::new(),
         colors: None,
+        cell_width: None,
+        cell_height: None,
     }))
     .contains("/does/not/exist"));
     assert!(host.sessions().is_empty());
@@ -1809,6 +1817,8 @@ fn sessions_report_their_owner_tags_clients_and_creation_time() {
         owner: owner.map(str::to_string),
         tags,
         colors: None,
+        cell_width: None,
+        cell_height: None,
     };
     let created = match host.call(request(Some("com.example.cherry"), tags.clone())) {
         ServerMessage::Created { session } => session,
@@ -1861,6 +1871,8 @@ fn working_directories_are_expanded_on_the_host() {
             owner: None,
             tags: BTreeMap::new(),
             colors: None,
+            cell_width: None,
+            cell_height: None,
         }) {
             ServerMessage::Created { session } => session,
             other => panic!("{cwd}: {other:?}"),

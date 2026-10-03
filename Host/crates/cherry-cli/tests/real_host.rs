@@ -2275,3 +2275,188 @@ done"#,
     second.master.write_all(&[0x1d]).unwrap();
     assert!(second.wait().success());
 }
+
+impl Attached {
+    /// The terminal changes to `cols` by `rows`, and signals the attachment.
+    fn resize(&self, cols: u16, rows: u16) {
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe { libc::ioctl(self._slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGWINCH) },
+            0
+        );
+    }
+
+    /// Keep reading the terminal for `duration`, as a terminal would.
+    fn read_for(&mut self, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            let mut bytes = [0u8; 16384];
+            match self.master.read(&mut bytes) {
+                Ok(n) => self.received.extend_from_slice(&bytes[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("PTY read failed: {error}"),
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Host {
+    /// The session's grid (columns, rows) and whether a client is attached.
+    fn grid(&self, id: &str) -> ((u64, u64), bool) {
+        let listing = self.json(&["list", "--json"]);
+        let session = listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == id)
+            .unwrap()
+            .clone();
+        (
+            (
+                session["cols"].as_u64().unwrap(),
+                session["rows"].as_u64().unwrap(),
+            ),
+            session["attached"] == true,
+        )
+    }
+
+    fn wait_for_grid(&self, id: &str, cols: u64, rows: u64, attached: &mut Attached) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.grid(id).0 != (cols, rows) {
+            assert!(
+                Instant::now() < deadline,
+                "the session never took {cols}x{rows}: {:?}",
+                self.grid(id)
+            );
+            attached.read_for(Duration::from_millis(20));
+        }
+    }
+}
+
+/// A program that appends each size its terminal is given to `log`, as
+/// "ROWS COLS" (`stty size`), the first when it starts.
+fn size_logger(log: &Path) -> String {
+    format!(
+        r#"trap 'stty size >> "{log}"' WINCH; stty size >> "{log}"; printf 'READY\n'; while :; do sleep 1 & wait $!; done"#,
+        log = log.display()
+    )
+}
+
+fn logged_sizes(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn an_attachment_with_a_size_file_passes_on_only_the_sizes_its_window_settled_at() {
+    let host = Host::start();
+    let directory = private_directory();
+    let log = directory.path().join("sizes.log");
+    let size_file = directory.path().join("size.json");
+    let created = host.json(&[
+        "new",
+        "--cwd",
+        "/tmp",
+        "--name",
+        "Settled",
+        "--",
+        "/bin/sh",
+        "-c",
+        &size_logger(&log),
+    ]);
+    let id = created["id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while logged_sizes(&log).is_empty() {
+        assert!(Instant::now() < deadline, "the program never started");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(logged_sizes(&log), ["32 120"]);
+
+    // The window settles at 100x30; its terminal is still at another size
+    // (Ghostty's for a new surface), which the session never sees.
+    std::fs::write(&size_file, br#"{"cols":100,"rows":30}"#).unwrap();
+    let mut command = host.command_attach(id);
+    command.arg("--size-file").arg(&size_file);
+    let mut attached = Attached::with_command(command, 80, 24);
+    attached.read_for(Duration::from_millis(400));
+    assert_eq!(host.grid(id), ((120, 32), false), "it attached unsettled");
+    attached.resize(100, 30);
+    attached.expect(b"READY");
+    host.wait_for_grid(id, 100, 30, &mut attached);
+
+    // A full-screen transition: the window passes through sizes while the
+    // file says hold, and the host hears only of the one it settles at.
+    std::fs::write(&size_file, br#"{"hold":true}"#).unwrap();
+    attached.resize(70, 20);
+    attached.read_for(Duration::from_millis(150));
+    attached.resize(140, 40);
+    attached.read_for(Duration::from_millis(300));
+    assert_eq!(host.grid(id), ((100, 30), true), "it resized while held");
+    std::fs::write(&size_file, br#"{"cols":140,"rows":40}"#).unwrap();
+    host.wait_for_grid(id, 140, 40, &mut attached);
+    // Settled, it passes resizes on as they come.
+    attached.resize(120, 36);
+    host.wait_for_grid(id, 120, 36, &mut attached);
+    attached.read_for(Duration::from_millis(200));
+    assert_eq!(logged_sizes(&log), ["32 120", "30 100", "40 140", "36 120"]);
+    attached.master.write_all(&[0x1d]).unwrap();
+    assert!(attached.wait().success());
+}
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn a_size_file_that_never_names_the_window_holds_it_back_only_so_long() {
+    let host = Host::start();
+    let directory = private_directory();
+    let log = directory.path().join("sizes.log");
+    let size_file = directory.path().join("size.json");
+    let created = host.json(&[
+        "new",
+        "--cwd",
+        "/tmp",
+        "--name",
+        "Unsettled",
+        "--",
+        "/bin/sh",
+        "-c",
+        &size_logger(&log),
+    ]);
+    let id = created["id"].as_str().unwrap();
+    // No file at all: the attachment waits for it, then attaches at its
+    // terminal's size.
+    let mut command = host.command_attach(id);
+    command
+        .arg("--size-file")
+        .arg(&size_file)
+        .env("CHERRY_CLI_SIZE_FILE_WAIT_MS", "300");
+    let started = Instant::now();
+    let mut attached = Attached::with_command(command, 80, 24);
+    attached.expect(b"READY");
+    host.wait_for_grid(id, 80, 24, &mut attached);
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    // A hold the app never ends holds one resize back for as long, and
+    // none after it.
+    std::fs::write(&size_file, br#"{"hold":true}"#).unwrap();
+    attached.resize(100, 30);
+    attached.read_for(Duration::from_millis(100));
+    assert_eq!(host.grid(id).0, (80, 24));
+    host.wait_for_grid(id, 100, 30, &mut attached);
+    attached.resize(90, 28);
+    host.wait_for_grid(id, 90, 28, &mut attached);
+    attached.master.write_all(&[0x1d]).unwrap();
+    assert!(attached.wait().success());
+}

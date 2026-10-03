@@ -87,10 +87,16 @@ final class ProjectWindowRegistry {
     private(set) var windowFrameStore: ProjectWindowFrameStore?
     private var windowFrameSavers: [String: ProjectWindowFrameSaver] = [:]
     /// Puts a window that was in full screen back into full screen, then
-    /// calls its completion (`WindowFullScreenRestore.enter`). Tests give
-    /// their own, so no test window changes Spaces.
+    /// calls its completion (`WindowFullScreenRestore.enter`). Until then
+    /// its size is settling (`TerminalWindowSettling`): the persistent tabs
+    /// it shows attach at its full-screen size, not at its frame's first.
+    /// Tests give their own, so no test window changes Spaces.
     var enterFullScreen: @MainActor (_ window: NSWindow, _ done: @escaping @MainActor () -> Void) -> Void = { window, done in
-        WindowFullScreenRestore.enter(window, done: done)
+        let settled = TerminalWindowSettling.shared.hold(window)
+        WindowFullScreenRestore.enter(window) {
+            settled()
+            done()
+        }
     }
 
     /// Whether a saved window of another Mac's project (a `ProjectLocation`

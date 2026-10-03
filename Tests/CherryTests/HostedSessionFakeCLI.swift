@@ -74,9 +74,11 @@ struct HostedSessionFakeCLI {
                 --takeover) ;;
                 --detach-key=*) ;;
                 --status-file=*) status_file=${1#*=} ;;
+                --size-file=*) ;;
                 --client-id=*) client_id=${1#*=}; has_client_id=1 ;;
                 --detach-key) takes_value "$1" "$2"; shift ;;
                 --status-file) takes_value "$1" "$2"; status_file=$2; shift ;;
+                --size-file) takes_value "$1" "$2"; shift ;;
                 --client-id) takes_value "$1" "$2"; client_id=$2; has_client_id=1; shift ;;
                 *) fail "unexpected argument '$1' found" ;;
               esac
@@ -152,6 +154,13 @@ struct HostedSessionFakeCLI {
     static func statusFile(of call: String) -> URL? {
         let parts = call.split(separator: " ").map(String.init)
         guard let index = parts.firstIndex(of: "--status-file"), parts.indices.contains(index + 1) else { return nil }
+        return URL(fileURLWithPath: parts[index + 1])
+    }
+
+    /// The `--size-file` of an attach call (a line of `calls`).
+    static func sizeFile(of call: String) -> URL? {
+        let parts = call.split(separator: " ").map(String.init)
+        guard let index = parts.firstIndex(of: "--size-file"), parts.indices.contains(index + 1) else { return nil }
         return URL(fileURLWithPath: parts[index + 1])
     }
 

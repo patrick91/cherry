@@ -390,6 +390,22 @@ Attaching to a session from inside that same session is refused.
   can neither use nor replace, or a host that no longer has the session. The
   Mac app then stops trying to bring the tab back (see
   [Persistent Sessions](#persistent-sessions)).
+- **`--size-file PATH`.** For an app that runs `cherry attach` in a window of
+  its own: `PATH` holds the grid that window settled at,
+  `{"cols":C,"rows":R}`, or `{"hold":true}` while its size is changing (the
+  app replaces the file whole, with a rename). A terminal reports sizes its
+  window never settles at: Ghostty starts a new surface's child at a default
+  size (800×600 pixels) and gives it the view's about 25 ms later, and a
+  window going into or out of full screen lays its views out on the way.
+  Each size passed on resizes the session, and an inline program (one that
+  draws below its output, such as Claude Code) redraws for each, leaving
+  blank or repeated rows. So the attachment attaches only once its terminal
+  reports the grid the file names (a missing file names nothing yet), and
+  after the file said `hold` it sends a resize only once its terminal
+  reports the grid the file names again (the window meanwhile shows the
+  output as it comes); either wait ends after 3 s (`SIZE_FILE_WAIT`), going
+  on with the terminal's size, and a `hold` that outlasted it holds nothing
+  more until the file names a grid. Without a hold, resizes go as they come.
 - **Exit status.** `attach` exits with the session's exit code when the program
   ended, 0 when it detached (also without the host's confirmation) or was
   replaced by another attachment of its client, 1 for
@@ -721,8 +737,10 @@ newer requests evict it; after that the same ID creates a new session.
 Local terminal, command and agent tabs run as persistent sessions on This
 Mac's daemon by default (**Settings › Sessions › Run local terminals as
 persistent sessions**, which applies to new tabs). Each tab's Ghostty surface
-runs `cherry attach … --detach-key none --status-file … --client-id <tab ID>`
-(the attach adapter),
+runs `cherry attach … --detach-key none --status-file … --client-id <tab ID>
+--size-file …` (the attach adapter; the tab keeps its surface's grid in the
+size file, and `hold` while its window goes into or out of full screen, or
+comes back into full screen at launch),
 and the app keeps one `cherry control` connection per host. Quitting Cherry,
 a crash of Cherry or an update leaves the programs running, and each project
 window reopens its saved tabs attached to them. Closing a tab (Cmd-W) ends
@@ -1648,9 +1666,13 @@ window that sets the grid, of those that report one (see
 derives from its terminal's `TIOCGWINSZ` pixels and sends again when only
 they change (a new font size, a display of another scale). The holder also
 gives the program's PTY those pixels (`cols × cell_width` by `rows ×
-cell_height`), which image programs size images by; until a client gave a
-cell size, and for a holder older than link version 8, size replies use
-nominal 8×16 cells and the PTY reports 0×0 pixels. Colour replies (OSC 10, 11 and 12) and the colour-scheme report
+cell_height`), which image programs size images by; until `Create` or a
+client gave a cell size, and for a holder older than link version 8, size
+replies use nominal 8×16 cells and the PTY reports 0×0 pixels. A new cell
+size changes the PTY's pixels, which signals the program, so the Mac app
+creates a session with the cell size of the window it is created for
+(`Create`'s `cell_width` and `cell_height`), and its adapter attaching
+changes nothing. Colour replies (OSC 10, 11 and 12) and the colour-scheme report
 (`CSI ?996n`) use the colours and appearance `Create` named (`colors`; the
 Mac app passes its terminal theme for the appearance it shows), or light
 grey on black and dark without them. Kitty graphics reach renderers
@@ -1774,11 +1796,15 @@ released) and `Ping`, a control connection may send:
 
 `Create` carries `request_id`, `name`, `cwd`, `command`, `env`, `cols`,
 `rows`, and optionally `owner` (at most 256 bytes), `tags` (at most 64,
-keys of 1 to 128 bytes, 16 KiB in all) and `colors` (protocol 7:
+keys of 1 to 128 bytes, 16 KiB in all), `colors` (protocol 7:
 `{"foreground", "background", "cursor", "dark"}`, colours as `#rrggbb`, the
 cursor the foreground's when left out; what the session's terminal reports
-to its program, see above). Like the size, `colors` is not part of what a
-retry with the same `request_id` must repeat.
+to its program, see above) and `cell_width`/`cell_height` (the pixels of a
+cell of the window the session is created for, as `Attach` gives them:
+the program's PTY reports them from the start, so that window attaching
+changes nothing; additive, an older host ignores them). Like the size,
+`colors` and the cell size are not part of what a retry with the same
+`request_id` must repeat.
 
 An attached client must accept a replacement `Attached` snapshot at any time
 (reasons `attach`, `resize`, `resync`) and resume output at its offset. A
@@ -1987,7 +2013,8 @@ and `CHERRY_CLI_*_MS`
 `ESCAPE_WAIT`, `GRID_WAIT`, `RESIZE_COALESCE`, `DETACH_WAIT`, `REPORT_WAIT`,
 `CLOSED_WAIT`, `QUIET_WAIT`, `RECONNECT_WINDOW` (0 never reconnects),
 `RECONNECT_HEALTHY`,
-`RECONNECT_ATTEMPT` and `PASTE_TAIL_WAIT`) and `CHERRY_CLI_INPUT_HIGH_WATER`.
+`RECONNECT_ATTEMPT`, `PASTE_TAIL_WAIT` and `SIZE_FILE_WAIT`) and
+`CHERRY_CLI_INPUT_HIGH_WATER`.
 In `cherry-host`'s tests, `tests/support` has `Host::adopted()` (waits until
 a respawned daemon has no pending holders), `children(pid)` and
 `kill_holder(pid)`, and `tests/holder.rs` guards its holders with `Held`. In

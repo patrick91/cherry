@@ -592,6 +592,20 @@ pub struct Launch {
     /// for the defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub colors: Option<cherry_protocol::TerminalColors>,
+    /// The cell size in pixels the session's terminal and PTY start with
+    /// (`cherry_protocol::ClientMessage::Create`'s), as in `Size`; none
+    /// until a client gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_height: Option<u32>,
+}
+
+impl Launch {
+    /// The cell size, when it came whole.
+    pub fn cell(&self) -> Option<(u32, u32)> {
+        cherry_protocol::valid_cell_size(self.cell_width, self.cell_height)
+    }
 }
 
 #[derive(Serialize, Deserialize)]

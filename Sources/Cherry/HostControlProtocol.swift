@@ -314,6 +314,12 @@ struct HostCreateRequest: Equatable, Sendable {
     /// the program (OSC 10, 11, 12 and `CSI ? 996 n`); nil for the host's
     /// defaults (light grey on black, dark).
     var colors: HostTerminalColors?
+    /// The pixels of one cell of the window the session is created for
+    /// (`cell_width`, `cell_height`): the program's PTY reports them from
+    /// the start, so that window's adapter attaching changes nothing. Nil
+    /// leaves them out (the PTY reports no pixels until a client gives
+    /// some); a host older than the fields ignores them.
+    var cell: TerminalCellSize?
 }
 
 /// `TerminalColors`: the colours a session's terminal reports, as
@@ -395,6 +401,8 @@ struct HostRequest: Encodable, Equatable, Sendable {
         case op, req, version, id, name, cwd, command, env, cols, rows, owner, tags, data, scrollback, colors
         case requestID = "request_id"
         case maxLines = "max_lines"
+        case cellWidth = "cell_width"
+        case cellHeight = "cell_height"
     }
 
     func encode(to encoder: Encoder) throws {
@@ -418,6 +426,8 @@ struct HostRequest: Encodable, Equatable, Sendable {
             try container.encode(create.tags, forKey: .tags)
             // Left out without colours, so the host keeps its defaults.
             try container.encodeIfPresent(create.colors, forKey: .colors)
+            try container.encodeIfPresent(create.cell?.width, forKey: .cellWidth)
+            try container.encodeIfPresent(create.cell?.height, forKey: .cellHeight)
         case .kill(let id), .remove(let id), .clearHistory(let id):
             try container.encode(id, forKey: .id)
         case .sendInput(let id, let data):

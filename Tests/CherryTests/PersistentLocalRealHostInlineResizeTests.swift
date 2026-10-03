@@ -129,10 +129,13 @@ private func resizeInlineTabs(_ host: RealLocalHost, _ tabs: [InlineTab], height
 /// from the size it had when Cherry quit (a full-screen window) to the
 /// window's; shown, it is not resized again. Its screen and scrollback are
 /// then the native tab's after the same sizes: the gap a TUI's own redraw
-/// leaves is the one it leaves in a native tab.
+/// leaves is the one it leaves in a native tab. Each adapter starts with its
+/// terminal at another size, as Ghostty gives a new surface's child at
+/// first (800×600 pixels; resized about 25 ms later, which the adapter
+/// usually, not always, starts after): the sessions never see that size.
 @Test(.enabled(if: inlineResizeRealHostEnabled))
 @MainActor func PersistentLocalRealHostRestoredInlineTUIAttachesAtItsWindowsSizeAsANativeTabWouldShowIt() async throws {
-    let host = try await RealLocalHost()
+    let host = try await RealLocalHost(adapterTerminalStartsAt: (rows: 16, columns: 45))
     let project = host.home.appendingPathComponent("project", isDirectory: true)
     try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
     let store = WorkspaceStateStore(directory: host.root.appendingPathComponent("Workspaces", isDirectory: true))
@@ -247,4 +250,68 @@ private func resizeInlineTabs(_ host: RealLocalHost, _ tabs: [InlineTab], height
         throw error
     }
     await tearDown()
+}
+
+/// A window going into or out of full screen lays its views out on the way
+/// (`TerminalWindowSettling`, between AppKit's `will` and `did`
+/// notifications, which the test posts for its own window: no Space
+/// changes). The persistent tab's adapter holds its resizes meanwhile, so
+/// the session is resized once each time, to the size the window settled
+/// at, and the inline TUI's screen and scrollback end as a native tab's
+/// given only those sizes.
+@Test(.enabled(if: inlineResizeRealHostEnabled))
+@MainActor func PersistentLocalRealHostFullScreenTransitionsResizeTheSessionOnlyToTheSizeTheWindowSettlesAt() async throws {
+    let host = try await RealLocalHost()
+    let workspace = host.workspace()
+    do {
+        let tabs = try await startInlineTabs(host, workspace, mode: "claude-cursor", history: 120)
+        let persistent = tabs[0]
+        #expect(persistent.persistent)
+        let window = try #require(persistent.tab.ghosttyBridge.terminalView.window)
+        for (sizes, starts, ends) in [
+            (
+                [NSSize(width: 900, height: 560), NSSize(width: 1100, height: 760), NSSize(width: 1300, height: 900)],
+                NSWindow.willEnterFullScreenNotification,
+                NSWindow.didEnterFullScreenNotification
+            ),
+            (
+                [NSSize(width: 1000, height: 700), NSSize(width: 800, height: 500)],
+                NSWindow.willExitFullScreenNotification,
+                NSWindow.didExitFullScreenNotification
+            ),
+        ] {
+            let before = mimicSizes(persistent.log)
+            NotificationCenter.default.post(name: starts, object: window)
+            #expect(TerminalWindowSettling.shared.isSettling(window))
+            for size in sizes {
+                host.resize(persistent.tab, to: size)
+                // Longer than the adapter's own coalescing of resizes.
+                try await Task.sleep(for: .milliseconds(150))
+            }
+            #expect(mimicSizes(persistent.log) == before, "resized during \(starts.rawValue)")
+            let metrics = try #require(persistent.tab.ghosttyBridge.gridMetrics)
+            let settled = "\(metrics.rows)x\(metrics.columns)"
+            NotificationCenter.default.post(name: ends, object: window)
+            #expect(!TerminalWindowSettling.shared.isSettling(window))
+            try await host.waitFor("the mimic to redraw at the settled size \(settled)") {
+                mimicSizes(persistent.log).last == settled
+            }
+            try await Task.sleep(for: .milliseconds(500))
+            #expect(mimicSizes(persistent.log) == before + [settled])
+            // A native tab given the size the window settled at shows the
+            // same screen and scrollback.
+            host.resize(tabs[1].tab, to: sizes.last!)
+            try await host.waitFor("the native mimic to redraw at \(settled)") {
+                mimicSizes(tabs[1].log).last == settled
+            }
+            try await Task.sleep(for: .milliseconds(500))
+            #expect(inlineLines(host.screen(persistent.tab)) == inlineLines(host.screen(tabs[1].tab)))
+        }
+    } catch {
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
 }

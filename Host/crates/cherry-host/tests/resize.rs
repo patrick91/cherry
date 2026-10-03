@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 use support::*;
+use uuid::Uuid;
 
 /// A snapshot starts with a reset; the screens-only replacement does not.
 fn is_full(snapshot: &[u8]) -> bool {
@@ -859,6 +860,106 @@ fn a_cell_size_reaches_size_reports_and_the_pty() {
     screen.wait_for(&mut socket, "a report after the detach", |screen| {
         reports(screen, report) == 4
     });
+    host.kill(&session.id);
+}
+
+/// `size_reporter`, which also counts the times its terminal signalled a
+/// change (SIGWINCH): each report ends with ` WINCH:<count>`.
+fn signal_counting_size_reporter() -> Vec<String> {
+    let script = format!(
+        r#"$| = 1;
+my $winch = 0;
+$SIG{{WINCH}} = sub {{ $winch++ }};
+system("stty", "-icanon", "-echo", "min", "1", "time", "0");
+print "READY\n";
+while (1) {{
+    my $read = sysread(STDIN, my $key, 1);
+    next if !defined $read && $!{{EINTR}};
+    last unless $read;
+    next unless $key eq "q";
+    ioctl(STDIN, {}, my $size = "\0" x 8) or die "TIOCGWINSZ: $!";
+    my ($rows, $cols, $width, $height) = unpack("S4", $size);
+    print "PTY:$rows:$cols:$width:$height WINCH:$winch\n";
+}}"#,
+        libc::TIOCGWINSZ
+    );
+    vec!["perl".into(), "-e".into(), script]
+}
+
+#[test]
+fn a_session_created_for_a_window_has_its_pixels_and_that_window_attaching_changes_nothing() {
+    let host = Host::new();
+    let ClientMessage::Create {
+        request_id,
+        name,
+        cwd,
+        command,
+        env,
+        owner,
+        tags,
+        colors,
+        ..
+    } = create_request(Uuid::new_v4().to_string(), signal_counting_size_reporter())
+    else {
+        unreachable!()
+    };
+    let session = match host.call(ClientMessage::Create {
+        request_id,
+        name,
+        cwd,
+        command,
+        env,
+        cols: 80,
+        rows: 24,
+        owner,
+        tags,
+        colors,
+        cell_width: Some(10),
+        cell_height: Some(21),
+    }) {
+        ServerMessage::Created { session } => session,
+        other => panic!("create failed: {other:?}"),
+    };
+    // The window it was created for attaches: same grid, same cells.
+    let mut socket = host.connect();
+    send(
+        &mut socket,
+        &ClientMessage::Attach {
+            id: session.id.clone(),
+            cols: 80,
+            rows: 24,
+            takeover: false,
+            answers_queries: true,
+            client_id: None,
+            cell_width: Some(10),
+            cell_height: Some(21),
+        },
+    );
+    let ServerMessage::Attached {
+        offset, snapshot, ..
+    } = receive(&mut socket)
+    else {
+        panic!("attach failed")
+    };
+    let mut screen = Screen::new(80, 24, offset, &snapshot);
+    screen.wait_text(&mut socket, "READY");
+    // A signal on its way has arrived by now.
+    thread::sleep(Duration::from_millis(300));
+    input(&mut socket, b"q");
+    screen.wait_text(&mut socket, "PTY:24:80:800:504 WINCH:0");
+    // Its own cells answer size queries too, and a change still signals.
+    send(
+        &mut socket,
+        &ClientMessage::Resize {
+            cols: 80,
+            rows: 24,
+            cell_width: Some(9),
+            cell_height: Some(18),
+        },
+    );
+    thread::sleep(Duration::from_millis(200));
+    input(&mut socket, b"q");
+    screen.wait_text(&mut socket, "PTY:24:80:720:432 WINCH:1");
     host.kill(&session.id);
 }
 

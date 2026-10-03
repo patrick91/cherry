@@ -43,10 +43,15 @@ final class RealLocalHost {
     }
 
     /// `shellPath`: the shell tabs run (the user's own startup files are
-    /// never read: HOME is private).
+    /// never read: HOME is private). `adapterTerminalStartsAt`: each attach
+    /// adapter finds its terminal at this size (rows, columns) when it
+    /// starts, and the size Ghostty gave it 300 ms later, as one does when
+    /// it starts before Ghostty gave a new surface's child its view's size
+    /// (it starts it at 800×600 pixels, and resizes it about 25 ms later).
     init(
         shellPath: String = "/bin/bash",
-        configuration: PersistentLocalSessions.Configuration = PersistentLocalSessions.Configuration()
+        configuration: PersistentLocalSessions.Configuration = PersistentLocalSessions.Configuration(),
+        adapterTerminalStartsAt interim: (rows: Int, columns: Int)? = nil
     ) async throws {
         let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -61,11 +66,34 @@ final class RealLocalHost {
             },
             "Build the Rust helpers first: cargo build --manifest-path Host/Cargo.toml --locked --bins"
         )
-        let cliURL = binaries.appendingPathComponent("cherry")
+        var cliURL = binaries.appendingPathComponent("cherry")
         // Private (0700, as the CLI requires) and short enough for a socket.
         root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ch-pl-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        if let interim {
+            let wrapper = root.appendingPathComponent("cherry")
+            let quoted = "'" + cliURL.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+            try """
+            #!/bin/sh
+            case " $* " in
+            *" attach "*)
+              settled=$(/bin/stty size 2>/dev/null)
+              if [ -n "$settled" ]; then
+                /bin/stty rows \(interim.rows) cols \(interim.columns)
+                # A background job's own input is /dev/null: the terminal's
+                # goes in on descriptor 3.
+                exec 3<&0
+                (/bin/sleep 0.3; /bin/stty rows "${settled% *}" cols "${settled#* }" <&3) &
+                exec 3<&-
+              fi ;;
+            esac
+            exec \(quoted) "$@"
+
+            """.write(to: wrapper, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: wrapper.path)
+            cliURL = wrapper
+        }
         home = root.appendingPathComponent("home", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         socket = root.appendingPathComponent("host.sock")

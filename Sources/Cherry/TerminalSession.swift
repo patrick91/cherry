@@ -1218,7 +1218,22 @@ final class TerminalWorkspace: ObservableObject {
                 guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return nil }
                 return self.mountedTerminalSize
             }
+            session.windowTerminalCell = { [weak self, weak session] grid in
+                guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return nil }
+                return self.terminalCell(forGrid: grid)
+            }
         }
+    }
+
+    /// The cell size, in pixels, that a terminal of `grid` in this
+    /// workspace's window reports to its program, from a tab whose surface
+    /// has that grid (`TerminalSession.terminalCell(forGrid:)`), the
+    /// selected tab's first. Tabs of one window share its font and display,
+    /// and one of the same grid has the same pixels as a rule. Nil when
+    /// none has.
+    func terminalCell(forGrid grid: TerminalViewportSize) -> TerminalCellSize? {
+        let candidates = (selectedSession.map { [$0] } ?? []) + sessions
+        return candidates.lazy.compactMap { $0.terminalCell(forGrid: grid) }.first
     }
 
     /// The grid of a terminal this workspace's window shows now (see
@@ -3543,6 +3558,12 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// The SSH master the latest adapter launch of an SSH-hosted tab shares,
     /// registered once for that launch in `startShell`; nil for its own ssh.
     private var hostedLaunchSSHControlPath: String?
+    /// `--size-file` of the latest adapter launch, in its private directory:
+    /// where the tab tells the adapter which grid its window settled at
+    /// (`HostedAttachmentSizeFile`, `announceAdapterWindowSize`), and what
+    /// it said last.
+    private var hostedLaunchSizeFile: URL?
+    private var announcedAdapterWindowSize: HostedAttachmentSizeFile.Content?
     /// The latest adapter's outcome may be resumed by launching it again
     /// (`HostedAttachmentStatusFile.isRetryable`).
     private var hostedLaunchRetryable = false
@@ -3859,6 +3880,35 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// instead of Ghostty's default for a detached surface and then the
     /// window's when shown (two resizes, each redrawn by the program).
     var detachedSurfaceSize: (@MainActor () -> CGSize?)?
+    /// Set by the workspace showing the tab, as `detachedSurfaceSize`: the
+    /// cell size, in pixels, a terminal of the given grid its window shows
+    /// reports to its program (`TerminalWorkspace.terminalCell(forGrid:)`).
+    /// A persistent tab's Create passes it on (`PersistentSessionRequest.cell`),
+    /// so the program's PTY has the pixels its adapter will report, and the
+    /// adapter attaching changes nothing (new pixels alone signal the
+    /// program, which may redraw).
+    var windowTerminalCell: (@MainActor (TerminalViewportSize) -> TerminalCellSize?)?
+
+    /// The cell size this tab's terminal reports to a program at `grid`
+    /// (`GhosttySessionBridge.terminalWindowSize`), while its surface has
+    /// that grid.
+    func terminalCell(forGrid grid: TerminalViewportSize) -> TerminalCellSize? {
+        guard let size = ghosttyBridgeStorage?.terminalWindowSize,
+              size.columns == grid.columns, size.rows == grid.rows
+        else { return nil }
+        return size.cell
+    }
+
+    /// Tells the running attach adapter which size its window settled at,
+    /// or that it is changing (`HostedAttachmentSizeFile`); its surface's
+    /// bridge calls this as the surface's grid or its window changes. A tab
+    /// without an adapter launch says nothing.
+    func announceAdapterWindowSize(_ content: HostedAttachmentSizeFile.Content) {
+        guard let file = hostedLaunchSizeFile, content != announcedAdapterWindowSize else { return }
+        if HostedAttachmentSizeFile.write(content, to: file) {
+            announcedAdapterWindowSize = content
+        }
+    }
 
     /// The grid of this tab's terminal while a window shows it.
     var mountedTerminalGrid: TerminalViewportSize? {
@@ -5677,7 +5727,8 @@ final class TerminalSession: ObservableObject, Identifiable {
                     // after one swap. A surface is freed (its adapter killed
                     // and waited for) before the next one launches
                     // (`GhosttySessionBridge.relaunchNativeSurface`).
-                    clientID: id.uuidString
+                    clientID: id.uuidString,
+                    sizeFile: hostedLaunchSizeFile
                 ),
                 attachment.adapterEnvironment
             )
@@ -5711,6 +5762,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         // Each adapter launch reports through its own fresh status file.
         hostedPendingStatusDirectory = try? HostedAttachmentStatusFile.makeLaunchDirectory()
         hostedLaunchStatusFile = hostedPendingStatusDirectory.map(HostedAttachmentStatusFile.statusFileURL(in:))
+        // The new surface says its grid as it is built; a window whose size
+        // is changing says so first, so that the adapter waits for it.
+        hostedLaunchSizeFile = hostedPendingStatusDirectory.map(HostedAttachmentStatusFile.sizeFileURL(in:))
+        announcedAdapterWindowSize = nil
+        ghosttyBridgeStorage?.announceAdapterWindowSize()
         if let directory = hostedPendingStatusDirectory {
             watchAdapterStatus(in: directory)
         }
@@ -5998,6 +6054,9 @@ final class TerminalSession: ObservableObject, Identifiable {
                     var request = request
                     request.columns = self.viewportSize.columns
                     request.rows = self.viewportSize.rows
+                    // With the pixels its window's terminal of that grid
+                    // reports, which its adapter will.
+                    request.cell = self.windowTerminalCell?(self.viewportSize)
                     launch = try await hosting.create(request, configuration: configuration)
                 }
             } catch {

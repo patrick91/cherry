@@ -721,6 +721,84 @@ private func fixtureSession() throws -> HostedSessionInfo {
     #expect(removed.actions == [.closeTab(enabled: false)])
 }
 
+/// The attach adapter is told which grid its window settled at
+/// (`--size-file`, `HostedAttachmentSizeFile`): the surface's, as it is
+/// built and whenever it changes, and `hold` while the window that shows it
+/// goes into or out of full screen (`TerminalWindowSettling`; the test
+/// posts AppKit's notifications for its own window, which changes no
+/// Space).
+@Test @MainActor func HostedSessionAdapterIsToldTheGridItsWindowSettledAt() async throws {
+    let cli = try HostedSessionFakeCLI()
+    let workspace = TerminalWorkspace(createInitialSession: false)
+    let attachment = HostedSessionAttachment(
+        host: try .ssh("devbox"), hostID: "host-a", sessionID: "session-123",
+        name: "Editor", remoteWorkingDirectory: "/remote/project", executablePath: cli.executable.path,
+        environment: [:]
+    )
+    let session = workspace.attachHostedSession(attachment)
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    let window = NSWindow(contentRect: container.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    window.contentView = container
+    container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
+    window.orderFrontRegardless()
+    defer {
+        NotificationCenter.default.post(name: NSWindow.didExitFullScreenNotification, object: window)
+        workspace.closeAllSessions()
+        container.detachActiveSession()
+        window.close()
+        cli.cleanUp()
+    }
+    let deadline = Date().addingTimeInterval(5)
+    while cli.calls.first(where: { $0.contains(" attach ") }) == nil, Date() < deadline {
+        try await Task.sleep(for: .milliseconds(25))
+    }
+    let launch = try #require(cli.calls.first(where: { $0.contains(" attach ") }))
+    let sizeFile = try #require(HostedSessionFakeCLI.sizeFile(of: launch))
+    let statusFile = try #require(HostedSessionFakeCLI.statusFile(of: launch))
+    // In the launch's own private directory.
+    #expect(sizeFile.deletingLastPathComponent() == statusFile.deletingLastPathComponent())
+    func said() -> String? { try? String(contentsOf: sizeFile, encoding: .utf8) }
+    func grid() throws -> String {
+        let metrics = try #require(session.ghosttyBridge.gridMetrics)
+        return #"{"cols":\#(metrics.columns),"rows":\#(metrics.rows)}"#
+    }
+    #expect(said() == (try grid()))
+
+    // The window resizes: the new grid.
+    let before = try grid()
+    window.setContentSize(NSSize(width: 900, height: 600))
+    container.layoutSubtreeIfNeeded()
+    #expect(try grid() != before)
+    #expect(said() == (try grid()))
+
+    // Into full screen: hold while its views pass through sizes, then the
+    // grid it settled at.
+    NotificationCenter.default.post(name: NSWindow.willEnterFullScreenNotification, object: window)
+    #expect(said() == #"{"hold":true}"#)
+    for size in [NSSize(width: 1000, height: 650), NSSize(width: 1200, height: 800)] {
+        window.setContentSize(size)
+        container.layoutSubtreeIfNeeded()
+        #expect(said() == #"{"hold":true}"#)
+    }
+    NotificationCenter.default.post(name: NSWindow.didEnterFullScreenNotification, object: window)
+    #expect(said() == (try grid()))
+
+    // Another window's transition holds nothing here.
+    let other = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200), styleMask: [.borderless], backing: .buffered, defer: false)
+    other.isReleasedWhenClosed = false
+    NotificationCenter.default.post(name: NSWindow.willExitFullScreenNotification, object: other)
+    #expect(said() == (try grid()))
+    NotificationCenter.default.post(name: NSWindow.didExitFullScreenNotification, object: other)
+
+    // A surface taken out of a window that settles keeps its size, which
+    // it says.
+    NotificationCenter.default.post(name: NSWindow.willExitFullScreenNotification, object: window)
+    #expect(said() == #"{"hold":true}"#)
+    container.detachActiveSession(clearsSession: false, releasesBridge: false, preservingSurface: true)
+    #expect(said() == (try grid()))
+}
+
 @Test @MainActor func HostedSessionNativeAdapterReportsOutcomesAndNeverReconnectsAnEndedSession() async throws {
     let cli = try HostedSessionFakeCLI()
     let workspace = TerminalWorkspace(createInitialSession: false)

@@ -497,6 +497,18 @@ pub enum ClientMessage {
         /// (like the size).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         colors: Option<TerminalColors>,
+        /// The size of one cell, in pixels, of the window the session is
+        /// created for (`valid_cell_size`, as `Attach` gives it; both or
+        /// neither): the program's PTY reports those pixels from the start,
+        /// so a window of that grid and cell size attaching later changes
+        /// nothing (a change of the pixels alone signals the program too).
+        /// Without them the PTY reports 0×0 pixels until a client gives a
+        /// cell size. A host older than the fields ignores them; like the
+        /// size, not part of what a retry must repeat.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell_width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cell_height: Option<u32>,
     },
     Attach {
         id: String,
@@ -2566,6 +2578,8 @@ mod tests {
                 owner: Some("com.example.cherry".into()),
                 tags: BTreeMap::from([("tab".into(), "6d1f".into())]),
                 colors: None,
+                cell_width: None,
+                cell_height: None,
             },
             ClientMessage::Create {
                 request_id: "d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3c".into(),
@@ -2583,6 +2597,8 @@ mod tests {
                     cursor: None,
                     dark: false,
                 }),
+                cell_width: None,
+                cell_height: None,
             },
             ClientMessage::Attach {
                 id: "s".into(),
@@ -3081,6 +3097,8 @@ mod tests {
             owner: None,
             tags: BTreeMap::new(),
             colors,
+            cell_width: None,
+            cell_height: None,
         };
         assert_eq!(
             json(&create(Some(TerminalColors {
@@ -3140,6 +3158,35 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SessionInfo>(&json(&lost)).unwrap(),
             lost
+        );
+    }
+
+    #[test]
+    fn a_create_names_its_windows_cell_size_only_when_it_has_one() {
+        let create = |cell: Option<(u32, u32)>| ClientMessage::Create {
+            request_id: "r".into(),
+            name: "n".into(),
+            cwd: "/".into(),
+            command: Vec::new(),
+            env: BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            owner: None,
+            tags: BTreeMap::new(),
+            colors: None,
+            cell_width: cell.map(|(width, _)| width),
+            cell_height: cell.map(|(_, height)| height),
+        };
+        assert_eq!(
+            json(&create(Some((10, 21)))),
+            r#"{"op":"create","request_id":"r","name":"n","cwd":"/","command":[],"env":{},"cols":80,"rows":24,"owner":null,"tags":{},"cell_width":10,"cell_height":21}"#
+        );
+        // Left out without one, so an older host sees what it knows.
+        let without = json(&create(None));
+        assert!(!without.contains("cell_"), "{without}");
+        assert_eq!(
+            serde_json::from_str::<ClientMessage>(&without).unwrap(),
+            create(None)
         );
     }
 

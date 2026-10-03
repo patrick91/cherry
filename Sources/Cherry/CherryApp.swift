@@ -891,6 +891,10 @@ struct CherryApp: App {
     init() {
         LaunchTimeline.isEnabled = true
         LaunchTimeline.mark("app init")
+        // Launched from a Cherry tab (`open`, a script): its identity must
+        // not reach this app's tabs, whose adapters would refuse to attach
+        // that tab's session as "from inside itself".
+        CherryTabEnvironment.removeFromProcess()
         RemoteViewCrashGuard.installIfNeeded()
         // Helpers and adapters start with the last run's login environment
         // while this run's is captured (`LoginEnvironmentCache`).

@@ -404,6 +404,13 @@ enum CherryTabEnvironment {
         "CHERRY_ORIGINAL_ZDOTDIR", "CHERRY_STARTUP_COMMAND", "CHERRY_EMIT_OSC133",
         "CHERRY_TERM_PROGRAM", "INSIDE_CHERRY"
     ]
+
+    /// Clears `keys` from this process, for the app launched from inside a
+    /// Cherry tab: everything it starts inherits its environment, including
+    /// the native and adapter surfaces Ghostty spawns.
+    static func removeFromProcess() {
+        for key in keys { unsetenv(key) }
+    }
 }
 
 /// The account a session runs as, from the passwd database.

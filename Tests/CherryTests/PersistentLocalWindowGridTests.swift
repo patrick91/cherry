@@ -215,7 +215,9 @@ private func gridWorkspace(_ harness: PersistentHarness, wait: TerminalWindowGri
 @Test @MainActor func persistentLocalWindowGridTabClosedWhileItsWindowSettlesCreatesNothing() async throws {
     let harness = try PersistentHarness()
     let workspace = gridWorkspace(harness, wait: TerminalWindowGridWait(
-        quietPeriod: .milliseconds(200), maximumWait: .milliseconds(600), maximumSettlingWait: .seconds(1)
+        // A maximum wait a CI stall before the close cannot use up; the
+        // check after the close outlasts it, so a Create would show.
+        quietPeriod: .milliseconds(200), maximumWait: .seconds(2), maximumSettlingWait: .seconds(3)
     ))
     defer {
         workspace.closeAllSessions(intent: .windowClosed)
@@ -224,7 +226,7 @@ private func gridWorkspace(_ harness: PersistentHarness, wait: TerminalWindowGri
     let tab = workspace.addSession(title: "Gone")
     try await Task.sleep(for: .milliseconds(100))
     workspace.close(tab, allowEmptyWorkspace: true)
-    try await Task.sleep(for: .milliseconds(900))
+    try await Task.sleep(for: .milliseconds(2_500))
     #expect(harness.creates().isEmpty)
     #expect(harness.fake.requests("kill").isEmpty)
 }
@@ -232,7 +234,7 @@ private func gridWorkspace(_ harness: PersistentHarness, wait: TerminalWindowGri
 @Test @MainActor func persistentLocalWindowGridTabNoWindowShowsIsCreatedAtItsOwnGridAfterTheMaximumWait() async throws {
     let harness = try PersistentHarness()
     let workspace = gridWorkspace(harness, wait: TerminalWindowGridWait(
-        quietPeriod: .milliseconds(100), maximumWait: .milliseconds(500), maximumSettlingWait: .seconds(1)
+        quietPeriod: .milliseconds(100), maximumWait: .milliseconds(1_500), maximumSettlingWait: .seconds(3)
     ))
     defer {
         workspace.closeAllSessions(intent: .windowClosed)
@@ -241,7 +243,7 @@ private func gridWorkspace(_ harness: PersistentHarness, wait: TerminalWindowGri
     let added = ContinuousClock.now
     let tab = workspace.addSession(title: "Unseen")
     #expect(await harness.fake.wait { !harness.creates().isEmpty })
-    #expect(ContinuousClock.now - added >= .milliseconds(500))
+    #expect(ContinuousClock.now - added >= .milliseconds(1_500))
     #expect(createdGrid(try #require(harness.creates().first)).grid == TerminalViewportSize(columns: 120, rows: 32))
     #expect(await harness.waitUntilAttached(tab))
 
@@ -251,7 +253,8 @@ private func gridWorkspace(_ harness: PersistentHarness, wait: TerminalWindowGri
     let quick = ContinuousClock.now
     _ = unwaited.addSession(title: "Quick")
     #expect(await harness.fake.wait { harness.creates().count == 2 })
-    #expect(ContinuousClock.now - quick < .milliseconds(500))
+    // Well short of the waited tab's 1.5 s, with room for a slow runner.
+    #expect(ContinuousClock.now - quick < .milliseconds(1_000))
 }
 
 @Test @MainActor func persistentLocalWindowGridWaitsForASettlingWindowAndTakesTheGridItSettlesAt() async throws {
@@ -319,7 +322,8 @@ private func gridWorkspace(_ harness: PersistentHarness, wait: TerminalWindowGri
         backendPolicy: .remote(
             hosting, settings: { .defaults }, hostReconnects: nil,
             windowGridWait: TerminalWindowGridWait(
-                quietPeriod: .milliseconds(250), maximumWait: .seconds(4), maximumSettlingWait: .seconds(6)
+                // Far longer than the test's own steps (see the first-tab test).
+                quietPeriod: .milliseconds(1_500), maximumWait: .seconds(8), maximumSettlingWait: .seconds(10)
             )
         )
     )

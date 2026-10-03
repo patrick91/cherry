@@ -938,7 +938,7 @@ pub mod link {
     pub const PACE: u8 = 76;
     pub const CLEAR_HISTORY: u8 = 77;
     /// What this build's daemon and holders speak.
-    pub const VERSION: u16 = 8;
+    pub const VERSION: u16 = 9;
 
     #[derive(Debug)]
     pub struct Frame {

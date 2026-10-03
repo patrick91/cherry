@@ -250,7 +250,11 @@ For a physical terminal whose size differs from the canonical grid:
 
 ## Limits
 
-- Terminal graphics (kitty images) are not restored.
+- Of the kitty images, only those of the active screen's placements on
+  screen are re-sent (`graphics_replay`, after a snapshot's or
+  `refresh_with`'s content; `viewport_graphics` for a window that shows
+  part of the screen); see the
+  [host guide](../../README.md#kitty-graphics) for what is not.
 - Palette and dynamic colour changes (OSC 4/10/11/12), the working directory
   (OSC 7) and the title are not exported; `title()` and `pwd()` give the
   last two.

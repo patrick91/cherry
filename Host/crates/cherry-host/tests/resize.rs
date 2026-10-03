@@ -8,7 +8,7 @@ use cherry_vt::{Inspection, Terminal};
 use std::{
     fs,
     os::unix::net::UnixStream,
-    path::Path,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -1009,4 +1009,141 @@ fn an_image_whose_transmission_a_snapshot_cuts_in_two_arrives_whole() {
     assert_eq!(graphics.len(), 1, "{graphics:?}");
     assert!(graphics[0].starts_with("image 5 [2x1 "), "{graphics:?}");
     host.kill(&session.id);
+}
+
+/// A 1×1 RGBA PNG.
+const PNG: [u8; 70] = [
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64, 0x60, 0xf8, 0x5f,
+    0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47, 0xba, 0x92, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+#[test]
+fn the_holder_reads_images_in_files_and_sends_them_on_directly() {
+    assert!(cherry_vt::decode_rgba(&PNG).is_ok());
+    let host = Host::new();
+    // A temporary file in /tmp, which the holder deletes once read, and a
+    // file that is not there.
+    let temporary = PathBuf::from(format!(
+        "/tmp/tty-graphics-protocol-cherry-test-{}.png",
+        Uuid::new_v4()
+    ));
+    std::fs::write(&temporary, PNG).unwrap();
+    let path = |path: &str| String::from_utf8(cherry_vt::base64(path.as_bytes())).unwrap();
+    // Each command's reply, as the program read it (ESC shown as `^`).
+    let read_reply = r#"perl -e 'my $r = ""; while (sysread(STDIN, my $c, 1)) { $r .= $c; last if $r =~ /\e\\$/ } $r =~ s/\e/^/g; print "REPLY:$r\r\n"'"#;
+    let session = host.create(shell(&format!(
+        "stty -echo; IFS= read -r go; stty raw; \
+         printf '\\033_Ga=T,f=100,t=t,i=5;{}\\033\\\\'; {read_reply}; \
+         printf '\\033_Ga=t,f=100,t=f,i=6;{}\\033\\\\'; {read_reply}; \
+         printf 'DONE\\r\\n'; exec sleep 60",
+        path(temporary.to_str().unwrap()),
+        path("/nonexistent/cherry/image.png"),
+    )));
+    let (mut socket, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut renderer = image_renderer(80, 24, &snapshot);
+    let mut received = Vec::new();
+    let mut at = offset;
+    input(&mut socket, b"go\n");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !renderer.screen_text().unwrap().contains("DONE") {
+        assert!(
+            Instant::now() < deadline,
+            "no DONE: {:?}",
+            renderer.screen_text()
+        );
+        match receive(&mut socket) {
+            ServerMessage::Output { offset, data } => {
+                assert_eq!(offset, at);
+                at += data.len() as u64;
+                assert!(renderer.feed(&data).is_empty(), "q=2");
+                received.extend_from_slice(&data);
+            }
+            ServerMessage::Pong => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let text = renderer.screen_text().unwrap();
+    // The host's terminal decoded the image and answered; the file is gone.
+    assert!(text.contains("REPLY:^_Gi=5;OK^\\"), "{text}");
+    assert!(
+        text.contains("REPLY:^_Gi=6;ENOENT: cannot open the file: no such file or directory^\\"),
+        "{text}"
+    );
+    assert!(!temporary.exists());
+    // The renderer got the PNG itself, quietly, and nothing of the file.
+    let direct = format!(
+        "\x1b_Ga=T,f=100,i=5,q=2;{}\x1b\\",
+        String::from_utf8(cherry_vt::base64(&PNG)).unwrap()
+    );
+    let received = String::from_utf8_lossy(&received);
+    assert!(received.contains(&direct), "{received:?}");
+    assert_eq!(received.matches("\x1b_G").count(), 1, "{received:?}");
+    let graphics = renderer.inspect().unwrap().graphics;
+    assert_eq!(graphics.len(), 1, "{graphics:?}");
+    assert!(graphics[0].starts_with("image 5 [1x1 "), "{graphics:?}");
+    host.kill(&session.id);
+}
+
+/// The snapshot of the next `Attached` on `socket`, with its reason.
+fn next_replacement(socket: &mut UnixStream) -> (AttachReason, Vec<u8>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "no replacement");
+        if let ServerMessage::Attached {
+            reason, snapshot, ..
+        } = receive(socket)
+        {
+            return (reason, snapshot);
+        }
+    }
+}
+
+#[test]
+fn a_window_that_paints_a_viewport_gets_the_images_with_its_screens() {
+    let host = Host::new();
+    // Image 9, placed virtually, and its placeholder cell.
+    let session = host.create(shell(
+        "stty -echo; printf '\\033_Ga=T,U=1,f=24,s=1,v=1,i=9,c=1,r=1;AQID\\033\\\\'; \
+         printf '\\033[38;5;9m\\364\\216\\273\\256\\314\\205\\314\\205\\033[m READY\\r\\n'; exec sleep 60",
+    ));
+    let (mut small, _, offset, snapshot) = host.attach(&session.id, 80, 24);
+    let mut screen = Screen::new(80, 24, offset, &snapshot);
+    screen.wait_text(&mut small, "READY");
+    let (mut large, _, _, snapshot) = host.attach(&session.id, 100, 30);
+    assert!(contains(&snapshot, b"\x1b_Ga=t,i=9,"));
+    // The small window shrinks the grid: it keeps showing the stream and
+    // its own images, and the large one, which paints a viewport, gets
+    // screens that bring them.
+    send(
+        &mut small,
+        &ClientMessage::Resize {
+            cols: 70,
+            rows: 20,
+            cell_width: None,
+            cell_height: None,
+        },
+    );
+    let (reason, viewport) = next_replacement(&mut large);
+    assert_eq!(reason, AttachReason::Resize);
+    assert!(!is_full(&viewport));
+    let at = |needle: &[u8]| {
+        viewport
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap_or_else(|| panic!("{:?} missing", String::from_utf8_lossy(needle)))
+    };
+    assert!(at(cherry_vt::IMAGE_RESET) < at(b"\x1b_Ga=t,i=9,"));
+    assert!(at(b"\x1b_Ga=t,i=9,") < at(b"\x1b_Ga=p,U=1,i=9,c=1,r=1,q=2\x1b\\"));
+    let (_, streamed) = next_replacement(&mut small);
+    assert!(!contains(&streamed, b"\x1b_G"), "{streamed:?}");
+    host.kill(&session.id);
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }

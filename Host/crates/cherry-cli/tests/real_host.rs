@@ -2460,3 +2460,118 @@ fn a_size_file_that_never_names_the_window_holds_it_back_only_so_long() {
     attached.master.write_all(&[0x1d]).unwrap();
     assert!(attached.wait().success());
 }
+
+/// A 1×1 RGBA PNG.
+const PNG: [u8; 70] = [
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64, 0x60, 0xf8, 0x5f,
+    0x0f, 0x00, 0x02, 0x87, 0x01, 0x80, 0xeb, 0x47, 0xba, 0x92, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn an_image_a_program_sends_from_a_file_reaches_the_window_as_direct_chunks() {
+    let host = Host::start();
+    let directory = private_directory();
+    let image = directory.path().join("image.png");
+    std::fs::write(&image, PNG).unwrap();
+    let path = String::from_utf8(cherry_vt::base64(image.to_str().unwrap().as_bytes())).unwrap();
+    // Sent once a window is attached (one attaching later gets no image
+    // that nothing places).
+    let script = format!(
+        "stty -echo; printf 'READY\\n'; IFS= read -r go; \
+         printf '\\033_Ga=t,f=100,t=f,i=5;{path}\\033\\\\'; printf 'DONE\\n'; exec sleep 60"
+    );
+    let created = host.json(&[
+        "new", "--cwd", "/tmp", "--name", "File", "--", "/bin/sh", "-c", &script,
+    ]);
+    let id = created["id"].as_str().unwrap();
+    let mut attached = Attached::new(&host, id, 80, 24);
+    attached.expect(b"READY");
+    attached.master.write_all(b"go\n").unwrap();
+    attached.expect(b"DONE");
+    // The holder read the file: the window gets the PNG itself, quietly,
+    // and never the file's path.
+    let png = String::from_utf8(cherry_vt::base64(&PNG)).unwrap();
+    attached.expect(format!("\x1b_Ga=t,f=100,i=5,q=2;{png}\x1b\\").as_bytes());
+    assert!(!attached.shows(b"t=f"));
+    assert!(!attached.shows(path.as_bytes()));
+    attached.master.write_all(&[0x1d]).unwrap();
+    assert!(attached.wait().success());
+    assert!(image.exists(), "a file (t=f) is the program's to keep");
+}
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn a_window_that_paints_a_viewport_gets_images_but_no_placement_at_the_sessions_cursor() {
+    let host = Host::start();
+    // Image 7 placed at the cursor (row 2) by `a=T`; image 9 transmitted,
+    // placed virtually with its placeholder cells (row 3), and placed at
+    // the cursor (row 4) by `a=p`.
+    let script = r#"stty -echo; printf 'READY\n'; IFS= read -r go
+printf '\033_Ga=T,f=24,s=1,v=1,i=7,C=1;AQID\033\\\r\n'
+printf '\033_Ga=t,f=24,s=2,v=1,i=9;AQIDBAUG\033\\\033_Ga=p,U=1,i=9,c=2,r=1\033\\'
+printf '\033[38;5;9m\364\216\273\256\314\205\314\205\364\216\273\256\314\205\314\215\033[m\r\n'
+printf '\033_Ga=p,i=9,p=3,C=1\033\\DONE\n'
+exec sleep 60"#;
+    let created = host.json(&[
+        "new", "--cwd", "/tmp", "--name", "Viewport", "--", "/bin/sh", "-c", script,
+    ]);
+    let id = created["id"].as_str().unwrap();
+    let mut tall = Attached::new(&host, id, 80, 24);
+    tall.expect(b"READY");
+    // A shorter, wider window: the grid takes 80x20, and this window
+    // paints a viewport of it.
+    let mut short = Attached::new(&host, id, 100, 20);
+    short.expect(b"READY");
+    host.wait_for_grid(id, 80, 20, &mut short);
+    short.read_for(Duration::from_millis(200));
+    let start = short.received.len();
+    tall.master.write_all(b"go\n").unwrap();
+    // The placement at the cursor reaches the window from the screen copy,
+    // where the session has it.
+    short.expect(b"\x1b[4;1H\x1b_Ga=p,i=9,C=1,q=2\x1b\\");
+    short.expect(b"DONE");
+    let received = String::from_utf8_lossy(&short.received[start..]).into_owned();
+    // Transmissions and the virtual placement went through as they came,
+    // `a=T` as a transmission only.
+    for passed in [
+        "\x1b_Ga=t,f=24,s=1,v=1,i=7,C=1,q=2;AQID\x1b\\",
+        "\x1b_Ga=t,f=24,s=2,v=1,i=9,q=2;AQIDBAUG\x1b\\",
+        "\x1b_Ga=p,U=1,i=9,c=2,r=1,q=2\x1b\\",
+    ] {
+        assert!(received.contains(passed), "{passed:?} in {received:?}");
+    }
+    assert!(
+        received.contains("\x1b[2;1H\x1b_Ga=p,i=7,C=1,q=2\x1b\\"),
+        "{received:?}"
+    );
+    // Nothing is placed at the session's cursor: no `a=T`, and every other
+    // placement has a cell of its own.
+    assert!(!received.contains("a=T"), "{received:?}");
+    assert!(!received.contains("p=3"), "{received:?}");
+    for (at, _) in received.match_indices("\x1b_Ga=p,") {
+        let control = received[at..]
+            .split(['\x1b', ';'])
+            .nth(1)
+            .unwrap_or_default();
+        if control.contains("U=1") {
+            continue;
+        }
+        let before = &received[..at];
+        let moved = before
+            .rfind("\x1b[")
+            .is_some_and(|csi| before[csi..].ends_with('H') && before.len() - csi <= 10);
+        assert!(
+            moved && control.contains("C=1"),
+            "{control:?} in {received:?}"
+        );
+    }
+    assert!(received.contains("\x1b_Ga=d,d=R,x=1,y=4294967295,q=2\x1b\\"));
+    for attached in [&mut tall, &mut short] {
+        attached.master.write_all(&[0x1d]).unwrap();
+        assert!(attached.wait().success());
+    }
+}

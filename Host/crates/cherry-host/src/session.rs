@@ -1127,6 +1127,17 @@ impl Worker {
 
     /// Ask the holder for a snapshot; returns the request's ID.
     fn request_snapshot(&mut self, kind: &str, request: Request) -> Option<u64> {
+        self.request_snapshot_with(kind, false, request)
+    }
+
+    /// `request_snapshot`, for windows that paint a viewport (`graphics`:
+    /// the screens re-send the kitty images on screen, link version 9).
+    fn request_snapshot_with(
+        &mut self,
+        kind: &str,
+        graphics: bool,
+        request: Request,
+    ) -> Option<u64> {
         let req = self.next_req;
         let max = (kind == "limited").then_some(MAX_SNAPSHOT_BYTES);
         let sent = self.tell(link::encode(
@@ -1135,6 +1146,7 @@ impl Worker {
                 req,
                 kind: kind.into(),
                 max,
+                graphics,
             },
             &[],
         ));
@@ -1374,25 +1386,44 @@ impl Worker {
     /// follows the resize. A copy that took a snapshot of an older grid
     /// (an attach or resync meanwhile) may have missed several sizes, and
     /// gets the screens.
+    ///
+    /// A window that will paint a viewport (it is not the grid's size)
+    /// gets screens that re-send the kitty images on screen too, from a
+    /// holder that can (link version 9), so its copy has them (see
+    /// `cherry_vt::Terminal::refresh_with`); the others keep their own.
     fn request_screens(&mut self, leases: Vec<u64>, just_resized: bool) {
         if leases.is_empty() {
             return;
         }
-        let kind = match &self.link {
-            Some(link) if just_resized && link.version >= link::RESIZED_SNAPSHOT_VERSION => {
-                "resized"
-            }
-            _ => "refresh",
+        let version = self.link.as_ref().map_or(0, |link| link.version);
+        let kind = if just_resized && version >= link::RESIZED_SNAPSHOT_VERSION {
+            "resized"
+        } else {
+            "refresh"
         };
-        self.request_snapshot(
-            kind,
-            Request::Replace {
-                full: false,
-                leases,
-                resized: kind == "resized",
-                refreshes: Vec::new(),
-            },
-        );
+        let size = self.size();
+        let (viewports, streams): (Vec<u64>, Vec<u64>) = leases.into_iter().partition(|lease| {
+            version >= link::VIEWPORT_GRAPHICS_VERSION
+                && self
+                    .attached
+                    .iter()
+                    .any(|a| a.lease == *lease && (a.cols, a.rows) != size)
+        });
+        for (leases, graphics) in [(streams, false), (viewports, true)] {
+            if leases.is_empty() {
+                continue;
+            }
+            self.request_snapshot_with(
+                kind,
+                graphics,
+                Request::Replace {
+                    full: false,
+                    leases,
+                    resized: kind == "resized",
+                    refreshes: Vec::new(),
+                },
+            );
+        }
     }
 
     /// The grid took the size `size` at `offset` in the output, which

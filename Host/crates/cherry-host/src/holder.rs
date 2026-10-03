@@ -28,6 +28,7 @@ use crate::{
     daemon::{self, log, utc_timestamp},
     environment,
     link::{self, kind, Frame},
+    media::{self, Media},
     paths, processes, screen, signals,
     stream::{Batch, DisplayStream},
     terminal_thread::{Report, TerminalThread},
@@ -649,6 +650,7 @@ fn snapshot(
     max: Option<usize>,
     resized: bool,
     unfinished: &[u8],
+    graphics_asked: bool,
 ) -> Result<(String, Vec<u8>, Option<GraphicsReplay>)> {
     if kind == "resized" {
         // A full-screen program repaints when its terminal is resized:
@@ -668,6 +670,17 @@ fn snapshot(
             let max = (kind == "limited").then(|| max.unwrap_or(MAX_SNAPSHOT_BYTES));
             let (raw, replay) =
                 terminal.snapshot_with(max, MAX_SNAPSHOT_GRAPHICS_BYTES, unfinished)?;
+            graphics = Some(replay);
+            raw
+        }
+        // For a window that paints a viewport, with the images on screen
+        // (link version 9), which come on top of the limit.
+        "refresh" if graphics_asked => {
+            let (raw, replay) = terminal.refresh_with(
+                MAX_SNAPSHOT_BYTES,
+                MAX_SNAPSHOT_GRAPHICS_BYTES,
+                unfinished,
+            )?;
             graphics = Some(replay);
             raw
         }
@@ -712,6 +725,9 @@ struct Holder {
     pid: libc::pid_t,
     /// The headless terminal, parsing on a thread of its own.
     terminal: TerminalThread,
+    /// Kitty graphics data in files and shared memory, read before the
+    /// display stream (see `media`).
+    media: Media,
     display: DisplayStream,
     offset: u64,
     /// Where in the output the daemon's last `RESIZE` took effect; None
@@ -839,6 +855,13 @@ impl Holder {
         stream.set_nonblocking(true)?;
         // After the fork: the child inherits none of its descriptors.
         let terminal = TerminalThread::start(terminal)?;
+        let session_tmpdir = env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == b"TMPDIR")
+            .map(|(_, value)| value.as_slice());
+        let media = Media::new(media::Places::new(session_tmpdir))
+            .context("creating the media reader's wakeups")?;
         let mut holder = Self {
             id,
             socket: socket.to_path_buf(),
@@ -868,6 +891,7 @@ impl Holder {
             master: Some(master),
             pid,
             terminal,
+            media,
             display: DisplayStream::default(),
             offset: 0,
             resized_at: None,
@@ -1108,6 +1132,13 @@ impl Holder {
     /// lets it (`credit`) when `paced`; the output a program left when it
     /// exited is read whatever the daemon said.
     fn read_output(&mut self, paced: bool) -> bool {
+        // A kitty graphics command whose data the media layer read: its
+        // transmission goes on below. One it refused is answered here,
+        // after the replies to the output before it.
+        if let Some(reply) = self.media.finish(Instant::now()) {
+            self.settle_terminal();
+            self.queue_replies(&reply);
+        }
         let fd = self.master_fd();
         let mut credit = if paced { self.credit() } else { usize::MAX };
         let mut output = Batch::default();
@@ -1127,10 +1158,24 @@ impl Holder {
         let mut found = false;
         let spin = self.spinning && self.flooding();
         while reads < READS_PER_PASS && credit > 0 {
-            let buffer = &mut self.read_buffer;
             // No more than the daemon lets through: display output is no
             // longer than what it is read from, but for a few bytes.
-            let want = buffer.len().min(credit);
+            let want = self.read_buffer.len().min(credit);
+            // Output the media layer holds goes first, as if it were read
+            // now; while a read is under way, the PTY waits behind it.
+            if self.media.holds_output() {
+                let display = &mut self.display;
+                let went = self.media.resume(want, &mut |bytes: &[u8]| {
+                    display.feed_into(bytes, &mut output)
+                });
+                if went == 0 {
+                    break;
+                }
+                reads += 1;
+                credit = credit.saturating_sub(went);
+                continue;
+            }
+            let buffer = &mut self.read_buffer;
             let n = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), want) };
             if n < 0 {
                 let error = io::Error::last_os_error();
@@ -1154,8 +1199,16 @@ impl Holder {
             found |= retries > 0;
             reads += 1;
             credit = credit.saturating_sub(n as usize);
-            self.display
-                .feed_into(&self.read_buffer[..n as usize], &mut output);
+            let display = &mut self.display;
+            self.media
+                .feed(&self.read_buffer[..n as usize], &mut |bytes: &[u8]| {
+                    display.feed_into(bytes, &mut output)
+                });
+        }
+        // Output the media layer holds is ready at once, unless it waits
+        // for a read.
+        if self.media.holds_output() {
+            drained = !self.media.due(Instant::now());
         }
         let dropped = self.display.take_dropped_clipboard_writes();
         if dropped > 0 {
@@ -1444,9 +1497,10 @@ impl Holder {
         // A kitty image whose chunks are still coming (see
         // `DisplayStream::unfinished_transfer`).
         let unfinished = self.display.unfinished_transfer().to_vec();
+        let graphics = request.graphics;
         let snapshot = self
             .terminal
-            .call(move |terminal| snapshot(terminal, kind, max, resized, &unfinished));
+            .call(move |terminal| snapshot(terminal, kind, max, resized, &unfinished, graphics));
         self.collect_terminal();
         self.send_info();
         let (kind, bytes, graphics) = snapshot?;
@@ -1800,9 +1854,18 @@ impl Holder {
             return;
         };
         // Bytes written before exit are part of the transcript, however far
-        // the daemon lets the output be read.
+        // the daemon lets the output be read, and so are the kitty images
+        // the media layer reads for them: those reads are waited for, in
+        // all for at most `media::READ_TIMEOUT`.
         if !self.eof {
-            self.read_output(false);
+            let until = Instant::now() + media::READ_TIMEOUT;
+            loop {
+                self.media.wait(until);
+                self.read_output(false);
+                if !self.media.holds_output() || Instant::now() >= until {
+                    break;
+                }
+            }
         }
         self.termination = None;
         self.eof = true;
@@ -1871,11 +1934,20 @@ impl Holder {
             return Duration::ZERO;
         }
         let now = Instant::now();
+        // Output the media layer holds goes on at once (see `read_output`).
+        if self.reading() && self.media.due(now) {
+            return Duration::ZERO;
+        }
         let mut wait = IDLE_WAIT;
         if self.termination.is_some() {
             wait = wait.min(TERMINATION_POLL);
         }
-        for due in [self.redial_at, self.foreground_due].into_iter().flatten() {
+        // A read it waits for times out.
+        let media = self.media.deadline().filter(|_| self.media.reading());
+        for due in [self.redial_at, self.foreground_due, media]
+            .into_iter()
+            .flatten()
+        {
             wait = wait.min(due.saturating_duration_since(now));
         }
         // Output held for the terminal is handed over by `MAX_HOLD`.
@@ -1908,7 +1980,9 @@ impl Holder {
             let ready = std::mem::replace(&mut self.ready, Ready::ALL);
             // Output first, and out before any request is served, so that
             // request work (a snapshot, the screen as text) never delays it.
-            if self.reading() && (ready.master || self.more_output) {
+            if self.reading()
+                && (ready.master || self.more_output || self.media.due(Instant::now()))
+            {
                 self.eof = !self.read_output(true);
                 self.flush_link();
             }
@@ -1977,7 +2051,8 @@ impl Holder {
             self.master_fd()
         };
         let mut master_events = 0;
-        if !self.paused && !self.parsing && self.credit() > 0 {
+        // Not while output waits in the media layer, which goes first.
+        if !self.paused && !self.parsing && self.credit() > 0 && !self.media.holds_output() {
             master_events |= libc::POLLIN;
         }
         if self.pending_input.len > 0 {
@@ -2022,6 +2097,11 @@ impl Holder {
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: self.media.wakeup_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         let millis = wait.as_micros().div_ceil(1000).min(i32::MAX as u128) as libc::c_int;
         let ready = unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, millis) };
@@ -2045,6 +2125,10 @@ impl Holder {
         if poll[4].revents != 0 {
             // Taken at the top of the loop.
             signals::drain(self.terminal.wakeups());
+        }
+        if poll[5].revents != 0 {
+            // A read finished: taken by the next `read_output`.
+            self.media.drain_wakeups();
         }
         if poll[3].revents != 0 {
             // Watch afresh: the directory may have been replaced. Whatever

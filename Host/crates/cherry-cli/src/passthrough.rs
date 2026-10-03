@@ -1,9 +1,23 @@
 //! Session output that acts on the terminal rather than on its screen:
 //! clipboard writes, titles, the working directory, notifications, colours
-//! and bells. A viewport frame repaints only the screen, so in viewport mode
-//! these are picked out of the output and written to the window as they are.
-//! The output holds no queries: the host sends those apart, to one client
-//! (`ServerMessage::Query`), which writes them to its window in either mode.
+//! and bells, and the kitty graphics that do not depend on where the
+//! session's cursor is. A viewport frame repaints only the screen, so in
+//! viewport mode these are picked out of the output and written to the
+//! window as they are. The output holds no queries: the host sends those
+//! apart, to one client (`ServerMessage::Query`), which writes them to its
+//! window in either mode.
+//!
+//! Kitty graphics (`Passthrough::graphics`): transmissions (`a=t`, and
+//! their chunks), virtual placements (`U=1`, shown by unicode placeholder
+//! cells, which the frames paint wherever they are), deletions and the
+//! animation commands, which name images rather than cells, pass, with
+//! `q=2`. What places an image at the session's cursor does not: the
+//! window's cursor is not there. `a=T` passes as `a=t` (the image is
+//! transmitted, not placed), and `a=p` without `U=1`, or a deletion at the
+//! cursor (`d=c`), is dropped. Either one asks for the window's images to
+//! be brought in line with the screen copy at the next frame
+//! (`take_placed`; see `Renderer`), which places them where the copy has
+//! them, when the window shows them whole.
 //!
 //! The scanner follows the host's tokenizer (`DisplayStream`): ESC restarts
 //! an unfinished escape or CSI sequence, CAN and SUB abort any control, C0
@@ -13,6 +27,10 @@
 
 /// Longest control sequence kept, as the host limits them.
 const MAX_CONTROL: usize = 64 * 1024;
+/// The chunks of an unfinished kitty transmission kept, at most (see
+/// `Passthrough::unfinished_transfer`), as the host keeps them.
+const MAX_TRANSFER: usize = cherry_protocol::MAX_SNAPSHOT_GRAPHICS_BYTES;
+const GRAPHICS: &[u8] = b"\x1b_G";
 /// OSC 52 clipboard writes carry base64 text; the host passes up to 8 MiB.
 const MAX_CLIPBOARD: usize = 8 * 1024 * 1024;
 const CLIPBOARD: &[u8] = b"\x1b]52;";
@@ -29,6 +47,20 @@ pub struct Passthrough {
     escaped: bool,
     /// Inside an OSC: whether it can pass through is decided.
     checked: bool,
+    /// The chunks of a kitty transmission that began and has not ended, as
+    /// they passed (see `unfinished_transfer`).
+    transfer: Vec<u8>,
+    /// One is on its way, whether or not its chunks are kept.
+    transferring: bool,
+    /// Its chunks were too many to keep.
+    transfer_dropped: bool,
+    /// It places its image at the session's cursor once complete (`a=T`).
+    transfer_places: bool,
+    /// A kitty placement at the session's cursor was dropped since
+    /// `take_placed`.
+    placed: bool,
+    /// Kitty graphics passed since `take_graphics`.
+    graphics: bool,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -47,10 +79,19 @@ impl Passthrough {
     /// sequences to write through, back to back.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut found = Vec::new();
-        for &byte in bytes {
-            if let Some(sequence) = self.byte(byte) {
+        let mut at = 0;
+        while at < bytes.len() {
+            // Text: only ESC and BEL matter.
+            if self.state == State::Ground {
+                match memchr::memchr2(0x1b, 0x07, &bytes[at..]) {
+                    Some(skip) => at += skip,
+                    None => break,
+                }
+            }
+            if let Some(sequence) = self.byte(bytes[at]) {
                 found.extend_from_slice(&sequence);
             }
+            at += 1;
         }
         found
     }
@@ -58,6 +99,26 @@ impl Passthrough {
     /// The output restarts at a sequence boundary (a replacement snapshot).
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// The chunks of a kitty transmission the output began (`m=1`) and has
+    /// not ended, as they passed: written again after the window's images
+    /// were deleted (which abandons a transmission), the chunks still to
+    /// come complete it. At most `MAX_TRANSFER` bytes; a longer one is not
+    /// kept.
+    pub fn unfinished_transfer(&self) -> &[u8] {
+        &self.transfer
+    }
+
+    /// Whether a kitty placement at the session's cursor was dropped since
+    /// last asked.
+    pub fn take_placed(&mut self) -> bool {
+        std::mem::take(&mut self.placed)
+    }
+
+    /// Whether kitty graphics passed since last asked.
+    pub fn take_graphics(&mut self) -> bool {
+        std::mem::take(&mut self.graphics)
     }
 
     fn byte(&mut self, byte: u8) -> Option<Vec<u8>> {
@@ -129,6 +190,116 @@ impl Passthrough {
         self.checked = false;
     }
 
+    /// A whole kitty graphics command (`ESC _ G … ESC \`): what of it
+    /// passes (see the module's documentation), with `q=2`.
+    fn graphics(&mut self, token: &[u8]) -> Option<Vec<u8>> {
+        let body = &token[GRAPHICS.len()..token.len() - 2];
+        let (control, payload) = match body.iter().position(|&b| b == b';') {
+            Some(at) => (&body[..at], &body[at..]),
+            None => (body, &[][..]),
+        };
+        let keys: Vec<&[u8]> = control
+            .split(|&b| b == b',')
+            .filter(|key| !key.is_empty())
+            .collect();
+        let value = |name: &[u8]| {
+            keys.iter()
+                .rev()
+                .find_map(|key| key.strip_prefix(name)?.strip_prefix(b"="))
+        };
+        let more = value(b"m") == Some(b"1");
+        // A chunk, which only says whether more follow: of the transmission
+        // on its way, or of none this one saw begin (not kept).
+        let only_chunk = keys
+            .iter()
+            .all(|key| key.starts_with(b"m=") || key.starts_with(b"q="));
+        let chunk = only_chunk && self.transferring;
+        let action = if only_chunk {
+            &b"t"[..]
+        } else {
+            value(b"a").unwrap_or(b"t")
+        };
+        let mut rewritten = None;
+        match action {
+            b"t" | b"f" | b"a" | b"c" => {}
+            b"T" if value(b"U") == Some(b"1") => {}
+            // Transmitted, not placed at the session's cursor (which the
+            // session does once its last chunk came).
+            b"T" => {
+                self.placed |= !more;
+                rewritten = Some(b"a=t".as_slice());
+            }
+            b"p" if value(b"U") == Some(b"1") => {}
+            b"d" => {
+                // Every deletion abandons a transmission on its way.
+                self.end_transfer();
+                if matches!(value(b"d"), Some(b"c" | b"C")) {
+                    self.placed = true;
+                    return None;
+                }
+            }
+            // A placement at the session's cursor.
+            b"p" => {
+                self.placed = true;
+                return None;
+            }
+            // A query (the host answers those), or what is not known.
+            _ => return None,
+        }
+        let mut out = GRAPHICS.to_vec();
+        for key in keys.iter().filter(|key| !key.starts_with(b"q=")) {
+            out.extend_from_slice(match rewritten {
+                Some(action) if key.starts_with(b"a=") => action,
+                _ => key,
+            });
+            out.push(b',');
+        }
+        out.extend_from_slice(b"q=2");
+        out.extend_from_slice(payload);
+        out.extend_from_slice(b"\x1b\\");
+        // Placements and animation commands leave it alone, as a terminal
+        // does (only deletions abandon it).
+        if chunk || (!only_chunk && matches!(action, b"t" | b"T" | b"f")) {
+            // The last chunk of an `a=T` places its image.
+            self.placed |= chunk && !more && self.transfer_places;
+            self.follow_transfer(chunk, more, &out);
+            if !chunk && more {
+                self.transfer_places = rewritten.is_some();
+            }
+        }
+        self.graphics = true;
+        Some(out)
+    }
+
+    /// Keep the chunks of a transmission on its way, as they passed: a
+    /// new transmission replaces it, its last chunk ends it.
+    fn follow_transfer(&mut self, chunk: bool, more: bool, passed: &[u8]) {
+        if !chunk {
+            self.end_transfer();
+        }
+        if !more {
+            self.end_transfer();
+            return;
+        }
+        self.transferring = true;
+        if self.transfer_dropped {
+            return;
+        }
+        if self.transfer.len() + passed.len() > MAX_TRANSFER {
+            self.transfer = Vec::new();
+            self.transfer_dropped = true;
+            return;
+        }
+        self.transfer.extend_from_slice(passed);
+    }
+
+    fn end_transfer(&mut self) {
+        self.transfer = Vec::new();
+        self.transferring = false;
+        self.transfer_dropped = false;
+        self.transfer_places = false;
+    }
+
     fn push(&mut self, byte: u8) {
         if !self.discarding {
             self.pending.push(byte);
@@ -153,12 +324,13 @@ impl Passthrough {
     }
 
     /// Stop keeping a string as soon as it cannot be one to pass through,
-    /// so image data and hyperlinks are not copied: at once for DCS, APC,
-    /// PM and SOS, and once an OSC's code is complete. `byte` was just added.
+    /// so other strings' data and hyperlinks are not copied: at once for
+    /// DCS, PM, SOS and an APC other than kitty graphics, and once an
+    /// OSC's code is complete. `byte` was just added.
     fn check(&mut self, byte: u8) {
         let keep = match self.state {
             _ if self.discarding => true,
-            State::String => false,
+            State::String => self.pending == GRAPHICS,
             _ if byte.is_ascii_digit() => return,
             _ => osc_code(&self.pending[2..self.pending.len() - 1]).is_some(),
         };
@@ -179,8 +351,14 @@ impl Passthrough {
     }
 
     fn finish(&mut self) -> Option<Vec<u8>> {
-        let found =
-            (!self.discarding && passes(&self.pending)).then(|| std::mem::take(&mut self.pending));
+        let found = if self.discarding {
+            None
+        } else if self.pending.starts_with(GRAPHICS) && self.pending.ends_with(b"\x1b\\") {
+            let token = std::mem::take(&mut self.pending);
+            self.graphics(&token)
+        } else {
+            passes(&self.pending).then(|| std::mem::take(&mut self.pending))
+        };
         self.end();
         found
     }
@@ -266,7 +444,7 @@ mod tests {
             "\x1b]99;i=1:d=0;Deploy now?\x1b\\\x1b]99;;Continue?\x07",
             "\x07\x1b[22;0t\x1b[23;0t",
             "\x1b]4;1;rgb:ff/00/00\x07\x1b]104\x07\x1b]13;red\x07",
-            "\x1bP$qm\x1b\\\x1b_Gf=100;AAAA\x1b\\\x1b]133;A\x07\x1b]1337;File=x\x07",
+            "\x1bP$qm\x1b\\\x1b_Xother\x1b\\\x1b]133;A\x07\x1b]1337;File=x\x07",
             "\x1b[?1049h\x1b[H\x1b[2J\x1b[8;40;100t\x1b[3;1;1t\x1b[>4;2m",
         )
         .as_bytes();
@@ -367,16 +545,155 @@ mod tests {
         clipboard.resize(MAX_CONTROL * 4, b'A');
         clipboard.push(0x07);
         assert_eq!(passed(&clipboard), [clipboard.clone()]);
-        // Image data is never copied.
+        // Other strings' data is never copied, and kitty graphics no more
+        // than the host passes.
         let mut scanner = Passthrough::default();
-        let mut image = b"\x1b_Gf=100;".to_vec();
-        image.resize(4096, b'A');
-        scanner.feed(&image);
+        let mut string = b"\x1bPq".to_vec();
+        string.resize(4096, b'A');
+        scanner.feed(&string);
         assert!(scanner.pending.is_empty());
+        let mut image = b"\x1b_Gf=100;".to_vec();
+        image.resize(MAX_CONTROL + 10, b'A');
+        scanner.reset();
+        assert!(scanner.feed(&image).is_empty());
+        assert!(scanner.pending.capacity() <= MAX_CONTROL * 2);
+        assert_eq!(
+            scanner.feed(b"AA\x1b\\\x1b_Ga=t;AAAA\x1b\\"),
+            b"\x1b_Ga=t,q=2;AAAA\x1b\\"
+        );
         let mut hyperlink = b"\x1b]8;;".to_vec();
         hyperlink.resize(4096, b'x');
         scanner.reset();
         scanner.feed(&hyperlink);
         assert!(scanner.pending.is_empty());
+    }
+
+    /// What passes of each command, and whether a placement was dropped.
+    fn graphics(commands: &[&[u8]]) -> (Vec<Vec<u8>>, bool) {
+        let mut scanner = Passthrough::default();
+        let passed = commands
+            .iter()
+            .flat_map(|command| passed_by(&mut scanner, command))
+            .collect();
+        (passed, scanner.take_placed())
+    }
+
+    fn passed_by(scanner: &mut Passthrough, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut found = Vec::new();
+        for &byte in bytes {
+            if let Some(sequence) = scanner.byte(byte) {
+                found.push(sequence);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn kitty_transmissions_virtual_placements_and_deletions_pass_quietly() {
+        let (passed, placed) = graphics(&[
+            b"\x1b_Ga=t,f=24,s=1,v=1,i=7;AQID\x1b\\",
+            b"\x1b_Gf=100,i=8,q=0;AAAA\x1b\\",
+            b"\x1b_Ga=T,U=1,f=24,s=1,v=1,i=9,c=2,r=1,q=1;AQID\x1b\\",
+            b"\x1b_Ga=p,U=1,i=7,c=2,r=1\x1b\\",
+            b"\x1b_Ga=d,d=i,i=7\x1b\\",
+            b"\x1b_Ga=d,d=A\x1b\\",
+            b"\x1b_Ga=f,i=9,r=2,f=24,s=1,v=1;AQID\x1b\\",
+            b"\x1b_Ga=a,i=9,s=3\x1b\\",
+        ]);
+        assert!(!placed);
+        assert_eq!(
+            passed,
+            [
+                &b"\x1b_Ga=t,f=24,s=1,v=1,i=7,q=2;AQID\x1b\\"[..],
+                b"\x1b_Gf=100,i=8,q=2;AAAA\x1b\\",
+                b"\x1b_Ga=T,U=1,f=24,s=1,v=1,i=9,c=2,r=1,q=2;AQID\x1b\\",
+                b"\x1b_Ga=p,U=1,i=7,c=2,r=1,q=2\x1b\\",
+                b"\x1b_Ga=d,d=i,i=7,q=2\x1b\\",
+                b"\x1b_Ga=d,d=A,q=2\x1b\\",
+                b"\x1b_Ga=f,i=9,r=2,f=24,s=1,v=1,q=2;AQID\x1b\\",
+                b"\x1b_Ga=a,i=9,s=3,q=2\x1b\\",
+            ]
+        );
+    }
+
+    #[test]
+    fn kitty_placements_at_the_sessions_cursor_do_not_pass() {
+        // Transmitted and not placed.
+        let (passed, placed) = graphics(&[b"\x1b_Ga=T,f=24,s=1,v=1,i=7,C=1;AQID\x1b\\"]);
+        assert_eq!(
+            passed,
+            [b"\x1b_Ga=t,f=24,s=1,v=1,i=7,C=1,q=2;AQID\x1b\\".to_vec()]
+        );
+        assert!(placed);
+        for command in [
+            &b"\x1b_Ga=p,i=7,p=3,c=2\x1b\\"[..],
+            b"\x1b_Ga=p,I=4\x1b\\",
+            b"\x1b_Ga=d,d=c\x1b\\",
+            b"\x1b_Ga=d,d=C\x1b\\",
+        ] {
+            let (passed, placed) = graphics(&[command]);
+            assert!(passed.is_empty(), "{command:?}");
+            assert!(placed, "{command:?}");
+        }
+        // Queries are the host's, and unknown actions are not passed.
+        for command in [&b"\x1b_Ga=q,i=1,s=1,v=1;AAAA\x1b\\"[..], b"\x1b_Ga=z\x1b\\"] {
+            let (passed, placed) = graphics(&[command]);
+            assert!(passed.is_empty() && !placed, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn a_kitty_transmission_on_its_way_is_kept_until_it_ends() {
+        let mut scanner = Passthrough::default();
+        // `a=T` is passed, and kept, as `a=t`.
+        let first = scanner.feed(b"\x1b_Ga=T,f=24,s=2,v=1,i=5,m=1;AQID\x1b\\text");
+        assert_eq!(first, b"\x1b_Ga=t,f=24,s=2,v=1,i=5,m=1,q=2;AQID\x1b\\");
+        assert_eq!(scanner.unfinished_transfer(), first);
+        // A chunk of it, split anywhere, and a placement in between.
+        scanner.feed(b"\x1b_Gm=1;BB");
+        scanner.feed(b"BB\x1b\\\x1b_Ga=p,U=1,i=5\x1b\\");
+        assert_eq!(
+            scanner.unfinished_transfer(),
+            [&first[..], b"\x1b_Gm=1,q=2;BBBB\x1b\\"].concat()
+        );
+        // Its last chunk ends it, and places its image (`a=T`) on the
+        // session: the window's images are brought in line then, not before.
+        assert!(!scanner.take_placed());
+        assert_eq!(
+            scanner.feed(b"\x1b_Gm=0;CCCC\x1b\\"),
+            b"\x1b_Gm=0,q=2;CCCC\x1b\\"
+        );
+        assert!(scanner.unfinished_transfer().is_empty());
+        assert!(scanner.take_placed());
+        // A chunk of none this scanner saw begin passes, and is not kept.
+        assert_eq!(
+            scanner.feed(b"\x1b_Gm=1;DDDD\x1b\\"),
+            b"\x1b_Gm=1,q=2;DDDD\x1b\\"
+        );
+        assert!(scanner.unfinished_transfer().is_empty());
+        // A new transmission replaces one, and a deletion abandons it.
+        scanner.feed(b"\x1b_Ga=t,i=6,m=1;AAAA\x1b\\\x1b_Ga=t,i=7,m=1;BBBB\x1b\\");
+        assert_eq!(
+            scanner.unfinished_transfer(),
+            b"\x1b_Ga=t,i=7,m=1,q=2;BBBB\x1b\\"
+        );
+        scanner.feed(b"\x1b_Ga=d,d=i,i=3\x1b\\");
+        assert!(scanner.unfinished_transfer().is_empty());
+        // One too long to keep is dropped, with the rest of it.
+        scanner.feed(b"\x1b_Ga=t,i=8,m=1;AAAA\x1b\\");
+        let chunk = [&b"\x1b_Gm=1;"[..], &[b'A'; 4096], b"\x1b\\"].concat();
+        for _ in 0..(MAX_TRANSFER / 4096 + 1) {
+            assert!(!scanner.feed(&chunk).is_empty());
+        }
+        assert!(scanner.unfinished_transfer().is_empty());
+        scanner.feed(&chunk);
+        assert!(scanner.unfinished_transfer().is_empty());
+        scanner.feed(b"\x1b_Gm=0;AAAA\x1b\\\x1b_Ga=t,i=9,m=1;AAAA\x1b\\");
+        assert_eq!(
+            scanner.unfinished_transfer(),
+            b"\x1b_Ga=t,i=9,m=1,q=2;AAAA\x1b\\"
+        );
+        assert!(scanner.take_graphics());
+        assert!(!scanner.take_graphics());
     }
 }

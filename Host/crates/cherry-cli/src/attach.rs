@@ -234,6 +234,7 @@ pub fn attach(
     let terminal = RawTerminal::enter(libc::STDIN_FILENO)?;
     let mut output = TerminalOutput::new(libc::STDOUT_FILENO, terminal.raw_input())?;
     let mut renderer = Renderer::new(physical);
+    renderer.set_cell(cell);
     let result = Attachment {
         id,
         client_id: target.client_id,
@@ -526,6 +527,7 @@ impl Attachment<'_> {
                     sent_size = reattached.size;
                     sent_cell = reattached.cell;
                     self.renderer.physical = reattached.physical;
+                    self.renderer.set_cell(reattached.cell);
                 }
                 Reconnected::Ended(outcome) => return Ok(outcome),
             }
@@ -644,6 +646,7 @@ impl Attachment<'_> {
                 connection.resize_at = None;
                 let (physical, cell) = physical_size();
                 let size = protocol_size(physical);
+                self.renderer.set_cell(cell);
                 // A cell size the host has not been sent; a window that no
                 // longer reports one keeps the last.
                 let new_cell = cell.filter(|&cell| Some(cell) != connection.sent_cell);
@@ -1714,9 +1717,18 @@ pub struct Renderer {
     /// synchronized update to end (see `SYNC_HOLD`).
     held_since: Option<Instant>,
     /// The copy holds the kitty images the window had: it was made from a
-    /// full snapshot (which re-sends them) and followed the output since.
+    /// full snapshot, or screens that re-send them (see
+    /// `cherry_vt::Terminal::refresh_with`), and followed the output since.
     /// One made from the screens alone did not get them.
     copy_has_images: bool,
+    /// The window's cells in pixels, when its terminal reports them: the
+    /// copy's, so that it sizes images as the window does.
+    cell: Option<(u32, u32)>,
+    /// Viewport mode: the next frame brings the window's kitty images in
+    /// line with the copy (see `viewport_graphics`).
+    graphics_due: bool,
+    /// The window may hold kitty images: it was written some.
+    window_images: bool,
 }
 
 /// In viewport mode a frame is not painted while the copy is inside the
@@ -1775,6 +1787,31 @@ impl Renderer {
             queried: false,
             held_since: None,
             copy_has_images: false,
+            cell: None,
+            graphics_due: false,
+            window_images: false,
+        }
+    }
+
+    /// The window's cells, in pixels, as its terminal reports them; the
+    /// copy takes them, and a viewport places its images again for them.
+    /// A window that no longer reports any keeps the last.
+    pub fn set_cell(&mut self, cell: Option<(u32, u32)>) {
+        let Some((width, height)) = cell.filter(|&cell| Some(cell) != self.cell) else {
+            return;
+        };
+        self.cell = cell;
+        if let Some(terminal) = &mut self.terminal {
+            // Its replies are the host's to answer.
+            let _ = terminal.resize_cells(self.canonical.0, self.canonical.1, width, height);
+            self.graphics_due |= self.viewport();
+        }
+    }
+
+    /// The window was written `bytes`, which may hold kitty graphics.
+    fn note_window_graphics(&mut self, bytes: &[u8]) {
+        if !self.window_images && memchr::memmem::find(bytes, b"\x1b_G").is_some() {
+            self.window_images = true;
         }
     }
 
@@ -1792,6 +1829,7 @@ impl Renderer {
     /// Follow output that was written to the window as it is (`streams`;
     /// `output` without the bytes to write).
     fn track(&mut self, bytes: &[u8]) {
+        self.note_window_graphics(bytes);
         if let Some(tracker) = &mut self.tracker {
             tracker.feed(bytes);
             if tracker.origin() && !self.keep_copy {
@@ -1801,6 +1839,11 @@ impl Renderer {
             return;
         }
         self.passthrough.feed(bytes);
+        // The window got the stream as it is, placements and all.
+        let _ = (
+            self.passthrough.take_placed(),
+            self.passthrough.take_graphics(),
+        );
         self.feed(bytes);
     }
 
@@ -1904,6 +1947,12 @@ impl Renderer {
         self.held_since = None;
         // The host sends whole sequences: output resumes at a boundary.
         self.passthrough.reset();
+        // A full snapshot's reset deletes the window's images; the
+        // snapshot may write some again.
+        let full = snapshot.starts_with(b"\x18\x1bc");
+        let written = |window_images: bool| {
+            (window_images && !full) || memchr::memmem::find(snapshot, b"\x1b_G").is_some()
+        };
         if self.refreshes && self.direct() && !self.keep_copy {
             let mut tracker = Tracker::new()?;
             tracker.feed(snapshot);
@@ -1911,6 +1960,7 @@ impl Renderer {
                 self.tracker = Some(tracker);
                 self.terminal = None;
                 self.sent_modes = None;
+                self.window_images = written(self.window_images);
                 return Ok(snapshot.to_vec());
             }
             self.keep_copy = true;
@@ -1918,16 +1968,31 @@ impl Renderer {
         let mut terminal =
             cherry_vt::Terminal::new(canonical.0, canonical.1, RENDER_SCROLLBACK_BYTES)?;
         // Kitty images, which a full snapshot of the copy gives the window
-        // again when it goes back to the stream.
+        // again when it goes back to the stream, and a viewport shows.
         terminal.set_image_storage_limit(cherry_vt::IMAGE_STORAGE_BYTES)?;
+        if let Some((width, height)) = self.cell {
+            terminal.resize_cells(canonical.0, canonical.1, width, height)?;
+        }
         let _ = terminal.feed(snapshot);
-        self.copy_has_images = snapshot.starts_with(b"\x18\x1bc");
+        self.copy_has_images =
+            full || memchr::memmem::find(snapshot, cherry_vt::IMAGE_RESET).is_some();
+        // The transmission the snapshot leaves unfinished, which the
+        // window gets again with its images (see `viewport_graphics`).
+        let _ = self.passthrough.feed(snapshot);
+        let _ = (
+            self.passthrough.take_placed(),
+            self.passthrough.take_graphics(),
+        );
         self.terminal = Some(terminal);
         self.tracker = None;
         if self.direct() {
             self.sent_modes = None;
+            self.window_images = written(self.window_images);
             Ok(snapshot.to_vec())
         } else {
+            // The window keeps what it was written: the copy's images go
+            // in place of its own.
+            self.graphics_due = true;
             self.frame()
         }
     }
@@ -1941,6 +2006,10 @@ impl Renderer {
             return Ok(Cow::Borrowed(bytes));
         }
         let found = self.passthrough.feed(bytes);
+        // A placement at the session's cursor did not pass: the next frame
+        // places the images where the copy has them.
+        self.graphics_due |= self.passthrough.take_placed();
+        self.window_images |= self.passthrough.take_graphics();
         self.feed(bytes);
         self.dirty |= !bytes.is_empty();
         Ok(Cow::Owned(found))
@@ -2051,12 +2120,16 @@ impl Renderer {
             if self.sent_modes.take().is_some() {
                 let snapshot = self.terminal().snapshot()?;
                 self.images_from_host();
+                self.window_images = memchr::memmem::find(&snapshot, b"\x1b_G").is_some();
                 self.lighten(&snapshot)?;
                 return Ok(snapshot);
             }
         } else if self.terminal.is_none() {
             // A viewport is painted from a copy, which the host sends.
             self.want_copy();
+        } else {
+            // The copy's images may have moved with its rows.
+            self.graphics_due = true;
         }
         Ok(Vec::new())
     }
@@ -2081,6 +2154,7 @@ impl Renderer {
             self.sent_modes = None;
             let snapshot = self.terminal().snapshot()?;
             self.images_from_host();
+            self.window_images = memchr::memmem::find(&snapshot, b"\x1b_G").is_some();
             self.lighten(&snapshot)?;
             Ok(snapshot)
         } else {
@@ -2088,6 +2162,8 @@ impl Renderer {
                 // Leaving direct mode: the window shows the copy's screen.
                 self.window = self.followed_screen()?;
             }
+            // It shows another part of the copy.
+            self.graphics_due = true;
             self.frame()
         }
     }
@@ -2210,11 +2286,22 @@ impl Renderer {
     /// when the modes changed. Resending unchanged modes would re-trigger
     /// their side effects (focus reports, screen switches) on every frame.
     fn frame(&mut self) -> Result<Vec<u8>> {
+        // Entering viewport mode: the window's images were placed for the
+        // stream.
+        if self.sent_modes.is_none() {
+            self.graphics_due = true;
+        }
+        let graphics = if std::mem::take(&mut self.graphics_due) {
+            self.viewport_graphics()?
+        } else {
+            Vec::new()
+        };
         let terminal = self.terminal();
         let modes = terminal.modes()?;
         let viewport = terminal.viewport(self.physical.0, self.physical.1)?;
-        let mut frame = Vec::with_capacity(modes.len() + viewport.len() + 8);
-        if self.sent_modes.as_ref() != Some(&modes) {
+        let mut frame = Vec::with_capacity(modes.len() + graphics.len() + viewport.len() + 8);
+        let modes_changed = self.sent_modes.as_ref() != Some(&modes);
+        if modes_changed {
             // Its ?1049h saves the primary cursor only on the primary screen.
             let primary_saved = match self.window {
                 WindowScreen::Primary => true,
@@ -2232,8 +2319,44 @@ impl Renderer {
             frame.extend_from_slice(&modes);
             self.sent_modes = Some(modes);
         }
+        // On the screen the modes leave the window on (each screen has
+        // images of its own), before the rows are painted.
+        if !graphics.is_empty() {
+            if !modes_changed {
+                frame.extend_from_slice(b"\x1b[?2026h");
+            }
+            frame.extend_from_slice(&graphics);
+        }
         frame.extend_from_slice(&viewport);
         Ok(frame)
+    }
+
+    /// What brings the window's kitty images in line with the copy, for a
+    /// viewport: every image deleted (`IMAGE_RESET`), then the images of
+    /// the copy whose placements it shows (virtual ones, and direct ones
+    /// that lie wholly in the region it shows, at their cell, which is the
+    /// window's too; see `cherry_vt::Terminal::viewport_graphics`), then
+    /// the transmission on its way, as it passed (the deletion abandoned
+    /// it on the window). Nothing when there is nothing to delete or send.
+    fn viewport_graphics(&mut self) -> Result<Vec<u8>> {
+        let Some(terminal) = &self.terminal else {
+            return Ok(Vec::new());
+        };
+        let unfinished = self.passthrough.unfinished_transfer();
+        let replay = terminal.viewport_graphics(
+            self.canonical.0.min(self.physical.0),
+            self.canonical.1.min(self.physical.1),
+            cherry_protocol::MAX_SNAPSHOT_GRAPHICS_BYTES.saturating_sub(unfinished.len()),
+        )?;
+        let sends = !replay.bytes.is_empty() || !unfinished.is_empty();
+        if !sends && !self.window_images {
+            return Ok(Vec::new());
+        }
+        let mut graphics = cherry_vt::IMAGE_RESET.to_vec();
+        graphics.extend_from_slice(&replay.bytes);
+        graphics.extend_from_slice(unfinished);
+        self.window_images = sends;
+        Ok(graphics)
     }
 }
 
@@ -2974,6 +3097,182 @@ mod tests {
         assert!(!renderer.reporting().reports);
         live(&mut renderer, b"\x1b[?1004h");
         assert!(!renderer.reporting().reports, "not painted yet");
+    }
+
+    /// A session's terminal with image 7 placed at the cursor on its
+    /// second row, image 9 placed virtually with its placeholder cell on
+    /// the third, and image 4 placed at column 70 of the fourth.
+    fn session_with_images() -> cherry_vt::Terminal {
+        let mut source = cherry_vt::Terminal::new(80, 24, 0).unwrap();
+        source
+            .set_image_storage_limit(cherry_vt::IMAGE_STORAGE_BYTES)
+            .unwrap();
+        source.feed(b"top\r\n\x1b_Ga=T,f=24,s=1,v=1,i=7,C=1,q=2;AQID\x1b\\\r\n");
+        source.feed(b"\x1b_Ga=T,U=1,f=24,s=1,v=1,i=9,c=1,r=1,q=2;AQID\x1b\\");
+        source.feed("\x1b[38;5;9m\u{10EEEE}\u{0305}\u{0305}\x1b[m\r\n".as_bytes());
+        source.feed(b"\x1b[4;71H\x1b_Ga=T,f=24,s=1,v=1,i=4,C=1,q=2;AQID\x1b\\\x1b[24;1Hend");
+        source
+    }
+
+    /// Each kitty graphics command in `bytes`, with what comes before it
+    /// since the last one when that moves the cursor (`CSI … H`).
+    fn graphics_commands(bytes: &[u8]) -> Vec<String> {
+        String::from_utf8_lossy(bytes)
+            .split("\x1b_G")
+            .skip(1)
+            .map(|command| {
+                command
+                    .split(';')
+                    .next()
+                    .unwrap()
+                    .split('\x1b')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_viewport_shows_the_images_it_shows_whole_where_the_copy_has_them() {
+        let source = session_with_images();
+        // Wider and taller than the grid: the whole grid shows.
+        let mut renderer = Renderer::new((100, 40));
+        renderer.refreshes = true;
+        let frame = renderer
+            .replace((80, 24), &source.snapshot().unwrap())
+            .unwrap();
+        let commands = graphics_commands(&frame);
+        assert_eq!(commands[0], "a=d,d=R,x=1,y=4294967295,q=2", "{commands:?}");
+        for expected in [
+            "a=p,i=7,C=1,q=2",
+            "a=p,U=1,i=9,c=1,r=1,q=2",
+            "a=p,i=4,C=1,q=2",
+        ] {
+            assert!(
+                commands.iter().any(|c| c == expected),
+                "{expected}: {commands:?}"
+            );
+        }
+        assert!(contains(&frame, b"\x1b[2;1H\x1b_Ga=p,i=7,C=1,q=2\x1b\\"));
+        assert!(contains(&frame, b"\x1b[4;71H\x1b_Ga=p,i=4,C=1,q=2\x1b\\"));
+        // Inside the frame's synchronized update, before the rows.
+        let at = |needle: &[u8]| {
+            frame
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap()
+        };
+        assert!(at(b"\x1b[?2026h") < at(b"\x1b_G"));
+        assert!(at(b"\x1b_Ga=p,i=4") < at(b"end"));
+        // Narrower than the grid: image 4, at column 71, is not shown whole.
+        let mut narrow = Renderer::new((60, 40));
+        narrow.refreshes = true;
+        let frame = narrow
+            .replace((80, 24), &source.snapshot().unwrap())
+            .unwrap();
+        let commands = graphics_commands(&frame);
+        assert!(
+            commands.iter().any(|c| c == "a=p,i=7,C=1,q=2"),
+            "{commands:?}"
+        );
+        assert!(!commands.iter().any(|c| c.contains("i=4")), "{commands:?}");
+    }
+
+    #[test]
+    fn a_viewport_never_places_an_image_at_the_sessions_cursor_as_it_comes() {
+        let mut renderer = Renderer::new((100, 40));
+        renderer.refreshes = true;
+        let session = cherry_vt::Terminal::new(80, 24, 0).unwrap();
+        let frame = renderer
+            .replace((80, 24), &session.snapshot().unwrap())
+            .unwrap();
+        // No images anywhere: none deleted, none sent.
+        assert!(!contains(&frame, b"\x1b_G"));
+        // Transmissions and virtual placements go through as they come;
+        // `a=T` is transmitted only.
+        let passed = live(
+            &mut renderer,
+            b"\x1b[5;3H\x1b_Ga=T,f=24,s=1,v=1,i=8,q=0;AQID\x1b\\\x1b_Ga=p,U=1,i=8,c=1,r=1\x1b\\",
+        );
+        assert_eq!(
+            passed,
+            b"\x1b_Ga=t,f=24,s=1,v=1,i=8,q=2;AQID\x1b\\\x1b_Ga=p,U=1,i=8,c=1,r=1,q=2\x1b\\"
+        );
+        // The next frame places it where the session has it.
+        let frame = renderer.flush().unwrap().expect("a frame");
+        assert!(contains(&frame, cherry_vt::IMAGE_RESET));
+        assert!(contains(&frame, b"\x1b[5;3H\x1b_Ga=p,i=8,C=1,q=2\x1b\\"));
+        assert!(contains(&frame, b"\x1b_Ga=p,U=1,i=8,c=1,r=1,q=2\x1b\\"));
+        // A virtual placement alone changes nothing else.
+        assert_eq!(
+            live(&mut renderer, b"\x1b_Ga=p,U=1,i=8,c=2,r=1\x1b\\x"),
+            b"\x1b_Ga=p,U=1,i=8,c=2,r=1,q=2\x1b\\"
+        );
+        assert!(!contains(
+            &renderer.flush().unwrap().expect("a frame"),
+            b"\x1b_G"
+        ));
+        // A placement at the cursor does not pass; the frame places it.
+        assert!(live(&mut renderer, b"\x1b[9;9H\x1b_Ga=p,i=8,p=2\x1b\\").is_empty());
+        let frame = renderer.flush().unwrap().expect("a frame");
+        assert!(contains(&frame, b"\x1b[9;9H\x1b_Ga=p,i=8,C=1,q=2\x1b\\"));
+        // Once the images are gone, the window's are deleted, once.
+        live(&mut renderer, b"\x1b_Ga=d,d=I,i=8\x1b\\\x1b_Ga=p,I=1\x1b\\");
+        let frame = renderer.flush().unwrap().expect("a frame");
+        assert_eq!(graphics_commands(&frame), ["a=d,d=R,x=1,y=4294967295,q=2"]);
+        live(&mut renderer, b"\x1b_Ga=p,I=1\x1b\\");
+        assert!(!contains(
+            &renderer.flush().unwrap().expect("a frame"),
+            b"\x1b_G"
+        ));
+    }
+
+    #[test]
+    fn a_viewport_sends_a_transmission_on_its_way_again_with_the_images() {
+        let mut renderer = Renderer::new((100, 40));
+        renderer.refreshes = true;
+        let mut session = cherry_vt::Terminal::new(80, 24, 0).unwrap();
+        session
+            .set_image_storage_limit(cherry_vt::IMAGE_STORAGE_BYTES)
+            .unwrap();
+        renderer
+            .replace((80, 24), &session.snapshot().unwrap())
+            .unwrap();
+        let first = b"\x1b_Ga=t,f=24,s=2,v=1,i=5,m=1;AQID\x1b\\";
+        live(&mut renderer, first);
+        // A placement at the cursor brings a resync, which deletes the
+        // window's images (and so abandons the transmission there): its
+        // chunks so far go again.
+        live(&mut renderer, b"\x1b_Ga=p,i=5\x1b\\");
+        let frame = renderer.flush().unwrap().expect("a frame");
+        assert!(contains(
+            &frame,
+            b"\x1b_Ga=t,f=24,s=2,v=1,i=5,m=1,q=2;AQID\x1b\\"
+        ));
+        let at = |needle: &[u8]| {
+            frame
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap()
+        };
+        assert!(at(cherry_vt::IMAGE_RESET) < at(b"i=5,m=1"));
+    }
+
+    #[test]
+    fn the_copy_sizes_images_in_the_windows_cells() {
+        let mut renderer = Renderer::new((100, 40));
+        renderer.set_cell(Some((10, 20)));
+        renderer.refreshes = true;
+        let session = cherry_vt::Terminal::new(80, 24, 0).unwrap();
+        renderer
+            .replace((80, 24), &session.snapshot().unwrap())
+            .unwrap();
+        assert_eq!(renderer.terminal().cell_size(), (10, 20));
+        renderer.set_cell(Some((9, 18)));
+        assert_eq!(renderer.terminal().cell_size(), (9, 18));
+        renderer.set_cell(None);
+        assert_eq!(renderer.terminal().cell_size(), (9, 18));
     }
 
     #[test]

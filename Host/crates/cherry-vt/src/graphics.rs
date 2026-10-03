@@ -333,12 +333,17 @@ pub(crate) struct Candidate {
     pub placements: Vec<RawPlacement>,
 }
 
-/// The images that `placements` (of a screen `rows` tall) show, newest
-/// first: those of virtual placements (unicode placeholders), and of
-/// direct placements whose rows are all on screen. Placements of images
-/// whose data is still pending, and direct ones partly or wholly off
-/// screen, are left out.
-pub(crate) fn candidates(placements: &[RawPlacement], rows: u16) -> Vec<Candidate> {
+/// The images that `placements` show in the top `rows` rows of a screen
+/// (and its `cols` left columns, when given), newest first: those of
+/// virtual placements (unicode placeholders), and of direct placements
+/// whose rows (and columns) all lie there. Placements of images whose data
+/// is still pending, and direct ones partly or wholly outside, are left
+/// out.
+pub(crate) fn candidates(
+    placements: &[RawPlacement],
+    cols: Option<u16>,
+    rows: u16,
+) -> Vec<Candidate> {
     let mut images: BTreeMap<u32, Candidate> = BTreeMap::new();
     for placement in placements {
         let shown = placement.is_virtual
@@ -346,7 +351,11 @@ pub(crate) fn candidates(placements: &[RawPlacement], rows: u16) -> Vec<Candidat
                 && placement.viewport_row >= 0
                 && placement.viewport_col >= 0
                 && i64::from(placement.viewport_row) + i64::from(placement.grid_rows.max(1))
-                    <= i64::from(rows));
+                    <= i64::from(rows)
+                && cols.is_none_or(|cols| {
+                    i64::from(placement.viewport_col) + i64::from(placement.grid_cols.max(1))
+                        <= i64::from(cols)
+                }));
         if !shown || !placement.has_pixels {
             continue;
         }
@@ -433,6 +442,14 @@ pub(crate) fn filler(id: u32) -> Vec<u8> {
     format!("\x1b_Ga=t,i={id},s=1,v=1,f=32,q=2;AAAAAA==\x1b\\").into_bytes()
 }
 
+/// Deletes every image and placement a receiver holds (all IDs, 1 to
+/// 2^32 - 1, and the data of each; `d=R`), quietly: a receiver that is not
+/// fresh is brought to where a reset would leave its images before they
+/// are re-sent (`Terminal::refresh_with`, a window that paints a
+/// viewport). Like every delete, it also abandons a chunked transmission
+/// the receiver has not finished.
+pub const IMAGE_RESET: &[u8] = b"\x1b_Ga=d,d=R,x=1,y=4294967295,q=2\x1b\\";
+
 /// Deletes the stand-in image under `id` (`filler`).
 pub(crate) fn remove_filler(id: u32) -> Vec<u8> {
     format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\").into_bytes()
@@ -477,7 +494,8 @@ pub(crate) fn place(placement: &RawPlacement) -> Vec<u8> {
     out
 }
 
-pub(crate) fn base64(bytes: &[u8]) -> Vec<u8> {
+/// `bytes` in standard base64, padded (RFC 4648).
+pub fn base64(bytes: &[u8]) -> Vec<u8> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {

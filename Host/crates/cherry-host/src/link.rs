@@ -93,6 +93,13 @@
 //!   without changing the grid. Its full and limited snapshots re-send the
 //!   kitty images on screen (see `cherry_vt::Terminal::graphics_replay`).
 //!   An older holder is never sent the fields (its PTY keeps 0×0 pixels).
+//! - Version 9 adds `graphics` to `Snapshot`, for the snapshot kinds
+//!   `refresh` and `resized`: the screens for a client window that paints a
+//!   viewport, which re-send the kitty images on screen too (see
+//!   `cherry_vt::Terminal::refresh_with`), so its copy of the screens has
+//!   them. An older holder is never sent it. A holder of version 9 also
+//!   reads the kitty graphics programs transmit from files and shared
+//!   memory itself (see `media`); that changes nothing on the link.
 //!
 //! Replies (`SnapshotReply`, `ScreenReply`, `DetachDone`) come in the order
 //! of their requests, and in order with the output: a `SnapshotReply` shows
@@ -106,7 +113,7 @@ use std::{
 };
 
 /// The link version this build speaks.
-pub const LINK_VERSION: u16 = 8;
+pub const LINK_VERSION: u16 = 9;
 /// The oldest link version whose holders limit screen text themselves
 /// (`ScreenRequest::max_lines`).
 pub const SCREEN_LINES_VERSION: u16 = 3;
@@ -120,6 +127,8 @@ pub const PACE_VERSION: u16 = 6;
 pub const CLEAR_HISTORY_VERSION: u16 = 7;
 /// The oldest link version whose holders take a cell size in `Size`.
 pub const CELL_SIZE_VERSION: u16 = 8;
+/// The oldest link version whose holders take `graphics` in a `Snapshot`.
+pub const VIEWPORT_GRAPHICS_VERSION: u16 = 9;
 /// The oldest link version this daemon adopts holders of.
 pub const MIN_LINK_VERSION: u16 = 1;
 /// Frames are at most this long (an 8 MiB snapshot with its images, and
@@ -710,6 +719,11 @@ pub struct SnapshotRequest {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<usize>,
+    /// Version 9: a `refresh` (or a `resized` answered with one) also
+    /// re-sends the kitty images on screen, for a window that paints a
+    /// viewport.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub graphics: bool,
 }
 
 /// The data is the snapshot as a renderer stream, which shows exactly the
@@ -1112,6 +1126,25 @@ mod tests {
         );
         let old: Size = serde_json::from_str(r#"{"cols":80,"rows":24}"#).unwrap();
         assert_eq!(old.cell(), None);
+    }
+
+    #[test]
+    fn snapshot_requests_name_graphics_only_when_asked() {
+        const { assert!(LINK_VERSION >= VIEWPORT_GRAPHICS_VERSION) };
+        let request = |graphics| SnapshotRequest {
+            req: 1,
+            kind: "refresh".into(),
+            max: None,
+            graphics,
+        };
+        let json = |request: &SnapshotRequest| serde_json::to_string(request).unwrap();
+        assert_eq!(json(&request(false)), r#"{"req":1,"kind":"refresh"}"#);
+        assert_eq!(
+            json(&request(true)),
+            r#"{"req":1,"kind":"refresh","graphics":true}"#
+        );
+        let old: SnapshotRequest = serde_json::from_str(r#"{"req":1,"kind":"refresh"}"#).unwrap();
+        assert!(!old.graphics);
     }
 
     #[test]

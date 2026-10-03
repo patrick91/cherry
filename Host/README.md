@@ -1595,27 +1595,101 @@ compressed images it sent (16 MiB, by image ID and generation), so a resync
 or another attach does not compress them again, and logs the images a
 snapshot left out at most once a minute. A screens-only replacement (a
 resize, `Refresh`) keeps the renderer's history and images and re-sends
-none.
+none, but for a window that paints a viewport (its size is not the
+grid's): its screens re-send the images on screen as a full snapshot does,
+after `a=d,d=R,x=1,y=4294967295,q=2`, which deletes every image the
+receiver holds (a refresh has no reset), so the copy it paints from has
+them (holder link version 9; an older holder sends the screens alone).
 
 `cherry attach`'s own copy of the screen (the one a window of another size
-is painted from) keeps images too, so a window that goes back to the
-stream gets them from the copy's full snapshot; a copy made from the
-screens alone lacks those sent before it, so the client then asks the host
-for a replacement (`Refresh`), which carries them when the host too took
-the window for a viewport.
+is painted from) keeps images too, sized in the window's own cells (from
+its `TIOCGWINSZ` pixels), so a window that goes back to the stream gets
+them from the copy's full snapshot; a copy made from the screens alone
+lacks those sent before it, so the client then asks the host for a
+replacement (`Refresh`), which carries them when the host too took the
+window for a viewport.
+
+A window that paints a viewport gets kitty graphics too. Its frames repaint
+the top-left of the grid, cell for cell, and the window's cursor is not the
+session's, so of the live output the commands that name images, not cells,
+pass, with `q=2`: transmissions (`a=t`, their chunks, and `a=f` animation
+frames), virtual placements (`U=1`, which the placeholder cells the frames
+paint show wherever they are), deletions, and the animation commands
+(`a=a`, `a=c`). `a=T` passes as `a=t`: the image is transmitted, not placed
+at the window's cursor. A placement at the session's cursor (`a=p` without
+`U=1`) and a deletion at it (`d=c`) do not pass; instead, as when the
+window enters viewport mode, gets a replacement, changes size or its cell
+size, or the grid changes size, the next frame brings the window's images
+in line with the copy: it deletes them all (`a=d,d=R,x=1,y=4294967295`),
+then sends the copy's images whose placements the window shows, the
+virtual ones and the direct ones that lie wholly in the region it shows,
+placed at their cell (in a top-left viewport the session's cell is the
+window's), and then the chunks so far of a transmission on its way, which
+the deletion abandoned on the window, so the chunks still to come complete
+it. So a direct placement is translated, not dropped, when the window shows
+all of it, and dropped when it shows only part. The graphics go after the
+frame's modes (each screen has images of its own) and before its rows, in
+its synchronized update; a frame sends none while neither the window nor
+the copy has any.
+
+Programs may also transmit an image from a file (`t=f`), a temporary file
+(`t=t`) or POSIX shared memory (`t=s`). The holder reads the data, on the
+machine the session runs on (over SSH too, which is where the program left
+it), before the display stream, and passes the command on as a direct
+transmission (`t=d`) in chunks of 4096 base64 bytes (`m=1` but on the
+last; a query, `a=q`, in one command), with the command's other keys
+(`t=`, `S=`, `O=` and `m=` dropped), to its terminal and every renderer
+alike: neither ever reads a file, and the display stream keeps from the
+renderers a command that still names one. What it reads:
+
+- regular files only: never a device, FIFO, socket or directory, and
+  nothing under `/proc`, `/sys` or `/dev` (but `/dev/shm`), as kitty and
+  Ghostty refuse them. A file is looked at before it is opened, so a device
+  or FIFO is never opened, then opened by its canonical path without
+  following a link, blocking or taking a controlling terminal, and must be
+  the file looked at. `t=f` follows symbolic links to the file.
+- `t=t`: only a file whose canonical path names `tty-graphics-protocol`
+  and lies in a temporary directory (`/tmp`, `/dev/shm`, the holder's and
+  the session's `TMPDIR` and, on macOS, the user's temporary directory),
+  and which is not itself a symbolic link. It is deleted once read,
+  whether or not that worked.
+- `t=s`: a POSIX name (`/name`), mapped (macOS) or read (Linux), and
+  unlinked once read.
+- from `O=` bytes in, `S=` bytes exactly when given, otherwise to the end
+  (for shared memory holding raw pixels, `f=24` or `32` uncompressed, the
+  bytes `s=` by `v=` pixels take, as Ghostty reads it, since its size is
+  rounded up to pages), at most 32 MiB (what a screen keeps of images; a
+  query at most 32 KiB, which fits one command).
+
+A command it cannot serve (too large, unreadable, missing, not a regular
+file, outside a temporary directory) goes to neither the terminal nor the
+renderers, and is answered as a terminal answers, `ESC _ G i=…;CODE:
+message ESC \` (`ENOENT`, `EACCES`, `EBADF`, `EINVAL`, `EFBIG`,
+`ETIMEDOUT`, …), as its `q=` and its `i=`/`I=` allow, in order with the
+replies of the session's terminal. The read runs on a thread of its own, so
+a slow file (a network mount) never holds up the holder's loop: the output
+the program wrote after the command waits behind it, as output that waits
+for the terminal or the daemon does, and the PTY is not read meanwhile; the
+transmission then goes on at the pace the daemon lets output through. A
+read that takes longer than 5 seconds is refused (its thread is left to
+finish), and while four such reads still run, a command is refused at once
+(`EBUSY`). When the program exits, the reads its last output asked for are
+waited for, 5 seconds in all.
 
 The PTY's pixels and size replies follow the window that sets the grid
 (its columns and rows are the grid's), of those that give a cell size, not
 the client that types or answers queries: a new cell size makes the
 program repaint, so it changes only with the grid's window.
 
-Known gaps: a window rendering a viewport gets no kitty graphics at all (the
-viewport drops APC); only direct transmission is kept (`t=f`, `t=t` and
-`t=s` media are off); placements in the history or partly off screen, the
-primary screen's images under the alternate screen, images without a
-placement, placement IDs (above) and animation frames other than the
-current one are not re-sent; sixel and iTerm2 images are not supported
-(nor by Ghostty).
+Known gaps: placements in the history or partly off screen (and, in a
+viewport, partly outside the region the window shows), the primary
+screen's images under the alternate screen (in a viewport too: the window's
+images are brought in line on the screen it shows), images without a
+placement (a viewport's resync deletes those the window had, so a later
+virtual placement of one shows nothing there until the next resync),
+placement IDs (above) and animation frames other than the current one are
+not re-sent; a viewport places a direct placement at the next frame, not
+as it comes; sixel and iTerm2 images are not supported (nor by Ghostty).
 
 When an attachment's size matches the shared grid, it uses the ordinary
 terminal stream and its own scrollback. A larger attachment is repainted from a
@@ -1638,8 +1712,9 @@ terminal rather than on its screen: OSC 52 clipboard writes, titles (OSC 0–2)
 and the title stack (`CSI 22/23 t`), OSC 7, notifications (OSC 9, 99, 777),
 colour settings (OSC 4, 5, 10–19, 21, 104, 105, 110–119), and BEL. OSC 99
 notifications pass even when their text contains `?`; only `p=?` capability
-queries are held back. Kitty graphics, cursor and pointer shapes, and window
-operations are not passed through. A client in either mode writes the
+queries are held back. Kitty graphics pass as [kitty graphics](#kitty-graphics)
+describes (not what places an image at the session's cursor); cursor and
+pointer shapes, and window operations are not passed through. A client in either mode writes the
 queries the host sends it (`Query`) to its window, which answers them. In
 viewport mode the client first writes a frame of the screen up to the query,
 so a cursor report matches. A query that arrives after the client sent
@@ -1707,7 +1782,8 @@ answers it, by its own policy (Cherry's tab applies Ghostty's
 `clipboard-read`, which asks the user), and with no such client it is
 dropped unanswered.
 
-Current snapshot limitations include terminal graphics, palette and dynamic
+Current snapshot limitations include terminal graphics beyond the kitty
+images on screen (see [kitty graphics](#kitty-graphics)), palette and dynamic
 colour changes, OSC 7 directory metadata, the title, cursor shape, the
 contents and saved cursor of an inactive alternate screen, hyperlink ids, and
 OSC 133 prompt marks. See [cherry-vt](crates/cherry-vt/README.md) for details.

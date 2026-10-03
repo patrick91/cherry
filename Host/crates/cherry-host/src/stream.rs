@@ -63,9 +63,6 @@ impl Transfer {
             .split(|&b| b == b',')
             .filter(|k| !k.is_empty())
             .collect();
-        if keys.contains(&&b"a=q"[..]) {
-            return;
-        }
         let more = keys.contains(&&b"m=1"[..]);
         let continues = keys
             .iter()
@@ -75,6 +72,23 @@ impl Transfer {
                 return;
             }
         } else {
+            let action = keys
+                .iter()
+                .rev()
+                .find_map(|key| key.strip_prefix(b"a="))
+                .unwrap_or(b"t");
+            match action {
+                // A new transmission replaces it.
+                b"t" | b"T" | b"f" => {}
+                // A deletion abandons it, as it does on a terminal.
+                b"d" => {
+                    *self = Self::default();
+                    return;
+                }
+                // A probe, a placement or an animation command leaves it
+                // alone.
+                _ => return,
+            }
             *self = Self::default();
             if !more {
                 return;
@@ -842,7 +856,11 @@ fn host_answers_capability(name: &[u8]) -> bool {
 }
 
 /// Kitty graphics: the host answers `a=q` probes and acknowledges other
-/// commands; the renderer draws images but must stay silent (`q=2`).
+/// commands; the renderer draws images but must stay silent (`q=2`). A
+/// renderer never reads a file or shared memory for an image: the holder
+/// reads those and passes the command on as a direct transmission (see
+/// `media`), so one that names a medium still (one the holder took for no
+/// command) goes to the host alone, which refuses it.
 fn route_graphics(token: &[u8]) -> Route {
     let Some(body) = token
         .strip_prefix(b"\x1b_G")
@@ -856,7 +874,7 @@ fn route_graphics(token: &[u8]) -> Route {
         .split(|&b| b == b',')
         .filter(|key| !key.is_empty())
         .collect();
-    if keys.contains(&&b"a=q"[..]) {
+    if keys.contains(&&b"a=q"[..]) || crate::media::medium(control).is_some() {
         return Route::Host;
     }
     let mut quiet = b"\x1b_G".to_vec();
@@ -1623,8 +1641,9 @@ mod tests {
             stream.unfinished_transfer(),
             b"\x1b_Ga=T,f=100,i=3,m=1,q=2;AAAA\x1b\\"
         );
-        // A probe or another command in between leaves it alone.
-        stream.feed(b"\x1b_Ga=q,i=1,s=1,v=1;AAAA\x1b\\\x1b[H");
+        // A probe, a placement or another command in between leaves it
+        // alone.
+        stream.feed(b"\x1b_Ga=q,i=1,s=1,v=1;AAAA\x1b\\\x1b[H\x1b_Ga=p,U=1,i=3\x1b\\");
         stream.feed(b"\x1b_Gm=1;BBBB\x1b");
         stream.feed(b"\\");
         assert_eq!(
@@ -1637,13 +1656,16 @@ mod tests {
         // Continuation chunks without a beginning are not kept.
         stream.feed(b"\x1b_Gm=1;DDDD\x1b\\");
         assert!(stream.unfinished_transfer().is_empty());
-        // A new transmission replaces one, and a reset abandons it.
+        // A new transmission replaces one, and a reset or a deletion
+        // abandons it.
         stream.feed(b"\x1b_Ga=t,i=4,m=1;AAAA\x1b\\\x1b_Ga=t,i=5,m=1;BBBB\x1b\\");
         assert_eq!(
             stream.unfinished_transfer(),
             b"\x1b_Ga=t,i=5,m=1,q=2;BBBB\x1b\\"
         );
         stream.feed(b"\x1bc");
+        assert!(stream.unfinished_transfer().is_empty());
+        stream.feed(b"\x1b_Ga=t,i=4,m=1;AAAA\x1b\\\x1b_Ga=d,d=i,i=9\x1b\\");
         assert!(stream.unfinished_transfer().is_empty());
         // One too large for a snapshot is dropped, with the rest of it.
         let chunk = [&b"\x1b_Gm=1;"[..], &[b'A'; 4096], b"\x1b\\"].concat();
@@ -1675,5 +1697,24 @@ mod tests {
         let chunk = split(b"\x1b_Gm=0;\x1b\\");
         assert_eq!(chunk.display, b"\x1b_Gm=0,q=2;\x1b\\");
         assert_eq!(split(b"\x1b_G\x1b\\").display, b"\x1b_Gq=2\x1b\\");
+    }
+
+    #[test]
+    fn a_command_that_names_a_file_never_reaches_a_renderer() {
+        // The holder reads files and shared memory (see `media`); one it did
+        // not take for a command goes to the host alone, which refuses it.
+        for command in [
+            &b"\x1b_Ga=T,t=f,i=1;L3RtcC94\x1b\\"[..],
+            b"\x1b_Gt=t,i=1;L3RtcC94\x1b\\",
+            b"\x1b_Ga=f,t=s,i=1;L3g=\x1b\\",
+        ] {
+            let batch = split(command);
+            assert_eq!(batch.terminal, command);
+            assert!(batch.display.is_empty(), "{command:?}");
+            assert!(batch.answered);
+        }
+        // A medium on a command that carries no data is no file to read.
+        let place = split(b"\x1b_Ga=p,t=f,i=1\x1b\\");
+        assert_eq!(place.display, b"\x1b_Ga=p,t=f,i=1,q=2\x1b\\");
     }
 }

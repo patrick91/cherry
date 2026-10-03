@@ -1703,8 +1703,15 @@ fn a_refresh_that_meets_a_resize_the_program_repaints_for_still_gets_the_screens
             (resize.meta["cols"].as_u64(), resize.meta["rows"].as_u64()),
             (Some(70), Some(20))
         );
+        // One request for the small window, which shows the stream, and
+        // one for the large one, which paints a viewport: its screens bring
+        // the kitty images on screen (link version 9).
+        let streamed = holder.expect(link::SNAPSHOT);
+        assert_eq!(streamed.meta["kind"], "resized");
+        assert_eq!(streamed.meta.get("graphics"), None);
         let resized = holder.expect(link::SNAPSHOT);
         assert_eq!(resized.meta["kind"], "resized");
+        assert_eq!(resized.meta["graphics"], true);
         // Meanwhile the large window asks for the screens (it has no copy
         // to paint its viewport from); its input after it shows the host
         // took the request.
@@ -1712,10 +1719,12 @@ fn a_refresh_that_meets_a_resize_the_program_repaints_for_still_gets_the_screens
         input(&mut large, b"x");
         let typed = holder.expect(link::INPUT);
         assert_eq!(typed.data, b"x");
-        // The answer carries no screens: the large window still gets them.
+        // The answers carry no screens: the large window still gets them.
+        snapshot_reply(&mut holder, &streamed, "size", (70, 20), b"");
         snapshot_reply(&mut holder, &resized, "size", (70, 20), b"");
         let refresh = holder.expect(link::SNAPSHOT);
         assert_eq!(refresh.meta["kind"], "refresh");
+        assert_eq!(refresh.meta["graphics"], true);
         snapshot_reply(&mut holder, &refresh, "refresh", (70, 20), b"SCREENS");
         large
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -1738,5 +1747,49 @@ fn a_refresh_that_meets_a_resize_the_program_repaints_for_still_gets_the_screens
             }
         }
         assert_eq!(seen, ["resized 70x20", "screens"]);
+    });
+}
+
+#[test]
+fn only_a_holder_of_version_9_is_asked_for_a_viewports_images() {
+    let host = Host::new();
+    let mut holder = FakeHolder::register(&host, 8, hello(&Uuid::new_v4().to_string(), json!({})));
+    wait_until("the session", || {
+        host.sessions().iter().any(|s| s.id == holder.id)
+    });
+    let id = holder.id.clone();
+    let snapshot_reply = |holder: &mut FakeHolder, request: &link::Frame, kind: &str| {
+        holder.send(
+            link::SNAPSHOT_REPLY,
+            8,
+            json!({"req": request.meta["req"], "kind": kind, "offset": 5, "cols": 80, "rows": 24}),
+            b"SNAP",
+        );
+    };
+    thread::scope(|scope| {
+        let first = scope.spawn(|| host.attach(&id, 80, 24).0);
+        let request = holder.expect(link::SNAPSHOT);
+        snapshot_reply(&mut holder, &request, "limited");
+        let mut small = first.join().unwrap();
+        let second = scope.spawn(|| host.attach(&id, 100, 30).0);
+        let request = holder.expect(link::SNAPSHOT);
+        snapshot_reply(&mut holder, &request, "limited");
+        let _large = second.join().unwrap();
+        send(
+            &mut small,
+            &ClientMessage::Resize {
+                cols: 70,
+                rows: 20,
+                cell_width: None,
+                cell_height: None,
+            },
+        );
+        holder.expect(link::RESIZE);
+        // The screens for both windows, in one request without `graphics`.
+        let both = holder.expect(link::SNAPSHOT);
+        assert_eq!(both.meta["kind"], "resized");
+        assert_eq!(both.meta.get("graphics"), None);
+        input(&mut small, b"y");
+        assert_eq!(holder.expect(link::INPUT).data, b"y");
     });
 }

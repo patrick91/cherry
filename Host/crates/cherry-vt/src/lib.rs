@@ -8,7 +8,9 @@ mod graphics;
 pub use events::{
     parse_osc99, Osc99, ProgressState, VtEvent, MAX_PENDING_EVENTS, MAX_PENDING_EVENT_BYTES,
 };
-pub use graphics::{decode_rgba, GraphicsReplay, MAX_DECODED_BYTES, MAX_IMAGE_SIDE};
+pub use graphics::{
+    base64, decode_rgba, GraphicsReplay, IMAGE_RESET, MAX_DECODED_BYTES, MAX_IMAGE_SIDE,
+};
 
 type Handle = *mut c_void;
 type Sink = extern "C" fn(*mut c_void, *const u8, usize);
@@ -711,6 +713,19 @@ impl Terminal {
     /// screen's images under the alternate screen, images without a
     /// placement, and animation frames other than the current one.
     pub fn graphics_replay(&self, budget: usize) -> Result<GraphicsReplay> {
+        self.replay_within(None, self.rows, budget)
+    }
+
+    /// `graphics_replay` for a window that shows only the top-left `cols`
+    /// by `rows` cells of this terminal's screen (a viewport): a direct
+    /// placement is re-sent only when its columns and rows all lie there,
+    /// at its own cell, which is the window's too. Virtual placements are
+    /// re-sent wherever their placeholder cells are.
+    pub fn viewport_graphics(&self, cols: u16, rows: u16, budget: usize) -> Result<GraphicsReplay> {
+        self.replay_within(Some(cols.min(self.cols)), rows.min(self.rows), budget)
+    }
+
+    fn replay_within(&self, cols: Option<u16>, rows: u16, budget: usize) -> Result<GraphicsReplay> {
         let handle = self.handle.as_ptr();
         let mut placements = vec![graphics::RawPlacement::default(); 16];
         loop {
@@ -734,7 +749,7 @@ impl Terminal {
         }
         let mut replay = GraphicsReplay::default();
         let mut cache = self.graphics_cache.borrow_mut();
-        let candidates = graphics::candidates(&placements, self.rows);
+        let candidates = graphics::candidates(&placements, cols, rows);
         // Forget the images no longer shown.
         cache.retain(|key| candidates.iter().any(|c| (c.id, c.generation) == *key));
         struct Kept {
@@ -1073,6 +1088,35 @@ impl Terminal {
     /// it.
     pub fn refresh(&self) -> Result<Vec<u8>> {
         self.encode(Replay::Refresh, &[])
+    }
+
+    /// `refresh()` that also re-sends the kitty graphics on screen, in at
+    /// most `graphics_budget` bytes, for a receiver that paints a viewport
+    /// from it: after the active screen's content, `IMAGE_RESET` (a refresh
+    /// has no reset, and the receiver may hold images already), the images
+    /// and placements of `graphics_replay`, then `unfinished` (see
+    /// `snapshot_with`). An error when the rest, the screens, takes more
+    /// than `max_bytes`. Also returns what the graphics carried and left
+    /// out (without their bytes).
+    pub fn refresh_with(
+        &self,
+        max_bytes: usize,
+        graphics_budget: usize,
+        unfinished: &[u8],
+    ) -> Result<(Vec<u8>, GraphicsReplay)> {
+        let mut graphics = self.graphics_replay(
+            graphics_budget.saturating_sub(unfinished.len() + IMAGE_RESET.len()),
+        )?;
+        let mut extra = IMAGE_RESET.to_vec();
+        extra.append(&mut graphics.bytes);
+        extra.extend_from_slice(unfinished);
+        let refresh = self.encode(Replay::Refresh, &extra)?;
+        let screens = refresh.len() - extra.len();
+        ensure!(
+            screens <= max_bytes,
+            "the screens need a {screens}-byte refresh; the limit is {max_bytes} bytes"
+        );
+        Ok((refresh, graphics))
     }
 
     /// `snapshot()` limited to `max_bytes`: the oldest history is dropped,

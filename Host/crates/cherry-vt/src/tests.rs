@@ -2286,6 +2286,87 @@ fn images_off_screen_or_in_history_are_not_resent() {
     assert!(replay.bytes.is_empty());
 }
 
+#[test]
+fn a_viewport_gets_the_images_whose_placements_it_shows_whole() {
+    // Image 7 at row 2, column 1 (one cell) and again at row 6, columns 5
+    // and 6; image 9 placed virtually.
+    let original = screen_with_images();
+    let placements = |cols, rows| {
+        let replay = original.viewport_graphics(cols, rows, usize::MAX).unwrap();
+        (replay.images, replay.placements, replay)
+    };
+    let (images, count, all) = placements(40, 10);
+    assert_eq!((images, count), (2, 3));
+    assert_eq!(all, original.graphics_replay(usize::MAX).unwrap());
+    // Five columns cut the second placement of 7, which is left out; six
+    // show it whole.
+    let (images, count, replay) = placements(5, 10);
+    assert_eq!((images, count), (2, 2));
+    assert!(contains(
+        &replay.bytes,
+        b"\x1b[2;1H\x1b_Ga=p,i=7,C=1,q=2\x1b\\"
+    ));
+    assert!(!contains(&replay.bytes, b"\x1b[6;5H"));
+    assert!(contains(
+        &replay.bytes,
+        b"\x1b_Ga=p,U=1,i=9,c=2,r=2,q=2\x1b\\"
+    ));
+    assert_eq!(placements(6, 10).1, 3);
+    // One row shows neither placement of 7: only the virtual one is left,
+    // wherever its placeholder cells are.
+    let (images, count, replay) = placements(40, 1);
+    assert_eq!((images, count), (1, 1));
+    assert!(!contains(&replay.bytes, b"i=7"));
+    // A window larger than the screen sees it all.
+    assert_eq!(placements(200, 100).1, 3);
+}
+
+#[test]
+fn a_refresh_with_graphics_leaves_a_receiver_with_the_images_on_screen() {
+    let original = screen_with_images();
+    let (refresh, replay) = original
+        .refresh_with(
+            usize::MAX,
+            SNAPSHOT_GRAPHICS_BYTES,
+            b"\x1b_Gm=1,q=2;AAAA\x1b\\",
+        )
+        .unwrap();
+    // The limit counts the screens alone.
+    let screens = original.refresh().unwrap().len();
+    assert!(original.refresh_with(screens, usize::MAX, &[]).is_ok());
+    assert!(original.refresh_with(screens - 1, usize::MAX, &[]).is_err());
+    assert_eq!((replay.images, replay.placements), (2, 3));
+    assert!(replay.bytes.is_empty());
+    let at = |needle: &[u8]| {
+        refresh
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap_or_else(|| panic!("{:?} missing", String::from_utf8_lossy(needle)))
+    };
+    // After the content: the images go first, then the transfer still on
+    // its way, then the cursor.
+    assert!(at(b"after") < at(IMAGE_RESET));
+    assert!(at(IMAGE_RESET) < at(b"\x1b_Ga=t,i=7,"));
+    assert!(at(b"\x1b_Ga=p,U=1,i=9") < at(b"\x1b_Gm=1,q=2;AAAA"));
+    let text = String::from_utf8_lossy(&refresh);
+    assert!(text.rfind("\x1b[8;17H").expect("the cursor") > at(b"\x1b_Gm=1,q=2;AAAA"));
+    // A receiver that holds images of its own, and the screens before,
+    // ends with the original's images alone.
+    let mut copy = graphics_term(40, 10);
+    copy.resize_cells(40, 10, 10, 20).unwrap();
+    copy.feed(&apc("a=T,f=24,s=1,v=1,i=3,q=2", &[1, 2, 3]));
+    copy.feed(&apc("a=t,f=24,s=1,v=1,i=4,q=2", &[1, 2, 3]));
+    assert!(copy.feed(&refresh).is_empty());
+    assert_eq!(
+        copy.inspect().unwrap().graphics,
+        original.inspect().unwrap().graphics
+    );
+    assert_eq!(
+        copy.inspect().unwrap().active,
+        original.inspect().unwrap().active
+    );
+}
+
 /// A terminal of `source`'s size and cells that keeps images, with
 /// `source`'s snapshot replayed.
 fn graphics_copy(source: &Terminal) -> Terminal {

@@ -4,6 +4,7 @@ mod environment;
 mod holder;
 mod launch;
 mod link;
+mod media;
 mod outbox;
 mod paths;
 mod ports;

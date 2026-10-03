@@ -851,6 +851,18 @@ final class OpenHostedTabs {
 /// (`TerminalSession.ghosttyBridge`). Until its adapter runs, a tab follows
 /// its program through its host.
 ///
+/// A tab no window shows attaches at the size its window gives its
+/// terminals (`TerminalSession.detachedSurfaceSize`), which its surface then
+/// keeps until shown, so it waits for that window's grid to settle first, as
+/// a new window's first tab's Create does (`TerminalWindowGridWait`, the
+/// tab's `windowGridSource`; none for a workspace that does not wait): a
+/// window a tiling manager re-tiles just after it opens would otherwise give
+/// it the grid it had before, and showing the tab would resize its program.
+/// Its wait starts when the queue first looks at it outside a hold
+/// (`holdBackgroundTabs`), and every tab waiting then is looked at, so the
+/// tabs of one window launch together once its grid settled (or the wait
+/// gave up), one per turn as usual; the shown tabs never wait.
+///
 /// Workspaces use `.shared` unless given their own
 /// (`TerminalWorkspace.restoredTabLaunchQueue`, tests).
 @MainActor
@@ -864,12 +876,18 @@ final class RestoredTabLaunchQueue {
 
     private final class WeakTab {
         weak var session: TerminalSession?
+        /// A background tab's wait for its window's grid, from the first
+        /// look at it outside a hold.
+        var windowGridWaiting: TerminalWindowGridWait.Waiting?
         init(_ session: TerminalSession) { self.session = session }
     }
 
     private var shown: [WeakTab] = []
     private var background: [WeakTab] = []
     private var isScheduled = false
+    /// When a background tab waiting for its window's grid is looked at
+    /// again (set by `next`).
+    private var nextWindowGridLook: ContinuousClock.Instant?
     /// While the launch opens its windows, tabs no window shows wait
     /// (`holdBackgroundTabs`): their adapters would only compete with the
     /// windows and the host connection for the main thread.
@@ -925,9 +943,10 @@ final class RestoredTabLaunchQueue {
         if !shown.isEmpty || !background.isEmpty { schedule(after: interval) }
     }
 
-    /// Launches every waiting adapter now (tests).
+    /// Launches every waiting adapter now, without waiting for any window's
+    /// grid (tests).
     func drain() {
-        while let tab = next() {
+        while let tab = next(waitingForWindowGrids: false) {
             tab.launchDeferredAdapterIfNeeded()
         }
     }
@@ -951,20 +970,79 @@ final class RestoredTabLaunchQueue {
             }
         }
         if !shown.isEmpty || (!background.isEmpty && !isHoldingBackgroundTabs) {
-            let took = ContinuousClock.now - started
-            let seconds = Double(took.components.seconds) + Double(took.components.attoseconds) / 1e18
-            schedule(after: max(interval, seconds))
+            let now = ContinuousClock.now
+            let delay: Duration
+            if launched == 0, let look = nextWindowGridLook {
+                // Only tabs waiting for their window's grid: look again then.
+                delay = max(look - now, .zero)
+            } else {
+                delay = max(now - started, .seconds(interval))
+            }
+            schedule(after: Self.seconds(delay))
         }
     }
 
-    /// The next tab still waiting (closed or launched ones are skipped).
-    private func next() -> TerminalSession? {
-        while !shown.isEmpty || (!background.isEmpty && !isHoldingBackgroundTabs) {
-            let entry = shown.isEmpty ? background.removeFirst() : shown.removeFirst()
+    private static func seconds(_ duration: Duration) -> TimeInterval {
+        Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+    }
+
+    /// The next tab to launch: a shown one, else a background one whose
+    /// window's grid settled or that waited as long as it may (closed or
+    /// launched ones are skipped). Background tabs still waiting keep their
+    /// place; `nextWindowGridLook` says when to look at them again.
+    private func next(waitingForWindowGrids: Bool = true) -> TerminalSession? {
+        nextWindowGridLook = nil
+        while !shown.isEmpty {
+            let entry = shown.removeFirst()
             if let tab = entry.session, tab.isAwaitingDeferredLaunch {
                 return tab
             }
         }
+        guard !isHoldingBackgroundTabs else { return nil }
+        let now = ContinuousClock.now
+        var index = 0
+        while index < background.count {
+            let entry = background[index]
+            guard let tab = entry.session, tab.isAwaitingDeferredLaunch else {
+                background.remove(at: index)
+                continue
+            }
+            if waitingForWindowGrids, let look = windowGridLook(entry, tab, now: now) {
+                nextWindowGridLook = min(nextWindowGridLook ?? look, look)
+                index += 1
+                continue
+            }
+            background.remove(at: index)
+            return tab
+        }
         return nil
+    }
+
+    /// When to look again at `tab`, a background tab, while its window's
+    /// grid has not settled (`TerminalWindowGridWait`); nil once it may
+    /// launch.
+    private func windowGridLook(_ entry: WeakTab, _ tab: TerminalSession, now: ContinuousClock.Instant) -> ContinuousClock.Instant? {
+        guard let source = tab.windowGridSource else { return nil }
+        var waiting = entry.windowGridWaiting ?? TerminalWindowGridWait.Waiting(source.wait, startedAt: now)
+        let decision = waiting.decide(source.observe(), now: now)
+        entry.windowGridWaiting = waiting
+        let waited = (now - waiting.startedAt).components
+        let milliseconds = waited.seconds * 1_000 + waited.attoseconds / 1_000_000_000_000_000
+        switch decision {
+        case .wait(let until):
+            return waiting.nextLook(waitingUntil: until, now: now)
+        case .take:
+            if milliseconds > 0 {
+                SessionLog.debug(
+                    "tab \(tab.id.uuidString) attaches in the background at its window's grid after \(milliseconds) ms"
+                )
+            }
+            return nil
+        case .giveUp:
+            SessionLog.notice(
+                "tab \(tab.id.uuidString) attaches in the background: its window's terminal grid did not settle within \(milliseconds) ms"
+            )
+            return nil
+        }
     }
 }

@@ -446,9 +446,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         self.controller = TerminalController(configuration: terminalConfiguration, theme: terminalTheme)
         // A surface built while no view shows it (a restored tab's adapter
         // launching in the background) takes the size its window's terminal
-        // has, so its program attaches at the size the tab is shown at
-        // (`TerminalSession.detachedSurfaceSize`); Ghostty's default
-        // otherwise.
+        // has at the window's grid, so its program attaches at the size the
+        // tab is shown at (`TerminalSession.detachedSurfaceSize`); Ghostty's
+        // default otherwise.
         self.terminalView = TerminalView(frame: NSRect(origin: .zero, size: session.detachedSurfaceSize?() ?? .zero))
         self.appliedTerminalConfiguration = terminalConfiguration
         self.appliedTerminalTheme = terminalTheme
@@ -2440,8 +2440,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     /// (`HostedAttachmentSizeFile`): the surface's grid, or that the size
     /// is changing while the window that shows it settles
     /// (`TerminalWindowSettling`). A surface no window shows (a tab
-    /// attaching in the background) has the size its window's terminal has
-    /// (`TerminalSession.detachedSurfaceSize`), which it keeps.
+    /// attaching in the background) has the size its window's terminal had
+    /// at the window's settled grid (`TerminalSession.detachedSurfaceSize`,
+    /// `RestoredTabLaunchQueue`), which it keeps.
     func announceAdapterWindowSize() {
         guard !isReleased, isNativePTYBacked, let session = proxy.session else { return }
         if TerminalWindowSettling.shared.isSettling(terminalView.window) {
@@ -2456,16 +2457,18 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     }
 
     /// Tells the tab's workspace which grid the window showing this surface
-    /// gives a terminal (`TerminalWindowGrid`), once the surface is laid out
-    /// at its view's size (`isMountedViewportReadyForReveal`): whatever its
-    /// backend, so a persistent tab still being created learns its window's
-    /// grid from its own in-memory surface.
+    /// gives a terminal (`TerminalWindowGrid`), and the view's size at it,
+    /// once the surface is laid out at its view's size
+    /// (`isMountedViewportReadyForReveal`): whatever its backend, so a
+    /// persistent tab still being created learns its window's grid from its
+    /// own in-memory surface.
     private func reportWindowGrid() {
         guard !isReleased, let session = proxy.session, let window = terminalView.window,
               isMountedViewportReadyForReveal, let gridMetrics
         else { return }
         session.surfaceDidShowWindowGrid(
             TerminalViewportSize(columns: Int(gridMetrics.columns), rows: Int(gridMetrics.rows)),
+            size: terminalView.bounds.size,
             in: window
         )
     }

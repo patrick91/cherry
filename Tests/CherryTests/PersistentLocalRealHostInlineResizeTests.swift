@@ -206,7 +206,11 @@ private func resizeInlineTabs(_ host: RealLocalHost, _ tabs: [InlineTab], height
         #expect(second.activeWorkspace.selectedSession === restoredShell)
         host.show(restoredShell)
         host.resize(restoredShell, to: window)
-        try await host.waitFor("the shell to be on screen") { restoredShell.mountedTerminalSize != nil }
+        // At the window's grid, not only on screen: until Ghostty reports
+        // the view's size, the surface has the grid it was built at.
+        try await host.waitFor("the shell to be on screen at the window's grid") {
+            restoredShell.mountedTerminalGrid == grid
+        }
         #expect(restored.isAwaitingDeferredLaunch)
         queue.releaseBackgroundTabs()
         try await host.waitFor("the mimic's tab to attach in the background") {
@@ -245,6 +249,125 @@ private func resizeInlineTabs(_ host: RealLocalHost, _ tabs: [InlineTab], height
         try await Task.sleep(for: .milliseconds(500))
         #expect(mimicSizes(nativeLog) == mimicSizes(log))
         #expect(inlineLines(host.screen(restored)) == inlineLines(host.screen(native)))
+    } catch {
+        await tearDown()
+        throw error
+    }
+    await tearDown()
+}
+
+/// A launch releases the restored tabs no window shows once its windows are
+/// up (`RestoredTabLaunchQueue.releaseBackgroundTabs`), and a tiling window
+/// manager may re-tile a new window after that (AeroSpace re-tiles one 90 to
+/// 290 ms after its terminal is first laid out). Such a tab attaches in the
+/// background once its window's grid settled (`TerminalWindowGridWait`), at
+/// that grid: its program, an inline TUI, sees the size it had when Cherry
+/// quit and then the window's final one, never the window's first grid, and
+/// nothing more when the tab is shown.
+@Test(.enabled(if: inlineResizeRealHostEnabled))
+@MainActor func PersistentLocalRealHostRestoredBackgroundTabAttachesAtTheGridItsWindowSettlesAt() async throws {
+    let host = try await RealLocalHost(adapterTerminalStartsAt: (rows: 16, columns: 45))
+    let project = host.home.appendingPathComponent("project", isDirectory: true)
+    try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+    let store = WorkspaceStateStore(directory: host.root.appendingPathComponent("Workspaces", isDirectory: true))
+    let control = host.control
+    let restorer = WorkspaceSessionRestorers.hostedByDefault(localSessions: host.hosting, control: { _ in control })
+    let queue = RestoredTabLaunchQueue()
+    var waiting = host.policy
+    // A quiet period far longer than the test's own steps take, so a CI
+    // runner that stalls between showing the window and re-tiling it does
+    // not make the first grid look settled.
+    waiting.windowGridWait = TerminalWindowGridWait(
+        quietPeriod: .milliseconds(1_500), maximumWait: .seconds(8), maximumSettlingWait: .seconds(10)
+    )
+    var repositories: [RepositoryWorkspace] = []
+    func makeRepository(_ policy: SessionBackendPolicy) -> RepositoryWorkspace {
+        let repository = RepositoryWorkspace(
+            projectRoot: project.path, backendPolicy: policy, stateStore: store,
+            sessionRestorer: restorer, autoStartCommands: { _ in [] }, restoredTabLaunchQueue: queue
+        )
+        repositories.append(repository)
+        return repository
+    }
+    func tearDown() async {
+        for repository in repositories { repository.closeAllSessions(intent: .windowClosed) }
+        await host.tearDown()
+    }
+    let firstFrame = NSSize(width: 800, height: 500)
+    let tiled = NSSize(width: 560, height: 800)
+    do {
+        // The last run: the mimic runs in its window, which then goes full
+        // screen, and Cherry quits keeping its session with the shell
+        // selected.
+        let first = makeRepository(host.policy)
+        first.beginRestoringSavedStateIfNeeded(chromeState: nil)
+        await first.waitForPendingRestores()
+        let shell = try #require(first.activeWorkspace.sessions.first)
+        host.show(shell)
+        try await host.waitFor("the shell to be on screen") { shell.mountedTerminalGrid != nil }
+        let firstGrid = try #require(shell.mountedTerminalGrid)
+        let log = host.root.appendingPathComponent("background.log")
+        let mimic = first.activeWorkspace.addCommandSession(
+            command: ProjectCommandDefinition(
+                name: "mimic", command: "/usr/bin/python3",
+                arguments: "'\(inlineMimic.path)' claude-cursor 120 '\(log.path)'"
+            ),
+            projectRoot: project.path
+        )
+        #expect(mimic.isPersistentLocalSession)
+        host.show(mimic)
+        try await host.waitFor("the mimic to draw") {
+            mimic.adapterLiveStatus?.followsProgram == true
+                && inlineLines(host.screen(mimic)).contains { $0.hasPrefix("LIVE footer two") }
+        }
+        host.resize(mimic, to: NSSize(width: 1400, height: 1000))
+        try await host.waitFor("the mimic to redraw full screen") { mimicSizes(log).count == 2 }
+        let lastRun = mimicSizes(log)
+        #expect(lastRun.first == "\(firstGrid.rows)x\(firstGrid.columns)")
+        first.activeWorkspace.select(shell)
+        first.flushPersistentState()
+        first.closeAllSessions(intent: .appQuit)
+
+        // Relaunch: the window comes up at its first frame showing the
+        // shell; the launch then releases the mimic's tab, and the window
+        // manager re-tiles the window in two steps.
+        queue.holdBackgroundTabs(atMost: 60)
+        let second = makeRepository(waiting)
+        second.beginRestoringSavedStateIfNeeded(chromeState: nil)
+        await second.waitForPendingRestores()
+        let restoredShell = try #require(second.activeWorkspace.session(withID: shell.id))
+        let restored = try #require(second.activeWorkspace.session(withID: mimic.id))
+        #expect(second.activeWorkspace.selectedSession === restoredShell)
+        host.show(restoredShell, size: firstFrame)
+        try await host.waitFor("the shell to be on screen at the window's first grid") {
+            restoredShell.mountedTerminalGrid == firstGrid
+        }
+        #expect(restored.isAwaitingDeferredLaunch)
+        queue.releaseBackgroundTabs()
+        try await Task.sleep(for: .milliseconds(150))
+        host.resize(restoredShell, to: NSSize(width: tiled.width, height: 720))
+        try await Task.sleep(for: .milliseconds(20))
+        host.resize(restoredShell, to: tiled)
+        try await host.waitFor("the shell to take the tiled grid") {
+            restoredShell.mountedTerminalGrid.map { $0 != firstGrid && $0.columns < firstGrid.columns } ?? false
+        }
+        let tiledGrid = try #require(restoredShell.mountedTerminalGrid)
+        let tiledSize = "\(tiledGrid.rows)x\(tiledGrid.columns)"
+        try await host.waitFor("the mimic's tab to attach in the background") {
+            restored.adapterLiveStatus?.followsProgram == true && mimicSizes(log).count >= 3
+        }
+        #expect(restored.mountedTerminalSize == nil)
+        // Past the adapter's interim terminal size, and anything after.
+        try await Task.sleep(for: .milliseconds(700))
+        #expect(mimicSizes(log) == lastRun + [tiledSize])
+        // Shown in its window, at the size it attached at: no other resize.
+        host.show(restored, size: tiled)
+        try await host.waitFor("the restored tab's screen") {
+            inlineLines(host.screen(restored)).contains { $0.hasPrefix("LIVE footer two") }
+        }
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(restored.mountedTerminalGrid == tiledGrid)
+        #expect(mimicSizes(log) == lastRun + [tiledSize])
     } catch {
         await tearDown()
         throw error

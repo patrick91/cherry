@@ -1216,18 +1216,18 @@ final class TerminalWorkspace: ObservableObject {
             session.detachedSurfaceSize = { [weak self, weak session] in
                 // Only while the tab is this workspace's.
                 guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return nil }
-                return self.mountedTerminalSize
+                return self.windowGrid.record?.size ?? self.mountedTerminalSize
             }
             session.windowTerminalCell = { [weak self, weak session] grid in
                 guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return nil }
                 return self.terminalCell(forGrid: grid)
             }
-            session.surfaceShowedWindowGrid = { [weak self, weak session] grid, window in
+            session.surfaceShowedWindowGrid = { [weak self, weak session] grid, size, window in
                 guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return }
-                self.windowGrid.note(grid, in: window)
+                self.windowGrid.note(grid, size: size, in: window)
             }
             if let wait = backendPolicy.windowGridWait {
-                session.windowGridForCreate = (wait, { [weak self, weak session] in
+                session.windowGridSource = (wait, { [weak self, weak session] in
                     guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return nil }
                     return self.windowGrid.observation()
                 })
@@ -1237,8 +1237,10 @@ final class TerminalWorkspace: ObservableObject {
 
     /// The grid this workspace's window gives its terminals, and since when
     /// (`TerminalWindowGrid`): what a new persistent tab's Create starts its
-    /// program at once it settled (`TerminalWindowGridWait`). A repository's
-    /// worktrees share their window's (`RepositoryWorkspace`).
+    /// program at once it settled (`TerminalWindowGridWait`), and what a
+    /// restored tab no window shows attaches at (`detachedSurfaceSize`,
+    /// `RestoredTabLaunchQueue`). A repository's worktrees share their
+    /// window's (`RepositoryWorkspace`).
     var windowGrid = TerminalWindowGrid()
 
     /// The cell size, in pixels, that a terminal of `grid` in this
@@ -3888,13 +3890,17 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// stop, restart or close (they stop following it first), a program
     /// that had ended before the tab followed it, or an attached tab's.
     var programDidExit: (@MainActor (TerminalSession) -> Void)?
-    /// Set by the workspace showing the tab: the size, in points, of a
-    /// terminal its window shows now (`TerminalWorkspace.mountedTerminalSize`),
-    /// for a surface built while no view shows it (a restored tab's attach
-    /// adapter launching in the background): its program, or the persistent
-    /// session it attaches to, gets the size the tab will have when shown,
-    /// instead of Ghostty's default for a detached surface and then the
-    /// window's when shown (two resizes, each redrawn by the program).
+    /// Set by the workspace showing the tab: the size, in points, of the
+    /// terminal its window gives its tabs, for a surface built while no view
+    /// shows it (a restored tab's attach adapter launching in the
+    /// background): the size its window's terminal had when it got the
+    /// window's grid (`TerminalWindowGrid.Record.size`), else a terminal its
+    /// window shows now (`TerminalWorkspace.mountedTerminalSize`). Its
+    /// program, or the persistent session it attaches to, gets the size the
+    /// tab will have when shown, instead of Ghostty's default for a detached
+    /// surface and then the window's when shown (two resizes, each redrawn by
+    /// the program). The launch queue launches such an adapter once that grid
+    /// settled (`RestoredTabLaunchQueue`, `windowGridSource`).
     var detachedSurfaceSize: (@MainActor () -> CGSize?)?
     /// Set by the workspace showing the tab, as `detachedSurfaceSize`: the
     /// cell size, in pixels, a terminal of the given grid its window shows
@@ -3905,23 +3911,26 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// program, which may redraw).
     var windowTerminalCell: (@MainActor (TerminalViewportSize) -> TerminalCellSize?)?
     /// Set by the workspace showing the tab, as `detachedSurfaceSize`: this
-    /// tab's surface, laid out in a window, has a grid
+    /// tab's surface, laid out in a window at a size in points, has a grid
     /// (`TerminalWindowGrid.note`).
-    var surfaceShowedWindowGrid: (@MainActor (TerminalViewportSize, NSWindow) -> Void)?
+    var surfaceShowedWindowGrid: (@MainActor (TerminalViewportSize, CGSize, NSWindow) -> Void)?
     /// Set by the workspace showing the tab, as `detachedSurfaceSize`: how
-    /// long a persistent tab's Create waits for the terminal grid of the
-    /// window that shows it to settle (`SessionBackendPolicy.windowGridWait`),
-    /// and that grid now (`TerminalWindowGrid.observation`). Nil: the Create
+    /// long to wait for the terminal grid of the window that shows the tab to
+    /// settle (`SessionBackendPolicy.windowGridWait`), and that grid now
+    /// (`TerminalWindowGrid.observation`). A persistent tab's Create waits
+    /// before it starts its program at that grid, and the launch queue
+    /// before it launches the attach adapter of a restored tab no window
+    /// shows (`RestoredTabLaunchQueue`). Nil: neither waits; the Create
     /// takes the grid the tab has.
-    var windowGridForCreate: (
+    var windowGridSource: (
         wait: TerminalWindowGridWait,
         observe: @MainActor () -> TerminalWindowGridWait.Observation?
     )?
 
-    /// This tab's surface, laid out in `window`, has `grid`
+    /// This tab's surface, laid out in `window` at `size` points, has `grid`
     /// (`GhosttySessionBridge.reportWindowGrid`).
-    func surfaceDidShowWindowGrid(_ grid: TerminalViewportSize, in window: NSWindow) {
-        surfaceShowedWindowGrid?(grid, window)
+    func surfaceDidShowWindowGrid(_ grid: TerminalViewportSize, size: CGSize, in window: NSWindow) {
+        surfaceShowedWindowGrid?(grid, size, window)
     }
 
     /// The cell size this tab's terminal reports to a program at `grid`
@@ -6259,25 +6268,22 @@ final class TerminalSession: ObservableObject, Identifiable {
         startedAt: ContinuousClock.Instant
     ) async throws -> (grid: TerminalViewportSize, cell: TerminalCellSize?) {
         let grid: TerminalViewportSize
-        if let source = windowGridForCreate {
-            var observation = source.observe()
-            var sawSettling = observation?.settling == true
-            var decision = source.wait.decision(for: observation, startedAt: startedAt, now: .now, sawSettling: sawSettling)
+        if let source = windowGridSource {
+            var waiting = TerminalWindowGridWait.Waiting(source.wait, startedAt: startedAt)
+            var decision = waiting.decide(source.observe(), now: .now)
             while case .wait(let until) = decision {
-                let pause = min(until - ContinuousClock.now, source.wait.pollInterval)
-                try await Task.sleep(for: max(pause, .milliseconds(1)))
+                let now = ContinuousClock.now
+                try await Task.sleep(for: max(waiting.nextLook(waitingUntil: until, now: now) - now, .milliseconds(1)))
                 guard activeLaunchID == launchID, persistentHosting === hosting else {
                     guard claim.keepsSession else { throw CancellationError() }
                     decision = .giveUp
                     break
                 }
-                observation = source.observe()
-                sawSettling = sawSettling || observation?.settling == true
-                decision = source.wait.decision(for: observation, startedAt: startedAt, now: .now, sawSettling: sawSettling)
+                decision = waiting.decide(source.observe(), now: .now)
             }
             // The window's grid as last seen (a tab detached meanwhile is
             // no longer its window's).
-            observation = source.observe() ?? observation
+            let observation = source.observe() ?? waiting.observation
             grid = TerminalWindowGridWait.grid(own: mountedTerminalGrid, window: observation?.grid, tab: viewportSize)
             let waited = (ContinuousClock.now - startedAt).components
             let milliseconds = waited.seconds * 1_000 + waited.attoseconds / 1_000_000_000_000_000

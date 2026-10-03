@@ -57,6 +57,19 @@ private let settledGrid = TerminalViewportSize(columns: 65, rows: 63)
     #expect(standardLike.decision(for: settled, startedAt: at(0), now: at(1_700)) == .giveUp)
 }
 
+@Test func persistentLocalWindowGridWaitRemembersAWindowItSawSettling() {
+    var waiting = TerminalWindowGridWait.Waiting(standardLike, startedAt: at(0))
+    let settling = TerminalWindowGridWait.Observation(grid: settledGrid, since: at(-5_000), settling: true)
+    #expect(waiting.decide(settling, now: at(100)) == .wait(until: at(3_000)))
+    // Settled since: the settling window's limit still holds.
+    let settled = TerminalWindowGridWait.Observation(grid: settledGrid, since: at(1_600), settling: false)
+    #expect(waiting.decide(settled, now: at(1_700)) == .wait(until: at(1_900)))
+    #expect(waiting.observation == settled)
+    #expect(waiting.nextLook(waitingUntil: at(1_900), now: at(1_700)) == at(1_715))
+    #expect(waiting.nextLook(waitingUntil: at(1_900), now: at(1_890)) == at(1_900))
+    #expect(waiting.decide(settled, now: at(1_900)) == .take)
+}
+
 @Test func persistentLocalWindowGridPrefersTheTabsOwnTerminalThenItsWindowsThenItsOwnGrid() {
     let own = TerminalViewportSize(columns: 80, rows: 40)
     let window = TerminalViewportSize(columns: 160, rows: 40)
@@ -73,14 +86,17 @@ private let settledGrid = TerminalViewportSize(columns: 65, rows: 63)
     window.isReleasedWhenClosed = false
     other.isReleasedWhenClosed = false
     #expect(windowGrid.observation() == nil)
-    windowGrid.note(settledGrid, in: window, now: at(0))
-    // Another tab shown at the grid the window has.
-    windowGrid.note(settledGrid, in: window, now: at(500))
+    windowGrid.note(settledGrid, size: CGSize(width: 600, height: 1_000), in: window, now: at(0))
+    // Another tab shown at the grid the window has: only the size it was
+    // shown at is new.
+    windowGrid.note(settledGrid, size: CGSize(width: 603, height: 1_000), in: window, now: at(500))
     #expect(windowGrid.observation(isSettling: { _ in false }) == .init(grid: settledGrid, since: at(0), settling: false))
+    #expect(windowGrid.record?.size == CGSize(width: 603, height: 1_000))
     let wider = TerminalViewportSize(columns: 100, rows: 63)
-    windowGrid.note(wider, in: window, now: at(600))
+    windowGrid.note(wider, size: CGSize(width: 900, height: 1_000), in: window, now: at(600))
     #expect(windowGrid.observation(isSettling: { _ in false }) == .init(grid: wider, since: at(600), settling: false))
-    windowGrid.note(wider, in: other, now: at(700))
+    #expect(windowGrid.record?.size == CGSize(width: 900, height: 1_000))
+    windowGrid.note(wider, size: CGSize(width: 900, height: 1_000), in: other, now: at(700))
     var asked: NSWindow?
     #expect(windowGrid.observation(isSettling: { asked = $0; return true }) == .init(grid: wider, since: at(700), settling: true))
     #expect(asked === other)
@@ -205,7 +221,7 @@ private func gridWorkspace(_ harness: PersistentHarness, wait: TerminalWindowGri
     window.isReleasedWhenClosed = false
     defer { window.close() }
     let grid = TerminalViewportSize(columns: 97, rows: 29)
-    workspace.windowGrid.note(grid, in: window, now: .now - .seconds(31))
+    workspace.windowGrid.note(grid, size: CGSize(width: 800, height: 500), in: window, now: .now - .seconds(31))
 
     let tab = workspace.addSession(title: "New")
     #expect(await harness.waitUntilAttached(tab, timeout: 10))
@@ -366,7 +382,7 @@ private func gridWorkspace(_ harness: PersistentHarness, wait: TerminalWindowGri
     window.isReleasedWhenClosed = false
     defer { window.close() }
     let grid = TerminalViewportSize(columns: 88, rows: 30)
-    workspace.windowGrid.note(grid, in: window)
+    workspace.windowGrid.note(grid, size: CGSize(width: 800, height: 500), in: window)
     let tab = workspace.addSession(title: "Detached")
     try await Task.sleep(for: .milliseconds(150))
     #expect(harness.creates().isEmpty)
@@ -378,4 +394,127 @@ private func gridWorkspace(_ harness: PersistentHarness, wait: TerminalWindowGri
     #expect(createdGrid(try #require(harness.creates().first)).grid == grid)
     try await Task.sleep(for: .milliseconds(300))
     #expect(harness.fake.requests("kill").isEmpty)
+}
+
+// MARK: - Restored tabs no window shows
+
+private func restoredTerminal(_ title: String, sessionID: String, root: String) -> WorkspaceSessionRecord {
+    WorkspaceSessionRecord(
+        id: UUID(), kind: .terminal, title: title,
+        launchWorkingDirectory: root, workingDirectory: root, projectRoot: root,
+        hosted: HostedSessionBindingRecord(host: "local", hostID: "host-a", sessionID: sessionID, owned: true)
+    )
+}
+
+private func runningSession(_ id: String, _ record: WorkspaceSessionRecord, pid: UInt32) -> HostedSessionInfo {
+    HostedSessionInfo(id: id, name: record.title, cwd: record.workingDirectory, pid: pid, owner: "CherryTests",
+                      tags: [PersistentSessionTag.tab: record.id.uuidString])
+}
+
+/// The grid the `--size-file` of an attach adapter's call names now.
+private func sizeFileGrid(_ call: String) -> TerminalViewportSize? {
+    let arguments = call.split(separator: " ").map(String.init)
+    guard let index = arguments.firstIndex(of: "--size-file"), index + 1 < arguments.count,
+          let data = FileManager.default.contents(atPath: arguments[index + 1]),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let columns = json["cols"] as? Int, let rows = json["rows"] as? Int
+    else { return nil }
+    return TerminalViewportSize(columns: columns, rows: rows)
+}
+
+/// A launch restores a window's tabs; the one it shows attaches at once, and
+/// the others, which no window shows, once the launch released them
+/// (`RestoredTabLaunchQueue.releaseBackgroundTabs`) and their window's grid
+/// settled (`TerminalWindowGridWait`): a tiling window manager re-tiles the
+/// new window after the release, and the background tab's surface (its
+/// adapter's size file) takes the grid the window settles at, not the one it
+/// had first.
+@Test @MainActor func persistentLocalWindowGridRestoredTabNoWindowShowsAttachesAtTheGridItsWindowSettlesAt() async throws {
+    let harness = try PersistentHarness()
+    let workspace = gridWorkspace(harness, wait: TerminalWindowGridWait(
+        // Far longer than the test's own steps (see the first-tab test).
+        quietPeriod: .milliseconds(1_500), maximumWait: .seconds(8), maximumSettlingWait: .seconds(10)
+    ))
+    let queue = RestoredTabLaunchQueue()
+    queue.interval = 0.01
+    workspace.restoredTabLaunchQueue = queue
+    let windows = TabWindows()
+    defer {
+        windows.closeAll()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let root = harness.project.path
+    let shownRecord = restoredTerminal("Shown", sessionID: "s-shown", root: root)
+    let hiddenRecord = restoredTerminal("Hidden", sessionID: "s-hidden", root: root)
+    harness.fake.sessions = [runningSession("s-shown", shownRecord, pid: 1), runningSession("s-hidden", hiddenRecord, pid: 2)]
+    queue.holdBackgroundTabs(atMost: 60)
+    let result = await harness.restorer(WorkspaceRestoreRequest(
+        repositoryRoot: root, worktreeRoot: root, records: [shownRecord, hiddenRecord], workspace: workspace
+    ))
+    workspace.restoreSessions(result.sessions, from: WorktreeStateRecord(
+        root: root, sessions: [shownRecord, hiddenRecord], selectedSessionID: shownRecord.id
+    ))
+    let shown = try #require(workspace.session(withID: shownRecord.id))
+    let hidden = try #require(workspace.session(withID: hiddenRecord.id))
+    // The window comes up at its first frame, and the launch's windows are
+    // up: the background tabs may go.
+    let window = windows.show(shown, size: NSSize(width: 1_000, height: 700))
+    #expect(await harness.fake.wait { shown.mountedTerminalGrid != nil && workspace.windowGrid.record != nil })
+    let first = try #require(shown.mountedTerminalGrid)
+    #expect(await harness.fake.wait { harness.attachCalls.contains { $0.contains("attach s-shown ") } })
+    queue.releaseBackgroundTabs()
+    // A window manager re-tiles the window in two steps.
+    try await Task.sleep(for: .milliseconds(150))
+    windows.resize(window, to: NSSize(width: 560, height: 800))
+    try await Task.sleep(for: .milliseconds(20))
+    windows.resize(window, to: NSSize(width: 560, height: 900))
+    #expect(await harness.fake.wait { shown.mountedTerminalGrid.map { $0 != first && $0.rows > first.rows } ?? false })
+    let settled = try #require(shown.mountedTerminalGrid)
+    #expect(!harness.attachCalls.contains { $0.contains("attach s-hidden ") })
+    #expect(queue.pendingTabs.map(\.id) == [hiddenRecord.id])
+
+    #expect(await harness.fake.wait(timeout: 10) { harness.attachCalls.contains { $0.contains("attach s-hidden ") } })
+    #expect(hidden.mountedTerminalSize == nil)
+    let call = try #require(harness.attachCalls.first { $0.contains("attach s-hidden ") })
+    #expect(await harness.fake.wait { sizeFileGrid(call) == settled })
+    let metrics = try #require(hidden.ghosttyBridge.gridMetrics)
+    #expect(TerminalViewportSize(columns: Int(metrics.columns), rows: Int(metrics.rows)) == settled)
+}
+
+/// Background tabs whose window shows no terminal (its grid unknown) wait
+/// only as long as the wait allows, and the tabs of one window give up
+/// together, not one maximum wait after another.
+@Test @MainActor func persistentLocalWindowGridRestoredTabsOfAWindowWithNoGridAttachTogetherAfterTheMaximumWait() async throws {
+    let harness = try PersistentHarness()
+    let workspace = gridWorkspace(harness, wait: TerminalWindowGridWait(
+        quietPeriod: .milliseconds(100), maximumWait: .milliseconds(1_200), maximumSettlingWait: .seconds(3)
+    ))
+    let queue = RestoredTabLaunchQueue()
+    queue.interval = 0.01
+    workspace.restoredTabLaunchQueue = queue
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let root = harness.project.path
+    let records = (1...3).map { restoredTerminal("Tab \($0)", sessionID: "s-tab-\($0)", root: root) }
+    harness.fake.sessions = records.enumerated().map { runningSession("s-tab-\($0.offset + 1)", $0.element, pid: UInt32($0.offset + 1)) }
+    queue.holdBackgroundTabs(atMost: 60)
+    let result = await harness.restorer(WorkspaceRestoreRequest(
+        repositoryRoot: root, worktreeRoot: root, records: records, workspace: workspace
+    ))
+    workspace.restoreSessions(result.sessions, from: WorktreeStateRecord(
+        root: root, sessions: records, selectedSessionID: records[0].id
+    ))
+    // The selected tab goes at once (no window lays it out here).
+    #expect(await harness.fake.wait { harness.attachCalls.contains { $0.contains("attach s-tab-1 ") } })
+    let background = ["attach s-tab-2 ", "attach s-tab-3 "]
+    let released = ContinuousClock.now
+    queue.releaseBackgroundTabs()
+    #expect(await harness.fake.wait(timeout: 10) { harness.attachCalls.contains { $0.contains(background[0]) || $0.contains(background[1]) } })
+    #expect(ContinuousClock.now - released >= .milliseconds(1_200))
+    #expect(await harness.fake.wait(timeout: 10) { background.allSatisfy { tab in harness.attachCalls.contains { $0.contains(tab) } } })
+    // Together: one maximum wait after another would take twice as long.
+    #expect(ContinuousClock.now - released < .milliseconds(2_400))
 }

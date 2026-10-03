@@ -48,6 +48,11 @@ final class RealLocalHost {
     /// starts, and the size Ghostty gave it 300 ms later, as one does when
     /// it starts before Ghostty gave a new surface's child its view's size
     /// (it starts it at 800×600 pixels, and resizes it about 25 ms later).
+    /// The size Ghostty gave it is the grid the tab names in the adapter's
+    /// `--size-file`: the one its terminal had when the wrapper started may
+    /// still be Ghostty's first (on a slow runner Ghostty's resize can come
+    /// after the wrapper looked, and is then lost to, or undone by, the
+    /// interim size).
     init(
         shellPath: String = "/bin/bash",
         configuration: PersistentLocalSessions.Configuration = PersistentLocalSessions.Configuration(),
@@ -80,11 +85,22 @@ final class RealLocalHost {
             *" attach "*)
               settled=$(/bin/stty size 2>/dev/null)
               if [ -n "$settled" ]; then
+                size_file= previous=
+                for argument in "$@"; do
+                  [ "$previous" = --size-file ] && size_file=$argument
+                  previous=$argument
+                done
                 /bin/stty rows \(interim.rows) cols \(interim.columns)
                 # A background job's own input is /dev/null: the terminal's
                 # goes in on descriptor 3.
                 exec 3<&0
-                (/bin/sleep 0.3; /bin/stty rows "${settled% *}" cols "${settled#* }" <&3) &
+                (
+                  /bin/sleep 0.3
+                  # The grid the tab names: Ghostty's size for it.
+                  named=$(/usr/bin/sed -n 's/^{"cols":\\([0-9]*\\),"rows":\\([0-9]*\\)}$/\\2 \\1/p' "$size_file" 2>/dev/null)
+                  [ -n "$named" ] && settled=$named
+                  /bin/stty rows "${settled% *}" cols "${settled#* }" <&3
+                ) &
                 exec 3<&-
               fi ;;
             esac
@@ -207,9 +223,9 @@ final class RealLocalHost {
         TerminalWorkspace(projectRoot: home.path, createInitialSession: false, backendPolicy: policy)
     }
 
-    /// Shows `session` in a window, so its surface renders.
-    func show(_ session: TerminalSession) {
-        let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 800, height: 500))
+    /// Shows `session` in a window of `size` points, so its surface renders.
+    func show(_ session: TerminalSession, size: NSSize = NSSize(width: 800, height: 500)) {
+        let container = GhosttyTerminalContainerView(frame: NSRect(origin: .zero, size: size))
         let window = NSWindow(contentRect: container.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = container

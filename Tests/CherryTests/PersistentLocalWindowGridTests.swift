@@ -144,8 +144,11 @@ private func gridWorkspace(_ harness: PersistentHarness, wait: TerminalWindowGri
 
 @Test @MainActor func persistentLocalWindowGridNewWindowsFirstTabIsCreatedAtTheGridItsWindowSettlesAt() async throws {
     let harness = try PersistentHarness()
+    // A quiet period far longer than the test's own steps take, so a CI
+    // runner that stalls between showing the window and re-tiling it does
+    // not make the first grid look settled (CI took the first grid at 250 ms).
     let workspace = gridWorkspace(harness, wait: TerminalWindowGridWait(
-        quietPeriod: .milliseconds(250), maximumWait: .seconds(4), maximumSettlingWait: .seconds(6)
+        quietPeriod: .milliseconds(1_500), maximumWait: .seconds(8), maximumSettlingWait: .seconds(10)
     ))
     let windows = TabWindows()
     defer {

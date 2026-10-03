@@ -447,3 +447,114 @@ private func makeFullScreenTestWindow() -> NSWindow {
     )
     #expect(ended == 3)
 }
+
+// MARK: - Keys typed before a terminal shows
+
+@MainActor
+private func key(_ characters: String, keyCode: UInt16, in window: NSWindow?, up: Bool = false,
+                 modifiers: NSEvent.ModifierFlags = []) throws -> NSEvent {
+    try #require(NSEvent.keyEvent(
+        with: up ? .keyUp : .keyDown,
+        location: .zero,
+        modifierFlags: modifiers,
+        timestamp: 1,
+        windowNumber: window?.windowNumber ?? 0,
+        context: nil,
+        characters: characters,
+        charactersIgnoringModifiers: characters,
+        isARepeat: false,
+        keyCode: keyCode
+    ))
+}
+
+/// Keys typed into a window kept off screen for its tabs (AppKit makes it
+/// key while it is transparent) are held, and posted back in order once it
+/// shows; Command shortcuts and other windows' keys are not.
+@Test @MainActor func keysTypedIntoAWindowOffScreenAreHeldUntilItShowsInOrder() throws {
+    var posted: [NSEvent] = []
+    let hold = HiddenWindowKeyHold(installsMonitor: false) { posted += $0 }
+    let window = makeCoverTestWindow()
+    let other = makeCoverTestWindow(identifier: "project-AppWindow-2")
+    defer { [window, other].forEach { $0.close() } }
+    let typed = [try key("l", keyCode: 37, in: window), try key("l", keyCode: 37, in: window, up: true),
+                 try key("s", keyCode: 1, in: window)]
+    // Not held before the window is.
+    #expect(!hold.take(typed[0]))
+
+    hold.hold(window)
+    #expect(hold.isHolding(window))
+    for event in typed { #expect(hold.take(event)) }
+    #expect(!hold.take(try key("w", keyCode: 13, in: window, modifiers: .command)))
+    #expect(!hold.take(try key("x", keyCode: 7, in: other)))
+    #expect(posted.isEmpty)
+
+    hold.release(window)
+    #expect(!hold.isHolding(window))
+    #expect(posted == typed)
+    // Shown: its keys go through.
+    #expect(!hold.take(try key("y", keyCode: 16, in: window)))
+    hold.release(window)
+    #expect(posted == typed)
+}
+
+/// While the launch's first window is not on screen, keys typed with no
+/// window key are held for it; they go first when it shows, then its own,
+/// in the order typed. Without a window, they go after the hold's limit.
+@Test @MainActor func keysTypedBeforeTheLaunchsFirstWindowGoWithIt() async throws {
+    var posted: [NSEvent] = []
+    let hold = HiddenWindowKeyHold(installsMonitor: false) { posted += $0 }
+    let window = makeCoverTestWindow()
+    defer { window.close() }
+    hold.holdWindowlessKeys(atMost: .seconds(60))
+    let early = try key("e", keyCode: 14, in: nil)
+    #expect(hold.take(early))
+    hold.hold(window)
+    let later = try key("c", keyCode: 8, in: window)
+    #expect(hold.take(later))
+    hold.release(window)
+    #expect(posted == [early, later])
+    // The launch's hold ended with the first window.
+    #expect(!hold.isHoldingWindowlessKeys)
+    #expect(!hold.take(try key("h", keyCode: 4, in: nil)))
+
+    let other = HiddenWindowKeyHold(installsMonitor: false) { posted += $0 }
+    posted = []
+    other.holdWindowlessKeys(atMost: .milliseconds(50))
+    let lone = try key("o", keyCode: 31, in: nil)
+    #expect(other.take(lone))
+    let deadline = ContinuousClock.now + .seconds(5)
+    while posted.isEmpty, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(posted == [lone])
+    #expect(!other.isHoldingWindowlessKeys)
+}
+
+/// A window the reveal keeps off screen holds its keys from the moment it
+/// hides, and posts them once it shows, after its `onShow` (which gives
+/// its terminal the keys).
+@Test @MainActor func aWindowsRevealHoldsItsKeysUntilItShows() async throws {
+    var posted: [NSEvent] = []
+    var order: [String] = []
+    let hold = HiddenWindowKeyHold(installsMonitor: false) { events in
+        order.append("posted")
+        posted += events
+    }
+    let window = makeCoverTestWindow()
+    defer { window.close() }
+    let gate = try #require(ProjectWindowReveal.hold(
+        window, until: nil, name: "test", alreadyHidden: true, maximumWait: .seconds(60), keyHold: hold
+    ) { order.append("shown") })
+    #expect(hold.isHolding(window))
+    let typed = try key("k", keyCode: 40, in: window)
+    #expect(hold.take(typed))
+    let deadline = ContinuousClock.now + .seconds(5)
+    while gate.outcome == nil, ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(gate.outcome == .contentReady)
+    #expect(window.alphaValue == 1)
+    #expect(order == ["shown", "posted"])
+    #expect(posted == [typed])
+    #expect(!hold.isHolding(window))
+}

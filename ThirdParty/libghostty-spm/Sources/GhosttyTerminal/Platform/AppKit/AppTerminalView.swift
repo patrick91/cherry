@@ -87,6 +87,11 @@
             core.surface
         }
 
+        /// Whether the view has a surface now (one that takes keys).
+        public var hasSurface: Bool {
+            core.surface != nil
+        }
+
         /// How many surfaces this view has built (see
         /// `TerminalSurfaceCoordinator.surfaceBuildCount`).
         public var surfaceBuildCount: Int {

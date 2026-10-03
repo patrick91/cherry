@@ -81,6 +81,10 @@ final class ProjectWindowRegistry {
     /// in, before they register (`LaunchWindowCover`). The app sets it;
     /// tests leave it nil or give their own.
     var launchWindowCover: LaunchWindowCover?
+    /// Holds the keys typed into a window kept off screen for its tabs
+    /// until it shows (`HiddenWindowKeyHold`). The app sets `.shared`;
+    /// tests leave it nil or give their own.
+    var hiddenWindowKeyHold: HiddenWindowKeyHold?
     /// Where each project window's frame is saved. The app sets it
     /// (`configureWindowFrames`); tests leave it nil unless they give their
     /// own, so the app's defaults are never written.
@@ -832,11 +836,16 @@ final class ProjectWindowRegistry {
             // screen until they are in place (at most a second): it never
             // shows empty first. It registers before AppKit first draws it.
             let coveredAtLaunch = launchWindowCover?.claim(window) ?? false
-            let shown: @MainActor () -> Void = { [weak self] in self?.launchWindowDidShow(projectRoot: projectRoot) }
+            let keyHold = hiddenWindowKeyHold ?? launchWindowCover?.keyHold
+            let shown: @MainActor () -> Void = { [weak self, weak window] in
+                // Before the reveal's layout and the keys held meanwhile.
+                if let self, let window { self.focusSelectedTerminal(in: window, projectRoot: projectRoot) }
+                self?.launchWindowDidShow(projectRoot: projectRoot)
+            }
             if let maximumWait = windowRevealMaximumWait,
                let gate = ProjectWindowReveal.hold(
                    window, until: repository, name: name, alreadyHidden: coveredAtLaunch, holdsAnyway: restoresFullScreen,
-                   maximumWait: maximumWait, onShow: shown
+                   maximumWait: maximumWait, keyHold: keyHold, onShow: shown
                ) {
                 // Shown by the gate; a window that was in full screen once it
                 // is again, so it never shows windowed first.
@@ -852,6 +861,7 @@ final class ProjectWindowRegistry {
                     enterFullScreen(window) {}
                 }
                 shown()
+                keyHold?.release(window)
             }
         }
         windows[projectRoot] = WeakWindow(window)
@@ -884,6 +894,23 @@ final class ProjectWindowRegistry {
         instanceLockNotice?.projectWindowDidRegister(window)
         backgroundSessionsNotice?.projectWindowDidRegister(window)
         return true
+    }
+
+    /// A window that comes on screen with its restored tabs takes keys at
+    /// once: its selected tab's terminal becomes first responder as it
+    /// shows, before the reveal's layout pass and the keys typed while it
+    /// was off screen (`HiddenWindowKeyHold`), rather than on a turn after
+    /// them (its container's own request, which then finds it done). Only
+    /// a key window showing its terminal (not a note, a to-do or the Omni
+    /// bar), and only the terminal of that window.
+    private func focusSelectedTerminal(in window: NSWindow, projectRoot: String) {
+        guard window.isKeyWindow,
+              let workspace = workspaces[projectRoot]?.workspace,
+              chromeStates[projectRoot]?.chromeState.map({ $0.isShowingTerminalContent && !$0.isOmniBarPresented }) ?? true,
+              let bridge = workspace.selectedSession?.loadedGhosttyBridge,
+              bridge.terminalView.window === window
+        else { return }
+        bridge.focus(in: window)
     }
 
     /// Gives a newly claimed project window its project's saved frame, and

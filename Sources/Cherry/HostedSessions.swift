@@ -1,6 +1,7 @@
 import CherryControl
 import Darwin
 import Foundation
+import os
 
 /// An SSH destination is a normal OpenSSH alias (or user@host), never a shell command.
 struct HostedSessionHost: Codable, Hashable, Identifiable, Sendable {
@@ -806,13 +807,14 @@ enum HostedAttachmentSizeFile {
 /// Directory names carry the owning app's PID. An app that quits with hosted
 /// tabs attached never reads their outcomes (the adapters write them after
 /// the app is gone), so each app run removes directories whose owner is no
-/// longer running before its first launch. Another running Cherry keeps its own.
+/// longer running, in the background (`LaunchDirectorySweep`). Another
+/// running Cherry keeps its own.
 enum HostedAttachmentStatusFile {
     static let fileName = "status.json"
     private static let directoryPrefix = "cherry-attach-"
-    private static let abandonedDirectoriesRemoved: Void = removeAbandonedLaunchDirectories(
-        in: FileManager.default.temporaryDirectory
-    )
+    private static let abandonedDirectorySweep = LaunchDirectorySweep {
+        removeAbandonedLaunchDirectories(in: FileManager.default.temporaryDirectory)
+    }
 
     /// The outcome a running adapter writes; any other one is final.
     static let liveOutcome = "attached"
@@ -838,11 +840,16 @@ enum HostedAttachmentStatusFile {
     /// background queue, so the first adapter a launch attaches does not
     /// sweep the temporary directory on the main thread.
     static func removeAbandonedLaunchDirectoriesInBackground() {
-        DispatchQueue.global(qos: .utility).async { _ = abandonedDirectoriesRemoved }
+        abandonedDirectorySweep.start()
     }
 
+    /// A new launch directory of this run. It never waits for the sweep
+    /// (listing a temporary directory with tens of thousands of entries
+    /// took the first restored tab's attach 80–150 ms at launch): the
+    /// directories this run makes carry its own PID, which the sweep never
+    /// removes.
     static func makeLaunchDirectory() throws -> URL {
-        _ = abandonedDirectoriesRemoved
+        abandonedDirectorySweep.start()
         return try makeLaunchDirectory(in: FileManager.default.temporaryDirectory)
     }
 
@@ -1939,5 +1946,31 @@ enum HostedSessionInstallation {
     /// own daemon and are unaffected.
     static func localHostUnavailableReason(bundleURL: URL = Bundle.main.bundleURL) -> String? {
         runsFromDiskImage(bundleURL: bundleURL) ? diskImageWarning(bundleURL: bundleURL) : nil
+    }
+}
+
+/// Work that runs once per run on a background queue, and that nothing waits
+/// for: `start` begins it the first time it is called and returns at once
+/// (`HostedAttachmentStatusFile`'s sweep of abandoned launch directories).
+final class LaunchDirectorySweep: Sendable {
+    private let started = OSAllocatedUnfairLock(initialState: false)
+    private let sweep: @Sendable () -> Void
+
+    init(sweep: @escaping @Sendable () -> Void) {
+        self.sweep = sweep
+    }
+
+    /// Starts the sweep on `queue` the first time; later calls do nothing.
+    /// True when this call started it.
+    @discardableResult
+    func start(on queue: DispatchQueue = .global(qos: .utility)) -> Bool {
+        let first = started.withLock { started in
+            defer { started = true }
+            return !started
+        }
+        guard first else { return false }
+        let sweep = sweep
+        queue.async { sweep() }
+        return true
     }
 }

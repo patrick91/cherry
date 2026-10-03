@@ -1339,7 +1339,9 @@ enum CherryProjectFile {
     private static let endMarker = "# END CHERRY COMMANDS"
 
     static func fileURL(projectRoot: String) -> URL {
-        URL(fileURLWithPath: projectRoot, isDirectory: true).appendingPathComponent(fileName)
+        // Said to be a file: inferring it would `lstat` the path, on every
+        // body evaluation that reads the project's settings.
+        URL(fileURLWithPath: projectRoot, isDirectory: true).appendingPathComponent(fileName, isDirectory: false)
     }
 
     @MainActor

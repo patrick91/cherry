@@ -26,6 +26,8 @@ enum ProjectWindowReveal {
     /// (`holdsAnyway`: it goes back into full screen first, and adds that
     /// wait with `ProjectWindowRevealGate.waitAlso`): it then shows on the
     /// next turn, once SwiftUI has laid it out.
+    /// While it is off screen, keys typed into it are held, and replayed
+    /// once it shows, after `onShow` (`keyHold`, `HiddenWindowKeyHold`).
     @discardableResult
     static func hold(
         _ window: NSWindow,
@@ -34,6 +36,7 @@ enum ProjectWindowReveal {
         alreadyHidden: Bool = false,
         holdsAnyway: Bool = false,
         maximumWait: Duration = defaultMaximumWait,
+        keyHold: HiddenWindowKeyHold? = nil,
         onShow: (@MainActor () -> Void)? = nil
     ) -> ProjectWindowRevealGate? {
         let awaitsRestore = repository?.isAwaitingInitialRestore ?? false
@@ -42,8 +45,10 @@ enum ProjectWindowReveal {
         let gate = ProjectWindowRevealGate(
             maximumWait: maximumWait,
             hide: { [weak window] in
-                window?.alphaValue = 0
-                window?.ignoresMouseEvents = true
+                guard let window else { return }
+                window.alphaValue = 0
+                window.ignoresMouseEvents = true
+                keyHold?.hold(window)
             },
             show: { [weak window] outcome in
                 guard let window else { return }
@@ -51,6 +56,8 @@ enum ProjectWindowReveal {
                 window.ignoresMouseEvents = previousIgnoresMouseEvents
                 LaunchTimeline.mark("window shown \(name) (\(outcome))")
                 onShow?()
+                // After `onShow`, which gives the selected terminal the keys.
+                keyHold?.release(window)
             }
         )
         gate.begin()
@@ -87,6 +94,9 @@ final class LaunchWindowCover {
     /// Whether a window is one of the project windows expected (the app: a
     /// window of its project scene).
     let isCandidate: @MainActor (NSWindow) -> Bool
+    /// Holds the keys typed into a covered window until it shows
+    /// (`HiddenWindowKeyHold`): its claim hands them to the window's reveal.
+    let keyHold: HiddenWindowKeyHold?
     private let schedule: ProjectWindowRevealGate.Schedule
     private let center: NotificationCenter
     private var expected = 0
@@ -100,11 +110,13 @@ final class LaunchWindowCover {
         fallbackWait: Duration = ProjectWindowReveal.defaultMaximumWait,
         center: NotificationCenter = .default,
         schedule: @escaping ProjectWindowRevealGate.Schedule = ProjectWindowRevealGate.mainQueueSchedule,
+        keyHold: HiddenWindowKeyHold? = nil,
         isCandidate: @escaping @MainActor (NSWindow) -> Bool
     ) {
         self.fallbackWait = fallbackWait
         self.center = center
         self.schedule = schedule
+        self.keyHold = keyHold
         self.isCandidate = isCandidate
     }
 
@@ -154,11 +166,13 @@ final class LaunchWindowCover {
         covered[ObjectIdentifier(window)] = entry
         window.alphaValue = 0
         window.ignoresMouseEvents = true
+        keyHold?.hold(window)
         LaunchTimeline.mark("window covered \(window.identifier?.rawValue ?? "?")")
         schedule(fallbackWait) { [weak self, weak window] in
             guard let self, let window, self.covered.removeValue(forKey: ObjectIdentifier(window)) === entry else { return }
             window.alphaValue = 1
             window.ignoresMouseEvents = entry.ignoresMouseEvents
+            self.keyHold?.release(window)
         }
     }
 
@@ -175,6 +189,159 @@ final class LaunchWindowCover {
     private func stopObserving() {
         observers.forEach(center.removeObserver)
         observers.removeAll()
+    }
+}
+
+/// Keys typed while no terminal can take them yet, during a launch: into a
+/// project window kept off screen waiting for its tabs (`LaunchWindowCover`,
+/// `ProjectWindowReveal`; AppKit makes such a window key while it is still
+/// transparent, and it would drop them with a beep), or, while the launch's
+/// first window has not come on screen, into the app with no window key
+/// yet (`holdWindowlessKeys`). They are held, in the order typed, and posted
+/// back to the app ahead of anything typed later once the window shows
+/// (its selected terminal first responder by then; a key typed with no
+/// window goes with the first window that shows): they then go wherever a
+/// key typed at that moment would (a persistent tab whose adapter still
+/// attaches holds them on, `TerminalSession.holdKeyUntilAdapterAttaches`).
+/// Command shortcuts are never held (the menu and the window's shortcuts
+/// take them at once), nor keys of other windows.
+@MainActor
+final class HiddenWindowKeyHold {
+    static let shared = HiddenWindowKeyHold()
+
+    private struct Held {
+        /// The window it was typed into; nil when none was key.
+        let window: ObjectIdentifier?
+        let event: NSEvent
+    }
+
+    private final class WeakWindow {
+        weak var window: NSWindow?
+        init(_ window: NSWindow) { self.window = window }
+    }
+
+    private var windows: [ObjectIdentifier: WeakWindow] = [:]
+    private var held: [Held] = []
+    private var holdsWindowlessKeys = false
+    private var windowlessDeadline: Task<Void, Never>?
+    private var monitor: Any?
+    /// Whether holding watches the app's key events itself (a local event
+    /// monitor); tests hand events to `take` instead.
+    private let installsMonitor: Bool
+    /// Posts released events back to the app, the first in front (tests
+    /// record them).
+    private let post: @MainActor ([NSEvent]) -> Void
+
+    init(
+        installsMonitor: Bool = true,
+        post: @escaping @MainActor ([NSEvent]) -> Void = { events in
+            // Each at the front, the last first: in their order, ahead of
+            // events already queued.
+            for event in events.reversed() { NSApp.postEvent(event, atStart: true) }
+        }
+    ) {
+        self.installsMonitor = installsMonitor
+        self.post = post
+    }
+
+    /// Whether keys typed into `window` are held now.
+    func isHolding(_ window: NSWindow) -> Bool {
+        windows[ObjectIdentifier(window)] != nil
+    }
+
+    /// Whether keys typed while no window is key are held now.
+    var isHoldingWindowlessKeys: Bool { holdsWindowlessKeys }
+
+    /// Holds the keys typed into `window` from now until `release` (again:
+    /// nothing).
+    func hold(_ window: NSWindow) {
+        dropClosedWindows()
+        guard windows[ObjectIdentifier(window)] == nil else { return }
+        windows[ObjectIdentifier(window)] = WeakWindow(window)
+        startMonitoring()
+    }
+
+    /// The launch's windows are on their way: until the first of them shows
+    /// (`release`), or `limit` passed, keys typed while no window is key are
+    /// held for it.
+    func holdWindowlessKeys(atMost limit: Duration) {
+        guard !holdsWindowlessKeys else { return }
+        holdsWindowlessKeys = true
+        startMonitoring()
+        windowlessDeadline = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: limit)
+            guard !Task.isCancelled else { return }
+            self?.endWindowlessHold()
+        }
+    }
+
+    /// Stops holding `window`'s keys and posts those held back to the app,
+    /// in order, with any typed while no window was key (the launch's hold
+    /// for those ends with the first window that shows).
+    func release(_ window: NSWindow) {
+        let id = ObjectIdentifier(window)
+        let wasHolding = windows.removeValue(forKey: id) != nil
+        let endsWindowless = holdsWindowlessKeys
+        guard wasHolding || endsWindowless else { return }
+        if endsWindowless {
+            holdsWindowlessKeys = false
+            windowlessDeadline?.cancel()
+            windowlessDeadline = nil
+        }
+        flush { $0 == id || $0 == nil }
+    }
+
+    private func endWindowlessHold() {
+        guard holdsWindowlessKeys else { return }
+        holdsWindowlessKeys = false
+        windowlessDeadline = nil
+        flush { $0 == nil }
+    }
+
+    /// Forgets windows that closed while held, and their keys.
+    private func dropClosedWindows() {
+        windows = windows.filter { $0.value.window != nil }
+        held.removeAll { held in held.window.map { windows[$0] == nil } ?? false }
+    }
+
+    /// Posts the held events `released` picks (by the window they were
+    /// typed into), in order; stops watching once nothing is held.
+    private func flush(_ released: (ObjectIdentifier?) -> Bool) {
+        let events = held.filter { released($0.window) }.map(\.event)
+        held.removeAll { released($0.window) }
+        dropClosedWindows()
+        if windows.isEmpty, !holdsWindowlessKeys, let monitor {
+            NSEvent.removeMonitor(monitor)
+            self.monitor = nil
+        }
+        guard !events.isEmpty else { return }
+        LaunchTimeline.mark("keys typed before a terminal showed: \(events.count) events")
+        post(events)
+    }
+
+    private func startMonitoring() {
+        guard installsMonitor, monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+            let taken = MainActor.assumeIsolated { self?.take(event) ?? false }
+            return taken ? nil : event
+        }
+    }
+
+    /// Holds `event` when it is a key typed into a window held now (or with
+    /// no window while the launch holds those), other than a Command
+    /// shortcut. True when held.
+    func take(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown || event.type == .keyUp,
+              !event.modifierFlags.contains(.command)
+        else { return false }
+        if let window = event.window {
+            guard windows[ObjectIdentifier(window)] != nil else { return false }
+            held.append(Held(window: ObjectIdentifier(window), event: event))
+            return true
+        }
+        guard holdsWindowlessKeys else { return false }
+        held.append(Held(window: nil, event: event))
+        return true
     }
 }
 

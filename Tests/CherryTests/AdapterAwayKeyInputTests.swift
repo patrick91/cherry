@@ -480,3 +480,121 @@ private func encoded(
     #expect(await harness.fake.wait { typedThroughHost(harness).count == 4 })
     #expect(typedThroughHost(harness) == ["\u{1B}[27u", "\u{1B}[\(controlCCode);5u", "\u{1B}[13~", "\u{1B}[B"])
 }
+
+// Keys typed into a persistent tab whose attach adapter was launched and has
+// not reported itself attached yet (at launch, the restored tab's adapter
+// attaches a few tens of milliseconds after its window takes keys): its
+// terminal is still in the mode it started in, where a Ctrl-U would edit a
+// line the program never sees and a Ctrl-C would signal the adapter. They
+// wait for it, in order, and go on once it attached.
+
+/// The characters of held keys as they were sent on.
+@MainActor
+private final class DeliveredKeys {
+    var characters: [String] = []
+    func deliver(_ event: NSEvent) { characters.append(event.characters ?? "") }
+}
+
+@Test @MainActor func keysTypedWhileAPersistentTabsAdapterAttachesWaitForItAndArriveInOrder() async throws {
+    let harness = try PersistentHarness()
+    let workspace = harness.workspace()
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    defer {
+        container.detachActiveSession()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let tab = workspace.addSession(title: "Shell")
+    #expect(await harness.waitUntilAttached(tab))
+    container.configure(with: tab, colorScheme: .dark, allowsAutoFocus: false)
+    #expect(await harness.fake.wait { harness.attachCalls.count == 1 })
+    let call = try #require(harness.attachCalls.first)
+
+    // Launched, and not reported attached yet (the fake adapter says
+    // nothing until its status file is written).
+    #expect(tab.adapterLiveStatus == nil)
+    #expect(tab.holdsKeysUntilAdapterAttaches)
+    #expect(!tab.keyboardInputGoesThroughHost)
+    let delivered = DeliveredKeys()
+    for (characters, keyCode) in [("l", UInt16(37)), ("\u{15}", 32), ("s", 1)] {
+        let modifiers: NSEvent.ModifierFlags = characters == "\u{15}" ? .control : []
+        tab.holdKeyUntilAdapterAttaches(try keyDown(characters, ignoringModifiers: characters == "\u{15}" ? "u" : nil,
+                                                    keyCode: keyCode, modifiers: modifiers)) { delivered.deliver($0) }
+    }
+    #expect(tab.hasKeysAwaitingAdapter)
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(delivered.characters.isEmpty)
+
+    // The window's key monitor holds the keys typed now behind them; a
+    // Command shortcut is the menu's, at once.
+    #expect(container.holdKeyWhileAdapterAttaches(try keyDown("x", keyCode: 7)))
+    #expect(!container.holdKeyWhileAdapterAttaches(try keyDown("w", keyCode: 13, modifiers: .command)))
+
+    // Attached: they go on, in the order typed, on that turn.
+    try HostedSessionFakeCLI.writeStatus(HostedSessionFakeCLI.attachedStatus(), to: try harness.statusFile(of: call))
+    #expect(await harness.fake.wait { tab.adapterLiveStatus != nil })
+    #expect(delivered.characters == ["l", "\u{15}", "s"])
+    #expect(!tab.hasKeysAwaitingAdapter)
+    #expect(!tab.holdsKeysUntilAdapterAttaches)
+    // From now on keys reach the surface (its adapter) directly.
+    #expect(!container.holdKeyWhileAdapterAttaches(try keyDown("y", keyCode: 16)))
+    // None went through the host.
+    #expect(typedThroughHost(harness).isEmpty)
+}
+
+@Test @MainActor func keysHeldForAnAdapterThatNeverReportsGoOnOnceTheHoldRunsOut() async throws {
+    let limit = TerminalSession.adapterAttachKeyHoldLimit
+    TerminalSession.adapterAttachKeyHoldLimit = .milliseconds(150)
+    defer { TerminalSession.adapterAttachKeyHoldLimit = limit }
+    let harness = try PersistentHarness()
+    let workspace = harness.workspace()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let tab = workspace.addSession(title: "Shell")
+    #expect(await harness.waitUntilAttached(tab))
+    #expect(await harness.fake.wait { tab.holdsKeysUntilAdapterAttaches })
+    let delivered = DeliveredKeys()
+    tab.holdKeyUntilAdapterAttaches(try keyDown("a", keyCode: 0)) { delivered.deliver($0) }
+    tab.holdKeyUntilAdapterAttaches(try keyDown("b", keyCode: 11)) { delivered.deliver($0) }
+    #expect(await harness.fake.wait { delivered.characters == ["a", "b"] })
+    // That launch's keys are not held again.
+    #expect(!tab.holdsKeysUntilAdapterAttaches)
+}
+
+@Test @MainActor func keysHeldForAnAdapterWhoseLaunchEndsGoWhereKeysGoNextAndInOrder() async throws {
+    var configuration = PersistentHarness.fastConfiguration
+    // The adapter is launched again only after the test.
+    configuration.reconnectDelay = (30, 30)
+    let harness = try PersistentHarness(configuration: configuration)
+    let workspace = harness.workspace()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let tab = workspace.addSession(title: "Shell")
+    #expect(await harness.waitUntilAttached(tab))
+    #expect(await harness.fake.wait { harness.attachCalls.count == 1 })
+    let call = try #require(harness.attachCalls.first)
+    #expect(tab.holdsKeysUntilAdapterAttaches)
+    let delivered = DeliveredKeys()
+    let route = Recorder<[Bool]>([])
+    let deliver: @MainActor (NSEvent) -> Void = { event in
+        route.value.append(tab.keyboardInputGoesThroughHost)
+        delivered.deliver(event)
+    }
+    tab.holdKeyUntilAdapterAttaches(try keyDown("p", keyCode: 35), deliver: deliver)
+
+    // The adapter ended before it attached; it is launched again later.
+    try Data(#"{"outcome":"disconnected","exit_code":null,"signal":null,"message":"connection lost"}"#.utf8)
+        .write(to: try harness.statusFile(of: call))
+    tab.ingestNativeChildExit(exitCode: 1)
+    // A key typed now waits behind the held one.
+    #expect(tab.hasKeysAwaitingAdapter)
+    tab.holdKeyUntilAdapterAttaches(try keyDown("q", keyCode: 12), deliver: deliver)
+    // On the next turn, once the tab knows what comes next: through the
+    // host (the adapter is away), in order.
+    #expect(await harness.fake.wait { delivered.characters == ["p", "q"] })
+    #expect(route.value == [true, true])
+}

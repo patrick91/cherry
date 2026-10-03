@@ -17,6 +17,9 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     func applicationWillFinishLaunching(_ notification: Notification) {
         LaunchTimeline.mark("will finish launching")
         MainActor.assumeIsolated {
+            // Keys typed once the app is active, before its first window
+            // shows with a terminal to take them, are held for that window.
+            HiddenWindowKeyHold.shared.holdWindowlessKeys(atMost: .seconds(3))
             Self.configureSessionRecords(localSessions: .shared, store: .shared)
             // Each device's hosting records the same (docs/specs/remote-devices.md).
             RemoteDeviceStore.shared.endedSessionsStore = .shared
@@ -47,8 +50,8 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         MainActor.assumeIsolated {
             Self.startLaunchHousekeeping()
         }
-        // Before the first restored tab attaches (it would sweep on the main
-        // thread).
+        // In the background, early: nothing waits for it (the first
+        // restored tab's attach would start it otherwise).
         HostedAttachmentStatusFile.removeAbandonedLaunchDirectoriesInBackground()
         MainActor.assumeIsolated {
             Self.finishLaunchingAfterInstanceLock(lock: .shared, store: .shared) {
@@ -164,9 +167,10 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         return false
     }
 
-    // The MenuBarExtra's status-item window is always in `NSApp.windows`, so
-    // naive first/visible checks see "a window" on a windowless launch and
-    // never open the default project window. Key-capable filters it out.
+    // The menu bar item's status-item window is always in `NSApp.windows`
+    // (once it is made), so naive first/visible checks see "a window" on a
+    // windowless launch and never open the default project window.
+    // Key-capable filters it out (its panel is key-capable only while shown).
     private static var firstProjectCapableWindow: NSWindow? {
         NSApp.windows.first { $0.canBecomeKey }
     }
@@ -746,6 +750,9 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             // Once those windows restored their tabs: sessions of closed
             // windows or tabs that still run.
             ProjectWindowRegistry.shared.backgroundSessionsNotice?.launchWindowsOpened(expecting: reopened)
+            Self.installMenuBarItemOnceLaunchWindowsOpened(registry: .shared) {
+                MenuBarStatusItem.shared.installSoon()
+            }
         }
 
         // Windows that had tabs come back from the app's own list (AppKit
@@ -767,6 +774,16 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                 hasVisibleWindow: NSApp.windows.contains(where: { $0.isVisible && $0.canBecomeKey })
             ))
         }
+    }
+
+    /// The menu bar item (`MenuBarStatusItem`) comes once the launch's
+    /// windows are open: making it earlier would hold up the first one.
+    @MainActor
+    static func installMenuBarItemOnceLaunchWindowsOpened(
+        registry: ProjectWindowRegistry,
+        install: @escaping @MainActor () -> Void
+    ) {
+        registry.whenLaunchWindowsOpened(install)
     }
 
     func userNotificationCenter(
@@ -880,7 +897,6 @@ struct CherryApp: App {
     @NSApplicationDelegateAdaptor(CherryAppDelegate.self) private var appDelegate
     @StateObject private var terminalSettings = TerminalSettings.shared
     @StateObject private var agentSettings = AgentSettings.shared
-    @StateObject private var menuBarAgents = MenuBarAgentsModel()
     /// Only the count: the list itself would re-evaluate the app's body.
     @StateObject private var backgroundSessions = BackgroundSessionsModel.shared.summary
     @State private var controlServer: CherryControlServer?
@@ -891,6 +907,7 @@ struct CherryApp: App {
     init() {
         LaunchTimeline.isEnabled = true
         LaunchTimeline.mark("app init")
+        LaunchInteractivity.start()
         // Launched from a Cherry tab (`open`, a script): its identity must
         // not reach this app's tabs, whose adapters would refuse to attach
         // that tab's session as "from inside itself".
@@ -910,7 +927,9 @@ struct CherryApp: App {
         ProjectWindowRegistry.shared.configureWindowFrames(ProjectWindowFrameStore())
         // The Omni bar's Projects › Recent and project frecency.
         ProjectWindowRegistry.shared.projectRecency = .shared
-        ProjectWindowRegistry.shared.launchWindowCover = LaunchWindowCover { window in
+        // Keys typed into a window still off screen come once it shows.
+        ProjectWindowRegistry.shared.hiddenWindowKeyHold = .shared
+        ProjectWindowRegistry.shared.launchWindowCover = LaunchWindowCover(keyHold: .shared) { window in
             // A window of the project scene (SwiftUI names them after it).
             !(window is NSPanel) && (window.identifier?.rawValue.hasPrefix(Self.projectWindowSceneID) ?? false)
         }
@@ -1192,13 +1211,6 @@ struct CherryApp: App {
                 }
             }
         }
-
-        MenuBarExtra {
-            MenuBarAgentsPanel(model: menuBarAgents, background: .shared)
-        } label: {
-            MenuBarStatusLabel(model: menuBarAgents)
-        }
-        .menuBarExtraStyle(.window)
 
         Settings {
             SettingsView()

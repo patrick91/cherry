@@ -2,6 +2,7 @@ import AppKit
 import CherryControl
 import Darwin
 import Foundation
+import os
 import SwiftUI
 import Testing
 import GhosttyTerminal
@@ -329,6 +330,34 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     let second = try #require(HostedAdapterStatusWatcher(directory: written) { early.value.append($0) })
     #expect(early.value == [HostedAdapterLiveStatus(viewport: true)])
     second.cancel()
+}
+
+/// The first restored tab's launch directory never waits for the sweep of
+/// abandoned ones (a huge temporary directory took it 80–150 ms at launch):
+/// the sweep starts once, in the background, and `start` returns at once
+/// while it runs.
+@Test func HostedSessionLaunchDirectorySweepStartsOnceAndIsNeverWaitedFor() throws {
+    let release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0)
+    let runs = OSAllocatedUnfairLock(initialState: 0)
+    let sweep = LaunchDirectorySweep {
+        runs.withLock { $0 += 1 }
+        release.wait()
+        finished.signal()
+    }
+    let queue = DispatchQueue(label: "sweep-test")
+    let clock = ContinuousClock()
+    let began = clock.now
+    #expect(sweep.start(on: queue))
+    // While it runs (blocked), starting again neither runs it twice nor waits.
+    #expect(!sweep.start(on: queue))
+    #expect(!sweep.start(on: queue))
+    #expect(clock.now - began < .seconds(1))
+    release.signal()
+    #expect(finished.wait(timeout: .now() + 5) == .success)
+    let ran = runs.withLock { $0 }
+    #expect(ran == 1)
+    #expect(!sweep.start(on: queue))
 }
 
 @Test func HostedSessionAttachStatusDirectoriesOfQuitAppsAreRemoved() throws {

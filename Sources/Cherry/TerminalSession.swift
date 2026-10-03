@@ -4794,6 +4794,76 @@ final class TerminalSession: ObservableObject, Identifiable {
         persistentInputGoesThroughHost && persistentPhase != .creating
     }
 
+    /// The tab's attach adapter was launched and has not reported itself
+    /// attached yet (`adapterLiveStatus`): its terminal is still in the mode
+    /// it started in, not the raw mode it reads the program's input in, so
+    /// a key typed into the surface now would be echoed by the pty, a Ctrl-U
+    /// or Ctrl-W would edit a line the program never sees, and a Ctrl-C
+    /// would signal the adapter itself. The window's key monitor holds such
+    /// keys (`holdKeyUntilAdapterAttaches`) until it reports attached (at
+    /// launch, the restored tab's adapter attaches a few tens of
+    /// milliseconds after its window takes keys), at most
+    /// `adapterAttachKeyHoldLimit` per launch.
+    var holdsKeysUntilAdapterAttaches: Bool {
+        guard isRunning, !usesInjectedTestingContent, !hostedLaunchDeferred, adapterLiveStatus == nil,
+              let directory = hostedPendingStatusDirectory, directory != keyHoldExpiredLaunchDirectory
+        else { return false }
+        if persistentHosting != nil {
+            guard case .attached = persistentPhase else { return false }
+            return true
+        }
+        return hostedAttachment != nil
+    }
+
+    /// How long keys typed before the adapter attached wait for it
+    /// (`holdsKeysUntilAdapterAttaches`); then they, and those typed after,
+    /// go to its surface as before.
+    static var adapterAttachKeyHoldLimit: Duration = .seconds(3)
+
+    private var keysAwaitingAdapter: [(event: NSEvent, deliver: @MainActor (NSEvent) -> Void)] = []
+    private var keysAwaitingAdapterDeadline: Task<Void, Never>?
+    /// The launch whose hold ran out (`adapterAttachKeyHoldLimit`): its keys
+    /// are not held again.
+    private var keyHoldExpiredLaunchDirectory: URL?
+
+    /// Keys held for the adapter (`holdKeyUntilAdapterAttaches`) still wait
+    /// to be sent on: keys typed now are held behind them, whatever the
+    /// tab's state, so that they keep their order.
+    var hasKeysAwaitingAdapter: Bool {
+        !keysAwaitingAdapter.isEmpty
+    }
+
+    /// Holds `event`, typed while the adapter attaches
+    /// (`holdsKeysUntilAdapterAttaches`), until it attached, its launch ended
+    /// or the hold ran out: `deliver` then sends it on, in the order typed
+    /// and ahead of anything typed later (it runs on the turn that decides).
+    /// Dropped if the tab's program ended meanwhile.
+    func holdKeyUntilAdapterAttaches(_ event: NSEvent, deliver: @escaping @MainActor (NSEvent) -> Void) {
+        keysAwaitingAdapter.append((event, deliver))
+        guard keysAwaitingAdapterDeadline == nil else { return }
+        let directory = hostedPendingStatusDirectory
+        let limit = Self.adapterAttachKeyHoldLimit
+        keysAwaitingAdapterDeadline = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: limit)
+            guard !Task.isCancelled, let self else { return }
+            self.keyHoldExpiredLaunchDirectory = directory
+            self.releaseKeysAwaitingAdapter()
+        }
+    }
+
+    /// Sends on the keys `holdKeyUntilAdapterAttaches` held, in order: the
+    /// adapter attached (or reconnects, or its launch ended, or the hold ran
+    /// out), so they go where a key typed now goes.
+    private func releaseKeysAwaitingAdapter() {
+        keysAwaitingAdapterDeadline?.cancel()
+        keysAwaitingAdapterDeadline = nil
+        guard !keysAwaitingAdapter.isEmpty else { return }
+        let held = keysAwaitingAdapter
+        keysAwaitingAdapter.removeAll()
+        guard isRunning else { return }
+        for (event, deliver) in held { deliver(event) }
+    }
+
     /// `routePersistentInput` takes a persistent tab's input now (queued
     /// or sent through its host), not its surface.
     private var persistentInputGoesThroughHost: Bool {
@@ -5524,6 +5594,13 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func stopWatchingAdapterStatus() {
         adapterStatusWatcher?.cancel()
         adapterStatusWatcher = nil
+        // The launch ended or is replaced: its held keys go where keys go
+        // once the tab has settled what comes next (on the next turn).
+        if !keysAwaitingAdapter.isEmpty {
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated { self?.releaseKeysAwaitingAdapter() }
+            }
+        }
         adapterReconnectingNotice?.cancel()
         adapterReconnectingNotice = nil
         if adapterLiveStatus != nil { adapterLiveStatus = nil }
@@ -5548,6 +5625,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard launchDirectory == hostedPendingStatusDirectory, isRunning else { return }
         let wasFollowing = adapterLiveStatus?.followsProgram ?? false
         adapterLiveStatus = status
+        // Attached (or reconnecting, when the host takes them): the keys
+        // typed while it attached go on now, first.
+        defer { releaseKeysAwaitingAdapter() }
         if hostedAttachment != nil, status.followsProgram {
             hostReconnects?.tabAttached(self)
         }
@@ -5731,6 +5811,12 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     var rawOutputRetainedByteCount: Int {
         rawOutputStore.retainedByteCount
+    }
+
+    /// The tab's bridge if it has one already; never builds one (nor
+    /// launches a deferred adapter), as `ghosttyBridge` does.
+    var loadedGhosttyBridge: GhosttySessionBridge? {
+        ghosttyBridgeStorage
     }
 
     var ghosttyBridge: GhosttySessionBridge {

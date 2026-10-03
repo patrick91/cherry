@@ -472,6 +472,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             TerminalPerformanceMonitor.recordRenderTick()
             self?.handlePostRender()
             self?.noteLaunchContentFrame()
+            if let self { LaunchInteractivity.noteFrame(of: self) }
         }
         if isNativePTYBacked {
             // Native eagerly creates the EXEC surface below, which spawns
@@ -3427,6 +3428,7 @@ final class GhosttyTerminalContainerView: NSView {
             else {
                 return false
             }
+            if holdKeyWhileAdapterAttaches(event) { return true }
             switch Self.nativeKeyRoute(
                 modifiers: event.modifierFlags,
                 charactersIgnoringModifiers: event.charactersIgnoringModifiers,
@@ -3560,8 +3562,59 @@ final class GhosttyTerminalContainerView: NSView {
     /// which the menu handles; keys `HostRoutedKeyEncoder` has no encoding
     /// for; text being composed with an input method).
     func sendKeyThroughHostWhileAdapterIsAway(_ event: NSEvent) -> Bool {
-        guard let activeSession, let activeBridge,
-              activeBridge.isNativePTYBacked,
+        guard let activeSession, let activeBridge else { return false }
+        return sendKeyThroughHostWhileAdapterIsAway(event, session: activeSession, bridge: activeBridge)
+    }
+
+    /// A key typed into the tab while its attach adapter attaches
+    /// (`TerminalSession.holdsKeysUntilAdapterAttaches`), or while keys held
+    /// so still wait: its terminal does not read the program's input yet,
+    /// so the key waits for it behind those, and goes on in order once it
+    /// attached (`deliverHeldKey`). True when held; Command shortcuts and
+    /// text being composed with an input method are not.
+    func holdKeyWhileAdapterAttaches(_ event: NSEvent) -> Bool {
+        guard let activeSession, let activeBridge, activeBridge.isNativePTYBacked,
+              !event.modifierFlags.contains(.command),
+              !activeBridge.terminalView.hasMarkedText(),
+              activeSession.holdsKeysUntilAdapterAttaches || activeSession.hasKeysAwaitingAdapter
+        else { return false }
+        activeSession.holdKeyUntilAdapterAttaches(event) { [weak self, weak activeSession, weak activeBridge] held in
+            guard let activeSession, let activeBridge else { return }
+            Self.deliverHeldKey(held, session: activeSession, bridge: activeBridge, container: self)
+        }
+        return true
+    }
+
+    /// A key `session` held while its adapter attached
+    /// (`TerminalSession.holdKeyUntilAdapterAttaches`), sent where a key
+    /// typed into it now would go: held again while another adapter of the
+    /// tab attaches, else through the host while its adapter is away, else
+    /// to its surface (the attached adapter).
+    static func deliverHeldKey(
+        _ event: NSEvent,
+        session: TerminalSession,
+        bridge: GhosttySessionBridge,
+        container: GhosttyTerminalContainerView?
+    ) {
+        if session.holdsKeysUntilAdapterAttaches {
+            session.holdKeyUntilAdapterAttaches(event) { [weak session, weak bridge, weak container] held in
+                guard let session, let bridge else { return }
+                deliverHeldKey(held, session: session, bridge: bridge, container: container)
+            }
+            return
+        }
+        if let container, container.sendKeyThroughHostWhileAdapterIsAway(event, session: session, bridge: bridge) {
+            return
+        }
+        bridge.terminalView.keyDown(with: event)
+    }
+
+    private func sendKeyThroughHostWhileAdapterIsAway(
+        _ event: NSEvent,
+        session activeSession: TerminalSession,
+        bridge activeBridge: GhosttySessionBridge
+    ) -> Bool {
+        guard activeBridge.isNativePTYBacked,
               activeSession.acceptsInput,
               activeSession.keyboardInputGoesThroughHost,
               !activeBridge.terminalView.hasMarkedText()

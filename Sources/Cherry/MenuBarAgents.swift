@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-// A menu-bar (NSStatusItem via SwiftUI `MenuBarExtra`) summary of every live agent
+// A menu-bar (an AppKit NSStatusItem, `MenuBarStatusItem`) summary of every live agent
 // across all project windows, with a glanceable aggregate state on the icon and a
 // click-to-focus list grouped by project. The per-agent state comes from
 // `TerminalSession.agentActivityState`; see the activity state machine for how idle
@@ -91,14 +91,16 @@ struct MenuBarShimmerSettings: Equatable {
 /// Drives the working-state shimmer of the menu-bar glyph: small highlight
 /// sweeps across the stack layers.
 ///
-/// Two hard-won constraints shape this:
-/// - It must NOT be a `TimelineView` in the `MenuBarExtra` label: that livelocks
+/// Two hard-won constraints shaped this (when the item was a SwiftUI
+/// `MenuBarExtra`; it is an AppKit status item now, `MenuBarStatusItem`, which
+/// sets each frame's image itself):
+/// - It must NOT be a `TimelineView` in a `MenuBarExtra` label: that livelocks
 ///   SwiftUI's status-item update loop at launch (requestUpdate → setImage →
 ///   requestUpdate never drains) and the app never finishes launching.
-/// - It must NOT publish through `MenuBarAgentsModel`: `CherryApp` holds that model
-///   as `@StateObject`, so every publish re-evaluates the entire App body and the
-///   dropdown panel — at pulse rate that costs ~11% CPU. A separate object observed
-///   only by the status label keeps each tick's invalidation to the tiny label view.
+/// - It must NOT publish through `MenuBarAgentsModel`: the dropdown panel observes
+///   that model, so every publish would re-evaluate it (and, while `CherryApp`
+///   held the model, the entire App body) — at pulse rate that cost ~11% CPU. A
+///   separate object keeps each tick to the item's image.
 ///
 /// One timer tick per frame: quantizing the shimmer keeps the tick rate bounded
 /// and gives every frame a stable cache key, so the label can reuse a small set of
@@ -281,6 +283,17 @@ struct MenuBarStatusLabel: View {
     // the same frame table every cycle, and handing AppKit the same instance lets its
     // symbol rasterization cache hit instead of re-rendering a fresh image per frame.
     @MainActor private static var iconCache: [String: NSImage] = [:]
+
+    /// The glyph for `state` (the menu bar item's, `MenuBarStatusItem`).
+    @MainActor
+    static func icon(
+        for state: MenuBarAggregateState,
+        dark: Bool,
+        shimmerFrame: Int,
+        settings: MenuBarShimmerSettings
+    ) -> NSImage {
+        cachedIcon(for: state, dark: dark, shimmerFrame: shimmerFrame, settings: settings)
+    }
 
     @MainActor
     private static func cachedIcon(

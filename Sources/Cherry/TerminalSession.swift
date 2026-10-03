@@ -4060,8 +4060,21 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// waits and monitors: did a turn start after its submit?).
     private(set) var lastStrongWorkingEvidenceAt: Date?
     /// Turns Cherry saw submitted to this agent (an Enter typed or sent by
-    /// MCP), over the tab's life in this run of Cherry: MCP's `agent_turn`.
+    /// MCP), over the tab's life in this run of Cherry.
     private(set) var agentSubmittedTurnCount = 0
+    /// Turns the agent began by itself after one ended (it answered a
+    /// background agent's or task's result, woke up on a schedule, a hook
+    /// continued it): `AgentResumedWorkDetector`, over the tab's life in
+    /// this run of Cherry.
+    private(set) var agentSelfResumedTurnCount = 0
+    /// MCP's `agent_turn`: every turn Cherry saw start, submitted or begun
+    /// by the agent itself. It only grows.
+    var agentTurnCount: Int { agentSubmittedTurnCount &+ agentSelfResumedTurnCount }
+    /// Watches a finished turn's agent for work it resumes by itself.
+    private var resumedWorkDetector = AgentResumedWorkDetector()
+    /// The last key or input sent to the agent (any key, a paste, MCP
+    /// input): a screen change right after one may be its own effect.
+    private var lastAgentInputAt: Date?
     /// When the latest of those turns was submitted.
     private(set) var lastAgentSubmitAt: Date?
     /// The agent showed it was at work (strong evidence) when that turn was
@@ -5045,6 +5058,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         clearCurrentAttentionScreenTag()
         noteInputOutputBaseline()
         guard kind == .agent, let event else { return }
+        if event.type == .keyDown {
+            lastAgentInputAt = Date()
+        }
         applyAgentDraftInputEffect(Self.appKitDraftInputEffect(event))
         if Self.appKitKeyEventInterruptsAgentTurn(event) {
             noteAgentTurnInterrupted()
@@ -5863,6 +5879,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         clearCurrentAttentionScreenTag()
         latestAttentionObservationEvent = .contentChanged
         agentTurnState = .notStarted
+        resumedWorkDetector.disarm()
+        lastAgentInputAt = nil
         childProcessID = nil
         // A session of This Mac's program, while the adapter runs; never
         // another machine's.
@@ -7507,6 +7525,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         ghosttyBridgeStorage?.noteHostInputForOutputLatency()
         noteInputOutputBaseline()
         guard kind == .agent else { return }
+        lastAgentInputAt = Date()
         applyAgentDraftInputEffect(Self.agentDraftInputEffect(input))
         if input == Data([0x1B]) {
             noteAgentTurnInterrupted()
@@ -8556,8 +8575,12 @@ final class TerminalSession: ObservableObject, Identifiable {
             lastTitleSpinnerAt = Date()
             lastStrongWorkingEvidenceAt = Date()
             scheduleAgentIdleRecheck()
+            if noteAgentTitleForResumedWork(title, isSpinner: true) {
+                return startSelfResumedAgentTurn(source: .titleSpinner) || didChange
+            }
             return markAgentWorking(source: .titleSpinner) || didChange
         }
+        _ = noteAgentTitleForResumedWork(title, isSpinner: false)
         if spinnerCleared || agentUsesTitleActivitySignals {
             didChange = recordAgentActivitySignal() || didChange
         }
@@ -8646,7 +8669,12 @@ final class TerminalSession: ObservableObject, Identifiable {
             break
         }
 
-        if renderedOutputShowsAgentWorkingMarker() {
+        let markerLines = renderedOutputAgentMarkerLines()
+        let workingLineIndices = AgentScreenActivity.workingLineIndices(markerLines, agent: screenAgentKey)
+        if noteAgentScreenForResumedWork(markerLines, workingLineIndices: workingLineIndices) {
+            return startSelfResumedAgentTurn(source: .workingMarker) || didChange
+        }
+        if !workingLineIndices.isEmpty {
             return markAgentWorking(source: .workingMarker) || didChange
         }
         if titleSpinnerEvidenceIsActive {
@@ -8754,6 +8782,79 @@ final class TerminalSession: ObservableObject, Identifiable {
             }
         }
         return setAgentActivityState(.working, source: source)
+    }
+
+    // MARK: Turns the agent resumes by itself
+
+    /// The agent's turn ended (or, interrupted by the user, it settled at
+    /// its composer), and it neither waits on an answer nor failed or
+    /// exited: work it shows from here on is its own new turn, once
+    /// `AgentResumedWorkDetector` tells it from a stale frame.
+    private var agentMayResumeWorkByItself: Bool {
+        guard resumedWorkDetector.isArmed,
+              agentTurnState == .completed || agentTurnState == .userInterrupted
+        else { return false }
+        return agentActivitySource != .processExit
+            && !agentActivityState.awaitsUserAnswer
+            && agentActivityState != .error
+    }
+
+    private var resumedWorkLayout: AgentResumedWorkDetector.Layout {
+        .init(columns: viewportSize.columns, rows: viewportSize.rows, fromHost: readsContentFromHost)
+    }
+
+    /// The turn ended: what the screen shows now is its past.
+    private func armResumedWorkDetector() {
+        resumedWorkDetector.arm(screenLines: lastReadAgentScreenTail(), layout: resumedWorkLayout)
+    }
+
+    /// Whether `screen` (the marker tail), whose lines at
+    /// `workingLineIndices` show live work, shows the agent back at work by
+    /// itself.
+    private func noteAgentScreenForResumedWork(_ screen: [String], workingLineIndices: [Int]) -> Bool {
+        guard agentMayResumeWorkByItself else { return false }
+        return resumedWorkDetector.noteScreen(
+            screen,
+            workingLineIndices: workingLineIndices,
+            layout: resumedWorkLayout,
+            lastInputAt: lastAgentInputAt,
+            now: Date()
+        )
+    }
+
+    /// Whether the title, now `title`, shows the agent back at work by
+    /// itself.
+    private func noteAgentTitleForResumedWork(_ title: String, isSpinner: Bool) -> Bool {
+        guard agentMayResumeWorkByItself else { return false }
+        return resumedWorkDetector.noteTitle(title, isSpinner: isSpinner, now: Date())
+    }
+
+    /// The agent went back to work by itself after its turn ended (a
+    /// background agent's or task's result, a scheduled wake-up, a hook):
+    /// a new turn, as if one was submitted. The sidebar shows it working,
+    /// MCP counts it (`agent_turn`, `agent_turn_state` active, a monitor's
+    /// `done` when it ends), and its end is a new attention episode that
+    /// can alert once. Nothing was submitted, so `lastAgentSubmitAt` and
+    /// the turn-start rule of MCP waits keep to submitted turns.
+    @discardableResult
+    private func startSelfResumedAgentTurn(source: AgentActivitySource) -> Bool {
+        resumedWorkDetector.disarm()
+        agentSelfResumedTurnCount &+= 1
+        agentTurnState = .active
+        // A harness notification of the turn that ended owned that turn's
+        // episode, not this one's.
+        hasHarnessNotificationForAttentionEpisode = false
+        if activityDebugEnabled {
+            SessionLog.debug("[activity] turn resumed by the agent itself source=\(source)")
+        }
+        if !markAgentWorking(source: source) {
+            // Its first frames already made it working: the observation
+            // that ends the finished turn's episode is due now.
+            scheduleAttentionObservation(event: .activityStateChanged)
+        }
+        scheduleAgentIdleRecheck()
+        bumpRevision()
+        return true
     }
 
     @discardableResult
@@ -8887,13 +8988,41 @@ final class TerminalSession: ObservableObject, Identifiable {
         return effectiveEnd
     }
 
-    private func renderedOutputShowsAgentWorkingMarker() -> Bool {
+    /// The screen tail the working and input markers are read from: the
+    /// last `agentInputMarkerTailLineLimit` lines up to the last one with
+    /// text.
+    private func renderedOutputAgentMarkerLines() -> [String] {
         let lineCount = effectiveAgentContentLineCount()
-        guard lineCount > 0 else { return false }
-        let normalizedAgentName = screenAgentKey
+        guard lineCount > 0 else { return [] }
         let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-        let markerLines = contentSnapshot(range: markerStart..<lineCount)
-        return AgentScreenActivity.showsWorkingMarker(markerLines, agent: normalizedAgentName)
+        return contentSnapshot(range: markerStart..<lineCount)
+    }
+
+    private func renderedOutputShowsAgentWorkingMarker() -> Bool {
+        AgentScreenActivity.showsWorkingMarker(renderedOutputAgentMarkerLines(), agent: screenAgentKey)
+    }
+
+    private static let agentResumedWorkBaselineLineLimit = 200
+
+    /// The tab's last lines with text as it last read them, without reading
+    /// its screen again: a state change can take them (a refresh from there
+    /// would re-enter the activity hooks).
+    private func lastReadAgentScreenTail() -> [String] {
+        let lines: [String]
+        if let closedTabContentLines {
+            lines = closedTabContentLines
+        } else if readsContentFromHost
+                    || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
+            lines = nativeContentLines
+        } else {
+            let count = processor.lineCount
+            lines = processor.snapshot(range: max(0, count - Self.agentTrailingBlankScanLimit)..<count)
+        }
+        var end = lines.count
+        while end > 0, lines[end - 1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            end -= 1
+        }
+        return Array(lines[max(0, end - Self.agentResumedWorkBaselineLineLimit)..<end])
     }
 
     private func renderedOutputShowsAgentInputPrompt() -> Bool {
@@ -9163,6 +9292,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             agentSubmittedTurnCount &+= 1
             lastAgentSubmitAt = Date()
             agentTurnState = .active
+            resumedWorkDetector.disarm()
             setAgentActivityState(.working, source: .inputSubmit)
             scheduleAgentIdleRecheck()
             scheduleAttentionObservation(event: .inputSubmitted)
@@ -9191,9 +9321,18 @@ final class TerminalSession: ObservableObject, Identifiable {
     @discardableResult
     private func setAgentActivityState(_ nextState: AgentActivityState, source: AgentActivitySource) -> Bool {
         guard kind == .agent else { return false }
-        if agentTurnState == .active,
-           nextState == .idle || nextState == .error {
-            agentTurnState = .completed
+        if nextState == .idle || nextState == .error {
+            switch agentTurnState {
+            case .active:
+                agentTurnState = .completed
+                armResumedWorkDetector()
+            case .userInterrupted where nextState == .idle && !resumedWorkDetector.isArmed:
+                // The interrupted turn settled at the composer: work the
+                // agent shows from here on is its own.
+                armResumedWorkDetector()
+            case .userInterrupted, .completed, .notStarted:
+                break
+            }
         }
         let stateChanged = agentActivityState != nextState
         agentActivityState = nextState

@@ -433,6 +433,276 @@ struct AgentScreenActivityTests {
         #expect(AgentScreenActivity.verdict(for: trust, agent: "claude", includesAnswerMenus: false) == .prompt)
     }
 
+    // MARK: Work the agent resumes by itself (`AgentResumedWorkDetector`)
+
+    static let claudeFinishedTurn = [
+        "⏺ The docs index is rebuilt; the summary is above.",
+        "",
+        "✻ Worked for 3m 10s · 1 shell still running",
+        "",
+        "────────────────────────────────────────",
+        "❯ ",
+        "────────────────────────────────────────",
+        "  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage",
+    ]
+
+    /// The finished turn's last working frame, as a repaint or reflow can
+    /// bring it back: frozen.
+    static let claudeStaleWorkingFrame = [
+        "⏺ The docs index is rebuilt; the summary is above.",
+        "",
+        "✶ Indexing… (3m 9s · ↓ 12.4k tokens)",
+        "",
+        "────────────────────────────────────────",
+        "❯ ",
+        "────────────────────────────────────────",
+        "  ⏵⏵ bypass permissions on · esc to interrupt",
+    ]
+
+    /// Frame `frame` of Claude answering a background shell's result by
+    /// itself: a new transcript line, and a status line whose glyph,
+    /// elapsed counter and token meter advance.
+    static func claudeResumedFrame(_ frame: Int) -> [String] {
+        let glyphs = ["✶", "✻", "✽", "✢", "·"]
+        return [
+            "⏺ The docs index is rebuilt; the summary is above.",
+            "",
+            "✻ Worked for 3m 10s · 1 shell still running",
+            "",
+            "⏺ Background command \"npm test\" completed (exit code 0)",
+            "",
+            "\(glyphs[frame % glyphs.count]) Pondering… (\(1 + frame / 4)s · ↓ \(12 + 37 * frame) tokens)",
+            "",
+            "────────────────────────────────────────",
+            "❯ ",
+            "────────────────────────────────────────",
+            "  ⏵⏵ bypass permissions on · 1 shell · esc to interrupt",
+        ]
+    }
+
+    static let claudeResumedTurnFinished = [
+        "✻ Worked for 3m 10s · 1 shell still running",
+        "",
+        "⏺ Background command \"npm test\" completed (exit code 0)",
+        "",
+        "⏺ The tests pass: 412 passed, none failed.",
+        "",
+        "✻ Cooked for 6s · 1 shell still running",
+        "",
+        "────────────────────────────────────────",
+        "❯ ",
+        "────────────────────────────────────────",
+        "  ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage",
+    ]
+
+    @Test func workingLinesAreTheLiveWorkEvidence() {
+        let cases: [([String], String, [String])] = [
+            (Self.claudeFinishedTurn, "claude", []),
+            (Self.claudeStaleWorkingFrame, "claude", [
+                "✶ Indexing… (3m 9s · ↓ 12.4k tokens)",
+                "⏵⏵ bypass permissions on · esc to interrupt",
+            ]),
+            // Only the newest status line counts; live task rows do too.
+            (["✻ Worked for 2m", "✶ Waiting for 1 background agent to finish"] + claudeComposer + [
+                "  ◯ code-review  Inspecting the retry handler   1m 8s · ↓ 56.3k tokens",
+                "  ◯ lint  /lint",
+            ], "claude", [
+                "✶ Waiting for 1 background agent to finish",
+                "◯ code-review  Inspecting the retry handler   1m 8s · ↓ 56.3k tokens",
+            ]),
+            (["• Working (12s • esc to interrupt)", "", "› "], "codex", ["• Working (12s • esc to interrupt)"]),
+            (["⠧ Auto-compacting... (escape to cancel)", "> "], "pi", ["⠧ Auto-compacting... (escape to cancel)"]),
+            (["╭────────╮", "│ >      │", "╰ ∼ Thinking 27 tok ───╯"], "amp", ["╰ ∼ Thinking 27 tok ───╯"]),
+            (["╭────────╮", "│ >      │", "╰ Enter to Reference Previous Thread ───╯"], "amp", []),
+        ]
+        for (screen, agent, expected) in cases {
+            let lines = AgentScreenActivity.workingLines(screen, agent: agent)
+            #expect(lines == expected, "\(agent): \(screen)")
+            #expect(AgentScreenActivity.showsWorkingMarker(screen, agent: agent) == !expected.isEmpty)
+        }
+    }
+
+    private static let resumedWorkLayout = AgentResumedWorkDetector.Layout(columns: 120, rows: 40, fromHost: false)
+    private static let resumedWorkEpoch = Date(timeIntervalSinceReferenceDate: 800_000_000)
+
+    private func armedDetector(_ screen: [String] = Self.claudeFinishedTurn) -> AgentResumedWorkDetector {
+        var detector = AgentResumedWorkDetector()
+        detector.arm(screenLines: screen, layout: Self.resumedWorkLayout)
+        return detector
+    }
+
+    /// Shows `screen` to `detector` `seconds` after the epoch.
+    private func show(
+        _ screen: [String],
+        to detector: inout AgentResumedWorkDetector,
+        at seconds: TimeInterval,
+        columns: Int = 120,
+        inputAt: TimeInterval? = nil,
+        agent: String = "claude"
+    ) -> Bool {
+        detector.noteScreen(
+            screen,
+            workingLineIndices: AgentScreenActivity.workingLineIndices(screen, agent: agent),
+            layout: .init(columns: columns, rows: 40, fromHost: false),
+            lastInputAt: inputAt.map { Self.resumedWorkEpoch + $0 },
+            now: Self.resumedWorkEpoch + seconds
+        )
+    }
+
+    @Test func resumedWorkStartsOnceTheStatusLineKeepsAdvancing() {
+        var detector = armedDetector()
+        // Frames every 250 ms: the first is no change, and the changes must
+        // span a second.
+        let results = (0..<8).map { frame in
+            show(Self.claudeResumedFrame(frame), to: &detector, at: 0.25 * Double(frame))
+        }
+        #expect(results.firstIndex(of: true) == 5)
+
+        // Codex's elapsed counter ticks once a second.
+        var codex = armedDetector(["─ Worked for 2m ─", "", "› "])
+        let ticks = (0..<3).map { second in
+            show(["• Working (\(second + 2)s • esc to interrupt)", "", "› "], to: &codex, at: Double(second), agent: "codex")
+        }
+        #expect(ticks == [false, false, true])
+    }
+
+    @Test func frozenRepaintOfAWorkingFrameNeverResumesWork() {
+        var detector = armedDetector()
+        for step in 0..<20 {
+            // The rest of the screen may change (a recap line, the
+            // composer); the working lines stay frozen.
+            var screen = Self.claudeStaleWorkingFrame
+            if step.isMultiple(of: 2) { screen.insert("※ recap: the docs index is rebuilt", at: 1) }
+            let resumed = show(screen, to: &detector, at: 0.25 * Double(step))
+            #expect(!resumed)
+        }
+    }
+
+    @Test func resizeReflowIsNoProgress() {
+        var detector = armedDetector()
+        let footers = ["esc to interrupt", "esc to interr…", "esc to …", "esc to interrupt"]
+        var time = 0.0
+        for (index, columns) in [120, 100, 80, 60, 90].enumerated() {
+            // The reflowed frame can come before the new grid is known,
+            // and the program's redraw after it.
+            let footer = footers[index % footers.count]
+            var reflowed = Self.claudeStaleWorkingFrame
+            reflowed[reflowed.count - 1] = "  ⏵⏵ bypass permissions on · \(footer)"
+            let resumed = show(reflowed, to: &detector, at: time, columns: index == 0 ? 120 : columns + 20)
+            #expect(!resumed)
+            reflowed[2] = "✶ Indexing… (3m 9s · ↓ 12.4k"
+            let redrawn = show(reflowed, to: &detector, at: time + 0.4, columns: columns)
+            #expect(!redrawn)
+            time += 0.6
+        }
+        // Settled at the last width, the redraw stays frozen.
+        for step in 0..<8 {
+            var settled = Self.claudeStaleWorkingFrame
+            settled[2] = "✶ Indexing… (3m 9s · ↓ 12.4k"
+            let resumed = show(settled, to: &detector, at: time + 0.25 * Double(step), columns: 90)
+            #expect(!resumed)
+        }
+    }
+
+    @Test func flappingBetweenTwoFramesIsNoProgress() {
+        var detector = armedDetector()
+        let frames = [Self.claudeResumedFrame(0), Self.claudeResumedFrame(1)]
+        for step in 0..<16 {
+            let resumed = show(frames[step % 2], to: &detector, at: 0.25 * Double(step))
+            #expect(!resumed)
+        }
+    }
+
+    @Test func screenChangesRightAfterAKeyDoNotCount() {
+        var detector = armedDetector()
+        // Each change follows a key at once (the user moving the cursor,
+        // scrolling a TUI's transcript).
+        for frame in 0..<8 {
+            let time = 0.25 * Double(frame)
+            let resumed = show(Self.claudeResumedFrame(frame), to: &detector, at: time, inputAt: time - 0.1)
+            #expect(!resumed)
+        }
+        // The keys stop and the work goes on advancing: it counts again.
+        let results = (8..<18).map { frame in
+            show(Self.claudeResumedFrame(frame), to: &detector, at: 0.25 * Double(frame), inputAt: 1.65)
+        }
+        // Changes count from 2.75 s (a second after the last key): the
+        // fifth of them spans a second.
+        #expect(results.firstIndex(of: true) == 7)
+    }
+
+    @Test func linesOfTheFinishedScreenAreThePast() {
+        // The finished turn's transcript quotes working markers.
+        let quotes = [
+            "  1. A wide footer says esc to interrupt while it works.",
+            "  2. A narrow one says esc to interr…",
+            "  3. A narrower one says esc to …",
+        ]
+        var detector = armedDetector(quotes + Self.claudeFinishedTurn)
+        // The program scrolls them by itself: other windows of the same
+        // stale lines.
+        let windows = [[0, 1], [1, 2], [0, 2], [0], [2], [1], [0, 1, 2], [2, 0]]
+        for (step, window) in windows.enumerated() {
+            let screen = window.map { quotes[$0] } + Self.claudeFinishedTurn
+            let resumed = show(screen, to: &detector, at: 0.3 * Double(step))
+            #expect(!resumed)
+        }
+    }
+
+    @Test func scrollingPastLinesThatQuoteMarkersIsNoProgress() {
+        // A transcript that quotes working markers, scrolled by the program
+        // (a mouse wheel reaches it without a key Cherry sees): new lines
+        // come in, but none changes in place.
+        let transcript = (0..<24).map { line in
+            line.isMultiple(of: 3)
+                ? "  note \(line): the footer read esc to interrupt at \(line)s"
+                : "  note \(line): the turn went on"
+        }
+        var detector = armedDetector()
+        for step in 0..<16 {
+            let screen = Array(transcript[step..<(step + 8)]) + claudeComposer
+            let resumed = show(screen, to: &detector, at: 0.2 * Double(step))
+            #expect(!resumed)
+        }
+    }
+
+    @Test func titleSpinnerThatKeepsPulsingResumesWork() {
+        var detector = armedDetector()
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        let results = (0..<10).map { step in
+            detector.noteTitle("\(frames[step]) Run the tests", isSpinner: true, now: Self.resumedWorkEpoch + 0.15 * Double(step))
+        }
+        // The first frame is no change; the changes (from 0.15 s) span a
+        // second at the ninth frame (1.2 s).
+        #expect(results.firstIndex(of: true) == 8)
+
+        // A spinner frame left behind is no heartbeat, nor is the plain title.
+        var stale = armedDetector()
+        for step in 0..<10 {
+            let at = Self.resumedWorkEpoch + 0.5 * Double(step)
+            let resumed = stale.noteTitle("⠴ cherry", isSpinner: true, now: at)
+            #expect(!resumed)
+            let plain = stale.noteTitle("✳ Claude Code", isSpinner: false, now: at + 0.1)
+            #expect(!plain)
+        }
+    }
+
+    @Test func nothingResumesUnlessATurnEnded() {
+        let idle = AgentResumedWorkDetector()
+        #expect(!idle.isArmed)
+        var disarmed = armedDetector()
+        disarmed.disarm()
+        for detector in [idle, disarmed] {
+            var detector = detector
+            for frame in 0..<12 {
+                let resumed = show(Self.claudeResumedFrame(frame), to: &detector, at: 0.25 * Double(frame))
+                #expect(!resumed)
+                let titled = detector.noteTitle("⠋\(frame) Run", isSpinner: true, now: Self.resumedWorkEpoch + 0.25 * Double(frame))
+                #expect(!titled)
+            }
+        }
+    }
+
     // MARK: Agent keys
 
     @Test func agentKeyFallsBackToTheHarnessItNames() {

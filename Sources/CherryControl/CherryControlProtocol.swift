@@ -1294,9 +1294,11 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     public let contentVersion: Int?
     /// Why the launch failed, when `state` is `failed`.
     public let failureMessage: String?
-    /// Agents only: how many turns Cherry saw submitted to this tab (typed
-    /// Enter or MCP input), over the tab's whole life. Monotonic, so
-    /// "done since my message" compares against it.
+    /// Agents only: how many turns Cherry saw start in this tab, over its
+    /// whole life: submitted (typed Enter or MCP input), or begun by the
+    /// agent itself after a finished turn (a background task's result, a
+    /// scheduled wake-up). Monotonic, so "done since my message" compares
+    /// against it.
     public let agentTurn: Int?
     /// Agents only: `not_started`, `active`, `completed` or
     /// `user_interrupted`, for the latest turn.

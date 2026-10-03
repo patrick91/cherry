@@ -844,7 +844,7 @@ final class CherryControlServer: @unchecked Sendable {
         case .getMyTask:
             return .init(result: .getMyTask(try getMyTask()))
         case .reportResult(let request):
-            return .init(result: .reportResult(try reportResult(request)))
+            return .init(result: .reportResult(try await reportResult(request)))
         case .reportProgress(let request):
             return .init(result: .reportProgress(try reportProgress(request)))
         case .waitForTasks(let request):
@@ -1678,7 +1678,7 @@ final class CherryControlServer: @unchecked Sendable {
             lastContentChangeAt: session.lastContentChangeAt,
             contentVersion: session.contentVersion,
             failureMessage: session.state.failureMessage,
-            agentTurn: session.kind == .agent ? session.agentSubmittedTurnCount : nil,
+            agentTurn: session.kind == .agent ? session.agentTurnCount : nil,
             agentTurnState: session.kind == .agent ? session.agentTurnState.rawValue : nil,
             taskID: task?.id,
             taskState: task?.state.rawValue,
@@ -1873,6 +1873,10 @@ final class CherryControlServer: @unchecked Sendable {
             var inputError: CherryControlError?
             let typedSince = Date()
             if let input, !input.isEmpty {
+                // A task's kickoff goes under the tab's typing lock, as
+                // every line Cherry types (`typeCherryLine`).
+                let typingLock = task != nil ? tasks.typingLocks : nil
+                await typingLock?.acquire(session.id)
                 // The process exists either way: sentBytes says whether its
                 // first input reached it.
                 do {
@@ -1882,6 +1886,7 @@ final class CherryControlServer: @unchecked Sendable {
                     inputError = error as? CherryControlError
                     sentBytes = 0
                 }
+                typingLock?.release(session.id)
             } else {
                 sentBytes = 0
             }
@@ -2149,7 +2154,7 @@ final class CherryControlServer: @unchecked Sendable {
                 lastOutputAt: session.lastOutputAt,
                 agentActivityState: reportedAgentActivityState(of: session),
                 output: output,
-                agentTurn: session.kind == .agent ? session.agentSubmittedTurnCount : nil,
+                agentTurn: session.kind == .agent ? session.agentTurnCount : nil,
                 turnStarted: Self.agentTurnStarted(session)
             )
         }

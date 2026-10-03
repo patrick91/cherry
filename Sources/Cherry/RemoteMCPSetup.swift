@@ -130,6 +130,12 @@ enum RemoteMCPSetup {
             "printf 'claude=%s\\n' \"$claude\"",
             "printf 'codex=%s\\n' \"$codex\"",
             "printf 'pi=%s\\n' \"$pi\"",
+            // Pi reads its agent directory from PI_CODING_AGENT_DIR, which a
+            // login shell may set: pi here runs with the same.
+            "if [ -n \"$pi\" ] && [ -z \"${PI_CODING_AGENT_DIR:-}\" ]; then",
+            "  pd=$(\"${SHELL:-/bin/sh}\" -l -c 'printf \"cherry_pi_dir=%s\\n\" \"${PI_CODING_AGENT_DIR:-}\"' </dev/null 2>/dev/null | sed -n 's/^cherry_pi_dir=//p' | tail -n 1)",
+            "  if [ -n \"$pd\" ]; then PI_CODING_AGENT_DIR=$pd; export PI_CODING_AGENT_DIR; fi",
+            "fi",
             "if [ -n \"$helper\" ]; then",
             "  if [ -x \"$helper\" ]; then",
             "    if v=$(\"$helper\" --version 2>&1 </dev/null); then printf 'helper_version=%s\\n' \"$(printf '%s' \"$v\" | tr '\\n' ' ')\"; else printf 'helper_error=%s\\n' \"$(printf '%s' \"$v\" | tr '\\n' ' ' | cut -c1-300)\"; fi",

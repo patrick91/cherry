@@ -971,3 +971,82 @@ private func quitSteps(_ harness: PersistentHarness, events: Recorder<[String]>)
     #expect(chromeState.closedTabs.entries.count == 1)
     window.delegate = nil
 }
+
+// MARK: - Cherry tasks
+
+/// A Cherry task follows its worker's tab by id (docs/mcp.md, Tasks And
+/// Results): a ⌘W that is undone, or a ⌘D, leaves it the task's worker (the
+/// tab that comes back is a new object with the same id); only a close that
+/// can no longer be undone, whose session ends, cancels the task.
+@Test @MainActor func aTasksWorkerClosedOrDetachedAndBroughtBackStaysItsWorkerUntilTheCloseIsFinal() async throws {
+    let harness = try PersistentHarness()
+    let workspace = harness.workspace()
+    let defaultsName = "CherryTests.TaskUndo.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    let server = CherryControlServer(
+        workspace: workspace,
+        socketURL: URL(fileURLWithPath: "/tmp/cherry-control-\(UUID().uuidString.prefix(8))/control.sock"),
+        agentSettings: AgentSettings(defaults: defaults),
+        monitorDefaults: defaults,
+        taskBoard: AgentTaskBoard()
+    )
+    defer {
+        server.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+    let anchor = workspace.addSession(title: "Anchor")
+    let worker = workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Worker", command: "/bin/cat"), projectRoot: harness.project.path
+    )
+    for tab in [anchor, worker] {
+        #expect(await harness.waitUntilAttached(tab))
+    }
+    let sessionID = try #require(worker.persistentSession?.sessionID)
+    let task = server.registerTask(
+        .init(brief: "Review", label: "Review", phase: nil, resultSchema: nil, run: nil, device: nil, ownerID: nil, owner: nil),
+        worker: worker, workspace: workspace
+    )
+    await server.sampleTasks()
+    #expect(task.hostSessionID == sessionID)
+    let clock = ManualClock()
+    let chromeState = windowChrome(clock: clock)
+    let registry = ProjectWindowRegistry()
+
+    // ⌘W can still be undone: the task waits for its worker.
+    SessionCloseCoordinator.closeTab(worker, in: workspace, chromeState: chromeState, registry: registry)
+    #expect(workspace.session(withID: worker.id) == nil)
+    await server.sampleTasks()
+    try await Task.sleep(for: .milliseconds(300))
+    await server.sampleTasks()
+    #expect(!task.state.isSettled, "cancelled while its close could still be undone")
+
+    // ⌘Z: the tab that comes back is the task's worker.
+    #expect(chromeState.closedTabs.undoLatest())
+    let reopened = try #require(workspace.session(withID: worker.id))
+    #expect(reopened !== worker)
+    await server.sampleTasks()
+    #expect(task.worker === reopened)
+    #expect(server.tasks.latestTask(forWorker: reopened.id) === task)
+
+    // ⌘D: its session runs on in the background, and it stays the worker,
+    // again once it comes back.
+    SessionCloseCoordinator.detach(reopened, in: workspace, chromeState: chromeState, registry: registry)
+    #expect(workspace.session(withID: worker.id) == nil)
+    await server.sampleTasks()
+    #expect(!task.state.isSettled)
+    #expect(chromeState.closedTabs.undoLatest())
+    let reattached = try #require(workspace.session(withID: worker.id))
+    await server.sampleTasks()
+    #expect(task.worker === reattached)
+
+    // ⌘W again, and its undo runs out: the session ends, and so does the task.
+    SessionCloseCoordinator.closeTab(reattached, in: workspace, chromeState: chromeState, registry: registry)
+    await server.sampleTasks()
+    #expect(!task.state.isSettled)
+    clock.advance(by: 60)
+    #expect(await harness.fake.wait { harness.requestIDs("kill").contains(sessionID) })
+    await server.sampleTasks()
+    #expect(task.state == .cancelled)
+}

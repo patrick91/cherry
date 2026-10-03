@@ -9,25 +9,37 @@ import Foundation
 // visible agent tab nested under the orchestrator, records the task in a
 // run, and types a one-line kickoff into the worker once it is ready. The
 // worker reads its brief with `get_my_task` and answers with
-// `report_result`, which Cherry checks against the task's result schema;
-// the worker is always the caller's own tab (`verifiedCallerSession`),
-// never a selector. The orchestrator waits with `wait_for_tasks`, or ends
-// its turn: once every task of its run settled and it is idle, Cherry types
-// one line into its tab (counts and the run id only, never a worker's
-// text), as monitors' wake lines do.
+// `report_result`, which Cherry checks against the task's result schema
+// (off the main thread, within a work budget); the worker is always the
+// caller's own tab (`verifiedCallerSession`), never a selector. The
+// orchestrator waits with `wait_for_tasks`, or ends its turn: once every
+// task of its run settled and it is idle, Cherry types one line into its
+// tab (counts and the run id only, never a worker's text), as monitors'
+// wake lines do.
 //
 // `report_result` is the signal. A worker that goes idle after its turn
 // without reporting is asked once ("Please call report_result with your
 // result."); idle again without a report, its task is `no_report`, with its
-// screen's last lines as the result. The monitor sampler watches open tasks
+// screen's last lines as the result. Neither happens while the worker waits
+// on a monitor of its own (a wake subscription whose processes still run or
+// whose events it has not read). The monitor sampler watches open tasks
 // (`sampleTasks`), so tasks reuse its refresh throttle, status and idle
-// rules.
+// rules. Everything Cherry types into a tab (wake lines, the nudge, a
+// kickoff) goes through one lock per tab (`typeCherryLine`), so two lines
+// never mix into one message.
+//
+// A task follows its worker's tab by id: a tab closed with ⌘W (or detached
+// with ⌘D) that comes back (⌘Z, Background Sessions › Open) is the task's
+// worker again. While its tab is away the task waits: a closed tab's task is
+// cancelled once its session really ends (the close can no longer be
+// undone); a detached worker whose session runs stays the task's worker
+// (and may report, identified by its program's processes).
 //
 // Records live in memory, in the control server, each tied to its worker's
 // tab and window: a relaunch of Cherry forgets them (a restored worker's
-// `get_my_task` answers `no_assignment`). Tasks are one level deep (a
-// worker cannot hand out tasks), and a caller on another Mac reaches only
-// the tasks its Mac's callers made.
+// `get_my_task` answers `no_assignment`). Each run keeps its own events. Tasks
+// are one level deep (a worker cannot hand out tasks), and a caller on
+// another Mac reaches only the tasks its Mac's callers made.
 
 /// One task (main actor only).
 @MainActor
@@ -38,8 +50,17 @@ final class AgentTask {
     /// of that Mac find it.
     let device: UUID?
     let workerID: UUID
+    /// The worker's tab as last found (`locateWorker` finds a tab that came
+    /// back by `workerID`).
     weak var worker: TerminalSession?
     weak var workspace: TerminalWorkspace?
+    /// The worker's persistent session and its host, while it runs as one:
+    /// what tells a closed tab whose close may still be undone, or a
+    /// detached one, from a tab that is gone.
+    weak var hosting: PersistentLocalSessions?
+    var hostSessionID: String?
+    /// Since when its tab is in no open window.
+    var awaySince: Date?
     let label: String
     let phase: String?
     let brief: String
@@ -52,6 +73,13 @@ final class AgentTask {
     var result: AgentTaskResult?
     var progress: String?
     var progressAt: Date?
+    /// The event that last settled it, and the last that said it needs
+    /// the user: `wait_for_tasks` reads them even when the events went.
+    var settledSeq: Int?
+    var needsInputSeq: Int?
+    /// When its last report was recorded, and whether one is being checked.
+    var lastReportAt: Date?
+    var isCheckingReport = false
 
     /// The kickoff reached the worker (or it found its task by itself).
     var kickoffDeliveredAt: Date?
@@ -110,12 +138,18 @@ final class AgentRun {
     let isImplicit: Bool
     let createdAt = Date()
     var taskIDs: [String] = []
+    /// Its tasks' events, oldest first: at most one of each kind per task
+    /// (a newer one replaces it), and at most `maxEventsPerRun`.
+    var events: [AgentTaskEvent] = []
+    /// The newest event it dropped to stay within `maxEventsPerRun`.
+    var droppedThroughSeq = 0
     /// The event at which every task of it settled; nil while one is open.
     var settledSeq: Int?
     var settledAt: Date?
     /// The settle its wake line was typed for (or given up on).
     var wokenSeq = 0
-    /// The settle its owner read with `wait_for_tasks`: no wake line then.
+    /// The settle its owner read with `wait_for_tasks` (or caused, with
+    /// `cancel_tasks`): no wake line then.
     var ownerReadSeq = 0
     var lastWakeAt: Date?
     var isWaking = false
@@ -135,14 +169,51 @@ final class AgentRun {
     var wakes: Bool { owner?.kind == .agent }
 }
 
+/// One lock per tab for what Cherry types into it (wake lines, the nudge,
+/// a kickoff): a line's text, its pause and its Enter go together, so two
+/// lines never mix into one message.
+@MainActor
+final class TabTypingLocks {
+    private var holders: Set<UUID> = []
+    private var waiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
+
+    /// Cherry types into the tab now (or a line waits for it).
+    func isBusy(_ id: UUID) -> Bool { holders.contains(id) }
+
+    func acquire(_ id: UUID) async {
+        if holders.insert(id).inserted { return }
+        await withCheckedContinuation { waiters[id, default: []].append($0) }
+    }
+
+    /// Hands the lock to the next line waiting for the tab, if any.
+    func release(_ id: UUID) {
+        if var queue = waiters[id], !queue.isEmpty {
+            let next = queue.removeFirst()
+            waiters[id] = queue.isEmpty ? nil : queue
+            next.resume()
+        } else {
+            holders.remove(id)
+            waiters[id] = nil
+        }
+    }
+}
+
 /// The tasks and runs of one control server.
 @MainActor
 final class AgentTaskRegistry {
     static let maximumTasks = 1_000
-    static let maximumEvents = 5_000
     static let maximumBriefCharacters = 64_000
-    static let maximumResultBytes = 256 * 1024
+    static let maximumBriefBytes = 256 * 1024
+    nonisolated static let maximumResultBytes = 256 * 1024
     static let maximumKickoffAttempts = 3
+    /// What each text keeps, in characters and in UTF-8 bytes (a character
+    /// can be many bytes).
+    static let summaryBytes = 4 * CherryControl.maximumTaskSummaryCharacters
+    static let progressBytes = 4 * CherryControl.maximumTaskProgressCharacters
+    static let labelLimit = (characters: 80, bytes: 320)
+    static let phaseLimit = (characters: 60, bytes: 240)
+    /// A report's or progress message's excerpt in an event.
+    static let eventTextLimit = (characters: 120, bytes: 480)
     /// The screen's last lines a `no_report` (or an exit) keeps.
     static let screenTailLines = 40
     static let screenTailCharacters = 4_000
@@ -150,11 +221,11 @@ final class AgentTaskRegistry {
     static let nudgeLine = "Please call report_result with your result."
 
     let board: AgentTaskBoard
+    let typingLocks = TabTypingLocks()
     private(set) var tasks: [String: AgentTask] = [:]
     private(set) var taskOrder: [String] = []
     private(set) var runs: [String: AgentRun] = [:]
     private(set) var runOrder: [String] = []
-    private(set) var events: [AgentTaskEvent] = []
     private(set) var nextSeq = 1
     /// Settings › MCP › Wake idle agents (the server's monitors' setting).
     var wakeLinesEnabled: @MainActor () -> Bool = { true }
@@ -162,12 +233,19 @@ final class AgentTaskRegistry {
     // Tunables (tests shorten them).
     /// At most one progress message is recorded this often.
     var progressInterval: TimeInterval = 5
+    /// At most one report is recorded this often (the first at once).
+    var reportInterval: TimeInterval = 2
     /// An idle worker whose turn showed no work is taken as done with that
     /// turn this long after it was submitted.
     var idleFallbackInterval: TimeInterval = 30
     var kickoffRetryInterval: TimeInterval = 5
     /// A settled run's wake line is given up after this long.
     var wakeLifetime: TimeInterval = 60 * 60
+    /// The events a run keeps (it drops its oldest beyond).
+    var maxEventsPerRun = 2_000
+    /// How long a worker whose tab is gone, and whose session its host no
+    /// longer lists, may come back before its task is cancelled.
+    var awayGrace: TimeInterval = 10
 
     init(board: AgentTaskBoard) {
         self.board = board
@@ -175,6 +253,24 @@ final class AgentTaskRegistry {
 
     static func newID(_ prefix: String) -> String {
         prefix + "-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(12)
+    }
+
+    /// `text` within `characters` characters and `bytes` UTF-8 bytes, cut
+    /// at a character with "…"; and whether it was cut.
+    nonisolated static func clip(_ text: String, characters: Int, bytes: Int) -> (text: String, clipped: Bool) {
+        if text.utf8.count <= bytes, text.count <= characters { return (text, false) }
+        let ellipsis = "…"
+        var kept = ""
+        var keptCharacters = 0
+        var keptBytes = 0
+        for character in text {
+            let size = character.utf8.count
+            guard keptCharacters + 1 < characters, keptBytes + size + ellipsis.utf8.count <= bytes else { break }
+            kept.append(character)
+            keptCharacters += 1
+            keptBytes += size
+        }
+        return (kept + ellipsis, true)
     }
 
     /// One line, typed into the worker as its first message.
@@ -266,9 +362,6 @@ final class AgentTaskRegistry {
         tasks.values.contains { !$0.state.isSettled } || (wakeLinesEnabled() && runs.values.contains(where: awaitsWake))
     }
 
-    /// The first event still kept.
-    var firstKeptSeq: Int { events.first?.seq ?? nextSeq }
-
     // MARK: Changes
 
     func addRun(device: UUID?, ownerID: UUID?, owner: TerminalSession?, isImplicit: Bool) -> AgentRun {
@@ -282,12 +375,16 @@ final class AgentTaskRegistry {
         tasks[task.id] = task
         taskOrder.append(task.id)
         run.taskIDs.append(task.id)
-        record(.queued, for: task)
-        settleCheck(run, seq: nextSeq - 1)
+        let event = record(.queued, for: task)
+        settleCheck(run, seq: event.seq)
         prune()
         publish()
     }
 
+    /// Adds an event to its run: it replaces the task's earlier event of
+    /// the same kind (one of each kind per task: a chatty worker's progress
+    /// or re-reports never pile up), and the run drops its oldest beyond
+    /// `maxEventsPerRun`. Other runs' events are never touched.
     @discardableResult
     func record(_ kind: AgentTaskEventKind, for task: AgentTask, text: String? = nil, version: Int? = nil) -> AgentTaskEvent {
         let event = AgentTaskEvent(
@@ -300,13 +397,17 @@ final class AgentTaskRegistry {
             label: task.label,
             phase: task.phase,
             at: Date(),
-            text: text,
+            text: text.map { Self.clip($0, characters: Self.eventTextLimit.characters, bytes: Self.eventTextLimit.bytes).text },
             version: version
         )
         nextSeq += 1
-        events.append(event)
-        if events.count > Self.maximumEvents {
-            events.removeFirst(events.count - Self.maximumEvents)
+        guard let run = runs[task.runID] else { return event }
+        run.events.removeAll { $0.taskID == task.id && $0.kind == kind }
+        run.events.append(event)
+        if run.events.count > maxEventsPerRun {
+            let overflow = run.events.count - maxEventsPerRun
+            run.droppedThroughSeq = max(run.droppedThroughSeq, run.events[overflow - 1].seq)
+            run.events.removeFirst(overflow)
         }
         return event
     }
@@ -332,6 +433,8 @@ final class AgentTaskRegistry {
         task.settledAt = state.isSettled ? (task.settledAt ?? now) : nil
         if state.isSettled, kind.settles { task.settledAt = now }
         let event = record(kind, for: task, text: text, version: result?.version)
+        if state.isSettled, kind.settles { task.settledSeq = event.seq }
+        if state == .needsInput { task.needsInputSeq = event.seq }
         if let run = runs[task.runID] { settleCheck(run, seq: event.seq) }
         publish()
     }
@@ -543,6 +646,24 @@ extension CherryControlServer {
         )
     }
 
+    /// Input that failed in a way that may still have typed it (its
+    /// host's answer was lost, or only a first part went): never typed
+    /// again, or it would be typed twice.
+    nonisolated static func inputMayHaveBeenTyped(_ error: Error) -> Bool {
+        guard let error = error as? CherryControlError else { return false }
+        return error.code == "input_maybe_delivered" || error.code == "input_partially_delivered"
+    }
+
+    /// Types `text` and Enter into `session` as Cherry's own line (a wake
+    /// line, the nudge, a kickoff): under the tab's typing lock, so the
+    /// text, its pause and its Enter are never mixed with another line.
+    @MainActor
+    func typeCherryLine(_ text: String, into session: TerminalSession) async throws -> Int {
+        await tasks.typingLocks.acquire(session.id)
+        defer { tasks.typingLocks.release(session.id) }
+        return try await sendControlInput(text: text, rawBase64: nil, submit: true, to: session)
+    }
+
     /// Checks a spawn's task (nil without one): the brief, that it is not
     /// also given a message, the schema (linted here, before anything is
     /// spawned), the run, and that the caller is not itself a worker.
@@ -561,10 +682,10 @@ extension CherryControlServer {
         guard !brief.isEmpty else {
             throw CherryControlError(code: "invalid_process_request", message: "task is empty: give the worker its brief.")
         }
-        guard brief.count <= AgentTaskRegistry.maximumBriefCharacters else {
+        guard brief.utf8.count <= AgentTaskRegistry.maximumBriefBytes, brief.count <= AgentTaskRegistry.maximumBriefCharacters else {
             throw CherryControlError(
                 code: "invalid_process_request",
-                message: "task is longer than \(AgentTaskRegistry.maximumBriefCharacters) characters: put the details in a file and name it in the brief."
+                message: "task is longer than \(AgentTaskRegistry.maximumBriefCharacters) characters or \(AgentTaskRegistry.maximumBriefBytes) bytes: put the details in a file and name it in the brief."
             )
         }
         guard request.text == nil, request.rawBase64 == nil else {
@@ -602,10 +723,11 @@ extension CherryControlServer {
         let label = request.label?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
             ?? request.title?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
             ?? Self.defaultTaskLabel(brief)
+        let phase = request.phase?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         return TaskSpawnPlan(
             brief: brief,
-            label: String(label.prefix(80)),
-            phase: request.phase?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty.map { String($0.prefix(60)) },
+            label: AgentTaskRegistry.clip(label, characters: AgentTaskRegistry.labelLimit.characters, bytes: AgentTaskRegistry.labelLimit.bytes).text,
+            phase: phase.map { AgentTaskRegistry.clip($0, characters: AgentTaskRegistry.phaseLimit.characters, bytes: AgentTaskRegistry.phaseLimit.bytes).text },
             resultSchema: request.resultSchema,
             run: run,
             device: device,
@@ -618,7 +740,7 @@ extension CherryControlServer {
     nonisolated static func defaultTaskLabel(_ brief: String) -> String {
         let firstLine = brief.split(whereSeparator: \.isNewline).first.map(String.init) ?? brief
         let words = firstLine.split(whereSeparator: \.isWhitespace).prefix(6).joined(separator: " ")
-        return words.count > 40 ? String(words.prefix(39)) + "…" : words
+        return AgentTaskRegistry.clip(words, characters: 40, bytes: 160).text
     }
 
     /// Records the task of the worker just spawned for `plan`.
@@ -666,10 +788,13 @@ extension CherryControlServer {
 
     // MARK: Worker side
 
-    /// The caller's own tab's task.
+    /// The caller's own tab's task; for a worker whose tab is away (its
+    /// close may still be undone, or it was detached) while its session
+    /// runs, the task whose session's program is an ancestor of the caller.
     @MainActor
     private func callerTask() throws -> AgentTask {
         guard let caller = verifiedCallerSession() else {
+            if let away = awayWorkerTaskOfCaller() { return away }
             throw Self.noAssignment(
                 "Cherry could not tell which of its tabs this MCP session runs in, so it has no task for it. Run CherryMCP inside the agent's own Cherry tab (as its MCP server, or \"$CHERRY_MCP_HELPER\" --call from its shell)."
             )
@@ -678,6 +803,23 @@ extension CherryControlServer {
             throw Self.noAssignment("This tab has no Cherry task: only agents spawned with spawn_agent's task have one (Cherry forgets tasks when it relaunches).")
         }
         return task
+    }
+
+    /// A task whose worker's tab is in no open window while its session
+    /// runs on its host, when the caller (This Mac's) descends from that
+    /// session's program.
+    @MainActor
+    private func awayWorkerTaskOfCaller() -> AgentTask? {
+        guard Self.remoteDevice == nil, callerSessionResolverForTesting == nil, let peerPID = Self.callerPeerPID else { return nil }
+        let ancestry = Set(Self.processAncestry(of: peerPID))
+        for id in tasks.taskOrder.reversed() {
+            guard let task = tasks.tasks[id], task.state != .cancelled, locateWorker(task) == nil,
+                  let hosting = task.hosting, let sessionID = task.hostSessionID,
+                  let pid = hosting.sessionInfo(sessionID)?.pid, ancestry.contains(Int32(bitPattern: pid))
+            else { continue }
+            return task
+        }
+        return nil
     }
 
     @MainActor
@@ -706,65 +848,101 @@ extension CherryControlServer {
         )
     }
 
+    /// What checking a report found (`checkReport`).
+    enum ReportCheck: Sendable, Equatable {
+        case accepted(JSONValue?)
+        case tooLarge
+        case mismatch([String])
+    }
+
+    /// A report's value checked: its size first, then (status ok) its
+    /// schema; JSON text of an object or array stands for that value when
+    /// it matches (some clients send an argument whose type the tool leaves
+    /// open as a string). Pure, and bounded: run off the main thread.
+    nonisolated static func checkReport(value: JSONValue?, status: String, schema: JSONValue?) -> ReportCheck {
+        if case .string(let text)? = value, text.utf8.count > AgentTaskRegistry.maximumResultBytes { return .tooLarge }
+        if let value, value.encodedByteCount > AgentTaskRegistry.maximumResultBytes { return .tooLarge }
+        let parsed: JSONValue? = {
+            guard case .string(let text)? = value,
+                  let first = text.trimmingCharacters(in: .whitespacesAndNewlines).first, first == "{" || first == "["
+            else { return nil }
+            return try? JSONValue.parse(Data(text.utf8))
+        }()
+        guard status == "ok", let schema else { return .accepted(schema == nil ? (parsed ?? value) : value) }
+        let problems = TaskResultSchema.validate(value ?? .null, against: schema)
+        if problems.isEmpty { return .accepted(value) }
+        if let parsed, TaskResultSchema.validate(parsed, against: schema).isEmpty { return .accepted(parsed) }
+        return .mismatch(problems)
+    }
+
     @MainActor
-    func reportResult(_ request: ReportResultRequest) throws -> ReportResultResult {
+    func reportResult(_ request: ReportResultRequest) async throws -> ReportResultResult {
         let task = try callerTask()
         if task.state == .cancelled { throw Self.taskCancelled(task) }
         let status = (request.status ?? "ok").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard status == "ok" || status == "failed" else {
             throw CherryControlError(code: "invalid_argument", message: "status is ok or failed, not \(request.status ?? "").")
         }
-        var value = request.value
-        // Some clients declare an argument without a type a string (Codex):
-        // JSON text of an object or array is taken as that value when it
-        // matches the schema (or there is none).
-        let parsed: JSONValue? = {
-            guard case .string(let text)? = request.value,
-                  let first = text.trimmingCharacters(in: .whitespacesAndNewlines).first, first == "{" || first == "["
-            else { return nil }
-            return try? JSONValue.parse(Data(text.utf8))
-        }()
-        if let parsed, task.resultSchema == nil { value = parsed }
-        if status == "ok", let schema = task.resultSchema {
-            var problems = TaskResultSchema.validate(value ?? .null, against: schema)
-            if !problems.isEmpty, let parsed, TaskResultSchema.validate(parsed, against: schema).isEmpty {
-                value = parsed
-                problems = []
-            }
-            guard problems.isEmpty else {
-                throw CherryControlError(
-                    code: "schema_mismatch",
-                    message: "value does not match task \(task.id)'s result_schema (nothing was recorded): \(problems.prefix(5).joined(separator: "; ")). Fix it and call report_result again.",
-                    details: problems
-                )
-            }
+        let now = Date()
+        if task.isCheckingReport {
+            throw CherryControlError(code: "rate_limited", message: "A report of task \(task.id) is being checked; send the next one after its answer.")
         }
-        if let value, value.encodedByteCount > AgentTaskRegistry.maximumResultBytes {
+        if let last = task.lastReportAt, now.timeIntervalSince(last) < tasks.reportInterval {
+            let wait = Int(((tasks.reportInterval - now.timeIntervalSince(last)) * 1_000).rounded(.up))
             throw CherryControlError(
-                code: "result_too_large",
-                message: "value is larger than \(AgentTaskRegistry.maximumResultBytes) bytes: write the details to a file and report its path."
+                code: "rate_limited",
+                message: "Task \(task.id) was reported less than \(Int(tasks.reportInterval)) s ago; nothing was recorded. Report again in \(wait) ms."
             )
         }
+        // Checked off the main thread: a large value against a large
+        // schema must not stall Cherry.
+        task.isCheckingReport = true
+        let value = request.value
+        let schema = task.resultSchema
+        let check = await Task.detached(priority: .userInitiated) {
+            Self.checkReport(value: value, status: status, schema: schema)
+        }.value
+        task.isCheckingReport = false
+        let checked: JSONValue?
+        switch check {
+        case .tooLarge:
+            throw CherryControlError(
+                code: "result_too_large",
+                message: "value is larger than \(AgentTaskRegistry.maximumResultBytes) bytes (nothing was recorded): write the details to a file and report its path."
+            )
+        case .mismatch(let problems):
+            throw CherryControlError(
+                code: "schema_mismatch",
+                message: "value does not match task \(task.id)'s result_schema (nothing was recorded): \(problems.prefix(5).joined(separator: "; ")). Fix it and call report_result again.",
+                details: problems
+            )
+        case .accepted(let accepted):
+            checked = accepted
+        }
+        // Cancelled while it was checked.
+        if task.state == .cancelled { throw Self.taskCancelled(task) }
         let trimmed = request.summary?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-        let limit = CherryControl.maximumTaskSummaryCharacters
-        let summary = trimmed.map { $0.count > limit ? String($0.prefix(limit - 1)) + "…" : $0 }
+        let summary = trimmed.map {
+            AgentTaskRegistry.clip($0, characters: CherryControl.maximumTaskSummaryCharacters, bytes: AgentTaskRegistry.summaryBytes)
+        }
         let version = (task.result?.version ?? 0) + 1
         let result = AgentTaskResult(
-            value: value,
+            value: checked,
             status: status,
-            summary: summary,
+            summary: summary?.text,
             version: version,
             reportedAt: Date(),
             source: "report_result"
         )
+        task.lastReportAt = Date()
         let state: AgentTaskState = status == "ok" ? .reported : .failed
-        tasks.update(task, to: state, event: state == .reported ? .reported : .failed, text: summary, result: result)
+        tasks.update(task, to: state, event: state == .reported ? .reported : .failed, text: summary?.text, result: result)
         return ReportResultResult(
             taskID: task.id,
             runID: task.runID,
             version: version,
             state: task.state,
-            summaryTruncated: (trimmed?.count ?? 0) > limit
+            summaryTruncated: summary?.clipped ?? false
         )
     }
 
@@ -784,8 +962,9 @@ extension CherryControlServer {
             let wait = tasks.progressInterval - now.timeIntervalSince(last)
             return ReportProgressResult(taskID: task.id, recorded: false, retryAfterMilliseconds: Int((wait * 1_000).rounded(.up)))
         }
-        let limit = CherryControl.maximumTaskProgressCharacters
-        let message = oneLine.count > limit ? String(oneLine.prefix(limit - 1)) + "…" : oneLine
+        let message = AgentTaskRegistry.clip(
+            oneLine, characters: CherryControl.maximumTaskProgressCharacters, bytes: AgentTaskRegistry.progressBytes
+        ).text
         task.progress = message
         task.progressAt = now
         if task.state == .queued {
@@ -840,6 +1019,16 @@ extension CherryControlServer {
         return result
     }
 
+    /// The runs a selection reaches: its runs and its tasks' runs.
+    @MainActor
+    private func involvedRuns(_ selection: (runs: [AgentRun], tasks: [AgentTask])) -> [AgentRun] {
+        var result = selection.runs
+        for task in selection.tasks {
+            if let run = tasks.runs[task.runID], !result.contains(where: { $0 === run }) { result.append(run) }
+        }
+        return result
+    }
+
     @MainActor
     func waitForTasks(_ request: WaitForTasksRequest) async throws -> WaitForTasksResult {
         let until = (request.until ?? "any").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -855,26 +1044,32 @@ extension CherryControlServer {
         let maxEvents = min(max(request.maxEvents ?? 100, 1), 500)
         let after = max(request.cursor ?? 0, 0)
         let deadline = Date().addingTimeInterval(TimeInterval(timeout) / 1_000)
-        var involvedRuns = selection.runs
-        for task in selection.tasks {
-            if let run = tasks.runs[task.runID], !involvedRuns.contains(where: { $0 === run }) { involvedRuns.append(run) }
-        }
-        for run in involvedRuns { run.activeWaits += 1 }
-        defer { for run in involvedRuns { run.activeWaits -= 1 } }
+        let runs = involvedRuns(selection)
+        for run in runs { run.activeWaits += 1 }
+        defer { for run in runs { run.activeWaits -= 1 } }
 
         while true {
             let selected = selectedTasks(selection)
             let ids = Set(selected.map(\.id))
-            let available = tasks.events.filter { $0.seq > after && ids.contains($0.taskID) }
+            let available = runs.flatMap(\.events)
+                .filter { $0.seq > after && ids.contains($0.taskID) }
+                .sorted { $0.seq < $1.seq }
             let pending = selected.filter { !$0.state.isSettled }
-            let ready = until == "all"
-                ? pending.isEmpty
-                : pending.isEmpty || available.contains { $0.kind.settles || $0.kind == .needsInput }
+            // A task's own seqs say it settled (or needs the user) after
+            // the cursor, even when its event went.
+            let changed = selected.contains { task in
+                (task.state.isSettled && (task.settledSeq ?? 0) > after)
+                    || (task.state == .needsInput && (task.needsInputSeq ?? 0) > after)
+            }
+            let ready = until == "all" ? pending.isEmpty : pending.isEmpty || changed
             if ready || Date() >= deadline {
                 let events = Array(available.prefix(maxEvents))
-                let cursor = events.last?.seq ?? after
+                let latestChange = selected.compactMap { max($0.settledSeq ?? 0, $0.needsInputSeq ?? 0) }.max() ?? 0
+                let cursor = events.count == available.count
+                    ? max(events.last?.seq ?? after, min(latestChange, tasks.nextSeq - 1), after)
+                    : events.last?.seq ?? after
                 // The owner read its run's settle: no wake line for it.
-                for run in involvedRuns where run.ownerID != nil && run.ownerID == callerID {
+                for run in runs where run.ownerID != nil && run.ownerID == callerID {
                     if let settledSeq = run.settledSeq, events.count == available.count {
                         run.ownerReadSeq = max(run.ownerReadSeq, settledSeq)
                     }
@@ -886,8 +1081,8 @@ extension CherryControlServer {
                     cursor: cursor,
                     timedOut: !ready,
                     moreEvents: available.count - events.count,
-                    eventsDropped: after < tasks.firstKeptSeq - 1,
-                    runs: involvedRuns.map { tasks.info(for: $0) }
+                    eventsDropped: runs.contains { $0.droppedThroughSeq > after },
+                    runs: runs.map { tasks.info(for: $0) }
                 )
             }
             try? await Task.sleep(for: .milliseconds(100))
@@ -940,20 +1135,92 @@ extension CherryControlServer {
                 tasks.update(task, to: .cancelled, event: .cancelled, text: "Cancelled by the orchestrator.", reason: "cancelled by the orchestrator")
                 cancelled.append(task.id)
             }
-            guard request.close == true, let worker = task.worker, let workspace = task.workspace,
-                  isOpen(worker, in: workspace), callerReaches(worker, in: workspace)
-            else { continue }
+            guard request.close == true, let found = locateWorker(task), callerReaches(found.session, in: found.workspace) else { continue }
             do {
-                try closeFromControl(worker, workspace: workspace, agentClosePolicy: nil)
+                try closeFromControl(found.session, workspace: found.workspace, agentClosePolicy: nil)
                 closed.append(task.id)
             } catch {
                 SessionLog.debug("[task] \(task.id)'s worker not closed: \(error)")
+            }
+        }
+        // Its owner ended it: it knows the run settled (no wake line).
+        if let callerID = verifiedCallerSession()?.id {
+            for run in involvedRuns(selection) where run.ownerID == callerID {
+                if let settledSeq = run.settledSeq { run.ownerReadSeq = max(run.ownerReadSeq, settledSeq) }
             }
         }
         return CancelTasksResult(cancelled: cancelled, closed: closed, alreadySettled: alreadySettled)
     }
 
     // MARK: Sampling
+
+    /// The worker's tab, in an open window: the one the task last saw, or
+    /// one that came back with its id (⌘Z after ⌘W or ⌘D, Background
+    /// Sessions › Open), which becomes the task's worker. Notes its
+    /// persistent session while it has one.
+    @MainActor
+    func locateWorker(_ task: AgentTask) -> (session: TerminalSession, workspace: TerminalWorkspace)? {
+        var found: (TerminalSession, TerminalWorkspace)?
+        if let worker = task.worker, let workspace = task.workspace, workspace.sessions.contains(where: { $0 === worker }) {
+            found = (worker, workspace)
+        } else {
+            for workspace in allOpenWorkspaces() {
+                if let session = workspace.sessions.first(where: { $0.id == task.workerID }) {
+                    found = (session, workspace)
+                    break
+                }
+            }
+        }
+        guard let found else { return nil }
+        let (worker, workspace) = found
+        task.worker = worker
+        task.workspace = workspace
+        task.awaySince = nil
+        if let hosting = worker.persistentHosting, let sessionID = worker.persistentSession?.sessionID {
+            task.hosting = hosting
+            task.hostSessionID = sessionID
+        }
+        return (worker, workspace)
+    }
+
+    /// A worker whose tab is in no open window: its task waits while the
+    /// tab may come back (a close that can still be undone) or its session
+    /// runs on detached; it is cancelled once that session ends with its
+    /// close, failed when its program ended by itself, and cancelled at
+    /// once for a tab whose program ended with it (a native tab).
+    @MainActor
+    private func settleIfWorkerGone(_ task: AgentTask, now: Date) {
+        let awaySince = task.awaySince ?? now
+        task.awaySince = awaySince
+        if let hosting = task.hosting, let sessionID = task.hostSessionID {
+            if hosting.isEndDeferred(sessionID) { return }
+            let ending = hosting.isEnding(sessionID)
+            if let info = hosting.sessionInfo(sessionID), !ending {
+                if info.isRunning { return }
+                let exit = info.exitCode.map { " (exit \($0))" } ?? ""
+                tasks.update(task, to: .failed, event: .failed, text: "The worker ended\(exit) before it reported.", reason: "it ended\(exit) before it reported")
+                return
+            }
+            // Not listed (yet): the host may be catching up.
+            if !ending, now.timeIntervalSince(awaySince) < tasks.awayGrace { return }
+        }
+        tasks.update(task, to: .cancelled, event: .cancelled, text: "The worker's tab was closed.", reason: "its tab was closed before it reported")
+    }
+
+    /// The worker waits on a monitor of its own: a subscription that types
+    /// wake lines into it, whose events it has not read or whose processes
+    /// still run. It ended its turn to be woken; that is not the end of
+    /// its task.
+    @MainActor
+    func awaitsMonitorWake(_ session: TerminalSession) -> Bool {
+        guard monitors.wakeLinesEnabled else { return false }
+        let busy: Set<String> = ["working", "running", "needs_input", "permission", "unknown"]
+        return monitors.subscriptions.values.contains { subscription in
+            guard subscription.wakeRequested, subscription.subscriber === session else { return false }
+            if subscription.pending.contains(where: { $0.seq > subscription.ackCursor }) { return true }
+            return subscription.watched.contains { !$0.finished && busy.contains(monitorStatus(of: $0)) }
+        }
+    }
 
     /// Looks at every open task's worker (the monitor sampler calls it):
     /// its tab closed or its program ended, it waits for the user, it went
@@ -964,10 +1231,12 @@ extension CherryControlServer {
     func sampleTasks() async {
         for task in tasks.openTasks {
             guard !task.state.isSettled else { continue }
-            guard let worker = task.worker, let workspace = task.workspace, isOpen(worker, in: workspace) else {
-                tasks.update(task, to: .cancelled, event: .cancelled, text: "The worker's tab was closed.", reason: "its tab was closed before it reported")
+            guard let found = locateWorker(task) else {
+                settleIfWorkerGone(task, now: Date())
                 continue
             }
+            let worker = found.session
+            let workspace = found.workspace
             let key = ObjectIdentifier(worker)
             let now = Date()
             if monitors.lastRefreshAt[key].map({ now.timeIntervalSince($0) >= monitors.refreshInterval }) ?? true {
@@ -979,7 +1248,7 @@ extension CherryControlServer {
             let status = monitorStatus(session: worker, workspace: workspace, now: Date())
             switch status {
             case "closed":
-                tasks.update(task, to: .cancelled, event: .cancelled, text: "The worker's tab was closed.", reason: "its tab was closed before it reported")
+                settleIfWorkerGone(task, now: Date())
             case "exited", "disconnected":
                 let exit = worker.exitCode.map { " (exit \($0))" } ?? ""
                 tasks.update(
@@ -1036,7 +1305,8 @@ extension CherryControlServer {
     }
 
     /// An idle worker whose turn for the task ended without a report: asked
-    /// once to report; after that turn too, `no_report`.
+    /// once to report; after that turn too, `no_report`. Never while it
+    /// waits on a monitor of its own, or while Cherry types into it.
     @MainActor
     private func checkTurnEnded(_ task: AgentTask, worker: TerminalSession, now: Date) {
         guard let baselineAt = task.turnBaselineAt, task.kickoffDeliveredAt != nil, !task.isTypingIntoWorker,
@@ -1046,6 +1316,7 @@ extension CherryControlServer {
         let completedThatTurn = worker.agentTurnState == .completed
             && (worker.lastAgentSubmitAt.map { $0 >= baselineAt } ?? false)
         guard sawWork || completedThatTurn || now.timeIntervalSince(baselineAt) >= tasks.idleFallbackInterval else { return }
+        guard !awaitsMonitorWake(worker), !isTypingWakeLine(into: worker) else { return }
         if task.nudgedAt == nil {
             if let last = task.lastNudgeAttemptAt, now.timeIntervalSince(last) < monitors.wakeMinimumInterval { return }
             guard subscriberTakesWakeLine(worker, now: now) else { return }
@@ -1060,6 +1331,8 @@ extension CherryControlServer {
         }
     }
 
+    /// Types the nudge (once): a nudge that may have been typed although it
+    /// failed counts as typed.
     @MainActor
     private func nudge(_ task: AgentTask, worker: TerminalSession) {
         task.isTypingIntoWorker = true
@@ -1069,16 +1342,19 @@ extension CherryControlServer {
             defer { task.isTypingIntoWorker = false }
             guard let self else { return }
             do {
-                _ = try await self.sendControlInput(text: AgentTaskRegistry.nudgeLine, rawBase64: nil, submit: true, to: worker)
-                guard !task.state.isSettled else { return }
-                task.nudgedAt = Date()
-                task.turnBaselineAt = typedSince
-                task.turnBaseline = worker.agentSubmittedTurnCount
-                self.tasks.record(.nudged, for: task)
-                self.tasks.publish()
+                _ = try await self.typeCherryLine(AgentTaskRegistry.nudgeLine, into: worker)
             } catch {
-                SessionLog.debug("[task] nudge for \(task.id) not sent: \(error)")
+                guard Self.inputMayHaveBeenTyped(error) else {
+                    SessionLog.debug("[task] nudge for \(task.id) not sent: \(error)")
+                    return
+                }
             }
+            guard !task.state.isSettled else { return }
+            task.nudgedAt = Date()
+            task.turnBaselineAt = typedSince
+            task.turnBaseline = worker.agentSubmittedTurnCount
+            self.tasks.record(.nudged, for: task)
+            self.tasks.publish()
         }
     }
 
@@ -1109,14 +1385,16 @@ extension CherryControlServer {
             return
         }
         if let last = task.lastKickoffAttemptAt, now.timeIntervalSince(last) < tasks.kickoffRetryInterval { return }
-        guard worker.acceptsControlInput, !worker.humanIsComposing(within: monitors.humanTypingInterval) else { return }
+        guard worker.acceptsControlInput, !worker.humanIsComposing(within: monitors.humanTypingInterval),
+              !isTypingWakeLine(into: worker)
+        else { return }
         task.isTypingIntoWorker = true
         let typedSince = Date()
         Task { @MainActor [weak self] in
             defer { task.isTypingIntoWorker = false }
             guard let self else { return }
             do {
-                _ = try await self.sendControlInput(text: task.kickoffLine, rawBase64: nil, submit: true, to: worker)
+                _ = try await self.typeCherryLine(task.kickoffLine, into: worker)
                 self.noteKickoff(task, delivered: true, error: nil, typedSince: typedSince)
             } catch {
                 self.noteKickoff(task, delivered: false, error: error as? CherryControlError, typedSince: typedSince)
@@ -1124,11 +1402,14 @@ extension CherryControlServer {
         }
     }
 
-    /// A monitor's or a run's wake line is being typed into `session`.
+    /// Cherry types (or is about to type) a line into `session`: a
+    /// monitor's or a run's wake line, a nudge or a kickoff.
     @MainActor
     func isTypingWakeLine(into session: TerminalSession) -> Bool {
-        monitors.subscriptions.values.contains { $0.isWaking && $0.subscriber === session }
+        tasks.typingLocks.isBusy(session.id)
+            || monitors.subscriptions.values.contains { $0.isWaking && $0.subscriber === session }
             || tasks.orderedRuns.contains { $0.isWaking && $0.owner === session }
+            || tasks.tasks.values.contains { $0.isTypingIntoWorker && $0.workerID == session.id }
     }
 
     /// Types the run's wake line into its owner once every task settled,
@@ -1147,7 +1428,7 @@ extension CherryControlServer {
             return
         }
         if let last = run.lastWakeAt, now.timeIntervalSince(last) < monitors.wakeMinimumInterval { return }
-        // One line at a time into a tab: never while a monitor's is typed.
+        // One line at a time into a tab.
         guard !isTypingWakeLine(into: owner), subscriberTakesWakeLine(owner, now: now) else { return }
         let line = AgentTaskRegistry.wakeLine(runID: run.id, counts: tasks.counts(of: run))
         run.isWaking = true
@@ -1155,9 +1436,11 @@ extension CherryControlServer {
             defer { run.isWaking = false }
             guard let self else { return }
             do {
-                _ = try await self.sendControlInput(text: line, rawBase64: nil, submit: true, to: owner)
+                _ = try await self.typeCherryLine(line, into: owner)
                 run.wokenSeq = max(run.wokenSeq, settledSeq)
             } catch {
+                // Maybe typed: never typed twice.
+                if Self.inputMayHaveBeenTyped(error) { run.wokenSeq = max(run.wokenSeq, settledSeq) }
                 SessionLog.debug("[task] wake line for \(run.id) not sent: \(error)")
             }
             run.lastWakeAt = Date()

@@ -179,7 +179,7 @@ final class AgentMonitorRegistry {
             processName: process.name,
             kind: process.kind,
             at: Date(),
-            agentTurn: session.flatMap { $0.kind == .agent ? $0.agentSubmittedTurnCount : nil },
+            agentTurn: session.flatMap { $0.kind == .agent ? $0.agentTurnCount : nil },
             exitCode: exitCode,
             matchedLine: matchedLine.map { String($0.prefix(300)) },
             initial: initial
@@ -575,7 +575,7 @@ extension CherryControlServer {
             kind: watched.kind,
             status: monitorStatus(of: watched),
             state: session?.programStateLabel ?? "closed",
-            agentTurn: session.flatMap { $0.kind == .agent ? $0.agentSubmittedTurnCount : nil },
+            agentTurn: session.flatMap { $0.kind == .agent ? $0.agentTurnCount : nil },
             exitCode: session?.exitCode
         )
     }
@@ -659,7 +659,9 @@ extension CherryControlServer {
            now.timeIntervalSince(lastWakeAt) < monitors.wakeMinimumInterval {
             return
         }
-        // One line at a time into a tab: never while a run's is typed.
+        // One line at a time into a tab: never while Cherry types another
+        // (a run's wake line, a task's nudge or kickoff), and under the
+        // tab's typing lock (`typeCherryLine`).
         guard !isTypingWakeLine(into: subscriber), subscriberTakesWakeLine(subscriber, now: now) else { return }
         let line = AgentMonitorRegistry.wakeLine(for: subscription, unread: unread)
         subscription.isWaking = true
@@ -667,9 +669,11 @@ extension CherryControlServer {
             defer { subscription.isWaking = false }
             guard let self else { return }
             do {
-                _ = try await self.sendControlInput(text: line, rawBase64: nil, submit: true, to: subscriber)
+                _ = try await self.typeCherryLine(line, into: subscriber)
                 subscription.lastWokenSeq = newest.seq
             } catch {
+                // Maybe typed: never typed twice.
+                if Self.inputMayHaveBeenTyped(error) { subscription.lastWokenSeq = newest.seq }
                 SessionLog.debug("[monitor] wake line for \(subscription.id) not sent: \(error)")
             }
             subscription.lastWakeAt = Date()

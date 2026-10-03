@@ -609,7 +609,8 @@ public struct CancelTasksResult: Codable, Equatable, Sendable {
 /// for every element), `enum`, and `additionalProperties` (true, false or
 /// a schema). `description`, `title`, `$schema`, `default` and `examples`
 /// are allowed and ignored; any other keyword is refused when the task is
-/// made (`lint`), so nothing the worker must meet goes unchecked.
+/// made (`lint`), so nothing the worker must meet goes unchecked; so is an
+/// `enum` of more than `maximumEnumValues` values.
 public enum TaskResultSchema {
     public static let checkedKeywords: Set<String> = ["type", "properties", "required", "items", "enum", "additionalProperties"]
     public static let ignoredKeywords: Set<String> = ["description", "title", "$schema", "default", "examples"]
@@ -619,6 +620,8 @@ public enum TaskResultSchema {
     public static let maximumDepth = 32
     /// At most this many problems are listed.
     public static let maximumErrors = 20
+    /// The longest `enum` list.
+    public static let maximumEnumValues = 256
 
     /// What is wrong with `schema` itself; empty when Cherry can check
     /// values against it.
@@ -682,8 +685,13 @@ public enum TaskResultSchema {
                 lint(items, path: path + ".items", depth: depth + 1, errors: &errors)
             }
         }
-        if let values = object["enum"], values.arrayValue?.isEmpty ?? true {
-            errors.append("\(path).enum: a non-empty list of values")
+        if let values = object["enum"] {
+            let count = values.arrayValue?.count ?? 0
+            if count == 0 {
+                errors.append("\(path).enum: a non-empty list of values")
+            } else if count > maximumEnumValues {
+                errors.append("\(path).enum: at most \(maximumEnumValues) values (it has \(count))")
+            }
         }
         if let additional = object["additionalProperties"] {
             switch additional {
@@ -694,59 +702,151 @@ public enum TaskResultSchema {
         }
     }
 
+    /// The most work `validate` does (about one step per value and schema
+    /// node it looks at): a value too large to check within it fails.
+    public static let defaultValidationBudget = 2_000_000
+
     /// Where `value` does not match `schema` (a schema `lint` accepts):
     /// empty when it matches; at most `maximumErrors` problems, each with
-    /// its path (`$.findings[2].severity`).
-    public static func validate(_ value: JSONValue, against schema: JSONValue) -> [String] {
-        var errors: [String] = []
-        validate(value, schema, path: "$", errors: &errors)
-        return Array(errors.prefix(maximumErrors))
+    /// its path (`$.findings[2].severity`). Linear in the value's size
+    /// (`enum` values are looked up, not compared one by one), and it stops
+    /// after `budget` steps. Pure: callers run it off the main thread.
+    public static func validate(_ value: JSONValue, against schema: JSONValue, budget: Int = defaultValidationBudget) -> [String] {
+        var validator = Validator(budget: budget)
+        validator.validate(value, CompiledSchema(schema), path: "$")
+        if validator.exhausted {
+            validator.errors = Array(validator.errors.prefix(maximumErrors - 1))
+            validator.errors.append("$: the value is too large to check against the schema; report a smaller one (put details in a file)")
+        }
+        return Array(validator.errors.prefix(maximumErrors))
     }
 
-    private static func validate(_ value: JSONValue, _ schema: JSONValue, path: String, errors: inout [String]) {
-        guard errors.count < maximumErrors else { return }
-        let object: [String: JSONValue]
-        switch schema {
-        case .bool(true): return
-        case .bool(false):
-            errors.append("\(path): no value is allowed here")
-            return
-        case .object(let map): object = map
-        default: return
+    /// A schema made ready to check against: its type names, its `enum`
+    /// as a set of canonical keys, its properties and items compiled.
+    private final class CompiledSchema {
+        enum Kind {
+            case any
+            case none
+            case object
         }
-        if let type = object["type"] {
-            let names = type.stringValue.map { [$0] } ?? (type.arrayValue ?? []).compactMap(\.stringValue)
-            if !names.isEmpty, !names.contains(where: { matches(value, type: $0) }) {
-                errors.append("\(path): expected \(names.joined(separator: " or ")), got \(value.typeName)")
+
+        let kind: Kind
+        var types: [String] = []
+        var enumKeys: Set<String>?
+        var enumListing = ""
+        var required: [String] = []
+        var properties: [String: CompiledSchema] = [:]
+        var items: CompiledSchema?
+        /// nil: any extra property; `.none` kind: none allowed.
+        var additional: CompiledSchema?
+
+        init(_ schema: JSONValue) {
+            switch schema {
+            case .bool(true): kind = .any
+            case .bool(false): kind = .none
+            case .object(let object):
+                kind = .object
+                if let type = object["type"] {
+                    types = type.stringValue.map { [$0] } ?? (type.arrayValue ?? []).compactMap(\.stringValue)
+                }
+                if let options = object["enum"]?.arrayValue {
+                    var keys = Set<String>()
+                    var steps = 0
+                    for option in options { keys.insert(TaskResultSchema.canonicalKey(option, steps: &steps)) }
+                    enumKeys = keys
+                    let listed = options.prefix(20).map(\.compactJSON).joined(separator: ", ")
+                    enumListing = listed.count > 200 || options.count > 20 ? String(listed.prefix(200)) + "…" : listed
+                }
+                required = (object["required"]?.arrayValue ?? []).compactMap(\.stringValue)
+                for (key, property) in object["properties"]?.objectValue ?? [:] {
+                    properties[key] = CompiledSchema(property)
+                }
+                items = object["items"].map(CompiledSchema.init)
+                additional = object["additionalProperties"].map(CompiledSchema.init)
+            default: kind = .any
+            }
+        }
+    }
+
+    private struct Validator {
+        let budget: Int
+        var steps = 0
+        var errors: [String] = []
+        var exhausted: Bool { steps > budget }
+
+        init(budget: Int) {
+            self.budget = budget
+        }
+
+        mutating func validate(_ value: JSONValue, _ schema: CompiledSchema, path: @autoclosure () -> String) {
+            steps += 1
+            guard errors.count < TaskResultSchema.maximumErrors, !exhausted else { return }
+            switch schema.kind {
+            case .any: return
+            case .none:
+                errors.append("\(path()): no value is allowed here")
+                return
+            case .object: break
+            }
+            if !schema.types.isEmpty, !schema.types.contains(where: { TaskResultSchema.matches(value, type: $0) }) {
+                errors.append("\(path()): expected \(schema.types.joined(separator: " or ")), got \(value.typeName)")
                 return
             }
-        }
-        if let options = object["enum"]?.arrayValue, !options.contains(where: { $0.isJSONEqual(to: value) }) {
-            let listed = options.map(\.compactJSON).joined(separator: ", ")
-            errors.append("\(path): expected one of [\(listed.count > 200 ? String(listed.prefix(200)) + "…" : listed)], got \(clipped(value))")
-        }
-        if case .object(let fields) = value {
-            for key in (object["required"]?.arrayValue ?? []).compactMap(\.stringValue) where fields[key] == nil {
-                errors.append("\(path): missing required property \(key)")
+            if let keys = schema.enumKeys {
+                let key = TaskResultSchema.canonicalKey(value, steps: &steps)
+                if !keys.contains(key) {
+                    errors.append("\(path()): expected one of [\(schema.enumListing)], got \(TaskResultSchema.clipped(value))")
+                }
             }
-            let properties = object["properties"]?.objectValue ?? [:]
-            for key in fields.keys.sorted() {
-                guard let field = fields[key] else { continue }
-                if let property = properties[key] {
-                    validate(field, property, path: path + member(key), errors: &errors)
-                } else if let additional = object["additionalProperties"] {
-                    if case .bool(false) = additional {
-                        errors.append("\(path): property \(key) is not allowed")
-                    } else {
-                        validate(field, additional, path: path + member(key), errors: &errors)
+            if case .object(let fields) = value {
+                for key in schema.required where fields[key] == nil {
+                    errors.append("\(path()): missing required property \(key)")
+                }
+                let base = path()
+                for key in fields.keys.sorted() {
+                    guard let field = fields[key], !exhausted else { continue }
+                    if let property = schema.properties[key] {
+                        validate(field, property, path: base + TaskResultSchema.member(key))
+                    } else if let additional = schema.additional {
+                        if additional.kind == .none {
+                            errors.append("\(base): property \(key) is not allowed")
+                        } else {
+                            validate(field, additional, path: base + TaskResultSchema.member(key))
+                        }
                     }
                 }
             }
-        }
-        if case .array(let elements) = value, let items = object["items"] {
-            for (index, element) in elements.enumerated() {
-                validate(element, items, path: "\(path)[\(index)]", errors: &errors)
+            if case .array(let elements) = value, let items = schema.items {
+                let base = path()
+                for (index, element) in elements.enumerated() where !exhausted && errors.count < TaskResultSchema.maximumErrors {
+                    validate(element, items, path: "\(base)[\(index)]")
+                }
             }
+        }
+    }
+
+    /// A key equal for values `isJSONEqual` takes as equal (numbers by
+    /// value, object keys in any order), counting one step per node.
+    static func canonicalKey(_ value: JSONValue, steps: inout Int) -> String {
+        steps += 1
+        switch value {
+        case .null: return "n;"
+        case .bool(let flag): return flag ? "t;" : "f;"
+        case .int(let number): return "i\(number);"
+        case .double(let number):
+            if number.isFinite, number.rounded() == number, abs(number) < 9.0e15 { return "i\(Int(number));" }
+            return "d\(number);"
+        case .string(let text): return "s\(text.utf8.count):\(text)"
+        case .array(let elements):
+            var key = "["
+            for element in elements { key += canonicalKey(element, steps: &steps) }
+            return key + "]"
+        case .object(let fields):
+            var key = "{"
+            for name in fields.keys.sorted() {
+                key += "k\(name.utf8.count):\(name)" + canonicalKey(fields[name] ?? .null, steps: &steps)
+            }
+            return key + "}"
         }
     }
 

@@ -90,14 +90,16 @@ private func temporaryDirectory(_ name: String) throws -> URL {
         serverName: "cherry",
         helperPath: helper,
         agentDirectory: agentDirectory,
-        runner: { name, path in
+        environment: { ["PATH": "/usr/bin:/bin"] },
+        runner: { name, path, environment in
             await PiMCPRegistration.run(
                 executable: stub,
                 arguments: PiMCPRegistration.addArguments(serverName: name, helperPath: path),
-                environment: ["PATH": "/usr/bin:/bin"]
+                environment: environment
             )
         }
     )
+    await model.refresh()
     #expect(await model.status == .notRegistered)
     #expect(!FileManager.default.fileExists(atPath: log.path), "nothing runs before the click")
     await model.register()
@@ -109,9 +111,47 @@ private func temporaryDirectory(_ name: String) throws -> URL {
     // A failing pi says why.
     let failing = await PiMCPRegistrationModel(
         serverName: "cherry", helperPath: helper, agentDirectory: root.appendingPathComponent("none"),
-        runner: { _, _ in PiMCPRegistration.RunOutcome(status: 1, output: "boom\n") }
+        environment: { [:] },
+        runner: { _, _, _ in PiMCPRegistration.RunOutcome(status: 1, output: "boom\n") }
     )
     await failing.register()
     #expect(await failing.lastRunFailed)
     #expect(await failing.message == "boom")
+}
+
+/// Pi's settings are read where `pi` reads them: the agent directory the
+/// environment `pi` runs with names (its login shell's
+/// PI_CODING_AGENT_DIR), not Cherry's own environment; and `pi` runs in
+/// that same environment.
+@Test func SettingsMCPPiReadsTheAgentDirectoryOfTheEnvironmentPiRunsWith() async throws {
+    let root = try temporaryDirectory("pi-env")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let custom = root.appendingPathComponent("custom-agent", isDirectory: true)
+    let home = root.appendingPathComponent("home", isDirectory: true)
+    try FileManager.default.createDirectory(at: custom, withIntermediateDirectories: true)
+    let helper = "/Applications/Cherry.app/Contents/MacOS/CherryMCP"
+    try #"{"mcpServers":{"cherry":{"command":"/Applications/Cherry.app/Contents/MacOS/CherryMCP","exposure":"direct"}}}"#
+        .write(to: custom.appendingPathComponent("mcp.json"), atomically: true, encoding: .utf8)
+    let login = ["PATH": "/usr/bin:/bin", "HOME": home.path, "PI_CODING_AGENT_DIR": custom.path]
+    let ran = Recorder<[String: String]?>(nil)
+    let model = await PiMCPRegistrationModel(
+        serverName: "cherry",
+        helperPath: helper,
+        environment: { login },
+        runner: { _, _, environment in
+            ran.value = environment
+            return PiMCPRegistration.RunOutcome(status: 0, output: "")
+        }
+    )
+    #expect(await model.statusText == "Reading Pi's MCP settings…")
+    await model.refresh()
+    #expect(await model.agentDirectory?.path == custom.path)
+    #expect(await model.status == .registered)
+    // Without the variable: that environment's HOME, not Cherry's.
+    let plain = await PiMCPRegistrationModel(serverName: "cherry", helperPath: helper, environment: { ["HOME": home.path] })
+    await plain.refresh()
+    #expect(await plain.agentDirectory?.path == home.appendingPathComponent(".pi/agent").path)
+    #expect(await plain.status == .notRegistered)
+    await model.register()
+    #expect(ran.value?["PI_CODING_AGENT_DIR"] == custom.path)
 }

@@ -1397,6 +1397,13 @@ final class PersistentHostSessions {
         endings[sessionID] != nil || deferredEnds[sessionID] != nil
     }
 
+    /// Whether the session's end waits for its tab's close to be undone
+    /// (`deferEnd`): the tab may come back (a Cherry task keeps its worker
+    /// meanwhile).
+    func isEndDeferred(_ sessionID: String) -> Bool {
+        deferredEnds[sessionID] != nil
+    }
+
     // MARK: Ends that wait for an undo
 
     /// A user closed the tab of `sessionID` (⌘W), and may still undo that

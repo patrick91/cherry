@@ -382,6 +382,105 @@ struct TerminalAttentionClassifierTests {
         #expect(notificationProbabilities.count == 1)
     }
 
+    // MARK: Work the agent resumes by itself
+
+    /// A whole frame on the alternate screen (Claude Code's), so no earlier
+    /// frame stays above it.
+    private func alternateScreenData(_ lines: [String]) -> Data {
+        Data(("\u{1B}[?1049h\u{1B}[2J\u{1B}[H" + lines.joined(separator: "\r\n")).utf8)
+    }
+
+    /// Claude finishes a turn, then answers a background shell's result by
+    /// itself. A frozen working frame (a repaint, also across a resize) is
+    /// no turn; work that advances, with new content, is one: working in
+    /// the sidebar, counted by MCP, and its end alerts once.
+    @Test func workTheAgentResumesByItselfIsANewTurnThatAlertsOnce() async throws {
+        var notifications = 0
+        let session = TerminalSession(
+            title: "Resumed work fixture",
+            subtitle: "claude",
+            tint: .systemBlue,
+            launchShell: false,
+            kind: .agent,
+            agentName: "Claude",
+            attentionObservationDirectoryProvider: { nil },
+            attentionNotificationHandler: { _, _ in notifications += 1 }
+        )
+        defer {
+            session.stop()
+        }
+
+        // A submitted turn works, then ends: its result alerts once.
+        session.noteNativeHostInput(event: try #require(returnKeyEvent()))
+        session.ingestTestingData(alternateScreenData(AgentScreenActivityTests.claudeStaleWorkingFrame))
+        try await Task.sleep(for: .milliseconds(300))
+        session.ingestTestingData(alternateScreenData(AgentScreenActivityTests.claudeFinishedTurn))
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(session.agentTurnState == .completed)
+        #expect(session.agentActivityState == .idle)
+        #expect(session.attentionClassifierPrediction?.needsAttention == true)
+        #expect(session.hasUnacknowledgedAttention)
+        #expect(notifications == 1)
+        let firstGeneration = session.attentionAlertGeneration
+        session.acknowledgeAttentionAlert()
+
+        // The finished turn's last working frame comes back and stays
+        // frozen while the rest of the screen changes, also across a
+        // resize: no turn.
+        for step in 0..<8 {
+            if step == 4 { session.resize(columns: 100, rows: 32) }
+            var frame = AgentScreenActivityTests.claudeStaleWorkingFrame
+            if step.isMultiple(of: 2) { frame.insert("※ recap: the docs index is rebuilt", at: 1) }
+            session.ingestTestingData(alternateScreenData(frame))
+            try await Task.sleep(for: .milliseconds(300))
+        }
+        #expect(session.agentActivityState == .working)
+        #expect(session.agentTurnState == .completed)
+        #expect(session.agentSelfResumedTurnCount == 0)
+        #expect(session.agentTurnCount == 1)
+        try await Task.sleep(for: .milliseconds(1_100))
+        #expect(session.attentionClassifierPrediction?.needsAttention == false)
+        #expect(!SidebarAgentWorkingPresentation.shouldShow(prediction: session.attentionClassifierPrediction))
+
+        // The agent answers the background shell: new content, and a
+        // status line whose spinner, counter and meter advance.
+        for frame in 0..<8 {
+            session.ingestTestingData(alternateScreenData(AgentScreenActivityTests.claudeResumedFrame(frame)))
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        #expect(session.agentTurnState == .active)
+        #expect(session.agentActivityState == .working)
+        #expect(session.agentSelfResumedTurnCount == 1)
+        #expect(session.agentSubmittedTurnCount == 1)
+        #expect(session.agentTurnCount == 2)
+        try await Task.sleep(for: .milliseconds(1_100))
+        let working = try #require(session.attentionClassifierPrediction)
+        #expect(working.turnState == .active)
+        #expect(!working.needsAttention)
+        #expect(SidebarAgentWorkingPresentation.shouldShow(prediction: working))
+        #expect(notifications == 1)
+
+        // Its end is a new result: one alert.
+        session.ingestTestingData(alternateScreenData(AgentScreenActivityTests.claudeResumedTurnFinished))
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(session.agentTurnState == .completed)
+        #expect(session.agentActivityState == .idle)
+        #expect(session.attentionClassifierPrediction?.needsAttention == true)
+        #expect(session.attentionAlertGeneration > firstGeneration)
+        #expect(session.hasUnacknowledgedAttention)
+        #expect(notifications == 2)
+
+        // Repaints of the finished screen, and one stale working frame,
+        // neither start a turn nor alert again.
+        session.ingestTestingData(alternateScreenData(AgentScreenActivityTests.claudeResumedFrame(7)))
+        try await Task.sleep(for: .milliseconds(300))
+        session.ingestTestingData(alternateScreenData(AgentScreenActivityTests.claudeResumedTurnFinished))
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(session.agentTurnState == .completed)
+        #expect(session.agentTurnCount == 2)
+        #expect(notifications == 2)
+    }
+
     // MARK: Menus waiting on the user's answer
 
     private func screenData(_ lines: [String]) -> Data {

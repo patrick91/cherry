@@ -312,6 +312,11 @@ struct ControlAgentTaskTests {
             return
         }
         #expect(first.taskID == taskA && first.version == 1 && first.state == .reported && first.summaryTruncated)
+        // Re-reports are rate-limited: nothing is recorded too soon after one.
+        let tooSoonReport = try await harness.send(.reportResult(.init(value: try json(#"{"severity":"low","files":[]}"#))))
+        #expect(tooSoonReport.error?.code == "rate_limited")
+        #expect(try await harness.task(taskA).result?.version == 1)
+        harness.server.tasks.reportInterval = 0
         let again = try await harness.send(.reportResult(.init(value: try json(#"{"severity":"low","files":[]}"#), summary: "Second look")))
         guard case .reportResult(let second)? = again.result else {
             Issue.record("Expected reportResult, got \(again)")
@@ -528,10 +533,10 @@ struct ControlAgentTaskTests {
         try await Task.sleep(for: .milliseconds(1_000))
         #expect(!(try await harness.output(of: orchestrator)).contains("[cherry] Run"))
 
-        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
-        _ = try await harness.send(.cancelTasks(.init(runID: runID)))
+        harness.server.callerSessionResolverForTesting = { _ in workerB }
+        _ = try await harness.send(.reportResult(.init(value: .null, status: "failed", summary: "SECRET-SUMMARY-B")))
         let woken = try await harness.waitForOutput("handled [cherry] Run \(runID)", in: orchestrator, seconds: 10)
-        #expect(woken.contains("[cherry] Run \(runID): 2 tasks settled (1 reported, 1 cancelled). Call the cherry wait_for_tasks tool with run_id \"\(runID)\" to read them, and get_task for each result."), "\(woken)")
+        #expect(woken.contains("[cherry] Run \(runID): 2 tasks settled (1 reported, 1 failed). Call the cherry wait_for_tasks tool with run_id \"\(runID)\" to read them, and get_task for each result."), "\(woken)")
         #expect(!woken.contains("SECRET-SUMMARY"), "the wake line carries no worker text")
         try await Task.sleep(for: .milliseconds(1_000))
         #expect(try await harness.output(of: orchestrator).components(separatedBy: "handled [cherry] Run").count - 1 == 1)
@@ -625,5 +630,226 @@ struct ControlAgentTaskTests {
             }
         }
         #expect(words.sorted() == ["alpha", "beta"])
+    }
+}
+
+// MARK: - Limits, typing and fallbacks
+
+/// A schema's enum is capped when the task is made, and checking a value
+/// is linear (enum values are looked up) and bounded by a work budget.
+@Test func ControlAgentTaskSchemaEnumsAreCappedAndChecksStayLinear() throws {
+    let tooMany = JSONValue.object(["enum": .array((0..<300).map { .string("v\($0)") })])
+    #expect(TaskResultSchema.lint(tooMany) == ["$.enum: at most 256 values (it has 300)"])
+
+    let options = (0..<256).map { JSONValue.string("option-\($0)") }
+    let schema = JSONValue.object(["type": .string("array"), "items": .object(["enum": .array(options)])])
+    #expect(TaskResultSchema.lint(schema).isEmpty)
+    let value = JSONValue.array(Array(repeating: .string("option-255"), count: 20_000))
+    let startedAt = Date()
+    #expect(TaskResultSchema.validate(value, against: schema).isEmpty)
+    #expect(Date().timeIntervalSince(startedAt) < 1.5, "checking 20,000 values against a 256-value enum took \(Date().timeIntervalSince(startedAt)) s")
+    // Numbers compare by value in an enum, objects by content.
+    let numbers = try json(#"{"enum":[1,{"a":[2,"x"]}]}"#)
+    #expect(TaskResultSchema.validate(.double(1.0), against: numbers).isEmpty)
+    #expect(TaskResultSchema.validate(try json(#"{"a":[2.0,"x"]}"#), against: numbers).isEmpty)
+    #expect(TaskResultSchema.validate(.string("1"), against: numbers).count == 1)
+
+    // Past its budget the check stops and says so.
+    let budgeted = TaskResultSchema.validate(value, against: schema, budget: 100)
+    #expect(budgeted.last?.contains("too large to check") == true, "\(budgeted)")
+}
+
+@MainActor
+@Suite(.serialized)
+struct ControlAgentTaskLimitTests {
+    /// The size cap comes before the schema: an oversized value that also
+    /// mismatches is result_too_large, checked without a long stall.
+    @Test func oversizedReportIsRefusedBeforeItsSchemaIsChecked() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.start()
+        let options = (0..<256).map { JSONValue.string("option-\($0)") }
+        let schema = JSONValue.object(["type": .string("object"), "properties": .object([
+            "items": .object(["type": .string("array"), "items": .object(["enum": .array(options)])]),
+        ])])
+        let (worker, spawned) = try await harness.spawnTask(agent: "Worker", task: "Report big", resultSchema: schema)
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+        let big = JSONValue.object(["items": .array(Array(repeating: .string("not-an-option-\(String(repeating: "x", count: 20))"), count: 12_000))])
+        #expect(big.encodedByteCount > AgentTaskRegistry.maximumResultBytes)
+        let startedAt = Date()
+        let response = try await harness.send(.reportResult(.init(value: big)))
+        #expect(response.error?.code == "result_too_large", "\(String(describing: response.error))")
+        #expect(Date().timeIntervalSince(startedAt) < 3)
+        #expect(try await harness.task(try #require(spawned.task?.taskID)).result == nil)
+    }
+
+    /// Caps count UTF-8 bytes as well as characters: a summary, progress
+    /// message, label or phase of characters many bytes long is cut, and a
+    /// brief over the byte cap is refused; events keep a short excerpt.
+    @Test func textCapsCountBytes() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.start()
+        // One character of 1 + 100 combining marks: 201 bytes.
+        let heavy = "e" + String(repeating: "\u{0301}", count: 100)
+        #expect(heavy.count == 1 && heavy.utf8.count == 201)
+        let (worker, spawned) = try await harness.spawnTask(
+            agent: "Worker", task: "Heavy", label: String(repeating: heavy, count: 70), phase: String(repeating: heavy, count: 50)
+        )
+        let task = try #require(spawned.task)
+        #expect(task.label.utf8.count <= AgentTaskRegistry.labelLimit.bytes && task.label.hasSuffix("…"))
+        #expect((task.phase?.utf8.count ?? 0) <= AgentTaskRegistry.phaseLimit.bytes)
+
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+        let reported = try await harness.send(.reportResult(.init(value: .null, summary: String(repeating: heavy, count: 390))))
+        guard case .reportResult(let result)? = reported.result else {
+            Issue.record("Expected reportResult, got \(reported)")
+            return
+        }
+        #expect(result.summaryTruncated)
+        let detail = try await harness.task(task.taskID)
+        #expect((detail.result?.summary?.utf8.count ?? .max) <= AgentTaskRegistry.summaryBytes)
+        harness.server.tasks.progressInterval = 0
+        _ = try await harness.send(.reportProgress(.init(message: String(repeating: heavy, count: 190))))
+        #expect((try await harness.task(task.taskID).task.progress?.utf8.count ?? .max) <= AgentTaskRegistry.progressBytes)
+        let events = try await harness.waitForTasks(.init(taskIDs: [task.taskID], timeoutMilliseconds: 0))
+        #expect(events.events.allSatisfy { ($0.text?.utf8.count ?? 0) <= AgentTaskRegistry.eventTextLimit.bytes })
+
+        // 30,000 characters of 11 bytes on average: under the character
+        // cap, over the byte cap.
+        let wide = String(repeating: "e" + String(repeating: "\u{0301}", count: 10) + " ", count: 15_000)
+        #expect(wide.count <= AgentTaskRegistry.maximumBriefCharacters && wide.utf8.count > AgentTaskRegistry.maximumBriefBytes)
+        let refused = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Worker", task: wide)))
+        #expect(refused.error?.code == "invalid_process_request")
+    }
+
+    /// Each run keeps its own events: one run's flood never pushes out
+    /// another's; a task's re-reports and progress keep one event each;
+    /// and `until: any` sees a task that settled after the cursor even when
+    /// its event was dropped.
+    @Test func eachRunKeepsItsOwnEventsAndASettleIsSeenAfterItsEventWent() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.start()
+        harness.server.tasks.maxEventsPerRun = 4
+        harness.server.tasks.reportInterval = 0
+        let leadA = try await harness.spawnAgent(named: "LeadA")
+        let leadB = try await harness.spawnAgent(named: "LeadB")
+        harness.server.callerSessionResolverForTesting = { _ in leadA }
+        let (workerX, spawnedX) = try await harness.spawnTask(agent: "Worker", task: "X")
+        harness.server.callerSessionResolverForTesting = { _ in leadB }
+        let (workerY, spawnedY) = try await harness.spawnTask(agent: "Worker", task: "Y")
+        let runA = try #require(spawnedX.task?.runID)
+        let runB = try #require(spawnedY.task?.runID)
+        #expect(runA != runB)
+        let cursorB = try await harness.waitForTasks(.init(runID: runB, timeoutMilliseconds: 0)).cursor
+
+        harness.server.callerSessionResolverForTesting = { _ in workerY }
+        for summary in ["first", "second", "third"] {
+            _ = try await harness.send(.reportResult(.init(value: .null, summary: summary)))
+        }
+        // Run A floods its own events.
+        harness.server.callerSessionResolverForTesting = { _ in leadA }
+        for index in 0..<8 {
+            _ = try await harness.spawnTask(agent: "Worker", task: "Flood \(index)", runID: runA)
+        }
+        let readB = try await harness.waitForTasks(.init(runID: runB, cursor: cursorB, timeoutMilliseconds: 0))
+        #expect(!readB.eventsDropped)
+        #expect(readB.events.filter { $0.kind == .reported }.map(\.text) == ["third"], "re-reports keep one event, the latest")
+        #expect(readB.completed.first?.resultVersion == 3)
+
+        // X settles, then run A's flood drops that event.
+        let beforeSettle = try await harness.waitForTasks(.init(runID: runA, timeoutMilliseconds: 0)).cursor
+        harness.server.callerSessionResolverForTesting = { _ in workerX }
+        _ = try await harness.send(.reportResult(.init(value: .null, summary: "X done")))
+        harness.server.callerSessionResolverForTesting = { _ in leadA }
+        for index in 0..<6 {
+            _ = try await harness.spawnTask(agent: "Worker", task: "More \(index)", runID: runA)
+        }
+        let startedAt = Date()
+        let readA = try await harness.waitForTasks(.init(runID: runA, cursor: beforeSettle, timeoutMilliseconds: 5_000))
+        #expect(!readA.timedOut && Date().timeIntervalSince(startedAt) < 2)
+        #expect(readA.eventsDropped)
+        #expect(!readA.events.contains { $0.taskID == spawnedX.task?.taskID && $0.kind == .reported })
+        #expect(readA.completed.map(\.taskID) == [spawnedX.task?.taskID])
+        // The returned cursor is past that settle: the next wait waits.
+        let next = try await harness.waitForTasks(.init(runID: runA, cursor: readA.cursor, timeoutMilliseconds: 300))
+        #expect(next.timedOut)
+    }
+
+    /// An orchestrator that cancels its own run knows it settled: no wake
+    /// line for it.
+    @Test func ownerCancellingItsOwnRunGetsNoWakeLine() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastTaskSampling()
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        try await Task.sleep(for: .milliseconds(600))
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        let (workerA, spawned) = try await harness.spawnTask(agent: "Worker", task: "A")
+        let (workerB, _) = try await harness.spawnTask(agent: "Worker", task: "B")
+        let runID = try #require(spawned.task?.runID)
+
+        let cancelled = try await harness.send(.cancelTasks(.init(runID: runID, close: true)))
+        guard case .cancelTasks(let result)? = cancelled.result else {
+            Issue.record("Expected cancelTasks, got \(cancelled)")
+            return
+        }
+        #expect(result.cancelled.count == 2 && result.closed.count == 2)
+        #expect(!harness.workspace.sessions.contains { $0 === workerA || $0 === workerB })
+        try await Task.sleep(for: .milliseconds(2_000))
+        #expect(!(try await harness.output(of: orchestrator)).contains("[cherry] Run"))
+    }
+
+    /// A worker that subscribed to a job of its own and ended its turn
+    /// (as the MCP instructions recommend) waits for its wake line: it is
+    /// neither nudged nor marked no_report while the job runs; once it no
+    /// longer waits on anything, the nudge comes.
+    @Test func workerWaitingOnItsOwnMonitorIsNotNudged() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastTaskSampling()
+        harness.server.start()
+        let job = try #require(harness.workspace.sessions.first, "the harness's terminal stands for a running job")
+        let script = try harness.fakeAgentScript(thinking: 0.3, working: 0.4)
+        let (worker, spawned) = try await harness.spawnTask(agent: "Fakeworker", command: script, task: "Wait for the job")
+        let taskID = try #require(spawned.task?.taskID)
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+        let subscribed = try await harness.send(.subscribe(.init(processIDs: [job.id.uuidString])))
+        guard case .subscribe(let subscription)? = subscribed.result else {
+            Issue.record("Expected subscribe, got \(subscribed)")
+            return
+        }
+        #expect(subscription.subscription.wake)
+        _ = try await harness.waitForOutput("handled You are Cherry task \(taskID)", in: worker)
+        try await Task.sleep(for: .milliseconds(2_500))
+        #expect(!(try await harness.output(of: worker)).contains(AgentTaskRegistry.nudgeLine), "nudged while it waits on its job")
+        #expect(try await harness.task(taskID).task.state == .working)
+
+        _ = try await harness.send(.unsubscribe(.init(subscriptionID: subscription.subscription.subscriptionID)))
+        let nudged = try await harness.waitForOutput("handled \(AgentTaskRegistry.nudgeLine)", in: worker, seconds: 10)
+        #expect(nudged.contains("handled \(AgentTaskRegistry.nudgeLine)"))
+    }
+
+    /// Two lines Cherry types into one tab at once (a wake line and a
+    /// nudge, say) go one after the other, each with its own Enter: never
+    /// mixed into one message.
+    @Test func cherryLinesTypedAtOnceIntoOneTabNeverMix() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.start()
+        // Named as an agent whose Enter Cherry sends after a pause.
+        let script = try harness.fakeAgentScript(thinking: 0.05, working: 0.1)
+        let agent = try await harness.spawnAgent(named: "Claude", command: script)
+        try await Task.sleep(for: .milliseconds(800))
+        async let first = harness.server.typeCherryLine("[cherry] LINE-ONE", into: agent)
+        async let second = harness.server.typeCherryLine("[cherry] LINE-TWO", into: agent)
+        _ = try await (first, second)
+        let output = try await harness.waitForOutput("handled [cherry] LINE-TWO", in: agent)
+        #expect(output.contains("handled [cherry] LINE-ONE"), "\(output)")
+        #expect(!output.contains("LINE-ONE[cherry] LINE-TWO") && !output.contains("LINE-TWO[cherry] LINE-ONE"), "\(output)")
+        #expect(!harness.server.tasks.typingLocks.isBusy(agent.id))
     }
 }

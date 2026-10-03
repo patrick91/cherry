@@ -97,9 +97,10 @@ enum TerminalAttentionObservationEvent: String, Codable, Equatable, Sendable {
 enum TerminalAttentionTurnState: String, Codable, Equatable, Sendable {
     /// Cherry has not observed a submitted turn in this terminal process yet.
     case notStarted = "not_started"
-    /// A submitted turn is still running.
+    /// A turn is still running: submitted, or begun by the agent itself
+    /// after the last one ended (`AgentResumedWorkDetector`).
     case active
-    /// The agent has yielded control after a submitted turn.
+    /// The agent has yielded control after a turn.
     case completed
     /// The user explicitly interrupted the active turn.
     case userInterrupted = "user_interrupted"

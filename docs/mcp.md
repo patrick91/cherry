@@ -21,7 +21,10 @@ Pi needs `--exposure direct`: its default (`codemode`) hides an MCP
 server's tools behind a script tool. Settings › MCP shows the three
 commands; its **Add to Pi** button runs Pi's (only when clicked: Pi writes
 its own `mcp.json`, which Cherry only reads to say whether Cherry is
-registered there).
+registered there). Both use the environment of your login shell, as this
+run of Cherry captured it, so a `PI_CODING_AGENT_DIR` set there names the
+`mcp.json` Pi uses; Set Up Cherry MCP on another Mac passes that Mac's
+login-shell `PI_CODING_AGENT_DIR` to `pi` too.
 
 The helper talks to Cherry through the instance-scoped Unix control socket; the
 old direct HTTP MCP endpoint has been removed.
@@ -232,10 +235,16 @@ process tools include activity metadata:
   (its screen shows a question to the user with a choice menu, such as
   Claude Code's AskUserQuestion: the turn waits on an answer), `error`, or
   `unknown` when Cherry has not classified the agent yet.
-- `agent_turn` (agents): how many turns Cherry saw submitted to the tab (an
-  Enter typed into it or sent by MCP), over the tab's life in this run of
-  Cherry. It only grows, so "done since my message" means a `done` event or
-  idle result whose `agent_turn` is at least the value after your message.
+- `agent_turn` (agents): how many turns Cherry saw start in the tab, over its
+  life in this run of Cherry: turns submitted to it (an Enter typed into it or
+  sent by MCP, a monitor's wake line included) and turns the agent began by
+  itself after one ended (it answers a background agent's or task's result,
+  wakes up on a schedule, or a hook continues it; Cherry tells that from a
+  repaint by its status line or title spinner advancing for about a second,
+  see `docs/attention-classifier.md`). It only grows, so "done since my
+  message" means a `done` event or idle result whose `agent_turn` is at least
+  the value after your message. A turn the agent resumed by itself is
+  `active` while it works and ends with another `done`.
   `agent_turn_state`: `not_started`, `active`, `completed` or
   `user_interrupted` for the latest turn.
 - `uses_alternate_screen`: whether the process is currently showing a
@@ -432,9 +441,11 @@ Code, Codex and Pi.
 
 **Orchestrator side**
 
-- `spawn_agent` with `task` (the worker's brief, instead of `message`),
-  and optionally `label` (shown in the sidebar; defaults to `title`, else
-  the brief's first words), `phase`, `run_id` and `result_schema`. The
+- `spawn_agent` with `task` (the worker's brief, instead of `message`; at
+  most 64,000 characters and 256 KiB), and optionally `label` (shown in the
+  sidebar; defaults to `title`, else the brief's first words; cut at 80
+  characters and 320 bytes), `phase` (60 characters, 240 bytes), `run_id`
+  and `result_schema`. The
   agent is the configured `name` with its usual command and options. The
   result has `task_id` and `run_id` (and `task`). Without `run_id` the task
   joins the caller's current run: one per orchestrator, a new one once all
@@ -460,20 +471,33 @@ Code, Codex and Pi.
   `reported`, `failed`, `no_report`, `cancelled`, each with its `seq`),
   `completed` and `pending` tasks, `cursor` (pass it back next time),
   `timed_out`, and the `runs` with their counts. A timeout is a normal
-  answer: call again, or end the turn.
+  answer: call again, or end the turn. Each run keeps its own events (at
+  most 2000), and a task keeps one event of each kind (a newer one, such
+  as a re-report or the latest progress, replaces it), so one chatty
+  worker never pushes out other runs' events. `until: any` returns for a
+  task that settled (or needs input) after `cursor` even when its event
+  is no longer kept (`events_dropped` says so), and the returned `cursor`
+  is past it.
 - **The wake line.** When the orchestrator's tab is the caller Cherry
   confirmed (as for monitors) and an agent, Cherry types one line into it
   once every task of a run settled and the orchestrator is idle (the
   monitors' rule: at its composer, screen still, nobody typing, not in a
   `wait_for_tasks` call on that run, never at a prompt), once per settle,
-  unless it already read the settle with `wait_for_tasks`:
+  unless it already read the settle with `wait_for_tasks` or caused it
+  with its own `cancel_tasks`:
 
   ```text
   [cherry] Run run-…: 3 tasks settled (2 reported, 1 failed). Call the cherry wait_for_tasks tool with run_id "run-…" to read them, and get_task for each result.
   ```
 
   It carries the run id and counts only, never a worker's text. Settings ›
-  MCP › Wake idle agents turns it off with monitors' wake lines. So the
+  MCP › Wake idle agents turns it off with monitors' wake lines.
+  Everything Cherry types into a tab (this line, a monitor's wake line,
+  the nudge and a kickoff) goes through one lock per tab: each line's
+  text, pause and Enter go together, so two lines never merge into one
+  message. A line whose input failed in a way that may still have typed
+  it (`input_maybe_delivered`, `input_partially_delivered`) is never
+  typed again. So the
   cheapest orchestration is: spawn the workers, end the turn, and read the
   results when the line arrives.
 - `get_task` returns the task with its `brief`, `result_schema` and
@@ -496,18 +520,23 @@ names); the tools take no selector, so no agent can report for another.
   `result_schema`, `rules`, `state` and `result_version`. A tab without a
   task (or a caller Cherry cannot place) gets `no_assignment`.
 - `report_result` with `value` (any JSON), `status` (`ok`, the default, or
-  `failed`) and `summary` (at most 400 characters; longer is cut, and
-  `summary_truncated` says so). With status `ok`, `value` must match the
+  `failed`) and `summary` (at most 400 characters and 1600 UTF-8 bytes;
+  longer is cut, and `summary_truncated` says so). At most one report is
+  recorded every 2 s (the first at once): one sooner is `rate_limited`,
+  and nothing is recorded. With status `ok`, `value` must match the
   task's `result_schema`; otherwise the answer is `schema_mismatch` with
   each problem in `details` (`$.findings[2].severity: expected one of
   ["low", "high"], got "medium"`), nothing is recorded, and the worker can
   fix the value and call again. Reporting again later (after more
   instructions in its tab) replaces the result; its `version` goes up by
-  one. A value is at most 256 KiB (`result_too_large`). A string holding
+  one. A value is at most 256 KiB (`result_too_large`, checked before the
+  schema); Cherry checks it off its main thread, within a work budget (a
+  value too large to check is a `schema_mismatch` that says so). A string holding
   the JSON of an object or array is taken as that value when it matches
   the schema (or the task has none): some clients send an argument whose
   type the tool leaves open as a string.
-- `report_progress` with a one-line `message` (at most 200 characters):
+- `report_progress` with a one-line `message` (at most 200 characters and
+  800 UTF-8 bytes):
   at most one every 5 s is recorded (`recorded: false` and
   `retry_after_milliseconds` otherwise).
 
@@ -515,7 +544,7 @@ names); the tools take no selector, so no agent can report for another.
 (a name or a list of them: `object`, `array`, `string`, `number`,
 `integer`, `boolean`, `null`; a whole number is an `integer`),
 `properties`, `required`, `items` (one schema for every element),
-`enum` (numbers compare by value) and `additionalProperties` (`true`,
+`enum` (at most 256 values; numbers compare by value) and `additionalProperties` (`true`,
 `false` or a schema); `true` and `false` are schemas too. `description`,
 `title`, `$schema`, `default` and `examples` are allowed and ignored. Any
 other keyword (`$ref`, `oneOf`, `pattern`, `minimum`, …) is refused when
@@ -533,9 +562,19 @@ also watches each open task's worker:
   report, the task is `no_report`, and its result is the worker's last
   screen lines (`source: screen_tail`). A worker Cherry cannot read (an
   agent with no recognizable composer or working marker) is never
-  nudged: only its report settles it.
+  nudged: only its report settles it. Neither the nudge nor `no_report`
+  comes while the worker waits on a monitor of its own: a subscription
+  that wakes it, whose watched processes still run or whose events it
+  has not read (it ended its turn to be woken).
 - Its program ended before it reported: `failed`, with its last lines.
-  Its tab closed: `cancelled`.
+- Its tab left its window: the task follows the tab by id. A tab closed
+  with ⌘W whose close can still be undone, or detached with ⌘D (its
+  session runs on in the background), stays the task's worker, again when
+  it comes back (⌘Z, Background Sessions › Open); while away, a detached
+  worker may still report (Cherry knows it by its session's program). The
+  task is `cancelled` once the close is final and the session ends (or at
+  once for a native tab, whose program ends with it), and `failed` when a
+  detached worker's program ends by itself.
 
 A report after `no_report` or `failed` still replaces the result.
 
@@ -545,7 +584,7 @@ cancelled); hovering shows the result's summary. While one of its runs is
 open, the orchestrator's row shows how many of its tasks settled ("3/5").
 
 **Scope and lifetime.** Tasks live in Cherry's memory, each tied to its
-worker's tab and window: a relaunch forgets them (a restored worker's
+worker's tab (by its id): a relaunch forgets them (a restored worker's
 `get_my_task` answers `no_assignment`, and run and task ids become
 `unknown_run` and `unknown_task`). A caller on another Mac reaches only the
 tasks its Mac's callers made, and This Mac's callers never see those.

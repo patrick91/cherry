@@ -72,7 +72,9 @@ struct MCPSettingsPane: View {
         }
         .onAppear {
             socketExists = FileManager.default.fileExists(atPath: CherryControl.socketURL.path)
-            piRegistration.refresh()
+        }
+        .task {
+            await piRegistration.refresh()
         }
     }
 

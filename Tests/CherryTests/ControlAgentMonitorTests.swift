@@ -41,6 +41,20 @@ private extension ControlAgentWaitHarness {
     func screen(_ text: String, on session: TerminalSession) {
         session.ingestTestingData(Data("\u{1B}[2J\u{1B}[H".utf8) + Data(text.replacingOccurrences(of: "\n", with: "\r\n").utf8))
     }
+
+    /// A whole frame on the alternate screen (Claude Code's), so no earlier
+    /// frame stays above it.
+    func alternateScreen(_ lines: [String], on session: TerminalSession) {
+        session.ingestTestingData(Data(("\u{1B}[?1049h\u{1B}[2J\u{1B}[H" + lines.joined(separator: "\r\n")).utf8))
+    }
+
+    func status(of session: TerminalSession) async throws -> ProcessSummary {
+        let response = try await send(.getProcessStatus(.init(processID: session.id.uuidString)))
+        guard case .getProcessStatus(let status)? = response.result else {
+            throw CherryControlError(code: "status_failed", message: "Expected getProcessStatus result, got \(String(describing: response))")
+        }
+        return status.process
+    }
 }
 
 @MainActor
@@ -148,6 +162,51 @@ struct ControlAgentMonitorTests {
         #expect(events.events.first?.agentTurn == 1)
     }
 
+    /// An agent that goes back to work by itself after its turn ended (it
+    /// answers a background shell's result) starts a turn MCP sees: its
+    /// `agent_turn` grows, its turn is active while it works, `done` fires
+    /// again when that turn ends, and `wait_for_process_idle` waits for it.
+    @Test func turnTheAgentResumesByItselfIsDoneAgain() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.start()
+        let worker = try await harness.spawnAgent(named: "Claude")
+        let sent = try await harness.send(.sendProcessInput(.init(processID: worker.id.uuidString, text: "rebuild the index", submit: true)))
+        #expect(sent.error == nil)
+        try await Task.sleep(for: .milliseconds(300))
+        harness.alternateScreen(AgentScreenActivityTests.claudeStaleWorkingFrame, on: worker)
+        try await Task.sleep(for: .milliseconds(200))
+        let id = try await harness.subscribe(.init(processIDs: [worker.id.uuidString])).subscription.subscriptionID
+
+        harness.alternateScreen(AgentScreenActivityTests.claudeFinishedTurn, on: worker)
+        let first = try await harness.events(id)
+        #expect(first.events.map(\.type) == [.done])
+        #expect(first.events.first?.agentTurn == 1)
+        #expect(try await harness.status(of: worker).agentTurnState == "completed")
+
+        for frame in 0..<8 {
+            harness.alternateScreen(AgentScreenActivityTests.claudeResumedFrame(frame), on: worker)
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        let resumed = try await harness.status(of: worker)
+        #expect(resumed.agentTurn == 2)
+        #expect(resumed.agentTurnState == "active")
+        #expect(resumed.agentActivityState == "working")
+        let busy = try await harness.events(id, timeoutMilliseconds: 0)
+        #expect(busy.events.isEmpty)
+        #expect(busy.watching.first?.status == "working")
+
+        harness.alternateScreen(AgentScreenActivityTests.claudeResumedTurnFinished, on: worker)
+        let second = try await harness.events(id)
+        #expect(second.events.map(\.type) == [.done])
+        #expect(second.events.first?.agentTurn == 2)
+        let waited = try await harness.wait(worker, quietMilliseconds: 300)
+        #expect(waited.reason == .idle)
+        #expect(waited.agentTurn == 2)
+        #expect(try await harness.status(of: worker).agentTurnState == "completed")
+    }
+
     @Test func explicitCursorRereadsUntilAcknowledged() async throws {
         let harness = try ControlAgentWaitHarness()
         defer { harness.stop() }
@@ -242,6 +301,9 @@ struct ControlAgentMonitorTests {
         }
         #expect(typed.contains("[cherry] Monitor \(id): 1 event ready (1 done). Call the cherry wait_for_events tool with subscription_id \"\(id)\" to read them."))
         #expect(!typed.contains("Done."), "the wake line carries no worker text")
+        // The wake line is a turn submitted to the subscriber.
+        #expect(orchestrator.agentSubmittedTurnCount == 1)
+        #expect(orchestrator.agentTurnCount == 1)
 
         // Not woken again for the same events.
         try await Task.sleep(for: .milliseconds(1_000))

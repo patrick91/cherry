@@ -161,21 +161,36 @@ enum AgentScreenActivity {
     private static let claudeSpinnerGlyphs: Set<Character> = ["·", "✢", "✳", "✶", "✻", "✽", "∗", "*"]
 
     static func showsWorkingMarker(_ lines: [String], agent: String) -> Bool {
+        !workingLines(lines, agent: agent).isEmpty
+    }
+
+    /// The lines of `lines` (a screen's tail, oldest first) that show a turn
+    /// in flight, trimmed, oldest first: the evidence `showsWorkingMarker`
+    /// finds. While the agent works their text advances (a spinner glyph,
+    /// an elapsed counter, a token meter) where they stand; a repaint of a
+    /// finished screen leaves them frozen (`AgentResumedWorkDetector`).
+    static func workingLines(_ lines: [String], agent: String) -> [String] {
+        workingLineIndices(lines, agent: agent).map { lines[$0].trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+
+    /// The indices in `lines` of its `workingLines`, ascending.
+    static func workingLineIndices(_ lines: [String], agent: String) -> [Int] {
         let trimmedLines = lines.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        if trimmedLines.contains(where: showsInterruptHint) {
-            return true
-        }
+        var live = IndexSet(trimmedLines.indices.filter { showsInterruptHint(trimmedLines[$0]) })
 
         switch agent {
         case "pi":
-            return trimmedLines.contains(where: isPiSpinnerStatus)
+            live.formUnion(IndexSet(trimmedLines.indices.filter { isPiSpinnerStatus(trimmedLines[$0]) }))
         case "amp":
-            return ampComposerBox(in: lines).map(ampStatusIsLive) ?? false
+            if let border = ampComposerBoxIndex(in: lines), ampStatusIsLive(trimmedLines[border]) {
+                live.insert(border)
+            }
         case "claude":
-            return claudeShowsLiveWork(trimmedLines)
+            live.formUnion(claudeLiveWorkLineIndices(trimmedLines))
         default:
-            return false
+            break
         }
+        return Array(live)
     }
 
     /// "esc to interrupt", also when a narrow footer truncates it
@@ -202,11 +217,14 @@ enum AgentScreenActivity {
     /// A background *shell* is not work: "✻ Worked for 3m · 1 shell still
     /// running" ends a turn whose result is ready (dev servers and watchers
     /// outlive turns), so only agents and workflows keep the session working.
-    private static func claudeShowsLiveWork(_ lines: [String]) -> Bool {
-        if let status = lines.last(where: isClaudeStatusLine), claudeStatusIsLive(status) {
-            return true
+    /// Returns the indices of those lines: the newest status line when it
+    /// is live, and each live task row.
+    private static func claudeLiveWorkLineIndices(_ lines: [String]) -> IndexSet {
+        var live = IndexSet(lines.indices.filter { isLiveClaudeTaskRow(lines[$0]) })
+        if let status = lines.lastIndex(where: isClaudeStatusLine), claudeStatusIsLive(lines[status]) {
+            live.insert(status)
         }
-        return lines.contains(where: isLiveClaudeTaskRow)
+        return live
     }
 
     private static func isClaudeStatusLine(_ line: String) -> Bool {
@@ -278,10 +296,18 @@ enum AgentScreenActivity {
     /// Amp keeps a framed composer at the bottom of its screen (`╭─…─╮`,
     /// `│ … │` rows, `╰ <status> ─…─╯`); returns its bottom border.
     private static func ampComposerBox(in lines: [String]) -> String? {
-        let footer = nonBlankSuffix(lines, count: 3)
-        guard let bottom = footer.last(where: { $0.hasPrefix("╰") }) else { return nil }
-        let tail = nonBlankSuffix(lines, count: 12)
-        guard tail.contains(where: { $0.hasPrefix("╭") }) else { return nil }
+        ampComposerBoxIndex(in: lines).map { lines[$0].trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// The index in `lines` of Amp's composer's bottom border (above).
+    private static func ampComposerBoxIndex(in lines: [String]) -> Int? {
+        let nonBlank = lines.indices.filter { !lines[$0].trimmingCharacters(in: .whitespaces).isEmpty }
+        func starts(_ index: Int, with prefix: String) -> Bool {
+            lines[index].trimmingCharacters(in: .whitespaces).hasPrefix(prefix)
+        }
+        guard let bottom = nonBlank.suffix(3).last(where: { starts($0, with: "╰") }),
+              nonBlank.suffix(12).contains(where: { starts($0, with: "╭") })
+        else { return nil }
         return bottom
     }
 

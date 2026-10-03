@@ -314,7 +314,7 @@ The sidebar uses the model for the agent's turn presentation:
 - a pink exclamation means the model predicts `attention_needed`;
 - the existing hand remains the native permission indicator;
 - the spinner appears when the model predicts `no_attention_needed` during an
-  active submitted turn.
+  active turn: a submitted one, or one the agent resumed by itself (below).
 
 High-confidence action predictions can create fallback system notifications for
 top-level agents that do not notify on their own. A native harness notification
@@ -346,6 +346,42 @@ the menu goes the paused turn is working again. A menu before the first turn
 The model's strongest input is the native activity state, so most corrections
 are fixed in the screen rules (`AgentScreenActivity`: working markers, composer
 prompts and harness-specific screens), not in the weights.
+
+### Turns the Agent Resumes by Itself
+
+An agent can go back to work after its turn ended without anyone submitting
+anything: Claude answers a background agent's or task's result, a scheduled
+wake-up or loop iteration fires, a workflow notifies it, or a hook continues
+it. Cherry takes that as a new turn (`turn.state` is `active` again): the
+sidebar shows the spinner, MCP counts it in `agent_turn` (a monitor's `done`
+fires again when it ends), and its end is a new attention episode, which can
+alert once.
+
+A working marker alone cannot say so: a completed turn's screen can briefly
+show one again when it is repainted or reflowed, and the episode logic
+deliberately treats that as wobble so the finished result does not alert
+twice (`acknowledgedAlertStaysConsumedThroughCompletedTurnClassifierWobble`).
+A stale frame is frozen, while real work advances, so the turn restarts only
+on a fresh working episode (`AgentResumedWorkDetector`, fed by the session):
+
+- the screen's live-work lines (`AgentScreenActivity.workingLines`: Claude's
+  newest status line and live task rows, an `esc to interrupt` hint, Pi's and
+  Amp's statuses) changed twice within 4 s, the first and last change at
+  least 1 s apart, each time in place (the same rows from the bottom of the
+  screen, as a status line is redrawn; scrolling moves lines) and to text
+  never shown since the turn ended: lines of the finished screen, or of a
+  screen redrawn by a resize or a switch between the surface and the host,
+  never count, nor does a frame shown before, nor a change within 1 s of a
+  key or input sent to the agent; or
+- the title's braille spinner changed twice within 4 s, at least 1 s apart.
+
+So a repaint of the finished screen, a resize, a scroll, the user moving the
+cursor, or one frozen working frame never starts a turn, and work shorter
+than about a second is not seen. Only a completed turn, or an interrupted one
+once its agent settled at the composer, is watched. A monitor or task wake
+line Cherry types is a submitted turn already. Single recorded observations
+cannot show the heartbeat, so the corrections replay keeps the recorded turn
+state.
 
 ### Replay Corrections
 

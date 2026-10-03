@@ -833,6 +833,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         let script = """
         #!/bin/sh
         printf '%s\\n' "$*" >> '\(root.path)/\(tool).log'
+        printf '%s\\n' "${PI_CODING_AGENT_DIR:-}" > '\(root.path)/\(tool).pidir'
         case "$2" in
           add) printf '%s\\n' "$*" > '\(root.path)/\(tool).registered' ;;
           remove) [ -f '\(root.path)/\(tool).registered' ] || { echo "No MCP server named cherry" >&2; exit 1; }; rm -f '\(root.path)/\(tool).registered'; \(unconfig) ;;
@@ -846,9 +847,11 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         try script.write(to: url, atomically: true, encoding: .utf8)
         chmod(url.path, 0o755)
     }
-    // The login shell only reports the stubs' PATH (never the real CLIs).
+    // The login shell only reports the stubs' PATH (never the real CLIs),
+    // after a Pi agent directory its startup files set.
     let loginShell = stubs.appendingPathComponent("login-shell")
-    try "#!/bin/sh\nprintf '%s' '\(stubs.path):/usr/bin:/bin'\n".write(to: loginShell, atomically: true, encoding: .utf8)
+    let piDirectory = root.appendingPathComponent("pi-agent").path
+    try "#!/bin/sh\nprintf 'cherry_pi_dir=%s\\n%s' '\(piDirectory)' '\(stubs.path):/usr/bin:/bin'\n".write(to: loginShell, atomically: true, encoding: .utf8)
     chmod(loginShell.path, 0o755)
     let helper = root.appendingPathComponent("CherryMCP")
     try "#!/bin/sh\n[ \"$1\" = --version ] && { echo '{\"name\":\"CherryMCP\"}'; exit 0; }\necho \"ran $*\"\n".write(to: helper, atomically: true, encoding: .utf8)
@@ -889,9 +892,11 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         let report = try run(.install)
         #expect(report.failures.isEmpty, "\(report.failures)")
         #expect(report.claudeResult == "ok" && report.codexResult == "ok" && report.piResult == "ok" && report.launcherInstalled)
-        // Pi: direct exposure, so the model sees Cherry's tools themselves.
+        // Pi: direct exposure, so the model sees Cherry's tools themselves,
+        // run with the agent directory the login shell names.
         #expect(try String(contentsOf: root.appendingPathComponent("pi.registered"), encoding: .utf8)
             == "mcp add cherry --exposure direct -- \(launcher)\n")
+        #expect(try String(contentsOf: root.appendingPathComponent("pi.pidir"), encoding: .utf8) == piDirectory + "\n")
         #expect(try String(contentsOf: root.appendingPathComponent("claude.registered"), encoding: .utf8)
             == "mcp add --scope user --transport stdio cherry -- \(launcher)\n")
         #expect(try String(contentsOf: root.appendingPathComponent("codex.registered"), encoding: .utf8)

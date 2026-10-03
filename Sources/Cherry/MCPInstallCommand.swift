@@ -182,30 +182,48 @@ enum PiMCPRegistration {
         return RunOutcome(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
     }
 
-    /// `pi mcp add` as Settings › MCP runs it: `pi` from the login shell's
-    /// PATH, in the login environment (its node or bun needs it).
-    static func register(serverName: String, helperPath: String) async -> RunOutcome {
-        let environment = await Task.detached {
-            HostedSessionLoginEnvironment.shared.resolve()?.environment ?? ProcessInfo.processInfo.environment
+    /// The environment `pi` runs with from Settings › MCP: the login
+    /// shell's, as this run captured it in full (the last run's saved copy
+    /// keeps only a few variables, never `PI_CODING_AGENT_DIR`), else
+    /// Cherry's own. Blocks while the shell runs: off the main thread.
+    static func loginEnvironment() async -> [String: String] {
+        await Task.detached {
+            HostedSessionLoginEnvironment.shared.resolve(retryingNow: true)?.environment
+                ?? ProcessInfo.processInfo.environment
         }.value
-        guard let pi = locate(searchPath: environment["PATH"] ?? "") else {
+    }
+
+    /// `pi mcp add` as Settings › MCP runs it: `pi` from `environment`'s
+    /// PATH (the login shell's: its node or bun needs it), in that
+    /// environment, which is also where Pi finds its agent directory.
+    static func register(serverName: String, helperPath: String, environment: [String: String]) async -> RunOutcome {
+        guard let pi = locate(searchPath: environment["PATH"] ?? "", homeDirectory: environment["HOME"] ?? NSHomeDirectory()) else {
             return RunOutcome(status: -1, output: "pi was not found on the login shell's PATH (nor in ~/.bun/bin, ~/.local/bin, /opt/homebrew/bin or /usr/local/bin).")
         }
         return await run(executable: pi, arguments: addArguments(serverName: serverName, helperPath: helperPath), environment: environment)
     }
 }
 
-/// The Pi row's state in Settings › MCP.
+/// The Pi row's state in Settings › MCP. Pi's settings are read where `pi`
+/// itself reads them: its agent directory as the environment `pi` runs
+/// with names it (`PI_CODING_AGENT_DIR`, else `~/.pi/agent`).
 @MainActor
 final class PiMCPRegistrationModel: ObservableObject {
-    typealias Runner = @Sendable (_ serverName: String, _ helperPath: String) async -> PiMCPRegistration.RunOutcome
+    typealias Runner = @Sendable (_ serverName: String, _ helperPath: String, _ environment: [String: String]) async -> PiMCPRegistration.RunOutcome
+    typealias EnvironmentProvider = @Sendable () async -> [String: String]
 
     let serverName: String
     let helperPath: String?
-    let agentDirectory: URL
+    /// Fixed for tests; nil: from the environment `pi` runs with.
+    private let fixedAgentDirectory: URL?
+    private let environment: EnvironmentProvider
     private let runner: Runner
 
     @Published private(set) var status: PiMCPRegistration.Status = .notRegistered
+    /// Pi's settings were read at least once.
+    @Published private(set) var hasChecked = false
+    /// The agent directory last read.
+    @Published private(set) var agentDirectory: URL?
     @Published private(set) var isRunning = false
     /// What the last Add said (Pi's output, or why it failed).
     @Published private(set) var message: String?
@@ -214,42 +232,62 @@ final class PiMCPRegistrationModel: ObservableObject {
     init(
         serverName: String = CherryAppIdentity.current.urlScheme,
         helperPath: String? = MCPInstallCommandBuilder.helperPath,
-        agentDirectory: URL = PiMCPRegistration.agentDirectory(),
-        runner: @escaping Runner = { await PiMCPRegistration.register(serverName: $0, helperPath: $1) }
+        agentDirectory: URL? = nil,
+        environment: @escaping EnvironmentProvider = { await PiMCPRegistration.loginEnvironment() },
+        runner: @escaping Runner = { await PiMCPRegistration.register(serverName: $0, helperPath: $1, environment: $2) }
     ) {
         self.serverName = serverName
         self.helperPath = helperPath
-        self.agentDirectory = agentDirectory
+        self.fixedAgentDirectory = agentDirectory
+        self.environment = environment
         self.runner = runner
-        refresh()
     }
 
-    func refresh() {
+    /// Reads Pi's mcp.json (never writes it), off the main thread.
+    func refresh() async {
+        await refresh(environment: await environment())
+    }
+
+    private func refresh(environment: [String: String]) async {
+        let directory = fixedAgentDirectory ?? PiMCPRegistration.agentDirectory(
+            environment: environment,
+            homeDirectory: environment["HOME"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+                ?? FileManager.default.homeDirectoryForCurrentUser
+        )
+        agentDirectory = directory
         guard let helperPath else {
             status = .notRegistered
+            hasChecked = true
             return
         }
-        status = PiMCPRegistration.status(serverName: serverName, helperPath: helperPath, agentDirectory: agentDirectory)
+        let serverName = serverName
+        status = await Task.detached {
+            PiMCPRegistration.status(serverName: serverName, helperPath: helperPath, agentDirectory: directory)
+        }.value
+        hasChecked = true
     }
 
-    /// Runs `pi mcp add` (only ever from the user's click).
+    /// Runs `pi mcp add` (only ever from the user's click), in the
+    /// environment its status is read with.
     func register() async {
         guard let helperPath, !isRunning else { return }
         isRunning = true
         defer { isRunning = false }
-        let outcome = await runner(serverName, helperPath)
+        let environment = await environment()
+        let outcome = await runner(serverName, helperPath, environment)
         lastRunFailed = outcome.status != 0
         let output = outcome.output.trimmingCharacters(in: .whitespacesAndNewlines)
         message = output.isEmpty ? (lastRunFailed ? "pi exited with status \(outcome.status)." : nil) : output
-        refresh()
+        await refresh(environment: environment)
     }
 
     var statusText: String {
+        guard hasChecked else { return "Reading Pi's MCP settings…" }
         switch status {
-        case .registered: "Registered with Pi (direct exposure)."
-        case .differs(let what): "Pi has a \(serverName) server, but \(what)."
-        case .notRegistered: "Not registered with Pi."
-        case .unreadable(let why): "Pi's MCP settings could not be read: \(why)."
+        case .registered: return "Registered with Pi (direct exposure)."
+        case .differs(let what): return "Pi has a \(serverName) server, but \(what)."
+        case .notRegistered: return "Not registered with Pi."
+        case .unreadable(let why): return "Pi's MCP settings could not be read: \(why)."
         }
     }
 }

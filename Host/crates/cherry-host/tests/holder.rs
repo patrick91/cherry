@@ -617,15 +617,17 @@ exec sleep 60"#,
 }
 
 /// Until `pid`'s state, as `ps` shows it, starts with `state` (`T`: stopped).
+fn process_state(pid: i32) -> String {
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 fn wait_for_state(pid: i32, state: char) {
     wait_until(&format!("{pid} in state {state}"), || {
-        let output = Command::new("/bin/ps")
-            .args(["-p", &pid.to_string(), "-o", "stat="])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .starts_with(state)
+        process_state(pid).starts_with(state)
     });
 }
 
@@ -658,9 +660,13 @@ exec sleep 600"#,
     let hello = link::next(&mut daemon);
     assert_eq!(hello.kind, link::HOLDER_HELLO);
     let pid = hello.meta["session"]["pid"].as_u64().unwrap() as i32;
-    // Stopped (a debugger, `kill -STOP`, a job control stop)...
-    unsafe { libc::kill(pid, libc::SIGSTOP) };
-    wait_for_state(pid, 'T');
+    // Stopped (a debugger, `kill -STOP`, a job control stop)... Sent again
+    // while waiting: a loaded runner once never showed the first one take
+    // (the program may still have been starting).
+    wait_until(&format!("{pid} in state T"), || {
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        process_state(pid).starts_with('T')
+    });
     // ...it keeps running, and the holder keeps serving the session: a
     // resize, the screen, input, each of which wakes it.
     link::send(

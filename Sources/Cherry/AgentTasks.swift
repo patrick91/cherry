@@ -461,7 +461,8 @@ final class AgentTaskRegistry {
     nonisolated static func kickoffLine(taskID: String) -> String {
         "You are Cherry task \(taskID): call get_my_task (Cherry MCP) for your brief, do it, then call report_result. "
             + "Without Cherry MCP tools, run \"$CHERRY_MCP_HELPER\" --call get_my_task, then "
-            + "\"$CHERRY_MCP_HELPER\" --call report_result '{\"value\":…,\"status\":\"ok\",\"summary\":\"…\"}'."
+            + "\"$CHERRY_MCP_HELPER\" --call report_result '{\"value\":{},\"status\":\"ok\",\"summary\":\"done\"}' "
+            + "(one JSON object, your result as value)."
     }
 
     /// What `get_my_task` tells every worker.
@@ -471,7 +472,7 @@ final class AgentTaskRegistry {
         "If you cannot finish, report status failed with the reason in summary rather than waiting for an answer.",
         "For long work you may call report_progress with a short message (at most one every few seconds is kept).",
         "If you get more instructions in this tab later, report again: the newest report replaces the earlier one.",
-        "Without Cherry MCP tools, run \"$CHERRY_MCP_HELPER\" --call get_my_task and \"$CHERRY_MCP_HELPER\" --call report_result '<JSON arguments>' in a shell.",
+        "Without Cherry MCP tools, run \"$CHERRY_MCP_HELPER\" --call get_my_task and \"$CHERRY_MCP_HELPER\" --call report_result '{\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}' in a shell: the second argument is one valid JSON object in single quotes (no placeholders such as …).",
     ]
 
     /// The run's wake line: its id and counts, never a worker's text.

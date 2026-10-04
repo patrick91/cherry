@@ -61,7 +61,7 @@ struct CherryMCPStdioMain {
         var toolArguments: [String: Value] = [:]
         if arguments.count > 1 {
             guard let decoded = try? JSONDecoder().decode([String: Value].self, from: Data(arguments[1].utf8)) else {
-                fputs("CherryMCP: the arguments are not a JSON object\n", stderr)
+                fputs("CherryMCP: the arguments are not a JSON object; pass one valid JSON object in single quotes, for example: CherryMCP --call \(name) '{\"status\":\"ok\"}'\n", stderr)
                 exit(2)
             }
             toolArguments = decoded

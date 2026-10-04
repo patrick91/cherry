@@ -116,6 +116,7 @@ groups=(
   BackgroundSession     # BackgroundSessionsTests
   '[Aa]ppIdentity'      # AppIdentityTests
   RemoteDevice          # RemoteDevice{,RealHost}Tests
+  ControlAgentTaskPersistence # ControlAgentTaskPersistenceTests
 )
 
 # What marks a test file as a session suite: the hosted and persistent session

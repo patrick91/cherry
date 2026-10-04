@@ -614,10 +614,13 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     /// (`WorkspaceStateStore.noteSystemQuit`): the system then ends the
     /// sessions, and the next launch brings their tabs back ended. Then
     /// whatever the store still has queued (the sessions ended on purpose)
-    /// is written before the process ends.
+    /// is written before the process ends, and so are the MCP tasks'
+    /// latest changes (`AgentTaskRegistry.saveNow`).
     func applicationWillTerminate(_ notification: Notification) {
         let isPowerOffEvent = lastQuitWasPowerOffEvent
         MainActor.assumeIsolated {
+            // MCP tasks' latest changes (saves wait a second for more).
+            AgentTaskRegistry.app?.saveNow()
             Self.recordSystemQuit(
                 isPowerOffEvent: isPowerOffEvent,
                 onQuit: TerminalSettings.shared.localSessionsOnQuit,
@@ -1013,6 +1016,9 @@ struct CherryApp: App {
                         guard !ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) else { return }
                         openWindow(id: Self.projectWindowSceneID, value: projectRoot)
                     })
+                    // MCP tasks survive a relaunch: the last run's are read
+                    // back (off this thread) before any request is handled.
+                    server.configureTaskPersistence(store: .shared, hostings: .shared, stateStore: .shared)
                     server.start()
                     controlServer = server
                     // Devices' forwards reach its listeners (phase 4b).

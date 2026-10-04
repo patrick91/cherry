@@ -35,11 +35,60 @@ import Foundation
 // undone); a detached worker whose session runs stays the task's worker
 // (and may report, identified by its program's processes).
 //
-// Records live in memory, in the control server, each tied to its worker's
-// tab and window: a relaunch of Cherry forgets them (a restored worker's
-// `get_my_task` answers `no_assignment`). Each run keeps its own events. Tasks
-// are one level deep (a worker cannot hand out tasks), and a caller on
-// another Mac reaches only the tasks its Mac's callers made.
+// The kickoff is checked, not only typed: an agent CLI that shows its
+// composer before it takes input (Claude Code while its MCP servers load)
+// drops the text or its Enter. Until the worker's turn starts, it asks for
+// its task, or the kickoff shows as a sent message, Cherry looks at its
+// screen once it is still: the kickoff left in the composer gets its Enter,
+// one that is not there is typed again (bounded, `kickoff_retry`). A worker
+// that has not read its task is never asked to report; it gets the kickoff
+// again.
+//
+// Records survive a relaunch of Cherry (`AgentTaskPersistence.swift`): the
+// app saves tasks and runs, with their events and sequence numbers, to
+// `Workspaces/agent-tasks.json` (the instance-lock holder only), and the
+// next launch reads them back and finds each worker and orchestrator again
+// by its tab id or its session. Each run keeps its own events. Tasks are
+// one level deep (a worker cannot hand out tasks), and a caller on another
+// Mac reaches only the tasks its Mac's callers made.
+
+/// The hosted session a task's worker (or a run's owner) runs in: what a
+/// relaunch of Cherry looks for.
+struct AgentTaskSessionBinding: Codable, Equatable, Hashable, Sendable {
+    /// `HostedSessionHost.id`: "local", or "ssh:" and the destination (a
+    /// device's host).
+    var host: String
+    /// The host's identity, when known.
+    var hostID: String?
+    var sessionID: String
+
+    init(host: String, hostID: String?, sessionID: String) {
+        self.host = host
+        self.hostID = hostID
+        self.sessionID = sessionID
+    }
+
+    init(_ attachment: HostedSessionAttachment) {
+        self.init(host: attachment.host.id, hostID: attachment.hostID, sessionID: attachment.sessionID)
+    }
+
+    /// Whether `attachment` names this session.
+    func names(_ attachment: HostedSessionAttachment?) -> Bool {
+        guard let attachment else { return false }
+        return attachment.sessionID == sessionID && attachment.host.id == host
+            && (hostID == nil || attachment.hostID == hostID)
+    }
+}
+
+/// What Cherry is typing into a task's worker now.
+enum AgentTaskTyping: Equatable {
+    /// The spawn waits for the worker to be ready for its first kickoff:
+    /// nothing typed yet.
+    case kickoffPending
+    case kickoff
+    case kickoffEnter
+    case nudge
+}
 
 /// One task (main actor only).
 @MainActor
@@ -49,7 +98,9 @@ final class AgentTask {
     /// The Mac of the caller that made it, nil for This Mac: only callers
     /// of that Mac find it.
     let device: UUID?
-    let workerID: UUID
+    /// The worker's tab. A tab that comes back for the worker's session
+    /// under another id becomes the worker (`locateWorker`).
+    var workerID: UUID
     /// The worker's tab as last found (`locateWorker` finds a tab that came
     /// back by `workerID`).
     weak var worker: TerminalSession?
@@ -59,13 +110,19 @@ final class AgentTask {
     /// detached one, from a tab that is gone.
     weak var hosting: PersistentLocalSessions?
     var hostSessionID: String?
+    /// The worker's session as last seen (attached or its own): saved, so
+    /// a relaunch looks for it.
+    var workerSession: AgentTaskSessionBinding?
+    /// The worker's program ran in a persistent session it owned (it can
+    /// outlive Cherry).
+    var workerIsPersistent = false
     /// Since when its tab is in no open window.
     var awaySince: Date?
     let label: String
     let phase: String?
     let brief: String
     let resultSchema: JSONValue?
-    let createdAt = Date()
+    let createdAt: Date
     var state: AgentTaskState = .queued
     var startedAt: Date?
     var settledAt: Date?
@@ -81,23 +138,76 @@ final class AgentTask {
     var lastReportAt: Date?
     var isCheckingReport = false
 
-    /// The kickoff reached the worker (or it found its task by itself).
+    /// Read back from the last run's file and not found again yet: its tab,
+    /// or its session on its host, is still looked for.
+    var restoredAt: Date?
+    /// When its tab was found again after a relaunch: lines Cherry types
+    /// into it wait their grace from then.
+    var relinkedAt: Date?
+
+    /// The worker asked for its task (`get_my_task`), or reported on it.
+    var fetchedAt: Date?
+    /// When the latest kickoff was typed; nil before one was (or after one
+    /// that sent nothing).
+    var kickoffTypedAt: Date?
+    /// The latest kickoff failed in a way that may have typed it: never
+    /// typed again (its Enter may still be pressed).
+    var kickoffUncertain = false
+    /// The kickoff was seen sent: the worker's turn started, it asked for
+    /// its task, or the kickoff shows as a sent message.
     var kickoffDeliveredAt: Date?
     var kickoffAttempts = 0
     var lastKickoffAttemptAt: Date?
-    /// The last kickoff did not reach the worker and nothing of it was
-    /// typed: it may be typed again.
-    var kickoffRetryable = false
-    /// Cherry is typing into the worker (a kickoff or the nudge).
-    var isTypingIntoWorker = false
+    /// Enter pressed for a kickoff left in the worker's composer.
+    var kickoffEnterPresses = 0
+    /// The latest kickoff typed or Enter pressed.
+    var lastKickoffActionAt: Date?
+    /// The worker's submitted turns when the latest kickoff was typed.
+    var kickoffTurnCount = 0
+    /// Copies of the kickoff on the worker's screen just before the latest
+    /// was typed: one more, outside its composer, is the latest sent.
+    var kickoffCopiesBefore = 0
+    /// What Cherry is typing into the worker now (a kickoff, its Enter, or
+    /// the nudge).
+    var typing: AgentTaskTyping?
+    var isTypingIntoWorker: Bool { typing != nil }
     /// Since when the worker's current turn for the task runs (the
     /// kickoff's, then the nudge's), and its turn count then.
     var turnBaselineAt: Date?
     var turnBaseline = 0
     var nudgedAt: Date?
     var lastNudgeAttemptAt: Date?
+    /// The size of its result's value as JSON, for the saved file's budget
+    /// (by result version).
+    var resultBytes: (version: Int, bytes: Int)?
 
     init(
+        id: String,
+        runID: String,
+        device: UUID?,
+        workerID: UUID,
+        worker: TerminalSession?,
+        workspace: TerminalWorkspace?,
+        label: String,
+        phase: String?,
+        brief: String,
+        resultSchema: JSONValue?,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.runID = runID
+        self.device = device
+        self.workerID = workerID
+        self.worker = worker
+        self.workspace = workspace
+        self.label = label
+        self.phase = phase
+        self.brief = brief
+        self.resultSchema = resultSchema
+        self.createdAt = createdAt
+    }
+
+    convenience init(
         id: String,
         runID: String,
         device: UUID?,
@@ -108,16 +218,10 @@ final class AgentTask {
         brief: String,
         resultSchema: JSONValue?
     ) {
-        self.id = id
-        self.runID = runID
-        self.device = device
-        self.workerID = worker.id
-        self.worker = worker
-        self.workspace = workspace
-        self.label = label
-        self.phase = phase
-        self.brief = brief
-        self.resultSchema = resultSchema
+        self.init(
+            id: id, runID: runID, device: device, workerID: worker.id, worker: worker, workspace: workspace,
+            label: label, phase: phase, brief: brief, resultSchema: resultSchema
+        )
     }
 
     var kickoffLine: String { AgentTaskRegistry.kickoffLine(taskID: id) }
@@ -129,14 +233,21 @@ final class AgentRun {
     let id: String
     let device: UUID?
     /// Whose run it is: the orchestrator's tab Cherry confirmed made it,
-    /// else the workers' parent agent; nil when neither is known.
-    let ownerID: UUID?
+    /// else the workers' parent agent; nil when neither is known. A tab
+    /// that comes back for the owner's session under another id becomes it.
+    var ownerID: UUID?
     /// The orchestrator's tab, only when Cherry confirmed it is the caller
     /// that made the run: the wake line goes there, and only to an agent.
     weak var owner: TerminalSession?
+    /// The owner was confirmed (the caller) and an agent when the run was
+    /// made: the wake line goes to it, or to the tab that comes back for
+    /// it after a relaunch.
+    let ownerWakes: Bool
+    /// The owner's session as last seen: saved, so a relaunch finds it.
+    var ownerSession: AgentTaskSessionBinding?
     /// Made for its owner's spawns that named no run.
     let isImplicit: Bool
-    let createdAt = Date()
+    let createdAt: Date
     var taskIDs: [String] = []
     /// Its tasks' events, oldest first: at most one of each kind per task
     /// (a newer one replaces it), and at most `maxEventsPerRun`.
@@ -155,18 +266,35 @@ final class AgentRun {
     var isWaking = false
     /// `wait_for_tasks` calls on it now: no wake line while one runs.
     var activeWaits = 0
+    /// Read back from the last run's file, its owner not found again yet.
+    var restoredAt: Date?
+    /// When its owner's tab was found again after a relaunch.
+    var relinkedAt: Date?
+    /// Since when none of its tabs is open or running (`pruneSettledRuns`).
+    var tabsGoneSince: Date?
 
-    init(id: String, device: UUID?, ownerID: UUID?, owner: TerminalSession?, isImplicit: Bool) {
+    init(
+        id: String,
+        device: UUID?,
+        ownerID: UUID?,
+        owner: TerminalSession?,
+        isImplicit: Bool,
+        ownerWakes: Bool? = nil,
+        createdAt: Date = Date()
+    ) {
         self.id = id
         self.device = device
         self.ownerID = ownerID
         self.owner = owner
         self.isImplicit = isImplicit
+        self.ownerWakes = ownerWakes ?? (owner?.kind == .agent)
+        self.createdAt = createdAt
+        if let binding = owner?.hostedSessionBinding { ownerSession = AgentTaskSessionBinding(binding) }
     }
 
     /// A wake line can be typed into its owner (an agent tab Cherry
-    /// confirmed).
-    var wakes: Bool { owner?.kind == .agent }
+    /// confirmed, or the tab that came back for it).
+    var wakes: Bool { ownerWakes && (owner.map { $0.kind == .agent } ?? true) }
 }
 
 /// One lock per tab for what Cherry types into it (wake lines, the nudge,
@@ -205,7 +333,10 @@ final class AgentTaskRegistry {
     static let maximumBriefCharacters = 64_000
     static let maximumBriefBytes = 256 * 1024
     nonisolated static let maximumResultBytes = 256 * 1024
+    /// Kickoffs typed into one worker at most (the first and its retries).
     static let maximumKickoffAttempts = 3
+    /// Enter pressed at most for a kickoff left in the worker's composer.
+    static let maximumKickoffEnterPresses = 2
     /// What each text keeps, in characters and in UTF-8 bytes (a character
     /// can be many bytes).
     static let summaryBytes = 4 * CherryControl.maximumTaskSummaryCharacters
@@ -227,8 +358,37 @@ final class AgentTaskRegistry {
     private(set) var runs: [String: AgentRun] = [:]
     private(set) var runOrder: [String] = []
     private(set) var nextSeq = 1
+    /// After a relaunch: the newest seq the saved file had, and the first
+    /// one this run gives out (a gap of `restoredSeqGap` between them). A
+    /// cursor in between names events the file lost (`cursor_reset`).
+    private(set) var restoredThroughSeq: Int?
+    private(set) var restoredSeqGapEnd: Int?
     /// Settings › MCP › Wake idle agents (the server's monitors' setting).
     var wakeLinesEnabled: @MainActor () -> Bool = { true }
+
+    // Persistence (`AgentTaskPersistence.swift`): nil saves nothing (tests
+    // that do not set one).
+    var store: AgentTaskStore?
+    /// The hosting a task's session runs on (the app's looks in its
+    /// `PersistentHostingRegistry`), and what that session is now
+    /// (`AgentTaskHostLookup`; tests set their own). Used for tasks read
+    /// back after a relaunch, and to tell when a settled run's tabs are gone.
+    var hostingForSession: @MainActor (AgentTaskSessionBinding) -> PersistentLocalSessions? = { _ in nil }
+    var sessionStatus: @MainActor (AgentTaskSessionBinding, PersistentLocalSessions?, _ savedAt: Date?) -> AgentTaskSessionStatus = { _, _, _ in
+        .unknown(waitsForDevice: false)
+    }
+    /// The saved file was read (or there was none to read): saves may
+    /// replace it from now on.
+    var isRestoreSettled = true
+    /// Reading the saved file, at launch: requests wait for it.
+    var restoreTask: Task<Void, Never>?
+    /// When the saved state was read back (nil: nothing was).
+    private(set) var restoredAt: Date?
+    /// When the file read back was saved.
+    private(set) var restoredFileSavedAt: Date?
+    var saveTask: Task<Void, Never>?
+    var pruneTask: Task<Void, Never>?
+    var hasUnsavedChanges = false
 
     // Tunables (tests shorten them).
     /// At most one progress message is recorded this often.
@@ -246,6 +406,30 @@ final class AgentTaskRegistry {
     /// How long a worker whose tab is gone, and whose session its host no
     /// longer lists, may come back before its task is cancelled.
     var awayGrace: TimeInterval = 10
+    /// A kickoff not seen sent is looked at again this long after it was
+    /// typed (or its Enter pressed), once the worker's screen was still for
+    /// `kickoffQuietInterval`.
+    var kickoffCheckDelay: TimeInterval = 2
+    var kickoffQuietInterval: TimeInterval = 1
+    /// After a relaunch: how long a worker or owner whose tab has not come
+    /// back (and that ran no session Cherry can look for) is waited for, and
+    /// how long nothing is typed into one that did.
+    var relinkGrace: TimeInterval = 120
+    var restoredLineGrace: TimeInterval = 5
+    /// After a relaunch: how long a This Mac worker's session that its host
+    /// cannot be asked about is waited for (another Mac's waits for it).
+    var restoreDecisionTimeout: TimeInterval = 10 * 60
+    /// Saves wait this long for more changes.
+    var saveDelay: Duration = .seconds(1)
+    /// A settled run is forgotten this long after it settled, or this long
+    /// after none of its tabs is open or running.
+    var settledRunLifetime: TimeInterval = 24 * 60 * 60
+    var goneRunLifetime: TimeInterval = 10 * 60
+    /// How often settled runs are looked at for pruning.
+    var maintenanceInterval: Duration = .seconds(300)
+    /// Seqs left unused after a relaunch: a cursor among them names events
+    /// the saved file lost.
+    static let restoredSeqGap = 1_000
 
     init(board: AgentTaskBoard) {
         self.board = board
@@ -274,7 +458,7 @@ final class AgentTaskRegistry {
     }
 
     /// One line, typed into the worker as its first message.
-    static func kickoffLine(taskID: String) -> String {
+    nonisolated static func kickoffLine(taskID: String) -> String {
         "You are Cherry task \(taskID): call get_my_task (Cherry MCP) for your brief, do it, then call report_result. "
             + "Without Cherry MCP tools, run \"$CHERRY_MCP_HELPER\" --call get_my_task, then "
             + "\"$CHERRY_MCP_HELPER\" --call report_result '{\"value\":…,\"status\":\"ok\",\"summary\":\"…\"}'."
@@ -366,9 +550,48 @@ final class AgentTaskRegistry {
 
     func addRun(device: UUID?, ownerID: UUID?, owner: TerminalSession?, isImplicit: Bool) -> AgentRun {
         let run = AgentRun(id: Self.newID("run"), device: device, ownerID: ownerID, owner: owner, isImplicit: isImplicit)
+        insert(run)
+        return run
+    }
+
+    /// Adds a run made here or read back from the saved file.
+    func insert(_ run: AgentRun) {
         runs[run.id] = run
         runOrder.append(run.id)
-        return run
+    }
+
+    /// Adds a task read back from the saved file (its run's ids name it).
+    func insertRestored(_ task: AgentTask) {
+        tasks[task.id] = task
+        taskOrder.append(task.id)
+    }
+
+    /// Starts this run's seqs after the saved file's, leaving a gap.
+    func continueSeqs(afterSaved savedNextSeq: Int, restoredAt: Date, fileSavedAt: Date) {
+        restoredThroughSeq = max(savedNextSeq - 1, 0)
+        nextSeq = max(savedNextSeq, 1) + Self.restoredSeqGap
+        restoredSeqGapEnd = nextSeq
+        self.restoredAt = restoredAt
+        restoredFileSavedAt = fileSavedAt
+    }
+
+    /// Whether `cursor` is one Cherry can go on from: not past the newest
+    /// seq given out, nor in the gap a relaunch left (events the saved file
+    /// lost).
+    func cursorIsValid(_ cursor: Int) -> Bool {
+        if cursor > nextSeq - 1 { return false }
+        if let through = restoredThroughSeq, let gapEnd = restoredSeqGapEnd, cursor > through, cursor < gapEnd {
+            return false
+        }
+        return true
+    }
+
+    /// Forgets `run` and its tasks.
+    func remove(_ run: AgentRun) {
+        for id in run.taskIDs { tasks[id] = nil }
+        taskOrder.removeAll { tasks[$0] == nil }
+        runs[run.id] = nil
+        runOrder.removeAll { $0 == run.id }
     }
 
     func add(_ task: AgentTask, to run: AgentRun) {
@@ -401,6 +624,7 @@ final class AgentTaskRegistry {
             version: version
         )
         nextSeq += 1
+        scheduleSave()
         guard let run = runs[task.runID] else { return event }
         run.events.removeAll { $0.taskID == task.id && $0.kind == kind }
         run.events.append(event)
@@ -539,6 +763,7 @@ final class AgentTaskRegistry {
             progress[ownerID] = AgentRunProgress(settled: current.settled + counts.settled, total: current.total + counts.total)
         }
         board.update(badges: badges, runProgress: progress)
+        scheduleSave()
     }
 }
 
@@ -635,14 +860,14 @@ extension CherryControlServer {
     static func unknownTask(_ id: String) -> CherryControlError {
         CherryControlError(
             code: "unknown_task",
-            message: "No Cherry task \(id) this caller can see: tasks live in Cherry's memory, so a relaunch forgets them."
+            message: "No Cherry task \(id) this caller can see: it was never made on this caller's Mac, or it settled and was forgotten (a day after it settled, or once its tabs were gone)."
         )
     }
 
     static func unknownRun(_ id: String) -> CherryControlError {
         CherryControlError(
             code: "unknown_run",
-            message: "No Cherry run \(id) this caller can use: tasks live in Cherry's memory, so a relaunch forgets them."
+            message: "No Cherry run \(id) this caller can use: it was never made on this caller's Mac, or it settled and was forgotten (a day after it settled, or once its tabs were gone)."
         )
     }
 
@@ -706,6 +931,7 @@ extension CherryControlServer {
         }
         let device = Self.remoteDevice
         let caller = verifiedCallerSession()
+        if let caller { adoptRunsOwned(by: caller) }
         if let caller, let callerTask = tasks.latestTask(forWorker: caller.id), !callerTask.state.isSettled {
             throw CherryControlError(
                 code: "nested_task",
@@ -760,30 +986,73 @@ extension CherryControlServer {
             brief: plan.brief,
             resultSchema: plan.resultSchema
         )
+        if let binding = worker.hostedSessionBinding {
+            task.workerSession = AgentTaskSessionBinding(binding)
+            task.workerIsPersistent = worker.persistentSession != nil
+        } else {
+            task.workerIsPersistent = worker.persistentHosting != nil
+        }
         tasks.add(task, to: run)
         startMonitorSamplerIfNeeded()
+        startTaskMaintenanceIfNeeded()
         return task
     }
 
-    /// What became of a kickoff typed at `typedSince`.
+    /// What became of a kickoff typed at `typedSince`. Typed is not sent:
+    /// the sampler looks for the worker's turn, its `get_my_task` or the
+    /// kickoff among its sent messages (`checkKickoff`) before it counts
+    /// as delivered.
     @MainActor
     func noteKickoff(_ task: AgentTask, delivered: Bool, error: CherryControlError?, typedSince: Date = Date()) {
         task.kickoffAttempts += 1
         task.lastKickoffAttemptAt = Date()
-        if delivered, let worker = task.worker {
-            task.kickoffDeliveredAt = Date()
-            task.kickoffRetryable = false
-            task.turnBaselineAt = typedSince
-            task.turnBaseline = worker.agentSubmittedTurnCount
+        task.lastKickoffActionAt = Date()
+        task.kickoffEnterPresses = 0
+        if delivered {
+            task.kickoffTypedAt = typedSince
+            task.kickoffUncertain = false
+            task.kickoffTurnCount = task.worker?.agentSubmittedTurnCount ?? 0
         } else {
-            // Typed again once the worker takes input, unless some of it
-            // may have been typed.
+            // Typed again once the worker takes input when nothing of it
+            // was typed; never when some of it may have been.
             let nothingSent: Set<String> = [
                 "agent_awaiting_permission", "agent_awaiting_input", "process_not_accepting_input", "input_not_delivered",
             ]
-            task.kickoffRetryable = nothingSent.contains(error?.code ?? "")
+            if nothingSent.contains(error?.code ?? "") {
+                task.kickoffTypedAt = nil
+                task.kickoffUncertain = false
+            } else {
+                task.kickoffTypedAt = typedSince
+                task.kickoffUncertain = true
+            }
         }
+        tasks.scheduleSave()
         startMonitorSamplerIfNeeded()
+    }
+
+    /// The kickoff was seen sent (at `at`): the worker's turn for it runs
+    /// from then.
+    @MainActor
+    func noteKickoffDelivered(_ task: AgentTask, at: Date) {
+        guard task.kickoffDeliveredAt == nil else { return }
+        task.kickoffDeliveredAt = at
+        task.turnBaselineAt = at
+        task.turnBaseline = task.kickoffTurnCount
+        tasks.scheduleSave()
+    }
+
+    /// The worker asked for its task, or reported on it: it has it.
+    @MainActor
+    private func noteFetched(_ task: AgentTask) {
+        let now = Date()
+        if task.fetchedAt == nil { task.fetchedAt = now }
+        if task.kickoffDeliveredAt == nil {
+            // It found its task (by itself, or the kickoff reached it
+            // unseen): no kickoff is typed any more.
+            if task.kickoffTypedAt == nil { task.kickoffTurnCount = task.worker?.agentSubmittedTurnCount ?? 0 }
+            noteKickoffDelivered(task, at: task.kickoffTypedAt ?? now)
+        }
+        tasks.scheduleSave()
     }
 
     // MARK: Worker side
@@ -800,7 +1069,7 @@ extension CherryControlServer {
             )
         }
         guard let task = tasks.latestTask(forWorker: caller.id) else {
-            throw Self.noAssignment("This tab has no Cherry task: only agents spawned with spawn_agent's task have one (Cherry forgets tasks when it relaunches).")
+            throw Self.noAssignment("This tab has no Cherry task: only agents spawned with spawn_agent's task have one.")
         }
         return task
     }
@@ -814,7 +1083,7 @@ extension CherryControlServer {
         let ancestry = Set(Self.processAncestry(of: peerPID))
         for id in tasks.taskOrder.reversed() {
             guard let task = tasks.tasks[id], task.state != .cancelled, locateWorker(task) == nil,
-                  let hosting = task.hosting, let sessionID = task.hostSessionID,
+                  let hosting = hosting(of: task), let sessionID = task.hostSessionID ?? task.workerSession?.sessionID,
                   let pid = hosting.sessionInfo(sessionID)?.pid, ancestry.contains(Int32(bitPattern: pid))
             else { continue }
             return task
@@ -826,12 +1095,7 @@ extension CherryControlServer {
     func getMyTask() throws -> GetMyTaskResult {
         let task = try callerTask()
         if task.state == .cancelled { throw Self.taskCancelled(task) }
-        if task.kickoffDeliveredAt == nil {
-            // It found its task by itself: no kickoff is typed any more.
-            task.kickoffDeliveredAt = Date()
-            task.turnBaselineAt = task.turnBaselineAt ?? Date()
-            task.turnBaseline = task.worker?.agentSubmittedTurnCount ?? 0
-        }
+        noteFetched(task)
         if task.state == .queued {
             tasks.update(task, to: .working, event: .started)
         }
@@ -921,6 +1185,7 @@ extension CherryControlServer {
         }
         // Cancelled while it was checked.
         if task.state == .cancelled { throw Self.taskCancelled(task) }
+        noteFetched(task)
         let trimmed = request.summary?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         let summary = trimmed.map {
             AgentTaskRegistry.clip($0, characters: CherryControl.maximumTaskSummaryCharacters, bytes: AgentTaskRegistry.summaryBytes)
@@ -965,6 +1230,7 @@ extension CherryControlServer {
         let message = AgentTaskRegistry.clip(
             oneLine, characters: CherryControl.maximumTaskProgressCharacters, bytes: AgentTaskRegistry.progressBytes
         ).text
+        noteFetched(task)
         task.progress = message
         task.progressAt = now
         if task.state == .queued {
@@ -998,6 +1264,7 @@ extension CherryControlServer {
             guard defaultingToCallers, let caller = verifiedCallerSession() else {
                 throw CherryControlError(code: "missing_argument", message: "Name the tasks with run_id or task_ids (spawn_agent returns them).")
             }
+            adoptRunsOwned(by: caller)
             let owned = tasks.runs(ownedBy: caller.id, device: device)
             let open = owned.filter { tasks.isOpen($0) }
             selectedRuns = open.isEmpty ? owned.suffix(1) : open
@@ -1042,7 +1309,11 @@ extension CherryControlServer {
             CherryControl.maximumTaskWaitMilliseconds
         )
         let maxEvents = min(max(request.maxEvents ?? 100, 1), 500)
-        let after = max(request.cursor ?? 0, 0)
+        var after = max(request.cursor ?? 0, 0)
+        // A cursor Cherry cannot go on from (it names events a relaunch
+        // lost): answered from the first event kept, with the tasks' states.
+        let cursorReset = !tasks.cursorIsValid(after)
+        if cursorReset { after = 0 }
         let deadline = Date().addingTimeInterval(TimeInterval(timeout) / 1_000)
         let runs = involvedRuns(selection)
         for run in runs { run.activeWaits += 1 }
@@ -1061,7 +1332,7 @@ extension CherryControlServer {
                 (task.state.isSettled && (task.settledSeq ?? 0) > after)
                     || (task.state == .needsInput && (task.needsInputSeq ?? 0) > after)
             }
-            let ready = until == "all" ? pending.isEmpty : pending.isEmpty || changed
+            let ready = cursorReset || (until == "all" ? pending.isEmpty : pending.isEmpty || changed)
             if ready || Date() >= deadline {
                 let events = Array(available.prefix(maxEvents))
                 let latestChange = selected.compactMap { max($0.settledSeq ?? 0, $0.needsInputSeq ?? 0) }.max() ?? 0
@@ -1070,8 +1341,9 @@ extension CherryControlServer {
                     : events.last?.seq ?? after
                 // The owner read its run's settle: no wake line for it.
                 for run in runs where run.ownerID != nil && run.ownerID == callerID {
-                    if let settledSeq = run.settledSeq, events.count == available.count {
-                        run.ownerReadSeq = max(run.ownerReadSeq, settledSeq)
+                    if let settledSeq = run.settledSeq, events.count == available.count, settledSeq > run.ownerReadSeq {
+                        run.ownerReadSeq = settledSeq
+                        tasks.scheduleSave()
                     }
                 }
                 return WaitForTasksResult(
@@ -1082,7 +1354,8 @@ extension CherryControlServer {
                     timedOut: !ready,
                     moreEvents: available.count - events.count,
                     eventsDropped: runs.contains { $0.droppedThroughSeq > after },
-                    runs: runs.map { tasks.info(for: $0) }
+                    runs: runs.map { tasks.info(for: $0) },
+                    cursorReset: cursorReset ? true : nil
                 )
             }
             try? await Task.sleep(for: .milliseconds(100))
@@ -1111,9 +1384,11 @@ extension CherryControlServer {
             state = parsed
         }
         let runs: [AgentRun]
+        let caller = request.runID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty == nil ? verifiedCallerSession() : nil
+        if let caller { adoptRunsOwned(by: caller) }
         if request.runID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty != nil {
             runs = try taskSelection(runID: request.runID, taskIDs: nil, defaultingToCallers: false).runs
-        } else if let caller = verifiedCallerSession(), case let owned = tasks.runs(ownedBy: caller.id, device: device), !owned.isEmpty {
+        } else if let caller, case let owned = tasks.runs(ownedBy: caller.id, device: device), !owned.isEmpty {
             runs = owned
         } else {
             runs = tasks.orderedRuns.filter { $0.device == device }
@@ -1148,31 +1423,34 @@ extension CherryControlServer {
             for run in involvedRuns(selection) where run.ownerID == callerID {
                 if let settledSeq = run.settledSeq { run.ownerReadSeq = max(run.ownerReadSeq, settledSeq) }
             }
+            tasks.scheduleSave()
         }
         return CancelTasksResult(cancelled: cancelled, closed: closed, alreadySettled: alreadySettled)
     }
 
     // MARK: Sampling
 
-    /// The worker's tab, in an open window: the one the task last saw, or
-    /// one that came back with its id (⌘Z after ⌘W or ⌘D, Background
-    /// Sessions › Open), which becomes the task's worker. Notes its
-    /// persistent session while it has one.
+    /// The worker's tab, in an open window: the one the task last saw, one
+    /// that came back with its id (⌘Z after ⌘W or ⌘D, Background Sessions ›
+    /// Open, a relaunch's restore), or one that came back for its session
+    /// under another id (on the task's Mac); that tab becomes the task's
+    /// worker. Notes its session while it has one.
     @MainActor
     func locateWorker(_ task: AgentTask) -> (session: TerminalSession, workspace: TerminalWorkspace)? {
-        var found: (TerminalSession, TerminalWorkspace)?
+        var found: (session: TerminalSession, workspace: TerminalWorkspace)?
         if let worker = task.worker, let workspace = task.workspace, workspace.sessions.contains(where: { $0 === worker }) {
             found = (worker, workspace)
         } else {
-            for workspace in allOpenWorkspaces() {
-                if let session = workspace.sessions.first(where: { $0.id == task.workerID }) {
-                    found = (session, workspace)
-                    break
-                }
-            }
+            let workspaces = allOpenWorkspaces()
+            found = Self.openTab(id: task.workerID, in: workspaces)
+                ?? task.workerSession.flatMap { Self.openTab(boundTo: $0, in: workspaces, device: task.device) }
         }
         guard let found else { return nil }
         let (worker, workspace) = found
+        if worker.id != task.workerID {
+            task.workerID = worker.id
+            tasks.publish()
+        }
         task.worker = worker
         task.workspace = workspace
         task.awaySince = nil
@@ -1180,16 +1458,128 @@ extension CherryControlServer {
             task.hosting = hosting
             task.hostSessionID = sessionID
         }
+        if let binding = worker.hostedSessionBinding.map(AgentTaskSessionBinding.init), binding != task.workerSession {
+            task.workerSession = binding
+            task.workerIsPersistent = worker.persistentSession != nil
+            tasks.scheduleSave()
+        }
+        // A tab shown before its host answered is not back yet: the restore
+        // may still withdraw it (its session gone).
+        if task.restoredAt != nil, !worker.isProvisionalRestore { noteRelinked(task, worker: worker) }
         return (worker, workspace)
+    }
+
+    /// A restored task's worker was found again: its turns are counted
+    /// again from now (the idle grace starts over), and a kickoff not seen
+    /// sent is looked at again on its screen.
+    @MainActor
+    private func noteRelinked(_ task: AgentTask, worker: TerminalSession) {
+        let now = Date()
+        task.restoredAt = nil
+        task.relinkedAt = now
+        if task.kickoffDeliveredAt != nil {
+            task.turnBaselineAt = now
+            task.turnBaseline = worker.agentSubmittedTurnCount
+        } else if task.kickoffTypedAt != nil {
+            // Any copy of it outside the composer now was sent.
+            task.kickoffTypedAt = now
+            task.lastKickoffActionAt = now
+            task.kickoffTurnCount = worker.agentSubmittedTurnCount
+            task.kickoffCopiesBefore = 0
+        }
+        tasks.scheduleSave()
+    }
+
+    /// The tab `id` in an open window.
+    @MainActor
+    static func openTab(id: UUID, in workspaces: [TerminalWorkspace]) -> (session: TerminalSession, workspace: TerminalWorkspace)? {
+        for workspace in workspaces {
+            if let session = workspace.sessions.first(where: { $0.id == id }) { return (session, workspace) }
+        }
+        return nil
+    }
+
+    /// A tab of `binding`'s session in an open window of `device` (This
+    /// Mac's windows for nil): its own tab first, then one attached to it.
+    @MainActor
+    static func openTab(
+        boundTo binding: AgentTaskSessionBinding,
+        in workspaces: [TerminalWorkspace],
+        device: UUID?
+    ) -> (session: TerminalSession, workspace: TerminalWorkspace)? {
+        let scoped = workspaces.filter { workspace in
+            guard let device else { return workspace.projectRoot.map { ProjectLocation(key: $0).deviceID == nil } ?? true }
+            return isOnDevice(workspace.projectRoot, device)
+        }
+        for owned in [true, false] {
+            for workspace in scoped {
+                if let session = workspace.sessions.first(where: { binding.names(owned ? $0.persistentSession : $0.hostedAttachment) }) {
+                    guard device.map({ isSession(session, in: workspace, onDevice: $0) }) ?? true else { continue }
+                    return (session, workspace)
+                }
+            }
+        }
+        return nil
+    }
+
+    /// The run's owner's tab, in an open window: the one it last saw, or
+    /// (only for an owner a wake line goes to) the tab that came back with
+    /// its id or for its session, which becomes the owner.
+    @MainActor
+    func locateOwner(_ run: AgentRun) -> TerminalSession? {
+        let workspaces = allOpenWorkspaces()
+        var found: TerminalSession?
+        if let owner = run.owner, workspaces.contains(where: { $0.sessions.contains { $0 === owner } }) {
+            found = owner
+        } else if run.ownerWakes {
+            let candidate = run.ownerID.flatMap { Self.openTab(id: $0, in: workspaces) }
+                ?? run.ownerSession.flatMap { Self.openTab(boundTo: $0, in: workspaces, device: run.device) }
+            found = candidate.flatMap { $0.session.kind == .agent ? $0.session : nil }
+        }
+        // A tab shown before its host answered is not back yet.
+        guard let owner = found, !owner.isProvisionalRestore else { return nil }
+        if owner.id != run.ownerID {
+            run.ownerID = owner.id
+            tasks.publish()
+        }
+        run.owner = owner
+        if run.restoredAt != nil {
+            run.restoredAt = nil
+            run.relinkedAt = Date()
+        }
+        if let binding = owner.hostedSessionBinding.map(AgentTaskSessionBinding.init), binding != run.ownerSession {
+            run.ownerSession = binding
+            tasks.scheduleSave()
+        }
+        return owner
+    }
+
+    /// Runs whose owner's session is the caller's while their owner's tab
+    /// is not open (it came back under another id after a relaunch): the
+    /// caller owns them.
+    @MainActor
+    func adoptRunsOwned(by caller: TerminalSession) {
+        guard let binding = caller.hostedSessionBinding else { return }
+        let workspaces = allOpenWorkspaces()
+        for run in tasks.orderedRuns where run.ownerID != caller.id && run.ownerSession?.names(binding) == true {
+            if let ownerID = run.ownerID, Self.openTab(id: ownerID, in: workspaces) != nil { continue }
+            _ = locateOwner(run)
+        }
     }
 
     /// A worker whose tab is in no open window: its task waits while the
     /// tab may come back (a close that can still be undone) or its session
     /// runs on detached; it is cancelled once that session ends with its
     /// close, failed when its program ended by itself, and cancelled at
-    /// once for a tab whose program ended with it (a native tab).
+    /// once for a tab whose program ended with it (a native tab). A task
+    /// read back after a relaunch is decided by its session on its host
+    /// (`settleRestoredWorkerIfGone`).
     @MainActor
     private func settleIfWorkerGone(_ task: AgentTask, now: Date) {
+        if let restoredAt = task.restoredAt {
+            settleRestoredWorkerIfGone(task, restoredAt: restoredAt, now: now)
+            return
+        }
         let awaySince = task.awaySince ?? now
         task.awaySince = awaySince
         if let hosting = task.hosting, let sessionID = task.hostSessionID {
@@ -1223,10 +1613,11 @@ extension CherryControlServer {
     }
 
     /// Looks at every open task's worker (the monitor sampler calls it):
-    /// its tab closed or its program ended, it waits for the user, it went
-    /// idle after its turn without reporting (asked once, then
-    /// `no_report`), or its kickoff is still to be typed; then types the
-    /// wake line of each run that settled.
+    /// its tab closed or its program ended, it waits for the user, its
+    /// kickoff is still to be typed or seen sent (`checkKickoff`), or it
+    /// went idle after its turn without asking for its task (the kickoff
+    /// again) or without reporting (asked once, then `no_report`); then
+    /// types the wake line of each run that settled.
     @MainActor
     func sampleTasks() async {
         for task in tasks.openTasks {
@@ -1237,6 +1628,9 @@ extension CherryControlServer {
             }
             let worker = found.session
             let workspace = found.workspace
+            // Shown before its host answered (a relaunch): nothing is
+            // decided or typed until the restore confirms the tab.
+            if worker.isProvisionalRestore { continue }
             let key = ObjectIdentifier(worker)
             let now = Date()
             if monitors.lastRefreshAt[key].map({ now.timeIntervalSince($0) >= monitors.refreshInterval }) ?? true {
@@ -1245,17 +1639,25 @@ extension CherryControlServer {
             }
             // A report may have come in meanwhile.
             guard !task.state.isSettled else { continue }
+            if let end = worker.systemSessionEnd {
+                // It came back ended: the system ended its session while
+                // Cherry was closed.
+                let reason = "its session " + AgentTaskRegistry.lowercasedFirst(end.message)
+                tasks.update(task, to: .failed, event: .failed, text: "The worker's session is gone: \(reason).", reason: reason)
+                continue
+            }
             let status = monitorStatus(session: worker, workspace: workspace, now: Date())
             switch status {
             case "closed":
                 settleIfWorkerGone(task, now: Date())
             case "exited", "disconnected":
                 let exit = worker.exitCode.map { " (exit \($0))" } ?? ""
+                let crashed = worker.hostSessionEnd?.isHolderLost == true
                 tasks.update(
                     task, to: .failed, event: .failed,
-                    text: "The worker ended\(exit) before it reported.",
+                    text: crashed ? "The worker's session host crashed before it reported." : "The worker ended\(exit) before it reported.",
                     result: screenTailResult(of: worker, task: task),
-                    reason: "it ended\(exit) before it reported"
+                    reason: crashed ? "its session host crashed before it reported" : "it ended\(exit) before it reported"
                 )
             case "needs_input", "permission":
                 if task.state != .needsInput {
@@ -1265,6 +1667,7 @@ extension CherryControlServer {
                     )
                 }
             case "working":
+                checkKickoff(task, worker: worker, now: Date())
                 if task.kickoffDeliveredAt != nil, task.state != .working {
                     tasks.update(task, to: .working, event: task.state == .needsInput ? .resumed : .started)
                 }
@@ -1272,12 +1675,13 @@ extension CherryControlServer {
                 if task.state == .needsInput {
                     tasks.update(task, to: .working, event: .resumed)
                 }
+                checkKickoff(task, worker: worker, now: Date())
                 checkTurnEnded(task, worker: worker, now: Date())
-                retryKickoffIfNeeded(task, worker: worker, now: Date())
             default:
                 // Cherry cannot tell (an agent it cannot read): only
-                // report_result settles the task.
-                break
+                // report_result settles the task; its kickoff is still
+                // looked after.
+                checkKickoff(task, worker: worker, now: Date())
             }
         }
         for run in tasks.runsAwaitingWake {
@@ -1304,19 +1708,218 @@ extension CherryControlServer {
         )
     }
 
-    /// An idle worker whose turn for the task ended without a report: asked
-    /// once to report; after that turn too, `no_report`. Never while it
-    /// waits on a monitor of its own, or while Cherry types into it.
+    // MARK: The kickoff
+
+    /// The worker's screen as the kickoff check reads it (oldest first),
+    /// with enough of its scrollback to count the kickoff's earlier copies.
+    @MainActor
+    private func kickoffScreen(of worker: TerminalSession, lineLimit: Int = 400) -> [String] {
+        terminalOutput(for: worker, startLine: nil, lineLimit: lineLimit).lines
+    }
+
+    /// A kickoff is about to be typed into the worker (by the spawn, or
+    /// again): notes when, and the copies of it its screen shows now.
+    @MainActor
+    func beginKickoff(_ task: AgentTask, into worker: TerminalSession) {
+        task.typing = .kickoff
+        task.lastKickoffAttemptAt = Date()
+        task.kickoffCopiesBefore = AgentTaskRegistry.kickoffCopies(taskID: task.id, in: kickoffScreen(of: worker))
+    }
+
+    @MainActor
+    private func screenKey(of worker: TerminalSession) -> String {
+        AgentScreenActivity.agentKey(name: worker.agentName ?? worker.title, commandLine: worker.subtitle)
+    }
+
+    /// The worker's screen has not changed for `interval`.
+    @MainActor
+    private func screenIsStill(_ worker: TerminalSession, for interval: TimeInterval, now: Date) -> Bool {
+        let changedAt = worker.lastContentChangeAt ?? worker.startedAt ?? .distantPast
+        return now.timeIntervalSince(changedAt) >= interval
+    }
+
+    /// Lines Cherry types into a tab found again after a relaunch wait this
+    /// long first.
+    @MainActor
+    private func inRestoredGrace(_ relinkedAt: Date?, now: Date) -> Bool {
+        relinkedAt.map { now.timeIntervalSince($0) < tasks.restoredLineGrace } ?? false
+    }
+
+    /// The kickoff until it is seen sent. Not typed yet (or typed with
+    /// nothing sent): typed once the worker sits at a still composer.
+    /// Typed: sent once the worker's turn starts after it, the worker asks
+    /// for its task, or the kickoff shows among its sent messages; else,
+    /// once the screen is still, left in the composer gets its Enter, and
+    /// not on screen at all is typed again (bounded; never one that may
+    /// have been typed). An agent whose screen Cherry cannot read keeps
+    /// the kickoff as typed.
+    @MainActor
+    private func checkKickoff(_ task: AgentTask, worker: TerminalSession, now: Date) {
+        guard task.kickoffDeliveredAt == nil, task.fetchedAt == nil, !task.isTypingIntoWorker else { return }
+        guard let typedAt = task.kickoffTypedAt else {
+            guard task.kickoffAttempts < AgentTaskRegistry.maximumKickoffAttempts else {
+                tasks.update(
+                    task, to: .failed, event: .failed,
+                    text: "Cherry could not type the kickoff into the worker.",
+                    reason: "Cherry could not type its kickoff into the worker"
+                )
+                return
+            }
+            typeKickoffIfReady(
+                task, worker: worker, now: now,
+                retry: task.kickoffAttempts > 0 ? "The kickoff was not typed (the worker took no input then): typing it again." : nil
+            )
+            return
+        }
+        let lines = kickoffScreen(of: worker)
+        let agent = screenKey(of: worker)
+        let placement = AgentTaskRegistry.kickoffPlacement(taskID: task.id, in: lines, agent: agent, copiesBefore: task.kickoffCopiesBefore)
+        if placement == .submitted || kickoffTurnStarted(worker, since: typedAt) {
+            noteKickoffDelivered(task, at: typedAt)
+            return
+        }
+        let lastAction = task.lastKickoffActionAt ?? typedAt
+        guard now.timeIntervalSince(lastAction) >= tasks.kickoffCheckDelay,
+              screenIsStill(worker, for: tasks.kickoffQuietInterval, now: now)
+        else { return }
+        let verdict = AgentScreenActivity.verdict(for: lines, agent: agent)
+        switch placement {
+        case .submitted:
+            break
+        case .composer:
+            guard verdict == .prompt else { return }
+            if task.kickoffEnterPresses < AgentTaskRegistry.maximumKickoffEnterPresses {
+                pressKickoffEnter(task, worker: worker, now: now)
+            } else if now.timeIntervalSince(lastAction) >= tasks.idleFallbackInterval {
+                tasks.update(
+                    task, to: .failed, event: .failed,
+                    text: "The kickoff stayed unsent in the worker's composer.",
+                    reason: "its kickoff stayed unsent in the worker's composer"
+                )
+            }
+        case .absent:
+            guard verdict == .prompt else {
+                // A screen Cherry cannot read (no composer, no marker): the
+                // kickoff counts as typed, as it always did.
+                if verdict == .none, !worker.agentActivityEvidenceIsStrong {
+                    noteKickoffDelivered(task, at: typedAt)
+                }
+                return
+            }
+            if task.kickoffUncertain || task.kickoffAttempts >= AgentTaskRegistry.maximumKickoffAttempts {
+                // Never typed twice when some of it may have been; a worker
+                // that sits idle without asking for its task did not get it.
+                if now.timeIntervalSince(lastAction) >= tasks.idleFallbackInterval {
+                    tasks.update(
+                        task, to: .failed, event: .failed,
+                        text: "The kickoff may not have reached the worker.",
+                        reason: "its kickoff may not have reached the worker, which never asked for its task"
+                    )
+                }
+                return
+            }
+            typeKickoffIfReady(task, worker: worker, now: now, retry: "The kickoff did not reach the worker: typing it again.")
+        }
+    }
+
+    /// The worker's turn started after `typedAt`: working evidence since,
+    /// or it was at work when the kickoff was submitted (its CLI queued it).
+    @MainActor
+    private func kickoffTurnStarted(_ worker: TerminalSession, since typedAt: Date) -> Bool {
+        if let evidence = worker.lastStrongWorkingEvidenceAt, evidence >= typedAt { return true }
+        if worker.agentWasWorkingAtLastSubmit, let submittedAt = worker.lastAgentSubmitAt, submittedAt >= typedAt { return true }
+        return false
+    }
+
+    /// The worker sits at a still composer: it takes input, nobody types
+    /// into it, no line of Cherry's goes in, its screen has not changed
+    /// for `kickoffQuietInterval` and shows its composer (when Cherry can
+    /// read it at all).
+    @MainActor
+    private func workerTakesKickoff(_ worker: TerminalSession, now: Date) -> Bool {
+        guard worker.acceptsControlInput, !worker.humanIsComposing(within: tasks.kickoffQuietInterval),
+              !isTypingWakeLine(into: worker), screenIsStill(worker, for: tasks.kickoffQuietInterval, now: now)
+        else { return false }
+        let verdict = AgentScreenActivity.verdict(for: kickoffScreen(of: worker, lineLimit: 80), agent: screenKey(of: worker))
+        return verdict == .prompt || (verdict == .none && !worker.agentActivityEvidenceIsStrong)
+    }
+
+    /// Types the kickoff (again) once the worker takes it, at most so
+    /// often; `retry` (the event's text) says why for a retry.
+    @MainActor
+    private func typeKickoffIfReady(_ task: AgentTask, worker: TerminalSession, now: Date, retry: String?) {
+        if let last = task.lastKickoffAttemptAt, now.timeIntervalSince(last) < tasks.kickoffRetryInterval { return }
+        guard !inRestoredGrace(task.relinkedAt, now: now), workerTakesKickoff(worker, now: now) else { return }
+        typeKickoff(task, into: worker, retry: retry)
+    }
+
+    @MainActor
+    private func typeKickoff(_ task: AgentTask, into worker: TerminalSession, retry: String?) {
+        beginKickoff(task, into: worker)
+        if let retry {
+            tasks.record(.kickoffRetry, for: task, text: retry)
+            tasks.publish()
+        }
+        let typedSince = Date()
+        Task { @MainActor [weak self] in
+            defer { task.typing = nil }
+            guard let self else { return }
+            do {
+                _ = try await self.typeCherryLine(task.kickoffLine, into: worker)
+                self.noteKickoff(task, delivered: true, error: nil, typedSince: typedSince)
+            } catch {
+                self.noteKickoff(task, delivered: false, error: error as? CherryControlError, typedSince: typedSince)
+            }
+        }
+    }
+
+    /// Presses Enter for a kickoff that sits unsent in the worker's
+    /// composer (its CLI dropped the first one), under the tab's typing
+    /// lock and never at a permission prompt or question menu.
+    @MainActor
+    private func pressKickoffEnter(_ task: AgentTask, worker: TerminalSession, now: Date) {
+        guard !inRestoredGrace(task.relinkedAt, now: now), worker.acceptsControlInput,
+              !worker.humanIsComposing(within: tasks.kickoffQuietInterval), !isTypingWakeLine(into: worker)
+        else { return }
+        task.typing = .kickoffEnter
+        task.kickoffEnterPresses += 1
+        task.lastKickoffActionAt = now
+        tasks.record(.kickoffRetry, for: task, text: "The kickoff sat unsent in the worker's composer: pressed its Enter.")
+        tasks.publish()
+        Task { @MainActor [weak self] in
+            defer {
+                task.typing = nil
+                task.lastKickoffActionAt = Date()
+            }
+            guard let self else { return }
+            do {
+                _ = try await self.typeCherryLine("", into: worker)
+            } catch {
+                SessionLog.debug("[task] kickoff Enter for \(task.id) not sent: \(error)")
+            }
+        }
+    }
+
+    /// An idle worker whose turn for the task ended: one that never asked
+    /// for its task gets the kickoff again (never the report nudge), at
+    /// most `maximumKickoffAttempts` kickoffs in all; one that has its
+    /// task and did not report is asked once to report; after that turn
+    /// too, `no_report`. Never while it waits on a monitor of its own,
+    /// while Cherry types into it, or within its grace after a relaunch.
     @MainActor
     private func checkTurnEnded(_ task: AgentTask, worker: TerminalSession, now: Date) {
         guard let baselineAt = task.turnBaselineAt, task.kickoffDeliveredAt != nil, !task.isTypingIntoWorker,
-              worker.agentSubmittedTurnCount >= task.turnBaseline
+              worker.agentSubmittedTurnCount >= task.turnBaseline, !inRestoredGrace(task.relinkedAt, now: now)
         else { return }
         let sawWork = worker.lastStrongWorkingEvidenceAt.map { $0 >= baselineAt } ?? false
         let completedThatTurn = worker.agentTurnState == .completed
             && (worker.lastAgentSubmitAt.map { $0 >= baselineAt } ?? false)
         guard sawWork || completedThatTurn || now.timeIntervalSince(baselineAt) >= tasks.idleFallbackInterval else { return }
         guard !awaitsMonitorWake(worker), !isTypingWakeLine(into: worker) else { return }
+        guard task.fetchedAt != nil else {
+            kickOffAgain(task, worker: worker, now: now)
+            return
+        }
         if task.nudgedAt == nil {
             if let last = task.lastNudgeAttemptAt, now.timeIntervalSince(last) < monitors.wakeMinimumInterval { return }
             guard subscriberTakesWakeLine(worker, now: now) else { return }
@@ -1331,15 +1934,47 @@ extension CherryControlServer {
         }
     }
 
+    /// A worker idle after its kickoff's turn that never asked for its
+    /// task: the kickoff again, checked like the first; once the kickoffs
+    /// are used up, `failed` with its last lines.
+    @MainActor
+    private func kickOffAgain(_ task: AgentTask, worker: TerminalSession, now: Date) {
+        guard task.kickoffAttempts < AgentTaskRegistry.maximumKickoffAttempts else {
+            tasks.update(
+                task, to: .failed, event: .failed,
+                text: "It went idle without asking for its task, even after \(task.kickoffAttempts) kickoffs.",
+                result: screenTailResult(of: worker, task: task),
+                reason: "it never called get_my_task, even after \(task.kickoffAttempts) kickoffs; the result is its screen's last lines"
+            )
+            return
+        }
+        if let last = task.lastKickoffAttemptAt, now.timeIntervalSince(last) < tasks.kickoffRetryInterval { return }
+        guard subscriberTakesWakeLine(worker, now: now) else { return }
+        // A new kickoff, checked again until it is seen sent.
+        task.kickoffDeliveredAt = nil
+        task.turnBaselineAt = nil
+        task.kickoffEnterPresses = 0
+        let lines = kickoffScreen(of: worker)
+        if AgentTaskRegistry.kickoffPlacement(taskID: task.id, in: lines, agent: screenKey(of: worker)) == .composer {
+            // Its last one still sits in the composer (taken as sent by
+            // mistake): its Enter, not a second copy.
+            task.kickoffTypedAt = now
+            task.kickoffCopiesBefore = AgentTaskRegistry.kickoffCopies(taskID: task.id, in: lines) - 1
+            pressKickoffEnter(task, worker: worker, now: now)
+            return
+        }
+        typeKickoff(task, into: worker, retry: "It went idle without asking for its task: typing the kickoff again.")
+    }
+
     /// Types the nudge (once): a nudge that may have been typed although it
     /// failed counts as typed.
     @MainActor
     private func nudge(_ task: AgentTask, worker: TerminalSession) {
-        task.isTypingIntoWorker = true
+        task.typing = .nudge
         task.lastNudgeAttemptAt = Date()
         let typedSince = Date()
         Task { @MainActor [weak self] in
-            defer { task.isTypingIntoWorker = false }
+            defer { task.typing = nil }
             guard let self else { return }
             do {
                 _ = try await self.typeCherryLine(AgentTaskRegistry.nudgeLine, into: worker)
@@ -1358,50 +1993,6 @@ extension CherryControlServer {
         }
     }
 
-    /// Types the kickoff again into an idle worker it did not reach (it
-    /// showed a prompt, say); gives up after `maximumKickoffAttempts`.
-    @MainActor
-    private func retryKickoffIfNeeded(_ task: AgentTask, worker: TerminalSession, now: Date) {
-        guard task.kickoffDeliveredAt == nil, !task.isTypingIntoWorker else { return }
-        guard task.kickoffRetryable else {
-            // Some of it may have been typed (its host's answer was lost):
-            // never typed twice. A worker that sits idle without asking
-            // for its task did not get it.
-            if let last = task.lastKickoffAttemptAt, now.timeIntervalSince(last) >= tasks.idleFallbackInterval {
-                tasks.update(
-                    task, to: .failed, event: .failed,
-                    text: "The kickoff may not have reached the worker.",
-                    reason: "its kickoff may not have reached the worker, which never asked for its task"
-                )
-            }
-            return
-        }
-        guard task.kickoffAttempts < AgentTaskRegistry.maximumKickoffAttempts else {
-            tasks.update(
-                task, to: .failed, event: .failed,
-                text: "Cherry could not type the kickoff into the worker.",
-                reason: "Cherry could not type its kickoff into the worker"
-            )
-            return
-        }
-        if let last = task.lastKickoffAttemptAt, now.timeIntervalSince(last) < tasks.kickoffRetryInterval { return }
-        guard worker.acceptsControlInput, !worker.humanIsComposing(within: monitors.humanTypingInterval),
-              !isTypingWakeLine(into: worker)
-        else { return }
-        task.isTypingIntoWorker = true
-        let typedSince = Date()
-        Task { @MainActor [weak self] in
-            defer { task.isTypingIntoWorker = false }
-            guard let self else { return }
-            do {
-                _ = try await self.typeCherryLine(task.kickoffLine, into: worker)
-                self.noteKickoff(task, delivered: true, error: nil, typedSince: typedSince)
-            } catch {
-                self.noteKickoff(task, delivered: false, error: error as? CherryControlError, typedSince: typedSince)
-            }
-        }
-    }
-
     /// Cherry types (or is about to type) a line into `session`: a
     /// monitor's or a run's wake line, a nudge or a kickoff.
     @MainActor
@@ -1414,19 +2005,28 @@ extension CherryControlServer {
 
     /// Types the run's wake line into its owner once every task settled,
     /// the owner did not read that yet, and it is idle (the monitors' rule,
-    /// `subscriberTakesWakeLine`).
+    /// `subscriberTakesWakeLine`). An owner whose tab is not open is given
+    /// up on, except after a relaunch, while its tab may still come back
+    /// (`relinkGrace`); one found again waits `restoredLineGrace` first.
     @MainActor
     func deliverRunWakeIfReady(_ run: AgentRun) {
         guard monitors.wakeLinesEnabled, !run.isWaking, run.activeWaits == 0,
-              tasks.awaitsWake(run), let owner = run.owner, let settledSeq = run.settledSeq
+              tasks.awaitsWake(run), let settledSeq = run.settledSeq
         else { return }
         let now = Date()
-        let ownerIsOpen = allOpenWorkspaces().contains { $0.sessions.contains { $0 === owner } }
-        if !ownerIsOpen || (run.settledAt.map { now.timeIntervalSince($0) > tasks.wakeLifetime } ?? false) {
-            // Nobody to wake any more.
+        if run.settledAt.map({ now.timeIntervalSince($0) > tasks.wakeLifetime }) ?? false {
             run.wokenSeq = settledSeq
+            tasks.scheduleSave()
             return
         }
+        guard let owner = locateOwner(run) else {
+            if let restoredAt = run.restoredAt, now.timeIntervalSince(restoredAt) < tasks.relinkGrace { return }
+            // Nobody to wake any more.
+            run.wokenSeq = settledSeq
+            tasks.scheduleSave()
+            return
+        }
+        if inRestoredGrace(run.relinkedAt, now: now) { return }
         if let last = run.lastWakeAt, now.timeIntervalSince(last) < monitors.wakeMinimumInterval { return }
         // One line at a time into a tab.
         guard !isTypingWakeLine(into: owner), subscriberTakesWakeLine(owner, now: now) else { return }
@@ -1444,6 +2044,60 @@ extension CherryControlServer {
                 SessionLog.debug("[task] wake line for \(run.id) not sent: \(error)")
             }
             run.lastWakeAt = Date()
+            self.tasks.scheduleSave()
         }
+    }
+}
+
+// MARK: - Where a kickoff stands
+
+/// Where the kickoff is on the worker's screen.
+enum KickoffPlacement: Equatable, Sendable {
+    /// On the composer's prompt line: typed, not sent.
+    case composer
+    /// Above the composer (among the sent messages), or on a screen with
+    /// no composer.
+    case submitted
+    /// Not on screen.
+    case absent
+}
+
+extension AgentTaskRegistry {
+    /// What a kickoff starts with: its task's mark on the worker's screen.
+    nonisolated static func kickoffMarker(taskID: String) -> String {
+        "You are Cherry task \(taskID)"
+    }
+
+    /// Where task `taskID`'s latest kickoff is in `lines` (a screen,
+    /// oldest first), when `copiesBefore` copies of it were there before it
+    /// was typed: a copy on the composer's prompt line (the last prompt
+    /// line on screen, `AgentScreenActivity.isInputPromptLine`, also inside
+    /// a framed composer `│ > …`) is unsent; one more copy than before
+    /// anywhere else (among the sent messages, or on a screen without a
+    /// composer) was sent; otherwise it is not there.
+    nonisolated static func kickoffPlacement(taskID: String, in lines: [String], agent: String, copiesBefore: Int = 0) -> KickoffPlacement {
+        let marker = kickoffMarker(taskID: taskID)
+        let copies = lines.indices.filter { lines[$0].contains(marker) }
+        guard let markerLine = copies.last else { return .absent }
+        if isComposerPromptLine(lines[markerLine], agent: agent),
+           !lines[(markerLine + 1)...].contains(where: { isComposerPromptLine($0, agent: agent) }) {
+            return .composer
+        }
+        return copies.count > copiesBefore ? .submitted : .absent
+    }
+
+    /// Copies of task `taskID`'s kickoff in `lines`.
+    nonisolated static func kickoffCopies(taskID: String, in lines: [String]) -> Int {
+        let marker = kickoffMarker(taskID: taskID)
+        return lines.reduce(0) { $0 + ($1.contains(marker) ? 1 : 0) }
+    }
+
+    /// A composer's prompt line, framed (`│ > …`) or not.
+    nonisolated static func isComposerPromptLine(_ line: String, agent: String) -> Bool {
+        var trimmed = Substring(line.trimmingCharacters(in: .whitespaces))
+        if let first = trimmed.first, first == "│" || first == "┃" || first == "|" {
+            trimmed = trimmed.dropFirst()
+        }
+        return AgentScreenActivity.isInputPromptLine(String(trimmed), agent: agent)
     }
 }

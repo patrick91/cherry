@@ -460,19 +460,33 @@ Code, Codex and Pi.
   You are Cherry task task-…: call get_my_task (Cherry MCP) for your brief, do it, then call report_result. Without Cherry MCP tools, run "$CHERRY_MCP_HELPER" --call get_my_task, then "$CHERRY_MCP_HELPER" --call report_result '{"value":…,"status":"ok","summary":"…"}'.
   ```
 
-  The brief itself is never typed. A kickoff that could not be typed
-  (the worker showed a prompt) is typed again once the worker is idle, at
-  most three times in all; then the task is `failed`.
+  The brief itself is never typed. Into a CLI Cherry knows, the first
+  kickoff waits for its composer on a screen still for a second. Typed is
+  not sent: an agent CLI can show its composer before it takes input
+  (Claude Code while its MCP servers load) and drop the text or its
+  Enter. Until the worker's turn starts, it calls `get_my_task`, or the
+  kickoff shows among its sent messages, Cherry looks at its screen once
+  it has been still for a second: a kickoff left unsent in the composer
+  gets its Enter (at most twice), and one not on screen at all is typed
+  again; so is one that could not be typed (the worker showed a prompt),
+  once the worker is idle. That is at most three kickoffs in all (each
+  retry is a `kickoff_retry` event); then the task is `failed`. A kickoff
+  that may have been typed although its input failed
+  (`input_maybe_delivered`) is never typed again. An agent whose screen
+  Cherry cannot read keeps its kickoff as typed.
 - `wait_for_tasks` with `run_id` or `task_ids` (default: the caller's own
   open runs), `until` (`any`, the default: a task settled or needs input;
   `all`: every task settled), `cursor` and `timeout_ms` (at most and by
   default 50000; 0 returns at once). It returns `events` after `cursor`
-  (`queued`, `started`, `progress`, `needs_input`, `resumed`, `nudged`,
-  `reported`, `failed`, `no_report`, `cancelled`, each with its `seq`),
-  `completed` and `pending` tasks, `cursor` (pass it back next time),
-  `timed_out`, and the `runs` with their counts. A timeout is a normal
-  answer: call again, or end the turn. Each run keeps its own events (at
-  most 2000), and a task keeps one event of each kind (a newer one, such
+  (`queued`, `started`, `progress`, `needs_input`, `resumed`,
+  `kickoff_retry`, `nudged`, `reported`, `failed`, `no_report`,
+  `cancelled`, each with its `seq`), `completed` and `pending` tasks,
+  `cursor` (pass it back next time), `timed_out`, and the `runs` with
+  their counts. A cursor Cherry cannot go on from (it names events a
+  relaunch lost) is answered at once with `cursor_reset: true`, the events
+  from the first one kept, and every selected task's state. A timeout is
+  a normal answer: call again, or end the turn. Each run keeps its own
+  events (at most 2000), and a task keeps one event of each kind (a newer one, such
   as a re-report or the latest progress, replaces it), so one chatty
   worker never pushes out other runs' events. `until: any` returns for a
   task that settled (or needs input) after `cursor` even when its event
@@ -560,7 +574,11 @@ also watches each open task's worker:
   `done`) without reporting: Cherry types "Please call report_result with
   your result." once, when it is idle. Idle again after that turn without a
   report, the task is `no_report`, and its result is the worker's last
-  screen lines (`source: screen_tail`). A worker Cherry cannot read (an
+  screen lines (`source: screen_tail`). Only a worker that has its task
+  (it called `get_my_task`, `report_progress` or `report_result`) is ever
+  asked to report: one whose turn ended without asking for its task gets
+  the kickoff again (`kickoff_retry`, within the three kickoffs), and then
+  its task is `failed` with its last lines. A worker Cherry cannot read (an
   agent with no recognizable composer or working marker) is never
   nudged: only its report settles it. Neither the nudge nor `no_report`
   comes while the worker waits on a monitor of its own: a subscription
@@ -583,10 +601,33 @@ task's state (queued, working, needs you, reported, no report, failed,
 cancelled); hovering shows the result's summary. While one of its runs is
 open, the orchestrator's row shows how many of its tasks settled ("3/5").
 
-**Scope and lifetime.** Tasks live in Cherry's memory, each tied to its
-worker's tab (by its id): a relaunch forgets them (a restored worker's
-`get_my_task` answers `no_assignment`, and run and task ids become
-`unknown_run` and `unknown_task`). A caller on another Mac reaches only the
+**Scope and lifetime.** Each task is tied to its worker's tab (by its id,
+or its persistent session). Tasks survive a relaunch of Cherry (quit,
+keep the sessions, open it again): Cherry saves every run and task (brief,
+result schema, state, result as stored, progress, the worker's and the
+orchestrator's tabs and sessions, the Mac, events, seqs and cursors) to
+`agent-tasks.json` in its Application Support's `Workspaces` folder, a
+second or so after each change and at quit; only the copy of Cherry that
+owns the saved tabs writes it (a second copy neither reads nor writes
+it), and it is the user's alone (mode 0600, never read through a link,
+left out of backups). After a relaunch each worker and orchestrator is
+found again by its tab id (or a tab of its session): the worker's
+`get_my_task` and `report_result`, and the orchestrator's `wait_for_tasks`
+(from the cursor it had), `get_task` and `list_tasks`, go on as before.
+Nothing is typed into a tab that came back for a few seconds, and its
+idle grace starts over, so it is never nudged at once; a kickoff already
+typed is never typed again, and one that never was is typed once the
+worker is idle. A worker whose tab does not come back is decided by its
+session on its host: one that runs on (a closed window's tab, a detached
+worker) keeps the task waiting, and may report; one that ended, or is gone
+from its host (it ended while Cherry was closed, the Mac restarted, its
+holder was lost), fails the task (`cancelled` when Cherry ended it on
+purpose) with the reason; a worker that ran no persistent session ended
+with Cherry, and its task fails. A worker on another Mac Cherry cannot
+reach keeps its task waiting until that Mac is connected again. Settled
+runs are forgotten a day after they settled, or once none of their tabs
+has been open or running for ten minutes; a forgotten run's ids are
+`unknown_run` and `unknown_task`. A caller on another Mac reaches only the
 tasks its Mac's callers made, and This Mac's callers never see those.
 There is no limit on how many workers run at once yet: they share the
 user's agent subscriptions.

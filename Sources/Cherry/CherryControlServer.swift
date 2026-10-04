@@ -159,7 +159,10 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     func stop() {
-        Task { @MainActor [monitors] in monitors.stopSampler() }
+        Task { @MainActor [monitors, tasks] in
+            monitors.stopSampler()
+            tasks.pruneTask?.cancel()
+        }
         acceptSource?.cancel()
         acceptSource = nil
         if listenFileDescriptor >= 0 {
@@ -437,6 +440,8 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     func handleRequestData(_ data: Data, peerPID: Int32?, origin: CallerOrigin = .thisMac) async -> CherryControlResponse {
+        // The last run's tasks are read back first (at launch).
+        if let restoring = tasks.restoreTask { await restoring.value }
         do {
             let (credentials, request) = try CherryControlEnvelope.decode(data)
             if let credentials {
@@ -540,7 +545,8 @@ final class CherryControlServer: @unchecked Sendable {
     let monitors: AgentMonitorRegistry
 
     /// Tasks (`spawn_agent` with `task`, `report_result`, `wait_for_tasks`):
-    /// in memory, each tied to its worker's tab and window.
+    /// each tied to its worker's tab; the app's are saved, so they survive
+    /// its relaunch (`configureTaskPersistence`).
     let tasks: AgentTaskRegistry
 
     /// Tests: the caller's own tab, in place of the peer's process ancestry.
@@ -1801,8 +1807,10 @@ final class CherryControlServer: @unchecked Sendable {
         let session: TerminalSession
         let agent: AgentToolDefinition?
         // A task's worker (`spawn_agent` with `task`): its kickoff line is
-        // the agent's first input.
+        // the agent's first input. Until it is typed, the task's sampler
+        // types nothing into it (`AgentTaskTyping.kickoffPending`).
         var task: AgentTask?
+        defer { task?.typing = nil }
         if kind != .agent, request.task != nil {
             throw CherryControlError(code: "invalid_process_request", message: "Only agent processes take a task.")
         }
@@ -1837,6 +1845,7 @@ final class CherryControlServer: @unchecked Sendable {
             )
             if let taskPlan {
                 task = registerTask(taskPlan, worker: session, workspace: workspace)
+                task?.typing = .kickoffPending
             }
             agent = agentDefinition
         case .command:
@@ -1859,7 +1868,11 @@ final class CherryControlServer: @unchecked Sendable {
         let text = task?.kickoffLine ?? request.text
         let submit = task != nil ? true : request.submit
         if (text != nil || request.rawBase64 != nil || submit == true), let agent {
-            await waitForAgentInitialInputReadiness(session: session, agent: agent)
+            if task != nil {
+                await waitForTaskKickoffReadiness(session: session, agent: agent)
+            } else {
+                await waitForAgentInitialInputReadiness(session: session, agent: agent)
+            }
         }
 
         let sentBytes: Int
@@ -1877,6 +1890,7 @@ final class CherryControlServer: @unchecked Sendable {
                 // every line Cherry types (`typeCherryLine`).
                 let typingLock = task != nil ? tasks.typingLocks : nil
                 await typingLock?.acquire(session.id)
+                if let task { beginKickoff(task, into: session) }
                 // The process exists either way: sentBytes says whether its
                 // first input reached it.
                 do {
@@ -3132,13 +3146,46 @@ final class CherryControlServer: @unchecked Sendable {
         }
     }
 
+    /// How long a task's first kickoff waits, after the agent's usual
+    /// readiness, for its composer on a still screen.
+    static let taskKickoffComposerWait: TimeInterval = 6
+
+    /// Before a task's first kickoff into a CLI Cherry knows: its usual
+    /// readiness (its startup prompt answered) with a full second of a
+    /// still screen, then until it shows its composer on a screen still for
+    /// a second (at most `taskKickoffComposerWait` more). A CLI can show its
+    /// composer before it takes input (Claude Code while its MCP servers
+    /// load), so the kickoff is checked after it is typed too
+    /// (`checkKickoff`).
     @MainActor
-    private func waitForDeferredAgentInputReadiness(session: TerminalSession) async {
+    private func waitForTaskKickoffReadiness(session: TerminalSession, agent: AgentToolDefinition) async {
+        guard shouldDeferInitialInput(for: agent) else { return }
+        await waitForDeferredAgentInputReadiness(session: session, quietInterval: 1)
+        let key = AgentScreenActivity.agentKey(name: agent.name, commandLine: agent.commandLine)
+        let deadline = Date().addingTimeInterval(Self.taskKickoffComposerWait)
+        while Date() < deadline {
+            switch session.state {
+            case .disconnected where session.isPersistentLocalSession && session.isRunning, .launching, .live:
+                break
+            case .exited, .failed, .disconnected:
+                return
+            }
+            await session.refreshContentFromHostIfNeeded(maximumAge: session.hostContentPollInterval, recentOnly: true)
+            let changedAt = session.lastContentChangeAt ?? session.startedAt ?? .distantPast
+            if Date().timeIntervalSince(changedAt) >= 1 {
+                let lines = terminalOutput(for: session, startLine: nil, lineLimit: 80).lines
+                if AgentScreenActivity.verdict(for: lines, agent: key, includesAnswerMenus: false) == .prompt { return }
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    @MainActor
+    private func waitForDeferredAgentInputReadiness(session: TerminalSession, quietInterval: TimeInterval = 0.75) async {
         var startedAt = Date()
         // A session being created holds the wait no longer than this.
         let creationDeadline = startedAt.addingTimeInterval(30)
         let maximumWait: TimeInterval = 6
-        let quietInterval: TimeInterval = 0.75
         let noOutputFallback: TimeInterval = 2.5
         let maximumStartupAcknowledgements = 2
         var acknowledgedStartupPromptCount = 0

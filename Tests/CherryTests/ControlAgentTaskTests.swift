@@ -442,9 +442,9 @@ struct ControlAgentTaskTests {
 
     // MARK: Fallback
 
-    /// A worker that finishes its turn without report_result is asked once;
-    /// idle again without a report, its task is no_report, with its
-    /// screen's last lines as the result.
+    /// A worker that read its task and finishes its turn without
+    /// report_result is asked once; idle again without a report, its task
+    /// is no_report, with its screen's last lines as the result.
     @Test func idleWorkerIsNudgedOnceThenMarkedNoReport() async throws {
         let harness = try ControlAgentWaitHarness()
         defer { harness.stop() }
@@ -453,6 +453,10 @@ struct ControlAgentTaskTests {
         let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
         let (worker, spawned) = try await harness.spawnTask(agent: "Fakeworker", command: script, task: "Say hi")
         let taskID = try #require(spawned.task?.taskID)
+        // It read its brief (only a worker that has its task is asked to
+        // report).
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+        #expect(try await harness.send(.getMyTask).error == nil)
 
         let nudged = try await harness.waitForOutput("handled \(AgentTaskRegistry.nudgeLine)", in: worker, seconds: 15)
         #expect(nudged.contains("handled You are Cherry task \(taskID)"), "the kickoff turn ran first: \(nudged)")
@@ -474,9 +478,9 @@ struct ControlAgentTaskTests {
 
         let events = try await harness.waitForTasks(.init(taskIDs: [taskID], timeoutMilliseconds: 0))
         #expect(events.events.map(\.kind).contains(.nudged))
+        #expect(!events.events.map(\.kind).contains(.kickoffRetry))
         #expect(events.events.last?.kind == .noReport)
         // A report after all replaces the fallback.
-        harness.server.callerSessionResolverForTesting = { _ in worker }
         let late = try await harness.send(.reportResult(.init(value: .string("hi"), summary: "Said hi")))
         guard case .reportResult(let result)? = late.result else {
             Issue.record("Expected reportResult, got \(late)")
@@ -817,6 +821,7 @@ struct ControlAgentTaskLimitTests {
         let (worker, spawned) = try await harness.spawnTask(agent: "Fakeworker", command: script, task: "Wait for the job")
         let taskID = try #require(spawned.task?.taskID)
         harness.server.callerSessionResolverForTesting = { _ in worker }
+        #expect(try await harness.send(.getMyTask).error == nil)
         let subscribed = try await harness.send(.subscribe(.init(processIDs: [job.id.uuidString])))
         guard case .subscribe(let subscription)? = subscribed.result else {
             Issue.record("Expected subscribe, got \(subscribed)")
@@ -851,5 +856,191 @@ struct ControlAgentTaskLimitTests {
         #expect(output.contains("handled [cherry] LINE-ONE"), "\(output)")
         #expect(!output.contains("LINE-ONE[cherry] LINE-TWO") && !output.contains("LINE-TWO[cherry] LINE-ONE"), "\(output)")
         #expect(!harness.server.tasks.typingLocks.isBusy(agent.id))
+    }
+}
+
+// MARK: - The kickoff, checked
+
+/// Where a kickoff stands on a worker's screen: on the composer's prompt
+/// line it is unsent; one more copy than before it was typed, anywhere
+/// else, was sent; otherwise it is not there.
+@Test func ControlAgentTaskKickoffPlacementReadsTheComposer() {
+    let id = "task-0123456789ab"
+    let kickoff = AgentTaskRegistry.kickoffLine(taskID: id)
+    let start = String(kickoff.prefix(60))
+    func placement(_ lines: [String], agent: String = "claude", before: Int = 0) -> KickoffPlacement {
+        AgentTaskRegistry.kickoffPlacement(taskID: id, in: lines, agent: agent, copiesBefore: before)
+    }
+    // Typed, its Enter lost: on the composer's prompt line, wrapped.
+    #expect(placement(["Welcome back", "", "\u{276F} " + start, "  for your brief, do it", "", "? for shortcuts"]) == .composer)
+    #expect(placement(["\u{256D}\u{2500}\u{256E}", "\u{2502} > " + start + " \u{2502}", "\u{2570}\u{2500}\u{256F}"]) == .composer)
+    // Sent: among the messages, the composer below it.
+    #expect(placement(["> " + start, "", "\u{2736} Reticulating\u{2026} (esc to interrupt)", "\u{276F} "]) == .submitted)
+    // Dropped: not on screen at all.
+    #expect(placement(["Welcome back", "", "\u{276F} "]) == .absent)
+    // Typed again: an earlier copy alone is not this one.
+    #expect(placement(["> " + start, "\u{23FA} I have no task.", "\u{276F} "], before: 1) == .absent)
+    #expect(placement(["> " + start, "\u{23FA} ok", "> " + start, "\u{276F} "], before: 1) == .submitted)
+    #expect(placement(["> " + start, "\u{23FA} ok", "\u{276F} " + start], before: 1) == .composer)
+    // A screen with no composer at all (an echoing program): sent.
+    #expect(placement([start, start], agent: "worker") == .submitted)
+    #expect(AgentTaskRegistry.kickoffCopies(taskID: id, in: ["> " + start, "x", "\u{276F} " + start]) == 2)
+}
+
+@MainActor
+private extension ControlAgentWaitHarness {
+    /// Fast sampling, and short kickoff checks; a worker's turn that ends
+    /// without its task read waits `wakeQuiet` before its kickoff comes
+    /// again, so a test can read the task first.
+    func useFastKickoffChecks(wakeQuiet: TimeInterval = 0.3, retryInterval: TimeInterval = 0.8) {
+        useFastTaskSampling()
+        server.monitors.wakeQuietInterval = wakeQuiet
+        server.tasks.kickoffCheckDelay = 0.4
+        server.tasks.kickoffQuietInterval = 0.5
+        server.tasks.kickoffRetryInterval = retryInterval
+    }
+
+    func script(_ name: String, _ body: String) throws -> String {
+        let url = projectRoot.appendingPathComponent(name)
+        try body.write(to: url, atomically: true, encoding: .utf8)
+        chmod(url.path, 0o755)
+        return url.path
+    }
+
+    func count(_ text: String, in session: TerminalSession) async throws -> Int {
+        try await output(of: session).components(separatedBy: text).count - 1
+    }
+}
+
+@MainActor
+@Suite(.serialized)
+struct ControlAgentTaskKickoffTests {
+    /// Claude Code shows its composer before it takes input (while its MCP
+    /// servers load) and drops what is typed meanwhile: the kickoff that
+    /// went nowhere is typed again once the composer is back and still,
+    /// and the worker gets it once, sent.
+    @Test func kickoffDroppedWhileTheWorkerStartsIsTypedAgainAndSentOnce() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        // Typed again no sooner than 1.5 s after the first: after the
+        // startup below is over.
+        harness.useFastKickoffChecks(wakeQuiet: 3, retryInterval: 1.5)
+        harness.server.start()
+        // Named as Claude: Cherry waits for its composer before the first
+        // kickoff (a second of quiet screen: about 1 s in), as it does for
+        // the real one.
+        let script = try harness.script("slow-start.sh", """
+        #!/bin/sh
+        stty -echo 2>/dev/null
+        printf '\\342\\235\\257 \\n'
+        # Starting up: whatever is typed now is lost.
+        perl -MPOSIX -MTime::HiRes=sleep -e 'for (1..20) { sleep 0.1; POSIX::tcflush(0, POSIX::TCIFLUSH()) }'
+        printf '\\342\\235\\257 \\n'
+        while IFS= read -r line; do
+          printf '> %s\\n\\n\\342\\235\\257 \\n' "$line"
+          sleep 0.1
+          printf '\\342\\234\\266 Reticulating\\342\\200\\246 (esc to interrupt)'
+          sleep 0.3
+          printf '\\r\\033[2K\\342\\217\\272 handled %s\\n\\n\\342\\235\\257 \\n' "$line"
+        done
+        """)
+        let (worker, spawned) = try await harness.spawnTask(agent: "Claude", command: script, task: "Start slowly")
+        let taskID = try #require(spawned.task?.taskID)
+        #expect(spawned.sentBytes > 0, "the first kickoff was typed (and lost)")
+
+        let handled = try await harness.waitForOutput("handled You are Cherry task \(taskID)", in: worker, seconds: 20)
+        #expect(handled.contains("handled You are Cherry task \(taskID)"), "the kickoff never reached the worker: \(handled)")
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+        #expect(try await harness.send(.getMyTask).error == nil)
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(try await harness.count("handled You are Cherry task \(taskID)", in: worker) == 1)
+        #expect(try await harness.count("> You are Cherry task \(taskID)", in: worker) == 1, "sent once")
+        let task = try #require(harness.server.tasks.tasks[taskID])
+        #expect(task.kickoffDeliveredAt != nil)
+        #expect(task.kickoffAttempts >= 2, "typed again: \(task.kickoffAttempts)")
+        let events = try await harness.waitForTasks(.init(taskIDs: [taskID], timeoutMilliseconds: 0))
+        #expect(events.events.contains { $0.kind == .kickoffRetry && $0.text?.contains("did not reach") == true })
+        #expect(!events.events.contains { $0.kind == .nudged })
+        #expect(!(try await harness.output(of: worker)).contains(AgentTaskRegistry.nudgeLine))
+    }
+
+    /// A kickoff whose text reached the composer but whose Enter was lost
+    /// gets its Enter (once the composer is still), and is never typed a
+    /// second time.
+    @Test func kickoffLeftInTheComposerGetsItsEnter() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastKickoffChecks(wakeQuiet: 3)
+        harness.server.start()
+        // A composer that shows what is typed and loses its first Enter.
+        let script = try harness.script("lost-enter.pl", """
+        #!/usr/bin/perl
+        use strict;
+        use warnings;
+        $| = 1;
+        system("stty raw -echo 2>/dev/null");
+        my $composer = "\\xe2\\x9d\\xaf ";
+        print $composer;
+        my $buffer = "";
+        my $lost = 0;
+        while (sysread(STDIN, my $byte, 1)) {
+          if ($byte eq "\\r" || $byte eq "\\n") {
+            if (!$lost) { $lost = 1; next; }
+            next if $buffer eq "";
+            print "\\r\\n> $buffer\\r\\n\\r\\n";
+            select(undef, undef, undef, 0.1);
+            print "\\xe2\\x9c\\xb6 Reticulating\\xe2\\x80\\xa6 (esc to interrupt)";
+            select(undef, undef, undef, 0.3);
+            print "\\r\\033[2K\\xe2\\x8f\\xba handled $buffer\\r\\n\\r\\n$composer";
+            $buffer = "";
+          } else {
+            $buffer .= $byte;
+            print $byte;
+          }
+        }
+        """)
+        let (worker, spawned) = try await harness.spawnTask(agent: "Claude", command: script, task: "Lose the Enter")
+        let taskID = try #require(spawned.task?.taskID)
+
+        let handled = try await harness.waitForOutput("handled You are Cherry task \(taskID)", in: worker, seconds: 20)
+        #expect(handled.contains("handled You are Cherry task \(taskID)"), "the kickoff stayed in the composer: \(handled)")
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+        #expect(try await harness.send(.getMyTask).error == nil)
+        try await Task.sleep(for: .milliseconds(1_000))
+        #expect(try await harness.count("handled You are Cherry task \(taskID)", in: worker) == 1)
+        let task = try #require(harness.server.tasks.tasks[taskID])
+        #expect(task.kickoffAttempts == 1, "the text was never typed again")
+        #expect(task.kickoffEnterPresses == 1)
+        let events = try await harness.waitForTasks(.init(taskIDs: [taskID], timeoutMilliseconds: 0))
+        #expect(events.events.contains { $0.kind == .kickoffRetry && $0.text?.contains("Enter") == true })
+    }
+
+    /// A worker whose turn ends without asking for its task is never told
+    /// to report: it gets the kickoff again, at most three kickoffs in all,
+    /// and then its task fails with its last lines.
+    @Test func workerThatNeverAsksForItsTaskGetsTheKickoffAgainNeverTheNudge() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastKickoffChecks()
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let (worker, spawned) = try await harness.spawnTask(agent: "Claude", command: script, task: "Ignore it")
+        let taskID = try #require(spawned.task?.taskID)
+
+        var detail = try await harness.task(taskID)
+        for _ in 0..<300 where !detail.task.state.isSettled {
+            try await Task.sleep(for: .milliseconds(100))
+            detail = try await harness.task(taskID)
+        }
+        #expect(detail.task.state == .failed)
+        #expect(detail.task.reason?.contains("never called get_my_task") == true, "\(String(describing: detail.task.reason))")
+        #expect(detail.result?.source == "screen_tail")
+        #expect(!detail.task.nudged)
+        let output = try await harness.output(of: worker)
+        #expect(!output.contains(AgentTaskRegistry.nudgeLine), "nudged a worker that never read its task: \(output)")
+        #expect(output.components(separatedBy: "handled You are Cherry task \(taskID)").count - 1 == AgentTaskRegistry.maximumKickoffAttempts)
+        let events = try await harness.waitForTasks(.init(taskIDs: [taskID], timeoutMilliseconds: 0))
+        #expect(events.events.contains { $0.kind == .kickoffRetry && $0.text?.contains("without asking for its task") == true })
+        #expect(!events.events.contains { $0.kind == .nudged })
     }
 }

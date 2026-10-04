@@ -9,7 +9,8 @@ import Foundation
 // checked against the task's `result_schema`. The orchestrator waits with
 // `wait_for_tasks` (or ends its turn: Cherry types one line into its tab
 // once the run settled) and reads results with `get_task`. Task records
-// live in the app's memory (docs/mcp.md, Tasks and results).
+// are kept by the app, which saves them (`agent-tasks.json`) so they
+// survive its relaunch (docs/mcp.md, Tasks and results).
 
 extension CherryControl {
     /// The longest `wait_for_tasks` call, as `wait_for_events`.
@@ -274,6 +275,11 @@ public enum AgentTaskEventKind: String, Codable, CaseIterable, Equatable, Sendab
     case resumed
     /// Cherry asked the idle worker once to report.
     case nudged
+    /// The kickoff did not reach the worker, sat unsent in its composer,
+    /// or the worker went idle without asking for its task: Cherry typed
+    /// it again (or pressed its Enter). Never the report nudge: a worker
+    /// that has not read its task is not asked to report.
+    case kickoffRetry = "kickoff_retry"
     case reported
     case failed
     case noReport = "no_report"
@@ -523,6 +529,11 @@ public struct WaitForTasksResult: Codable, Equatable, Sendable {
     /// Some events after `cursor` were no longer kept.
     public let eventsDropped: Bool
     public let runs: [AgentRunInfo]
+    /// True when `cursor` was not one Cherry can continue from (events
+    /// after it were lost when Cherry relaunched): the answer starts from
+    /// the first event it keeps, with every selected task's state now.
+    /// Absent otherwise.
+    public let cursorReset: Bool?
 
     public init(
         events: [AgentTaskEvent],
@@ -532,7 +543,8 @@ public struct WaitForTasksResult: Codable, Equatable, Sendable {
         timedOut: Bool,
         moreEvents: Int,
         eventsDropped: Bool,
-        runs: [AgentRunInfo]
+        runs: [AgentRunInfo],
+        cursorReset: Bool? = nil
     ) {
         self.events = events
         self.completed = completed
@@ -542,6 +554,7 @@ public struct WaitForTasksResult: Codable, Equatable, Sendable {
         self.moreEvents = moreEvents
         self.eventsDropped = eventsDropped
         self.runs = runs
+        self.cursorReset = cursorReset
     }
 }
 

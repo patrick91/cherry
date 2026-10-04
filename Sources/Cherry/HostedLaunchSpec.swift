@@ -44,6 +44,10 @@ struct HostedLaunchSpec: Equatable, Sendable {
     /// Create's `cwd`, as the tab asked for it (not canonicalised); `PWD` is
     /// the same path. The host rejects a directory that does not exist.
     let workingDirectory: String
+    /// Never sent. A device's command or agent launched without the
+    /// device's login environment (`RemoteLaunchSpec`): why Cherry could not
+    /// read it, which the tab says if the shell then finds no such command.
+    var loginPathProblem: String? = nil
 
     /// The staged Ghostty resources copy the session reads (its content
     /// hash, `GhosttyStagedResources`): the `cherry.resources` tag, which

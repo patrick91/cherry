@@ -51,6 +51,12 @@
 # tab's test token against the forwarded socket (list_processes), checks
 # that a missing or wrong token is refused, and that `-O cancel` and the
 # cleanup take the socket away ("Cherry on Laptop is not reachable").
+# The Swift test RemoteDeviceRealHostLoginPathIsReadOverSSHWithoutATerminal
+# reads a device's login PATH the way the app does (zsh -l -i with a .zshrc
+# in the private home that prints and asks, in an sshd session with no
+# terminal and standard input closed), then runs a device agent's line
+# (`zsh -l -c`, PATH set from CHERRY_LOGIN_PATH) there, which finds a tool
+# only that .zshrc puts on PATH.
 # Exits 2 when sshd cannot run here (then use Scripts/fake-remote-mac, which
 # the Swift tests use).
 set -euo pipefail
@@ -290,6 +296,20 @@ if ! (cd "$root" && env PATH="$original_path" CHERRY_TEST_HOST_INTEGRATION=1 \
 fi
 grep -q "Test $forward_test() passed" "$dir/swift-forward.log" || { cat "$dir/swift-forward.log" >&2; fail "$forward_test did not run"; }
 pass "a page fetched through ssh -O forward on a master with ClearAllForwardings=yes, then cancelled"
+
+# A device's login PATH read over SSH (the app's
+# RemoteLoginEnvironmentCapture, run by its Swift test against this sshd).
+path_test=RemoteDeviceRealHostLoginPathIsReadOverSSHWithoutATerminal
+if ! (cd "$root" && env PATH="$original_path" CHERRY_TEST_HOST_INTEGRATION=1 \
+  CHERRY_TEST_LOOPBACK_SSH="$dir/bin/ssh" CHERRY_TEST_LOOPBACK_HOME="$dir/remote/home" \
+  CHERRY_TEST_LOOPBACK_DESTINATION=loopback \
+  swift test --skip-build --no-parallel --filter "$path_test" >"$dir/swift-path.log" 2>&1); then
+  cat "$dir/swift-path.log" >&2
+  fail "the login PATH read over SSH ($path_test)"
+fi
+grep -q "Test $path_test() passed" "$dir/swift-path.log" || { cat "$dir/swift-path.log" >&2; fail "$path_test did not run"; }
+grep -q "^sh -s\$" "$dir/commands" || fail "the login PATH was read through sh -s"
+pass "a device's login PATH read from zsh -l -i over SSH (no terminal, standard input closed), and an agent's line found its tool"
 
 # Cherry MCP through a reverse forward of a Unix socket (the app's
 # RemoteMCPForwards and the real CherryMCP, run by their Swift test).

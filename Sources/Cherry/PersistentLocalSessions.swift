@@ -30,6 +30,9 @@ struct PersistentSessionLaunch: Equatable, Sendable {
     let attachment: HostedSessionAttachment
     /// The session as the host described it then.
     let info: HostedSessionInfo
+    /// A device's command or agent created without the device's login
+    /// environment: why (`HostedLaunchSpec.loginPathProblem`).
+    var loginPathProblem: String? = nil
 }
 
 /// Where a tab's program stands, as the local host last reported it.
@@ -132,6 +135,11 @@ struct PersistentHostProfile: Sendable {
     /// home folder and Ghostty resources (`RemoteDeviceStore`); nil for This
     /// Mac.
     var device: @MainActor @Sendable () -> RemoteLaunchSpec.Device? = { nil }
+    /// Waits (bounded) for the device's login environment to be read, for a
+    /// command or agent launched while it is not known
+    /// (`RemoteDeviceStore.awaitLoginEnvironmentForLaunch`); returns at once
+    /// for This Mac.
+    var awaitLoginEnvironment: @MainActor @Sendable () async -> Void = {}
 
     /// This Mac's own host.
     static let thisMac = PersistentHostProfile(
@@ -147,7 +155,8 @@ struct PersistentHostProfile: Sendable {
         host: HostedSessionHost,
         displayName: String,
         machineNames: Set<String> = [],
-        device: @escaping @MainActor @Sendable () -> RemoteLaunchSpec.Device? = { nil }
+        device: @escaping @MainActor @Sendable () -> RemoteLaunchSpec.Device? = { nil },
+        awaitLoginEnvironment: @escaping @MainActor @Sendable () async -> Void = {}
     ) -> PersistentHostProfile {
         PersistentHostProfile(
             host: host,
@@ -155,7 +164,8 @@ struct PersistentHostProfile: Sendable {
             allowsNativeFallback: false,
             isThisMac: false,
             machineNames: { machineNames },
-            device: device
+            device: device,
+            awaitLoginEnvironment: awaitLoginEnvironment
         )
     }
 
@@ -336,7 +346,11 @@ final class PersistentHostSessions {
             owner: remoteOwner(installationID: installationID),
             control: control ?? { HostControlRegistry.shared.control(for: host) },
             installationUnavailableReason: installationUnavailableReason,
-            launchSpec: RemoteLaunchSpec.builder(remoteShell: remoteShell) { profile.device() ?? RemoteLaunchSpec.Device() },
+            launchSpec: RemoteLaunchSpec.builder(
+                remoteShell: remoteShell,
+                device: { profile.device() ?? RemoteLaunchSpec.Device() },
+                awaitLoginEnvironment: profile.awaitLoginEnvironment
+            ),
             status: status,
             instanceLock: instanceLock,
             terminalColors: terminalColors,
@@ -799,7 +813,8 @@ final class PersistentHostSessions {
                 executablePath: executable.path,
                 environment: loginEnvironment ?? [:]
             ),
-            info: info
+            info: info,
+            loginPathProblem: spec.loginPathProblem
         )
     }
 

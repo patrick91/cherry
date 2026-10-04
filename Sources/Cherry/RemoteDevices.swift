@@ -54,6 +54,12 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
     /// The colour its windows show it in (Settings › Sessions › Other
     /// Macs); nil: automatic, from its id (`effectiveColor`).
     var color: RemoteDeviceColor? = nil
+    /// Its interactive login shell's PATH (and the few other variables
+    /// `RemoteLoginEnvironment.isSent` allows), as Cherry last read it there
+    /// (`RemoteLoginEnvironmentCapture`): its commands and agents get it, so
+    /// their non-interactive login shell finds what ~/.zshrc puts on PATH.
+    /// Nil until read; a failed read keeps the last one.
+    var loginEnvironment: RemoteLoginEnvironment? = nil
 
     init(
         id: UUID = UUID(),
@@ -115,6 +121,10 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
         // A colour this build does not know (a newer Cherry's) is automatic.
         color = (try? container.decodeIfPresent(String.self, forKey: .color)).flatMap { $0 }
             .flatMap(RemoteDeviceColor.init(rawValue:))
+        // One this build cannot read is read again there.
+        loginEnvironment = (try? container.decodeIfPresent(RemoteLoginEnvironment.self, forKey: .loginEnvironment))
+            .flatMap { $0 }
+            .flatMap { $0.environment["PATH"]?.nilIfEmpty == nil ? nil : $0 }
     }
 
     /// What its tabs' launches need of it (`RemoteLaunchSpec.Device`).
@@ -124,7 +134,8 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
             homeDirectory: homeDirectory,
             resources: installedResources
                 ? RemoteLaunchSpec.Resources.of(remoteHostPath: remoteHostPath, homeDirectory: homeDirectory)
-                : nil
+                : nil,
+            loginEnvironment: loginEnvironment?.environment
         )
     }
 
@@ -176,7 +187,11 @@ final class RemoteDeviceStore: ObservableObject {
         hostStore: .shared,
         installationID: { CherryInstallation.shared.id() },
         registry: .shared,
-        remoteHostPaths: .shared
+        remoteHostPaths: .shared,
+        // Only the app's store runs ssh by itself: a test's store marks
+        // and reads nothing unless the test gives it its fake Mac's.
+        markBuild: RemoteDeviceStore.markBuildOverSSH,
+        captureLoginEnvironment: RemoteDeviceStore.captureLoginEnvironmentOverSSH
     )
 
     /// Makes a device's hosting: its profile, and this installation's id
@@ -197,10 +212,28 @@ final class RemoteDeviceStore: ObservableObject {
     /// (`RemoteHostInstaller.markScript`): on each connection of its
     /// control, at most once per `markInterval`. Tests replace it.
     typealias BuildMarker = @MainActor (_ device: RemoteDevice, _ directoryName: String, _ installationID: UUID) async -> Void
-    private let markBuild: BuildMarker
+    private let markBuild: BuildMarker?
     static let markInterval: TimeInterval = 6 * 3_600
     private var lastMarked: [UUID: (directory: String, at: Date)] = [:]
     private var connectionWatches: [UUID: AnyCancellable] = [:]
+    /// Reads a device's login environment there
+    /// (`RemoteLoginEnvironmentCapture`): when its control connects (at
+    /// most once per `loginEnvironmentRefreshInterval`), and for a command
+    /// or agent launched while none was ever read. The app's runs over the
+    /// device's SSH master; nil (a test's store, unless it gives its fake
+    /// Mac's) reads nothing.
+    typealias LoginEnvironmentCapturer = @MainActor (_ device: RemoteDevice) async -> RemoteLoginEnvironmentCapture.Outcome
+    private let captureLoginEnvironment: LoginEnvironmentCapturer?
+    static let loginEnvironmentRefreshInterval: TimeInterval = 30 * 60
+    /// How long a command or agent of a device whose login environment was
+    /// never read waits for the read under way (well inside a device's
+    /// creation deadline).
+    var loginEnvironmentLaunchWait: Duration = .seconds(12)
+    private var loginEnvironmentAttempts: [UUID: Date] = [:]
+    private var loginEnvironmentReads: [UUID: Task<Void, Never>] = [:]
+    /// Why the last read of each device's failed (this run), until one
+    /// succeeds.
+    private var loginEnvironmentProblems: [UUID: String] = [:]
     /// The app's saved-state store: each hosting records the sessions it
     /// ends on purpose, and those its host reports lost, there, and
     /// finishes the ends it could not do while its device was offline.
@@ -216,7 +249,8 @@ final class RemoteDeviceStore: ObservableObject {
         makeHosting: @escaping HostingFactory = { profile, installationID in
             PersistentHostSessions.remote(profile: profile, installationID: installationID)
         },
-        markBuild: @escaping BuildMarker = RemoteDeviceStore.markBuildOverSSH
+        markBuild: BuildMarker? = nil,
+        captureLoginEnvironment: LoginEnvironmentCapturer? = nil
     ) {
         self.fileURL = fileURL
         self.canWrite = canWrite
@@ -226,6 +260,7 @@ final class RemoteDeviceStore: ObservableObject {
         self.remoteHostPaths = remoteHostPaths
         self.makeHosting = makeHosting
         self.markBuild = markBuild
+        self.captureLoginEnvironment = captureLoginEnvironment
         devices = Self.load(from: fileURL)
         updateRemoteHostPaths()
     }
@@ -276,7 +311,8 @@ final class RemoteDeviceStore: ObservableObject {
         installedArch: String? = nil,
         shell: String? = nil,
         installedResources: Bool = false,
-        userTemporaryDirectory: String? = nil
+        userTemporaryDirectory: String? = nil,
+        loginEnvironment: RemoteLoginEnvironment? = nil
     ) throws -> RemoteDevice {
         guard canWrite() else { throw HostedSessionError.message(Self.readOnlyReason) }
         let host = try HostedSessionHost.ssh(sshDestination)
@@ -306,6 +342,11 @@ final class RemoteDeviceStore: ObservableObject {
             installedResources: installedResources
         )
         device.userTemporaryDirectory = RemoteMCPPaths.validTemporaryDirectory(userTemporaryDirectory, source: "the check")
+        if let loginEnvironment, loginEnvironment.environment["PATH"]?.nilIfEmpty != nil {
+            device.loginEnvironment = loginEnvironment
+            // Read just now: its first connection need not read it again.
+            loginEnvironmentAttempts[device.id] = Date()
+        }
         if device.createdHostEntry { try hostStore.add(destination) }
         devices.append(device)
         save()
@@ -345,6 +386,9 @@ final class RemoteDeviceStore: ObservableObject {
         if device.createdHostEntry, let host = device.host { hostStore.remove(host) }
         connectionWatches.removeValue(forKey: id)
         lastMarked.removeValue(forKey: id)
+        loginEnvironmentReads.removeValue(forKey: id)?.cancel()
+        loginEnvironmentAttempts.removeValue(forKey: id)
+        loginEnvironmentProblems.removeValue(forKey: id)
         if let forwards = RemoteMCPForwards.existing {
             Task { await forwards.stop(deviceID: id) }
         }
@@ -412,9 +456,13 @@ final class RemoteDeviceStore: ObservableObject {
             return live
         }
         let hosting = makeHosting(
-            .remote(host: host, displayName: device.name, machineNames: Set(device.machineNames)) { [weak self] in
-                self?.launchDevice(id: id)
-            },
+            .remote(
+                host: host,
+                displayName: device.name,
+                machineNames: Set(device.machineNames),
+                device: { [weak self] in self?.launchDevice(id: id) },
+                awaitLoginEnvironment: { [weak self] in await self?.awaitLoginEnvironmentForLaunch(id: id) }
+            ),
             installation
         )
         hosting.endedSessionsStore = endedSessionsStore
@@ -430,6 +478,9 @@ final class RemoteDeviceStore: ObservableObject {
     func launchDevice(id: UUID) -> RemoteLaunchSpec.Device? {
         guard let device = device(id: id) else { return nil }
         var launch = device.launchDevice
+        if launch.loginEnvironment == nil {
+            launch.loginEnvironmentProblem = loginEnvironmentProblems[id]
+        }
         // The socket goes in the account's per-user temporary directory
         // there: known from the check or the first forward; until then its
         // tabs have no Cherry MCP (never a path in the shared /tmp).
@@ -495,8 +546,107 @@ final class RemoteDeviceStore: ObservableObject {
                 MainActor.assumeIsolated {
                     self?.markUsedBuild(of: id)
                     self?.ensureMCPForward(of: id)
+                    self?.refreshLoginEnvironment(of: id)
                 }
             }
+    }
+
+    // MARK: Login environment
+
+    /// Why the device's login environment is not known now: its last read
+    /// failed this run (nil once one succeeded, or before any).
+    func loginEnvironmentProblem(of id: UUID) -> String? {
+        loginEnvironmentProblems[id]
+    }
+
+    /// Reads the device's login environment there, unless a read is under
+    /// way (whose task it returns) or one started (this run), or the one
+    /// kept was read, within `loginEnvironmentRefreshInterval` (`force`:
+    /// read anyway). Only the copy that keeps the devices reads (and saves)
+    /// it.
+    @discardableResult
+    func refreshLoginEnvironment(of id: UUID, force: Bool = false, now: Date = Date()) -> Task<Void, Never>? {
+        if let read = loginEnvironmentReads[id] { return read }
+        guard let capture = captureLoginEnvironment, canWrite(), let device = device(id: id) else { return nil }
+        if !force, let last = loginEnvironmentAttempts[id] ?? device.loginEnvironment?.capturedAt,
+           now.timeIntervalSince(last) < Self.loginEnvironmentRefreshInterval {
+            return nil
+        }
+        loginEnvironmentAttempts[id] = now
+        let read = Task { @MainActor [weak self] in
+            let outcome = await capture(device)
+            guard let self, !Task.isCancelled else { return }
+            self.loginEnvironmentReads[id] = nil
+            self.recordLoginEnvironment(outcome, for: id)
+        }
+        loginEnvironmentReads[id] = read
+        return read
+    }
+
+    /// Keeps what a read found: the variables (saved in devices.json), or
+    /// why not (logged; the last variables read stay in use).
+    func recordLoginEnvironment(_ outcome: RemoteLoginEnvironmentCapture.Outcome, for id: UUID) {
+        guard let device = device(id: id) else { return }
+        switch outcome {
+        case .captured(let environment):
+            loginEnvironmentProblems[id] = nil
+            update(id) { $0.loginEnvironment = environment }
+        case .failed(let reason):
+            loginEnvironmentProblems[id] = reason
+            SessionLog.notice(
+                "could not read the login PATH of \(device.name) (\(device.sshDestination)): \(reason)"
+                    + (device.loginEnvironment == nil ? "; its commands and agents get the host's PATH" : "; the last one read stays in use")
+            )
+        }
+    }
+
+    /// For each command or agent of the device: while its login environment
+    /// was never read, waits for a read (starting one unless one ran within
+    /// `loginEnvironmentRefreshInterval`), at most
+    /// `loginEnvironmentLaunchWait`. Once known, starts a read in the
+    /// background when the last is that old, and returns at once.
+    func awaitLoginEnvironmentForLaunch(id: UUID) async {
+        guard let device = device(id: id) else { return }
+        guard device.loginEnvironment == nil else {
+            refreshLoginEnvironment(of: id)
+            return
+        }
+        guard let read = refreshLoginEnvironment(of: id) else { return }
+        await Self.wait(for: read, upTo: loginEnvironmentLaunchWait)
+    }
+
+    /// Waits for `task` to finish, at most `timeout` (the task goes on).
+    private static func wait(for task: Task<Void, Never>, upTo timeout: Duration) async {
+        let waiter = FirstResume()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            waiter.continuation = continuation
+            Task { @MainActor in
+                await task.value
+                waiter.resume()
+            }
+            Task { @MainActor in
+                try? await Task.sleep(for: timeout)
+                waiter.resume()
+            }
+        }
+    }
+
+    @MainActor
+    private final class FirstResume {
+        var continuation: CheckedContinuation<Void, Never>?
+
+        func resume() {
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
+    /// Reads the device's login environment over its ssh (its master when
+    /// up), with its recorded login shell.
+    static func captureLoginEnvironmentOverSSH(_ device: RemoteDevice) async -> RemoteLoginEnvironmentCapture.Outcome {
+        var shell = await RemoteDeviceShell.app()
+        shell.controlPath = HostSSHMasterManager.shared.controlPathIfUp(for: device.sshDestination)
+        return await RemoteLoginEnvironmentCapture.run(on: device.sshDestination, loginShell: device.shell, shell: shell)
     }
 
     /// Marks the build directory the device uses now, unless it was marked
@@ -507,8 +657,8 @@ final class RemoteDeviceStore: ObservableObject {
               let installation = installationID()
         else { return }
         if let last = lastMarked[id], last.directory == directory, now.timeIntervalSince(last.at) < Self.markInterval { return }
+        guard let markBuild else { return }
         lastMarked[id] = (directory, now)
-        let markBuild = markBuild
         Task { await markBuild(device, directory, installation) }
     }
 

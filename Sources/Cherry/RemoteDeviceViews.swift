@@ -34,6 +34,9 @@ final class AddDeviceModel: ObservableObject {
     /// What the install found once its build ran there (a session host the
     /// check could not see), shown once the Mac is added.
     @Published private(set) var installWarnings: [String] = []
+    /// Its login shell's PATH, read after a check that reached a Mac
+    /// (`RemoteLoginEnvironmentCapture`), kept with the device on Add.
+    @Published private(set) var loginEnvironment: RemoteLoginEnvironmentCapture.Outcome?
 
     /// Host aliases from ~/.ssh/config (non-wildcard).
     let aliases: [String]
@@ -63,6 +66,7 @@ final class AddDeviceModel: ObservableObject {
     private func invalidate() {
         checklist = nil
         installation = nil
+        loginEnvironment = nil
     }
 
     var suggestions: [String] {
@@ -117,10 +121,20 @@ final class AddDeviceModel: ObservableObject {
         error = nil
         isChecking = true
         defer { isChecking = false }
+        let checkShell = await shell()
         let result = await RemoteDeviceProbe.run(
-            destination: destination, remoteHostPath: hostPath.nilIfEmpty, shell: await shell()
+            destination: destination, remoteHostPath: hostPath.nilIfEmpty, shell: checkShell
         )
         guard trimmedDestination == destination, trimmedHostPath == hostPath else { return }
+        // What its commands and agents will find on PATH (its login shell
+        // with the startup files a terminal there reads).
+        var loginEnvironment: RemoteLoginEnvironmentCapture.Outcome?
+        if result.sshFailure == nil, result.isMac {
+            loginEnvironment = await RemoteLoginEnvironmentCapture.run(
+                on: destination, loginShell: result.shell, shell: checkShell
+            )
+            guard trimmedDestination == destination, trimmedHostPath == hostPath else { return }
+        }
         var decision: RemoteHostInstallDecision?
         if hostPath.isEmpty, result.sshFailure == nil, result.isMac {
             let helpers = await helpers()
@@ -134,7 +148,10 @@ final class AddDeviceModel: ObservableObject {
         guard trimmedDestination == destination, trimmedHostPath == hostPath else { return }
         probe = result
         installation = decision
-        let checklist = RemoteDeviceChecklist(result: result, destination: destination, installation: decision)
+        self.loginEnvironment = loginEnvironment
+        let checklist = RemoteDeviceChecklist(
+            result: result, destination: destination, installation: decision, loginEnvironment: loginEnvironment
+        )
         self.checklist = checklist
         checkedDestination = destination
         checkedHostPath = hostPath
@@ -192,8 +209,9 @@ final class AddDeviceModel: ObservableObject {
     @discardableResult
     func add(installed: RemoteHostInstaller.Outcome? = nil) -> RemoteDevice? {
         guard canAdd, let probe else { return nil }
+        let captured: RemoteLoginEnvironment? = if case .captured(let environment)? = loginEnvironment { environment } else { nil }
         do {
-            return try store.add(
+            let device = try store.add(
                 name: name.trimmingCharacters(in: .whitespaces).nilIfEmpty ?? checklist?.suggestedName ?? trimmedDestination,
                 sshDestination: trimmedDestination,
                 remoteHostPath: installed?.remoteHostPath ?? trimmedHostPath.nilIfEmpty
@@ -205,8 +223,15 @@ final class AddDeviceModel: ObservableObject {
                 installedArch: installed?.architecture,
                 shell: probe.shell,
                 installedResources: installed?.resourcesInstalled ?? false,
-                userTemporaryDirectory: probe.userTemporaryDirectory
+                userTemporaryDirectory: probe.userTemporaryDirectory,
+                loginEnvironment: captured
             )
+            if case .failed? = loginEnvironment, let loginEnvironment {
+                // Said once its tabs run a command it does not find; read
+                // again when it connects.
+                store.recordLoginEnvironment(loginEnvironment, for: device.id)
+            }
+            return device
         } catch {
             self.error = error.localizedDescription
             return nil
@@ -454,6 +479,13 @@ final class UpdateDeviceHostModel: ObservableObject {
         let result = await RemoteDeviceProbe.run(
             destination: device.sshDestination, remoteHostPath: nil, marker: marker, shell: shell
         )
+        if result.sshFailure == nil, result.isMac, store.canModify {
+            // A check reads its login PATH again (a tool installed since).
+            let outcome = await RemoteLoginEnvironmentCapture.run(
+                on: device.sshDestination, loginShell: result.shell ?? device.shell, shell: shell
+            )
+            store.recordLoginEnvironment(outcome, for: deviceID)
+        }
         let helpers = await helpers()
         if case .success(let loaded) = helpers { loadedHelpers = loaded }
         probe = result

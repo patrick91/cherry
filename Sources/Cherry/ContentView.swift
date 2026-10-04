@@ -10716,6 +10716,9 @@ private struct CommandExitStatusBar: View {
         case .exited(let code):
             if let end = session.hostSessionEnd {
                 Status(text: session.restartOnExit ? "\(end.message); not restarted" : end.message, isFailure: true)
+            } else if let notFound = session.remoteProgramNotFoundMessage {
+                // A device's command its login shell did not find.
+                Status(text: notFound, isFailure: true)
             } else if session.isAutoRestartPaused {
                 Status(text: "Keeps failing — auto-restart paused", isFailure: true)
             } else if code == 0 {
@@ -10741,8 +10744,9 @@ private struct CommandExitStatusBar: View {
 
                 Text(status.text)
                     .font(.system(size: 12, weight: .medium))
-                    .lineLimit(1)
+                    .lineLimit(2)
                     .truncationMode(.tail)
+                    .help(status.text)
 
                 Button("Restart") {
                     session.restartManagedCommandIfNeeded()
@@ -10951,8 +10955,9 @@ private struct PersistentSessionEndedBar: View {
 
                 Text(message)
                     .font(.system(size: 12, weight: .medium))
-                    .lineLimit(1)
+                    .lineLimit(2)
                     .truncationMode(.tail)
+                    .help(message)
 
                 Button("Restart") {
                     session.restart()

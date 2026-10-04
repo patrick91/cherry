@@ -592,11 +592,14 @@ struct RemoteDeviceChecklist: Equatable {
     /// `installation`: what installing this Cherry's session host there
     /// would do (`RemoteHostInstall.decide`); nil when no install is
     /// offered (a cherry-host path was given), as in phase 1.
+    /// `loginEnvironment`: what reading its login shell's PATH found (a
+    /// line of its own; none when not read).
     init(
         result: RemoteDeviceProbeResult,
         destination: String,
         localProtocol: UInt32 = HostProtocol.version,
-        installation: RemoteHostInstallDecision? = nil
+        installation: RemoteHostInstallDecision? = nil,
+        loginEnvironment: RemoteLoginEnvironmentCapture.Outcome? = nil
     ) {
         var items: [Item] = []
         if let failure = result.sshFailure {
@@ -691,6 +694,21 @@ struct RemoteDeviceChecklist: Equatable {
                 detail: allowsPlainAdd && compatible
                     ? reason + " The cherry-host already there is used instead."
                     : reason
+            ))
+        case nil:
+            break
+        }
+        switch loginEnvironment {
+        case .captured(let environment)?:
+            let folders = environment.environment["PATH"]?.split(separator: ":").count ?? 0
+            items.append(Item(
+                id: "path", status: .ok, title: "Login PATH",
+                detail: "Read from \(environment.shell) with its startup files (\(folders) folders): commands and agents there find the tools they put on PATH."
+            ))
+        case .failed(let reason)?:
+            items.append(Item(
+                id: "path", status: .warning, title: "Login PATH",
+                detail: "Cherry couldn't read its shell's PATH (\(reason)). Its commands and agents get only what a login shell that is not interactive sets (~/.zprofile, not ~/.zshrc); Cherry tries again whenever it connects."
             ))
         case nil:
             break

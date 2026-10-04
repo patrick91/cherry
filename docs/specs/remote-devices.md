@@ -7,7 +7,8 @@ dropped files, master shards), phase 4a (ports, URLs and forwards for
 device tabs, and pasted images) and phase 4b (Cherry MCP for agents running
 on another Mac) implemented on `codex/persistent-sessions`; the rest of
 phase 4 is the plan. Phases 1–4b as built, and where they differ from the
-plan below, are in *Phase 1 as built* … *Phase 4b as built*.
+plan below, are in *Phase 1 as built* … *Phase 4b as built*; a device's
+login PATH for its commands and agents is in *Login PATH on devices*.
 Builds on
 [multiplexer-default.md](multiplexer-default.md) (persistent sessions, the
 holder-per-session host, close intents, restore) and
@@ -171,8 +172,9 @@ No user-visible change for local tabs. What exists:
   own variables, and `LANG`/`LC_*`; never `PATH`, `HOME`, `SHELL`, This
   Mac's control socket, Ghostty resources, the zsh bootstrap or anything
   else that names a local file. (Phase 4b sets `CHERRY_CONTROL_SOCKET` to
-  the socket forwarded to the device, never This Mac's path.) `cwd` is the remote
-  path.
+  the socket forwarded to the device, never This Mac's path; a command or
+  agent gets the device's own interactive PATH, *Login PATH on devices*.)
+  `cwd` is the remote path.
 - **Restore rules**: `SystemEndedSessions` uses only the host's lost
   sessions for a record owned on another host (it comes back as `.logout`,
   like a local lost holder; phase 1 words it for the device: "Ended when
@@ -1142,6 +1144,112 @@ app's control socket with `ssh -R` to a per-session socket"):
   table.
 - The agent registration is a stable launcher, not the build's CherryMCP
   path, which an update's garbage collection would remove later.
+
+## Login PATH on devices
+
+The problem: a device's command or agent runs `[shell, "-l", "-c", line]`, a
+login shell that is not interactive, so ~/.zshrc (~/.bashrc, fish's
+interactive config) never runs. Tools that put themselves on PATH there
+(bun's `~/.bun/bin`, Claude Code's `~/.local/bin`, nvm, pyenv) are then not
+found: `zsh:1: command not found: codex`, while the same Mac's terminal tab
+(an interactive login shell) finds them. This Mac's commands and agents run
+in an interactive shell (Cherry's zsh bootstrap, or `shell -l -i -c`), so
+they never had the problem.
+
+What exists (`Sources/Cherry/RemoteLoginEnvironment.swift`, the device
+store's reads in `RemoteDevices.swift`, `RemoteLaunchSpec`):
+
+- **The read** (`RemoteLoginEnvironmentCapture`): one `sh -s` script over
+  the device's ssh (`RemoteDeviceShell`, the master's ControlPath while it
+  is up) runs the login shell as This Mac's capture does
+  (`HostedSessionLoginEnvironment`): `"$s" -l -i -c '<printf marker; env -0;
+  printf marker>'`, csh and tcsh `-l` with the command on standard input,
+  where `$s` is the device record's `shell` (else, or when it is not
+  executable there, `$SHELL` there). Standard input is /dev/null (nothing
+  prompts; a `read` in an rc file gets end of file) and standard error is
+  dropped. The shell runs in the background with a watchdog that kills it
+  after 10 s (`shellTimeout`); the script then reports its exit status. The
+  markers are printed in halves (an echoed command line shows none) and
+  everything an rc file prints around them is ignored; a program the rc file
+  started that keeps the output open only delays the end of ssh (25 s at
+  most here), and what was printed is still read. sshd's sessions have no
+  terminal, so the interactive shell takes none. No session host is started
+  or asked.
+- **What is kept** (`RemoteLoginEnvironment`): only `PATH`, `MANPATH`, `TZ`
+  and `XDG_*` (`isSent`: `LoginEnvironmentCache.isPersisted` without the
+  account's own variables, which the host sets, the agent socket, which
+  stays the host's agent link, askpass and display, terminfo and the
+  locale, which stays This Mac's), each value at most 32 KiB and 64 KiB in
+  all; nothing without a PATH. Never This Mac's PATH: the read runs there,
+  and ssh sends no PATH. It is saved in the device record
+  (`RemoteDevice.loginEnvironment`: `shell`, `capturedAt`, `environment`;
+  devices.json, so the instance-lock holder alone writes it, and only that
+  copy reads it) and checked again when read back.
+- **When**: Add Mac…'s check reads it after the probe (its checklist has a
+  "Login PATH" line: read from which shell with how many folders, or a
+  warning with why), and Add keeps it; Update Session Host…'s check reads it
+  again; and each connection of the device's control reads it at most once
+  per `loginEnvironmentRefreshInterval` (30 minutes) per run
+  (`RemoteDeviceStore.refreshLoginEnvironment`). A command or agent launched
+  while the device has none waits for the read under way (starting one
+  unless one ran within the interval), at most `loginEnvironmentLaunchWait`
+  (12 s, inside the device's 45 s creation deadline:
+  `PersistentHostProfile.awaitLoginEnvironment`, called by
+  `RemoteLaunchSpec.builder`). A device with one never waits; a launch
+  starts a background read when it is older than the interval. A failed
+  read keeps the last one read and is logged (`SessionLog`, "could not read
+  the login PATH of …"); its reason is kept for this run
+  (`loginEnvironmentProblem(of:)`). Only `RemoteDeviceStore.shared` reads
+  (and marks builds) over ssh by itself: a test's store does neither unless
+  it is given its fake Mac's (`captureLoginEnvironment:`, `markBuild:`).
+- **The launch**: a command's or agent's `env` has the read variables, and
+  PATH goes as `CHERRY_LOGIN_PATH`; its line becomes `export
+  PATH="$CHERRY_LOGIN_PATH"; unset CHERRY_LOGIN_PATH; <line>` (fish: `set
+  -gx PATH (string split ':' "$CHERRY_LOGIN_PATH"); set -e …`; csh and tcsh:
+  `setenv PATH …; unsetenv …`; `RemoteLaunchSpec.lineSettingLoginPath`), still
+  run by `[shell, "-l", "-c", …]`, so the program's own shell stays a login
+  shell that is not interactive (an interactive .zshrc may start tmux or
+  print banners). PATH is set by the line, after the startup files, because
+  a system one may set PATH from scratch: nix-darwin's /etc/zshenv does, for
+  every zsh, so a PATH in the environment would not reach the program. The
+  program sees the PATH an interactive terminal there has, in its order. A
+  shell whose syntax is not known here (nushell) gets PATH in `env` instead.
+  A terminal tab gets none of this: its login shell reads its own startup
+  files. `CHERRY_LOGIN_PATH` from a tab's own variables is never sent.
+- **When it cannot be read**: today's launch (the host's PATH, the
+  account's). The launch records why (`HostedLaunchSpec.loginPathProblem`,
+  `PersistentSessionLaunch.loginPathProblem`,
+  `TerminalSession.persistentLoginPathProblem`), and when the program then
+  exits with 127 the tab says "codex is not on Studio's login PATH; Cherry
+  couldn't read its shell's PATH (<why>)" (`remoteProgramNotFoundMessage`,
+  in the command's exit bar and the agent's ended bar, which now take two
+  lines, with the whole text as help), and logs it. With the PATH read, an
+  exit 127 says "Exit 127: codex, or a command it runs, was not found on
+  Studio".
+- **Tests**: `RemoteDeviceLoginPathTests` (parsing through rc noise and half
+  markers, what is kept and its limits, devices.json, the failure reasons,
+  the script run by a local sh with a private HOME whose .zshrc prints,
+  asks and adds a folder, a shell that hangs killed by the watchdog, the
+  launch per kind and shell, the line run by zsh, bash, sh, ksh, dash and
+  tcsh after startup files that reset PATH, the store's read on connection
+  and once only, the fallback and its messages, the instance-lock rule, the
+  checklist line) and `RemoteDeviceRealHostLoginPathTests` (through
+  `Scripts/fake-remote-mac`, whose new `shell` switch makes zsh that fake
+  Mac's login shell, with its home's .zshrc: `zsh -lc` does not find
+  `rc-agent`, `zsh -ic` does; the read finds it; an agent and a command of
+  the device's window run it; a Mac whose .zshrc exits gives the
+  not-found message; and the read over the loopback's real sshd). The fake
+  Mac now runs `sh -s` scripts in a session of their own without a
+  controlling terminal, as sshd does, so an interactive shell there never
+  takes the terminal the tests run in. `Scripts/test-remote-mac-loopback`
+  runs `RemoteDeviceRealHostLoginPathIsReadOverSSHWithoutATerminal` against
+  its sshd.
+
+Deviations from the task's design: PATH is set by the line from
+`CHERRY_LOGIN_PATH` rather than passed as `PATH` in `env`, because a system
+zshenv that sets PATH (nix-darwin's) replaced it before the program ran
+(found by the fake Mac, which runs this Mac's /etc files). The read is not a
+per-device cache file: it is the device record's.
 
 ## Phase 1: devices and remote project windows (the plan)
 

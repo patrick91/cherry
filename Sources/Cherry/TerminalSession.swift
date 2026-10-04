@@ -3643,6 +3643,11 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// and a command that restarts on exit is not restarted by it. Cleared
     /// by the next launch.
     @Published private(set) var hostSessionEnd: HostSessionEnd?
+    /// A device's command or agent whose session was created without the
+    /// device's login environment (`PersistentSessionLaunch.loginPathProblem`):
+    /// why Cherry could not read it. Set by each Create (nil for one that
+    /// had it, and for an adopted or restored session).
+    private(set) var persistentLoginPathProblem: String?
     /// The name the tab's session has on its host, as far as the tab knows
     /// (`syncHostSessionName`).
     private var hostSessionName: String?
@@ -6426,6 +6431,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     ) {
         let binding = launch.attachment
         persistentSession = binding
+        persistentLoginPathProblem = launch.loginPathProblem
         if startedCurrentProgram {
             // Its Create answered: the program started now, however long
             // the host took (a daemon starting cold).
@@ -7334,6 +7340,9 @@ final class TerminalSession: ObservableObject, Identifiable {
             return
         }
         state = .exited(status)
+        if let notFound = remoteProgramNotFoundMessage {
+            SessionLog.notice("tab \(id.uuidString): \(notFound)")
+        }
         if kind == .agent || kind == .command {
             let hideCursor = Data("\u{1B}[?25l".utf8)
             renderedReplayCache = nil
@@ -7387,7 +7396,51 @@ final class TerminalSession: ObservableObject, Identifiable {
               case .exited(let status) = state
         else { return nil }
         if let hostSessionEnd { return hostSessionEnd.message }
+        if let notFound = remoteProgramNotFoundMessage { return notFound }
         return HostedAttachmentStatus.exited(code: status, signal: nil).summary
+    }
+
+    /// The exit status a shell gives a command it does not find.
+    static let commandNotFoundStatus: Int32 = 127
+
+    /// A device's command or agent whose shell found no such program (exit
+    /// 127): what to do about it. When its session was created without the
+    /// device's login environment, "codex is not on Studio's login PATH;
+    /// Cherry couldn't read its shell's PATH (<why>)": a program that
+    /// ~/.zshrc puts on PATH is not found then. Nil otherwise (This Mac's
+    /// tabs, other exits, a session the host or the system ended).
+    var remoteProgramNotFoundMessage: String? {
+        guard kind == .command || kind == .agent, let machine = remoteMachineName,
+              hostSessionEnd == nil, systemSessionEnd == nil,
+              case .exited(let status) = state, status == Self.commandNotFoundStatus
+        else { return nil }
+        let program = Self.programName(ofCommandLine: launchCommand)
+        if let problem = persistentLoginPathProblem {
+            return "\(program ?? "The command") is not on \(machine)'s login PATH; Cherry couldn't read its shell's PATH (\(problem))"
+        }
+        return "Exit 127: \(program ?? "the command"), or a command it runs, was not found on \(machine)"
+    }
+
+    /// The program a command line runs: its first word that is not a
+    /// variable assignment or `exec`/`env`/`command`, unquoted, without its
+    /// folder. Nil when there is none.
+    nonisolated static func programName(ofCommandLine line: String?) -> String? {
+        guard let line else { return nil }
+        for word in line.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }) {
+            var word = String(word)
+            if word.count >= 2, let first = word.first, first == word.last, first == "'" || first == "\"" {
+                word = String(word.dropFirst().dropLast())
+            }
+            if ["exec", "env", "command", "nohup", "noglob"].contains(word) { continue }
+            if let equals = word.firstIndex(of: "="), equals != word.startIndex,
+               word[..<equals].allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" }) {
+                continue
+            }
+            if word.hasPrefix("-") { continue }
+            let name = (word as NSString).lastPathComponent
+            return name.isEmpty ? nil : name
+        }
+        return nil
     }
 
     /// Shows that the system ended this tab's session while Cherry was

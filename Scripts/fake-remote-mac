@@ -48,6 +48,14 @@
 #             and `uname -sm` report there (a stand-in `uname`)
 #   no-gui    its `osascript` stand-in fails as osascript does over SSH
 #             with nobody logged in there
+#   shell     its contents (e.g. /bin/zsh) are its login shell, the SHELL
+#             every command there sees (default /bin/sh); that shell's
+#             startup files are home/'s (home/.zshrc for zsh), so a test can
+#             put a tool on PATH only for interactive shells there
+# As sshd does, the shim runs every `sh -s` script (a check, an install, the
+# login environment's read) in a session of its own without a controlling
+# terminal, so an interactive shell such a script starts never takes the
+# terminal the tests run in (other commands run as before).
 # Every fake Mac has that `osascript` stand-in first on its PATH, so the
 # real one (which would set this Mac's clipboard) never runs: `set the
 # clipboard to (read (POSIX file "P") as «class PNGf»)` copies P to
@@ -292,6 +300,30 @@ if [ $# -eq 0 ]; then
   echo "fake-remote-mac: no remote command (interactive logins are not faked)" >&2
   exit 255
 fi
+login_shell=/bin/sh
+if [ -f "$host/shell" ]; then login_shell=$(/bin/cat "$host/shell"); fi
+command_line=$*
+# Runs the remote command with that Mac's environment; an `sh -s` script in
+# a session of its own (perl: fork, setsid, exec; TERM and HUP passed on).
+remote() {
+  set -- /usr/bin/env -i \
+    HOME="$host/home" \
+    USER="${USER:-}" LOGNAME="${LOGNAME:-}" \
+    PATH="$host/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    SHELL="$login_shell" \
+    LANG="${LANG:-en_US.UTF-8}" \
+    TMPDIR="${TMPDIR:-/tmp}" \
+    CHERRY_HOST_SOCKET="$host/host.sock" \
+    /bin/sh -c "$command_line"
+  if [ "$command_line" = "sh -s" ]; then
+    /usr/bin/perl -e 'use POSIX (); my $pid = fork(); die "fork: $!\n" unless defined $pid;
+      if ($pid == 0) { POSIX::setsid(); exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n"; }
+      $SIG{TERM} = sub { kill "TERM", $pid }; $SIG{HUP} = sub { kill "HUP", $pid };
+      waitpid($pid, 0); exit(($? & 127) ? 128 + ($? & 127) : ($? >> 8));' "$@"
+  else
+    "$@"
+  fi
+}
 if [ -n "$path" ] && [ -f "$path.pid" ] && [ -d "$path.ch" ]; then
   # A session of a running master: MaxSessions.
   max=10
@@ -307,28 +339,24 @@ if [ -n "$path" ] && [ -f "$path.pid" ] && [ -d "$path.ch" ]; then
   fi
   : > "$path.ch/$$"
   printf '%s\n' "$path" >> "$dir/sessions"
-  /usr/bin/env -i \
-    HOME="$host/home" \
-    USER="${USER:-}" LOGNAME="${LOGNAME:-}" \
-    PATH="$host/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-    SHELL=/bin/sh \
-    LANG="${LANG:-en_US.UTF-8}" \
-    TMPDIR="${TMPDIR:-/tmp}" \
-    CHERRY_HOST_SOCKET="$host/host.sock" \
-    /bin/sh -c "$*"
+  remote
   status=$?
   /bin/rm -f "$path.ch/$$"
   exit $status
+fi
+if [ "$command_line" = "sh -s" ]; then
+  remote
+  exit $?
 fi
 exec /usr/bin/env -i \
   HOME="$host/home" \
   USER="${USER:-}" LOGNAME="${LOGNAME:-}" \
   PATH="$host/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-  SHELL=/bin/sh \
+  SHELL="$login_shell" \
   LANG="${LANG:-en_US.UTF-8}" \
   TMPDIR="${TMPDIR:-/tmp}" \
   CHERRY_HOST_SOCKET="$host/host.sock" \
-  /bin/sh -c "$*"
+  /bin/sh -c "$command_line"
 EOF
     chmod 700 "$dir/bin/ssh"
     echo "$dir/bin"

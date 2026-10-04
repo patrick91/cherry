@@ -116,6 +116,14 @@ enum BackgroundSessionPresentation {
         session.displayTitle.nilIfEmpty ?? session.title
     }
 
+    /// The project shown beside a row's title, unless the title already
+    /// says it ("cross-auth  cross-auth").
+    static func detail(of session: BackgroundSession) -> String? {
+        let project = session.projectName
+        let title = rowTitle(of: session)
+        return project.caseInsensitiveCompare(title) == .orderedSame ? nil : project.nilIfEmpty
+    }
+
     static func projectName(projectRoot: String?) -> String {
         projectRoot.map(MenuBarAgentPresentation.projectName(projectRoot:)) ?? "No project"
     }

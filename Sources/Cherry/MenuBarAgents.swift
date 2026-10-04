@@ -714,11 +714,18 @@ private struct MenuBarBackgroundSessionRow: View {
                         .font(.system(size: 13))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(item.projectName)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .layoutPriority(-1)
+                    if let detail = BackgroundSessionPresentation.detail(of: item) {
+                        // Its own room before the title takes the rest: a
+                        // long title truncates, the project stays readable.
+                        Text(detail)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: 110, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .layoutPriority(1)
+                    }
                     if isUnread {
                         Circle()
                             .fill(Color.blue)

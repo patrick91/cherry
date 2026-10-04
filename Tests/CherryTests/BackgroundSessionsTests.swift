@@ -856,6 +856,30 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
 }
 
 
+@Test func backgroundShellRowsNameAnAbbreviatedPathByItsFolderAndNeverRepeatTheProject() {
+    func row(_ info: HostedSessionInfo) -> BackgroundSession {
+        BackgroundSessionPresentation.session(info, hostID: "host-a")
+    }
+    // A shell whose host name is an abbreviated path ("…/github/…", as
+    // prompts and the sidebar shorten long ones) is named by its folder,
+    // and the project beside it is not repeated.
+    for name in ["…/github/fastapilabs/cloud", ".../github/fastapilabs/cloud"] {
+        #expect(SessionDisplayTitle.isPathLike(name))
+        let shell = row(ownSession("p", project: "/Users/tester/github/fastapilabs/cloud", name: name))
+        #expect(BackgroundSessionPresentation.rowTitle(of: shell) == "cloud")
+        #expect(BackgroundSessionPresentation.detail(of: shell) == nil)
+    }
+    // A title that is the project's name shows no detail; another does.
+    let same = row(ownSession("s", project: "/Users/tester/code/cross-auth", name: "cross-auth"))
+    #expect(BackgroundSessionPresentation.rowTitle(of: same) == "cross-auth")
+    #expect(BackgroundSessionPresentation.detail(of: same) == nil)
+    let other = row(ownSession("o", project: "/Users/tester/code/cloud", name: "Tilt", kind: "command", command: "Tilt"))
+    #expect(BackgroundSessionPresentation.detail(of: other) == "cloud")
+    // "…" alone, or a sentence starting with it, is no path.
+    #expect(!SessionDisplayTitle.isPathLike("… loading"))
+    #expect(!SessionDisplayTitle.isPathLike("…/a b"))
+}
+
 @Test func backgroundRowsShowTitleProjectAndStatusWithoutTitleChurn() {
     let project = "/Users/tester/code/cherry"
     func row(_ info: HostedSessionInfo) -> BackgroundSession {

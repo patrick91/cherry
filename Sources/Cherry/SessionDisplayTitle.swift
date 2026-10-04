@@ -170,7 +170,8 @@ enum SessionDisplayTitle {
         return shellNames.contains(name)
     }
 
-    /// A directory as shells title themselves: "~/code", "/usr", or
+    /// A directory as shells title themselves: "~/code", "/usr", an
+    /// abbreviated "…/github/code" (or ".../github/code"), or
     /// "user@host: ~/code" / "user@host:~/code". Not one with a space,
     /// which reads as a command line.
     static func isPathLike(_ title: String) -> Bool {
@@ -180,12 +181,19 @@ enum SessionDisplayTitle {
     private static func pathInTitle(_ title: String) -> String? {
         let title = normalized(title)
         // A path with a space reads as a command line ("/usr/bin/env node").
-        if title.hasPrefix("/") || title == "~" || title.hasPrefix("~/") { return title.contains(" ") ? nil : title }
+        if startsLikePath(title) { return title.contains(" ") ? nil : title }
         if let colon = title.firstIndex(of: ":"), title[..<colon].contains("@"), !title[..<colon].contains(" ") {
             let rest = title[title.index(after: colon)...].trimmingCharacters(in: .whitespaces)
-            if rest.hasPrefix("/") || rest == "~" || rest.hasPrefix("~/") { return rest }
+            if startsLikePath(rest) { return rest }
         }
         return nil
+    }
+
+    /// "/…", "~", "~/…", or a path shortened from the left ("…/a/b",
+    /// ".../a/b"), as prompts and sidebars abbreviate long ones.
+    private static func startsLikePath(_ value: String) -> Bool {
+        value.hasPrefix("/") || value == "~" || value.hasPrefix("~/")
+            || value.hasPrefix("…/") || value.hasPrefix(".../")
     }
 
     private static func normalized(_ value: String) -> String {

@@ -2335,6 +2335,37 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
+@Test func controlServerAppliesPerLaunchAgentEffortAndRejectsBadOnes() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Codex", command: "/bin/echo", arguments: "codex"))
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Amp", command: "amp"))
+    harness.server.start()
+
+    let response = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Codex",
+        model: "gpt-6-luna",
+        effort: "low"
+    )))
+    guard case .spawnProcess(let result)? = response.result else {
+        Issue.record("Expected spawnProcess result, got \(String(describing: response))")
+        return
+    }
+    #expect(result.process.commandLine == "/bin/echo codex --model gpt-6-luna -c 'model_reasoning_effort=\"low\"'")
+
+    let injected = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Codex", effort: "low\"; touch /tmp/x")))
+    #expect(injected.error?.code == "invalid_effort")
+    let amp = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Amp", effort: "low")))
+    #expect(amp.error?.code == "unsupported_effort_override")
+    let terminal = try await harness.send(.spawnProcess(.init(kind: "terminal", effort: "low")))
+    #expect(terminal.error?.code == "invalid_process_request")
+}
+
+@MainActor
 @Test func controlServerRejectsUnsupportedAndMisplacedModelOverrides() async throws {
     let harness = try ControlServerHarness()
     defer {
@@ -9375,6 +9406,22 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         codex.overridingModel("gpt'; touch /tmp/not-run", for: .codex).arguments
             == "--model 'gpt'\\''; touch /tmp/not-run'"
     )
+}
+
+@Test func agentDefinitionsPassAnEffortAsEachCLITakesIt() {
+    let claude = AgentToolDefinition(name: "Claude", command: "claude", arguments: "--existing")
+    #expect(claude.overridingEffort("low", for: .claude).arguments == "--existing --effort low")
+    let pi = AgentToolDefinition(name: "Pi", command: "pi")
+    #expect(pi.overridingEffort("low", for: .pi).arguments == "--thinking low")
+    let codex = AgentToolDefinition(name: "Codex", command: "codex", arguments: "--yolo")
+    #expect(codex.overridingEffort("low", for: .codex).arguments == "--yolo -c 'model_reasoning_effort=\"low\"'")
+    // Model and effort together, as spawn_agent applies them.
+    #expect(
+        codex.overridingModel("gpt-6-luna", for: .codex).overridingEffort("low", for: .codex).arguments
+            == "--yolo --model gpt-6-luna -c 'model_reasoning_effort=\"low\"'"
+    )
+    let amp = AgentToolDefinition(name: "Amp", command: "amp")
+    #expect(amp.overridingEffort("low", for: .amp) == amp)
 }
 
 @Test func agentDefinitionsRejectDuplicateNames() async throws {

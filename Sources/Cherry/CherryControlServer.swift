@@ -1819,8 +1819,8 @@ final class CherryControlServer: @unchecked Sendable {
             guard request.name == nil else {
                 throw CherryControlError(code: "invalid_process_request", message: "Terminal processes do not use name; pass title instead.")
             }
-            guard request.model == nil else {
-                throw CherryControlError(code: "invalid_process_request", message: "Model overrides are only valid for agent processes.")
+            guard request.model == nil, request.effort == nil else {
+                throw CherryControlError(code: "invalid_process_request", message: "Model and effort overrides are only valid for agent processes.")
             }
             session = workspace.addSession(title: request.title, workingDirectory: request.workingDirectory, select: false)
             agent = nil
@@ -1832,7 +1832,7 @@ final class CherryControlServer: @unchecked Sendable {
             guard resolvedAgent.isLaunchable else {
                 throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(resolvedAgent.name)' is not launchable.")
             }
-            let agentDefinition = try agentDefinition(resolvedAgent.definition, overridingModel: request.model)
+            let agentDefinition = try agentDefinition(resolvedAgent.definition, overridingModel: request.model, effort: request.effort)
             let parentID = try parentAgentID(from: request.parentAgentID, workspace: workspace)
             // Checked (its schema too) before anything is spawned.
             let taskPlan = try prepareTaskSpawn(request, parentAgentID: parentID, workspace: workspace)
@@ -1849,8 +1849,8 @@ final class CherryControlServer: @unchecked Sendable {
             }
             agent = agentDefinition
         case .command:
-            guard request.model == nil else {
-                throw CherryControlError(code: "invalid_process_request", message: "Model overrides are only valid for agent processes.")
+            guard request.model == nil, request.effort == nil else {
+                throw CherryControlError(code: "invalid_process_request", message: "Model and effort overrides are only valid for agent processes.")
             }
             guard let projectRoot = workspace.projectRoot else {
                 throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
@@ -1922,6 +1922,29 @@ final class CherryControlServer: @unchecked Sendable {
             }
         }
         return (session, sentBytes)
+    }
+
+    private func agentDefinition(
+        _ agent: AgentToolDefinition,
+        overridingModel requestedModel: String?,
+        effort requestedEffort: String? = nil
+    ) throws -> AgentToolDefinition {
+        let agent = try agentDefinition(agent, overridingModel: requestedModel)
+        guard let requestedEffort else { return agent }
+        let effort = requestedEffort.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // A word ("low", "xhigh"): each CLI checks its own levels.
+        guard (1...16).contains(effort.count), effort.allSatisfy({ ("a"..."z").contains($0) }) else {
+            throw CherryControlError(code: "invalid_effort", message: "Effort must be a level such as low, medium or high.")
+        }
+        let brand = AgentToolBrand.detect(name: nil, commandLine: agent.commandLine)
+            ?? AgentToolBrand.detect(name: agent.name)
+        guard let brand, brand.effortArguments(effort) != nil else {
+            throw CherryControlError(
+                code: "unsupported_effort_override",
+                message: "Agent '\(agent.name)' does not support a per-launch effort."
+            )
+        }
+        return agent.overridingEffort(effort, for: brand)
     }
 
     private func agentDefinition(

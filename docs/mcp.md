@@ -327,6 +327,12 @@ A typical agent-native flow:
 1. `spawn_agent` with the configured agent name. Pass `model` to override the
    configured agent's model for this launch. Codex, Claude, Gemini, OpenCode,
    and Pi support model overrides; Amp and unrecognized custom agents do not.
+   Pass `effort` (a level such as `low`, `medium` or `high`) to set the
+   reasoning effort or thinking level for this launch: Claude gets
+   `--effort`, Pi `--thinking`, Codex `-c model_reasoning_effort="…"`; other
+   agents answer `unsupported_effort_override`, and each CLI checks its own
+   levels. For example, a cheap Codex worker: `model: "gpt-6-luna"`,
+   `effort: "low"`.
    Keep the returned `process.id`; agent sessions are not rebound by default so
    multi-agent orchestration does not accidentally message the most recently spawned agent.
    For a single-agent conversation, pass `bind_session: true`.

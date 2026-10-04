@@ -346,6 +346,9 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
     public let kind: String
     public let name: String?
     public let model: String?
+    /// Agents only: a reasoning effort or thinking level for this launch
+    /// ("low", "high", …), passed as the agent CLI takes it.
+    public let effort: String?
     public let title: String?
     public let workingDirectory: String?
     public let text: String?
@@ -370,6 +373,7 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
         kind: String,
         name: String? = nil,
         model: String? = nil,
+        effort: String? = nil,
         title: String? = nil,
         workingDirectory: String? = nil,
         text: String? = nil,
@@ -387,6 +391,7 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
         self.kind = kind
         self.name = name
         self.model = model
+        self.effort = effort
         self.title = title
         self.workingDirectory = workingDirectory
         self.text = text

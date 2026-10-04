@@ -82,6 +82,18 @@ enum AgentToolBrand: String, Equatable {
         }
     }
 
+    /// How the CLI takes a reasoning effort or thinking level for one
+    /// launch: Claude's `--effort`, Pi's `--thinking`, Codex's
+    /// `model_reasoning_effort` setting; nil for a CLI without one.
+    func effortArguments(_ level: String) -> [String]? {
+        switch self {
+        case .claude: ["--effort", level]
+        case .pi: ["--thinking", level]
+        case .codex: ["-c", "model_reasoning_effort=\"\(level)\""]
+        case .gemini, .openCode, .amp: nil
+        }
+    }
+
     var modelFlag: String? {
         switch self {
         case .codex, .claude, .gemini, .openCode, .pi:
@@ -136,6 +148,17 @@ extension AgentToolDefinition {
         var overridden = self
         let overrideArguments = "\(modelFlag) \(Self.shellQuoted(model))"
         overridden.arguments = [arguments, overrideArguments]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return overridden
+    }
+
+    func overridingEffort(_ level: String, for brand: AgentToolBrand) -> AgentToolDefinition {
+        guard let effortArguments = brand.effortArguments(level) else { return self }
+
+        var overridden = self
+        overridden.arguments = [arguments, effortArguments.map(Self.shellQuoted).joined(separator: " ")]
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: " ")

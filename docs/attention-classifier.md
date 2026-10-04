@@ -3,7 +3,9 @@
 Cherry can collect terminal-grid observations for developing a small local
 classifier that recognizes when an agent needs attention. Collection is off by
 default because visible terminal grids can contain source code, prompts, paths,
-credentials, and other sensitive text.
+credentials, and other sensitive text. The one exception is the continuous
+attention samples of the user's own local install (below, "Continuous Samples
+and Auto-Labelling"), which stay on that Mac.
 
 ## Labels
 
@@ -436,6 +438,241 @@ text is not recorded, so a recorded `title_spinner` state is replayed as a fresh
 spinner. Turn state is replayed as recorded, and observations from before turn
 tracking have none. Turn each new pattern into a synthetic fixture in
 `AgentScreenActivityTests` rather than copying recorded screens into the repo.
+
+## Continuous Samples and Auto-Labelling
+
+Collecting corrections by hand is slow, and corrections-v4 showed what goes
+wrong when labels and features come from different screen rules. Cherry
+therefore samples every agent tab continuously, with the features its current
+rules compute, and `Scripts/attention-autolabel` labels the samples from what
+happened next, so no screen has to be tagged by hand.
+
+### What Cherry Samples
+
+`TerminalAttentionSampler` (`Sources/Cherry/TerminalAttentionSampling.swift`)
+samples every agent tab (persistent, native, device and attached tabs; never
+plain shells):
+
+- every 30 s, from the screen as the tab last read it (no surface read, no
+  classifier state change), while the tab's program runs;
+- at once when Cherry's view of the tab changes: its activity state, the
+  state's evidence, the turn state or count, or the prediction's label.
+
+A sample whose screen and features (all but the elapsed-time numbers, which
+always advance) repeat the tab's previous one is skipped; a periodic check
+then writes an `unchanged` heartbeat naming the sample it repeats. Each
+sample holds:
+
+- `recordedAt`, the pseudonymous `tab` and `run` (the first 16 hex digits of
+  the SHA-256 of the tab's UUID and of the launch's; a restart is a new run),
+  `hostSession` (the persistent or attached session, hashed), `agent` (the
+  screen rules' key) and `backend`;
+- `observation`: exactly the classifier's input, with `terminal.grid` cut to
+  the last 60 lines up to the last line with text (the cursor row is relative
+  to that tail; `scrollbackLinesOmitted` and every other feature field are
+  the full screen's), so `features` (`TerminalAttentionClassifier.features`,
+  the trainer's `observation_features`) can be recomputed from it;
+- `prediction` (model id, probability, threshold, label and the runtime rule
+  that decided, if any) for that observation, and `shownPrediction`, what the
+  tab shows now;
+- `lifecycle`: turn state, submitted and self-resumed turn counts, and the
+  last submit, output, content change, strong working evidence, keystroke
+  and input times, the alert generation and whether an alert is unread;
+- `screen`: the tail's live lines (`AgentScreenActivity.workingLines`) and
+  verdict;
+- `changes` since the tab's previous written sample: how often the screen
+  changed, how often by itself (no key, input or resize in the 1.5 s before),
+  and the times of those self-driven changes, at most one a second.
+
+Interaction events go in between as their kind and time only, never content:
+`typed` (at most one every 2 s), `submitted`, `menu_key` (detail
+`permission` or `question`), `interrupted`, `focused` (selected or viewed, at
+most one every 5 s), `closed` (detail: the close intent), `bell`,
+`notification` and `exited` (detail: the status).
+
+Records are appended to
+`~/Library/Application Support/<identity>/Attention Study/Samples/<yyyy-mm-dd>.jsonl`
+(local date), by a background queue in batches (every 5 s, or 64 KiB, and at
+quit). The directory is `0700` and each file `0600`, opened without following
+links. The directory is capped at 200 MB: the oldest day files go first, and
+a day that alone outgrows the cap drops records until the next day. On the
+main thread a sample costs one classifier pass over state the tab already
+holds; with sampling off, or no agent tab running, there is no timer and no
+work.
+
+The setting is **Settings › Terminal › Attention Study › Collect attention
+samples** (`attention.collectSamples`). Its default is on only for the
+identity whose user agreed to collection, the local install
+(`Scripts/install-local-app`, bundle identifier `dev.patrick.cherry.local`);
+every other identity (tests, CherryDev, packaged builds, `swift run`)
+defaults off. The default is computed, never written: only toggling the
+setting stores a value. A blanket default-on would start writing screen text
+for anyone who installs another build, which the study's opt-in rule above
+forbids.
+
+### Where the Data Lives and What Leaves the Mac
+
+- Samples, recordings and corrections: the identity's
+  `Application Support/<identity>/Attention Study/` (`Samples`, `Recordings`,
+  `Corrections`). Never in the repository.
+- Auto-label and evaluation runs: by default
+  `Attention Study/Model Runs/<yyyymmdd-hhmmss>-autolabel` (or
+  `-teacher-eval`), next to the earlier runs. The script refuses an
+  `--output` inside a git work tree unless `--allow-in-repo` is given, writes
+  a `.gitignore` of `*` into every run folder, and the repository's
+  `.gitignore` also ignores `Model Runs/`, `Attention Study/`,
+  `*-autolabel/`, `*-teacher-eval/` and `cherry-attention-*/`. Test fixtures
+  are synthetic; nothing derived from real samples or corrections is
+  committed.
+- What leaves the machine: only the masked screen excerpts in teacher
+  prompts, and only when the teacher runs (not with `--no-teacher` or
+  `--dry-run`). Hindsight labelling, training and comparison are local. The
+  script prints counts and ids, never screen text, and writes screens only
+  into the run's own folder (the dataset's observations).
+
+### Hindsight Labels
+
+`Scripts/attention-autolabel` reads the day files, keeps each record once,
+builds one timeline per tab run, and labels each sample from the samples and
+events after it, with these rules in order (`hindsight_label`):
+
+| Fine label | Rule | Binary label / reason |
+| --- | --- | --- |
+| `user_responding` | the sample shows an unsent draft, or the user typed within 5 s before it and has not submitted since | no / `user_responding` |
+| `idle_no_task` | no turn was submitted or resumed in this run | no / `idle_no_active_task` |
+| `working` | the screen changed by itself within 20 s, before the user acted, and either the sample's live lines read differently in the next sample (within 45 s), or the program changed its screen in 3 or more separate seconds of those 20 and the next sample shows 2 or more new lines | no / `agent_working` |
+| `needs_approval`, `needs_input` | the user's next action was a key into a menu (`menu_key`), and the screen did not change by itself from 2 s after the sample until then | yes / `waiting_for_approval`, `waiting_for_input` |
+| `result_ready` | a turn ran in this run, the sample shows no live lines, the user's next action was typing or submitting, the screen did not change by itself from 2 s after the sample until then, and it had stood still at least 10 s when they did | yes / `result_ready` |
+
+Everything else stays unresolved for the teacher: a tab closed, detached or
+exited without the user typing (closing is a response to a result the user
+may or may not have read already), an interrupt, a still screen that shows
+live lines, a return within 10 s, or too little future. A one-line animation
+(a clock, a spinner on an idle screen) is not work: it adds no new lines.
+The run prints each rule's coverage. Identical examples (same tab run,
+screen, categorical features and label) are kept once.
+
+These labels come from what happened after the screen, not from the screen
+rules that produce the features, so they cannot repeat the corrections-v4
+mistake of learning the rules' old verdicts back.
+
+### The Teacher
+
+Samples hindsight cannot resolve go to a cheap model in batches (6 per call),
+each with its masked 60-line screen, the last 12 lines of the previous and
+next samples, whether a turn was submitted, whether a draft is open, and
+what happened next in words ("the screen changed by itself 3 s later", "the
+user typed 45 s later"). The default teacher is
+
+```bash
+claude -p --model haiku --output-format json --json-schema {schema} \
+  --tools '' --strict-mcp-config --restricted --no-session-persistence \
+  --disable-slash-commands
+```
+
+run with the prompt on stdin, in an empty temporary directory, from an
+environment without `CLAUDECODE`, `CLAUDE_*` (but `CLAUDE_CONFIG_DIR`),
+`CHERRY_*`, `CODEX_*`, `MCP_*` and `GHOSTTY_*`: a Claude started inside an
+agent tab otherwise acts as that session's child, and Cherry's variables
+name the tab and its MCP socket. `--restricted` skips the user's settings
+(plugins and their hooks), `--strict-mcp-config` every MCP server, `--tools
+''` every tool, and `--no-session-persistence` the transcript. Another
+teacher takes the same stdin prompt, for example `--teacher "codex exec -m
+gpt-6-luna -c model_reasoning_effort=low --skip-git-repo-check --output-schema
+{schema_file} -"`. Calls are capped (`--max-calls`, default 300, with a
+deterministic spread of items when the budget is short), the item, call and
+token estimate is printed first, and `--dry-run` stops there.
+
+Masking runs over every line sent: private-key blocks, Anthropic, OpenAI,
+GitHub, GitLab, Slack, AWS, Google, Stripe, npm, PyPI and Tailscale keys,
+JWTs, bearer tokens, URL passwords, `password=`/`token:`/`api_key=`-style
+assignments (any key naming a password, secret, token, API or access key,
+client secret or credential; numbers are left alone), and long mixed-case
+alphanumeric strings with digits. Git hashes, UUIDs, paths and token counts
+stay readable.
+
+The teacher answers a label, a reason and a confidence; the reason decides
+the label, and answers under 0.7 confidence or `unknown` are dropped.
+`--teacher-keep negatives` keeps only its `no_attention_needed` labels.
+
+#### Teacher Agreement With the Human Corrections
+
+`--evaluate-on` runs the teacher over a corrections bundle and reports
+agreement per label, reason and agent. The corrections carry no future
+context, so the teacher sees present-only screens there; sampled screens
+also get the screens and events around them, so this is a pessimistic
+measure for the auto-labeller. On the 2 October bundle (68 usable
+corrections: 8 attention-needed, 60 not), with Haiku through `claude -p`
+(37 calls over four runs, 4 October 2026):
+
+| Run | Teacher answer | Agree (of 68) | Balanced | Precision of kept labels |
+| --- | --- | --- | --- | --- |
+| 1 | label + reason, contradictions dropped | 57 (84%) | 80.0% | 57/60 (95%) |
+| 1, rescored | label + reason, the reason decides | 64 (94%) | 85.8% | 64/67 (96%) |
+| 2 | one state, no label | 59 (87%) | 81.7% | 59/67 (88%) |
+| 3 | label + reason, the reason decides | 62 (91%) | 84.2% | 62/67 (93%) |
+
+Run 1 (one smoke-test call before it) showed seven answers whose label
+contradicted a correct reason (six Pi screens: `attention_needed` because
+`agent_working`), so the reason now decides. Asking for the state alone (run
+2) did worse, so the label stays in the answer, apparently as a step that
+makes the model look twice. Run 3 replicates the shipped prompt and schema:
+6 of 8 attention-needed and 56 of 60 no-attention corrections agree, Pi 15/15
+and Codex 27/28. The teacher's `no_attention_needed` labels were 56/57
+right; its `attention_needed` ones only 6/10 (two idle startup screens
+called menus, a working screen called a result, a finished one called an
+error), and confidence did not separate those errors. The prompt was
+revised after run 1 on these same 68 corrections, so runs 2 and 3 are
+optimistic; future in-app corrections are the unbiased check.
+
+### Dataset and Workflow
+
+The output is a dataset directory `attention-train-baseline` and
+`attention-augment-dataset` read (`dataset.jsonl` and a checksummed
+`manifest.json`). Each record keeps its provenance: `review.source` is
+`autolabel_hindsight` or `autolabel_teacher`, `review.provenance` names the
+rule (`hindsight:result_ready:static_until_user`) or the teacher model, and
+`autolabel` holds the fine label, teacher confidence, agent, trigger and
+Cherry's own prediction. The split is by whole tab (a hash of the tab id,
+`--test-fraction`, default 0.2). With `--base-dataset` the base records are
+kept as they are, so the frozen test split stays the fixed comparison, and
+the auto-labelled test tabs become `autolabel_holdout` (scored separately,
+never fitted).
+
+Held-out human set: every tab with an in-app human correction in the
+identity's `Corrections` or `Recordings` (and any `--holdout-corrections`
+bundle) is left out of the auto-labelled data entirely, matched by hashing
+the correction's `session.id` as Cherry hashes the tab. Future corrections
+are never trained on; they are the evaluation set.
+
+1. **Collect.** Use the local install with *Collect attention samples* on.
+   Keep tagging a screen now and then (**Tag Current Screen**): those
+   corrections are the held-out evaluation set.
+2. **Auto-label.**
+   ```bash
+   Scripts/attention-autolabel --dry-run                      # coverage and teacher estimate
+   Scripts/attention-autolabel --base-dataset "$frozen/dataset"
+   ```
+   `--evaluate-on` a new corrections bundle first if the teacher, its prompt
+   or the harnesses changed.
+3. **Train.**
+   ```bash
+   Scripts/attention-train-baseline --dataset "$run/dataset" --output "$run/model"
+   ```
+4. **Compare with the embedded model** on the fixed test and the held-out
+   corrections, with Cherry's runtime rules on top:
+   ```bash
+   Scripts/attention-study-data export --source ".../Attention Study/Corrections" \
+     --output ~/Desktop/cherry-attention-heldout
+   Scripts/attention-compare-models --candidate "$run/model/model.json" \
+     --dataset "$run/dataset" --corrections ~/Desktop/cherry-attention-heldout
+   ```
+   It reads the embedded weights from `TerminalAttentionClassifier.swift`
+   (its probabilities match Cherry's) and calls the candidate "not worse"
+   only when no set gains a false positive or a false negative.
+5. **Embed only if nothing gets worse**: copy the weights, feature names and
+   statistics into `TerminalAttentionClassifier.swift`, bump `modelID`, and
+   record the run here.
 
 ## Run Controlled Scenarios
 

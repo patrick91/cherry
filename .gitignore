@@ -12,3 +12,11 @@ __pycache__/
 /tmp/
 /Host/target/
 /Host/.deps/
+# Attention study data stays local (docs/attention-classifier.md): samples,
+# corrections and model runs belong in Application Support. These catch a
+# run directory an override placed in the repository.
+/Attention Study/
+/Model Runs/
+*-autolabel/
+*-teacher-eval/
+cherry-attention-*/

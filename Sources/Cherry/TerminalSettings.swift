@@ -317,6 +317,18 @@ final class TerminalSettings: ObservableObject {
         }
     }
 
+    /// Continuous attention sampling (`TerminalAttentionSampler`). Its
+    /// default depends on the app's identity
+    /// (`TerminalAttentionSampling.defaultEnabled`) and is never written:
+    /// only a change here stores a value.
+    @Published var attentionSamplesEnabled: Bool {
+        didSet {
+            guard attentionSamplesEnabled != oldValue else { return }
+            save(attentionSamplesEnabled, forKey: Keys.attentionSamplesEnabled, notifyTerminal: false)
+            attentionSamplesSettingDidChange()
+        }
+    }
+
     @Published var appearance: CherryAppearancePreference {
         didSet { save(appearance.rawValue, forKey: Keys.appearance) }
     }
@@ -367,9 +379,20 @@ final class TerminalSettings: ObservableObject {
     }
 
     private let defaults: UserDefaults
+    private let attentionSamplesSettingDidChange: @MainActor () -> Void
 
-    init(defaults: UserDefaults = .standard) {
+    /// `attentionSamplesBundleIdentifier` picks the sampling default
+    /// (the app's own bundle identifier); `attentionSamplesSettingDidChange`
+    /// tells the sampler the setting changed.
+    init(
+        defaults: UserDefaults = .standard,
+        attentionSamplesBundleIdentifier: String? = Bundle.main.bundleIdentifier,
+        attentionSamplesSettingDidChange: @escaping @MainActor () -> Void = {
+            TerminalAttentionSampler.shared.settingDidChange()
+        }
+    ) {
         self.defaults = defaults
+        self.attentionSamplesSettingDidChange = attentionSamplesSettingDidChange
         fontSize = defaults.object(forKey: Keys.fontSize) as? Double ?? Defaults.fontSize
         cursorBlink = defaults.object(forKey: Keys.cursorBlink) as? Bool ?? Defaults.cursorBlink
         minimumContrast = defaults.object(forKey: Keys.minimumContrast) as? Double ?? Defaults.minimumContrast
@@ -383,6 +406,10 @@ final class TerminalSettings: ObservableObject {
             ?? Defaults.worktreeSpacesEnabled
         attentionStudyEnabled = defaults.object(forKey: Keys.attentionStudyEnabled) as? Bool
             ?? Defaults.attentionStudyEnabled
+        attentionSamplesEnabled = TerminalAttentionSampling.isEnabled(
+            defaults: defaults,
+            bundleIdentifier: attentionSamplesBundleIdentifier
+        )
         appearance = (defaults.object(forKey: Keys.appearance) as? String)
             .flatMap(CherryAppearancePreference.init(rawValue:)) ?? Defaults.appearance
         lightTerminalThemeName = defaults.object(forKey: Keys.lightTerminalThemeName) as? String
@@ -620,6 +647,7 @@ final class TerminalSettings: ObservableObject {
         static let projectColorDisplayMode = "sidebar.projectColorDisplayMode"
         static let worktreeSpacesEnabled = "features.worktreeSpaces"
         static let attentionStudyEnabled = TerminalAttentionStudy.enabledDefaultsKey
+        static let attentionSamplesEnabled = TerminalAttentionSampling.enabledDefaultsKey
         static let appearance = "appearance.theme"
         static let lightTerminalThemeName = "terminal.theme.light"
         static let darkTerminalThemeName = "terminal.theme.dark"

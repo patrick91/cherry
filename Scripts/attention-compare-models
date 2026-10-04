@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Compare a retrained attention model with the one Cherry embeds.
+
+  Scripts/attention-compare-models --candidate RUN/model/model.json \\
+      --dataset FROZEN/dataset --corrections HELD_OUT_BUNDLE [--corrections …]
+
+Scores both models with Cherry's runtime rules on top (no action before the
+first turn or on live work; a menu always needs action), on the dataset's
+fixed test split, its autolabel holdout if any, and each bundle of held-out
+human corrections. A candidate is "not worse" only when, on every set, it
+has no more false positives and no more false negatives than the embedded
+model. It prints counts, never screen text, and writes nothing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import math
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+
+def load_sibling(name: str) -> Any:
+    path = Path(__file__).with_name(name)
+    module_name = name.replace("-", "_")
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    loader = importlib.machinery.SourceFileLoader(module_name, str(path))
+    specification = importlib.util.spec_from_loader(loader.name, loader)
+    assert specification is not None
+    module = importlib.util.module_from_spec(specification)
+    sys.modules[module_name] = module
+    loader.exec_module(module)
+    return module
+
+
+TRAINER = load_sibling("attention-train-baseline")
+EXPORTER = load_sibling("attention-reviewed-dataset")
+AUTOLABEL = load_sibling("attention-autolabel")
+
+EMBEDDED_SOURCE = Path(__file__).resolve().parent.parent / "Sources/Cherry/TerminalAttentionClassifier.swift"
+POSITIVE = "attention_needed"
+
+
+class CompareError(Exception):
+    pass
+
+
+def embedded_model(source: Path = EMBEDDED_SOURCE) -> dict[str, Any]:
+    """The weights `TerminalAttentionClassifier` embeds, read from its source."""
+    text = source.read_text(encoding="utf-8")
+
+    def scalar(name: str) -> str:
+        match = re.search(rf"static let {name}\s*=\s*([^\n]+)", text)
+        if not match:
+            raise CompareError(f"{name} not found in {source}")
+        return match.group(1).strip()
+
+    def array(name: str) -> str:
+        match = re.search(rf"static let {name}(?:\s*:[^=]+)?\s*=\s*\[(.*?)\n\s*\]", text, flags=re.DOTALL)
+        if not match:
+            raise CompareError(f"{name} not found in {source}")
+        return match.group(1)
+
+    names = re.findall(r'"([^"]+)"', array("featureNames"))
+    weights = [float(value) for value in re.findall(r"-?\d+(?:\.\d+)?(?:e-?\d+)?", array("weights"))]
+    statistics = {
+        name: {"mean": float(mean), "scale": float(scale)}
+        for name, mean, scale in re.findall(
+            r'"([^"]+)":\s*\((-?[\d.e-]+),\s*(-?[\d.e-]+)\)', array("numericStatistics")
+        )
+    }
+    if len(names) != len(weights):
+        raise CompareError("embedded feature and weight counts differ")
+    return {
+        "id": scalar("modelID").strip('"'),
+        "bias": float(scalar("bias")),
+        "threshold": float(scalar("threshold")),
+        "featureNames": names,
+        "weights": weights,
+        "numericStatistics": statistics,
+    }
+
+
+def model_from_file(path: Path) -> dict[str, Any]:
+    model = json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "id": str(path),
+        "bias": float(model["bias"]),
+        "threshold": float(model.get("threshold", 0.5)),
+        "featureNames": list(model["featureNames"]),
+        "weights": [float(value) for value in model["weights"]],
+        "numericStatistics": model.get("numericStatistics", {}),
+    }
+
+
+def probability(model: dict[str, Any], observation: dict[str, Any]) -> float:
+    features = TRAINER.observation_features({"observation": observation})
+    score = model["bias"]
+    for name, weight in zip(model["featureNames"], model["weights"]):
+        if name not in features:
+            continue
+        value = features[name]
+        statistics = model["numericStatistics"].get(name)
+        if statistics:
+            value = (value - statistics["mean"]) / statistics["scale"]
+        score += weight * value
+    return 1 / (1 + math.exp(-score)) if score >= 0 else math.exp(score) / (1 + math.exp(score))
+
+
+def needs_attention(model: dict[str, Any], observation: dict[str, Any], gates: bool = True) -> bool:
+    """`TerminalAttentionPrediction.needsAttention`."""
+    above = probability(model, observation) >= model["threshold"]
+    if not gates:
+        return above
+    activity = observation.get("activity") or {}
+    state, evidence = activity.get("state"), activity.get("evidence")
+    turn = (observation.get("turn") or {}).get("state")
+    raised = evidence == "answer_menu" and state in ("needs_input", "permission")
+    not_started = turn == "not_started"
+    live_work = state == "working" and evidence in ("working_marker", "title_spinner")
+    return (above or raised) and not not_started and not live_work
+
+
+def confusion(model: dict[str, Any], examples: list[tuple[str, dict[str, Any]]], gates: bool) -> dict[str, Any]:
+    counts = {"truePositive": 0, "falsePositive": 0, "trueNegative": 0, "falseNegative": 0}
+    for target, observation in examples:
+        predicted = needs_attention(model, observation, gates)
+        if target == POSITIVE:
+            counts["truePositive" if predicted else "falseNegative"] += 1
+        else:
+            counts["falsePositive" if predicted else "trueNegative"] += 1
+    positives = counts["truePositive"] + counts["falseNegative"]
+    negatives = counts["trueNegative"] + counts["falsePositive"]
+    recalls = []
+    if positives:
+        recalls.append(counts["truePositive"] / positives)
+    if negatives:
+        recalls.append(counts["trueNegative"] / negatives)
+    return {**counts, "count": len(examples), "balancedAccuracy": sum(recalls) / len(recalls) if recalls else None}
+
+
+def dataset_sets(path: Path) -> dict[str, list[tuple[str, dict[str, Any]]]]:
+    records = TRAINER.read_dataset(path)
+    sets: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    for split, name in (("test", "fixed test"), ("autolabel_holdout", "autolabel holdout")):
+        examples = [
+            (record["target"], record.get("observation") or {})
+            for record in records
+            if record.get("split") == split and record.get("target") in TRAINER.BINARY_LABELS
+        ]
+        if examples:
+            sets[f"{name} ({path.name})"] = examples
+    return sets
+
+
+def correction_set(path: Path) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (payload["label"], EXPORTER.sanitized_observation(payload))
+        for payload in AUTOLABEL.correction_payloads([path])
+        if payload.get("label") in TRAINER.BINARY_LABELS
+    ]
+
+
+def compare(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    sets: dict[str, list[tuple[str, dict[str, Any]]]],
+    gates: bool = True,
+) -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    not_worse = True
+    for name, examples in sets.items():
+        base = confusion(baseline, examples, gates)
+        new = confusion(candidate, examples, gates)
+        ok = new["falsePositive"] <= base["falsePositive"] and new["falseNegative"] <= base["falseNegative"]
+        not_worse = not_worse and ok
+        results[name] = {"baseline": base, "candidate": new, "notWorse": ok}
+    return {"baseline": baseline["id"], "candidate": candidate["id"], "sets": results, "notWorse": not_worse}
+
+
+def describe(counts: dict[str, Any]) -> str:
+    balanced = counts["balancedAccuracy"]
+    return (
+        f"TP {counts['truePositive']:>3}  FP {counts['falsePositive']:>3}  "
+        f"TN {counts['trueNegative']:>3}  FN {counts['falseNegative']:>3}  "
+        f"balanced {'-' if balanced is None else f'{balanced:.1%}'}"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--candidate", type=Path, required=True, help="model.json from attention-train-baseline.")
+    parser.add_argument("--baseline", type=Path, help="model.json to compare with (default: the embedded model).")
+    parser.add_argument("--dataset", type=Path, action="append", default=[],
+                        help="Dataset whose test split (and autolabel holdout) to score.")
+    parser.add_argument("--corrections", type=Path, action="append", default=[],
+                        help="Held-out human corrections (bundle or directory); repeatable.")
+    parser.add_argument("--no-gates", action="store_true", help="Compare raw scores, without the runtime rules.")
+    parser.add_argument("--json", action="store_true", help="Print the comparison as JSON.")
+    args = parser.parse_args(argv)
+    try:
+        baseline = model_from_file(args.baseline) if args.baseline else embedded_model()
+        candidate = model_from_file(args.candidate)
+        sets: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for path in args.dataset:
+            sets.update(dataset_sets(path.expanduser()))
+        for path in args.corrections:
+            sets[f"human corrections ({path.name})"] = correction_set(path.expanduser())
+        if not sets:
+            raise CompareError("nothing to compare on: pass --dataset and/or --corrections")
+        result = compare(baseline, candidate, sets, gates=not args.no_gates)
+    except (CompareError, OSError, KeyError, ValueError, AUTOLABEL.AutolabelError) as error:
+        print(f"attention-compare-models: {error}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    print(f"Baseline:  {result['baseline']}")
+    print(f"Candidate: {result['candidate']}")
+    for name, value in result["sets"].items():
+        print(f"{name} ({value['baseline']['count']} examples){'' if value['notWorse'] else '  WORSE'}")
+        print(f"  baseline   {describe(value['baseline'])}")
+        print(f"  candidate  {describe(value['candidate'])}")
+    print("Verdict: " + ("not worse on every set" if result["notWorse"] else "worse on at least one set; keep the embedded model"))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

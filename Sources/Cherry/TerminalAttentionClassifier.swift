@@ -359,7 +359,10 @@ struct TerminalAttentionClassifier: Sendable {
         )
     }
 
-    private static func features(
+    /// The model's input features for `observation`, before scaling: what
+    /// `Scripts/attention-train-baseline`'s `observation_features` computes.
+    /// Attention samples record them as the model saw them.
+    static func features(
         for observation: TerminalAttentionObservation
     ) -> [String: Double] {
         var features: [String: Double] = [:]

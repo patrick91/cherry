@@ -1101,6 +1101,9 @@ final class TerminalWorkspace: ObservableObject {
         didSet {
             updateAuxiliaryProcessingForSelection(previousSelectedSessionID: oldValue)
             clearUnreadNotificationForSelectedSession()
+            if selectedSessionID != oldValue, let selectedSessionID {
+                sessions.first { $0.id == selectedSessionID }?.noteAttentionSampleEvent(.focused, detail: "selected")
+            }
         }
     }
     /// The project's key (`ProjectLocation`): its directory for a project
@@ -2644,6 +2647,7 @@ final class TerminalWorkspace: ObservableObject {
     /// only disconnects it (its action detaches, or it is attached to a
     /// session it does not own): that one is left to the app's exit.
     private func finishClosingForQuit(_ session: TerminalSession, intent: SessionCloseIntent, action: SessionCloseAction) {
+        session.noteAttentionSampleClosed(intent: intent)
         guard action == .detach || session.hostedAttachment != nil else {
             finishClosing(session, intent: intent)
             return
@@ -2748,6 +2752,7 @@ final class TerminalWorkspace: ObservableObject {
 
     /// Ends a removed tab's program the way `intent` asks for its backend.
     private func finishClosing(_ session: TerminalSession, intent: SessionCloseIntent) {
+        session.noteAttentionSampleClosed(intent: intent)
         // A persistent tab whose program already ended leaves nothing worth
         // keeping when someone closes or detaches it, or it closes because
         // its shell exited: its session goes whatever the intent.
@@ -3075,6 +3080,7 @@ final class TerminalWorkspace: ObservableObject {
         else {
             return
         }
+        session.noteAttentionSampleEvent(.focused, detail: "viewed")
         session.acknowledgeAttentionAlert()
     }
 
@@ -4039,6 +4045,16 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var attentionNotificationGate = TerminalAttentionNotificationGate()
     private var currentAttentionScreenTagObservationID: UUID?
     private var latestAttentionObservationEvent: TerminalAttentionObservationEvent = .contentChanged
+    /// Continuous attention sampling (`TerminalAttentionSampler`); nil for
+    /// tabs that are not agents.
+    private let attentionSampler: TerminalAttentionSampler?
+    /// The sampler's pseudonymous ids of this tab and of its program's
+    /// current launch.
+    private lazy var attentionSampleTabID = TerminalAttentionSampling.stableID(id)
+    private var attentionSampleRunID = TerminalAttentionSampling.stableID(UUID())
+    /// Cherry's state when the tab was last sampled for a change of it.
+    private var lastAttentionSampleSignature: String?
+    private var lastViewportResizeAt: Date?
     /// Where the agent's current turn stands (read by tests).
     private(set) var agentTurnState: TerminalAttentionTurnState = .notStarted
     private var outputHoldUntil: Date?
@@ -4191,9 +4207,11 @@ final class TerminalSession: ObservableObject, Identifiable {
             TerminalSession
         ) -> Void = { _, session in
             TerminalNotificationCenter.shared.postAttention(for: session)
-        }
+        },
+        attentionSampler: TerminalAttentionSampler? = .shared
     ) {
         self.id = id
+        self.attentionSampler = kind == .agent ? attentionSampler : nil
         self.title = title
         self.titleSource = titleSource
         self.subtitle = subtitle
@@ -5354,6 +5372,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         finalScreenRead = nil
         let launchID = activeLaunchID
         activeLaunchID = nil
+        attentionSampler?.unregister(self)
         auxiliaryProcessingSuspensionTask?.cancel()
         auxiliaryProcessingSuspensionTask = nil
         backgroundOutputThrottleTask?.cancel()
@@ -5746,6 +5765,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
 
         viewportSize = nextSize
+        lastViewportResizeAt = Date()
         renderedReplayCache = nil
         processor.resize(to: nextSize)
         shellProcess?.resize(columns: nextSize.columns, rows: nextSize.rows)
@@ -5932,6 +5952,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         let launchID = UUID()
         activeLaunchID = launchID
+        // Each launch is a new run of samples (a restart starts over).
+        attentionSampleRunID = TerminalAttentionSampling.stableID(launchID)
+        lastAttentionSampleSignature = nil
+        attentionSampler?.register(self)
         // A restored or adopted session (`persistentSessionToAdopt`, taken
         // by `startPersistentLaunch`) and an attached one were running
         // before this launch.
@@ -7029,6 +7053,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             guard hostSignalMissedTheAdapter(key: "bell"),
                   noteSignalDelivery(key: "bell", fromHost: true, window: Self.bellDeduplicationWindow)
             else { return }
+            noteAttentionSampleEvent(.bell)
             bellHandler(self)
         case .notification(let title, let body):
             let key = Self.notificationKey(title: title, body: body)
@@ -7329,6 +7354,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 hostSessionEnd.map { "[\($0.message)]" } ?? "[shell exited with status \(status)]"
             ])
         }
+        noteAttentionSampleEvent(.exited, detail: String(status))
         scheduleAttentionObservation(event: .processExited)
         bumpRevision()
         if isPersistentLocalSession {
@@ -7476,6 +7502,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             // daemon heard from its holder again: the adapter finds out.
             launchDeferredAdapterIfNeeded()
         case .bell:
+            noteAttentionSampleEvent(.bell)
             bellHandler(self)
         case .notification(_, let title, let body):
             handleIncomingNotification(TerminalNotificationRequest(title: title.nilIfEmpty, body: body, source: .osc777))
@@ -7588,6 +7615,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             contentVersion &+= 1
         }
         if kind == .agent, contentChanged {
+            noteAttentionSampleContentChange()
             recordAgentActivitySignal()
             if agentActivityState == .working {
                 scheduleAgentIdleRecheck()
@@ -7846,6 +7874,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     func ingestNativeBell() {
         guard noteSignalDelivery(key: "bell", fromHost: false, window: Self.bellDeduplicationWindow) else { return }
         noteSurfaceSignalWhileFollowing(key: "bell")
+        noteAttentionSampleEvent(.bell)
         bellHandler(self)
     }
 
@@ -7919,6 +7948,30 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         ensureNativeContentFresh()
         return nativeContentLines.count
+    }
+
+    /// `contentLineCount` and `contentSnapshot` without refreshing a native
+    /// surface's lines: what the tab read last.
+    private func lastReadContentLineCount() -> Int {
+        if let closedTabContentLines {
+            return closedTabContentLines.count
+        }
+        if readsContentFromHost
+            || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
+            return nativeContentLines.count
+        }
+        return processor.lineCount
+    }
+
+    private func lastReadContentSnapshot(range: Range<Int>) -> [String] {
+        if let closedTabContentLines {
+            return Array(closedTabContentLines[range.clamped(to: 0..<closedTabContentLines.count)])
+        }
+        if readsContentFromHost
+            || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
+            return nativeContentSnapshot(range: range)
+        }
+        return processor.snapshot(range: range)
     }
 
     private func contentSnapshot(range: Range<Int>) -> [String] {
@@ -8028,6 +8081,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastContentChangeAt = Date()
         contentVersion &+= 1
         if kind == .agent {
+            noteAttentionSampleContentChange()
             recordAgentActivitySignal()
             if agentActivityState == .working {
                 scheduleAgentIdleRecheck()
@@ -8422,6 +8476,9 @@ final class TerminalSession: ObservableObject, Identifiable {
             runID: nil
         )
         let prediction = TerminalAttentionClassifier.shared.predict(observation)
+        defer {
+            sampleAttentionIfStateChanged(observation: observation, prediction: prediction)
+        }
         // Published values change only when they differ: an observation
         // follows typing (debounced), and republishing an unchanged value
         // would re-render every view observing the tab.
@@ -8483,6 +8540,177 @@ final class TerminalSession: ObservableObject, Identifiable {
         attentionNotificationHandler(prediction, self)
     }
 
+    // MARK: Attention samples
+
+    /// Records an interaction for attention sampling: its kind and time,
+    /// never content. Does nothing while sampling is off.
+    func noteAttentionSampleEvent(_ kind: TerminalAttentionSampleEvent.Kind, detail: String? = nil) {
+        guard let attentionSampler, attentionSampler.isCollecting else { return }
+        attentionSampler.recordEvent(
+            kind,
+            detail: detail,
+            tab: attentionSampleTabID,
+            run: attentionSampleRunID,
+            at: Date()
+        )
+    }
+
+    /// The tab closed (`intent`): the last event of its run.
+    func noteAttentionSampleClosed(intent: SessionCloseIntent) {
+        guard let attentionSampler else { return }
+        noteAttentionSampleEvent(.closed, detail: intent.rawValue)
+        attentionSampler.unregister(self)
+        attentionSampler.forget(tab: attentionSampleTabID, run: attentionSampleRunID)
+    }
+
+    private func noteAttentionSampleInput(_ effect: AgentDraftInputEffect) {
+        guard let attentionSampler, attentionSampler.isCollecting else { return }
+        if agentIsAtAnswerMenu {
+            noteAttentionSampleEvent(
+                .menuKey,
+                detail: agentActivityState == .permission ? "permission" : "question"
+            )
+            return
+        }
+        switch effect {
+        case .none: return
+        case .inserted, .edited, .cleared: noteAttentionSampleEvent(.typed)
+        case .submitted: noteAttentionSampleEvent(.submitted)
+        }
+    }
+
+    private func noteAttentionSampleContentChange() {
+        guard let attentionSampler, attentionSampler.isCollecting else { return }
+        let now = Date()
+        let window = TerminalAttentionSampling.inputEchoWindow
+        let followsInput = lastAgentInputAt.map { now.timeIntervalSince($0) < window } ?? false
+        let followsResize = lastViewportResizeAt.map { now.timeIntervalSince($0) < window } ?? false
+        attentionSampler.noteContentChange(
+            tab: attentionSampleTabID,
+            run: attentionSampleRunID,
+            selfDriven: !followsInput && !followsResize,
+            at: now
+        )
+    }
+
+    /// Samples the tab when Cherry's view of it changed (activity, its
+    /// evidence, the turn, the prediction), from the observation it just
+    /// classified.
+    private func sampleAttentionIfStateChanged(
+        observation: TerminalAttentionObservation,
+        prediction: TerminalAttentionPrediction
+    ) {
+        guard let attentionSampler, attentionSampler.isCollecting else { return }
+        let signature = [
+            agentActivityState.rawValue,
+            attentionActivityEvidenceName,
+            agentTurnState.rawValue,
+            String(agentTurnCount),
+            prediction.label.rawValue,
+        ].joined(separator: "|")
+        guard signature != lastAttentionSampleSignature else { return }
+        lastAttentionSampleSignature = signature
+        guard let sample = makeAttentionSample(
+            trigger: .stateChanged,
+            observation: observation,
+            prediction: prediction
+        ) else { return }
+        attentionSampler.record(sample)
+    }
+
+    /// The periodic sample (`TerminalAttentionSampler.tick`), from the
+    /// screen as the tab last read it: no surface read, no classifier
+    /// state change. Nil once the program exited (its exit was sampled)
+    /// or while the screen is blank.
+    func makePeriodicAttentionSample() -> TerminalAttentionSample? {
+        guard kind == .agent, exitedAt == nil else { return nil }
+        let observation = makeAttentionObservation(
+            event: latestAttentionObservationEvent,
+            label: nil,
+            annotation: nil,
+            scenarioID: nil,
+            checkpoint: nil,
+            harnessVersion: nil,
+            runID: nil,
+            readsLastContent: true
+        )
+        return makeAttentionSample(
+            trigger: .periodic,
+            observation: observation,
+            prediction: TerminalAttentionClassifier.shared.predict(observation)
+        )
+    }
+
+    private func makeAttentionSample(
+        trigger: TerminalAttentionSample.Trigger,
+        observation: TerminalAttentionObservation,
+        prediction: TerminalAttentionPrediction
+    ) -> TerminalAttentionSample? {
+        let grid = observation.terminal.grid
+        guard let lastLine = grid.lastIndex(where: {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else { return nil }
+        let tailEnd = lastLine + 1
+        let tailStart = max(0, tailEnd - TerminalAttentionSampling.screenTailLineLimit)
+        let tail = Array(grid[tailStart..<tailEnd])
+        let agent = screenAgentKey
+        let markerLines = Array(tail.suffix(AgentScreenActivity.markerTailLineLimit))
+        let backend: String
+        if persistentHosting != nil {
+            backend = remoteMachineName == nil ? "persistent" : "device"
+        } else if hostedAttachment != nil {
+            backend = "attached"
+        } else {
+            backend = "native"
+        }
+        let hostSessionID = persistentSession?.sessionID ?? hostedAttachment?.sessionID
+        return TerminalAttentionSample(
+            type: TerminalAttentionSample.recordType,
+            schemaVersion: TerminalAttentionSample.currentSchemaVersion,
+            id: UUID(),
+            recordedAt: observation.recordedAt,
+            trigger: trigger,
+            tab: attentionSampleTabID,
+            run: attentionSampleRunID,
+            hostSession: hostSessionID.map(TerminalAttentionSampling.stableID),
+            agent: agent,
+            backend: backend,
+            observation: observation.sampled(
+                grid: tail,
+                rowOffset: tailStart,
+                sessionID: attentionSampleTabID,
+                runID: attentionSampleRunID
+            ),
+            features: TerminalAttentionClassifier.features(for: observation),
+            prediction: .init(prediction),
+            shownPrediction: attentionClassifierPrediction.map(TerminalAttentionSample.Prediction.init),
+            lifecycle: .init(
+                turnState: agentTurnState,
+                submittedTurns: agentSubmittedTurnCount,
+                selfResumedTurns: agentSelfResumedTurnCount,
+                lastSubmitAt: lastAgentSubmitAt,
+                lastOutputAt: lastOutputAt,
+                lastContentChangeAt: lastContentChangeAt,
+                lastStrongWorkingEvidenceAt: lastStrongWorkingEvidenceAt,
+                lastKeystrokeAt: lastHumanKeystrokeAt,
+                lastInputAt: lastAgentInputAt,
+                alertGeneration: attentionAlertGeneration,
+                hasUnacknowledgedAttention: hasUnacknowledgedAttention
+            ),
+            screen: .init(
+                tailStartRow: tailStart,
+                viewportGridRows: grid.count,
+                liveLines: AgentScreenActivity.workingLines(markerLines, agent: agent),
+                verdict: AgentScreenActivity.verdict(
+                    for: tail,
+                    agent: agent,
+                    includesAnswerMenus: agentTurnState != .notStarted
+                ).rawValue
+            ),
+            changes: .init()
+        )
+    }
+
     private func ensureAttentionObservationRecorder() -> TerminalAttentionObservationRecorder? {
         guard let directoryURL = attentionObservationDirectoryProvider() else { return nil }
         if attentionObservationRecorder == nil {
@@ -8514,14 +8742,20 @@ final class TerminalSession: ObservableObject, Identifiable {
         checkpoint: String?,
         harnessVersion: String?,
         runID: String?,
-        correction: TerminalAttentionObservation.CorrectionContext? = nil
+        correction: TerminalAttentionObservation.CorrectionContext? = nil,
+        readsLastContent: Bool = false
     ) -> TerminalAttentionObservation {
         let now = Date()
-        let lineCount = contentLineCount()
+        // `readsLastContent`: the lines as last read, without reading the
+        // surface again (a periodic sample must not run the activity hooks).
+        let lineCount = readsLastContent ? lastReadContentLineCount() : contentLineCount()
         let rowLimit = min(max(viewportSize.rows, 1), Self.attentionObservationMaximumRows)
         let columnLimit = min(max(viewportSize.columns, 1), Self.attentionObservationMaximumColumns)
         let gridStart = max(0, lineCount - rowLimit)
-        let grid = contentSnapshot(range: gridStart..<lineCount).map { line in
+        let gridLines = readsLastContent
+            ? lastReadContentSnapshot(range: gridStart..<lineCount)
+            : contentSnapshot(range: gridStart..<lineCount)
+        let grid = gridLines.map { line in
             String(line.prefix(columnLimit))
         }
         // libghostty exposes terminal text but not per-cell styling. Preserve the
@@ -8623,6 +8857,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         _ notification: TerminalNotificationRequest
     ) {
         guard kind == .agent else { return }
+        noteAttentionSampleEvent(.notification)
         defer {
             scheduleAttentionObservation(event: .notification)
         }
@@ -9350,6 +9585,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func applyAgentDraftInputEffect(_ effect: AgentDraftInputEffect) {
         guard kind == .agent, effect != .none else { return }
         lastHumanKeystrokeAt = Date()
+        noteAttentionSampleInput(effect)
 
         if agentIsAtAnswerMenu {
             // Keys typed into a permission or question menu answer it
@@ -9398,6 +9634,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     private func noteAgentTurnInterrupted() {
         guard kind == .agent, agentTurnState == .active else { return }
+        noteAttentionSampleEvent(.interrupted)
         agentTurnState = .userInterrupted
         scheduleAttentionObservation(event: .turnInterrupted)
     }

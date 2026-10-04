@@ -191,6 +191,11 @@ final class TerminalCallbackBridge {
         func pastedImageText(from pasteboard: NSPasteboard) -> String? {
             (delegate as? any TerminalSurfacePastedImageDelegate)?.terminalText(forImageOn: pasteboard)
         }
+
+        /// Whether the delegate turns pasted images into text.
+        var takesPastedImages: Bool {
+            delegate is any TerminalSurfacePastedImageDelegate
+        }
     #endif
 
     /// Whether the delegate handles a click on `url` itself.

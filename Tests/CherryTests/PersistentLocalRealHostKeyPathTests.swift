@@ -289,11 +289,17 @@ private func nativeKeyBytes(in directory: URL, stage: KeyPathStage) async throws
             #expect(attached[index] == native[index], "\(mode.name): persistent \(attached[index] ?? "-"), native \(native[index] ?? "-")")
         }
         // Ctrl+B is 0x02 and Ctrl+Space NUL wherever the kitty keyboard
-        // protocol is off, modifyOtherKeys included; `CSI 98;5u` under it.
+        // protocol and modifyOtherKeys 2 are off; `CSI 27;5;98~` under
+        // modifyOtherKeys 2 (Ghostty encodes Control keys with it since
+        // 3c47ca159368), `CSI 98;5u` under the kitty protocol.
         let legacyPrefix = "0200" + hex("d")
-        for index in [0, 1, 2, 3, 4, 6, 8] {
+        for index in [0, 1, 2, 4, 6, 8] {
             #expect(attached[index]?.hasPrefix(legacyPrefix) == true, "\(KeyLogger.modes[index].name): \(attached[index] ?? "-")")
         }
+        #expect(
+            attached[3]?.hasPrefix(hex("\u{1B}[27;5;98~\u{1B}[27;5;32~d")) == true,
+            "\(KeyLogger.modes[3].name): \(attached[3] ?? "-")"
+        )
         for index in [5, 7] {
             #expect(attached[index]?.hasPrefix(hex("\u{1B}[98;5u")) == true, "\(KeyLogger.modes[index].name): \(attached[index] ?? "-")")
         }

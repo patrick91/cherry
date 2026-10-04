@@ -13,7 +13,7 @@ private let bootstrapDirectory = "/Users/tester/Library/Application Support/Cher
 private let binDirectory = "/Applications/Cherry.app/Contents/MacOS"
 private let tabID = "6F1C1F7E-5B7A-4C1B-9A55-3D2F8E0C4A11"
 /// The embedded Ghostty whose launch code HostedLaunchSpec reproduces.
-private let auditedGhosttyVersion = "1.3.2-HEAD-+35e1a0160"
+private let auditedGhosttyVersion = "1.3.2-HEAD-+3c47ca159"
 
 /// Cherry's environment as launchd gives it to a Dock launch, after
 /// libghostty's init set LANG, LANGUAGE and GHOSTTY_RESOURCES_DIR, plus
@@ -1164,10 +1164,12 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
         "CHERRY_SESSION_ID", CherryControl.processIDEnvironmentKey, CherryControl.agentIDEnvironmentKey,
         "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION",
     ]
-    for key in keys { setenv(key, "from-a-tab", 1) }
-    setenv("CHERRY_HOST_SOCKET_PROBE_KEEP", "kept", 1)
-    CherryTabEnvironment.removeFromProcess()
-    for key in keys { #expect(getenv(key) == nil) }
-    #expect(String(cString: getenv("CHERRY_HOST_SOCKET_PROBE_KEEP")) == "kept")
-    unsetenv("CHERRY_HOST_SOCKET_PROBE_KEEP")
+    // Never this process's own environment: libghostty, initialised by
+    // other tests, builds native surfaces' environments from the block it
+    // saw then, which a change here would move or shorten under it.
+    var removed: Set<String> = []
+    CherryTabEnvironment.removeFromProcess { removed.insert($0) }
+    for key in keys { #expect(removed.contains(key)) }
+    #expect(!removed.contains("CHERRY_HOST_SOCKET_PROBE_KEEP"))
+    #expect(!removed.contains("PATH"))
 }

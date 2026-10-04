@@ -425,8 +425,13 @@ enum CherryTabEnvironment {
     /// launched from inside a Cherry tab or an agent's shell: everything it
     /// starts inherits its environment, including the native and adapter
     /// surfaces Ghostty spawns and the sessions it creates.
-    static func removeFromProcess() {
-        for key in keys.union(agentChildMarkers) { unsetenv(key) }
+    ///
+    /// Only before the first terminal: libghostty keeps the process
+    /// environment it saw at its init (`ghostty_init`) and builds every
+    /// native surface's from it, so changing the environment after that
+    /// leaves it reading a moved or shortened block. Tests pass `unset`.
+    static func removeFromProcess(unset: (String) -> Void = { _ = unsetenv($0) }) {
+        for key in keys.union(agentChildMarkers) { unset(key) }
     }
 }
 

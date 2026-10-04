@@ -194,13 +194,16 @@ public enum TerminalClipboardRequestKind: Sendable {
     case osc52Read
     case osc52Write
 
+    /// A program's Kitty clipboard protocol (OSC 5522) read or write asks
+    /// as its OSC 52 one does. Nil for a request Ghostty never asks about
+    /// (a paste event's listing).
     init?(_ rawValue: ghostty_clipboard_request_e) {
         switch rawValue {
         case GHOSTTY_CLIPBOARD_REQUEST_PASTE:
             self = .paste
-        case GHOSTTY_CLIPBOARD_REQUEST_OSC_52_READ:
+        case GHOSTTY_CLIPBOARD_REQUEST_OSC_52_READ, GHOSTTY_CLIPBOARD_REQUEST_KITTY_READ:
             self = .osc52Read
-        case GHOSTTY_CLIPBOARD_REQUEST_OSC_52_WRITE:
+        case GHOSTTY_CLIPBOARD_REQUEST_OSC_52_WRITE, GHOSTTY_CLIPBOARD_REQUEST_KITTY_WRITE:
             self = .osc52Write
         default:
             return nil

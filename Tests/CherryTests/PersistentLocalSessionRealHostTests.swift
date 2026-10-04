@@ -1397,10 +1397,16 @@ final class MainThreadHeartbeat {
 }
 
 /// The longest the main thread may stop answering while a Stop runs and
-/// its program ends (the target is ~50 ms; debug builds under load leave
-/// some room). A Stop that waited for the program would block for its
-/// whole grace period (HUP → TERM → KILL), hundreds of milliseconds at least.
-private let stopMainThreadGapLimit: CFTimeInterval = 0.1
+/// its program ends. CI's own main thread pauses 80–90 ms now and then
+/// whatever runs (one gap reached 155 ms with Stop taking 11 ms), so this
+/// bounds work done after the call; a Stop that waited for its program
+/// would block for its whole grace period (HUP → TERM → KILL), hundreds of
+/// milliseconds at least.
+private let stopMainThreadGapLimit: CFTimeInterval = 0.3
+
+/// The longest the Stop call itself may take on the main thread (the
+/// target is ~50 ms; CI measured 2–11 ms).
+private let stopCallLimit: CFTimeInterval = 0.05
 
 /// Stops a running command tab as its Stop button and MCP `stop_process`
 /// do (`stopManagedCommand`), and returns how long that call took and the
@@ -1457,6 +1463,7 @@ private let stopMeasuredPrograms = [
                 print("stop main-thread block: persistent=\(persistent) program=\(script) call=\(Int(call * 1000)) ms longest gap=\(Int(gap * 1000)) ms")
                 #expect(command.state == .exited(0))
                 #expect(!command.isRunning)
+                #expect(call < stopCallLimit, "Stop took \(Int(call * 1000)) ms on the main thread (\(script), persistent \(persistent))")
                 #expect(gap < stopMainThreadGapLimit, "Stop blocked the main thread for \(Int(gap * 1000)) ms (\(script), persistent \(persistent))")
                 // A persistent tab's program is ended by its holder, and the
                 // session removed, even when it ignores HUP and TERM.
@@ -1557,6 +1564,7 @@ private struct StopMeasureContentHost: View {
                 let (gap, call) = try await mainThreadBlockOfStopping(command)
                 print("stop main-thread block in window: persistent=\(persistent) program=\(script) call=\(Int(call * 1000)) ms longest gap=\(Int(gap * 1000)) ms")
                 #expect(command.state == .exited(0))
+                #expect(call < stopCallLimit, "Stop took \(Int(call * 1000)) ms on the main thread (\(script), persistent \(persistent))")
                 #expect(gap < stopMainThreadGapLimit, "Stop blocked the main thread for \(Int(gap * 1000)) ms (\(script), persistent \(persistent))")
             }
         }

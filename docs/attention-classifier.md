@@ -302,6 +302,42 @@ enough to flip them caused held-out regressions, so the embedded model uses the
 conservative unweighted fit. More newly captured positive and negative examples
 are required to move that boundary safely.
 
+The `20261004-corrections-v4` update rebuilt from the original frozen dataset
+and the 2 October cumulative export (70 corrections, 31 July to 1 October). It
+contains 68 usable corrections from 42 sessions (eight attention-needed: seven
+results and one input request; 60 no-attention-needed), 34 beyond v2, after a
+relabel of an identical screen and a duplicate are removed. The new `active`
+and `user_interrupted` turn states enter through the existing `turn.state`
+category, which Swift already emits, making 49 parameters. The corrections
+carry no other field the model ignores, and the newer signals (question
+menus, `needs_input`, self-resumed turns) have no training examples, so no
+feature was added. The unweighted fit is worse on the fixed 279-example test,
+with 111 true positives, 160 true negatives, six false negatives and two false
+positives (one borderline screen crosses 0.5). Its human leave-one-session-out
+over the 33 original reviews falls from v2's 93.9% to 90.6% balanced accuracy
+(the 96.7% above is the July model). Over all 101 human examples it rises from
+64.5% to 72.5%, but only on the corrections' recorded activity, which the old
+screen rules produced: six of the eight positives were recorded as working, and
+all 23 negatives labelled agent working were recorded as idle at a prompt. The
+fit therefore learns a positive weight for an `active` turn and a strongly
+negative one for `completed`, both backwards at runtime.
+
+Correction weights raise the in-sample replay but not the held-out results.
+Weight two keeps the fixed-test regression, and weight three scores
+107/159/10/3. Replacing the corrections' activity with what the current screen
+rules report removes the inversion. It still only trades a false negative for
+a false positive on the fixed test (110/162/7/0, the same matrix v2 gives once
+the live-work rule applies) and keeps the original-33 leave-one-session-out at
+93.9%. At weight two its correction replay reaches 63 of 70 against v2's 61
+with the rule overrides, and 63 against 58 without them. That gain is in
+sample only. When each correction is scored by a model that never saw its
+session, the variants replay 61 of 70, as v2 does, except fits that lose
+fixed-test positives (replayed activity at weight three, 109/162/8/0, reaches
+63). The unembedded 27 August v3 candidate (54 corrections) failed the same
+way, at 111/160/6/2 and 90.6% on the original 33. v2 stays embedded.
+Moving the boundary safely needs corrections captured under the current rules,
+and a separate bundle of them held out for evaluation.
+
 ### Runtime Test Integration
 
 Cherry embeds the final weights and reproduces the Python feature extractor in

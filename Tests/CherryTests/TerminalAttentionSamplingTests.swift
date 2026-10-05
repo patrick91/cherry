@@ -108,16 +108,18 @@ struct TerminalAttentionSamplingTests {
 
         let before = try records(in: directory, sampler: sampler).count
         sampler.tick()
-        let first = try Array(records(in: directory, sampler: sampler).dropFirst(before))
-        #expect(first.count == 1)
-
         sampler.tick()
-        let afterSecond = try records(in: directory, sampler: sampler)
-        let second = Array(afterSecond.dropFirst(before + first.count))
-        #expect(second.count == 1)
-        #expect(second.first?["type"] as? String == "unchanged")
-        let lastSample = try #require(afterSecond.last { $0["type"] as? String == "sample" })
-        #expect(second.first?["sample"] as? String == lastSample["id"] as? String)
+        sampler.tick()
+        let afterTicks = try records(in: directory, sampler: sampler)
+        let ticks = Array(afterTicks.dropFirst(before))
+        // A sample (none when the tab's state-change sample already holds
+        // the screen), then one heartbeat naming it: checks this soon after
+        // a heartbeat write nothing (heartbeats back off).
+        #expect(ticks.filter { $0["type"] as? String == "sample" }.count <= 1)
+        let heartbeats = ticks.filter { $0["type"] as? String == "unchanged" }
+        #expect(heartbeats.count == 1)
+        let lastSample = try #require(afterTicks.last { $0["type"] as? String == "sample" })
+        #expect(heartbeats.first?["sample"] as? String == lastSample["id"] as? String)
 
         await showScreen(session, ["✻ Worked for 12s", "", "Done: the change is ready.", "Also updated the docs.", "", "❯ "])
         sampler.tick()
@@ -131,11 +133,112 @@ struct TerminalAttentionSamplingTests {
         #expect((changes["contentChanges"] as? Int ?? 0) >= 1)
     }
 
+    @Test func heartbeatsOfAnUnchangedScreenBackOffToTheirMaximum() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sampler = makeSampler(directory)
+        let base = try await baseSample(["✻ Worked for 12s", "", "Done: the change is ready.", "", "❯ "])
+        #expect(sampler.record(try variant(of: base, after: 0)))
+        for step in 1...40 {
+            #expect(!sampler.record(try variant(of: base, after: Double(step) * 30)))
+        }
+
+        let heartbeats = try records(in: directory, sampler: sampler).filter { $0["type"] as? String == "unchanged" }
+        let offsets = heartbeats.compactMap { $0["recordedAt"] as? String }.map { offset(of: $0, from: base) }
+        // Every check at first, then doubling gaps, then one every 5 min.
+        #expect(offsets == [30, 60, 120, 240, 480, 780, 1_080])
+        #expect(heartbeats.allSatisfy { $0["liveLines"] == nil })
+    }
+
+    @Test func aScreenThatOnlyAnimatesIsSkippedUntilItsSampleIsFiveMinutesOld() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sampler = makeSampler(directory)
+        let base = try await baseSample(["⏺ Reading 3 files", "", "✻ Worked for 12s", "", "❯ "])
+        #expect(sampler.record(try variant(of: base, after: 0, liveLines: [])))
+        // A blinking `⏺`, a spinner and a clock are animation.
+        let animated = ["  Reading 3 files", "", "✶ Worked for 14s", "", "❯ "]
+        #expect(!sampler.record(try variant(of: base, after: 30, grid: animated, liveLines: [])))
+        #expect(!sampler.record(try variant(of: base, after: 270, grid: animated, liveLines: [])))
+        #expect(sampler.record(try variant(of: base, after: 300, grid: animated, liveLines: [])))
+        // New text is a new sample at once, and so is any state change.
+        #expect(sampler.record(try variant(
+            of: base, after: 330, grid: ["⏺ Reading 4 files", "⏺ Edited main.rs", "", "❯ "], liveLines: []
+        )))
+        #expect(sampler.record(try variant(of: base, after: 331, trigger: .stateChanged, liveLines: [], submittedTurns: 3)))
+
+        #expect(TerminalAttentionSampler.animationFreeText(of: "  ⏺ Reading 12 files   ") == "Reading # files")
+        #expect(TerminalAttentionSampler.animationFreeText(of: "✻ Frosting… (1m 12s · esc)") == "Frosting… (#m #s · esc)")
+    }
+
+    @Test func aWorkingTabIsSampledEveryTwoMinutesWithItsLiveLinesInBetween() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sampler = makeSampler(directory)
+        let live = "✻ Frosting… (3s · esc to interrupt)"
+        let base = try await baseSample(["❯ fix it", "", "⏺ Reading files", "", live, "", "❯ "])
+        #expect(sampler.record(try variant(of: base, after: 0, liveLines: [live])))
+
+        // New output and advancing live lines: the same work, so heartbeats.
+        let later = "✻ Frosting… (33s · esc to interrupt)"
+        sampler.noteContentChange(tab: base.tab, run: base.run, selfDriven: true, at: date(of: base, after: 10))
+        #expect(!sampler.record(try variant(
+            of: base, after: 30, grid: ["❯ fix it", "", "⏺ Reading files", "⏺ Edited main.rs", "", later, "", "❯ "],
+            liveLines: [later]
+        )))
+        #expect(!sampler.record(try variant(
+            of: base, after: 60, grid: ["❯ fix it", "", "⏺ Edited main.rs", "⏺ Ran the tests", "", later, "", "❯ "],
+            liveLines: [later]
+        )))
+        // Two minutes after the last sample, a sample again.
+        let last = "✻ Frosting… (2m 3s · esc to interrupt)"
+        #expect(sampler.record(try variant(
+            of: base, after: 120, grid: ["❯ fix it", "", "⏺ Ran the tests", "⏺ All green", "", last, "", "❯ "],
+            liveLines: [last]
+        )))
+        // Another turn is other work.
+        #expect(sampler.record(try variant(of: base, after: 150, liveLines: [live], submittedTurns: 2)))
+
+        let all = try records(in: directory, sampler: sampler)
+        let heartbeats = all.filter { $0["type"] as? String == "unchanged" }
+        #expect(heartbeats.count == 2)
+        #expect(heartbeats.first?["liveLines"] as? [String] == [later])
+        // The second shows the same live lines as the first: none.
+        #expect(heartbeats.last?["liveLines"] == nil)
+        // Changes count from the tab's previous record.
+        let firstChanges = try #require(heartbeats.first?["changes"] as? [String: Any])
+        #expect(firstChanges["selfDrivenChanges"] as? Int == 1)
+        let samples = all.filter { $0["type"] as? String == "sample" }
+        let refreshed = try #require(samples.dropFirst().first?["changes"] as? [String: Any])
+        #expect(refreshed["selfDrivenChanges"] as? Int == 0)
+        #expect(all.allSatisfy { $0["schemaVersion"] as? Int == TerminalAttentionSample.currentSchemaVersion })
+    }
+
+    @Test func theEventThatMadeTheLastObservationIsNotANewScreen() async throws {
+        let base = try await baseSample(["✻ Worked for 12s", "", "Done.", "", "❯ "])
+        var features = base.features
+        for name in features.keys where name.hasPrefix("category.event=") {
+            features.removeValue(forKey: name)
+        }
+        var other = features
+        features["category.event=content_changed"] = 1
+        other["category.event=activity_state_changed"] = 1
+        let first = try variant(of: base, after: 0, features: features)
+        let second = try variant(of: base, after: 30, features: other)
+        #expect(TerminalAttentionSampler.dedupeKey(of: first) == TerminalAttentionSampler.dedupeKey(of: second))
+        var focused = other
+        focused["boolean.interaction.terminalFocused=true"] = 1
+        #expect(TerminalAttentionSampler.dedupeKey(of: first) != TerminalAttentionSampler.dedupeKey(of: try variant(of: base, after: 60, features: focused)))
+    }
+
     @Test func samplesHoldTheClassifiersExactInputsAndATail() async throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let sampler = makeSampler(directory)
-        let session = makeAgentSession(sampler: sampler, rows: 80)
+        // The tab's own state-change samples go to a sampler that is off,
+        // so the periodic one is not skipped as their repeat.
+        let idle = TerminalAttentionSampler(schedulesTimer: false, isEnabled: { false }, directoryURL: { directory })
+        let session = makeAgentSession(sampler: idle, rows: 80)
         defer { session.stop() }
         let screen = (1...70).map { "transcript line \($0)" } + ["", "❯ "]
         await showScreen(session, screen)
@@ -302,6 +405,53 @@ struct TerminalAttentionSamplingTests {
         #expect(remaining.reduce(0, +) <= 500)
     }
 
+    @Test func aDayStopsTakingSamplesAtItsDailyCapButKeepsEvents() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let utc = try #require(TimeZone(identifier: "UTC"))
+        let writer = TerminalAttentionSampleWriter(
+            directoryURL: directory,
+            maximumBytes: 1_000_000,
+            maximumDailyBytes: 2_000,
+            flushInterval: 3_600,
+            timeZone: utc
+        )
+        let start = try #require(ISO8601DateFormatter().date(from: "2026-10-05T12:00:00Z"))
+        for index in 0..<20 {
+            writer.append(.unchanged(heartbeat(at: start.addingTimeInterval(Double(index)))))
+        }
+        writer.flush()
+        for index in 0..<5 {
+            writer.append(.event(event(at: start.addingTimeInterval(100 + Double(index)))))
+            writer.append(.unchanged(heartbeat(at: start.addingTimeInterval(100 + Double(index)))))
+        }
+        // The next day starts afresh.
+        writer.append(.unchanged(heartbeat(at: start.addingTimeInterval(86_400))))
+        writer.flush()
+
+        let today = try String(contentsOf: directory.appendingPathComponent("2026-10-05.jsonl"), encoding: .utf8)
+        let lines = today.split(separator: "\n")
+        let heartbeatLines = lines.filter { $0.contains("\"type\":\"unchanged\"") }
+        #expect(heartbeatLines.count < 20)
+        #expect(heartbeatLines.reduce(0) { $0 + $1.utf8.count + 1 } <= 2_000)
+        #expect(lines.filter { $0.contains("\"type\":\"event\"") }.count == 5)
+        let tomorrow = try String(contentsOf: directory.appendingPathComponent("2026-10-06.jsonl"), encoding: .utf8)
+        #expect(tomorrow.split(separator: "\n").count == 1)
+
+        // A writer that starts on a day already full reads its size first.
+        let later = TerminalAttentionSampleWriter(
+            directoryURL: directory,
+            maximumBytes: 1_000_000,
+            maximumDailyBytes: 2_000,
+            flushInterval: 3_600,
+            timeZone: utc
+        )
+        later.append(.unchanged(heartbeat(at: start.addingTimeInterval(200))))
+        later.flush()
+        let after = try String(contentsOf: directory.appendingPathComponent("2026-10-05.jsonl"), encoding: .utf8)
+        #expect(after.split(separator: "\n").filter { $0.contains("\"type\":\"unchanged\"") }.count == heartbeatLines.count)
+    }
+
     @Test func writerLeavesFilesItDoesNotManage() throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -390,6 +540,81 @@ struct TerminalAttentionSamplingTests {
                 .filter { $0.contains("\"type\":\"sample\"") }
                 .map { try decoder.decode(TerminalAttentionSample.self, from: Data($0.utf8)) }
         }
+    }
+
+    /// A real periodic sample of a tab showing `lines`, from a tab whose
+    /// own sampler is off, so only what a test records reaches its sampler.
+    private func baseSample(_ lines: [String]) async throws -> TerminalAttentionSample {
+        let idle = TerminalAttentionSampler(schedulesTimer: false, isEnabled: { false }, directoryURL: { self.temporaryDirectory() })
+        let session = makeAgentSession(sampler: idle)
+        defer { session.stop() }
+        await showScreen(session, lines)
+        return try #require(session.makePeriodicAttentionSample())
+    }
+
+    /// `sample` `seconds` later (a new id), with its screen, live lines,
+    /// turn count or features replaced. The features stay as given: the
+    /// sampler compares what samples say, it does not recompute them.
+    private func variant(
+        of sample: TerminalAttentionSample,
+        after seconds: TimeInterval,
+        trigger: TerminalAttentionSample.Trigger = .periodic,
+        grid: [String]? = nil,
+        liveLines: [String]? = nil,
+        submittedTurns: Int? = nil,
+        features: [String: Double]? = nil
+    ) throws -> TerminalAttentionSample {
+        var object = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(sample)) as? [String: Any])
+        object["id"] = UUID().uuidString
+        object["recordedAt"] = date(of: sample, after: seconds).timeIntervalSinceReferenceDate
+        object["trigger"] = trigger.rawValue
+        if let grid {
+            var observation = try #require(object["observation"] as? [String: Any])
+            var terminal = try #require(observation["terminal"] as? [String: Any])
+            terminal["grid"] = grid
+            observation["terminal"] = terminal
+            object["observation"] = observation
+        }
+        if let liveLines {
+            var screen = try #require(object["screen"] as? [String: Any])
+            screen["liveLines"] = liveLines
+            object["screen"] = screen
+        }
+        if let submittedTurns {
+            var lifecycle = try #require(object["lifecycle"] as? [String: Any])
+            lifecycle["submittedTurns"] = submittedTurns
+            object["lifecycle"] = lifecycle
+        }
+        if let features {
+            object["features"] = features
+        }
+        return try JSONDecoder().decode(
+            TerminalAttentionSample.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+    }
+
+    private func date(of sample: TerminalAttentionSample, after seconds: TimeInterval) -> Date {
+        sample.recordedAt.addingTimeInterval(seconds)
+    }
+
+    /// Seconds from `sample` to a record's `recordedAt`, rounded.
+    private func offset(of recordedAt: String, from sample: TerminalAttentionSample) -> Int {
+        let style = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        guard let date = try? style.parse(recordedAt) else { return -1 }
+        return Int(date.timeIntervalSince(sample.recordedAt).rounded())
+    }
+
+    private func heartbeat(at date: Date) -> TerminalAttentionSampleHeartbeat {
+        TerminalAttentionSampleHeartbeat(
+            type: TerminalAttentionSampleHeartbeat.recordType,
+            schemaVersion: TerminalAttentionSample.currentSchemaVersion,
+            recordedAt: date,
+            tab: "0123456789abcdef",
+            run: "fedcba9876543210",
+            sample: UUID(),
+            changes: .init()
+        )
     }
 
     private func event(at date: Date) -> TerminalAttentionSampleEvent {

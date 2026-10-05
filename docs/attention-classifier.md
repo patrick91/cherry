@@ -340,6 +340,49 @@ way, at 111/160/6/2 and 90.6% on the original 33. v2 stays embedded.
 Moving the boundary safely needs corrections captured under the current rules,
 and a separate bundle of them held out for evaluation.
 
+The `20261005-autolabel-v1` candidate extended v2's dataset (the July data
+plus its 34 corrections, with the same 279-example fixed test) with
+auto-labelled samples from the first two days of continuous sampling (4 and
+5 October, 18 tab runs of Claude and Codex), `Scripts/attention-autolabel
+--base-dataset … --teacher-keep negatives`. Hindsight resolved 1,809 of the
+1,943 samples:
+
+- working: 898 by live lines and 75 by output;
+- 623 user responding;
+- 170 results ready;
+- 27 idle without a task;
+- 16 waiting at a menu.
+
+Once identical examples were dropped, 1,793 of them entered the dataset.
+The teacher labelled 61 more (21 Haiku calls, about 171,000 input tokens);
+60 of its positives were dropped and 4 answers abstained. Left out: 423
+samples of the 43 tabs with in-app corrections, and the 35 corrections made
+after v2, which are the held-out human set. 405 samples of tabs the hash
+split held out became the `autolabel_holdout`, leaving 2,313 binary
+training examples. `Scripts/attention-compare-models`, with the runtime
+rules on top:
+
+| Set | v2 TP/FP/TN/FN | Balanced | Candidate TP/FP/TN/FN | Balanced |
+| --- | --- | --- | --- | --- |
+| Fixed test (279) | 110/0/162/7 | 97.0% | 110/12/150/7 | 93.3% |
+| Auto-label holdout (405) | 2/2/400/1 | 83.1% | 2/4/398/1 | 82.8% |
+| Corrections after v2 (35) | 2/24/6/3 | 30.0% | 2/24/6/3 | 30.0% |
+
+The candidate is worse, so v2 stays embedded. All 12 new fixed-test false
+positives are July idle prompt screens (activity `idle`, evidence
+`prompt_marker`, event `activity_state_changed`). Those observations predate
+turn tracking, so they have no `turn.state` feature. The auto-labelled data
+tells a waiting result from an idle prompt mostly by turn state, so the fit
+raised the bias from -2.58 to -1.54, gave `completed` +0.24 (from -0.10),
+`active` -0.43 and `not_started` -0.36. Screens without a turn state fall to
+that higher bias. Every observation Cherry records now carries a turn state,
+so the fixed test penalises the candidate on screens the runtime no longer
+produces, but the rule above holds. The corrections made after v2 do not
+separate the models at all: both alert on 24 of the 30 no-attention
+corrections, which carry the old screen rules' activity, as corrections-v4
+found. Judging a model trained on current samples needs a fixed test of
+current observations, with turn states, frozen before it is used.
+
 ### Runtime Test Integration
 
 Cherry embeds the final weights and reproduces the Python feature extractor in
@@ -458,10 +501,35 @@ plain shells):
 - at once when Cherry's view of the tab changes: its activity state, the
   state's evidence, the turn state or count, or the prediction's label.
 
-A sample whose screen and features (all but the elapsed-time numbers, which
-always advance) repeat the tab's previous one is skipped; a periodic check
-then writes an `unchanged` heartbeat naming the sample it repeats. Each
-sample holds:
+A sample whose screen and features repeat the tab's previous one is skipped.
+The comparison ignores the elapsed-time numbers, which always advance, and
+the event that made the tab's last observation, which a periodic sample
+reuses. A periodic sample is also skipped:
+
+- while the last sample is under 5 minutes old, when its screen differs only
+  in animation: the live lines, each line's leading symbols and spaces (a
+  spinner, Claude's blinking `⏺`), digits (clocks, token counts), trailing
+  spaces and the cursor's column (`TerminalAttentionSampler.animationKey`);
+- while the last sample is under 2 minutes old, when the tab works: live
+  lines in it and in the last sample, with the same turn state and counts,
+  activity state and prediction (`workKey`).
+
+A skipped periodic sample may write an `unchanged` heartbeat naming the
+sample that still describes the tab. It writes one at once when the live
+lines read differently from the tab's previous record, and the heartbeat
+carries them (`liveLines`). Otherwise heartbeats back off: one at the first
+check, then gaps of 30 s, 1, 2 and 4 minutes, then one every 5 minutes.
+Before these rules, over the first two days of samples (4 and 5 October
+2026), 834 of the 1,586 periodic samples that differed from their tab's
+previous one differed only in live lines and digits (6.7 MB). An idle tab
+wrote a heartbeat every 30 s: by the evening of 5 October that day had
+11,524 heartbeats (3 MB) against 1,628 samples (8.4 KB on average).
+Replayed through the rules, the 5 October file (18.2 MB by then) comes to
+6.6 MB (697 samples, 2,637 heartbeats). It
+keeps every distinct waiting screen hindsight labels (70 result-ready
+screens over 68 turns, 8 menus) and every working turn. What goes are
+repeat copies of the same screen and the scrolling screens between a
+working turn's samples. Each sample holds:
 
 - `recordedAt`, the pseudonymous `tab` and `run` (the first 16 hex digits of
   the SHA-256 of the tab's UUID and of the launch's; a restart is a new run),
@@ -480,9 +548,11 @@ sample holds:
   and input times, the alert generation and whether an alert is unread;
 - `screen`: the tail's live lines (`AgentScreenActivity.workingLines`) and
   verdict;
-- `changes` since the tab's previous written sample: how often the screen
-  changed, how often by itself (no key, input or resize in the 1.5 s before),
-  and the times of those self-driven changes, at most one a second.
+- `changes` since the tab's previous record, sample or heartbeat (schema 2;
+  schema 1 counted from the previous sample, and its heartbeats from the
+  last sample): how often the screen changed, how often by itself (no key,
+  input or resize in the 1.5 s before), and the times of those self-driven
+  changes, at most one a second. Heartbeats carry the same.
 
 Interaction events go in between as their kind and time only, never content:
 `typed` (at most one every 2 s), `submitted`, `menu_key` (detail
@@ -495,7 +565,11 @@ Records are appended to
 (local date), by a background queue in batches (every 5 s, or 64 KiB, and at
 quit). The directory is `0700` and each file `0600`, opened without following
 links. The directory is capped at 200 MB: the oldest day files go first, and
-a day that alone outgrows the cap drops records until the next day. On the
+a day that alone outgrows the cap drops records until the next day. Each day
+file takes samples and heartbeats up to 16 MB, about twice the busiest day
+measured (6.6 MB with the rules above, ten agent tabs). Past that, only
+events are written until the next day: they are small and rate-limited, and
+hindsight labels need them. On the
 main thread a sample costs one classifier pass over state the tab already
 holds; with sampling off, or no agent tab running, there is no timer and no
 work.
@@ -540,7 +614,7 @@ events after it, with these rules in order (`hindsight_label`):
 | --- | --- | --- |
 | `user_responding` | the sample shows an unsent draft, or the user typed within 5 s before it and has not submitted since | no / `user_responding` |
 | `idle_no_task` | no turn was submitted or resumed in this run | no / `idle_no_active_task` |
-| `working` | the screen changed by itself within 20 s, before the user acted, and either the sample's live lines read differently in the next sample (within 45 s), or the program changed its screen in 3 or more separate seconds of those 20 and the next sample shows 2 or more new lines | no / `agent_working` |
+| `working` | the screen changed by itself within 20 s, before the user acted, and either the sample's live lines read differently in the next sample, or the next heartbeat carrying live lines (within 45 s), or the program changed its screen in 3 or more separate seconds of those 20 and the next sample shows 2 or more new lines | no / `agent_working` |
 | `needs_approval`, `needs_input` | the user's next action was a key into a menu (`menu_key`), and the screen did not change by itself from 2 s after the sample until then | yes / `waiting_for_approval`, `waiting_for_input` |
 | `result_ready` | a turn ran in this run, the sample shows no live lines, the user's next action was typing or submitting, the screen did not change by itself from 2 s after the sample until then, and it had stood still at least 10 s when they did | yes / `result_ready` |
 
@@ -624,6 +698,15 @@ called menus, a working screen called a result, a finished one called an
 error), and confidence did not separate those errors. The prompt was
 revised after run 1 on these same 68 corrections, so runs 2 and 3 are
 optimistic; future in-app corrections are the unbiased check.
+
+On 5 October 2026 the shipped prompt ran over the 35 corrections made after
+v2's dataset was built (15 August to 4 October; 6 calls, about 36,000 input
+tokens). It agreed on 32 (91%, balanced 95.0%). All 5 attention-needed
+corrections agreed, and 27 of the 30 no-attention ones: Pi 15/15, Claude
+16/17, Amp 1/3 (two idle Amp screens called results). Its `attention_needed`
+answers were again the less precise (5 of 8 right), so the retrain below
+kept only its negatives (`--teacher-keep negatives`). These 35 overlap the
+68 the prompt was tuned on, so this is still optimistic.
 
 ### Dataset and Workflow
 

@@ -102,12 +102,22 @@ def event(t: float, kind: str, detail: str | None = None, tab: str = TAB, run: s
     return record
 
 
-def heartbeat(t: float, sample_id: str, changes: list[float] | None = None) -> dict[str, Any]:
-    return {
-        "type": "unchanged", "schemaVersion": 1, "recordedAt": iso(t), "tab": TAB, "run": RUN,
+def heartbeat(
+    t: float,
+    sample_id: str,
+    changes: list[float] | None = None,
+    *,
+    live: list[str] | None = None,
+    schema: int = 1,
+) -> dict[str, Any]:
+    record = {
+        "type": "unchanged", "schemaVersion": schema, "recordedAt": iso(t), "tab": TAB, "run": RUN,
         "sample": sample_id,
         "changes": {"contentChanges": 0, "selfDrivenChanges": 0, "selfDrivenChangeTimes": changes or []},
     }
+    if live is not None:
+        record["liveLines"] = live
+    return record
 
 
 WORKING = ["❯ fix the bug", "", "⏺ Reading files", "", "✻ Frosting… (12s · esc to interrupt)", "", "❯ "]
@@ -203,6 +213,47 @@ class HindsightRuleTests(unittest.TestCase):
         timeline = AUTOLABEL.build_timelines([first, heartbeat(T0 + 30, first["id"], changes=[T0 + 4, T0 + 6])])[0]
         self.assertEqual(timeline.self_change_times_after(0), [T0 + 4, T0 + 6])
 
+    def test_schema_2_heartbeats_hold_changes_since_the_previous_record(self) -> None:
+        # Schema 2: each record holds the changes since the tab's previous
+        # record, so changes in heartbeats between samples count too.
+        first = sample(T0, DONE, live=[])
+        first["schemaVersion"] = 2
+        second = sample(T0 + 120, DONE, changes=[T0 + 100])
+        second["schemaVersion"] = 2
+        records = [
+            first,
+            heartbeat(T0 + 30, first["id"], changes=[T0 + 25], schema=2),
+            heartbeat(T0 + 60, first["id"], changes=[T0 + 41, T0 + 45], schema=2),
+            second,
+        ]
+        timeline = AUTOLABEL.build_timelines(records)[0]
+        self.assertEqual(timeline.self_change_times_after(0), [T0 + 25, T0 + 41, T0 + 45, T0 + 100])
+        self.assertEqual(timeline.self_change_times_before(1), [T0 + 25, T0 + 41, T0 + 45, T0 + 100])
+        # A change in a heartbeat before the user came back is not a still
+        # result.
+        records.append(event(T0 + 130, "typed"))
+        self.assertIsNone(label(records))
+
+    def test_live_lines_a_heartbeat_carries_are_work(self) -> None:
+        # The sampler skipped the samples of the same work: only heartbeats
+        # show the live lines advancing, and the next sample is 2 min away.
+        first = sample(T0, WORKING, live=["✻ Frosting… (12s · esc to interrupt)"])
+        first["schemaVersion"] = 2
+        later = sample(T0 + 120, WORKING_LATER, live=["✻ Frosting… (2m 12s · esc to interrupt)"],
+                       changes=[T0 + 95, T0 + 110])
+        later["schemaVersion"] = 2
+        records = [
+            first,
+            heartbeat(T0 + 30, first["id"], changes=[T0 + 3, T0 + 15], live=["✻ Frosting… (42s · esc to interrupt)"],
+                      schema=2),
+            later,
+        ]
+        verdict = label(records)
+        self.assertEqual((verdict.fine, verdict.rule), ("working", "live_lines_advanced"))
+        # Without the heartbeat's live lines the next sample is too far.
+        del records[1]["liveLines"]
+        self.assertIsNone(label(records))
+
     def test_rules_cover_every_fine_label(self) -> None:
         self.assertEqual(set(AUTOLABEL.FINE_LABELS), {
             "working", "user_responding", "idle_no_task", "result_ready", "needs_input", "needs_approval",
@@ -220,6 +271,19 @@ class ReadingTests(unittest.TestCase):
             records, stats = AUTOLABEL.load_records(AUTOLABEL.sample_files([Path(directory)], None))
         self.assertEqual(len(records), 2)
         self.assertEqual((stats["duplicate"], stats["malformed"]), (1, 1))
+
+    def test_schema_1_and_2_are_read_and_others_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            old = sample(T0, DONE)
+            new = sample(T0 + 30, DONE, draft=True)
+            new["schemaVersion"] = 2
+            future = sample(T0 + 60, DONE)
+            future["schemaVersion"] = 3
+            path = Path(directory) / "2026-10-05.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in (old, new, future)) + "\n", encoding="utf-8")
+            records, stats = AUTOLABEL.load_records(AUTOLABEL.sample_files([Path(directory)], None))
+        self.assertEqual([record["schemaVersion"] for record in records], [1, 2])
+        self.assertEqual(stats["unsupported"], 1)
 
     def test_near_duplicate_samples_keep_one_example(self) -> None:
         records = [sample(T0, DONE, draft=True), sample(T0 + 30, DONE, draft=True)]

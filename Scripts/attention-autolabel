@@ -41,7 +41,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-SAMPLE_SCHEMA_VERSION = 1
+# 2: `changes` count from the tab's previous record (sample or heartbeat), not
+# its previous sample, and heartbeats may carry `liveLines`.
+SAMPLE_SCHEMA_VERSIONS = (1, 2)
 DATASET_SCHEMA_VERSION = 1
 BINARY_LABELS = ("attention_needed", "no_attention_needed")
 ATTENTION_REASONS = ("result_ready", "waiting_for_input", "waiting_for_approval", "blocked_or_error")
@@ -308,7 +310,7 @@ def load_records(files: list[Path]) -> tuple[list[dict[str, Any]], Counter[str]]
                 except json.JSONDecodeError:
                     stats["malformed"] += 1
                     continue
-                if not isinstance(record, dict) or record.get("schemaVersion") != SAMPLE_SCHEMA_VERSION:
+                if not isinstance(record, dict) or record.get("schemaVersion") not in SAMPLE_SCHEMA_VERSIONS:
                     stats["unsupported"] += 1
                     continue
                 kind = record.get("type")
@@ -371,6 +373,9 @@ class Heartbeat:
     t: float
     sample: str
     change_times: list[float]
+    # The live lines when they advanced since the tab's previous record
+    # (schema 2): the sampler skipped a sample of the same work.
+    live_lines: list[str] | None = None
 
 
 @dataclass
@@ -394,24 +399,41 @@ class Timeline:
 
     def self_change_times_after(self, index: int) -> list[float]:
         """Times the program changed its screen by itself after sample
-        `index`: each later sample holds the changes since the one before
-        it, and the last heartbeat those since the last sample."""
+        `index`, from every later sample and heartbeat. Schema 2 records
+        hold the changes since the tab's previous record; schema 1 samples
+        those since the previous sample and heartbeats those since the last
+        sample, which the union reads the same."""
         start = self.samples[index].t
         times: list[float] = []
         for sample in self.samples[index + 1:]:
             times.extend(sample.change_times)
-        last_sample = self.samples[-1]
-        trailing = [heartbeat for heartbeat in self.heartbeats if heartbeat.t > last_sample.t]
-        if trailing:
-            times.extend(trailing[-1].change_times)
+        for heartbeat in self.heartbeats:
+            if heartbeat.t > start:
+                times.extend(heartbeat.change_times)
         return sorted(time for time in set(times) if time > start)
 
     def self_change_times_before(self, index: int) -> list[float]:
+        start = self.samples[index].t
         times: list[float] = []
         for sample in self.samples[: index + 1]:
             times.extend(sample.change_times)
-        start = self.samples[index].t
+        for heartbeat in self.heartbeats:
+            if heartbeat.t <= start:
+                times.extend(heartbeat.change_times)
         return sorted(time for time in set(times) if time <= start)
+
+    def live_lines_after(self, index: int) -> list[tuple[float, list[str]]]:
+        """The live lines the tab showed after sample `index`, in order:
+        each later sample's, and each heartbeat's that carries them (the
+        sampler skipped samples of the same work)."""
+        start = self.samples[index].t
+        shown = [(sample.t, sample.live_lines) for sample in self.samples[index + 1:]]
+        shown += [
+            (heartbeat.t, heartbeat.live_lines)
+            for heartbeat in self.heartbeats
+            if heartbeat.live_lines is not None and heartbeat.t > start
+        ]
+        return sorted(shown, key=lambda item: item[0])
 
     def first_event_after(self, start: float, kinds: set[str]) -> Event | None:
         for event in self.events:
@@ -479,10 +501,12 @@ def build_timelines(records: list[dict[str, Any]]) -> list[Timeline]:
             t = parse_time(record.get("recordedAt"))
             if t is not None:
                 changes = record.get("changes") or {}
+                live_lines = record.get("liveLines")
                 timeline(record).heartbeats.append(Heartbeat(
                     t,
                     str(record.get("sample")),
                     [float(value) for value in changes.get("selfDrivenChangeTimes") or []],
+                    [str(line) for line in live_lines] if isinstance(live_lines, list) else None,
                 ))
     for item in timelines.values():
         item.samples.sort(key=lambda sample: (sample.t, sample.id))
@@ -543,7 +567,8 @@ def hindsight_label(timeline: Timeline, index: int, config: HindsightConfig = Hi
     working          the screen changed by itself within 20 s, before the
                      user acted, and either the sample's live lines (status
                      line, `esc to interrupt`, live task rows) read
-                     differently in the next sample, or the program changed
+                     differently in the next sample (or heartbeat carrying
+                     live lines), or the program changed
                      its screen in 3 or more separate seconds of those 20
                      and the next sample shows 2 or more new lines;
     needs_input /    the next thing the user did was a key into a menu
@@ -578,12 +603,14 @@ def hindsight_label(timeline: Timeline, index: int, config: HindsightConfig = Hi
     user = timeline.first_event_after(t, USER_RETURN_KINDS)
     early = [time for time in changes if time - t <= config.work_window and (user is None or time < user.t)]
     if early:
-        comparable = (
-            next_sample is not None
-            and next_sample.t - t <= config.compare_window
-            and (user is None or next_sample.t < user.t)
-        )
-        if comparable and sample.live_lines and next_sample.live_lines != sample.live_lines:
+        def in_window(time: float) -> bool:
+            return time - t <= config.compare_window and (user is None or time < user.t)
+
+        comparable = next_sample is not None and in_window(next_sample.t)
+        # The next live lines shown: the next sample's, or a heartbeat's
+        # when the sampler skipped samples of the same work.
+        shown = [lines for time, lines in timeline.live_lines_after(index) if in_window(time)]
+        if sample.live_lines and shown and shown[0] != sample.live_lines:
             return Verdict("working", "live_lines_advanced")
         if comparable and len(early) >= 3 and new_lines(sample.grid, next_sample.grid) >= 2:
             return Verdict("working", "output_continued")

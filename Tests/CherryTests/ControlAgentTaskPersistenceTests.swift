@@ -310,7 +310,11 @@ struct ControlAgentTaskPersistenceTests {
             case "gone": saved.workerSession = binding("s-gone")
             case "ended": saved.workerSession = binding("s-ended")
             case "exited": saved.workerSession = binding("s-exited")
-            case "running": saved.workerSession = binding("s-running")
+            case "running":
+                // Saved after its worker started.
+                saved.workerSession = binding("s-running")
+                saved.state = .working
+                saved.startedAt = saved.startedAt ?? saved.createdAt
             case "device":
                 saved.workerSession = binding("s-device", host: "ssh:studio")
                 saved.device = device
@@ -334,6 +338,15 @@ struct ControlAgentTaskPersistenceTests {
             if saved.id == deviceTaskID { saved.runID = "run-device" }
             return saved
         }
+        // Tasks the relaunch cannot decide keep the state they were saved
+        // in (the sampler may have seen a worker start before the save).
+        let savedStates = Dictionary(uniqueKeysWithValues: record.tasks.map { ($0.id, $0.state) })
+        func saved(_ name: String) throws -> AgentTaskState {
+            let id = try #require(spawned[name]).id
+            return try #require(savedStates[id])
+        }
+        #expect(try saved("running") == .working)
+        #expect(try [AgentTaskState.queued, .working].contains(saved("device")))
 
         let after = try ControlAgentWaitHarness()
         defer { after.stop() }
@@ -369,8 +382,8 @@ struct ControlAgentTaskPersistenceTests {
         #expect(try state("exited") == (.failed, "it ended (exit 3) before it reported"))
         #expect(try state("native") == (.failed, "its tab ran no persistent session, so its program ended when Cherry quit"))
         #expect(try state("systemEnded") == (.failed, "its session ended when the Mac restarted"))
-        #expect(try state("running").0 == .queued, "a session that runs on keeps its task waiting")
-        #expect(try state("device").0 == .queued, "another Mac's task waits for it to be reachable")
+        #expect(try state("running").0 == saved("running"), "a session that runs on keeps its task waiting")
+        #expect(try state("device").0 == saved("device"), "another Mac's task waits for it to be reachable")
         #expect(try state("settled") == (.reported, nil))
         let settled = try await after.taskDetail(try #require(spawned["settled"]).id)
         #expect(settled.result?.summary == "Done before")
@@ -381,7 +394,7 @@ struct ControlAgentTaskPersistenceTests {
         #expect(events.events.contains { $0.taskID == spawned["gone"]?.id && $0.kind == .failed })
         // A device's task keeps to its Mac: This Mac's callers never see it.
         #expect(try await after.send(.getTask(.init(taskID: deviceTaskID))).error?.code == "unknown_task")
-        #expect(after.server.tasks.task(deviceTaskID, device: device)?.state == .queued)
+        #expect(try after.server.tasks.task(deviceTaskID, device: device)?.state == saved("device"))
 
         // This Mac's host that cannot be asked is waited for, at most so long.
         after.server.tasks.restoreDecisionTimeout = 0
@@ -390,7 +403,7 @@ struct ControlAgentTaskPersistenceTests {
         }
         await after.server.sampleTasks()
         #expect(try state("running") == (.failed, "Cherry could not find its session after it relaunched"))
-        #expect(try state("device").0 == .queued)
+        #expect(try state("device").0 == saved("device"))
     }
 
     /// A restored task whose kickoff was never typed gets it once its

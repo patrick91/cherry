@@ -340,7 +340,11 @@ mod tests {
         let other = start_identity(child.id() as libc::pid_t).unwrap();
         let _ = child.kill();
         let _ = child.wait();
-        assert!(other >= own, "{other} < {own}");
+        // Compared as numbers: Linux's clock ticks after the boot id gain
+        // digits (9897, then 10544), macOS's seconds and microseconds don't.
+        let started =
+            |identity: &str| -> f64 { identity.rsplit('/').next().unwrap().parse().unwrap() };
+        assert!(started(&other) >= started(&own), "{other} < {own}");
         assert_ne!(other, own);
         assert_eq!(start_identity(i32::MAX), None);
     }

@@ -1753,7 +1753,18 @@ fn a_connection_over_the_limit_is_told_why_and_the_log_says_so_once() {
         None,
         Stdio::from(File::create(&log).unwrap()),
     );
-    let _held = (host.connect(), host.connect());
+    // The launch's readiness check had a connection too: hold the second
+    // slot only once the daemon let that one go, or it is the one refused.
+    let first = std::cell::RefCell::new(host.connect());
+    wait_until("the readiness check's connection to close", || {
+        let mut first = first.borrow_mut();
+        send(&mut first, &ClientMessage::Status);
+        matches!(
+            receive(&mut first),
+            ServerMessage::Status { status } if status.connections == 1
+        )
+    });
+    let _held = (first.into_inner(), host.connect());
     // Every one after that gets an Error before its Welcome, and is closed.
     for _ in 0..3 {
         let mut refused = UnixStream::connect(&host.socket).unwrap();

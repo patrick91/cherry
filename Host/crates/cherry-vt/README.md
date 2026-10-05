@@ -97,7 +97,10 @@ kind, it is kept apart and taken first, so a taker never misses the current
 value (which, set again unchanged, would not be reported again). `title()`
 and `pwd()` always read the current values, and `mode(value, ansi)` reads one
 mode as the terminal holds it (DECCKM, application cursor keys, is
-`mode(1, false)`).
+`mode(1, false)`). modifyOtherKeys has no getter: `modes()` writes
+`ESC[>4;2m`, right before its kitty keyboard pop, exactly when it is at level
+2 (libghostty keeps only that level; 1 and `ESC[>4m` are off), and
+cherry-host's `screen::terminal_state` reads it there.
 
 The terminal can also be read as text in place, without a copy:
 `screen_text()` gives the whole of it with its history and `active_text()`

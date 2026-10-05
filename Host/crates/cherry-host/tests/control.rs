@@ -816,6 +816,58 @@ exec sleep 60"#,
 }
 
 #[test]
+fn subscribers_hear_modify_other_keys_turn_on_and_off() {
+    let host = Host::new();
+    let mut control = Control::subscribe(&host);
+    let dir = host.dir();
+    let (on, level1, again, reset) = (
+        dir.join("on"),
+        dir.join("level1"),
+        dir.join("again"),
+        dir.join("reset"),
+    );
+    let session = host.create(shell(&format!(
+        r#"stty -echo
+while [ ! -e '{on}' ]; do sleep 0.02; done
+printf '\033[>4;2m'
+while [ ! -e '{level1}' ]; do sleep 0.02; done
+printf '\033[>4;1m'
+while [ ! -e '{again}' ]; do sleep 0.02; done
+printf '\033[>4;2m'
+while [ ! -e '{reset}' ]; do sleep 0.02; done
+printf '\033[>4m'
+exec sleep 60"#,
+        on = on.display(),
+        level1 = level1.display(),
+        again = again.display(),
+        reset = reset.display(),
+    )));
+    let id = session.id.clone();
+    // Known, and off, from the start.
+    assert_eq!(session.modify_other_keys, Some(false));
+    let hear = |control: &mut Control, what: &str, on: bool| {
+        control.events_until(what, |event| {
+            matches!(event, SessionEvent::Changed { session } if session.id == id
+                && session.modify_other_keys == Some(on))
+        });
+    };
+    touch(&on);
+    hear(&mut control, "level 2", true);
+    assert_eq!(host.session(&id).modify_other_keys, Some(true));
+    // Attached clients are told too.
+    let (_attached, attached, ..) = host.attach(&id, 80, 24);
+    assert_eq!(attached.modify_other_keys, Some(true));
+    // Level 1 is off, as Ghostty encodes keys at level 1 as without it.
+    touch(&level1);
+    hear(&mut control, "level 1", false);
+    touch(&again);
+    hear(&mut control, "level 2 again", true);
+    touch(&reset);
+    hear(&mut control, "its reset", false);
+    host.kill(&id);
+}
+
+#[test]
 fn clearing_history_leaves_the_screen_and_no_history_for_reads_and_reattaches() {
     let host = Host::new();
     let dir = host.dir();

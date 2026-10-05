@@ -232,6 +232,7 @@ private func encoded(
     _ modifiers: NSEvent.ModifierFlags = [],
     applicationCursorKeys: Bool = false,
     kittyFlags: Int = 0,
+    modifyOtherKeys: Bool = false,
     optionAsAlt: HostRoutedKeyEncoder.OptionAsAlt = .both
 ) -> String? {
     HostRoutedKeyEncoder.data(
@@ -243,6 +244,7 @@ private func encoded(
         isEnhancedKeyboardProtocolActive: kittyFlags > 0,
         keyboardProtocolFlags: kittyFlags,
         sendsModifiedArrowKeys: false,
+        modifyOtherKeys: modifyOtherKeys,
         optionAsAlt: optionAsAlt
     ).map { String(decoding: $0, as: UTF8.self) }
 }
@@ -479,6 +481,154 @@ private func encoded(
     ))
     #expect(await harness.fake.wait { typedThroughHost(harness).count == 4 })
     #expect(typedThroughHost(harness) == ["\u{1B}[27u", "\u{1B}[\(controlCCode);5u", "\u{1B}[13~", "\u{1B}[B"])
+}
+
+@Test func keysUnderModifyOtherKeysGoAsGhosttysSurfaceTypesThemWhileAnAdapterIsAway() {
+    // The expectations are Ghostty's (input/key_encode.zig `legacy` with
+    // modify_other_keys_state_2, function_keys.zig).
+    func mok(
+        _ characters: String,
+        ignoring: String? = nil,
+        keyCode: UInt16,
+        _ modifiers: NSEvent.ModifierFlags = [],
+        kittyFlags: Int = 0,
+        optionAsAlt: HostRoutedKeyEncoder.OptionAsAlt = .both
+    ) -> String? {
+        encoded(
+            characters, ignoring: ignoring, keyCode: keyCode, modifiers,
+            kittyFlags: kittyFlags, modifyOtherKeys: true, optionAsAlt: optionAsAlt
+        )
+    }
+    // Return with modifiers: `CSI 27 ; m ; 13 ~`, Option as Alt or not.
+    #expect(mok("\r", keyCode: 36) == "\r")
+    #expect(mok("\r", keyCode: 36, .shift) == "\u{1B}[27;2;13~")
+    #expect(mok("\r", keyCode: 36, .control) == "\u{1B}[27;5;13~")
+    #expect(mok("\r", keyCode: 36, .option) == "\u{1B}[27;3;13~")
+    #expect(mok("\r", keyCode: 36, .option, optionAsAlt: .neither) == "\u{1B}[27;3;13~")
+    #expect(mok("\r", keyCode: 36, [.control, .shift]) == "\u{1B}[27;6;13~")
+    #expect(mok("\r", keyCode: 76, [.control, .shift]) == "\r")
+    // Control and a character: `CSI 27 ; m ; character ~`, never the C0 byte.
+    #expect(mok("\u{10}", ignoring: "p", keyCode: 35, .control) == "\u{1B}[27;5;112~")
+    #expect(mok("\u{03}", ignoring: "c", keyCode: 8, .control) == "\u{1B}[27;5;99~")
+    #expect(mok("\u{08}", ignoring: "H", keyCode: 4, [.control, .shift]) == "\u{1B}[27;6;72~")
+    #expect(mok("\u{00}", ignoring: " ", keyCode: 49, .control) == "\u{1B}[27;5;32~")
+    #expect(mok("1", keyCode: 18, .control) == "\u{1B}[27;5;49~")
+    #expect(mok("\u{1B}", ignoring: "[", keyCode: 33, .control) == "\u{1B}[27;5;91~")
+    // Shift alone: for `@`…`~` (letters) and space only.
+    #expect(mok("A", keyCode: 0, .shift) == "\u{1B}[27;2;65~")
+    #expect(mok(" ", keyCode: 49, .shift) == "\u{1B}[27;2;32~")
+    #expect(mok("!", keyCode: 18, .shift) == "!")
+    #expect(mok("a", keyCode: 0) == "a")
+    #expect(mok(" ", keyCode: 49) == " ")
+    #expect(mok("é", keyCode: 14) == "é")
+    // Option as Alt counts; Option that composes does not (Option+8 as `[`).
+    #expect(mok("•", ignoring: "8", keyCode: 28, .option) == "\u{1B}[27;3;56~")
+    #expect(mok("∫", ignoring: "b", keyCode: 11, .option) == "\u{1B}[27;3;98~")
+    #expect(mok("[", ignoring: "8", keyCode: 28, .option, optionAsAlt: .neither) == "[")
+    #expect(mok("\u{02}", ignoring: "b", keyCode: 11, [.control, .option]) == "\u{1B}[27;7;98~")
+    // Tab, Escape and Backspace.
+    #expect(mok("\t", keyCode: 48, .shift) == "\u{1B}[Z")
+    #expect(mok("\t", keyCode: 48, .control) == "\u{1B}[27;5;9~")
+    #expect(mok("\t", keyCode: 48, .option) == "\u{1B}[27;3;9~")
+    #expect(mok("\u{1B}", keyCode: 53) == "\u{1B}")
+    #expect(mok("\u{1B}", keyCode: 53, .option) == "\u{1B}[27;3;27~")
+    #expect(mok("\u{1B}", keyCode: 53, .shift) == "\u{1B}[27;2;27~")
+    #expect(mok("\u{7F}", keyCode: 51) == "\u{7F}")
+    #expect(mok("\u{7F}", keyCode: 51, .control) == "\u{08}")
+    #expect(mok("\u{7F}", keyCode: 51, .option) == "\u{1B}[27;3;127~")
+    #expect(mok("\u{7F}", keyCode: 51, [.control, .shift]) == "\u{1B}[27;6;127~")
+    // Navigation and function keys as without it (F3 with modifiers in
+    // Ghostty's `CSI 13 ; m ~`); keypad keys as their character.
+    let arrows: NSEvent.ModifierFlags = [.numericPad, .function]
+    #expect(mok("\u{F702}", keyCode: 123, arrows) == "\u{1B}[D")
+    #expect(mok("\u{F702}", keyCode: 123, arrows.union(.option)) == "\u{1B}[1;3D")
+    #expect(mok("\u{F703}", keyCode: 124, arrows.union([.control, .shift])) == "\u{1B}[1;6C")
+    #expect(mok("\u{F72C}", keyCode: 116, [.function, .control]) == "\u{1B}[5;5~")
+    #expect(mok("\u{F706}", keyCode: 99, .function) == "\u{1B}OR")
+    #expect(mok("\u{F706}", keyCode: 99, [.function, .control]) == "\u{1B}[13;5~")
+    #expect(mok("\u{F704}", keyCode: 122, [.function, .shift]) == "\u{1B}[1;2P")
+    #expect(mok("\u{F708}", keyCode: 96, [.function, .control]) == "\u{1B}[15;5~")
+    #expect(mok("1", keyCode: 83, [.numericPad, .control]) == "1")
+    // Command shortcuts are still the menu's.
+    #expect(mok("p", keyCode: 35, .command) == nil)
+    // The kitty keyboard protocol wins, as in Ghostty.
+    #expect(mok("\u{10}", ignoring: "p", keyCode: 35, .control, kittyFlags: 1) == "\u{1B}[112;5u")
+    #expect(mok("\r", keyCode: 36, .shift, kittyFlags: 1) == "\u{1B}[13;2u")
+
+    // Without it, the legacy encoding is unchanged.
+    #expect(encoded("\r", keyCode: 36, .shift) == "\r")
+    #expect(encoded("\r", keyCode: 36, .control) == "\r")
+    #expect(encoded("\r", keyCode: 36, .option) == "\u{1B}\r")
+    #expect(encoded("\u{10}", ignoring: "p", keyCode: 35, .control) == "\u{10}")
+    #expect(encoded("\u{08}", ignoring: "H", keyCode: 4, [.control, .shift]) == "\u{08}")
+    #expect(encoded("A", ignoring: "A", keyCode: 0, .shift) == "A")
+    #expect(encoded("∫", ignoring: "b", keyCode: 11, .option) == "\u{1B}b")
+    #expect(encoded("\u{1B}", keyCode: 53, .option) == "\u{1B}")
+    #expect(encoded("\u{7F}", keyCode: 51, .option) == "\u{1B}\u{7F}")
+}
+
+@Test @MainActor func keysTypedWhileAnAdapterIsAwayFollowTheModifyOtherKeysTheHostReports() async throws {
+    let harness = try PersistentHarness()
+    let workspace = harness.workspace()
+    let container = GhosttyTerminalContainerView(frame: NSRect(x: 0, y: 0, width: 640, height: 400))
+    defer {
+        container.detachActiveSession()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let tab = workspace.addSession(title: "Shell")
+    #expect(await harness.waitUntilAttached(tab))
+    container.configure(with: tab, colorScheme: .dark, allowsAutoFocus: false)
+    #expect(await harness.fake.wait { harness.attachCalls.count == 1 })
+    let call = try #require(harness.attachCalls.first)
+    let sessionID = try #require(tab.persistentSession?.sessionID)
+    func report(modifyOtherKeys: Bool?, kittyFlags: UInt32 = 0) {
+        harness.fake.connections.last(where: { !$0.isClosed })?.push(.event(.changed(HostedSessionInfo(
+            id: sessionID, name: "Shell", cwd: harness.project.path, pid: 42, clients: 1,
+            alternateScreen: true, kittyKeyboardFlags: kittyFlags, applicationCursorKeys: false,
+            modifyOtherKeys: modifyOtherKeys
+        ))))
+    }
+
+    // Vim sets modifyOtherKeys to level 2; the host reports it.
+    report(modifyOtherKeys: true)
+    #expect(await harness.fake.wait { tab.usesModifyOtherKeys })
+
+    // Its adapter reconnects: the keys go through the host, as Ghostty's
+    // surface would have typed them then.
+    try HostedSessionFakeCLI.writeStatus(
+        HostedSessionFakeCLI.attachedStatus(reconnecting: true), to: try harness.statusFile(of: call)
+    )
+    #expect(await harness.fake.wait { tab.keyboardInputGoesThroughHost })
+    let controlP = try keyDown("\u{10}", ignoringModifiers: "p", keyCode: 35, modifiers: .control)
+    // The key's own character (layout dependent): its code.
+    let controlPCode = try #require(controlP.characters(byApplyingModifiers: [])?.unicodeScalars.first?.value)
+    #expect(container.sendKeyThroughHostWhileAdapterIsAway(controlP))
+    #expect(container.sendKeyThroughHostWhileAdapterIsAway(try keyDown("\r", keyCode: 36, modifiers: .shift)))
+    #expect(container.sendKeyThroughHostWhileAdapterIsAway(try keyDown("\r", keyCode: 36, modifiers: .control)))
+    #expect(container.sendKeyThroughHostWhileAdapterIsAway(try keyDown("\u{1B}", keyCode: 53)))
+    #expect(await harness.fake.wait { typedThroughHost(harness).count == 4 })
+    #expect(typedThroughHost(harness) == [
+        "\u{1B}[27;5;\(controlPCode)~", "\u{1B}[27;2;13~", "\u{1B}[27;5;13~", "\u{1B}",
+    ])
+
+    // Under the kitty keyboard protocol too, that protocol wins.
+    report(modifyOtherKeys: true, kittyFlags: 1)
+    #expect(await harness.fake.wait { tab.isEnhancedKeyboardProtocolActive })
+    #expect(container.sendKeyThroughHostWhileAdapterIsAway(try keyDown("\r", keyCode: 36, modifiers: .shift)))
+    #expect(await harness.fake.wait { typedThroughHost(harness).last == "\u{1B}[13;2u" })
+
+    // Back at a prompt: the legacy bytes.
+    report(modifyOtherKeys: false)
+    #expect(await harness.fake.wait { !tab.usesModifyOtherKeys && !tab.isEnhancedKeyboardProtocolActive })
+    #expect(container.sendKeyThroughHostWhileAdapterIsAway(controlP))
+    #expect(await harness.fake.wait { typedThroughHost(harness).last == "\u{10}" })
+    // A host that does not say (a holder older than link version 10) is
+    // taken as off.
+    report(modifyOtherKeys: true)
+    #expect(await harness.fake.wait { tab.usesModifyOtherKeys })
+    report(modifyOtherKeys: nil)
+    #expect(await harness.fake.wait { !tab.usesModifyOtherKeys })
 }
 
 // Keys typed into a persistent tab whose attach adapter was launched and has

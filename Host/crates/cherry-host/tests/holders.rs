@@ -505,9 +505,10 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
             info.kitty_keyboard_flags,
             info.application_cursor_keys,
             info.bracketed_paste,
+            info.modify_other_keys,
             info.request_id.clone()
         ),
-        (false, 0, false, None, None)
+        (false, 0, false, None, None, None)
     );
     let old_id = old.id.clone();
     thread::scope(|scope| {
@@ -625,6 +626,7 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
                 "kitty_keyboard_flags": 7,
                 "application_cursor_keys": true,
                 "bracketed_paste": true,
+                "modify_other_keys": true,
             }, "receipt": {"request_id": request_id, "fingerprint": "f", "extra": 1}}),
         ),
     );
@@ -651,9 +653,17 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
             info.kitty_keyboard_flags,
             info.application_cursor_keys,
             info.bracketed_paste,
+            info.modify_other_keys,
             info.request_id.as_deref()
         ),
-        (true, 7, true, Some(true), Some(request_id.as_str()))
+        (
+            true,
+            7,
+            true,
+            Some(true),
+            Some(true),
+            Some(request_id.as_str())
+        )
     );
     new.send(
         link::INFO,
@@ -676,6 +686,10 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
     new.send(link::INFO, newer, json!({"bracketed_paste": false}), b"");
     let changed = host.wait(&new.id, |s| s.bracketed_paste == Some(false));
     assert!(!changed.application_cursor_keys);
+    assert_eq!(changed.modify_other_keys, Some(true));
+    new.send(link::INFO, newer, json!({"modify_other_keys": false}), b"");
+    let changed = host.wait(&new.id, |s| s.modify_other_keys == Some(false));
+    assert_eq!(changed.bracketed_paste, Some(false));
     // It is asked to clear its history, and the client hears how that went.
     let new_id = new.id.clone();
     thread::scope(|scope| {

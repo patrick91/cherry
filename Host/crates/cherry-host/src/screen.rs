@@ -1,7 +1,7 @@
 //! What a session's terminal shows, read without changing it: the screen as
 //! text (`Screen`), and the terminal state clients follow in `SessionInfo`
-//! (the alternate screen, the kitty keyboard flags, application cursor keys
-//! and bracketed paste).
+//! (the alternate screen, the kitty keyboard flags, application cursor keys,
+//! bracketed paste and modifyOtherKeys).
 use anyhow::Result;
 use cherry_protocol::MAX_SCREEN_TEXT_BYTES;
 use cherry_vt::Terminal;
@@ -28,6 +28,9 @@ pub struct TerminalState {
     /// Bracketed paste (mode `?2004`): a paste is wrapped in `ESC [ 200 ~`
     /// and `ESC [ 201 ~`.
     pub bracketed_paste: bool,
+    /// xterm's modifyOtherKeys at level 2 (`CSI > 4 ; 2 m`): in legacy key
+    /// encoding, keys with modifiers send `ESC [ 27 ; m ; code ~`.
+    pub modify_other_keys: bool,
 }
 
 /// What `terminal` has of the state clients follow; None if it cannot be
@@ -39,37 +42,44 @@ pub struct TerminalState {
 /// `ESC[?1049h ESC[?1049l ESC[?1047l ESC[?47l`, sets the mode that entered
 /// the alternate screen right after that when it is active, and ends by
 /// popping every kitty keyboard entry (`ESC[<8u`) and, when the flags are
-/// not 0, setting them (`ESC[=<flags>;1u`). DECCKM and bracketed paste are
-/// read as modes. It is cheap (a few microseconds), and read only after
-/// output that holds an escape sequence, since nothing else changes any of
-/// them (DECCKM changes with `CSI ? 1 h` / `l` and resets, bracketed paste
-/// with `CSI ? 2004 h` / `l` and resets). A test pins the shape against
-/// `Terminal::inspect`.
+/// not 0, setting them (`ESC[=<flags>;1u`). Right before that pop come the
+/// keyboard modes Ghostty's formatter writes, `ESC[>4;2m` exactly when
+/// modifyOtherKeys is at level 2 (libghostty keeps only that: level 1 and
+/// `ESC[>4m` turn it off). DECCKM and bracketed paste are read as modes. It
+/// is cheap (a few microseconds), and read only after output that holds an
+/// escape sequence, since nothing else changes any of them (DECCKM changes
+/// with `CSI ? 1 h` / `l` and resets, bracketed paste with `CSI ? 2004 h` /
+/// `l` and resets, modifyOtherKeys with `CSI > 4 ; … m` and resets). A test
+/// pins the shape against `Terminal::inspect`.
 pub fn terminal_state(terminal: &Terminal) -> Option<TerminalState> {
-    let (alternate_screen, kitty_keyboard_flags) = parse_terminal_state(&terminal.modes().ok()?)?;
+    let (alternate_screen, kitty_keyboard_flags, modify_other_keys) =
+        parse_terminal_state(&terminal.modes().ok()?)?;
     Some(TerminalState {
         alternate_screen,
         kitty_keyboard_flags,
         application_cursor_keys: terminal.mode(1, false).ok()?,
         bracketed_paste: terminal.mode(2004, false).ok()?,
+        modify_other_keys,
     })
 }
 
-fn parse_terminal_state(modes: &[u8]) -> Option<(bool, u32)> {
+fn parse_terminal_state(modes: &[u8]) -> Option<(bool, u32, bool)> {
     const PRIMARY: &[u8] = b"\x1b[?1049h\x1b[?1049l\x1b[?1047l\x1b[?47l";
     const ALTERNATE: [&[u8]; 3] = [b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
     const POP: &[u8] = b"\x1b[<8u";
+    const MODIFY_OTHER_KEYS: &[u8] = b"\x1b[>4;2m";
     let rest = modes.strip_prefix(PRIMARY)?;
     let alternate = ALTERNATE.iter().any(|entry| rest.starts_with(entry));
-    let popped = rest.windows(POP.len()).rposition(|window| window == POP)? + POP.len();
-    let flags = match &rest[popped..] {
+    let pop = rest.windows(POP.len()).rposition(|window| window == POP)?;
+    let modify_other_keys = rest[..pop].ends_with(MODIFY_OTHER_KEYS);
+    let flags = match &rest[pop + POP.len()..] {
         [] => 0,
         set => {
             let digits = set.strip_prefix(b"\x1b[=")?.strip_suffix(b";1u")?;
             std::str::from_utf8(digits).ok()?.parse().ok()?
         }
     };
-    Some((alternate, flags))
+    Some((alternate, flags, modify_other_keys))
 }
 
 /// How many lines `text` has: one more than its line ends (an empty text
@@ -275,6 +285,19 @@ mod tests {
             b"\x1b[?1049h\x1b[?2004h\x1b[?1049l",
             b"\x1b[?2004h\x1bc",
             b"\x1b[?2004h\x1b[!p",
+            // modifyOtherKeys at level 2, whichever screen shows; level 1
+            // and its reset are off.
+            b"\x1b[>4;2m",
+            b"\x1b[>4;2m\x1b[>4m",
+            b"\x1b[>4;2m\x1b[>4;1m",
+            b"\x1b[>4;1m",
+            b"\x1b[>4;2m\x1b[?1049h",
+            b"\x1b[?1049h\x1b[>4;2m\x1b[?1049l",
+            b"\x1b[>4;2m\x1b[>5u",
+            b"\x1b[>4;2m\x1b[?1h\x1b[?2004h",
+            b"\x1b[>4;2m\x1bc",
+            b"\x1b[>4;2m\x1b[>4n",
+            b"\x1b[>4;2m\x1b[>1m",
         ] {
             let terminal = terminal(20, 5, output);
             let inspection = terminal.inspect().unwrap();
@@ -285,6 +308,7 @@ mod tests {
                     kitty_keyboard_flags: u32::from(inspection.kitty_flags),
                     application_cursor_keys: inspection.modes.iter().any(|mode| mode == "?1h"),
                     bracketed_paste: inspection.modes.iter().any(|mode| mode == "?2004h"),
+                    modify_other_keys: inspection.state.contains("␛[>4;2m"),
                 }),
                 "{:?}",
                 String::from_utf8_lossy(output)
@@ -314,6 +338,19 @@ mod tests {
         );
         assert_eq!(
             terminal_state(&terminal(20, 5, b"\x1b[?1h\x1b[?1l")),
+            Some(TerminalState::default())
+        );
+        assert_eq!(
+            terminal_state(&terminal(20, 5, b"\x1b[?1049h\x1b[>4;2m\x1b[>1u")),
+            Some(TerminalState {
+                alternate_screen: true,
+                kitty_keyboard_flags: 1,
+                modify_other_keys: true,
+                ..TerminalState::default()
+            })
+        );
+        assert_eq!(
+            terminal_state(&terminal(20, 5, b"\x1b[>4;2m\x1b[>4;0m")),
             Some(TerminalState::default())
         );
         // Any other shape is not guessed at.

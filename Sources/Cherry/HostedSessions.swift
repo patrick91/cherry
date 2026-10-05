@@ -200,6 +200,13 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
     /// known: from a host older than protocol 7, or for a session whose
     /// holder predates holder link 7.
     let bracketedPaste: Bool?
+    /// Whether the program set xterm's modifyOtherKeys to level 2
+    /// (`ESC [ > 4 ; 2 m`, as Vim does): in legacy key encoding
+    /// (`kittyKeyboardFlags` 0), keys with modifiers are then
+    /// `ESC [ 27 ; m ; code ~` (Control+P is `ESC [ 27 ; 5 ; 112 ~`, not ^P).
+    /// Level 1 is off, as for Ghostty. Nil when it is not known: from an
+    /// older host, or for a session whose holder predates holder link 10.
+    let modifyOtherKeys: Bool?
     /// The `request_id` of the Create that started the session; nil when
     /// the host does not report it (an older host).
     let requestID: String?
@@ -221,6 +228,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         case kittyKeyboardFlags = "kitty_keyboard_flags"
         case applicationCursorKeys = "application_cursor_keys"
         case bracketedPaste = "bracketed_paste"
+        case modifyOtherKeys = "modify_other_keys"
         case requestID = "request_id"
         case endedBy = "ended_by"
         case holderLog = "holder_log"
@@ -249,6 +257,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         kittyKeyboardFlags: UInt32? = nil,
         applicationCursorKeys: Bool? = nil,
         bracketedPaste: Bool? = nil,
+        modifyOtherKeys: Bool? = nil,
         requestID: String? = nil,
         endedBy: String? = nil,
         holderLog: String? = nil
@@ -275,6 +284,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         self.kittyKeyboardFlags = kittyKeyboardFlags
         self.applicationCursorKeys = applicationCursorKeys
         self.bracketedPaste = bracketedPaste
+        self.modifyOtherKeys = modifyOtherKeys
         self.requestID = requestID
         self.endedBy = endedBy
         self.holderLog = holderLog
@@ -306,6 +316,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
             kittyKeyboardFlags: try container.decodeIfPresent(UInt32.self, forKey: .kittyKeyboardFlags),
             applicationCursorKeys: try container.decodeIfPresent(Bool.self, forKey: .applicationCursorKeys),
             bracketedPaste: try container.decodeIfPresent(Bool.self, forKey: .bracketedPaste),
+            modifyOtherKeys: try container.decodeIfPresent(Bool.self, forKey: .modifyOtherKeys),
             requestID: try container.decodeIfPresent(String.self, forKey: .requestID),
             endedBy: try container.decodeIfPresent(String.self, forKey: .endedBy),
             holderLog: try container.decodeIfPresent(String.self, forKey: .holderLog)
@@ -338,6 +349,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         try container.encodeIfPresent(kittyKeyboardFlags, forKey: .kittyKeyboardFlags)
         try container.encodeIfPresent(applicationCursorKeys, forKey: .applicationCursorKeys)
         try container.encodeIfPresent(bracketedPaste, forKey: .bracketedPaste)
+        try container.encodeIfPresent(modifyOtherKeys, forKey: .modifyOtherKeys)
         try container.encodeIfPresent(requestID, forKey: .requestID)
         try container.encodeIfPresent(endedBy, forKey: .endedBy)
         try container.encodeIfPresent(holderLog, forKey: .holderLog)
@@ -398,7 +410,8 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
             state: .exited, pid: pid, exitCode: code, exitSignal: signal, attached: attached,
             title: title, pwd: pwd, foreground: nil, clients: clients, owner: owner, tags: tags,
             createdAt: createdAt, alternateScreen: alternateScreen, kittyKeyboardFlags: kittyKeyboardFlags,
-            applicationCursorKeys: applicationCursorKeys, bracketedPaste: bracketedPaste, requestID: requestID,
+            applicationCursorKeys: applicationCursorKeys, bracketedPaste: bracketedPaste,
+            modifyOtherKeys: modifyOtherKeys, requestID: requestID,
             endedBy: end?.reason ?? endedBy, holderLog: end?.holderLog ?? holderLog
         )
     }

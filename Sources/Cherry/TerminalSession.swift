@@ -4461,6 +4461,20 @@ final class TerminalSession: ObservableObject, Identifiable {
         return application && (info.kittyKeyboardFlags ?? 0) == 0
     }
 
+    /// Whether the program set xterm's modifyOtherKeys to level 2, as its
+    /// host reports it for a hosted tab (`HostedSessionInfo.modifyOtherKeys`;
+    /// Ghostty's surface parses it for the adapter, not for Cherry): keys
+    /// typed while an adapter is away (`HostRoutedKeyEncoder`) are encoded
+    /// as Ghostty's surface would then, unless the kitty keyboard protocol
+    /// is on (it wins, as in Ghostty). False when the host does not report
+    /// it (an older host or holder) or reports nothing now. MCP input needs
+    /// nothing for it: the only keys with modifiers it can name (arrows,
+    /// Home, End, Page Up/Down, Delete, Shift+Tab) are typed the same either
+    /// way.
+    var usesModifyOtherKeys: Bool {
+        hostReportedSessionInfo?.modifyOtherKeys ?? false
+    }
+
     /// Whether the program turned on bracketed paste: as its host reports
     /// it for a hosted tab (`HostedSessionInfo.bracketedPaste`; the surface
     /// parses the mode for the adapter, not for Cherry), else as parsed from

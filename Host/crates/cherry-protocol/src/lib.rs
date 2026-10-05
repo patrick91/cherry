@@ -321,6 +321,16 @@ pub struct SessionInfo {
     /// or for a session whose holder predates link version 7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bracketed_paste: Option<bool>,
+    /// Whether the program set xterm's modifyOtherKeys to level 2
+    /// (`CSI > 4 ; 2 m`), as the host's terminal has it: in legacy key
+    /// encoding, keys with modifiers are then sent as `ESC [ 27 ; m ; code ~`
+    /// (Control+P as `ESC [ 27 ; 5 ; 112 ~`, not ^P). Level 1 and reset
+    /// (`CSI > 4 m`) are off, as for Ghostty, which encodes keys at level 1
+    /// as without it. It does not apply while [`Self::kitty_keyboard_flags`]
+    /// is not 0. None when it is not known: from an older host, or for a
+    /// session whose holder predates link version 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modify_other_keys: Option<bool>,
     /// The `request_id` of the `Create` that made the session. It survives
     /// host restarts; None for a session whose host did not record it.
     #[serde(default)]
@@ -2616,6 +2626,7 @@ mod tests {
             kitty_keyboard_flags: 31,
             application_cursor_keys: true,
             bracketed_paste: Some(true),
+            modify_other_keys: Some(true),
             request_id: Some("d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3b".into()),
             ended_by: None,
             holder_log: None,
@@ -3074,7 +3085,7 @@ mod tests {
             added.starts_with(r#"{"type":"event","event":{"kind":"added","session":{"id":"3f6c","#)
         );
         assert!(added.contains(
-            r#""title":"vim — main.rs","pwd":"file://studio/Users/me/My%20Code","foreground":{"pid":4300,"name":"nvim"},"clients":2,"owner":"com.example.cherry","tags":{"kind":"agent","tab":"6d1f"},"created_at":1790000000123,"alternate_screen":true,"kitty_keyboard_flags":31,"application_cursor_keys":true,"bracketed_paste":true,"request_id":"d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3b""#
+            r#""title":"vim — main.rs","pwd":"file://studio/Users/me/My%20Code","foreground":{"pid":4300,"name":"nvim"},"clients":2,"owner":"com.example.cherry","tags":{"kind":"agent","tab":"6d1f"},"created_at":1790000000123,"alternate_screen":true,"kitty_keyboard_flags":31,"application_cursor_keys":true,"bracketed_paste":true,"modify_other_keys":true,"request_id":"d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3b""#
         ), "{added}");
         assert_eq!(
             json(&ServerMessage::Sessions {
@@ -3210,6 +3221,17 @@ mod tests {
             ..session_info()
         };
         assert!(json(&off).contains(r#""bracketed_paste":false"#));
+        // modifyOtherKeys likewise.
+        let unknown = SessionInfo {
+            modify_other_keys: None,
+            ..session_info()
+        };
+        assert!(!json(&unknown).contains("modify_other_keys"));
+        let off = SessionInfo {
+            modify_other_keys: Some(false),
+            ..session_info()
+        };
+        assert!(json(&off).contains(r#""modify_other_keys":false"#));
         // Why it ended: left out unless a holder was lost.
         let normal = json(&session_info());
         assert!(!normal.contains("ended_by") && !normal.contains("holder_log"));
@@ -3284,9 +3306,10 @@ mod tests {
                 info.kitty_keyboard_flags,
                 info.application_cursor_keys,
                 info.bracketed_paste,
+                info.modify_other_keys,
                 info.request_id
             ),
-            (false, 0, false, None, None)
+            (false, 0, false, None, None, None)
         );
         // What a host of an earlier stage sends.
         assert_eq!(

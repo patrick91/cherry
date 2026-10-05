@@ -17,7 +17,8 @@ enum HostProtocol {
     /// in binary frames instead of base64 in JSON. The app's control
     /// connection speaks the same JSON messages as in v5.
     /// v7: `ClearHistory`, `Create`'s `colors`, and `SessionInfo`'s
-    /// `bracketed_paste`.
+    /// `bracketed_paste`. `SessionInfo`'s `modify_other_keys` came later
+    /// without a new version: a v7 host may leave it out.
     static let version: UInt32 = 7
     static let maxFrameBytes = 16 * 1_024 * 1_024
     /// The most bytes one `SendInput` carries.

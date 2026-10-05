@@ -589,6 +589,34 @@ private func decode(_ text: String) throws -> HostResponse {
     #expect(reported.exited(code: 0, signal: nil).applicationCursorKeys == true)
 }
 
+@Test func HostControlDecodesTheProgramsModifyOtherKeysLevel() throws {
+    // A changed event from a host that reports it (Vim set level 2).
+    let on = try decode("""
+    {"type":"event","event":{"kind":"changed","session":{"id":"s1","name":"n","cwd":"/","command":[],"cols":80,"rows":24,
+     "state":"running","pid":9,"kitty_keyboard_flags":0,"modify_other_keys":true}}}
+    """)
+    guard case .event(.changed(let info)) = on.message else {
+        Issue.record("Expected a changed event, got \(on.message)")
+        return
+    }
+    #expect(info.modifyOtherKeys == true)
+    // A host or holder from before it: unknown, not off.
+    let older = try decode("""
+    {"type":"sessions","host_id":"h","sessions":[
+     {"id":"s1","name":"n","cwd":"/","command":[],"cols":80,"rows":24,"state":"running"}]}
+    """)
+    guard case .sessions(let olderList) = older.message else { return }
+    #expect(olderList.sessions.first?.modifyOtherKeys == nil)
+
+    // Round trips keep it, and leave it out when unknown; an exit keeps it.
+    let reported = HostedSessionInfo(id: "s", name: "n", cwd: "/", modifyOtherKeys: false)
+    #expect(try json(JSONEncoder().encode(reported))["modify_other_keys"] as? Bool == false)
+    #expect(try json(JSONEncoder().encode(HostedSessionInfo(id: "s", name: "n", cwd: "/")))["modify_other_keys"] == nil)
+    let response = HostResponse(req: 1, message: .sessions(HostedSessionList(hostID: "h", sessions: [reported])))
+    #expect(try decode(String(decoding: JSONEncoder().encode(response), as: UTF8.self)) == response)
+    #expect(reported.exited(code: 0, signal: nil).modifyOtherKeys == false)
+}
+
 @Test func HostControlAsksForTheLastLinesOfAScreenOnlyWhenLimited() throws {
     #expect(try body(of: HostRequest(req: 5, message: .screen(id: "s", scrollback: true, maxLines: 600)))
         == (try json(#"{"op":"screen","req":5,"id":"s","scrollback":true,"max_lines":600}"#)))

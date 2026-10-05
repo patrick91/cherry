@@ -223,6 +223,11 @@ final class RealLocalHost {
         TerminalWorkspace(projectRoot: home.path, createInitialSession: false, backendPolicy: policy)
     }
 
+    /// The container that shows `session` (see `show`).
+    func container(showing session: TerminalSession) -> GhosttyTerminalContainerView? {
+        shownSessions.first { $0.1 === session }?.0
+    }
+
     /// Shows `session` in a window of `size` points, so its surface renders.
     func show(_ session: TerminalSession, size: NSSize = NSSize(width: 800, height: 500)) {
         let container = GhosttyTerminalContainerView(frame: NSRect(origin: .zero, size: size))
@@ -742,6 +747,54 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
             try await processOutput(control, tab).contains { $0.contains("KEY_[A_") }
         }
         #expect(try await processOutput(control, tab).contains { $0.contains("KEY_[B_") || $0.contains("KEY_OA_") } == false)
+    } catch {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    control.stop()
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostKeysReachAnUnattachedProgramInItsModifyOtherKeysForm() async throws {
+    var configuration = PersistentLocalSessions.Configuration()
+    // Once lost, the adapter stays lost for the test.
+    configuration.reconnectDelay = (120, 120)
+    let host = try await RealLocalHost(configuration: configuration)
+    let workspace = host.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    do {
+        let tab = workspace.addSession(title: "Keys")
+        host.show(tab)
+        let container = try #require(host.container(showing: tab))
+        try await host.waitFor("the tab to attach to its session") {
+            tab.persistentSession != nil && tab.state == .live && tab.usesNativePTYBackendAdapterAttached
+        }
+        let sessionID = try #require(tab.persistentSession?.sessionID)
+        #expect(try await host.hostSession(sessionID)?.modifyOtherKeys == false)
+
+        // A program that sets modifyOtherKeys to level 2 (as Vim does),
+        // prints the key it reads, then resets it.
+        tab.send(text: #"printf '\033[>4;2m'; IFS= read -rsn10 k; printf '\033[>4m'; echo "KEY_${k:1}_""# + "\n")
+        try await host.waitFor("the host to report modifyOtherKeys") { tab.usesModifyOtherKeys }
+        #expect(try await host.observedSession(sessionID)?.modifyOtherKeys == true)
+
+        // No adapter takes the key: Control+Return goes through the host as
+        // Ghostty's surface would type it then, not as a CR.
+        try await loseAdapter(of: tab, host: host)
+        try await host.waitFor("keys to go through the host") { tab.keyboardInputGoesThroughHost }
+        let controlReturn = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .control, timestamp: 0, windowNumber: 0,
+            context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36
+        ))
+        #expect(container.sendKeyThroughHostWhileAdapterIsAway(controlReturn))
+        try await host.waitFor("the program to read ESC [ 27 ; 5 ; 13 ~") {
+            try await processOutput(control, tab).contains { $0.contains("KEY_[27;5;13~_") }
+        }
+        try await host.waitFor("the host to report it reset") { !tab.usesModifyOtherKeys }
     } catch {
         control.stop()
         workspace.closeAllSessions(intent: .windowClosed)

@@ -2573,6 +2573,7 @@ mod tests {
             kitty_keyboard_flags: 0,
             application_cursor_keys: false,
             bracketed_paste: None,
+            modify_other_keys: None,
             request_id: None,
             ended_by: None,
             holder_log: None,

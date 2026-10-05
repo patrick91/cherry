@@ -100,6 +100,9 @@
 //!   them. An older holder is never sent it. A holder of version 9 also
 //!   reads the kitty graphics programs transmit from files and shared
 //!   memory itself (see `media`); that changes nothing on the link.
+//! - Version 10 adds xterm's modifyOtherKeys at level 2 (`CSI > 4 ; 2 m`),
+//!   as a field: `modify_other_keys` in `Info` and in the hello's session,
+//!   which a daemon takes as unknown from an older holder.
 //!
 //! Replies (`SnapshotReply`, `ScreenReply`, `DetachDone`) come in the order
 //! of their requests, and in order with the output: a `SnapshotReply` shows
@@ -113,7 +116,7 @@ use std::{
 };
 
 /// The link version this build speaks.
-pub const LINK_VERSION: u16 = 9;
+pub const LINK_VERSION: u16 = 10;
 /// The oldest link version whose holders limit screen text themselves
 /// (`ScreenRequest::max_lines`).
 pub const SCREEN_LINES_VERSION: u16 = 3;
@@ -514,6 +517,10 @@ pub struct SessionState {
     /// older holder, which never reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bracketed_paste: Option<bool>,
+    /// Version 10: whether modifyOtherKeys is at level 2; None from an
+    /// older holder, which never reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modify_other_keys: Option<bool>,
 }
 
 /// The `Create` that made a session, so that a daemon adopting it keeps
@@ -833,6 +840,9 @@ pub struct Info {
     /// Version 7: whether bracketed paste (DECSET 2004) is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bracketed_paste: Option<bool>,
+    /// Version 10: whether modifyOtherKeys is at level 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modify_other_keys: Option<bool>,
 }
 
 impl Info {
@@ -1032,9 +1042,19 @@ mod tests {
             .unwrap(),
             r#"{"bracketed_paste":true}"#
         );
+        // Version 10's, likewise.
+        assert_eq!(
+            serde_json::to_string(&Info {
+                modify_other_keys: Some(false),
+                ..Info::default()
+            })
+            .unwrap(),
+            r#"{"modify_other_keys":false}"#
+        );
         let old: Info = serde_json::from_str(r#"{"alternate_screen":true}"#).unwrap();
         assert_eq!(old.application_cursor_keys, None);
         assert_eq!(old.bracketed_paste, None);
+        assert_eq!(old.modify_other_keys, None);
         let old: SessionState = serde_json::from_str(
             r#"{"name":"n","cwd":"/","command":[],"cols":80,"rows":24,"running":true,"pid":7}"#,
         )
@@ -1044,9 +1064,10 @@ mod tests {
                 old.alternate_screen,
                 old.kitty_keyboard_flags,
                 old.application_cursor_keys,
-                old.bracketed_paste
+                old.bracketed_paste,
+                old.modify_other_keys
             ),
-            (false, 0, false, None)
+            (false, 0, false, None, None)
         );
         let request: ScreenRequest =
             serde_json::from_str(r#"{"req":1,"scrollback":true}"#).unwrap();

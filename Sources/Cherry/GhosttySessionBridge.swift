@@ -3557,7 +3557,8 @@ final class GhosttyTerminalContainerView: NSView {
     /// takes it there, so it goes through the host (`send(data:)`), and
     /// the surface keeps showing the last screen. Cursor keys are encoded
     /// for the program's cursor key mode as its host reports it
-    /// (`TerminalSession.usesApplicationCursorKeys`). True when it was
+    /// (`TerminalSession.usesApplicationCursorKeys`), and every key for its
+    /// modifyOtherKeys (`TerminalSession.usesModifyOtherKeys`). True when it was
     /// sent; false leaves the event to the surface (Command shortcuts,
     /// which the menu handles; keys `HostRoutedKeyEncoder` has no encoding
     /// for; text being composed with an input method).
@@ -3621,6 +3622,10 @@ final class GhosttyTerminalContainerView: NSView {
         else {
             return false
         }
+        let optionAsAlt = HostRoutedKeyEncoder.OptionAsAlt.nativeSurfaces
+        // Ghostty's modifyOtherKeys encoding applies in legacy key encoding
+        // only.
+        let modifyOtherKeys = activeSession.usesModifyOtherKeys && !activeSession.isEnhancedKeyboardProtocolActive
         let data: Data
         if isPasteShortcut(event) {
             // Bracketed as the host reports the program's mode: the
@@ -3635,15 +3640,19 @@ final class GhosttyTerminalContainerView: NSView {
             modifiers: event.modifierFlags,
             characters: event.characters,
             charactersIgnoringModifiers: event.charactersIgnoringModifiers,
-            // Only the kitty keyboard protocol's codes use it.
-            unshiftedCharacters: activeSession.isEnhancedKeyboardProtocolActive
+            // Only the kitty keyboard protocol's codes, and under
+            // modifyOtherKeys an Alt key that types no single character,
+            // use it.
+            unshiftedCharacters: activeSession.isEnhancedKeyboardProtocolActive || modifyOtherKeys
                 ? event.characters(byApplyingModifiers: []) : nil,
+            typedText: modifyOtherKeys ? HostRoutedKeyEncoder.surfaceText(for: event, optionAsAlt: optionAsAlt) : nil,
             usesApplicationCursorKeys: activeSession.usesApplicationCursorKeys,
             isEnhancedKeyboardProtocolActive: activeSession.isEnhancedKeyboardProtocolActive,
             keyboardProtocolFlags: activeSession.keyboardProtocolFlags,
             sendsModifiedArrowKeys: activeSession.usesAlternateScreen
                 || activeSession.isEnhancedKeyboardProtocolActive,
-            optionAsAlt: .nativeSurfaces
+            modifyOtherKeys: modifyOtherKeys,
+            optionAsAlt: optionAsAlt
         ) {
             data = encoded
         } else {
@@ -3960,6 +3969,11 @@ private extension NSLock {
 /// path only turns a lone Tab into `CSI 9 u` then, `normalizedInputData`),
 /// alternate keys (flag 4) and associated text (flag 16).
 ///
+/// While the program set xterm's modifyOtherKeys to level 2 and uses no
+/// kitty flags (`modifyOtherKeys`, as its host reports it), every key goes
+/// as Ghostty's surface types it then (`modifyOtherKeysData`): keys with
+/// modifiers mostly as `CSI 27 ; m ; code ~`.
+///
 /// Nil for Command shortcuts (the menu's) and keys it has no encoding for
 /// (F13 and above, keys with no character).
 enum HostRoutedKeyEncoder {
@@ -3980,6 +3994,14 @@ enum HostRoutedKeyEncoder {
         static let up: UInt16 = 126
         static let f3: UInt16 = 99
     }
+
+    /// The keypad keys (`kVK_ANSI_Keypad…`) Ghostty types as their character
+    /// whatever the modifiers, as the numeric keypad does by default (mode
+    /// 1035 on, so never in application keypad form), and keypad Enter as CR.
+    private static let keypadKeys: [UInt16: String] = [
+        65: ".", 67: "*", 69: "+", 75: "/", 76: "\r", 78: "-",
+        82: "0", 83: "1", 84: "2", 85: "3", 86: "4", 87: "5", 88: "6", 89: "7", 91: "8", 92: "9",
+    ]
 
     /// F1–F12 (`kVK_F1`…) as xterm types them: F1–F4 as `ESC O P`…`S`
     /// (`ESC [ 1 ; m P` with modifiers), the others as `ESC [ n ~`
@@ -4043,20 +4065,42 @@ enum HostRoutedKeyEncoder {
     /// (`NSEvent.characters(byApplyingModifiers: [])`), the code of a
     /// Control or Alt key under the kitty keyboard protocol; nil uses
     /// `charactersIgnoringModifiers` in lowercase.
+    /// `modifyOtherKeys`: the program set xterm's modifyOtherKeys to level 2
+    /// (`TerminalSession.usesModifyOtherKeys`); it applies only while the
+    /// kitty keyboard protocol does not, as in Ghostty.
+    /// `typedText`: the text Ghostty's surface takes the key to type
+    /// (`surfaceText(for:optionAsAlt:)`), used only with `modifyOtherKeys`;
+    /// nil works it out from `characters` and `charactersIgnoringModifiers`.
     static func data(
         keyCode: UInt16,
         modifiers eventModifiers: NSEvent.ModifierFlags,
         characters: String?,
         charactersIgnoringModifiers: String?,
         unshiftedCharacters: String? = nil,
+        typedText: String? = nil,
         usesApplicationCursorKeys: Bool,
         isEnhancedKeyboardProtocolActive: Bool,
         keyboardProtocolFlags: Int,
         sendsModifiedArrowKeys: Bool,
+        modifyOtherKeys: Bool = false,
         optionAsAlt: OptionAsAlt = .both
     ) -> Data? {
         let modifiers = eventModifiers.intersection(.deviceIndependentFlagsMask)
         guard !modifiers.contains(.command) else { return nil }
+        if modifyOtherKeys, !isEnhancedKeyboardProtocolActive {
+            return modifyOtherKeysData(
+                keyCode: keyCode,
+                modifiers: eventModifiers,
+                text: typedText ?? surfaceText(
+                    characters: characters,
+                    charactersIgnoringModifiers: charactersIgnoringModifiers,
+                    optionActsAsAlt: optionAsAlt.applies(to: eventModifiers)
+                ),
+                unshiftedCharacters: unshiftedCharacters,
+                usesApplicationCursorKeys: usesApplicationCursorKeys,
+                optionAsAlt: optionAsAlt
+            )
+        }
         if let sequence = TerminalInputEncoder.shiftEnterSequence(
             keyCode: keyCode, modifiers: modifiers, isEnhancedKeyboardProtocolActive: isEnhancedKeyboardProtocolActive
         ) ?? TerminalInputEncoder.shiftTabSequence(
@@ -4151,6 +4195,139 @@ enum HostRoutedKeyEncoder {
         // Text, as the key composed it (Option's characters included).
         guard let text = printableText(characters) else { return nil }
         return Data(text.utf8)
+    }
+
+    /// What Ghostty's surface types for a key while the program set xterm's
+    /// modifyOtherKeys to level 2 (`CSI > 4 ; 2 m`) and uses legacy key
+    /// encoding: Ghostty's legacy encoder in that state (`input/key_encode.zig`
+    /// `legacy`, with its `function_keys.zig` table), for the event the
+    /// surface gets (`text` as `surfaceText(for:optionAsAlt:)` gives it). `m`
+    /// is xterm's modifier parameter, 1 plus 1 for Shift, 2 for Alt and 4
+    /// for Control:
+    /// - Return, Tab, Escape and Backspace with modifiers as
+    ///   `CSI 27 ; m ; code ~` (Shift+Return `CSI 27 ; 2 ; 13 ~`, Option+Escape
+    ///   `CSI 27 ; 3 ; 27 ~`), Option counted whatever `optionAsAlt` says;
+    ///   Control+Backspace stays ^H, and Shift+Tab is `CSI Z`, Cherry's
+    ///   `shift+tab=csi:Z` binding (`TerminalSettings.nativeUserKeyboardConfig`);
+    /// - a key that types one character, with Control or Option as Alt, or
+    ///   with Shift when that character is in `@`…`~` (letters among them)
+    ///   or a space, as `CSI 27 ; m ; character ~`: Control+P is
+    ///   `CSI 27 ; 5 ; 112 ~`, Control+Shift+H `CSI 27 ; 6 ; 72 ~`, Shift+A
+    ///   `CSI 27 ; 2 ; 65 ~`; Option that composes is not counted (Option+8
+    ///   as `[` types `[`);
+    /// - arrows, Home, End, Page Up/Down, Forward Delete and F1–F12 as
+    ///   without it, with `m` (F3 with modifiers is `CSI 13 ; m ~`, as in
+    ///   Ghostty); keypad keys as their character; other text as typed.
+    /// A key whose text is not one character goes as in legacy encoding:
+    /// Control with a letter key as its C0 byte, Alt as ESC and the key.
+    private static func modifyOtherKeysData(
+        keyCode: UInt16,
+        modifiers eventModifiers: NSEvent.ModifierFlags,
+        text: String?,
+        unshiftedCharacters: String?,
+        usesApplicationCursorKeys: Bool,
+        optionAsAlt: OptionAsAlt
+    ) -> Data? {
+        let held = eventModifiers.intersection(.deviceIndependentFlagsMask).intersection([.shift, .control, .option])
+        let alt = optionAsAlt.applies(to: eventModifiers)
+        func parameter(_ modifiers: NSEvent.ModifierFlags) -> Int {
+            1 + (modifiers.contains(.shift) ? 1 : 0) + (modifiers.contains(.option) ? 2 : 0)
+                + (modifiers.contains(.control) ? 4 : 0)
+        }
+        let m = parameter(held)
+        /// Return, Tab, Escape or Backspace with modifiers.
+        func otherKey(_ code: Int) -> Data { csi("27;\(m);\(code)~") }
+
+        if let key = functionKeys[keyCode] {
+            if held.isEmpty {
+                return key.final == "~" ? csi("\(key.number)~") : Data("\u{1B}O\(key.final)".utf8)
+            }
+            if keyCode == KeyCode.f3 { return csi("13;\(m)~") }
+            return key.final == "~" ? csi("\(key.number);\(m)~") : csi("1;\(m)\(key.final)")
+        }
+        if let keypad = keypadKeys[keyCode] {
+            return Data(keypad.utf8)
+        }
+        switch keyCode {
+        case KeyCode.up, KeyCode.down, KeyCode.right, KeyCode.left, KeyCode.home, KeyCode.end:
+            let final = [
+                KeyCode.up: "A", KeyCode.down: "B", KeyCode.right: "C", KeyCode.left: "D",
+                KeyCode.home: "H", KeyCode.end: "F",
+            ][keyCode] ?? "A"
+            guard held.isEmpty else { return csi("1;\(m)\(final)") }
+            return Data(((usesApplicationCursorKeys ? "\u{1B}O" : "\u{1B}[") + final).utf8)
+        case KeyCode.pageUp:
+            return csi(held.isEmpty ? "5~" : "5;\(m)~")
+        case KeyCode.pageDown:
+            return csi(held.isEmpty ? "6~" : "6;\(m)~")
+        case KeyCode.forwardDelete:
+            return csi(held.isEmpty ? "3~" : "3;\(m)~")
+        case KeyCode.returnKey:
+            return held.isEmpty ? Data([0x0D]) : otherKey(13)
+        case KeyCode.tab:
+            if held.isEmpty { return Data([0x09]) }
+            return held == .shift ? csi("Z") : otherKey(9)
+        case KeyCode.escape:
+            return held.isEmpty ? Data([0x1B]) : otherKey(27)
+        case KeyCode.backspace:
+            if held.isEmpty { return Data([0x7F]) }
+            return held == .control ? Data([0x08]) : otherKey(127)
+        default:
+            break
+        }
+        // Option that composes the text is not a modifier here.
+        var textModifiers = held
+        if !alt { textModifiers.remove(.option) }
+        if let scalars = text?.unicodeScalars, scalars.count == 1, let scalar = scalars.first {
+            let modifies = (0x40...0x7F).contains(scalar.value) || scalar.value == 0x20
+                || !textModifiers.subtracting(.shift).isEmpty
+            if modifies, !textModifiers.isEmpty {
+                return csi("27;\(parameter(textModifiers));\(scalar.value)~")
+            }
+            guard let typed = printableText(text) else { return nil }
+            return Data(typed.utf8)
+        }
+        // No single character: as without modifyOtherKeys.
+        if held.subtracting(.option) == .control, let letter = letterKeys[keyCode] {
+            return (alt ? Data([0x1B]) : Data()) + Data([letter - 0x60])
+        }
+        guard let typed = printableText(text) ?? (alt ? printableText(unshiftedCharacters) : nil) else { return nil }
+        return alt ? Data([0x1B]) + Data(typed.utf8) : Data(typed.utf8)
+    }
+
+    /// The text Ghostty's surface takes a key to type, as libghostty-spm
+    /// gives it (`TerminalKeyEventHandler`, `filteredCharacters`): the
+    /// characters with the key's modifiers, but without Option when it acts
+    /// as Alt (`ghostty_surface_key_translation_mods`), and without Control
+    /// when that makes a control character (Control+Shift+H types `H`).
+    static func surfaceText(for event: NSEvent, optionAsAlt: OptionAsAlt) -> String? {
+        var modifiers = event.modifierFlags
+        let translated = optionAsAlt.applies(to: modifiers)
+        if translated { modifiers.remove(.option) }
+        var text = translated ? event.characters(byApplyingModifiers: modifiers) : event.characters
+        if let scalars = text?.unicodeScalars, scalars.count == 1, let scalar = scalars.first, scalar.value < 0x20 {
+            modifiers.remove(.control)
+            text = event.characters(byApplyingModifiers: modifiers)
+        }
+        return text
+    }
+
+    /// `surfaceText(for:optionAsAlt:)` from an event's characters alone:
+    /// `charactersIgnoringModifiers` (Shift only) when Option acts as Alt
+    /// or Control made a control character, else `characters`. Unlike the
+    /// event's own, it cannot tell what Control+Option types when Option
+    /// composes, and takes the key without both.
+    private static func surfaceText(
+        characters: String?,
+        charactersIgnoringModifiers: String?,
+        optionActsAsAlt: Bool
+    ) -> String? {
+        if optionActsAsAlt { return charactersIgnoringModifiers }
+        if let scalars = characters?.unicodeScalars, scalars.count == 1, let scalar = scalars.first,
+           scalar.value < 0x20 || scalar.value == 0x7F {
+            return charactersIgnoringModifiers
+        }
+        return characters
     }
 
     /// What Control and a key type: its C0 byte (Control+A is 0x01,

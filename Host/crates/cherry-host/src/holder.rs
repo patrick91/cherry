@@ -886,6 +886,7 @@ impl Holder {
                 kitty_keyboard_flags: 0,
                 application_cursor_keys: false,
                 bracketed_paste: Some(false),
+                modify_other_keys: Some(false),
             },
             receipt,
             master: Some(master),
@@ -1344,8 +1345,8 @@ impl Holder {
     }
 
     /// Whether the alternate screen shows, the kitty keyboard flags,
-    /// application cursor keys and bracketed paste: the daemon is told when
-    /// they change.
+    /// application cursor keys, bracketed paste and modifyOtherKeys: the
+    /// daemon is told when they change.
     fn terminal_state(&mut self, now: screen::TerminalState) {
         if self.state.alternate_screen != now.alternate_screen {
             self.state.alternate_screen = now.alternate_screen;
@@ -1362,6 +1363,10 @@ impl Holder {
         if self.state.bracketed_paste != Some(now.bracketed_paste) {
             self.state.bracketed_paste = Some(now.bracketed_paste);
             self.info.bracketed_paste = Some(now.bracketed_paste);
+        }
+        if self.state.modify_other_keys != Some(now.modify_other_keys) {
+            self.state.modify_other_keys = Some(now.modify_other_keys);
+            self.info.modify_other_keys = Some(now.modify_other_keys);
         }
     }
 

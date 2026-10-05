@@ -549,7 +549,7 @@ differs from the design above.
 
 - The daemon (`cherry-host serve`) and one holder per session
   (`cherry-host hold --socket …`, link on fd 3, never the daemon's child) are
-  implemented as designed. The holder link is at `LINK_VERSION` 8, and a
+  implemented as designed. The holder link is at `LINK_VERSION` 10, and a
   daemon speaks every version from 1. Beyond the frames listed above it has
   `Launch` and `Failed` (Create goes through the holder), `Update` (rename /
   retag kept by the holder), `Info` (title/pwd/foreground, from version 3
@@ -564,7 +564,9 @@ differs from the design above.
   cell size to `Resize` (`cell_width`, `cell_height`), which the holder
   gives its terminal (size reports, kitty images) and the PTY's pixels, and
   its full and limited snapshots re-send the kitty images on screen (see
-  "Kitty graphics" in `Host/README.md`, with the known gaps). On Linux a daemon starts holders from its own image
+  "Kitty graphics" in `Host/README.md`, with the known gaps); version 9
+  adds `graphics` to `Snapshot`; version 10 adds `modify_other_keys` (in
+  `Info` and the hello's session, left out by older holders). On Linux a daemon starts holders from its own image
   (`/proc/self/exe`); on macOS from its executable's path, which after an
   app update is the new build, so `Launch` fields are additive too.
 - A crashed holder reports its session exited with code 1, and says why:
@@ -618,7 +620,11 @@ differs from the design above.
   selects `ESC O x` for unmodified arrows, Home and End only in legacy key
   encoding, as the kitty encoding sends them as CSI whatever DECCKM says),
   `bracketed_paste` (protocol 7: mode 2004, `None` and left out for a
-  session whose holder predates link version 7), and `request_id` (the
+  session whose holder predates link version 7), `modify_other_keys`
+  (xterm's modifyOtherKeys at level 2, `CSI > 4 ; 2 m`, read from the
+  keyboard state `Terminal::modes` carries; an optional field, so
+  `PROTOCOL_VERSION` did not change; `None` and left out for a session
+  whose holder predates link version 10), and `request_id` (the
   Create's, from the receipt the holder keeps). The
   holder hello carries all of them, so they survive daemon crashes,
   restarts and Replace, and they are kept after exit; a `changed` event

@@ -129,7 +129,11 @@ encoding applies instead and never sends them as `ESC O x`; always false for
 a session whose holder predates holder link version 4, so false can also mean
 unknown), `bracketed_paste` (whether the program turned on bracketed paste,
 mode 2004; left out when unknown: for a session whose holder predates holder
-link version 7), `request_id` (the request ID of the `new` that created
+link version 7), `modify_other_keys` (whether the program set xterm's
+modifyOtherKeys to level 2, `ESC[>4;2m`, so keys with modifiers go as
+`ESC [ 27 ; m ; code ~` in legacy key encoding; level 1 and `ESC[>4m` are
+off, as for Ghostty; left out when unknown: for a session whose holder
+predates holder link version 10), `request_id` (the request ID of the `new` that created
 it), and, for a session that ended because its holder was lost rather than
 because its program exited, `ended_by` (`holder_lost`) and `holder_log` (the
 host log the holder wrote to, `host.log` in the state directory, when the

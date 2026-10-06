@@ -63,6 +63,35 @@ private func makeExecutable(_ url: URL, _ script: String = "#!/bin/sh\nexit 0\n"
     ])
 }
 
+@Test func aMacWithOnlyADeviceInstallHasItsNewestBuildFound() throws {
+    let home = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: home) }
+    let installs = home.appendingPathComponent("Library/Application Support/cherry-host/bin")
+    let old = installs.appendingPathComponent("20260928211211.83b3a4a/cherry")
+    let new = installs.appendingPathComponent("20261005175757.9eaeafc/cherry")
+    let copying = installs.appendingPathComponent("20261006100000.abcdef0.partial-1234/cherry")
+    let userApp = home.appendingPathComponent("Applications/Cherry.app/Contents/MacOS/cherry")
+    let candidates = [#"$HOME/Applications/Cherry.app/Contents/MacOS/cherry"#]
+    let installsWord = #"$HOME/Library/Application Support/cherry-host/bin"#
+    func find(_ path: String? = nil) throws -> (status: Int32, output: String) {
+        try runAsLoginShell(
+            CherryLocator.command(cherryPath: path, candidates: candidates, deviceInstalls: installsWord),
+            home: home
+        )
+    }
+
+    #expect(try find().status == 127)
+    try makeExecutable(old)
+    try makeExecutable(new)
+    try makeExecutable(copying)
+    #expect(try find() == (0, new.path + "\n"))
+    // A Cherry.app comes first, and a path the user typed before it, `~/` too.
+    try makeExecutable(userApp)
+    #expect(try find() == (0, userApp.path + "\n"))
+    #expect(try find("~/Library/Application Support/cherry-host/bin/20260928211211.83b3a4a/cherry") == (0, old.path + "\n"))
+    #expect(CherryLocator.deviceInstalls == installsWord)
+}
+
 @Test func theAgentStateCommandsCallTheMCPHelperOncePerRoot() throws {
     let home = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: home) }

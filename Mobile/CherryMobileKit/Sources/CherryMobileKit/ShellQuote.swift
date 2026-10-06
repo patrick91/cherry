@@ -28,14 +28,30 @@ enum CherryLocator {
         #"$HOME/Applications/Cherry.app/Contents/MacOS/cherry"#,
         "/Applications/Cherry.app/Contents/MacOS/cherry",
     ]
+    /// Where another Mac's Cherry installs its session host on this one
+    /// (Add Mac…, Update Session Host…), for a Mac with no Cherry.app of
+    /// its own: a directory per build, named by its build id
+    /// (`YYYYMMDDHHMMSS.rev`), so the last in name order is the newest.
+    static let deviceInstalls = #"$HOME/Library/Application Support/cherry-host/bin"#
 
-    /// Prints the first executable among `cherryPath` and `candidates`
-    /// (exit 0), or exits 127 when there is none.
-    static func command(cherryPath: String?, candidates: [String] = candidates) -> String {
+    /// Prints the first executable among `cherryPath` (a leading `~/` is
+    /// the Mac's home), `candidates`, and the newest build in
+    /// `deviceInstalls` (never one still being copied, `….partial-…`), and
+    /// exits 0; or exits 127 when there is none.
+    static func command(
+        cherryPath: String?,
+        candidates: [String] = candidates,
+        deviceInstalls: String = deviceInstalls
+    ) -> String {
         // The candidates are the script's own words (so `$HOME` expands);
         // the endpoint's path is an argument.
-        let script = #"for p in "$1" "# + candidates.map { "\"\($0)\"" }.joined(separator: " ")
-            + #"; do if [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ]; then printf '%s\n' "$p"; exit 0; fi; done; exit 127"#
+        let script = #"p=$1; case $p in "~/"*) p=$HOME/${p#"~/"} ;; esac; "#
+            + #"for p in "$p" "# + candidates.map { "\"\($0)\"" }.joined(separator: " ")
+            + #"; do if [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ]; then printf '%s\n' "$p"; exit 0; fi; done; "#
+            + #"newest=; for p in "# + "\"\(deviceInstalls)\"" + #"/[0-9]*/cherry; do "#
+            + #"case $p in *.partial-*) continue ;; esac; "#
+            + #"if [ -f "$p" ] && [ -x "$p" ]; then newest=$p; fi; done; "#
+            + #"if [ -n "$newest" ]; then printf '%s\n' "$newest"; exit 0; fi; exit 127"#
         return ShellQuote.sh(script, arguments: [cherryPath ?? ""])
     }
 

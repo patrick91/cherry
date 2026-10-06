@@ -131,3 +131,15 @@ private func makeExecutable(_ url: URL, _ script: String = "#!/bin/sh\nexit 0\n"
         }
     }
 }
+
+@Test func aMacWithoutRemoteLoginSaysToTurnItOn() async throws {
+    // Port 1 on this machine's loopback: nothing listens there, so the
+    // connect is refused before any SSH.
+    let endpoint = MacEndpoint(name: "closed", host: "127.0.0.1", port: 1, user: "nobody")
+    do {
+        _ = try await SSHMacConnector(identity: InMemoryDeviceIdentity()).connect(to: endpoint)
+        Issue.record("connected to a closed port")
+    } catch let error as MacConnectionError {
+        #expect(error.localizedDescription.contains("Turn on Remote Login"), "\(error.localizedDescription)")
+    }
+}

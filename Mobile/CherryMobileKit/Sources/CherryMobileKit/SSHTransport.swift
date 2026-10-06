@@ -67,7 +67,7 @@ final class SSHConnection: Sendable {
             channel = try await bootstrap.connect(host: host, port: port).get()
         } catch {
             authenticated.fail(Failure.closed)
-            throw Failure.unreachable(Self.describe(error))
+            throw Failure.unreachable(Self.connectProblem(error, host: host, port: port))
         }
         // A promise completes once: whichever comes first, the login or this.
         let deadline = authenticated.futureResult.eventLoop.scheduleTask(in: .nanoseconds(Int64(timeout.nanoseconds))) {
@@ -160,6 +160,34 @@ final class SSHConnection: Sendable {
 
     func close() async {
         try? await channel.close().get()
+    }
+
+    /// Why the TCP connect to `host`:`port` failed, with what to check.
+    static func connectProblem(_ error: any Error, host: String, port: Int) -> String {
+        let codes = errnoCodes(in: error)
+        if codes.contains(ECONNREFUSED) {
+            return "nothing answers SSH at \(host):\(port). Turn on Remote Login on that Mac "
+                + "(System Settings › General › Sharing)."
+        }
+        if let error = error as? NIOConnectionError, error.connectionErrors.isEmpty,
+           error.dnsAError != nil || error.dnsAAAAError != nil {
+            return "no address for \(host). Check the name, or use the Mac's Tailscale or LAN address."
+        }
+        let unanswered: Set<Int32> = [ETIMEDOUT, EHOSTUNREACH, ENETUNREACH, EHOSTDOWN]
+        if codes.contains(where: unanswered.contains) || error is ChannelError {
+            return "\(host) doesn't answer (\(describe(error))). Check the address; for a Tailscale "
+                + "address, that Tailscale is on here; on Wi-Fi, that you're on the Mac's network "
+                + "and allowed Cherry Local Network access."
+        }
+        return describe(error)
+    }
+
+    private static func errnoCodes(in error: any Error) -> [Int32] {
+        if let error = error as? IOError { return [error.errnoCode] }
+        if let error = error as? NIOConnectionError {
+            return error.connectionErrors.flatMap { errnoCodes(in: $0.error) }
+        }
+        return []
     }
 
     static func describe(_ error: any Error) -> String {

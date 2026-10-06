@@ -1,6 +1,7 @@
 #!/bin/sh
 # Generates the iOS app's Xcode project (xcodegen) and builds it for the
-# simulator, unsigned. The app lands in
+# simulator, signed ad hoc (Xcode's "Sign to Run Locally": an unsigned app
+# has no Keychain, error -34018, so no SSH key). The app lands in
 # Mobile/App/build/DerivedData/Build/Products/Debug-iphonesimulator/CherryMobile.app.
 set -eu
 
@@ -20,6 +21,8 @@ xcodebuild \
     -sdk iphonesimulator \
     -destination 'generic/platform=iOS Simulator' \
     -derivedDataPath build/DerivedData \
-    CODE_SIGNING_ALLOWED=NO \
+    CODE_SIGN_IDENTITY=- \
+    CODE_SIGN_STYLE=Manual \
+    DEVELOPMENT_TEAM= \
     "$@" \
     build

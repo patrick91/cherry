@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# CherryMobileKit's SSH transport against a real sshd and a real cherry-host,
+# both private, on this Mac's loopback:
+#
+#   Mobile/Scripts/test-loopback
+#
+# It needs /usr/sbin/sshd (run as you; no Remote Login setting changes) and
+# the debug helpers (Scripts/build-host debug, or CHERRY_HOST_BIN naming the
+# directory with cherry and cherry-host).
+#
+# Nothing of yours is used or changed:
+# - sshd listens on 127.0.0.1 only, with its own host key, config and
+#   authorized_keys (which the test writes its in-memory key into); ~/.ssh is
+#   never read;
+# - every command sshd runs goes through a wrapper with a private HOME and
+#   CHERRY_HOST_SOCKET (which sshd's SetEnv passes too), and the `cherry` the
+#   test uses is a wrapper that sets them again; the test pins the private
+#   host's id (`--expected-host-id`), so no other daemon (never
+#   /tmp/cherry-host-$UID) can answer it;
+# - CherryMCP is a stand-in next to that wrapper, printing recorded JSON;
+# - everything is stopped by the pids it started, and the directory removed.
+#
+# Exits 2 when sshd cannot run here.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/../.." && pwd)
+binaries=${CHERRY_HOST_BIN:-${CARGO_TARGET_DIR:-$root/Host/target}/debug}
+for tool in cherry cherry-host; do
+  if [ ! -x "$binaries/$tool" ]; then
+    echo "error: $binaries/$tool is missing; run Scripts/build-host debug" >&2
+    exit 1
+  fi
+done
+sshd=/usr/sbin/sshd
+[ -x "$sshd" ] || { echo "sshd is not available here" >&2; exit 2; }
+
+dir=$(mktemp -d "${TMPDIR:-/tmp}/cherry-mobile.XXXXXX")
+dir=$(cd "$dir" && pwd -P)
+chmod 700 "$dir"
+mkdir -p "$dir/home" "$dir/bin"
+socket="$dir/host.sock"
+sshd_pid=
+daemon_pid=
+session=
+program_pid=
+
+cleanup() {
+  set +e
+  if [ -n "$sshd_pid" ]; then kill "$sshd_pid" 2>/dev/null; fi
+  if [ -n "$session" ]; then
+    HOME="$dir/home" "$binaries/cherry" --socket "$socket" kill "$session" >/dev/null 2>&1
+  fi
+  HOME="$dir/home" "$binaries/cherry" --socket "$socket" shutdown >/dev/null 2>&1
+  sleep 0.3
+  # Anything still running, by the pids this script learned.
+  if [ -n "$program_pid" ] && kill -0 "$program_pid" 2>/dev/null; then
+    holder=$(ps -o ppid= -p "$program_pid" | tr -d ' ')
+    kill -KILL "$program_pid" 2>/dev/null
+    if [ -n "$holder" ] && [ "$holder" != 1 ]; then kill -KILL "$holder" 2>/dev/null; fi
+  fi
+  if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then kill -KILL "$daemon_pid" 2>/dev/null; fi
+  rm -rf "$dir"
+}
+trap cleanup EXIT
+
+private() {
+  HOME="$dir/home" CHERRY_HOST_SOCKET="$socket" "$binaries/cherry" --socket "$socket" "$@"
+}
+
+# The private host, and a session in it shaped like a Cherry agent tab.
+private start >/dev/null
+status=$(private status --json)
+daemon_pid=$(printf '%s' "$status" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["host"]["pid"])')
+host_id=$(printf '%s' "$status" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["host_id"])')
+tab=7F0C1E52-3B47-4E2B-9C1A-2D3E4F5A6B7C
+created=$(private new --cwd / --name "⠋ Fix the tests" \
+  --tag cherry.kind=agent --tag cherry.agent=claude --tag "cherry.tab=$tab" -- /bin/cat)
+session=$(printf '%s' "$created" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+program_pid=$(printf '%s' "$created" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["pid"])')
+
+# The `cherry` the test names, and a CherryMCP stand-in next to it.
+cat > "$dir/bin/cherry" <<EOF
+#!/bin/sh
+HOME='$dir/home'
+CHERRY_HOST_SOCKET='$socket'
+export HOME CHERRY_HOST_SOCKET
+exec '$binaries/cherry' "\$@"
+EOF
+tab_lower=$(printf '%s' "$tab" | tr 'A-Z' 'a-z')
+cat > "$dir/bin/CherryMCP" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> '$dir/mcp-calls'
+case "\$2" in
+  list_projects) printf '%s\n' '{"active_project_root":"/private/project","projects":[{"active":true,"features":{"notes_enabled":false,"todos_enabled":false},"name":"project","open":true,"root":"/private/project","worktrees":[]}]}' ;;
+  list_processes) printf '%s\n' '{"active_project_root":"/private/project","processes":[{"accepts_input":true,"agent_activity_state":"permission","agent_turn_state":"active","id":"$tab_lower","kind":"agent","label":"Fix the tests","line_count":1,"name":"Fix the tests","output_version":1,"selected":true,"state":"live","working_directory":"/private/project"}],"selected_process_id":null}' ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod 700 "$dir/bin/cherry" "$dir/bin/CherryMCP"
+
+# sshd: private everything; each command it runs gets the private environment.
+/usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$dir/host_key" -C cherry-mobile-loopback
+fingerprint=$(/usr/bin/ssh-keygen -lf "$dir/host_key.pub" -E sha256 | awk '{print $2}')
+: > "$dir/authorized_keys"
+chmod 600 "$dir/authorized_keys"
+cat > "$dir/force-command" <<EOF
+#!/bin/sh
+HOME='$dir/home'
+CHERRY_HOST_SOCKET='$socket'
+PATH='/usr/bin:/bin:/usr/sbin:/sbin'
+SHELL=/bin/sh
+export HOME CHERRY_HOST_SOCKET PATH SHELL
+printf '%s\n' "\$SSH_ORIGINAL_COMMAND" >> '$dir/commands'
+exec /bin/sh -c "\$SSH_ORIGINAL_COMMAND"
+EOF
+chmod 700 "$dir/force-command"
+
+port=$((20000 + RANDOM % 20000))
+cat > "$dir/sshd_config" <<EOF
+ListenAddress 127.0.0.1
+Port $port
+HostKey $dir/host_key
+PidFile $dir/sshd.pid
+AuthorizedKeysFile $dir/authorized_keys
+AllowUsers $(id -un)
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+StrictModes no
+PermitTTY yes
+AllowAgentForwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+X11Forwarding no
+PermitUserEnvironment no
+SetEnv CHERRY_HOST_SOCKET=$socket
+ForceCommand $dir/force-command
+EOF
+if ! "$sshd" -t -f "$dir/sshd_config" 2>"$dir/sshd-test.log"; then
+  echo "sshd cannot run here without admin rights:" >&2
+  cat "$dir/sshd-test.log" >&2
+  exit 2
+fi
+"$sshd" -D -e -f "$dir/sshd_config" 2>"$dir/sshd.log" &
+sshd_pid=$!
+for _ in $(seq 1 50); do
+  if /usr/bin/nc -z 127.0.0.1 "$port" 2>/dev/null; then break; fi
+  if ! kill -0 "$sshd_pid" 2>/dev/null; then
+    echo "sshd did not start:" >&2
+    cat "$dir/sshd.log" >&2
+    exit 2
+  fi
+  sleep 0.1
+done
+
+status=0
+CHERRY_TEST_MOBILE_LOOPBACK=1 \
+CHERRY_TEST_MOBILE_PORT="$port" \
+CHERRY_TEST_MOBILE_USER="$(id -un)" \
+CHERRY_TEST_MOBILE_HOST_FINGERPRINT="$fingerprint" \
+CHERRY_TEST_MOBILE_AUTHORIZED_KEYS="$dir/authorized_keys" \
+CHERRY_TEST_MOBILE_CHERRY="$dir/bin/cherry" \
+CHERRY_TEST_MOBILE_HOST_ID="$host_id" \
+CHERRY_TEST_MOBILE_SESSION="$session" \
+CHERRY_TEST_MOBILE_TAB="$tab" \
+  swift test --package-path "$root/Mobile/CherryMobileKit" --filter Loopback || status=$?
+
+if [ "$status" != 0 ]; then
+  echo "--- commands sshd ran" >&2
+  cat "$dir/commands" 2>/dev/null >&2
+  echo "--- sshd log" >&2
+  tail -20 "$dir/sshd.log" >&2
+fi
+exit "$status"

@@ -112,6 +112,14 @@ final class AppModel {
                 setStatus(.awaitingTrust(fingerprint: presented), of: macID)
                 return
             }
+            // A Mac trusted before its session host's identity was known
+            // pins it now (`--expected-host-id` from the next connect on).
+            if !mac.isDemo, mac.endpoint.expectedHostID == nil,
+               let hostID = connection.endpoint.expectedHostID,
+               var endpoint = self.mac(macID)?.endpoint {
+                endpoint.expectedHostID = hostID
+                update(endpoint)
+            }
             await adopt(connection, for: macID)
         } catch {
             setStatus(.failed(error.localizedDescription), of: macID)
@@ -125,6 +133,7 @@ final class AppModel {
               var endpoint = mac(macID)?.endpoint
         else { return }
         endpoint.hostKeyFingerprint = connection.endpoint.hostKeyFingerprint
+        endpoint.expectedHostID = connection.endpoint.expectedHostID
         update(endpoint)
         await adopt(connection, for: macID)
     }
@@ -139,11 +148,12 @@ final class AppModel {
     // MARK: - Macs
 
     /// Adds or changes a Mac, then connects to it again. A changed host or
-    /// port forgets the pinned host key.
+    /// port forgets the pinned host key and session host identity.
     func save(_ endpoint: MacEndpoint) async {
         var endpoint = endpoint
         if let old = mac(endpoint.id)?.endpoint, old.host != endpoint.host || old.port != endpoint.port {
             endpoint.hostKeyFingerprint = nil
+            endpoint.expectedHostID = nil
         }
         if mac(endpoint.id) == nil {
             macs.append(Mac(endpoint: endpoint, status: .idle, isDemo: false))

@@ -14,7 +14,38 @@ holds its P0 prototype:
 
 ```bash
 swift test --package-path Mobile/CherryMobileKit
+Mobile/Scripts/test-loopback   # the SSH transport against a private sshd and host
 ```
+
+`test-loopback` needs `/usr/sbin/sshd` (it runs as you) and the debug helpers
+(`Scripts/build-host debug`, or `CHERRY_HOST_BIN` naming their directory).
+
+## SSH transport
+
+`SSHMacConnector(identity:)` reaches a Mac with Apple's swift-nio-ssh (Citadel's
+current release pulls a personal fork of it):
+
+- **Identity:** `KeychainDeviceIdentity` is an Ed25519 key in the Keychain
+  (this device only, after first unlock), made on first use; `publicKey()` is
+  its `authorized_keys` line, `ssh-ed25519 … cherry-ios`.
+  `InMemoryDeviceIdentity` is for tests and previews.
+- **Host key:** pinned on first use. With no `hostKeyFingerprint`, the key is
+  accepted and the returned connection's `endpoint` carries its OpenSSH
+  fingerprint (`SHA256:…`) for the app to show and save; a different key later
+  is `.hostKeyMismatch`. The session host's identity is pinned the same way
+  (`expectedHostID`, passed as `--expected-host-id`).
+- **Finding cherry:** one `/bin/sh -c` prints the first executable among the
+  endpoint's `cherryPath`, `~/Applications/Cherry.app` and
+  `/Applications/Cherry.app` (`CherryLocator`). Commands are single-quoted
+  words, so zsh, bash and fish login shells read them alike (`ShellQuote`).
+- **Sessions:** a long-lived `cherry control --no-start` channel speaks the host
+  protocol (`HostWire`: List, Screen, SendInput, Subscribe, Ping every 15 s).
+  If no host runs, the error is `.noSessionHost`.
+- **Agent state:** `CherryMCP --call list_projects`, then `list_processes` for
+  each open project and loaded worktree, at most every 3 s. A process's `id` is
+  its tab's id, which its host session names in the `cherry.tab` tag.
+- **Terminal:** a PTY channel runs `cherry attach <id> --detach-key none
+  --client-id mobile-<device id>`; `resize` is an SSH window change.
 
 ## The app
 
@@ -23,7 +54,7 @@ xcodegen`); the generated `CherryMobile.xcodeproj` and `App/build/` are
 git-ignored.
 
 ```bash
-Mobile/Scripts/build-app        # generate, then build for the simulator, unsigned
+Mobile/Scripts/build-app        # generate, then build for the simulator, signed ad hoc
 Mobile/Scripts/screenshots DIR  # build, then screenshot each screen against the Demo Mac
 ```
 

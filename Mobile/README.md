@@ -16,6 +16,51 @@ holds its P0 prototype:
 swift test --package-path Mobile/CherryMobileKit
 ```
 
+## The app
+
+`App/project.yml` is the app's Xcode project for xcodegen (`brew install
+xcodegen`); the generated `CherryMobile.xcodeproj` and `App/build/` are
+git-ignored.
+
+```bash
+Mobile/Scripts/build-app        # generate, then build for the simulator, unsigned
+Mobile/Scripts/screenshots DIR  # build, then screenshot each screen against the Demo Mac
+```
+
+`screenshots` runs headless: it creates a private simulator named
+`CherryMobile-Proto`, boots it without Simulator.app, then shuts it down and
+deletes it. It touches no other simulator. To run the app yourself, open the
+generated project in Xcode and pick a simulator or your device; signing
+uses your team.
+
+Screens:
+
+- **Inbox:** every Mac's sessions. *Needs you* comes first (approvals,
+  questions, errors, results), then *Working*, then the rest. Pull to
+  refresh.
+- **Session:** the host's screen text at the session's width, kept to the
+  bottom. A menu on screen (`ScreenMenu`) becomes buttons that type the
+  option's digit, as an agent takes it. Below them are a reply field (text,
+  then Enter) and keys: Esc, arrows, Enter, Tab, ⌃C.
+- **Terminal:** Ghostty's `UITerminalView` on an `InMemoryTerminalSession`,
+  bridged to a `TerminalAttachment`.
+  - *Keep Mac size* (the default) attaches at the session's grid in a
+    zooming scroll view, so nothing changes on the Mac.
+  - *Fit to phone* attaches at the view's grid, so the session reflows
+    there and on the Mac while it is open.
+- **Macs:** add, edit and remove Macs; this device's public key, with Copy;
+  each Mac's status; the Demo Mac switch. A first connect shows the Mac's
+  host key and pins it once you trust it.
+
+Launch arguments open a screen against the Demo Mac, and such a run connects
+nowhere else:
+
+- `-screen inbox`
+- `-screen session:demo-claude`
+- `-screen terminal:demo-codex`
+- `-screen terminal-fit:demo-claude`
+- `-screen macs`
+
 ## Rules for tests
 
 Tests never reach the user's real Macs, daemon or Cherry:

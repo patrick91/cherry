@@ -1,0 +1,25 @@
+#!/bin/sh
+# Generates the iOS app's Xcode project (xcodegen) and builds it for the
+# simulator, unsigned. The app lands in
+# Mobile/App/build/DerivedData/Build/Products/Debug-iphonesimulator/CherryMobile.app.
+set -eu
+
+app_dir=$(cd "$(dirname "$0")/../App" && pwd)
+cd "$app_dir"
+
+if ! command -v xcodegen >/dev/null 2>&1; then
+    echo "build-app: xcodegen is not installed (brew install xcodegen)" >&2
+    exit 1
+fi
+
+xcodegen generate --quiet
+xcodebuild \
+    -project CherryMobile.xcodeproj \
+    -scheme CherryMobile \
+    -configuration Debug \
+    -sdk iphonesimulator \
+    -destination 'generic/platform=iOS Simulator' \
+    -derivedDataPath build/DerivedData \
+    CODE_SIGNING_ALLOWED=NO \
+    "$@" \
+    build

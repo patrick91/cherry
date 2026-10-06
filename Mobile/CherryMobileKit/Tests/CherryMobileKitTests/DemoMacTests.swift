@@ -24,6 +24,37 @@ import Testing
     #expect(screen.lines.contains { $0.contains("tests passed") })
 }
 
+@Test func aDigitAloneAnswersTheDemoMenuAsClaudesDo() async throws {
+    let connection = try await DemoMac(turnDuration: .seconds(60)).connect(to: DemoMac.endpoint)
+    let menu = try #require(ScreenMenu.find(in: try await connection.screen(of: "demo-claude").lines))
+    try await connection.send(menu.options[2].keys, to: "demo-claude")
+    let session = try await connection.sessions().first { $0.id == "demo-claude" }
+    #expect(session?.attention == .resultReady)
+    #expect(try await connection.screen(of: "demo-claude").lines.first == "⏺ Stopped. What should I do instead?")
+}
+
+@Test func aDigitTypedIntoTheDemoTerminalAnswersItsMenu() async throws {
+    let connection = try await DemoMac(turnDuration: .seconds(60)).connect(to: DemoMac.endpoint)
+    let terminal = try await connection.attach("demo-claude", size: TerminalSize(columns: 80, rows: 24))
+    try await terminal.write(Data("1".utf8))
+    #expect(try await connection.sessions().first { $0.id == "demo-claude" }?.attention == .working)
+    await terminal.detach()
+}
+
+@Test func theDemoTerminalPaintsWhatFitsItsSizeAndRepaintsOnResize() async throws {
+    let connection = try await DemoMac().connect(to: DemoMac.endpoint)
+    let terminal = try await connection.attach("demo-claude", size: TerminalSize(columns: 20, rows: 5))
+    var output = terminal.output.makeAsyncIterator()
+    let painted = String(decoding: try #require(await output.next()), as: UTF8.self)
+    let lines = painted.replacingOccurrences(of: "\u{1B}[H\u{1B}[2J", with: "").components(separatedBy: "\r\n")
+    #expect(lines.count == 5)
+    #expect(lines.allSatisfy { $0.count <= 20 })
+    try await terminal.resize(TerminalSize(columns: 60, rows: 30))
+    let repainted = String(decoding: try #require(await output.next()), as: UTF8.self)
+    #expect(repainted.contains("I'll run the key encoder tests"))
+    await terminal.detach()
+}
+
 @Test func aGoneSessionIsAnError() async throws {
     let connection = try await DemoMac().connect(to: DemoMac.endpoint)
     await #expect(throws: MacConnectionError.sessionGone("nope")) {

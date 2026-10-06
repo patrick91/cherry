@@ -31,6 +31,8 @@ public actor DemoMacConnection: MacConnection {
     private var drafts: [String: String] = [:]
     private var subscribers: [UUID: AsyncStream<MacEvent>.Continuation] = [:]
     private var attachments: [String: [DemoAttachment]] = [:]
+    /// Each attachment's size, which its paints keep to.
+    private var attachmentSizes: [ObjectIdentifier: TerminalSize] = [:]
     private var isConnected = true
 
     init(endpoint: MacEndpoint, turnDuration: Duration) {
@@ -130,7 +132,11 @@ public actor DemoMacConnection: MacConnection {
         for key in keys {
             switch key {
             case .text(let text):
-                drafts[sessionID, default: ""] += text
+                if awaitsChoice(at: index), let digit = Self.choiceDigit(text) {
+                    choose(digit, at: index)
+                } else {
+                    drafts[sessionID, default: ""] += text
+                }
             case .backspace:
                 _ = drafts[sessionID]?.popLast()
             case .controlC, .escape:
@@ -159,7 +165,8 @@ public actor DemoMacConnection: MacConnection {
         guard let lines = screens[sessionID] else { throw MacConnectionError.sessionGone(sessionID) }
         let attachment = DemoAttachment(sessionID: sessionID, connection: self)
         attachments[sessionID, default: []].append(attachment)
-        attachment.emit(Self.paint(lines + promptLine(sessionID)))
+        attachmentSizes[ObjectIdentifier(attachment)] = size
+        repaint(attachment, lines: lines + promptLine(sessionID))
         return attachment
     }
 
@@ -178,9 +185,15 @@ public actor DemoMacConnection: MacConnection {
 
     // MARK: - Demo behaviour
 
-    /// What a terminal shows for `lines`: cleared, then each line.
-    static func paint(_ lines: [String]) -> Data {
-        Data(("\u{1B}[H\u{1B}[2J" + lines.joined(separator: "\r\n")).utf8)
+    /// What a terminal of `size` shows for `lines`: cleared, then the last
+    /// lines that fit, each cut at its width (a real program would redraw
+    /// for it; the demo's screens are drawn for 100 columns).
+    static func paint(_ lines: [String], size: TerminalSize? = nil) -> Data {
+        var shown = lines
+        if let size, size.columns > 0, size.rows > 0 {
+            shown = shown.suffix(size.rows).map { String($0.prefix(size.columns)) }
+        }
+        return Data(("\u{1B}[H\u{1B}[2J" + shown.joined(separator: "\r\n")).utf8)
     }
 
     /// Bytes typed into an attached terminal: echoed, and Enter submits.
@@ -190,11 +203,15 @@ public actor DemoMacConnection: MacConnection {
             switch byte {
             case 0x0D:
                 submit(at: index)
-                attachment.emit(Self.paint(screens[sessionID, default: []] + promptLine(sessionID)))
+                repaint(attachment, lines: screens[sessionID, default: []] + promptLine(sessionID))
             case 0x7F:
                 if drafts[sessionID]?.popLast() != nil {
                     attachment.emit(Data("\u{8} \u{8}".utf8))
                 }
+            case 0x31...0x39 where awaitsChoice(at: index):
+                // A menu takes the digit by itself, as Claude Code's do.
+                choose(String(UnicodeScalar(byte)), at: index)
+                repaint(attachment, lines: screens[sessionID, default: []])
             case 0x20...0x7E:
                 drafts[sessionID, default: ""].append(Character(UnicodeScalar(byte)))
                 attachment.emit(Data([byte]))
@@ -204,8 +221,18 @@ public actor DemoMacConnection: MacConnection {
         }
     }
 
+    func resized(_ attachment: DemoAttachment, to size: TerminalSize) {
+        attachmentSizes[ObjectIdentifier(attachment)] = size
+        repaint(attachment, lines: screens[attachment.sessionID, default: []] + promptLine(attachment.sessionID))
+    }
+
     func detached(_ attachment: DemoAttachment) {
         attachments[attachment.sessionID]?.removeAll { $0 === attachment }
+        attachmentSizes[ObjectIdentifier(attachment)] = nil
+    }
+
+    private func repaint(_ attachment: DemoAttachment, lines: [String]) {
+        attachment.emit(Self.paint(lines, size: attachmentSizes[ObjectIdentifier(attachment)]))
     }
 
     private func promptLine(_ sessionID: String) -> [String] {
@@ -222,20 +249,43 @@ public actor DemoMacConnection: MacConnection {
         }
         switch sessions[index].attention {
         case .approval, .question:
-            let choice = draft.trimmingCharacters(in: .whitespaces)
-            if choice == "3" {
-                screens[id] = ["⏺ Stopped. What should I do instead?", ""]
-                sessions[index].attention = .resultReady
-            } else {
-                screens[id] = ["⏺ Bash(swift test --filter AdapterAwayKeyInput)", "", "✻ Running… (esc to interrupt)"]
-                startTurn(at: index, answer: "⏺ All 16 key encoder tests passed.")
-            }
+            // Enter picks the selected option, the first.
+            choose(Self.choiceDigit(draft) ?? "1", at: index)
+            return
         case .resultReady, .idle, .unknown, .error:
             guard !draft.isEmpty else { return }
             screens[id, default: []] += ["", "› \(draft)", "", "✻ Thinking… (esc to interrupt)"]
             startTurn(at: index, answer: "⏺ (\(name) in the demo) Done: \(draft)")
         case .working:
+            guard !draft.isEmpty else { return }
             screens[id, default: []] += ["› \(draft) (queued)"]
+        }
+        sessions[index].changedAt = Date()
+        broadcast(.sessionsChanged)
+    }
+
+    private func awaitsChoice(at index: Int) -> Bool {
+        sessions[index].attention == .approval || sessions[index].attention == .question
+    }
+
+    /// `text` when it is one digit from 1 to 9.
+    private static func choiceDigit(_ text: String) -> String? {
+        let choice = text.trimmingCharacters(in: .whitespaces)
+        guard choice.count == 1, let digit = choice.first, ("1"..."9").contains(digit) else { return nil }
+        return choice
+    }
+
+    /// Answers the waiting menu with option `choice`: 3 stops, any other
+    /// runs the command.
+    private func choose(_ choice: String, at index: Int) {
+        let id = sessions[index].id
+        drafts[id] = nil
+        if choice == "3" {
+            screens[id] = ["⏺ Stopped. What should I do instead?", ""]
+            sessions[index].attention = .resultReady
+        } else {
+            screens[id] = ["⏺ Bash(swift test --filter AdapterAwayKeyInput)", "", "✻ Running… (esc to interrupt)"]
+            startTurn(at: index, answer: "⏺ All 16 key encoder tests passed.")
         }
         sessions[index].changedAt = Date()
         broadcast(.sessionsChanged)
@@ -257,7 +307,7 @@ public actor DemoMacConnection: MacConnection {
         sessions[index].attention = .resultReady
         sessions[index].changedAt = Date()
         for attachment in attachments[id] ?? [] {
-            attachment.emit(Self.paint(screens[id, default: []]))
+            repaint(attachment, lines: screens[id, default: []])
         }
         broadcast(.screenChanged(sessionID: id))
         broadcast(.sessionsChanged)
@@ -305,7 +355,10 @@ public final class DemoAttachment: TerminalAttachment, @unchecked Sendable {
         await connection.typed(data, into: sessionID, by: self)
     }
 
-    public func resize(_ size: TerminalSize) async throws {}
+    public func resize(_ size: TerminalSize) async throws {
+        guard let connection else { throw MacConnectionError.unreachable("disconnected") }
+        await connection.resized(self, to: size)
+    }
 
     public func detach() async {
         await connection?.detached(self)

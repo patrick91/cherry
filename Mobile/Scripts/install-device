@@ -1,0 +1,67 @@
+#!/bin/sh
+# Builds the iOS app for a real iPhone or iPad, signed by your team, then
+# installs and launches it there:
+#
+#   CHERRY_MOBILE_TEAM=<team id> Mobile/Scripts/install-device [DEVICE]
+#
+# DEVICE is a name or identifier from `xcrun devicectl list devices`; without
+# one it is the only connected iPhone or iPad. The team must be one Xcode is
+# signed in to (Xcode › Settings › Accounts); the first build registers the
+# bundle id dev.patrick.cherry.mobile and the device with it
+# (-allowProvisioningUpdates). The device needs Developer Mode on (Settings ›
+# Privacy & Security), to be unlocked, and to be connected by USB or on the
+# same network. An app signed by a free (Personal) team stops launching after
+# 7 days: run this again.
+set -eu
+
+team=${CHERRY_MOBILE_TEAM:-}
+if [ -z "$team" ]; then
+    echo "install-device: set CHERRY_MOBILE_TEAM to your team id (Xcode › Settings › Accounts)" >&2
+    exit 1
+fi
+device=${1:-}
+app_dir=$(cd "$(dirname "$0")/../App" && pwd)
+cd "$app_dir"
+
+if ! command -v xcodegen >/dev/null 2>&1; then
+    echo "install-device: xcodegen is not installed (brew install xcodegen)" >&2
+    exit 1
+fi
+
+if [ -z "$device" ]; then
+    list=$(mktemp)
+    trap 'rm -f "$list"' EXIT
+    xcrun devicectl list devices --json-output "$list" >/dev/null
+    device=$(/usr/bin/python3 - "$list" <<'EOF'
+import json, sys
+devices = json.load(open(sys.argv[1]))["result"]["devices"]
+connected = [
+    device for device in devices
+    if device.get("hardwareProperties", {}).get("reality") == "physical"
+    and device.get("hardwareProperties", {}).get("platform") == "iOS"
+    and device.get("connectionProperties", {}).get("tunnelState") == "connected"
+]
+if len(connected) != 1:
+    names = ", ".join(d.get("deviceProperties", {}).get("name", "?") for d in connected) or "none"
+    sys.exit(f"install-device: connect one unlocked iPhone or iPad, or name it (connected: {names})")
+print(connected[0]["identifier"])
+EOF
+)
+fi
+
+xcodegen generate --quiet
+xcodebuild \
+    -project CherryMobile.xcodeproj \
+    -scheme CherryMobile \
+    -configuration Debug \
+    -destination 'generic/platform=iOS' \
+    -derivedDataPath build/DerivedData \
+    -allowProvisioningUpdates \
+    CODE_SIGN_STYLE=Automatic \
+    DEVELOPMENT_TEAM="$team" \
+    -quiet \
+    build
+
+app=build/DerivedData/Build/Products/Debug-iphoneos/CherryMobile.app
+xcrun devicectl device install app --device "$device" "$app"
+xcrun devicectl device process launch --device "$device" dev.patrick.cherry.mobile

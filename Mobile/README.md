@@ -58,6 +58,17 @@ Mobile/Scripts/build-app        # generate, then build for the simulator, signed
 Mobile/Scripts/screenshots DIR  # build, then screenshot each screen against the Demo Mac
 ```
 
+On your iPhone or iPad (Developer Mode on, unlocked, connected by USB or on
+the same network):
+
+```bash
+CHERRY_MOBILE_TEAM=<team id> Mobile/Scripts/install-device [DEVICE]
+```
+
+It signs with that team (one Xcode is signed in to), registering the bundle
+id and the device on the first run, then installs and launches the app. A
+free Personal team's build stops launching after 7 days; run it again.
+
 `screenshots` runs headless: it creates a private simulator named
 `CherryMobile-Proto`, boots it without Simulator.app, then shuts it down and
 deletes it. It touches no other simulator. To run the app yourself, open the

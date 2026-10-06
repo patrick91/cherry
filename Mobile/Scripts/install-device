@@ -1,0 +1,85 @@
+#!/bin/sh
+# Builds the iOS app for a real iPhone or iPad, signed by your team, then
+# installs and launches it there:
+#
+#   CHERRY_MOBILE_TEAM=<team id> Mobile/Scripts/install-device [DEVICE]
+#
+# DEVICE is a name or identifier from `xcrun devicectl list devices`; without
+# one it is the only connected iPhone or iPad. The team must be one Xcode is
+# signed in to (Xcode › Settings › Accounts); the first build registers the
+# bundle id dev.patrick.cherry.mobile and the device with it
+# (-allowProvisioningUpdates). The device needs Developer Mode on (Settings ›
+# Privacy & Security), to be unlocked, and to be connected by USB or on the
+# same network. An app signed by a free (Personal) team stops launching after
+# 7 days: run this again.
+set -eu
+
+team=${CHERRY_MOBILE_TEAM:-}
+if [ -z "$team" ]; then
+    echo "install-device: set CHERRY_MOBILE_TEAM to your team id (Xcode › Settings › Accounts)" >&2
+    exit 1
+fi
+device=${1:-}
+app_dir=$(cd "$(dirname "$0")/../App" && pwd)
+cd "$app_dir"
+
+if ! command -v xcodegen >/dev/null 2>&1; then
+    echo "install-device: xcodegen is not installed (brew install xcodegen)" >&2
+    exit 1
+fi
+
+list=$(mktemp)
+trap 'rm -f "$list"' EXIT
+xcrun devicectl list devices --json-output "$list" >/dev/null
+# The device's CoreDevice identifier (devicectl) and its UDID (xcodebuild).
+ids=$(/usr/bin/python3 - "$list" "$device" <<'EOF'
+import json, sys
+wanted = sys.argv[2]
+devices = [
+    device for device in json.load(open(sys.argv[1]))["result"]["devices"]
+    if device.get("hardwareProperties", {}).get("reality") != "simulated"
+    and device.get("hardwareProperties", {}).get("platform") == "iOS"
+]
+# Reachable now, by cable or on the network, and trusting this Mac: the
+# tunnel itself opens only when a command uses it.
+def connected(device):
+    connection = device.get("connectionProperties", {})
+    return connection.get("transportType") in ("wired", "localNetwork") and connection.get("pairingState") == "paired"
+if wanted:
+    found = [
+        device for device in devices
+        if wanted in (device.get("identifier"), device.get("hardwareProperties", {}).get("udid"),
+                      device.get("deviceProperties", {}).get("name"))
+    ]
+    if not found:
+        sys.exit(f"install-device: no iPhone or iPad named {wanted!r}")
+    if not connected(found[0]):
+        sys.exit(f"install-device: {wanted} is not connected, or does not trust this Mac: plug it in, unlock it, and run xcrun devicectl manage pair --device {wanted}")
+else:
+    found = [device for device in devices if connected(device)]
+    if len(found) != 1:
+        names = ", ".join(d.get("deviceProperties", {}).get("name", "?") for d in found) or "none"
+        sys.exit(f"install-device: connect one unlocked iPhone or iPad that trusts this Mac (xcrun devicectl manage pair), or name it (connected: {names})")
+print(found[0]["identifier"], found[0]["hardwareProperties"]["udid"])
+EOF
+)
+device=${ids% *}
+udid=${ids#* }
+
+xcodegen generate --quiet
+xcodebuild \
+    -project CherryMobile.xcodeproj \
+    -scheme CherryMobile \
+    -configuration Debug \
+    -destination "platform=iOS,id=$udid" \
+    -derivedDataPath build/DerivedData \
+    -allowProvisioningUpdates \
+    -allowProvisioningDeviceRegistration \
+    CODE_SIGN_STYLE=Automatic \
+    DEVELOPMENT_TEAM="$team" \
+    -quiet \
+    build
+
+app=build/DerivedData/Build/Products/Debug-iphoneos/CherryMobile.app
+xcrun devicectl device install app --device "$device" "$app"
+xcrun devicectl device process launch --device "$device" dev.patrick.cherry.mobile

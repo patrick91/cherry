@@ -37,11 +37,14 @@ import json, sys
 wanted = sys.argv[2]
 devices = [
     device for device in json.load(open(sys.argv[1]))["result"]["devices"]
-    if device.get("hardwareProperties", {}).get("reality") == "physical"
+    if device.get("hardwareProperties", {}).get("reality") != "simulated"
     and device.get("hardwareProperties", {}).get("platform") == "iOS"
 ]
+# Reachable now, by cable or on the network, and trusting this Mac: the
+# tunnel itself opens only when a command uses it.
 def connected(device):
-    return device.get("connectionProperties", {}).get("tunnelState") == "connected"
+    connection = device.get("connectionProperties", {})
+    return connection.get("transportType") in ("wired", "localNetwork") and connection.get("pairingState") == "paired"
 if wanted:
     found = [
         device for device in devices
@@ -51,12 +54,12 @@ if wanted:
     if not found:
         sys.exit(f"install-device: no iPhone or iPad named {wanted!r}")
     if not connected(found[0]):
-        sys.exit(f"install-device: {wanted} is not connected: unlock it, and plug it in or join this Mac's network")
+        sys.exit(f"install-device: {wanted} is not connected, or does not trust this Mac: plug it in, unlock it, and run xcrun devicectl manage pair --device {wanted}")
 else:
     found = [device for device in devices if connected(device)]
     if len(found) != 1:
         names = ", ".join(d.get("deviceProperties", {}).get("name", "?") for d in found) or "none"
-        sys.exit(f"install-device: connect one unlocked iPhone or iPad, or name it (connected: {names})")
+        sys.exit(f"install-device: connect one unlocked iPhone or iPad that trusts this Mac (xcrun devicectl manage pair), or name it (connected: {names})")
 print(found[0]["identifier"], found[0]["hardwareProperties"]["udid"])
 EOF
 )

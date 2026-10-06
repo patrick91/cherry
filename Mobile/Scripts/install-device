@@ -28,35 +28,50 @@ if ! command -v xcodegen >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ -z "$device" ]; then
-    list=$(mktemp)
-    trap 'rm -f "$list"' EXIT
-    xcrun devicectl list devices --json-output "$list" >/dev/null
-    device=$(/usr/bin/python3 - "$list" <<'EOF'
+list=$(mktemp)
+trap 'rm -f "$list"' EXIT
+xcrun devicectl list devices --json-output "$list" >/dev/null
+# The device's CoreDevice identifier (devicectl) and its UDID (xcodebuild).
+ids=$(/usr/bin/python3 - "$list" "$device" <<'EOF'
 import json, sys
-devices = json.load(open(sys.argv[1]))["result"]["devices"]
-connected = [
-    device for device in devices
+wanted = sys.argv[2]
+devices = [
+    device for device in json.load(open(sys.argv[1]))["result"]["devices"]
     if device.get("hardwareProperties", {}).get("reality") == "physical"
     and device.get("hardwareProperties", {}).get("platform") == "iOS"
-    and device.get("connectionProperties", {}).get("tunnelState") == "connected"
 ]
-if len(connected) != 1:
-    names = ", ".join(d.get("deviceProperties", {}).get("name", "?") for d in connected) or "none"
-    sys.exit(f"install-device: connect one unlocked iPhone or iPad, or name it (connected: {names})")
-print(connected[0]["identifier"])
+def connected(device):
+    return device.get("connectionProperties", {}).get("tunnelState") == "connected"
+if wanted:
+    found = [
+        device for device in devices
+        if wanted in (device.get("identifier"), device.get("hardwareProperties", {}).get("udid"),
+                      device.get("deviceProperties", {}).get("name"))
+    ]
+    if not found:
+        sys.exit(f"install-device: no iPhone or iPad named {wanted!r}")
+    if not connected(found[0]):
+        sys.exit(f"install-device: {wanted} is not connected: unlock it, and plug it in or join this Mac's network")
+else:
+    found = [device for device in devices if connected(device)]
+    if len(found) != 1:
+        names = ", ".join(d.get("deviceProperties", {}).get("name", "?") for d in found) or "none"
+        sys.exit(f"install-device: connect one unlocked iPhone or iPad, or name it (connected: {names})")
+print(found[0]["identifier"], found[0]["hardwareProperties"]["udid"])
 EOF
 )
-fi
+device=${ids% *}
+udid=${ids#* }
 
 xcodegen generate --quiet
 xcodebuild \
     -project CherryMobile.xcodeproj \
     -scheme CherryMobile \
     -configuration Debug \
-    -destination 'generic/platform=iOS' \
+    -destination "platform=iOS,id=$udid" \
     -derivedDataPath build/DerivedData \
     -allowProvisioningUpdates \
+    -allowProvisioningDeviceRegistration \
     CODE_SIGN_STYLE=Automatic \
     DEVELOPMENT_TEAM="$team" \
     -quiet \

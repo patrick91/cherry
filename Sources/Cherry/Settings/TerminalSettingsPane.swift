@@ -203,7 +203,7 @@ private struct GhosttyThemePicker: View {
     @Binding var selection: String
 
     private var selectedTheme: GhosttyThemeDefinition? {
-        GhosttyThemeCatalog.theme(named: selection)
+        Self.themesByName[selection]
     }
 
     var body: some View {
@@ -211,19 +211,11 @@ private struct GhosttyThemePicker: View {
             Text(title)
                 .frame(width: 140, alignment: .leading)
 
-            Picker("Ghostty theme", selection: $selection) {
-                if selectedTheme == nil {
-                    Text(selection.isEmpty ? "Select a theme" : "\(selection) (unknown)")
-                        .tag(selection)
-                }
-
-                ForEach(Self.themes) { theme in
-                    Text(theme.name)
-                        .tag(theme.name)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
+            GhosttyThemePopUp(
+                accessibilityLabel: "\(title) Ghostty theme",
+                themeNames: Self.themeNames,
+                selection: $selection
+            )
 
             if let selectedTheme {
                 GhosttyThemeSwatch(theme: selectedTheme)
@@ -235,8 +227,89 @@ private struct GhosttyThemePicker: View {
         }
     }
 
-    private static let themes = GhosttyThemeCatalog.allThemes.sorted {
-        $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+    private static let themeNames = GhosttyThemeCatalog.allThemes.map(\.name).sorted {
+        $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+    }
+
+    private static let themesByName = Dictionary(
+        GhosttyThemeCatalog.allThemes.map { ($0.name, $0) },
+        uniquingKeysWith: { first, _ in first }
+    )
+}
+
+/// The theme menu as an `NSPopUpButton` whose items are made once. A SwiftUI
+/// menu `Picker` rebuilds its menu, resolving every item's text and
+/// accessibility label, on each update of its window: with all of Ghostty's
+/// themes in each of two pickers that took the main thread most of a second
+/// on macOS 26 whenever the Settings window updated, as when Cherry came back
+/// to the front. An update here only selects an item.
+private struct GhosttyThemePopUp: NSViewRepresentable {
+    let accessibilityLabel: String
+    let themeNames: [String]
+    @Binding var selection: String
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(selection: $selection)
+    }
+
+    func makeNSView(context: Context) -> NSPopUpButton {
+        let button = NSPopUpButton(frame: .zero, pullsDown: false)
+        button.target = context.coordinator
+        button.action = #selector(Coordinator.choose(_:))
+        button.setAccessibilityLabel(accessibilityLabel)
+        button.cell?.setAccessibilityLabel(accessibilityLabel)
+
+        let menu = NSMenu()
+        // Stands for a selection that names no known theme.
+        let placeholder = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        placeholder.isHidden = true
+        menu.addItem(placeholder)
+        for (offset, name) in themeNames.enumerated() {
+            let item = NSMenuItem(title: name, action: nil, keyEquivalent: "")
+            item.representedObject = name
+            menu.addItem(item)
+            context.coordinator.itemIndexByName[name] = offset + 1
+        }
+        button.menu = menu
+        return button
+    }
+
+    /// The width SwiftUI's menu picker had; the button's own would fit the
+    /// longest theme name. Long names are truncated in the button only.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView button: NSPopUpButton, context: Context) -> CGSize? {
+        CGSize(width: 238, height: button.intrinsicContentSize.height)
+    }
+
+    func updateNSView(_ button: NSPopUpButton, context: Context) {
+        context.coordinator.selection = $selection
+        guard let placeholder = button.item(at: 0) else { return }
+
+        if let index = context.coordinator.itemIndexByName[selection] {
+            if !placeholder.isHidden { placeholder.isHidden = true }
+            if button.indexOfSelectedItem != index { button.selectItem(at: index) }
+        } else {
+            let title = selection.isEmpty ? "Select a theme" : "\(selection) (unknown)"
+            if placeholder.title != title { placeholder.title = title }
+            if placeholder.isHidden { placeholder.isHidden = false }
+            if button.indexOfSelectedItem != 0 { button.selectItem(at: 0) }
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var selection: Binding<String>
+        var itemIndexByName: [String: Int] = [:]
+
+        init(selection: Binding<String>) {
+            self.selection = selection
+        }
+
+        @objc func choose(_ sender: NSPopUpButton) {
+            guard let name = sender.selectedItem?.representedObject as? String,
+                  name != selection.wrappedValue
+            else { return }
+            selection.wrappedValue = name
+        }
     }
 }
 

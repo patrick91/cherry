@@ -292,7 +292,7 @@ final class OptionKeyObserver: ObservableObject {
 
         flagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             MainActor.assumeIsolated {
-                self?.isOptionDown = event.modifierFlags.contains(.option)
+                self?.setOptionDown(event.modifierFlags.contains(.option))
             }
             return event
         }
@@ -303,9 +303,16 @@ final class OptionKeyObserver: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.isOptionDown = false
+                self?.setOptionDown(false)
             }
         }
+    }
+
+    /// Publishes only a change: every ⌘ press and every window losing key
+    /// would otherwise update the views that read it.
+    private func setOptionDown(_ isDown: Bool) {
+        guard isOptionDown != isDown else { return }
+        isOptionDown = isDown
     }
 
     deinit {

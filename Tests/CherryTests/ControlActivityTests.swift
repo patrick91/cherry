@@ -98,6 +98,60 @@ struct ControlActivityTests {
         #expect(status.process.lastContentChangeAt != nil)
     }
 
+    /// `submit: true` into a terminal tab types the text and then, on its
+    /// own, the Enter: in one write a program that tells typing from pasting
+    /// (Claude Code in a terminal tab) takes the line as a paste and never
+    /// runs it.
+    @Test func aTerminalsSubmitSendsItsEnterOnItsOwnAfterTheText() async throws {
+        let harness = try ControlActivityHarness()
+        defer {
+            harness.stop()
+        }
+        harness.server.start()
+        let session = try #require(harness.workspace.sessions.first)
+        let log = harness.projectRoot.appendingPathComponent("reads.log")
+        let script = harness.projectRoot.appendingPathComponent("reads.sh")
+        // Each read it gets, as hex, one per line.
+        try """
+        #!/bin/sh
+        stty raw -echo
+        printf 'reading\\r\\n'
+        exec /usr/bin/perl -e 'open(my $log, ">>", $ARGV[0]) or die; $log->autoflush(1); while (sysread(STDIN, my $chunk, 4096)) { print $log unpack("H*", $chunk), "\\n"; }' '\(log.path)'
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let started = try await harness.send(.sendProcessInput(.init(
+            processID: session.id.uuidString, text: "exec '\(script.path)'\n"
+        )))
+        #expect(started.error == nil)
+        let deadline = Date().addingTimeInterval(10)
+        while !session.snapshot(range: 0..<session.lineCount).joined().contains("reading"), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        try Data().write(to: log)
+
+        let sent = try await harness.send(.sendProcessInput(.init(
+            processID: session.id.uuidString, text: "hello", submit: true
+        )))
+        guard case .sendProcessInput(let result)? = sent.result else {
+            Issue.record("Expected sendProcessInput, got \(String(describing: sent))")
+            return
+        }
+        #expect(result.sentBytes == 6)
+        var reads: [String] = []
+        for _ in 0..<100 {
+            reads = (try? String(contentsOf: log, encoding: .utf8))?.split(separator: "\n").map(String.init) ?? []
+            if reads.joined().hasSuffix("0d") { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(reads == [Data("hello".utf8).map { String(format: "%02x", $0) }.joined(), "0d"])
+
+        // Without submit a terminal's text is only typed.
+        _ = try await harness.send(.sendProcessInput(.init(processID: session.id.uuidString, text: "abc")))
+        try await Task.sleep(for: .milliseconds(400))
+        let after = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        #expect(after.hasSuffix("616263\n"))
+    }
+
     @Test func processOutputReportsScreenMode() async throws {
         let harness = try ControlActivityHarness()
         defer {

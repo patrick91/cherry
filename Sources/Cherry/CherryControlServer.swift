@@ -1877,10 +1877,9 @@ final class CherryControlServer: @unchecked Sendable {
             }
         } else {
             let input = try optionalTerminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
-            if let input, !input.payload.isEmpty {
+            if let input, !input.payload.isEmpty || request.submit == true {
                 do {
-                    try await sendTerminalInput(input, to: session)
-                    sentBytes = input.payload.count
+                    sentBytes = try await sendTerminalInput(input, submit: request.submit == true, to: session)
                 } catch {
                     mcpControlDebugLog("initial input not delivered session=\(session.id.uuidString): \(error)")
                     sentBytes = 0
@@ -2871,6 +2870,30 @@ final class CherryControlServer: @unchecked Sendable {
         try await deliver(input.payload, raw: input.isRaw, to: session)
     }
 
+    /// A terminal's input, and with `submit` (asked for explicitly: a
+    /// terminal's text is not submitted by default) the Enter after it, on
+    /// its own, as for an agent: text and Enter in one write read as a paste
+    /// to a program that tells them apart (Claude Code in a terminal tab) or
+    /// to a shell that brackets pastes, which then never runs the line.
+    /// Returns the bytes sent.
+    @MainActor
+    private func sendTerminalInput(_ input: TerminalControlInput, submit: Bool, to session: TerminalSession) async throws -> Int {
+        guard submit else {
+            try await sendTerminalInput(input, to: session)
+            return input.payload.count
+        }
+        if !input.payload.isEmpty {
+            try await sendTerminalInput(input, to: session)
+            try? await Task.sleep(for: Self.terminalSubmitPause)
+        }
+        let enter = TerminalInputEncoder.enterSequence(keyboardProtocolFlags: session.keyboardProtocolFlags)
+        try await deliver(enter, raw: false, to: session, alreadySent: input.payload.count)
+        return input.payload.count + enter.count
+    }
+
+    /// Between a terminal's text and the Enter MCP submits it with.
+    static let terminalSubmitPause: Duration = .milliseconds(150)
+
     /// `alreadySent`: bytes of the same input delivered before this part
     /// (an agent message whose Enter is sent after its text). When this
     /// part fails, the error then says the text was typed but not
@@ -2985,8 +3008,7 @@ final class CherryControlServer: @unchecked Sendable {
         }
 
         let input = try terminalInputPayload(text: text, rawBase64: rawBase64, for: session)
-        try await sendTerminalInput(input, to: session)
-        return input.payload.count
+        return try await sendTerminalInput(input, submit: submit == true, to: session)
     }
 
     @MainActor

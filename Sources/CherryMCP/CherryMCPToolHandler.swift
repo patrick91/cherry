@@ -251,7 +251,7 @@ public enum CherryMCPTools {
                 "working_directory": string("Optional terminal working directory."),
                 "text": string("Optional text to type after launch. CR/LF is encoded as the session's Enter key; use raw_base64 for exact bytes."),
                 "raw_base64": string("Optional raw bytes to send after launch, base64-encoded. Unlike text, they are not normalized for the session, though key sequences in them may be re-encoded for the program's key modes."),
-                "submit": boolean("For agent processes, whether to submit the input with Enter. Plain text defaults to true; raw bytes default to false."),
+                "submit": boolean("Whether to submit the input with Enter, sent on its own after it. For agent processes plain text defaults to true and raw bytes to false; for other processes it defaults to false (end the text with a newline, or pass true)."),
                 "parent_agent_id": string("For kind=agent, optional parent Cherry agent UUID. Defaults to the bound caller agent when available; unbound sessions create top-level agents."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
@@ -317,7 +317,7 @@ public enum CherryMCPTools {
             properties: processSelectorProperties([
                 "text": string("Text to type. CR/LF is encoded as the session's Enter key; use raw_base64 for exact bytes."),
                 "raw_base64": string("Raw bytes to send, base64-encoded. Unlike text, they are not normalized for the session, though key sequences in them may be re-encoded for the program's key modes: unmodified arrow, Home and End keys (ESC [ A or ESC O A …) follow its cursor key mode."),
-                "submit": boolean("For agent processes, whether to submit the input with Enter. Plain text defaults to true; raw bytes default to false."),
+                "submit": boolean("Whether to submit the input with Enter, sent on its own after it. For agent processes plain text defaults to true and raw bytes to false; for other processes it defaults to false (end the text with a newline, or pass true)."),
                 "wait_ms": integer("Optional wait before returning rendered output. Max 5000."),
                 "line_limit": integer("Rendered output line limit when wait_ms is set. Max 2000.")
             ])

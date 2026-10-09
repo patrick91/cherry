@@ -355,7 +355,10 @@ control:
 1. `spawn_process` to launch the agent.
 2. `send_process_input` with the prompt. For agent processes, plain `text`
    input is submitted with Enter by default; pass `submit: false` to only type
-   it.
+   it. For other processes `submit` defaults to false: end the text with a
+   newline, or pass `submit: true`. A submit's Enter is sent on its own after
+   the text, so a program that tells typing from pasting (Claude Code run in
+   a terminal tab, a shell that brackets pastes) runs it.
 3. `wait_for_process_idle` on that `process_id`.
 4. `get_process_output` if more context is needed.
 

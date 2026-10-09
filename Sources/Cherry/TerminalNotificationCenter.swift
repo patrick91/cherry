@@ -48,7 +48,7 @@ final class TerminalNotificationCenter {
     /// What a program status notification says: the program's own line
     /// when it gave one (`message`, untrusted text, shown as plain text),
     /// else what its state means.
-    static func programStatusBody(for status: ProgramStatus) -> String {
+    nonisolated static func programStatusBody(for status: ProgramStatus) -> String {
         if !status.message.isEmpty {
             return String(status.message.prefix(256))
         }
@@ -196,8 +196,9 @@ final class TerminalNotificationCenter {
     }
 }
 
-/// What the notification for a background session's bell or notification
-/// says (`TerminalNotificationCenter.postBackgroundSession`); pure, for tests.
+/// What the notification for a background session's bell, notification or
+/// program status says (`TerminalNotificationCenter.postBackgroundSession`);
+/// pure, for tests.
 struct BackgroundSessionNotificationContent: Equatable {
     /// The host session id, in `userInfo` under `sessionIDKey`.
     static let sessionIDKey = "backgroundSessionID"
@@ -214,23 +215,35 @@ struct BackgroundSessionNotificationContent: Equatable {
 
     /// `machine`: the device the session is on, nil for This Mac.
     init(session: BackgroundSession, signal: PersistentHostSignal, machine: String? = nil) {
+        let body: String
+        switch signal {
+        case .notification(let title, let text):
+            let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty {
+                body = title.isEmpty ? "Notification" : title
+            } else {
+                body = title.isEmpty ? text : "\(title): \(text)"
+            }
+        case .bell, .progress:
+            body = session.kind == .agent ? "This agent may need your attention." : "Terminal bell"
+        }
+        self.init(session: session, body: body, machine: machine)
+    }
+
+    /// Its program's status (OSC 7501): its own message, else what its
+    /// state means (`TerminalNotificationCenter.programStatusBody`).
+    init(session: BackgroundSession, programStatus: ProgramStatus, machine: String? = nil) {
+        self.init(session: session, body: TerminalNotificationCenter.programStatusBody(for: programStatus), machine: machine)
+    }
+
+    private init(session: BackgroundSession, body: String, machine: String?) {
         sessionID = session.id
         hostID = session.hostID
         title = session.title
         subtitle = machine.map { "\(session.projectName) on \($0) · in the background" }
             ?? "\(session.projectName) · in the background"
-        switch signal {
-        case .notification(let title, let body):
-            let body = body.trimmingCharacters(in: .whitespacesAndNewlines)
-            let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
-            if body.isEmpty {
-                self.body = title.isEmpty ? "Notification" : title
-            } else {
-                self.body = title.isEmpty ? body : "\(title): \(body)"
-            }
-        case .bell, .progress:
-            body = session.kind == .agent ? "This agent may need your attention." : "Terminal bell"
-        }
+        self.body = body
     }
 
     var userInfo: [String: String] {

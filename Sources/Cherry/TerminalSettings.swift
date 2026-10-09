@@ -352,6 +352,23 @@ final class TerminalSettings: ObservableObject {
         }
     }
 
+    /// A background session's program that waits for the user (program
+    /// status `blocked`, OSC 7501) posts a notification
+    /// (`BackgroundSessionsModel`); either way its row is marked.
+    @Published var notifyWhenBackgroundProgramNeedsInput: Bool {
+        didSet {
+            save(notifyWhenBackgroundProgramNeedsInput, forKey: Keys.notifyWhenBackgroundProgramNeedsInput, notifyTerminal: false)
+        }
+    }
+
+    /// A background session's program that finishes or fails (`done`,
+    /// `error`) posts a notification; either way its row is marked.
+    @Published var notifyWhenBackgroundProgramFinishes: Bool {
+        didSet {
+            save(notifyWhenBackgroundProgramFinishes, forKey: Keys.notifyWhenBackgroundProgramFinishes, notifyTerminal: false)
+        }
+    }
+
     var sessionPersistenceSettings: SessionPersistenceSettings {
         SessionPersistenceSettings(
             persistLocalSessions: persistLocalSessions,
@@ -391,6 +408,10 @@ final class TerminalSettings: ObservableObject {
             ?? Defaults.sessions.closeTabsOnCleanExit
         noticeBackgroundSessionsAtLaunch = defaults.object(forKey: Keys.noticeBackgroundSessionsAtLaunch) as? Bool
             ?? Defaults.noticeBackgroundSessionsAtLaunch
+        notifyWhenBackgroundProgramNeedsInput = defaults.object(forKey: Keys.notifyWhenBackgroundProgramNeedsInput) as? Bool
+            ?? Defaults.notifyWhenBackgroundProgramNeedsInput
+        notifyWhenBackgroundProgramFinishes = defaults.object(forKey: Keys.notifyWhenBackgroundProgramFinishes) as? Bool
+            ?? Defaults.notifyWhenBackgroundProgramFinishes
     }
 
     func resetTerminalAppearance() {
@@ -600,6 +621,8 @@ final class TerminalSettings: ObservableObject {
         static let defaultEditorID = ""
         static let sessions = SessionPersistenceSettings.defaults
         static let noticeBackgroundSessionsAtLaunch = true
+        static let notifyWhenBackgroundProgramNeedsInput = true
+        static let notifyWhenBackgroundProgramFinishes = false
     }
 
     private enum Keys {
@@ -618,6 +641,8 @@ final class TerminalSettings: ObservableObject {
         static let localSessionsOnQuit = "sessions.onQuit"
         static let closeTabsOnCleanExit = "sessions.closeTabOnExit"
         static let noticeBackgroundSessionsAtLaunch = "sessions.backgroundNoticeAtLaunch"
+        static let notifyWhenBackgroundProgramNeedsInput = "sessions.background.notifyNeedsInput"
+        static let notifyWhenBackgroundProgramFinishes = "sessions.background.notifyFinished"
     }
 
     private func terminalTheme(named name: String, fallback: String) -> GhosttyThemeDefinition {

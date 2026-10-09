@@ -70,3 +70,73 @@ private let programStatusRealHostEnabled = ProcessInfo.processInfo.environment["
     workspace.closeAllSessions(intent: .windowClosed)
     await host.tearDown()
 }
+
+/// A detached tab's program reports on with no client attached: the host
+/// still sends its records as they change, and Background Sessions marks
+/// the session and posts the wait.
+@Test(.enabled(if: programStatusRealHostEnabled))
+@MainActor func PersistentLocalRealHostBackgroundSessionFollowsWhatItsProgramReports() async throws {
+    let host = try await RealLocalHost()
+    let workspace = host.workspace()
+    let posted = Recorder<[BackgroundSessionNotificationContent]>([])
+    let model = BackgroundSessionsModel(
+        localSessions: host.hosting,
+        registry: ProjectWindowRegistry(),
+        prefersPersistentLocalSessions: { true },
+        closesTabsOnCleanExit: { true },
+        presentAlert: { _, _, _ in },
+        postNotification: { posted.value.append($0) },
+        notifiesProgramState: { $0 == .blocked }
+    )
+    let go = host.root.appendingPathComponent("go")
+    let script = host.root.appendingPathComponent("reports.sh")
+    try """
+    stty raw -echo
+    printf '\\033]7501;?\\033\\\\'
+    dd bs=1 count=10 2>/dev/null > /dev/null
+    printf 'ASKED\\r\\n\\033]7501;state=working:app=fake\\033\\\\'
+    while [ ! -e '\(go.path)1' ]; do sleep 0.05; done
+    printf '\\033]7501;state=blocked:app=fake:kind=permission:msg=YXBwcm92ZSBCYXNoOiBscw==\\033\\\\'
+    while [ ! -e '\(go.path)2' ]; do sleep 0.05; done
+    printf '\\033]7501;state=done:app=fake\\033\\\\'
+    exec sleep 600
+    """.write(to: script, atomically: true, encoding: .utf8)
+    let anchor = workspace.addSession(title: "Anchor")
+    let tab = workspace.addSession(title: "Status", command: "exec /bin/sh '\(script.path)'")
+    do {
+        host.show(tab)
+        try await host.waitFor("the tab to attach") { tab.persistentSession != nil && tab.state == .live }
+        try await host.waitFor("its working report") { tab.agentActivityState == .working }
+        let sessionID = try #require(tab.persistentSession?.sessionID)
+        // Detached (⌘D): in the background, at work, nothing news yet.
+        workspace.close(tab, intent: .userDetachedTab)
+        model.start()
+        try await host.waitFor("the session in the background") {
+            model.sessions.first { $0.id == sessionID }?.programState == .working
+        }
+        #expect(model.unreadSessionIDs.isEmpty)
+        #expect(posted.value.isEmpty)
+
+        FileManager.default.createFile(atPath: go.path + "1", contents: nil)
+        try await host.waitFor("the wait to be posted") { posted.value.count == 1 }
+        #expect(posted.value.first?.sessionID == sessionID)
+        #expect(posted.value.first?.body == "approve Bash: ls")
+        #expect(model.unreadSessionIDs == [sessionID])
+        try await host.waitFor("its row to say so") {
+            model.sessions.first { $0.id == sessionID }?.programState == .blocked
+        }
+
+        FileManager.default.createFile(atPath: go.path + "2", contents: nil)
+        try await host.waitFor("done") { model.sessions.first { $0.id == sessionID }?.programState == .done }
+        #expect(posted.value.count == 1)
+        _ = anchor
+    } catch {
+        model.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    model.stop()
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}

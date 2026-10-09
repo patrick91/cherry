@@ -59,7 +59,8 @@ private func ownSession(
     owner: String? = "CherryTests",
     clients: Int = 0,
     createdAt: Date? = nil,
-    foreground: String? = nil
+    foreground: String? = nil,
+    programStatus: [ProgramStatus] = []
 ) -> HostedSessionInfo {
     var tags = [PersistentSessionTag.tab: tab.uuidString, PersistentSessionTag.kind: kind]
     if let project { tags[PersistentSessionTag.project] = project }
@@ -69,7 +70,8 @@ private func ownSession(
         id: id, name: name, cwd: project ?? "/", pid: 300,
         foreground: foreground.map { HostedSessionForeground(pid: 99, name: $0) },
         clients: clients, owner: owner, tags: tags,
-        createdAt: createdAt.map { UInt64($0.timeIntervalSince1970 * 1_000) } ?? 0
+        createdAt: createdAt.map { UInt64($0.timeIntervalSince1970 * 1_000) } ?? 0,
+        programStatus: programStatus
     )
 }
 
@@ -152,6 +154,8 @@ private func makeModel(
     prefersPersistentLocalSessions: @escaping @MainActor () -> Bool = { true },
     closesTabsOnCleanExit: @escaping @MainActor () -> Bool = { true },
     postNotification: @escaping @MainActor (BackgroundSessionNotificationContent) -> Void = { _ in },
+    // The app's defaults: only a program that waits for the user.
+    notifiesProgramState: @escaping @MainActor (ProgramStatus.State) -> Bool = { $0 == .blocked },
     endedSessionGrace: TimeInterval = BackgroundSessionsModel.defaultEndedSessionGrace,
     now: @escaping @MainActor () -> Date = { Date() },
     isAppActive: @escaping @MainActor () -> Bool = { true },
@@ -164,6 +168,7 @@ private func makeModel(
         closesTabsOnCleanExit: closesTabsOnCleanExit,
         presentAlert: confirmations.presenter,
         postNotification: postNotification,
+        notifiesProgramState: notifiesProgramState,
         endedSessionGrace: endedSessionGrace,
         now: now,
         isAppActive: isAppActive,
@@ -762,7 +767,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
 
     // Known to be working: the dot.
     var working = listed[0]
-    working.isWorking = true
+    working.programState = .working
     sources.backgroundSessions = [OmniBarGathering.background(working, on: .thisMac)]
     #expect(OmniProviders.backgroundSessions(sources).first?.status == .working)
 
@@ -853,6 +858,165 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     // Only its own (root) record counts; done is not working.
     #expect(try await list([ProgramStatus(id: "build", state: .working)])?.isWorking == false)
     #expect(try await list([ProgramStatus(state: .done, app: "claude-code")])?.isWorking == false)
+}
+
+/// What a background session's program reports (OSC 7501) as the host
+/// changes it: a turn that finished or failed marks it unread; one that
+/// waits for the user is posted too, quoting the program, once per wait;
+/// what it reported before it was looked at is not news.
+@Test @MainActor func aBackgroundProgramThatFinishesIsUnreadAndOneThatWaitsForTheUserIsPosted() async throws {
+    let harness = try PersistentHarness()
+    let store = WorkspaceStateStore(directory: try temporaryDirectory("cherry-background-program-status"))
+    harness.hosting.endedSessionsStore = store
+    let clock = Recorder(Date())
+    let posted = Recorder<[BackgroundSessionNotificationContent]>([])
+    let model = makeModel(harness, postNotification: { posted.value.append($0) }, now: { clock.value })
+    model.start()
+    defer {
+        model.stop()
+        harness.cleanUp()
+        try? FileManager.default.removeItem(at: store.directory)
+    }
+    let project = harness.project.path
+    func agent(_ id: String, _ status: ProgramStatus...) -> HostedSessionInfo {
+        ownSession(id, project: project, name: "Fix the parser", kind: "agent", agent: "Claude", programStatus: status)
+    }
+    // Found finished, and found waiting: neither is news.
+    harness.fake.sessions = [
+        agent("s-work", ProgramStatus(state: .working, app: "claude-code")),
+        agent("s-found", ProgramStatus(state: .done, app: "claude-code")),
+        agent("s-asks", ProgramStatus(state: .blocked, kind: .question, app: "pi")),
+    ]
+    _ = try await harness.control.list()
+    model.refresh()
+    #expect(model.sessions.count == 3)
+    #expect(model.unreadSessionIDs.isEmpty)
+    #expect(posted.value.isEmpty)
+    let found = try #require(model.sessions.first { $0.id == "s-found" })
+    #expect(BackgroundSessionPresentation.statusText(of: found) == "done")
+    #expect(BackgroundSessionPresentation.tone(of: found) == .finished)
+    #expect(BackgroundSessionPresentation.statusText(of: try #require(model.sessions.first { $0.id == "s-asks" })) == "needs you")
+
+    func change(_ info: HostedSessionInfo) {
+        harness.fake.connections.last(where: { !$0.isClosed })?.push(.event(.changed(info)))
+    }
+    // It blocks on a permission: posted with its own message.
+    change(agent("s-work", ProgramStatus(state: .blocked, kind: .permission, app: "claude-code", message: "approve Bash: ls")))
+    #expect(await harness.fake.wait { posted.value.count == 1 })
+    let asked = try #require(posted.value.first)
+    #expect(asked.sessionID == "s-work")
+    #expect(asked.title == "Claude")
+    #expect(asked.body == "approve Bash: ls")
+    #expect(asked.subtitle == "\(BackgroundSessionPresentation.projectName(projectRoot: project)) · in the background")
+    #expect(model.unreadSessionIDs == ["s-work"])
+    #expect(store.unreadSessions(hostID: "host-a") == ["s-work"])
+    #expect(await harness.fake.wait { model.sessions.first { $0.id == "s-work" }?.programState == .blocked })
+    let blocked = try #require(model.sessions.first { $0.id == "s-work" })
+    #expect(BackgroundSessionPresentation.statusText(of: blocked) == "needs permission")
+    #expect(BackgroundSessionPresentation.tone(of: blocked) == .attention)
+    // The same wait with another message is not posted again.
+    change(agent("s-work", ProgramStatus(state: .blocked, kind: .permission, app: "claude-code", message: "approve Bash: ls -la")))
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(posted.value.count == 1)
+
+    // It works on and finishes: unread, never posted.
+    clock.value = clock.value.addingTimeInterval(BackgroundSessionsModel.notificationInterval + 1)
+    change(agent("s-work", ProgramStatus(state: .working, app: "claude-code")))
+    change(agent("s-work", ProgramStatus(state: .done, app: "claude-code")))
+    #expect(await harness.fake.wait { model.sessions.first { $0.id == "s-work" }?.programState == .done })
+    #expect(posted.value.count == 1)
+    // A turn that starts and fails between two looks at the list.
+    change(agent("s-found", ProgramStatus(state: .working, app: "claude-code")))
+    change(agent("s-found", ProgramStatus(state: .error, app: "claude-code", message: "API error")))
+    #expect(await harness.fake.wait { model.unreadSessionIDs == ["s-work", "s-found"] })
+    #expect(posted.value.count == 1)
+    #expect(await harness.fake.wait { model.sessions.first { $0.id == "s-found" }?.programState == .error })
+    #expect(BackgroundSessionPresentation.tone(of: try #require(model.sessions.first { $0.id == "s-found" })) == .failed)
+
+    // Another wait of a session already waiting on something else is
+    // posted; within its interval it is not.
+    change(agent("s-asks", ProgramStatus(state: .blocked, kind: .auth, app: "pi")))
+    #expect(await harness.fake.wait { posted.value.count == 2 })
+    #expect(posted.value.last?.body == "Waiting for you to sign in.")
+    change(agent("s-asks", ProgramStatus(state: .working, app: "pi")))
+    change(agent("s-asks", ProgramStatus(state: .blocked, kind: .question, app: "pi")))
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(posted.value.count == 2)
+    #expect(model.unreadSessionIDs.contains("s-asks"))
+}
+
+/// Settings › Sessions: a finished or failed background program is posted
+/// too when asked for; a waiting one is not when that is off. Either way
+/// the session is marked.
+@Test @MainActor func backgroundProgramStatusNotificationsFollowTheSettings() async throws {
+    let harness = try PersistentHarness()
+    let notifies = Recorder<Set<ProgramStatus.State>>([.done, .error])
+    let posted = Recorder<[BackgroundSessionNotificationContent]>([])
+    let model = makeModel(
+        harness,
+        postNotification: { posted.value.append($0) },
+        notifiesProgramState: { notifies.value.contains($0) }
+    )
+    model.start()
+    defer {
+        model.stop()
+        harness.cleanUp()
+    }
+    let project = harness.project.path
+    func agent(_ id: String, _ status: ProgramStatus...) -> HostedSessionInfo {
+        ownSession(id, project: project, name: id, kind: "agent", agent: "Claude", programStatus: status)
+    }
+    harness.fake.sessions = [
+        agent("s-done", ProgramStatus(state: .working)),
+        agent("s-fails", ProgramStatus(state: .working)),
+        agent("s-asks", ProgramStatus(state: .working)),
+    ]
+    _ = try await harness.control.list()
+    model.refresh()
+    #expect(model.sessions.count == 3)
+    func change(_ info: HostedSessionInfo) {
+        harness.fake.connections.last(where: { !$0.isClosed })?.push(.event(.changed(info)))
+    }
+    change(agent("s-done", ProgramStatus(state: .done, message: "Wrote 3 files")))
+    change(agent("s-fails", ProgramStatus(state: .error)))
+    #expect(await harness.fake.wait { posted.value.count == 2 })
+    #expect(posted.value.map(\.body) == ["Wrote 3 files", "Failed."])
+    change(agent("s-asks", ProgramStatus(state: .blocked, kind: .permission)))
+    #expect(await harness.fake.wait { model.unreadSessionIDs == ["s-done", "s-fails", "s-asks"] })
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(posted.value.count == 2)
+}
+
+/// The menu bar icon counts background sessions too: one waiting for the
+/// user asks for attention, one at work shows work, a failure only until
+/// it is seen; done, idle, silent or ended ones add nothing.
+@Test func theMenuBarIconCountsWhatBackgroundProgramsReport() {
+    func session(_ state: ProgramStatus.State?, kind: ProgramStatus.Kind? = nil, exited: Bool = false) -> BackgroundSession {
+        var info = ownSession("s", project: "/p", kind: "agent", agent: "Claude")
+        if exited { info = info.exited(code: 0, signal: nil) }
+        var row = BackgroundSessionPresentation.session(info, hostID: "host-a")
+        row.programState = state
+        row.programKind = kind
+        return row
+    }
+    func activity(_ row: BackgroundSession, unread: Bool = false) -> AgentActivityState? {
+        MenuBarAggregateState.backgroundActivity(of: row, isUnread: unread)
+    }
+    #expect(activity(session(.blocked, kind: .permission)) == .permission)
+    #expect(activity(session(.blocked, kind: .question)) == .needsInput)
+    #expect(activity(session(.working)) == .working)
+    #expect(activity(session(.error), unread: true) == .error)
+    #expect(activity(session(.error)) == nil)
+    #expect(activity(session(.done), unread: true) == nil)
+    #expect(activity(session(.idle)) == nil)
+    #expect(activity(session(nil)) == nil)
+    #expect(activity(session(.blocked, exited: true)) == nil)
+
+    #expect(MenuBarAggregateState(items: [], background: []) == .none)
+    #expect(MenuBarAggregateState(items: [], background: [.working]) == .working)
+    let idleTab = MenuBarAgentItem(id: UUID(), projectRoot: "/p", title: "Claude", agentKey: "claude", activity: .idle)
+    #expect(MenuBarAggregateState(items: [idleTab], background: []) == .idle)
+    #expect(MenuBarAggregateState(items: [idleTab], background: [.needsInput]) == .attention)
 }
 
 

@@ -305,7 +305,23 @@ is posted then if none took it. The session's row shows a blue dot, and the
 tab that shows it next (Open, a restore, the Persistent Sessions sheet)
 comes up unread (`Workspaces/unread-sessions.json`, which also brings the
 list's dots back at the next launch); a tab's unread dot is also saved with
-it, so a restored or reopened tab keeps it. The panel's
+it, so a restored or reopened tab keeps it.
+
+What a background session's program reports about itself (OSC 7501 program
+status, which its holder keeps and the host sends with the session) is
+followed the same way, against what Cherry saw when it last looked: a
+program that waits for the user (`blocked`, or blocked on something else
+than before), finishes (`done`) or fails (`error`) marks its session
+unread, as the spec's "the user has not seen it yet" asks. Settings ›
+Sessions › Background Sessions decides which are also posted, its own
+message as the text ("Waiting for your permission." and the like when it
+gave none), under the notifications' limits: *Notify me when a background
+program needs me* (on) and *… finishes* (off). What it reported before
+Cherry first looked (at launch, or as its tab went away) is not news. The
+row says "needs permission", "needs you", "working", "done" or "failed"
+with an orange, blue, pink or red dot, and the menu bar icon counts a
+waiting or working program, and a failure not yet seen, as it counts the
+tabs' agents. The panel's
 **Clear Ended** removes every ended session in the list at once (nothing
 asked: nothing runs). An ended session the list has shown for 10 minutes
 of time Cherry was active (in front, the Mac awake: refreshes more than 5 s

@@ -115,6 +115,28 @@ struct SessionsSettingsPane: View {
                         .labelsHidden()
                         .toggleStyle(.switch)
                 }
+
+                SettingsDivider()
+
+                SettingsRow(
+                    "Notify me when a background program needs me",
+                    subtitle: "When a program in a background session waits for your permission, an answer or a sign-in, Cherry posts a notification with what it asks. Works with programs that report their status, such as Claude Code and Pi."
+                ) {
+                    Toggle("Notify me when a background program needs me", isOn: $settings.notifyWhenBackgroundProgramNeedsInput)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
+
+                SettingsDivider()
+
+                SettingsRow(
+                    "Notify me when a background program finishes",
+                    subtitle: "Also post a notification when a program in a background session finishes or fails. Either way, Background Sessions marks it until you open it."
+                ) {
+                    Toggle("Notify me when a background program finishes", isOn: $settings.notifyWhenBackgroundProgramFinishes)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
             }
 
             SettingsCard("Session Host") {

@@ -45,21 +45,34 @@ final class TerminalNotificationCenter {
         )
     }
 
-    /// What an attention notification says: a menu on screen says what
-    /// the agent waits for.
-    static func attentionBody(for state: AgentActivityState) -> String {
-        switch state {
-        case .needsInput: "This agent is asking you a question."
-        case .permission: "This agent is waiting for your permission."
-        default: "This agent may need your attention."
+    /// What a program status notification says: the program's own line
+    /// when it gave one (`message`, untrusted text, shown as plain text),
+    /// else what its state means.
+    static func programStatusBody(for status: ProgramStatus) -> String {
+        if !status.message.isEmpty {
+            return String(status.message.prefix(256))
+        }
+        switch status.state {
+        case .blocked:
+            switch status.kind {
+            case .permission?: return "Waiting for your permission."
+            case .question?: return "Asking you a question."
+            case .auth?: return "Waiting for you to sign in."
+            case .unknown?, nil: return "Waiting for you."
+            }
+        case .done: return "Finished."
+        case .error: return "Failed."
+        case .idle, .working, .unknown: return "Needs your attention."
         }
     }
 
-    func postAttention(for session: TerminalSession) {
+    /// A tab's program blocked on the user, finished or failed (OSC 7501)
+    /// while the tab is not on screen.
+    func postProgramStatus(_ status: ProgramStatus, for session: TerminalSession) {
         deliver(
             title: session.title,
-            body: Self.attentionBody(for: session.agentActivityState),
-            identifierPrefix: "cherry-attention",
+            body: Self.programStatusBody(for: status),
+            identifierPrefix: "cherry-program-status",
             for: session
         )
     }

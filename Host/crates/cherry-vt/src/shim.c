@@ -59,6 +59,8 @@ enum {
     CHERRY_EVENT_BELL = 2,
     CHERRY_EVENT_NOTIFICATION = 3,
     CHERRY_EVENT_PROGRESS = 4,
+    CHERRY_EVENT_PROGRAM_STATUS = 5,
+    CHERRY_EVENT_PROMPT_START = 6,
 };
 
 // Mirrored by `RawEvent` in lib.rs. Strings are borrowed for the call only.
@@ -68,8 +70,15 @@ typedef struct {
     size_t text_len;
     const uint8_t *body;  // notification body
     size_t body_len;
-    int32_t state;        // progress state (GhosttyTerminalProgressState)
+    int32_t state;        // progress state (GhosttyTerminalProgressState) or
+                          // program status state (GhosttyProgramStatusState)
     int32_t progress;     // progress percentage, -1 when omitted
+    // Program status only (OSC 7501); `text` is its title, `body` its message.
+    int32_t status_kind;  // GhosttyProgramStatusKind
+    const uint8_t *id;
+    size_t id_len;
+    const uint8_t *app;
+    size_t app_len;
 } CherryEvent;
 
 static void emit_event(void *userdata, const CherryEvent *event) {
@@ -121,6 +130,33 @@ static void on_progress(GhosttyTerminal term, void *userdata, const GhosttyTermi
     emit_event(userdata, &event);
 }
 
+static void on_program_status(GhosttyTerminal term, void *userdata, const GhosttyTerminalProgramStatus *report) {
+    (void)term;
+    if (report->size < offsetof(GhosttyTerminalProgramStatus, message) + sizeof(GhosttyString)) return;
+    CherryEvent event = {
+        .kind = CHERRY_EVENT_PROGRAM_STATUS,
+        .state = (int32_t)report->state,
+        .progress = report->progress,
+        .status_kind = (int32_t)report->kind,
+        .id = report->id.ptr, .id_len = report->id.len,
+        .app = report->app.ptr, .app_len = report->app.len,
+        .text = report->title.ptr, .text_len = report->title.len,
+        .body = report->message.ptr, .body_len = report->message.len,
+    };
+    emit_event(userdata, &event);
+}
+
+// A new shell prompt (OSC 133 A, primary) ends the program status records of
+// the program that ran before it.
+static void on_semantic_prompt(GhosttyTerminal term, void *userdata, const GhosttyTerminalSemanticPrompt *prompt) {
+    (void)term;
+    if (prompt->size < offsetof(GhosttyTerminalSemanticPrompt, prompt_kind) + sizeof(GhosttySemanticPromptPromptKind)) return;
+    if (prompt->kind != GHOSTTY_SEMANTIC_PROMPT_PROMPT_START
+        || prompt->prompt_kind != GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY) return;
+    CherryEvent event = { .kind = CHERRY_EVENT_PROMPT_START };
+    emit_event(userdata, &event);
+}
+
 // The title (which 0) or pwd (1) as a borrowed string, valid until the next
 // mutating call; empty when unset.
 int cherry_vt_string(GhosttyTerminal term, int which, const uint8_t **ptr, size_t *len) {
@@ -158,6 +194,9 @@ int cherry_vt_new(GhosttyTerminal *out, uint16_t cols, uint16_t rows,
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_BELL, (void *)on_bell);
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION, (void *)on_notification);
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT, (void *)on_progress);
+    // Also makes the terminal answer the support query (OSC 7501 ; ?).
+    if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS, (void *)on_program_status);
+    if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT, (void *)on_semantic_prompt);
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_SIZE, (void *)terminal_size);
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_COLOR_SCHEME, (void *)terminal_color_scheme);
     if (!rc) rc = ghostty_terminal_set(*out, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &foreground);

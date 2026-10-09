@@ -340,7 +340,8 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     #expect(await harness.fake.wait { agent.state == .exited(3) })
     #expect(!agent.isRunning)
     #expect(agent.exitCode == 3)
-    #expect(agent.agentActivityState == .error)
+    // Its state is what it reported, and it reported nothing.
+    #expect(agent.agentActivityState == .unknown)
     #expect(agent.hostedProgramProcessID == nil)
     // The adapter reports the same exit as it ends: nothing changes.
     agent.ingestNativeChildExit(exitCode: 0)
@@ -760,7 +761,7 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     // Ended while Cherry was closed: shown ended at once, with no adapter;
     // its final screen comes from the host.
     #expect(agent.state == .exited(2))
-    #expect(agent.agentActivityState == .error)
+    #expect(agent.agentActivityState == .unknown)
     #expect(agent.persistentSessionEndedMessage == "Session ended (exit 2)")
     #expect(!agent.isAwaitingDeferredLaunch)
     #expect(harness.creates().isEmpty)

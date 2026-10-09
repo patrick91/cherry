@@ -736,6 +736,8 @@ impl Session {
             bracketed_paste: session.bracketed_paste,
             // Unknown from a holder older than link version 10.
             modify_other_keys: session.modify_other_keys,
+            // None from a holder older than link version 11.
+            program_status: session.program_status,
             // The holder keeps the Create's receipt for the next daemon.
             request_id: receipt.map(|receipt| receipt.request_id),
             ended_by: None,
@@ -2541,6 +2543,9 @@ impl Worker {
             }
             if let Some(modify) = update.modify_other_keys {
                 info.modify_other_keys = Some(modify);
+            }
+            if let Some(records) = update.program_status {
+                info.program_status = records;
             }
             *info != before
         };

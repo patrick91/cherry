@@ -133,7 +133,10 @@ link version 7), `modify_other_keys` (whether the program set xterm's
 modifyOtherKeys to level 2, `ESC[>4;2m`, so keys with modifiers go as
 `ESC [ 27 ; m ; code ~` in legacy key encoding; level 1 and `ESC[>4m` are
 off, as for Ghostty; left out when unknown: for a session whose holder
-predates holder link version 10), `request_id` (the request ID of the `new` that created
+predates holder link version 10), `program_status` (what the programs in the
+session say they are doing with the program status protocol, OSC 7501: the
+records the holder keeps, below; left out while there are none, and from a
+holder older than link version 11), `request_id` (the request ID of the `new` that created
 it), and, for a session that ended because its holder was lost rather than
 because its program exited, `ended_by` (`holder_lost`) and `holder_log` (the
 host log the holder wrote to, `host.log` in the state directory, when the
@@ -1553,6 +1556,27 @@ its rows reflow, so a two-line zsh prompt whose first line the new width
 wraps or unwraps is redrawn once, on its own rows, with the output above it
 intact; the replacement a window gets after its resize shows that screen.
 Details in [cherry-vt](crates/cherry-vt/README.md#prompts-on-resize).
+
+### Program status
+
+A program reports what it is doing with the program status protocol (OSC
+7501, https://www.superlogical.com/rex/docs/build/program-status): `idle`,
+`working`, `done`, `blocked` (on a `permission`, a `question` or `auth`) or
+`error`, with an optional progress, title and one-line message. Claude Code
+and Pi report only after their terminal answers the support query
+(`OSC 7501 ; ?`). The holder's terminal answers it (libghostty-vt answers
+while its program status callback is set) and keeps the records by the
+specification's rules (`cherry-vt` `program_status.rs`): a report replaces
+its record whole; `clear` removes a record and every record beneath it
+(`build` takes `build/test`), or all of them; at most 64, the record updated
+longest ago making room; when the program exits or a shell starts a new
+prompt (OSC 133 A), its `working`, `blocked` and `idle` records go while
+`done` and `error` stay; a reset (RIS) clears them all. Every change is a
+`Changed` event with the records as `SessionInfo.program_status`. The
+display stream sends every OSC 7501 to the holder only, so no attached
+terminal answers the query too or keeps records of its own. Titles and
+messages are decoded, without control or invisible formatting characters,
+and are the program's untrusted text.
 
 ### Kitty graphics
 

@@ -1,5 +1,5 @@
 Third-party notices for Cherry host libghostty-vt
-Pinned Ghostty revision: 7aab0a0392369613472bd5dcfd66bef58e78c3ec
+Pinned Ghostty revision: a4aacd918ba9e79929ff608034c60a4341773ef0
 Ghostty MIT license is provided in the adjacent LICENSE file.
 
 ========================================================================

@@ -6,11 +6,16 @@ use std::{ffi::c_void, io::Write, marker::PhantomData, ptr::NonNull};
 mod events;
 mod graphics;
 pub mod kitty;
+mod program_status;
+use events::ProgramStatusReport;
 pub use events::{
     parse_osc99, Osc99, ProgressState, VtEvent, MAX_PENDING_EVENTS, MAX_PENDING_EVENT_BYTES,
 };
 pub use graphics::{
     base64, decode_rgba, GraphicsReplay, Placement, IMAGE_RESET, MAX_DECODED_BYTES, MAX_IMAGE_SIDE,
+};
+pub use program_status::{
+    ProgramState, ProgramStatusKind, ProgramStatusRecord, MAX_PROGRAM_STATUS_RECORDS,
 };
 
 type Handle = *mut c_void;
@@ -27,6 +32,8 @@ const EVENT_PWD: i32 = 1;
 const EVENT_BELL: i32 = 2;
 const EVENT_NOTIFICATION: i32 = 3;
 const EVENT_PROGRESS: i32 = 4;
+const EVENT_PROGRAM_STATUS: i32 = 5;
+const EVENT_PROMPT_START: i32 = 6;
 
 /// `CherryEvent` in shim.c. The strings are borrowed for one call.
 #[repr(C)]
@@ -38,6 +45,11 @@ struct RawEvent {
     body_len: usize,
     state: i32,
     progress: i32,
+    status_kind: i32,
+    id: *const u8,
+    id_len: usize,
+    app: *const u8,
+    app_len: usize,
 }
 
 /// Every Ghostty callback's userdata. shim.c reads `event`, which must stay
@@ -50,6 +62,9 @@ struct Callbacks {
     /// PTY replies, taken by `feed` and `resize`.
     replies: Vec<u8>,
     events: events::Pending,
+    /// Program status records (OSC 7501), applied as reports come so that
+    /// no bound on pending events can lose one.
+    program_status: program_status::Records,
 }
 
 #[repr(C)]
@@ -296,6 +311,30 @@ extern "C" fn event(userdata: *mut c_void, raw: *const RawEvent) {
                 value: u8::try_from(raw.progress).ok().map(|value| value.min(100)),
             }
         }
+        EVENT_PROGRAM_STATUS => {
+            let Some(report) =
+                ProgramStatusReport::from_raw(raw.state, raw.status_kind, raw.progress)
+            else {
+                return;
+            };
+            let report = ProgramStatusReport {
+                id: text(raw.id, raw.id_len),
+                app: text(raw.app, raw.app_len),
+                title: text(raw.text, raw.text_len),
+                message: text(raw.body, raw.body_len),
+                ..report
+            };
+            if !callbacks.program_status.apply(report) {
+                return;
+            }
+            VtEvent::ProgramStatus
+        }
+        EVENT_PROMPT_START => {
+            if !callbacks.program_status.end_program() {
+                return;
+            }
+            VtEvent::ProgramStatus
+        }
         _ => return,
     };
     callbacks.events.push(event);
@@ -470,6 +509,7 @@ impl Terminal {
             light: false,
             replies: Vec::new(),
             events: events::Pending::default(),
+            program_status: program_status::Records::default(),
         })));
         let mut handle = std::ptr::null_mut();
         let created = check(
@@ -502,6 +542,19 @@ impl Terminal {
             compressions: Default::default(),
             _not_sync: PhantomData,
         })
+    }
+
+    /// The program status records (OSC 7501), the one updated longest ago
+    /// first. `VtEvent::ProgramStatus` says when they changed.
+    pub fn program_status(&self) -> &[ProgramStatusRecord] {
+        // No callback runs outside a mutating call.
+        unsafe { self.callbacks.as_ref() }.program_status.records()
+    }
+
+    /// The program in the terminal exited: its `working`, `blocked` and
+    /// `idle` records go, `done` and `error` stay. Whether any went.
+    pub fn end_program(&mut self) -> bool {
+        self.callbacks().program_status.end_program()
     }
 
     /// The callbacks' state, between calls into the terminal.

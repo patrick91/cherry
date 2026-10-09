@@ -83,14 +83,27 @@ beyond drawing. `take_events` returns them in order, as `VtEvent`s:
 - `Progress { state, value }` for OSC 9;4. `value` is a percentage, clamped to
   100, absent when the program gave none; a reset reports `Remove`. Ghostty
   takes an OSC 9;4 with an unknown state for an OSC 9 notification.
+- `ProgramStatus` when the program status records changed
+  (`program_status()`): an OSC 7501 report, a new primary shell prompt (OSC
+  133 A) that ends the program before it, or a reset. libghostty-vt checks
+  each report against the specification and keeps nothing (setting its
+  program status callback also makes it answer the support query, `OSC 7501
+  ; ?`); the terminal keeps the records as the reports come, in its
+  callbacks' state, so no bound on pending events can lose one
+  (`program_status.rs`: a report replaces its record whole, `clear` removes a
+  record and its children or all of them, at most
+  `MAX_PROGRAM_STATUS_RECORDS` (64) with the least recently updated making
+  room, invisible formatting characters removed from the text).
+  `end_program()` drops what an exited program left `working`, `blocked` or
+  `idle`; `done` and `error` stay.
 
 Events never produce replies, and nothing but `feed` produces them:
 snapshots, `refresh`, `viewport`, `modes`, `inspect` and `resize` work on
 copies or report nothing. Sequences split across reads are reported once
 they end. Pending events are bounded (`MAX_PENDING_EVENTS`,
 `MAX_PENDING_EVENT_BYTES`), so a terminal whose events nobody takes stays
-small: a title, working directory or progress report replaces the one before
-it when nothing came between, a bell right after a bell adds nothing, and
+small: a title, working directory, progress report or program status change
+replaces the one before it when nothing came between, a bell right after a bell adds nothing, and
 beyond the bounds the oldest are dropped. A title, working directory or
 progress report is state, not news: when the bounds drop the latest of its
 kind, it is kept apart and taken first, so a taker never misses the current

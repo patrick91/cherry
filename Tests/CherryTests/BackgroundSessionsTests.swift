@@ -816,43 +816,43 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     #expect(row.agentKey == nil)
 }
 
-@Test @MainActor func aBackgroundAgentIsWorkingOnlyWhileItsTitlesSpinnerMoves() async throws {
+@Test @MainActor func aBackgroundSessionIsWorkingWhileItsProgramReportsWorking() async throws {
     let harness = try PersistentHarness()
-    let clock = Recorder(Date(timeIntervalSince1970: 1_000))
-    let model = makeModel(harness, now: { clock.value })
+    let model = makeModel(harness)
     defer {
         model.stop()
         harness.cleanUp()
     }
     let project = harness.project.path
-    func agent(title: String) -> HostedSessionInfo {
+    func agent(_ status: [ProgramStatus]) -> HostedSessionInfo {
         HostedSessionInfo(
-            id: "s-agent", name: "✳ Results feedback", cwd: project, pid: 300, title: title, owner: "CherryTests",
+            id: "s-agent", name: "✳ Results feedback", cwd: project, pid: 300, title: "⠙ Results feedback",
+            owner: "CherryTests",
             tags: [
                 PersistentSessionTag.tab: UUID().uuidString, PersistentSessionTag.kind: "agent",
                 PersistentSessionTag.agent: "Claude", PersistentSessionTag.project: project,
-            ]
+            ],
+            programStatus: status
         )
     }
-    func list(title: String, after seconds: TimeInterval) async throws -> BackgroundSession? {
-        harness.fake.sessions = [agent(title: title)]
+    func list(_ status: [ProgramStatus]) async throws -> BackgroundSession? {
+        harness.fake.sessions = [agent(status)]
         _ = try await harness.control.list()
-        clock.value = clock.value.addingTimeInterval(seconds)
         model.refresh()
         return model.sessions.first
     }
-    // Running, with a spinner frame seen once: not known to work.
-    let first = try #require(try await list(title: "⠋ Results feedback", after: 0))
-    #expect(first.displayTitle == "Results feedback")
-    #expect(first.title == "Claude")
-    #expect(!first.isWorking)
-    // The spinner moves: working, and the Omni bar shows the dot.
-    let moving = try #require(try await list(title: "⠙ Results feedback", after: 1))
-    #expect(moving.isWorking)
-    #expect(OmniBarGathering.background(moving, on: .thisMac).isWorking)
-    // The frame it left behind goes stale; a settled title is idle.
-    #expect(try await list(title: "⠙ Results feedback", after: AgentTitleHeartbeat.freshness)?.isWorking == false)
-    #expect(try await list(title: "✳ Results feedback", after: 0.5)?.isWorking == false)
+    // A spinner in its title is no evidence: it reports nothing.
+    let silent = try #require(try await list([]))
+    #expect(silent.displayTitle == "Results feedback")
+    #expect(silent.title == "Claude")
+    #expect(!silent.isWorking)
+    // It reports working: the Omni bar shows the dot.
+    let working = try #require(try await list([ProgramStatus(state: .working, app: "claude-code")]))
+    #expect(working.isWorking)
+    #expect(OmniBarGathering.background(working, on: .thisMac).isWorking)
+    // Only its own (root) record counts; done is not working.
+    #expect(try await list([ProgramStatus(id: "build", state: .working)])?.isWorking == false)
+    #expect(try await list([ProgramStatus(state: .done, app: "claude-code")])?.isWorking == false)
 }
 
 

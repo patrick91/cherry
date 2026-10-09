@@ -50,8 +50,8 @@ struct BackgroundSession: Equatable, Identifiable, Sendable {
     let createdAt: Date?
     /// The device it runs on (its name); nil for This Mac.
     var machine: String? = nil
-    /// Its agent is known to be at work: its title's spinner is live
-    /// (`AgentTitleHeartbeat`, set by `BackgroundSessionsModel.refresh`).
+    /// Its program says it is at work: its program status reports
+    /// `working` (OSC 7501, set by `BackgroundSessionsModel.refresh`).
     /// Unlike `isAtWork`, never for an agent that merely runs.
     var isWorking = false
 
@@ -557,21 +557,18 @@ final class BackgroundSessionsModel: ObservableObject {
         updateLease()
     }
 
-    /// Sets `isWorking` of the running agents of `listed` from their titles
-    /// in `infos` (`AgentTitleHeartbeat`).
+    /// Sets `isWorking` of the running sessions of `listed` from their
+    /// programs' status in `infos` (OSC 7501: the root record says
+    /// `working`).
     private func markingWorkingAgents(_ listed: [BackgroundSession], from infos: [HostedSessionInfo]) -> [BackgroundSession] {
-        let titles = Dictionary(infos.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first })
-        let now = now()
-        agentHeartbeat.keep(only: Set(listed.map(\.id)))
+        let working = Set(infos.filter { $0.programStatus.root?.state == .working }.map(\.id))
         return listed.map { session in
-            guard session.kind == .agent, session.isRunning else { return session }
+            guard session.isRunning else { return session }
             var session = session
-            session.isWorking = agentHeartbeat.isWorking(id: session.id, title: titles[session.id] ?? nil, now: now)
+            session.isWorking = working.contains(session.id)
             return session
         }
     }
-
-    private var agentHeartbeat = AgentTitleHeartbeat()
 
     /// The counts the app shows: This Mac's and every device's.
     private func updateSummary() {

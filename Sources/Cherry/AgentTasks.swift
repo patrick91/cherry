@@ -1800,9 +1800,10 @@ extension CherryControlServer {
             }
         case .absent:
             guard verdict == .prompt else {
-                // A screen Cherry cannot read (no composer, no marker): the
-                // kickoff counts as typed, as it always did.
-                if verdict == .none, !worker.agentActivityEvidenceIsStrong {
+                // A screen Cherry cannot read (no composer) of a worker that
+                // reports no status: the kickoff counts as typed, as it
+                // always did.
+                if verdict == .none, !worker.reportsProgramStatus {
                     noteKickoffDelivered(task, at: typedAt)
                 }
                 return
@@ -1823,26 +1824,31 @@ extension CherryControlServer {
         }
     }
 
-    /// The worker's turn started after `typedAt`: working evidence since,
-    /// or it was at work when the kickoff was submitted (its CLI queued it).
+    /// The worker's turn started after `typedAt`: it reported `working`
+    /// since, or it was at work when the kickoff was submitted (its CLI
+    /// queued it).
     @MainActor
     private func kickoffTurnStarted(_ worker: TerminalSession, since typedAt: Date) -> Bool {
-        if let evidence = worker.lastStrongWorkingEvidenceAt, evidence >= typedAt { return true }
+        if let working = worker.lastWorkingReportAt, working >= typedAt { return true }
         if worker.agentWasWorkingAtLastSubmit, let submittedAt = worker.lastAgentSubmitAt, submittedAt >= typedAt { return true }
         return false
     }
 
     /// The worker sits at a still composer: it takes input, nobody types
     /// into it, no line of Cherry's goes in, its screen has not changed
-    /// for `kickoffQuietInterval` and shows its composer (when Cherry can
-    /// read it at all).
+    /// for `kickoffQuietInterval`, and it reports it is idle (a worker that
+    /// reports its status) or shows its composer (when Cherry can read it
+    /// at all).
     @MainActor
     private func workerTakesKickoff(_ worker: TerminalSession, now: Date) -> Bool {
         guard worker.acceptsControlInput, !worker.humanIsComposing(within: tasks.kickoffQuietInterval),
               !isTypingWakeLine(into: worker), screenIsStill(worker, for: tasks.kickoffQuietInterval, now: now)
         else { return false }
+        if worker.reportsProgramStatus {
+            return worker.agentActivityState == .idle
+        }
         let verdict = AgentScreenActivity.verdict(for: kickoffScreen(of: worker, lineLimit: 80), agent: screenKey(of: worker))
-        return verdict == .prompt || (verdict == .none && !worker.agentActivityEvidenceIsStrong)
+        return verdict == .prompt || verdict == .none
     }
 
     /// Types the kickoff (again) once the worker takes it, at most so
@@ -1912,7 +1918,7 @@ extension CherryControlServer {
         guard let baselineAt = task.turnBaselineAt, task.kickoffDeliveredAt != nil, !task.isTypingIntoWorker,
               worker.agentSubmittedTurnCount >= task.turnBaseline, !inRestoredGrace(task.relinkedAt, now: now)
         else { return }
-        let sawWork = worker.lastStrongWorkingEvidenceAt.map { $0 >= baselineAt } ?? false
+        let sawWork = worker.lastWorkingReportAt.map { $0 >= baselineAt } ?? false
         let completedThatTurn = worker.agentTurnState == .completed
             && (worker.lastAgentSubmitAt.map { $0 >= baselineAt } ?? false)
         guard sawWork || completedThatTurn || now.timeIntervalSince(baselineAt) >= tasks.idleFallbackInterval else { return }

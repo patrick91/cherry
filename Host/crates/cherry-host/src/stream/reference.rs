@@ -383,8 +383,8 @@ fn route_csi(token: &[u8]) -> Route {
         // Status and cursor reports, and the colour-scheme report.
         (b'n', None, b"") => matches!(params, b"5" | b"6"),
         (b'n', Some(b'?'), b"") => params == b"996",
-        // DEC private mode reports; ANSI mode requests are not answered.
-        (b'p', Some(b'?'), b"$") => true,
+        // Mode reports (DECRQM), DEC private and ANSI.
+        (b'p', Some(b'?') | None, b"$") => true,
         // XTVERSION.
         (b'q', Some(b'>'), b"") => true,
         // Kitty keyboard flags, whatever the parameters.
@@ -410,8 +410,6 @@ fn csi_query(last: u8, prefix: Option<u8>, params: &[u8], intermediates: &[u8]) 
         // Status reports (DSR, DECXCPR and the other DEC reports); `CSI > n`
         // sets key modifier options instead.
         (b'n', None | Some(b'?'), b"") => true,
-        // ANSI mode requests (DECRQM without `?`).
-        (b'p', None, b"$") => true,
         // Window and title reports (XTWINOPS); not the window operations or
         // the title stack.
         (b't', None, b"") => matches!(
@@ -516,6 +514,8 @@ fn route_osc(token: &[u8]) -> Route {
     match fields[0] {
         // Kitty clipboard: the host always replies (with an error).
         b"5522" => Route::Host,
+        // Program status (OSC 7501): the host keeps it and answers `?`.
+        b"7501" => Route::Host,
         // Palette: `4;index;spec;index;spec…`. The host answers queries.
         b"4" => {
             let (answered, sets, _) = indexed_colours(&fields, terminator);

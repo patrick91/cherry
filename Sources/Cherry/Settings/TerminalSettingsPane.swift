@@ -46,40 +46,6 @@ struct TerminalSettingsPane: View {
                 }
             }
 
-            SettingsCard("Attention Study") {
-                SettingsRow(
-                    "Collect agent observations",
-                    subtitle: "Save deduplicated terminal-grid checkpoints locally, including terminal colors. Manual screen tags remain available when collection is off. Restart Cherry after enabling. Terminal text may contain sensitive data."
-                ) {
-                    Toggle("Collect agent observations", isOn: $settings.attentionStudyEnabled)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                }
-
-                SettingsDivider()
-
-                SettingsRow(
-                    "Collect attention samples",
-                    subtitle: "Every 30 seconds and on each state change, save each agent tab's screen tail, the attention model's inputs and verdict, and when you typed, submitted, focused or closed it (never what you typed). Stored privately in Application Support, at most 200 MB, oldest days removed first. Scripts/attention-autolabel turns them into training data."
-                ) {
-                    Toggle("Collect attention samples", isOn: $settings.attentionSamplesEnabled)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                }
-
-                SettingsDivider()
-
-                SettingsRow(
-                    "Local recordings",
-                    subtitle: "Stored privately in Application Support. Older sessions are trimmed to 500 MB when collection starts."
-                ) {
-                    Button("Show in Finder") {
-                        revealAttentionStudyRecordings()
-                    }
-                    .settingsGlassButtonStyle()
-                }
-            }
-
             SettingsCard("Color") {
                 SettingsSlider(
                     title: "Minimum contrast",
@@ -122,12 +88,6 @@ struct TerminalSettingsPane: View {
                 }
             }
         }
-    }
-
-    private func revealAttentionStudyRecordings() {
-        let directoryURL = TerminalAttentionStudy.recordingsDirectoryURL()
-        try? TerminalAttentionStudy.prepareDirectoryIfNeeded(directoryURL)
-        NSWorkspace.shared.activateFileViewerSelecting([directoryURL])
     }
 }
 

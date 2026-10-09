@@ -31,11 +31,13 @@ use crate::{
     media::{self, Media},
     paths, processes, screen, signals,
     stream::{Batch, DisplayStream},
-    terminal_thread::{Report, TerminalThread},
+    terminal_thread::{self, Report, TerminalThread},
     watch::DirWatch,
 };
 use anyhow::{bail, Context, Result};
-use cherry_protocol::{priority, valid_size, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_GRAPHICS_BYTES};
+use cherry_protocol::{
+    priority, valid_size, ProgramStatus, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_GRAPHICS_BYTES,
+};
 use cherry_vt::{GraphicsReplay, ProgressState, Terminal, VtEvent};
 use portable_pty::{native_pty_system, MasterPty, PtySize};
 use std::{
@@ -887,6 +889,7 @@ impl Holder {
                 application_cursor_keys: false,
                 bracketed_paste: Some(false),
                 modify_other_keys: Some(false),
+                program_status: Vec::new(),
             },
             receipt,
             master: Some(master),
@@ -1117,6 +1120,16 @@ impl Holder {
                 state: progress_name(state).into(),
                 value,
             }),
+            // The terminal thread reports the records themselves.
+            VtEvent::ProgramStatus => {}
+        }
+    }
+
+    /// The program status records (OSC 7501) as they are now.
+    fn program_status(&mut self, records: Vec<ProgramStatus>) {
+        if self.state.program_status != records {
+            self.state.program_status = records.clone();
+            self.info.program_status = Some(records);
         }
     }
 
@@ -1266,6 +1279,7 @@ impl Holder {
         for report in parsed.reports {
             match report {
                 Report::Event(event) => self.vt_event(event),
+                Report::ProgramStatus(records) => self.program_status(records),
                 Report::State(state) => self.terminal_state(state),
             }
         }
@@ -1888,6 +1902,15 @@ impl Holder {
         // the terminal made of it.
         self.terminal.sync();
         self.collect_terminal();
+        // The program is gone, and so are its working, blocked and idle
+        // records; done and error ones stay for the user to see.
+        if let Some(records) = self.terminal.call(|terminal| {
+            terminal
+                .end_program()
+                .then(|| terminal_thread::program_status(terminal))
+        }) {
+            self.program_status(records);
+        }
         self.send_info();
         if self.link.is_some() {
             self.send(link::encode(

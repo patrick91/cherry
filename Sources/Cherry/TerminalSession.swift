@@ -7,7 +7,6 @@ import Foundation
 /// `CHERRY_DEBUG_INPUT=1`: trace typed input and the buffer's tail to the
 /// unified log (as private data). Tests switch it on.
 nonisolated(unsafe) var inputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
-private let activityDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_ACTIVITY_DEBUG"] == "1"
 private let ptyTraceDirectory = ProcessInfo.processInfo.environment["CHERRY_TRACE_PTY_DIR"]
 private let prototypeProcessorDisabledForPerf =
     ProcessInfo.processInfo.environment["CHERRY_DISABLE_PROTOTYPE_PROCESSOR"] == "1"
@@ -648,6 +647,7 @@ private enum TerminalMetadataEvent: Equatable {
     case workingDirectory(String)
     case resolvedCommandLine(String)
     case notification(TerminalNotificationRequest)
+    case programStatus(ProgramStatusReport)
     case nixShell(NixShellMetadataEvent)
     case keyboardProtocolPush(Int)
     case keyboardProtocolPop(Int)
@@ -811,6 +811,8 @@ private final class TerminalMetadataParser {
                 body: value,
                 source: .osc9
             ))
+        case "7501":
+            return ProgramStatusReport(osc: String(parts[1])).map(TerminalMetadataEvent.programStatus)
         case "777":
             if let event = cherryCommandEvent(from: value) {
                 return event
@@ -1101,9 +1103,6 @@ final class TerminalWorkspace: ObservableObject {
         didSet {
             updateAuxiliaryProcessingForSelection(previousSelectedSessionID: oldValue)
             clearUnreadNotificationForSelectedSession()
-            if selectedSessionID != oldValue, let selectedSessionID {
-                sessions.first { $0.id == selectedSessionID }?.noteAttentionSampleEvent(.focused, detail: "selected")
-            }
         }
     }
     /// The project's key (`ProjectLocation`): its directory for a project
@@ -2647,7 +2646,6 @@ final class TerminalWorkspace: ObservableObject {
     /// only disconnects it (its action detaches, or it is attached to a
     /// session it does not own): that one is left to the app's exit.
     private func finishClosingForQuit(_ session: TerminalSession, intent: SessionCloseIntent, action: SessionCloseAction) {
-        session.noteAttentionSampleClosed(intent: intent)
         guard action == .detach || session.hostedAttachment != nil else {
             finishClosing(session, intent: intent)
             return
@@ -2752,7 +2750,6 @@ final class TerminalWorkspace: ObservableObject {
 
     /// Ends a removed tab's program the way `intent` asks for its backend.
     private func finishClosing(_ session: TerminalSession, intent: SessionCloseIntent) {
-        session.noteAttentionSampleClosed(intent: intent)
         // A persistent tab whose program already ended leaves nothing worth
         // keeping when someone closes or detaches it, or it closes because
         // its shell exited: its session goes whatever the intent.
@@ -3074,14 +3071,15 @@ final class TerminalWorkspace: ObservableObject {
         session.clearUnreadNotification()
     }
 
-    func acknowledgeAttentionForSelectedSession() {
+    /// The selected tab is on screen in a key window: the result it shows
+    /// is seen.
+    func acknowledgeAgentResultForSelectedSession() {
         guard let selectedSessionID,
               let session = sessions.first(where: { $0.id == selectedSessionID })
         else {
             return
         }
-        session.noteAttentionSampleEvent(.focused, detail: "viewed")
-        session.acknowledgeAttentionAlert()
+        session.acknowledgeAgentResult()
     }
 
     private func commandSessions(orderedBy visibleCommandNames: [String]) -> [TerminalSession] {
@@ -3530,11 +3528,17 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var state: SessionState = .launching
     @Published private(set) var hasUnreadNotification = false
     @Published private(set) var lastNotification: TerminalNotificationRequest?
+    /// What the tab's program says it is doing (OSC 7501 program status),
+    /// the record updated longest ago first: its host's records for a
+    /// persistent tab. A native tab's Ghostty surface neither answers the
+    /// support query nor passes reports on, so it has none.
+    @Published private(set) var programStatus: [ProgramStatus] = []
+    /// The root record's state; `unknown` while the program reports nothing.
     @Published private(set) var agentActivityState: AgentActivityState = .unknown
-    @Published private(set) var attentionClassifierPrediction: TerminalAttentionPrediction?
-    @Published private(set) var attentionAlertGeneration = 0
-    @Published private(set) var hasUnacknowledgedAttention = false
-    @Published private(set) var currentAttentionScreenTag: TerminalAttentionCorrection?
+    /// The program finished a turn (`done` or `error`) the user has not seen
+    /// yet: the tab was not on screen in a key window then, and has not been
+    /// since (`acknowledgeAgentResult`).
+    @Published private(set) var hasUnseenAgentResult = false
     @Published private(set) var startedAt: Date?
     /// When the program the tab runs now started: at its launch
     /// (`startedAt`), or later, once its persistent session's Create
@@ -4038,30 +4042,15 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// The surface reported its grid (`resize`): a seed no longer applies.
     private var viewportWasReported = false
     private var traceRecorder: TerminalTraceRecorder?
-    private let attentionObservationDirectoryProvider: @MainActor () -> URL?
-    private let attentionCorrectionDirectoryProvider: @MainActor () -> URL
-    private let attentionNotificationHandler: @MainActor (TerminalAttentionPrediction, TerminalSession) -> Void
-    private var attentionObservationRecorder: TerminalAttentionObservationRecorder?
-    private var attentionCorrectionRecorder: TerminalAttentionObservationRecorder?
-    private var attentionObservationTask: Task<Void, Never>?
-    private var acknowledgedAttentionAlertGeneration = 0
-    private var isAttentionEpisodeActive = false
-    private var hasHarnessNotificationForAttentionEpisode = false
-    private var attentionNotificationGate = TerminalAttentionNotificationGate()
-    private var currentAttentionScreenTagObservationID: UUID?
-    private var latestAttentionObservationEvent: TerminalAttentionObservationEvent = .contentChanged
-    /// Continuous attention sampling (`TerminalAttentionSampler`); nil for
-    /// tabs that are not agents.
-    private let attentionSampler: TerminalAttentionSampler?
-    /// The sampler's pseudonymous ids of this tab and of its program's
-    /// current launch.
-    private lazy var attentionSampleTabID = TerminalAttentionSampling.stableID(id)
-    private var attentionSampleRunID = TerminalAttentionSampling.stableID(UUID())
-    /// Cherry's state when the tab was last sampled for a change of it.
-    private var lastAttentionSampleSignature: String?
+    /// Tells the user a program finished or needs them while its tab is
+    /// not in front (`TerminalNotificationCenter.postProgramStatus`).
+    private let programStatusNotificationHandler: @MainActor (ProgramStatus, TerminalSession) -> Void
+    /// The records of output Cherry parses itself (`ingestTerminalMetadata`:
+    /// the host-managed path, tests); a persistent tab's host keeps its own.
+    private var parsedProgramStatus = ProgramStatusRecords()
     private var lastViewportResizeAt: Date?
-    /// Where the agent's current turn stands (read by tests).
-    private(set) var agentTurnState: TerminalAttentionTurnState = .notStarted
+    /// Where the program's latest turn stands, from its reports.
+    private(set) var agentTurnState: AgentTurnState = .notStarted
     private var outputHoldUntil: Date?
     private var isOutputPausedForInteraction = false
     private var isOutputPausedForBackgroundThrottle = false
@@ -4070,8 +4059,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var keyboardProtocolFlagStack: [Int] = []
     private var ghosttyBridgeStorage: GhosttySessionBridge?
     private var renderedReplayCache: RenderedReplayCache?
-    private var lastHumanInputLine: Int?
-    private var lastHumanInputAt: Date?
     private var lastHumanKeystrokeAt: Date?
     private var hasUnsubmittedHumanInput = false
     /// Someone is typing into the agent's composer (keys not submitted
@@ -4082,41 +4069,26 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard let lastHumanKeystrokeAt else { return false }
         return Date().timeIntervalSince(lastHumanKeystrokeAt) < interval
     }
-    private var humanInputGeneration = 0
-    private var agentActivitySource: AgentActivitySource = .none
-    private var titleIndicatesAgentWorking = false
-    private var lastTitleSpinnerAt: Date?
-    /// The last working marker or title spinner pulse seen (read by MCP
-    /// waits and monitors: did a turn start after its submit?).
-    private(set) var lastStrongWorkingEvidenceAt: Date?
+    /// The program has sent a program status report since it started:
+    /// Cherry knows its state from its reports, not from its screen.
+    private(set) var reportsProgramStatus = false
+    /// The last time the program reported `working` (read by MCP waits and
+    /// monitors: did a turn start after its submit?).
+    private(set) var lastWorkingReportAt: Date?
     /// Turns Cherry saw submitted to this agent (an Enter typed or sent by
     /// MCP), over the tab's life in this run of Cherry.
     private(set) var agentSubmittedTurnCount = 0
-    /// Turns the agent began by itself after one ended (it answered a
-    /// background agent's or task's result, woke up on a schedule, a hook
-    /// continued it): `AgentResumedWorkDetector`, over the tab's life in
-    /// this run of Cherry.
-    private(set) var agentSelfResumedTurnCount = 0
-    /// MCP's `agent_turn`: every turn Cherry saw start, submitted or begun
-    /// by the agent itself. It only grows.
-    var agentTurnCount: Int { agentSubmittedTurnCount &+ agentSelfResumedTurnCount }
-    /// Watches a finished turn's agent for work it resumes by itself.
-    private var resumedWorkDetector = AgentResumedWorkDetector()
-    /// The last key or input sent to the agent (any key, a paste, MCP
-    /// input): a screen change right after one may be its own effect.
-    private var lastAgentInputAt: Date?
-    /// When the latest of those turns was submitted.
+    /// Turns the program reported starting (`working` after a state that
+    /// was not part of a turn), submitted or begun by itself.
+    private(set) var agentReportedTurnCount = 0
+    /// MCP's `agent_turn`: every turn Cherry saw start, submitted or
+    /// reported. It only grows.
+    var agentTurnCount: Int { max(agentSubmittedTurnCount, agentReportedTurnCount) }
+    /// When the latest of the submitted turns was submitted.
     private(set) var lastAgentSubmitAt: Date?
-    /// The agent showed it was at work (strong evidence) when that turn was
-    /// submitted: a message the CLI queues behind the running turn.
+    /// The program reported `working` when that turn was submitted: a
+    /// message the CLI queues behind the running turn.
     private(set) var agentWasWorkingAtLastSubmit = false
-    /// The agent's screen showed recognizable activity (its composer, a
-    /// working marker, a title spinner or a notification) when that turn
-    /// was submitted: Cherry can read this CLI, so it can tell when the
-    /// turn starts.
-    private(set) var agentWasReadableAtLastSubmit = false
-    private var agentIdleConfirmationTask: Task<Void, Never>?
-    private var agentIdleRecheckTask: Task<Void, Never>?
     private var auxiliaryProcessingSuspensionTask: Task<Void, Never>?
     private var lastContentFingerprint: Int?
     private var pendingMetadataOutput = Data()
@@ -4124,24 +4096,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var isMetadataOutputFlushScheduled = false
     private var shouldResetMetadataParserBeforeFlush = false
     private var isAuxiliaryProcessingActive = true
-
-    enum AgentActivitySource {
-        case none
-        case outputActivity
-        case inputSubmit
-        // Idle inferred purely from a quiet content window (no prompt/marker/spinner
-        // to key off) — weak evidence, so fresh output flips straight back to working.
-        case quietWindow
-        case promptMarker
-        case workingMarker
-        case titleSpinner
-        case notification
-        case processExit
-        // A permission or question menu on screen
-        // (`AgentScreenActivity.answerMenu`): the state follows the menu
-        // and ends when it goes.
-        case answerMenu
-    }
 
     private enum AgentDraftInputEffect: Equatable {
         case none
@@ -4168,12 +4122,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     private static let backgroundOutputThrottleByteInterval = 256 * 1024
     private static let backgroundOutputThrottleDuration: TimeInterval = 0.5
     private static let userScrollOutputHoldInterval: TimeInterval = 0.16
-    private static let agentIdleConfirmationEvidenceWindow: TimeInterval = 1.0
-    private static let agentIdleConfirmationDelay: TimeInterval = 0.4
-    private static let agentIdleRecheckQuietInterval: TimeInterval = 4.0
-    private static let attentionObservationInterval: TimeInterval = 1.0
-    private static let attentionObservationMaximumRows = 200
-    private static let attentionObservationMaximumColumns = 512
     private static let contentFingerprintTailLineLimit = 40
 
     init(
@@ -4201,22 +4149,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         adoptingPersistentSession: PersistentSessionLaunch? = nil,
         deferredLaunch: Bool = false,
         provisionalRestore: Bool = false,
-        attentionObservationDirectoryProvider: @escaping @MainActor () -> URL? = {
-            TerminalAttentionObservationRecorder.configuredDirectoryURL
-        },
-        attentionCorrectionDirectoryProvider: @escaping @MainActor () -> URL = {
-            TerminalAttentionStudy.correctionsDirectoryURL()
-        },
-        attentionNotificationHandler: @escaping @MainActor (
-            TerminalAttentionPrediction,
-            TerminalSession
-        ) -> Void = { _, session in
-            TerminalNotificationCenter.shared.postAttention(for: session)
-        },
-        attentionSampler: TerminalAttentionSampler? = .shared
+        programStatusNotificationHandler: @escaping @MainActor (ProgramStatus, TerminalSession) -> Void = { status, session in
+            TerminalNotificationCenter.shared.postProgramStatus(status, for: session)
+        }
     ) {
         self.id = id
-        self.attentionSampler = kind == .agent ? attentionSampler : nil
         self.title = title
         self.titleSource = titleSource
         self.subtitle = subtitle
@@ -4240,9 +4177,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.launchCommand = launchCommand?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.launchEnvironment = launchEnvironment
         self.restartOnExit = restartOnExit
-        self.attentionObservationDirectoryProvider = attentionObservationDirectoryProvider
-        self.attentionCorrectionDirectoryProvider = attentionCorrectionDirectoryProvider
-        self.attentionNotificationHandler = attentionNotificationHandler
+        self.programStatusNotificationHandler = programStatusNotificationHandler
         self.systemTitle = title
         let processorMaxScrollback = Self.processorMaxScrollback(for: kind, configuredMaxScrollback: maxScrollback)
         let processorBuffer = buffer ?? LiveTerminalOutputBuffer(maxScrollback: processorMaxScrollback)
@@ -5160,7 +5095,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             SessionLog.debug("[send interrupt] shellProcess=\(shellProcess != nil)")
         }
         noteAgentDraftCleared()
-        noteAgentTurnInterrupted()
         processor.discardPendingOutput()
         if routePersistentInput(Data([0x03])) { return }
         if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
@@ -5171,16 +5105,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     func noteNativeHostInput(event: NSEvent?) {
-        clearCurrentAttentionScreenTag()
         noteInputOutputBaseline()
         guard kind == .agent, let event else { return }
-        if event.type == .keyDown {
-            lastAgentInputAt = Date()
-        }
         applyAgentDraftInputEffect(Self.appKitDraftInputEffect(event))
-        if Self.appKitKeyEventInterruptsAgentTurn(event) {
-            noteAgentTurnInterrupted()
-        }
     }
 
     /// Mirror the kernel tty's flush-on-INTR for Cherry's own pipeline:
@@ -5191,7 +5118,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// manage their own interrupt handling.
     private func discardPendingOutputForInterrupt(in outboundData: Data) {
         guard outboundData.contains(0x03) else { return }
-        noteAgentTurnInterrupted()
         processor.discardPendingOutput()
     }
 
@@ -5241,8 +5167,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             processor.clear()
             ghosttyBridgeStorage?.reset()
         }
-        lastHumanInputLine = nil
-        lastHumanInputAt = nil
         lastContentFingerprint = nil
         clearUnreadNotification()
         bumpRevision()
@@ -5391,7 +5315,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         finalScreenRead = nil
         let launchID = activeLaunchID
         activeLaunchID = nil
-        attentionSampler?.unregister(self)
         auxiliaryProcessingSuspensionTask?.cancel()
         auxiliaryProcessingSuspensionTask = nil
         backgroundOutputThrottleTask?.cancel()
@@ -5399,13 +5322,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         isOutputPausedForBackgroundThrottle = false
         backgroundOutputBytesSinceThrottle = 0
         nixShellEnvironment = nil
-        cancelAgentIdleConfirmation()
-        cancelAgentIdleRecheck()
-        attentionObservationTask?.cancel()
-        attentionObservationTask = nil
         resetKeyboardProtocolState()
-        lastHumanInputLine = nil
-        lastHumanInputAt = nil
         lastHumanKeystrokeAt = nil
         hasUnsubmittedHumanInput = false
         outputHoldUntil = nil
@@ -5971,10 +5888,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         let launchID = UUID()
         activeLaunchID = launchID
-        // Each launch is a new run of samples (a restart starts over).
-        attentionSampleRunID = TerminalAttentionSampling.stableID(launchID)
-        lastAttentionSampleSignature = nil
-        attentionSampler?.register(self)
         // A restored or adopted session (`persistentSessionToAdopt`, taken
         // by `startPersistentLaunch`) and an attached one were running
         // before this launch.
@@ -6003,36 +5916,18 @@ final class TerminalSession: ObservableObject, Identifiable {
         programStartedAt = startedAt
         exitedAt = nil
         lastOutputAt = nil
-        lastHumanInputAt = nil
         lastHumanKeystrokeAt = nil
         hasUnsubmittedHumanInput = false
         usesInjectedTestingContent = false
-        attentionClassifierPrediction = nil
-        attentionAlertGeneration = 0
-        acknowledgedAttentionAlertGeneration = 0
-        hasUnacknowledgedAttention = false
-        isAttentionEpisodeActive = false
-        hasHarnessNotificationForAttentionEpisode = false
-        attentionNotificationGate = TerminalAttentionNotificationGate()
-        clearCurrentAttentionScreenTag()
-        latestAttentionObservationEvent = .contentChanged
-        agentTurnState = .notStarted
-        resumedWorkDetector.disarm()
-        lastAgentInputAt = nil
+        // What the program reports from here on is about this launch; a
+        // restored or adopted session's host reports its records again.
+        resetProgramStatus()
         childProcessID = nil
         // A session of This Mac's program, while the adapter runs; never
         // another machine's.
         hostedProgramProcessID = hostedAttachment?.host == .local ? attachedLocalProgramProcessID : nil
         exitCode = nil
         nixShellEnvironment = nil
-        if kind == .agent {
-            cancelAgentIdleConfirmation()
-            cancelAgentIdleRecheck()
-            titleIndicatesAgentWorking = false
-            lastTitleSpinnerAt = nil
-            lastStrongWorkingEvidenceAt = nil
-            setAgentActivityState(.unknown, source: .none)
-        }
         bumpRevision()
 
         if launchBackend == .nativePTY {
@@ -7003,7 +6898,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         return info.localWorkingDirectory
     }
 
-    /// Takes the title and directory the host reports for the program when
+    /// Takes the program status records the host keeps, and the title and
+    /// directory it reports for the program when
     /// they changed since its last report, unless the attach adapter passes
     /// them to the surface (which reports them itself, in order with the
     /// program's output). `resynchronizing`: the tab starts following a
@@ -7012,6 +6908,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// whatever was reported before. A directory on another machine (the
     /// program ran ssh) is ignored, as Ghostty ignores such an OSC 7.
     private func applyHostReportedTitleAndDirectory(of info: HostedSessionInfo, resynchronizing: Bool) {
+        // Program status never passes through the adapter: the host keeps
+        // the records (its stream keeps OSC 7501 from every surface).
+        applyProgramStatus(info.programStatus)
         let passesThrough = !resynchronizing && adapterPassesSignalsThrough
         // A device's tab takes its directory from the host even while the
         // adapter passes signals through: the surface ignores an OSC 7 of
@@ -7073,7 +6972,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             guard hostSignalMissedTheAdapter(key: "bell"),
                   noteSignalDelivery(key: "bell", fromHost: true, window: Self.bellDeduplicationWindow)
             else { return }
-            noteAttentionSampleEvent(.bell)
             bellHandler(self)
         case .notification(let title, let body):
             let key = Self.notificationKey(title: title, body: body)
@@ -7332,13 +7230,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         exitCode = status
         nixShellEnvironment = nil
         exitedAt = Date()
-        if kind == .agent {
-            cancelAgentIdleConfirmation()
-            cancelAgentIdleRecheck()
-            titleIndicatesAgentWorking = false
-            lastTitleSpinnerAt = nil
-            setAgentActivityState(status == 0 ? .idle : .error, source: .processExit)
-        }
+        // The program is gone: its working, blocked and idle records go (a
+        // persistent tab's host drops them itself).
+        endParsedProgramStatus()
         resetKeyboardProtocolState()
         outputHoldUntil = nil
         processor.endLaunch(launchID)
@@ -7377,8 +7271,6 @@ final class TerminalSession: ObservableObject, Identifiable {
                 hostSessionEnd.map { "[\($0.message)]" } ?? "[shell exited with status \(status)]"
             ])
         }
-        noteAttentionSampleEvent(.exited, detail: String(status))
-        scheduleAttentionObservation(event: .processExited)
         bumpRevision()
         if isPersistentLocalSession {
             // Saved with its exit (`savedExitStatus`): a relaunch that finds
@@ -7569,7 +7461,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             // daemon heard from its holder again: the adapter finds out.
             launchDeferredAdapterIfNeeded()
         case .bell:
-            noteAttentionSampleEvent(.bell)
             bellHandler(self)
         case .notification(_, let title, let body):
             handleIncomingNotification(TerminalNotificationRequest(title: title.nilIfEmpty, body: body, source: .osc777))
@@ -7677,17 +7568,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         outputVersion &+= 1
         let contentChanged = updateContentFingerprint()
         if contentChanged {
-            clearCurrentAttentionScreenTag()
             lastContentChangeAt = Date()
             contentVersion &+= 1
-        }
-        if kind == .agent, contentChanged {
-            noteAttentionSampleContentChange()
-            recordAgentActivitySignal()
-            if agentActivityState == .working {
-                scheduleAgentIdleRecheck()
-            }
-            scheduleAttentionObservation(event: .contentChanged)
         }
         bumpRevision()
     }
@@ -7708,15 +7590,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func noteInputBurst(_ input: Data) {
-        clearCurrentAttentionScreenTag()
         ghosttyBridgeStorage?.noteHostInputForOutputLatency()
         noteInputOutputBaseline()
         guard kind == .agent else { return }
-        lastAgentInputAt = Date()
         applyAgentDraftInputEffect(Self.agentDraftInputEffect(input))
-        if input == Data([0x1B]) {
-            noteAgentTurnInterrupted()
-        }
     }
 
     /// Assigns only a changed value: every keystroke comes here, and
@@ -7825,6 +7702,11 @@ final class TerminalSession: ObservableObject, Identifiable {
                 handleIncomingNotification(notification)
                 didChange = true
 
+            case .programStatus(let report):
+                if parsedProgramStatus.apply(report) {
+                    applyProgramStatus(parsedProgramStatus.records)
+                }
+
             case .resolvedCommandLine(let commandLine):
                 pendingResolvedCommandLine = commandLine
 
@@ -7881,15 +7763,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func handleIncomingNotification(_ notification: TerminalNotificationRequest) {
         let isAgentCompletion = kind == .agent
             && Self.notificationBodyIndicatesCompletion(notification.body)
-        if isAgentCompletion {
-            // Completion status is an attention-episode signal, not a second
-            // unread-dot source. Deliver the harness notification first and
-            // remember that it owns this episode so the classifier can avoid a
-            // duplicate fallback even though `hasUnreadNotification` stays false.
-            hasHarnessNotificationForAttentionEpisode = true
-        }
+        // A finished turn is the program status' unseen result
+        // (`hasUnseenAgentResult`), not a second unread dot.
         handleTerminalNotification(notification, marksUnread: !isAgentCompletion)
-        handleAgentNotification(notification)
     }
 
     // MARK: - Native-PTY chrome ingestion
@@ -7941,7 +7817,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     func ingestNativeBell() {
         guard noteSignalDelivery(key: "bell", fromHost: false, window: Self.bellDeduplicationWindow) else { return }
         noteSurfaceSignalWhileFollowing(key: "bell")
-        noteAttentionSampleEvent(.bell)
         bellHandler(self)
     }
 
@@ -8117,10 +7992,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         // The surface does not show the program now; its text comes from
         // the host (`refreshContentFromHostIfNeeded`).
         guard !readsContentFromHost else { return false }
-        // recordAgentActivitySignal below re-enters this function through
-        // contentSnapshot → ensureNativeContentFresh. Without
-        // this guard, a session whose screen changes faster than one scan pass
-        // (any working agent repaints its spinner every second) recurses
+        // A reader of the content (`contentSnapshot` →
+        // `ensureNativeContentFresh`) may come back here while it runs.
+        // Without this guard, a session whose screen changes faster than one
+        // pass (any working agent repaints its spinner every second) recurses
         // unboundedly and livelocks the main thread.
         guard !isRefreshingNativeContent else { return false }
         isRefreshingNativeContent = true
@@ -8131,7 +8006,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     /// Takes `text` as the tab's lines; when it changed, advances the output
-    /// and content counters and runs the agent activity hooks.
+    /// and content counters.
     @discardableResult
     private func replaceNativeContent(with text: String) -> Bool {
         var hasher = Hasher()
@@ -8144,17 +8019,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastOutputAt = Date()
         if case .launching = state { state = .live }
         outputVersion &+= 1
-        clearCurrentAttentionScreenTag()
         lastContentChangeAt = Date()
         contentVersion &+= 1
-        if kind == .agent {
-            noteAttentionSampleContentChange()
-            recordAgentActivitySignal()
-            if agentActivityState == .working {
-                scheduleAgentIdleRecheck()
-            }
-            scheduleAttentionObservation(event: .contentChanged)
-        }
         bumpRevision()
         return true
     }
@@ -8331,16 +8197,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         return lines
     }
 
-    /// The last lines the tab holds now, without reading the surface or the
-    /// host again (for listings that look at many tabs).
-    var cachedScreenTailLines: [String] {
-        if readsContentFromHost || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
-            return Array(AgentPermissionPrompt.tail(of: nativeContentLines))
-        }
-        let count = processor.lineCount
-        return Array(AgentPermissionPrompt.tail(of: processor.snapshot(range: max(0, count - 200)..<count)))
-    }
-
     private var hostScreenWaitForInput: Duration {
         persistentHosting?.configuration.hostScreenWait ?? .seconds(2)
     }
@@ -8419,566 +8275,120 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
-    @discardableResult
-    func captureAttentionObservation(
-        label: TerminalAttentionLabel,
-        scenarioID: String?,
-        checkpoint: String?,
-        harnessVersion: String?,
-        runID: String?
-    ) throws -> (id: UUID, outputURL: URL) {
-        guard let attentionObservationRecorder = ensureAttentionObservationRecorder() else {
-            throw TerminalAttentionRecordingError.disabled
-        }
+    // MARK: Program status (OSC 7501)
 
-        let observation = makeAttentionObservation(
-            event: .labeledCheckpoint,
-            label: label,
-            annotation: nil,
-            scenarioID: scenarioID,
-            checkpoint: checkpoint,
-            harnessVersion: harnessVersion,
-            runID: runID
-        )
-        attentionObservationRecorder.record(observation, synchronously: true)
-        return (observation.id, attentionObservationRecorder.outputURL)
+    /// The program's status records changed: its host's for a persistent
+    /// tab (`applyHostReportedTitleAndDirectory`), or those of output Cherry
+    /// parses itself (`ingestTerminalMetadata`). A native tab has none. The root record sets
+    /// `agentActivityState` and the turn bookkeeping MCP reads; a turn that
+    /// finished or a program that blocks while its tab is not in front is
+    /// unseen and posted as a notification.
+    func applyProgramStatus(_ records: [ProgramStatus]) {
+        guard records != programStatus else { return }
+        let firstReport = !reportsProgramStatus
+        let previousRoot = programStatus.root
+        programStatus = records
+        if !records.isEmpty {
+            reportsProgramStatus = true
+        }
+        let root = records.root
+        switch root?.state {
+        case .working?, .blocked?:
+            if root?.state == .working {
+                lastWorkingReportAt = Date()
+            }
+            if agentTurnState != .active {
+                agentTurnState = .active
+                agentReportedTurnCount &+= 1
+            }
+        case .done?, .error?:
+            // A result Cherry saw come: after a turn it saw, or a new one
+            // (a whole turn can pass between two of the host's reports). The
+            // records a tab finds when it starts or attaches are not news.
+            let finished = agentTurnState == .active || (!firstReport && previousRoot != root)
+            if finished, agentTurnState != .active {
+                agentReportedTurnCount &+= 1
+            }
+            if finished || agentTurnState == .notStarted {
+                agentTurnState = .completed
+            }
+            if finished {
+                hasUnseenAgentResult = true
+            }
+        case .idle?:
+            if agentTurnState == .active {
+                agentTurnState = .userInterrupted
+            }
+        case .unknown?, nil:
+            break
+        }
+        let nextState = AgentActivityState(root)
+        let stateChanged = agentActivityState != nextState
+        agentActivityState = nextState
+        if let root, !firstReport, previousRoot?.state != root.state || previousRoot?.kind != root.kind {
+            switch root.state {
+            case .blocked, .done, .error:
+                notifyProgramStatus(root)
+            case .idle, .working, .unknown:
+                break
+            }
+        }
+        if stateChanged {
+            bumpRevision()
+        }
     }
 
-    @discardableResult
-    func captureAttentionCorrection(
-        _ correction: TerminalAttentionCorrection
-    ) throws -> (id: UUID, outputURL: URL) {
-        guard let attentionObservationRecorder = (
-            ensureAttentionObservationRecorder() ?? ensureAttentionCorrectionRecorder()
-        ) else {
-            throw TerminalAttentionRecordingError.disabled
-        }
-
-        let sourceEvent = latestAttentionObservationEvent
-        let sourceObservation = makeAttentionObservation(
-            event: sourceEvent,
-            label: nil,
-            annotation: nil,
-            scenarioID: nil,
-            checkpoint: nil,
-            harnessVersion: nil,
-            runID: nil
-        )
-        let sourcePrediction = kind == .agent
-            ? TerminalAttentionClassifier.shared.predict(sourceObservation)
-            : nil
-        if let sourcePrediction {
-            attentionClassifierPrediction = sourcePrediction
-        }
-
-        let observation = makeAttentionObservation(
-            event: .labeledCheckpoint,
-            label: correction.label,
-            annotation: .init(
-                schemaVersion: 1,
-                provenance: "cherry_in_app_human_correction",
-                confidence: 1,
-                rationale: "human_corrected_action_label",
-                reason: correction.reason
-            ),
-            scenarioID: "in-app-attention-correction",
-            checkpoint: "human_corrected",
-            harnessVersion: nil,
-            runID: nil,
-            correction: .init(
-                sourceEvent: sourceEvent,
-                modelID: sourcePrediction?.modelID,
-                modelLabel: sourcePrediction?.label,
-                attentionProbability: sourcePrediction?.attentionProbability,
-                threshold: sourcePrediction?.threshold,
-                supersedesObservationID: currentAttentionScreenTagObservationID
-            )
-        )
-        attentionObservationRecorder.record(observation, synchronously: true)
-        currentAttentionScreenTag = correction
-        currentAttentionScreenTagObservationID = observation.id
-        acknowledgeAttentionAlert()
-        return (observation.id, attentionObservationRecorder.outputURL)
-    }
-
-    func acknowledgeAttentionAlert() {
-        guard attentionAlertGeneration > acknowledgedAttentionAlertGeneration else { return }
-        acknowledgedAttentionAlertGeneration = attentionAlertGeneration
-        attentionNotificationGate.acknowledge()
-        guard hasUnacknowledgedAttention else { return }
-        hasUnacknowledgedAttention = false
+    /// The user saw the tab (it was selected in a key window): the result
+    /// it showed is no longer news.
+    func acknowledgeAgentResult() {
+        guard hasUnseenAgentResult else { return }
+        hasUnseenAgentResult = false
         bumpRevision()
     }
 
-    private func scheduleAttentionObservation(event: TerminalAttentionObservationEvent) {
-        guard kind == .agent else { return }
-        latestAttentionObservationEvent = event
+    /// The program whose output Cherry parses itself ended (it exited, or
+    /// its shell finished a command): its `working`, `blocked` and `idle`
+    /// records go. A persistent tab's host drops its own.
+    private func endParsedProgramStatus() {
+        guard !isPersistentLocalSession, parsedProgramStatus.endProgram() else { return }
+        applyProgramStatus(parsedProgramStatus.records)
+    }
 
-        let isDebounced = event == .contentChanged || event == .inputChanged
-        if !isDebounced {
-            attentionObservationTask?.cancel()
-            attentionObservationTask = nil
-            recordAttentionObservation(event: event)
-            return
-        }
-
-        guard attentionObservationTask == nil else { return }
-        attentionObservationTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(Int(Self.attentionObservationInterval * 1_000)))
-            guard let self, !Task.isCancelled else { return }
-            self.attentionObservationTask = nil
-            self.recordAttentionObservation(event: event)
+    /// A new program starts in the tab: nothing it reported before counts.
+    private func resetProgramStatus() {
+        parsedProgramStatus.removeAll()
+        programStatus = []
+        reportsProgramStatus = false
+        lastWorkingReportAt = nil
+        agentTurnState = .notStarted
+        hasUnseenAgentResult = false
+        lastProgramStatusNotificationAt = nil
+        if agentActivityState != .unknown {
+            agentActivityState = .unknown
+            bumpRevision()
         }
     }
 
-    private func recordAttentionObservation(event: TerminalAttentionObservationEvent) {
-        let attentionObservationRecorder = ensureAttentionObservationRecorder()
-        let observation = makeAttentionObservation(
-            event: event,
-            label: nil,
-            annotation: nil,
-            scenarioID: nil,
-            checkpoint: nil,
-            harnessVersion: nil,
-            runID: nil
-        )
-        let prediction = TerminalAttentionClassifier.shared.predict(observation)
-        defer {
-            sampleAttentionIfStateChanged(observation: observation, prediction: prediction)
-        }
-        // Published values change only when they differ: an observation
-        // follows typing (debounced), and republishing an unchanged value
-        // would re-render every view observing the tab.
-        if attentionClassifierPrediction != prediction {
-            attentionClassifierPrediction = prediction
-        }
-        if agentTurnState == .userInterrupted {
-            // The user is already handling this turn. Preserve interruption and
-            // follow-up screen observations for training without surfacing a
-            // new alert until the user submits another turn.
-            isAttentionEpisodeActive = prediction.needsAttention
-            setHasUnacknowledgedAttention(false)
-            attentionNotificationGate.acknowledge()
-            attentionObservationRecorder?.record(observation)
-            return
-        }
-        if prediction.needsAttention {
-            // One continuous run of attention-needed predictions is one alert
-            // episode. Acknowledging the visible result must cover later
-            // debounced observations of that same completed screen.
-            if !isAttentionEpisodeActive, event != .inputChanged {
-                attentionAlertGeneration &+= 1
-                isAttentionEpisodeActive = true
-            }
-            setHasUnacknowledgedAttention(
-                isAttentionEpisodeActive
-                    && attentionAlertGeneration > acknowledgedAttentionAlertGeneration
-            )
-        } else {
-            // Preserve a consumed/completed episode through transient classifier
-            // wobble. Native screen reflow can momentarily make an idle agent
-            // look working without any new turn or agent output. The next active
-            // turn will still clear the episode and allow its result to alert.
-            if prediction.turnState != .completed {
-                isAttentionEpisodeActive = false
-            }
-            setHasUnacknowledgedAttention(false)
-        }
-        updateAttentionNotification(for: prediction)
-        attentionObservationRecorder?.record(observation)
-    }
+    /// At most one notification per tab in this long: a program cannot
+    /// flood the user by flipping its state.
+    private static let programStatusNotificationInterval: TimeInterval = 2
+    private var lastProgramStatusNotificationAt: Date?
 
-    private func setHasUnacknowledgedAttention(_ value: Bool) {
-        guard hasUnacknowledgedAttention != value else { return }
-        hasUnacknowledgedAttention = value
-    }
-
-    private func updateAttentionNotification(for prediction: TerminalAttentionPrediction) {
-        guard attentionNotificationGate.shouldNotify(
-            prediction: prediction,
-            isTopLevelAgent: kind == .agent && parentAgentID == nil,
-            hasUnreadNativeNotification:
-                hasUnreadNotification || hasHarnessNotificationForAttentionEpisode,
-            hasUnacknowledgedAttention: hasUnacknowledgedAttention
-        ) else {
-            return
-        }
-
-        attentionNotificationHandler(prediction, self)
-    }
-
-    // MARK: Attention samples
-
-    /// Records an interaction for attention sampling: its kind and time,
-    /// never content. Does nothing while sampling is off.
-    func noteAttentionSampleEvent(_ kind: TerminalAttentionSampleEvent.Kind, detail: String? = nil) {
-        guard let attentionSampler, attentionSampler.isCollecting else { return }
-        attentionSampler.recordEvent(
-            kind,
-            detail: detail,
-            tab: attentionSampleTabID,
-            run: attentionSampleRunID,
-            at: Date()
-        )
-    }
-
-    /// The tab closed (`intent`): the last event of its run.
-    func noteAttentionSampleClosed(intent: SessionCloseIntent) {
-        guard let attentionSampler else { return }
-        noteAttentionSampleEvent(.closed, detail: intent.rawValue)
-        attentionSampler.unregister(self)
-        attentionSampler.forget(tab: attentionSampleTabID, run: attentionSampleRunID)
-    }
-
-    private func noteAttentionSampleInput(_ effect: AgentDraftInputEffect) {
-        guard let attentionSampler, attentionSampler.isCollecting else { return }
-        if agentIsAtAnswerMenu {
-            noteAttentionSampleEvent(
-                .menuKey,
-                detail: agentActivityState == .permission ? "permission" : "question"
-            )
-            return
-        }
-        switch effect {
-        case .none: return
-        case .inserted, .edited, .cleared: noteAttentionSampleEvent(.typed)
-        case .submitted: noteAttentionSampleEvent(.submitted)
-        }
-    }
-
-    private func noteAttentionSampleContentChange() {
-        guard let attentionSampler, attentionSampler.isCollecting else { return }
+    private func notifyProgramStatus(_ status: ProgramStatus) {
         let now = Date()
-        let window = TerminalAttentionSampling.inputEchoWindow
-        let followsInput = lastAgentInputAt.map { now.timeIntervalSince($0) < window } ?? false
-        let followsResize = lastViewportResizeAt.map { now.timeIntervalSince($0) < window } ?? false
-        attentionSampler.noteContentChange(
-            tab: attentionSampleTabID,
-            run: attentionSampleRunID,
-            selfDriven: !followsInput && !followsResize,
-            at: now
-        )
-    }
-
-    /// Samples the tab when Cherry's view of it changed (activity, its
-    /// evidence, the turn, the prediction), from the observation it just
-    /// classified.
-    private func sampleAttentionIfStateChanged(
-        observation: TerminalAttentionObservation,
-        prediction: TerminalAttentionPrediction
-    ) {
-        guard let attentionSampler, attentionSampler.isCollecting else { return }
-        let signature = [
-            agentActivityState.rawValue,
-            attentionActivityEvidenceName,
-            agentTurnState.rawValue,
-            String(agentTurnCount),
-            prediction.label.rawValue,
-        ].joined(separator: "|")
-        guard signature != lastAttentionSampleSignature else { return }
-        lastAttentionSampleSignature = signature
-        guard let sample = makeAttentionSample(
-            trigger: .stateChanged,
-            observation: observation,
-            prediction: prediction
-        ) else { return }
-        attentionSampler.record(sample)
-    }
-
-    /// The periodic sample (`TerminalAttentionSampler.tick`), from the
-    /// screen as the tab last read it: no surface read, no classifier
-    /// state change. Nil once the program exited (its exit was sampled)
-    /// or while the screen is blank.
-    func makePeriodicAttentionSample() -> TerminalAttentionSample? {
-        guard kind == .agent, exitedAt == nil else { return nil }
-        let observation = makeAttentionObservation(
-            event: latestAttentionObservationEvent,
-            label: nil,
-            annotation: nil,
-            scenarioID: nil,
-            checkpoint: nil,
-            harnessVersion: nil,
-            runID: nil,
-            readsLastContent: true
-        )
-        return makeAttentionSample(
-            trigger: .periodic,
-            observation: observation,
-            prediction: TerminalAttentionClassifier.shared.predict(observation)
-        )
-    }
-
-    private func makeAttentionSample(
-        trigger: TerminalAttentionSample.Trigger,
-        observation: TerminalAttentionObservation,
-        prediction: TerminalAttentionPrediction
-    ) -> TerminalAttentionSample? {
-        let grid = observation.terminal.grid
-        guard let lastLine = grid.lastIndex(where: {
-            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }) else { return nil }
-        let tailEnd = lastLine + 1
-        let tailStart = max(0, tailEnd - TerminalAttentionSampling.screenTailLineLimit)
-        let tail = Array(grid[tailStart..<tailEnd])
-        let agent = screenAgentKey
-        let markerLines = Array(tail.suffix(AgentScreenActivity.markerTailLineLimit))
-        let backend: String
-        if persistentHosting != nil {
-            backend = remoteMachineName == nil ? "persistent" : "device"
-        } else if hostedAttachment != nil {
-            backend = "attached"
-        } else {
-            backend = "native"
-        }
-        let hostSessionID = persistentSession?.sessionID ?? hostedAttachment?.sessionID
-        return TerminalAttentionSample(
-            type: TerminalAttentionSample.recordType,
-            schemaVersion: TerminalAttentionSample.currentSchemaVersion,
-            id: UUID(),
-            recordedAt: observation.recordedAt,
-            trigger: trigger,
-            tab: attentionSampleTabID,
-            run: attentionSampleRunID,
-            hostSession: hostSessionID.map(TerminalAttentionSampling.stableID),
-            agent: agent,
-            backend: backend,
-            observation: observation.sampled(
-                grid: tail,
-                rowOffset: tailStart,
-                sessionID: attentionSampleTabID,
-                runID: attentionSampleRunID
-            ),
-            features: TerminalAttentionClassifier.features(for: observation),
-            prediction: .init(prediction),
-            shownPrediction: attentionClassifierPrediction.map(TerminalAttentionSample.Prediction.init),
-            lifecycle: .init(
-                turnState: agentTurnState,
-                submittedTurns: agentSubmittedTurnCount,
-                selfResumedTurns: agentSelfResumedTurnCount,
-                lastSubmitAt: lastAgentSubmitAt,
-                lastOutputAt: lastOutputAt,
-                lastContentChangeAt: lastContentChangeAt,
-                lastStrongWorkingEvidenceAt: lastStrongWorkingEvidenceAt,
-                lastKeystrokeAt: lastHumanKeystrokeAt,
-                lastInputAt: lastAgentInputAt,
-                alertGeneration: attentionAlertGeneration,
-                hasUnacknowledgedAttention: hasUnacknowledgedAttention
-            ),
-            screen: .init(
-                tailStartRow: tailStart,
-                viewportGridRows: grid.count,
-                liveLines: AgentScreenActivity.workingLines(markerLines, agent: agent),
-                verdict: AgentScreenActivity.verdict(
-                    for: tail,
-                    agent: agent,
-                    includesAnswerMenus: agentTurnState != .notStarted
-                ).rawValue
-            ),
-            changes: .init()
-        )
-    }
-
-    private func ensureAttentionObservationRecorder() -> TerminalAttentionObservationRecorder? {
-        guard let directoryURL = attentionObservationDirectoryProvider() else { return nil }
-        if attentionObservationRecorder == nil {
-            attentionObservationRecorder = TerminalAttentionObservationRecorder(
-                directoryURL: directoryURL,
-                sessionID: id,
-                harness: agentName
-            )
-        }
-        return attentionObservationRecorder
-    }
-
-    private func ensureAttentionCorrectionRecorder() -> TerminalAttentionObservationRecorder? {
-        if attentionCorrectionRecorder == nil {
-            attentionCorrectionRecorder = TerminalAttentionObservationRecorder(
-                directoryURL: attentionCorrectionDirectoryProvider(),
-                sessionID: id,
-                harness: "\(agentName ?? kind.rawValue)-correction"
-            )
-        }
-        return attentionCorrectionRecorder
-    }
-
-    private func makeAttentionObservation(
-        event: TerminalAttentionObservationEvent,
-        label: TerminalAttentionLabel?,
-        annotation: TerminalAttentionObservation.AnnotationContext?,
-        scenarioID: String?,
-        checkpoint: String?,
-        harnessVersion: String?,
-        runID: String?,
-        correction: TerminalAttentionObservation.CorrectionContext? = nil,
-        readsLastContent: Bool = false
-    ) -> TerminalAttentionObservation {
-        let now = Date()
-        // `readsLastContent`: the lines as last read, without reading the
-        // surface again (a periodic sample must not run the activity hooks).
-        let lineCount = readsLastContent ? lastReadContentLineCount() : contentLineCount()
-        let rowLimit = min(max(viewportSize.rows, 1), Self.attentionObservationMaximumRows)
-        let columnLimit = min(max(viewportSize.columns, 1), Self.attentionObservationMaximumColumns)
-        let gridStart = max(0, lineCount - rowLimit)
-        let gridLines = readsLastContent
-            ? lastReadContentSnapshot(range: gridStart..<lineCount)
-            : contentSnapshot(range: gridStart..<lineCount)
-        let grid = gridLines.map { line in
-            String(line.prefix(columnLimit))
-        }
-        // libghostty exposes terminal text but not per-cell styling. Preserve the
-        // optional schema field without maintaining a second terminal parser.
-        let styledGrid: [[TerminalAttentionObservation.TerminalContext.StyledRun]]? = nil
-        let cursor = cursorState
-
-        return TerminalAttentionObservation(
-            schemaVersion: TerminalAttentionObservation.currentSchemaVersion,
-            id: UUID(),
-            recordedAt: now,
-            event: event,
-            label: label,
-            annotation: annotation,
-            scenarioID: Self.attentionRecordingMetadata(scenarioID),
-            checkpoint: Self.attentionRecordingMetadata(checkpoint),
-            session: .init(
-                id: id.uuidString,
-                kind: kind.rawValue,
-                harness: Self.attentionRecordingMetadata(agentName),
-                harnessVersion: Self.attentionRecordingMetadata(harnessVersion),
-                runID: Self.attentionRecordingMetadata(runID)
-            ),
-            terminal: .init(
-                columns: viewportSize.columns,
-                rows: viewportSize.rows,
-                usesAlternateScreen: usesAlternateScreen,
-                cursor: .init(
-                    row: max(0, cursor.row - gridStart),
-                    column: cursor.column,
-                    shape: Self.attentionCursorShapeName(cursor.shape),
-                    isVisible: cursor.isVisible
-                ),
-                grid: grid,
-                styledGrid: styledGrid,
-                scrollbackLinesOmitted: gridStart
-            ),
-            timing: .init(
-                millisecondsSinceStarted: Self.milliseconds(since: startedAt, now: now),
-                millisecondsSinceLastOutput: Self.milliseconds(since: lastOutputAt, now: now),
-                millisecondsSinceLastContentChange: Self.milliseconds(since: lastContentChangeAt, now: now),
-                millisecondsSinceLastHumanInput: Self.milliseconds(since: lastHumanInputAt, now: now)
-            ),
-            activity: .init(
-                state: agentActivityState.rawValue,
-                evidence: attentionActivityEvidenceName,
-                hasUnreadNotification: hasUnreadNotification,
-                processState: state.label,
-                exitCode: exitCode
-            ),
-            interaction: .init(
-                hasUnsubmittedInput: hasUnsubmittedHumanInput,
-                millisecondsSinceLastKeystroke: Self.milliseconds(since: lastHumanKeystrokeAt, now: now),
-                terminalFocused: ghosttyBridgeStorage?.isTerminalFocused ?? false
-            ),
-            turn: kind == .agent ? .init(state: agentTurnState) : nil,
-            correction: correction,
-            outputVersion: outputVersion,
-            contentVersion: contentVersion
-        )
-    }
-
-    private var attentionActivityEvidenceName: String {
-        switch agentActivitySource {
-        case .none: "none"
-        case .outputActivity: "output_activity"
-        case .inputSubmit: "input_submit"
-        case .quietWindow: "quiet_window"
-        case .promptMarker: "prompt_marker"
-        case .workingMarker: "working_marker"
-        case .titleSpinner: "title_spinner"
-        case .notification: "notification"
-        case .processExit: "process_exit"
-        case .answerMenu: TerminalAttentionPrediction.answerMenuEvidence
-        }
-    }
-
-    private static func attentionCursorShapeName(_ shape: TerminalCursorShape) -> String {
-        switch shape {
-        case .block: "block"
-        case .bar: "bar"
-        case .underline: "underline"
-        }
-    }
-
-    private static func milliseconds(since date: Date?, now: Date) -> Int? {
-        guard let date else { return nil }
-        return max(0, Int(now.timeIntervalSince(date) * 1_000))
-    }
-
-    private static func attentionRecordingMetadata(_ value: String?) -> String? {
-        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
-            return nil
-        }
-        return String(value.prefix(160))
-    }
-
-    private func handleAgentNotification(
-        _ notification: TerminalNotificationRequest
-    ) {
-        guard kind == .agent else { return }
-        noteAttentionSampleEvent(.notification)
-        defer {
-            scheduleAttentionObservation(event: .notification)
-        }
-
-        let body = notification.body
-        if Self.notificationBodyIndicatesPermission(body) {
-            setAgentActivityState(.permission, source: .notification)
+        if let lastProgramStatusNotificationAt,
+           now.timeIntervalSince(lastProgramStatusNotificationAt) < Self.programStatusNotificationInterval {
             return
         }
-        // A menu on screen still waits on the user's answer.
-        if Self.notificationBodyIndicatesCompletion(body), !agentIsAtAnswerMenu {
-            setAgentActivityState(.idle, source: .notification)
-        }
+        lastProgramStatusNotificationAt = now
+        programStatusNotificationHandler(status, self)
     }
 
-    private var agentStateHasDirectEvidence: Bool {
-        switch agentActivitySource {
-        case .promptMarker, .workingMarker, .titleSpinner, .notification, .processExit, .answerMenu:
-            true
-        case .none, .outputActivity, .inputSubmit, .quietWindow:
-            false
-        }
-    }
-
-    // Agents without a recognizable prompt/working UI (e.g. plain REPLs) only
-    // ever produce weak evidence; idle waits fall back to quiet windows for them.
-    var agentActivityEvidenceIsStrong: Bool {
-        kind == .agent && agentStateHasDirectEvidence
-    }
-
+    /// An agent's title also names its task (`applyAutomaticAgentTitle`).
     @discardableResult
     private func recordAgentTitleActivity(_ title: String) -> Bool {
         guard kind == .agent else { return false }
-
-        var didChange = applyAutomaticAgentTitle(from: title)
-
-        let spinnerActive = Self.titleIndicatesAgentWorking(title)
-        let spinnerCleared = titleIndicatesAgentWorking && !spinnerActive
-        titleIndicatesAgentWorking = spinnerActive
-
-        if spinnerActive {
-            lastTitleSpinnerAt = Date()
-            lastStrongWorkingEvidenceAt = Date()
-            scheduleAgentIdleRecheck()
-            if noteAgentTitleForResumedWork(title, isSpinner: true) {
-                return startSelfResumedAgentTurn(source: .titleSpinner) || didChange
-            }
-            return markAgentWorking(source: .titleSpinner) || didChange
-        }
-        _ = noteAgentTitleForResumedWork(title, isSpinner: false)
-        if spinnerCleared || agentUsesTitleActivitySignals {
-            didChange = recordAgentActivitySignal() || didChange
-        }
-        return didChange
+        return applyAutomaticAgentTitle(from: title)
     }
 
     private func applyAutomaticAgentTitle(from terminalTitle: String) -> Bool {
@@ -9017,472 +8427,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         return didChange
     }
 
-    private static func titleIndicatesAgentWorking(_ title: String) -> Bool {
-        guard let first = title.trimmingCharacters(in: .whitespaces).unicodeScalars.first else {
-            return false
-        }
-        return (0x2800...0x28FF).contains(Int(first.value))
-    }
-
-    // Codex/Claude pulse the title spinner several times per second while a turn
-    // is in flight, but may leave the last spinner frame behind when they settle,
-    // so the title only counts as working evidence while the pulses are fresh.
-    private static let titleSpinnerFreshnessWindow: TimeInterval = 3.0
-
-    private var titleSpinnerEvidenceIsActive: Bool {
-        guard titleIndicatesAgentWorking, let lastTitleSpinnerAt else { return false }
-        return Date().timeIntervalSince(lastTitleSpinnerAt) < Self.titleSpinnerFreshnessWindow
-    }
-
-    private var agentUsesTitleActivitySignals: Bool {
-        let normalizedName = AgentToolDefinition.normalizedName(agentName ?? title)
-        if normalizedName == "codex" || normalizedName == "amp" {
-            return true
-        }
-
-        let commandName = subtitle
-            .split(whereSeparator: \.isWhitespace)
-            .first
-            .map(String.init)?
-            .lowercased()
-        return commandName == "codex" || commandName == "amp"
-    }
-
-    @discardableResult
-    private func recordAgentActivitySignal() -> Bool {
-        guard kind == .agent else { return false }
-        guard agentActivitySource != .processExit else { return false }
-
-        var didChange = false
-        switch applyAgentAnswerMenu() {
-        case .showing(let changed):
-            return changed
-        case .left(let changed):
-            didChange = changed
-        case .none:
-            break
-        }
-
-        let markerLines = renderedOutputAgentMarkerLines()
-        let workingLineIndices = AgentScreenActivity.workingLineIndices(markerLines, agent: screenAgentKey)
-        if noteAgentScreenForResumedWork(markerLines, workingLineIndices: workingLineIndices) {
-            return startSelfResumedAgentTurn(source: .workingMarker) || didChange
-        }
-        if !workingLineIndices.isEmpty {
-            return markAgentWorking(source: .workingMarker) || didChange
-        }
-        if titleSpinnerEvidenceIsActive {
-            return markAgentWorking(source: .titleSpinner) || didChange
-        }
-        if renderedOutputShowsAgentInputPrompt() {
-            return requestAgentIdleFromRenderedOutput() || didChange
-        }
-        // Full-screen TUIs repaint the composer after every keystroke. If a new
-        // harness version changes its prompt glyph or layout, that repaint must
-        // not look like agent output while Cherry knows the user still has an
-        // unsubmitted draft. Explicit working markers and title spinners above
-        // continue to win, and submitting the draft clears this flag before
-        // marking the agent working.
-        if hasUnsubmittedHumanInput {
-            cancelAgentIdleConfirmation()
-            return setAgentActivityState(.idle, source: .promptMarker) || didChange
-        }
-        guard !agentStateResistsOutputActivity else { return didChange }
-        return setAgentActivityState(.working, source: .outputActivity) || didChange
-    }
-
-    private enum AgentAnswerMenuEffect {
-        /// A menu shows: the state says so, and nothing else applies.
-        case showing(changed: Bool)
-        /// The menu the state followed is gone: the turn goes on.
-        case left(changed: Bool)
-        /// No menu, and the state did not follow one.
-        case none
-    }
-
-    /// Whether the state follows a permission or question menu on screen.
-    private var agentIsAtAnswerMenu: Bool {
-        agentActivitySource == .answerMenu && agentActivityState.awaitsUserAnswer
-    }
-
-    /// A permission or question menu at the bottom of the screen
-    /// (`AgentScreenActivity.answerMenu`, MCP's recognizers) makes the
-    /// agent wait on the user's answer: `.permission` or `.needsInput`, an
-    /// attention alert like a permission prompt. Its state follows the
-    /// menu: when the menu goes (answered, or withdrawn), the turn it
-    /// paused goes on and the agent is working again until its screen says
-    /// otherwise. A startup dialog before this tab's first turn (folder
-    /// trust, resume picker) is not one: the agent has no turn to pause.
-    /// A permission prompt the agent notified is left to the notification.
-    private func applyAgentAnswerMenu() -> AgentAnswerMenuEffect {
-        guard agentActivityState != .error else { return .none }
-        let menu = renderedOutputAgentAnswerMenu()
-        if let menu, agentTurnState != .notStarted || !startedCurrentProgram {
-            if agentActivityState == .permission, agentActivitySource == .notification {
-                return .showing(changed: false)
-            }
-            cancelAgentIdleConfirmation()
-            // An agent this tab follows rather than started (restored or
-            // adopted) asking a question is in a turn submitted before
-            // the tab followed it.
-            if agentTurnState == .notStarted {
-                agentTurnState = .active
-            }
-            let state: AgentActivityState = menu == .permission ? .permission : .needsInput
-            return .showing(changed: setAgentActivityState(state, source: .answerMenu))
-        }
-        guard agentIsAtAnswerMenu else { return .none }
-        // The answer resumes the turn: like fresh working evidence, a
-        // composer drawn before the agent's next working frame is
-        // confirmed before it counts as the turn's end.
-        lastStrongWorkingEvidenceAt = Date()
-        let changed = setAgentActivityState(.working, source: .inputSubmit)
-        scheduleAgentIdleRecheck()
-        return .left(changed: changed)
-    }
-
-    private func renderedOutputAgentAnswerMenu() -> AgentScreenActivity.AnswerMenu? {
-        let lineCount = effectiveAgentContentLineCount()
-        guard lineCount > 0 else { return nil }
-        let start = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-        return AgentScreenActivity.answerMenu(in: contentSnapshot(range: start..<lineCount))
-    }
-
-    private var agentStateResistsOutputActivity: Bool {
-        if agentActivityState == .permission || agentActivityState == .needsInput || agentActivityState == .error {
-            return true
-        }
-        switch agentActivitySource {
-        case .promptMarker, .notification, .processExit, .answerMenu:
-            return true
-        case .none, .outputActivity, .inputSubmit, .workingMarker, .titleSpinner, .quietWindow:
-            return false
-        }
-    }
-
-    @discardableResult
-    private func markAgentWorking(source: AgentActivitySource) -> Bool {
-        guard agentActivitySource != .processExit else { return false }
-        guard !agentActivityState.awaitsUserAnswer, agentActivityState != .error else { return false }
-        cancelAgentIdleConfirmation()
-        if source == .workingMarker || source == .titleSpinner {
-            lastStrongWorkingEvidenceAt = Date()
-            // An agent this tab follows rather than started (restored or
-            // adopted) that shows it is at work is in a turn submitted
-            // before the tab followed it: its end is a finished turn, which
-            // notifies like one this tab saw submitted.
-            if agentTurnState == .notStarted, !startedCurrentProgram {
-                agentTurnState = .active
-            }
-        }
-        return setAgentActivityState(.working, source: source)
-    }
-
-    // MARK: Turns the agent resumes by itself
-
-    /// The agent's turn ended (or, interrupted by the user, it settled at
-    /// its composer), and it neither waits on an answer nor failed or
-    /// exited: work it shows from here on is its own new turn, once
-    /// `AgentResumedWorkDetector` tells it from a stale frame.
-    private var agentMayResumeWorkByItself: Bool {
-        guard resumedWorkDetector.isArmed,
-              agentTurnState == .completed || agentTurnState == .userInterrupted
-        else { return false }
-        return agentActivitySource != .processExit
-            && !agentActivityState.awaitsUserAnswer
-            && agentActivityState != .error
-    }
-
-    private var resumedWorkLayout: AgentResumedWorkDetector.Layout {
-        .init(columns: viewportSize.columns, rows: viewportSize.rows, fromHost: readsContentFromHost)
-    }
-
-    /// The turn ended: what the screen shows now is its past.
-    private func armResumedWorkDetector() {
-        resumedWorkDetector.arm(screenLines: lastReadAgentScreenTail(), layout: resumedWorkLayout)
-    }
-
-    /// Whether `screen` (the marker tail), whose lines at
-    /// `workingLineIndices` show live work, shows the agent back at work by
-    /// itself.
-    private func noteAgentScreenForResumedWork(_ screen: [String], workingLineIndices: [Int]) -> Bool {
-        guard agentMayResumeWorkByItself else { return false }
-        return resumedWorkDetector.noteScreen(
-            screen,
-            workingLineIndices: workingLineIndices,
-            layout: resumedWorkLayout,
-            lastInputAt: lastAgentInputAt,
-            now: Date()
-        )
-    }
-
-    /// Whether the title, now `title`, shows the agent back at work by
-    /// itself.
-    private func noteAgentTitleForResumedWork(_ title: String, isSpinner: Bool) -> Bool {
-        guard agentMayResumeWorkByItself else { return false }
-        return resumedWorkDetector.noteTitle(title, isSpinner: isSpinner, now: Date())
-    }
-
-    /// The agent went back to work by itself after its turn ended (a
-    /// background agent's or task's result, a scheduled wake-up, a hook):
-    /// a new turn, as if one was submitted. The sidebar shows it working,
-    /// MCP counts it (`agent_turn`, `agent_turn_state` active, a monitor's
-    /// `done` when it ends), and its end is a new attention episode that
-    /// can alert once. Nothing was submitted, so `lastAgentSubmitAt` and
-    /// the turn-start rule of MCP waits keep to submitted turns.
-    @discardableResult
-    private func startSelfResumedAgentTurn(source: AgentActivitySource) -> Bool {
-        resumedWorkDetector.disarm()
-        agentSelfResumedTurnCount &+= 1
-        agentTurnState = .active
-        // A harness notification of the turn that ended owned that turn's
-        // episode, not this one's.
-        hasHarnessNotificationForAttentionEpisode = false
-        if activityDebugEnabled {
-            SessionLog.debug("[activity] turn resumed by the agent itself source=\(source)")
-        }
-        if !markAgentWorking(source: source) {
-            // Its first frames already made it working: the observation
-            // that ends the finished turn's episode is due now.
-            scheduleAttentionObservation(event: .activityStateChanged)
-        }
-        scheduleAgentIdleRecheck()
-        bumpRevision()
-        return true
-    }
-
-    @discardableResult
-    private func requestAgentIdleFromRenderedOutput() -> Bool {
-        guard agentActivitySource != .processExit else { return false }
-        guard !agentActivityState.awaitsUserAnswer, agentActivityState != .error else { return false }
-
-        if let lastStrongWorkingEvidenceAt,
-           Date().timeIntervalSince(lastStrongWorkingEvidenceAt) < Self.agentIdleConfirmationEvidenceWindow {
-            scheduleAgentIdleConfirmation()
-            return false
-        }
-        cancelAgentIdleConfirmation()
-        return setAgentActivityState(.idle, source: .promptMarker)
-    }
-
-    private func scheduleAgentIdleConfirmation() {
-        guard agentIdleConfirmationTask == nil else { return }
-        agentIdleConfirmationTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(Int(Self.agentIdleConfirmationDelay * 1_000)))
-            guard let self, !Task.isCancelled else { return }
-            self.agentIdleConfirmationTask = nil
-            self.confirmAgentIdleIfStillAtPrompt()
-        }
-    }
-
-    private func cancelAgentIdleConfirmation() {
-        agentIdleConfirmationTask?.cancel()
-        agentIdleConfirmationTask = nil
-    }
-
-    private func confirmAgentIdleIfStillAtPrompt() {
-        guard kind == .agent, agentActivitySource != .processExit else { return }
-        guard !agentActivityState.awaitsUserAnswer, agentActivityState != .error else { return }
-        guard !renderedOutputShowsAgentWorkingMarker(), !titleSpinnerEvidenceIsActive else { return }
-        guard renderedOutputShowsAgentInputPrompt() else { return }
-        setAgentActivityState(.idle, source: .promptMarker)
-    }
-
-    private func scheduleAgentIdleRecheck() {
-        guard kind == .agent else { return }
-        agentIdleRecheckTask?.cancel()
-        agentIdleRecheckTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(Int(Self.agentIdleRecheckQuietInterval * 1_000)))
-            guard let self, !Task.isCancelled else { return }
-            self.agentIdleRecheckTask = nil
-            self.recheckAgentActivityAfterQuiet()
-        }
-    }
-
-    private func cancelAgentIdleRecheck() {
-        agentIdleRecheckTask?.cancel()
-        agentIdleRecheckTask = nil
-    }
-
-    private func recheckAgentActivityAfterQuiet() {
-        if activityDebugEnabled {
-            SessionLog.debug("[activity] recheck state=\(agentActivityState) source=\(agentActivitySource) marker=\(renderedOutputShowsAgentWorkingMarker()) spinner=\(titleSpinnerEvidenceIsActive) prompt=\(renderedOutputShowsAgentInputPrompt())")
-        }
-        guard kind == .agent, agentActivityState == .working else { return }
-        guard agentActivitySource != .processExit else { return }
-        // A live working marker or a still-pulsing title spinner outranks quiet —
-        // but keep rechecking, so evidence that later disappears (marker scrolls
-        // out of the tail window, spinner stops pulsing) cannot pin "working"
-        // forever on a session that never produces another content change.
-        guard !renderedOutputShowsAgentWorkingMarker(), !titleSpinnerEvidenceIsActive else {
-            scheduleAgentIdleRecheck()
-            return
-        }
-
-        // Prefer a recognized composer prompt — the strongest idle signal. Ignore the
-        // human-input floor so a settled prompt is still found below the last typed line.
-        let lineCount = effectiveAgentContentLineCount()
-        if lineCount > 0 {
-            let normalizedAgentName = screenAgentKey
-            let scanStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-            let scanLines = contentSnapshot(range: scanStart..<lineCount)
-            let promptLines = agentPromptWindowLines(
-                scanStart: scanStart,
-                scanLines: scanLines,
-                applyInputFloor: false
-            )
-            let promptVisible = promptLines.contains { line in
-                AgentScreenActivity.isInputPromptLine(line, agent: normalizedAgentName)
-            } || AgentScreenActivity.showsInputMarker(scanLines, agent: normalizedAgentName)
-            if promptVisible {
-                setAgentActivityState(.idle, source: .promptMarker)
-                return
-            }
-        }
-
-        // No prompt/working UI to key off (amp, bare REPLs, unrecognized agents): the
-        // turn's strong evidence has gone stale and the content has been quiet for the
-        // recheck window, so settle to idle. Mirrors the content-quiet fallback the MCP
-        // wait_for_process_idle loop already applies, lifted into the live UI state so the
-        // sidebar/menu bar stop showing a permanent "working" spinner for these agents.
-        guard hasBeenContentQuiet(for: Self.agentIdleRecheckQuietInterval) else {
-            scheduleAgentIdleRecheck()
-            return
-        }
-        setAgentActivityState(.idle, source: .quietWindow)
-    }
-
-    private func hasBeenContentQuiet(for interval: TimeInterval) -> Bool {
-        guard let lastContentChangeAt else { return true }
-        return Date().timeIntervalSince(lastContentChangeAt) >= interval
-    }
-
-    // TUIs that park the cursor on the bottom screen row materialize dozens of
-    // empty rows below their content, so tail windows must anchor to the last
-    // row that actually holds text.
-    private static let agentTrailingBlankScanLimit = 600
-
-    /// The harness key the screen rules (`AgentScreenActivity`) use.
-    private var screenAgentKey: String {
-        AgentScreenActivity.agentKey(name: agentName ?? title, commandLine: subtitle)
-    }
-
-    private func effectiveAgentContentLineCount() -> Int {
-        let lineCount = contentLineCount()
-        guard lineCount > 0 else { return 0 }
-        let scanStart = max(0, lineCount - Self.agentTrailingBlankScanLimit)
-        let scanLines = contentSnapshot(range: scanStart..<lineCount)
-        var effectiveEnd = lineCount
-        var index = scanLines.count - 1
-        while index >= 0,
-              scanLines[index].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            effectiveEnd -= 1
-            index -= 1
-        }
-        return effectiveEnd
-    }
-
-    /// The screen tail the working and input markers are read from: the
-    /// last `agentInputMarkerTailLineLimit` lines up to the last one with
-    /// text.
-    private func renderedOutputAgentMarkerLines() -> [String] {
-        let lineCount = effectiveAgentContentLineCount()
-        guard lineCount > 0 else { return [] }
-        let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-        return contentSnapshot(range: markerStart..<lineCount)
-    }
-
-    private func renderedOutputShowsAgentWorkingMarker() -> Bool {
-        AgentScreenActivity.showsWorkingMarker(renderedOutputAgentMarkerLines(), agent: screenAgentKey)
-    }
-
-    private static let agentResumedWorkBaselineLineLimit = 200
-
-    /// The tab's last lines with text as it last read them, without reading
-    /// its screen again: a state change can take them (a refresh from there
-    /// would re-enter the activity hooks).
-    private func lastReadAgentScreenTail() -> [String] {
-        let lines: [String]
-        if let closedTabContentLines {
-            lines = closedTabContentLines
-        } else if readsContentFromHost
-                    || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
-            lines = nativeContentLines
-        } else {
-            let count = processor.lineCount
-            lines = processor.snapshot(range: max(0, count - Self.agentTrailingBlankScanLimit)..<count)
-        }
-        var end = lines.count
-        while end > 0, lines[end - 1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            end -= 1
-        }
-        return Array(lines[max(0, end - Self.agentResumedWorkBaselineLineLimit)..<end])
-    }
-
-    private func renderedOutputShowsAgentInputPrompt() -> Bool {
-        let lineCount = effectiveAgentContentLineCount()
-        guard lineCount > 0 else { return false }
-
-        let normalizedAgentName = screenAgentKey
-        let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-        let markerLines = contentSnapshot(range: markerStart..<lineCount)
-        if AgentScreenActivity.showsWorkingMarker(markerLines, agent: normalizedAgentName) {
-            return false
-        }
-
-        let promptLines = agentPromptWindowLines(
-            scanStart: markerStart,
-            scanLines: markerLines,
-            applyInputFloor: true
-        )
-        if promptLines.contains(where: { line in
-            AgentScreenActivity.isInputPromptLine(line, agent: normalizedAgentName)
-        }) {
-            return true
-        }
-
-        return AgentScreenActivity.showsInputMarker(markerLines, agent: normalizedAgentName)
-    }
-
-    // Alternate-screen grids and PTY echo can leave blank rows below the visible
-    // content, so the prompt window is anchored to the last non-blank row.
-    private func agentPromptWindowLines(
-        scanStart: Int,
-        scanLines: [String],
-        applyInputFloor: Bool
-    ) -> [String] {
-        var effectiveEndOffset = scanLines.count
-        while effectiveEndOffset > 0,
-              scanLines[effectiveEndOffset - 1]
-                  .trimmingCharacters(in: .whitespacesAndNewlines)
-                  .isEmpty {
-            effectiveEndOffset -= 1
-        }
-        guard effectiveEndOffset > 0 else { return [] }
-
-        let effectiveEnd = scanStart + effectiveEndOffset
-        let promptStart = Self.agentInputPromptSearchStart(
-            lineCount: effectiveEnd,
-            lastHumanInputLine: applyInputFloor ? lastHumanInputLine : nil
-        )
-        guard promptStart < effectiveEnd, promptStart >= scanStart else { return [] }
-        return Array(scanLines[(promptStart - scanStart)..<effectiveEndOffset])
-    }
-
-    private static let agentInputPromptTailLineLimit = AgentScreenActivity.promptTailLineLimit
-    private static let agentInputMarkerTailLineLimit = AgentScreenActivity.markerTailLineLimit
-
-    private static func agentInputPromptSearchStart(lineCount: Int, lastHumanInputLine: Int?) -> Int {
-        let tailStart = max(0, lineCount - agentInputPromptTailLineLimit)
-        guard let lastHumanInputLine, lastHumanInputLine < lineCount else {
-            // Fixed-size screens (alternate-screen TUIs) repaint in place, so the
-            // buffer never grows past the line recorded at submit time; a floor
-            // there would disable idle detection permanently.
-            return tailStart
-        }
-        return max(lastHumanInputLine, tailStart)
-    }
-
     private static let agentCompletionPhrases: [String] = [
         "turn complete",
         "task complete",
@@ -9490,27 +8434,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         "agent done"
     ]
 
-    private static let agentPermissionPhrases: [String] = [
-        "permission required",
-        "permission needed",
-        "needs approval",
-        "needs permission",
-        "needs confirmation",
-        "awaiting approval",
-        "awaiting permission",
-        "awaiting confirmation",
-        "approval required",
-        "approval needed",
-        "confirmation required",
-        "confirmation needed"
-    ]
-
     private static func notificationBodyIndicatesCompletion(_ body: String) -> Bool {
         notificationBody(body, containsAnyPhraseAsWord: agentCompletionPhrases)
-    }
-
-    private static func notificationBodyIndicatesPermission(_ body: String) -> Bool {
-        notificationBody(body, containsAnyPhraseAsWord: agentPermissionPhrases)
     }
 
     private static func notificationBody(_ body: String, containsAnyPhraseAsWord phrases: [String]) -> Bool {
@@ -9639,104 +8564,38 @@ final class TerminalSession: ObservableObject, Identifiable {
             : .none
     }
 
-    private static func appKitKeyEventInterruptsAgentTurn(_ event: NSEvent) -> Bool {
-        guard event.type == .keyDown else { return false }
-        let modifiers = event.modifierFlags.intersection([.shift, .control, .option, .command])
-        if event.keyCode == 53, modifiers.isEmpty {
-            return true
-        }
-        return modifiers == [.control]
-            && event.characters?.unicodeScalars.first?.value == 0x03
-    }
-
     private func applyAgentDraftInputEffect(_ effect: AgentDraftInputEffect) {
         guard kind == .agent, effect != .none else { return }
         lastHumanKeystrokeAt = Date()
-        noteAttentionSampleInput(effect)
 
-        if agentIsAtAnswerMenu {
+        if agentActivityState.awaitsUserAnswer {
             // Keys typed into a permission or question menu answer it
-            // (digits, arrows, Enter): no draft and no new turn. The state
-            // follows the screen: another question of the same menu keeps
-            // it, the menu's end resumes the paused turn
-            // (`applyAgentAnswerMenu`).
+            // (digits, arrows, Enter): no draft and no new turn; the
+            // program reports what comes next.
             if effect == .submitted {
                 hasUnsubmittedHumanInput = false
-                noteHumanInputIfNeeded()
             }
             return
         }
 
         switch effect {
-        case .none:
+        case .none, .edited:
             return
         case .inserted:
             hasUnsubmittedHumanInput = true
-            scheduleAttentionObservation(event: .inputChanged)
-        case .edited:
-            scheduleAttentionObservation(event: .inputChanged)
         case .cleared:
             hasUnsubmittedHumanInput = false
-            scheduleAttentionObservation(event: .inputChanged)
         case .submitted:
             hasUnsubmittedHumanInput = false
-            hasHarnessNotificationForAttentionEpisode = false
-            noteHumanInputIfNeeded()
-            agentWasWorkingAtLastSubmit = agentActivityState == .working && agentStateHasDirectEvidence
-            agentWasReadableAtLastSubmit = agentStateHasDirectEvidence
+            agentWasWorkingAtLastSubmit = agentActivityState == .working
             agentSubmittedTurnCount &+= 1
             lastAgentSubmitAt = Date()
-            agentTurnState = .active
-            resumedWorkDetector.disarm()
-            setAgentActivityState(.working, source: .inputSubmit)
-            scheduleAgentIdleRecheck()
-            scheduleAttentionObservation(event: .inputSubmitted)
         }
     }
 
     private func noteAgentDraftCleared() {
         guard kind == .agent else { return }
         applyAgentDraftInputEffect(.cleared)
-    }
-
-    private func noteAgentTurnInterrupted() {
-        guard kind == .agent, agentTurnState == .active else { return }
-        noteAttentionSampleEvent(.interrupted)
-        agentTurnState = .userInterrupted
-        scheduleAttentionObservation(event: .turnInterrupted)
-    }
-
-    /// Every keystroke clears it: publishes only when there was one.
-    private func clearCurrentAttentionScreenTag() {
-        if currentAttentionScreenTag != nil {
-            currentAttentionScreenTag = nil
-        }
-        currentAttentionScreenTagObservationID = nil
-    }
-
-    @discardableResult
-    private func setAgentActivityState(_ nextState: AgentActivityState, source: AgentActivitySource) -> Bool {
-        guard kind == .agent else { return false }
-        if nextState == .idle || nextState == .error {
-            switch agentTurnState {
-            case .active:
-                agentTurnState = .completed
-                armResumedWorkDetector()
-            case .userInterrupted where nextState == .idle && !resumedWorkDetector.isArmed:
-                // The interrupted turn settled at the composer: work the
-                // agent shows from here on is its own.
-                armResumedWorkDetector()
-            case .userInterrupted, .completed, .notStarted:
-                break
-            }
-        }
-        let stateChanged = agentActivityState != nextState
-        agentActivityState = nextState
-        agentActivitySource = source
-        guard stateChanged else { return false }
-        scheduleAttentionObservation(event: .activityStateChanged)
-        bumpRevision()
-        return true
     }
 
     private func normalizedInputData(_ data: Data) -> Data {
@@ -9781,13 +8640,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard systemTitle != shellTitle else { return false }
         updateSystemTitle(shellTitle)
         return true
-    }
-
-    private func noteHumanInputIfNeeded() {
-        guard kind == .agent else { return }
-        lastHumanInputLine = effectiveAgentContentLineCount()
-        lastHumanInputAt = Date()
-        humanInputGeneration &+= 1
     }
 
     private func keyboardProtocolFlagsByApplying(flags: Int, mode: Int) -> Int {

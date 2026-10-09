@@ -1150,7 +1150,7 @@ private struct DetailPaneView: View {
             if isShowingTerminalContent {
                 workspace.clearUnreadNotificationForSelectedSession()
                 if NSApp.isActive {
-                    workspace.acknowledgeAttentionForSelectedSession()
+                    workspace.acknowledgeAgentResultForSelectedSession()
                 }
             }
         }
@@ -5401,10 +5401,6 @@ private struct SidebarAgentSessionSection: View {
 
             Divider()
 
-            AttentionToolsMenu(session: session)
-
-            Divider()
-
             Button("Detach") {
                 SessionCloseCoordinator.detach(session, in: workspace, chromeState: chromeState)
             }
@@ -6511,10 +6507,6 @@ private struct SidebarSessionSection: View {
 
         Divider()
 
-        AttentionToolsMenu(session: session)
-
-        Divider()
-
         Button("Detach") {
             SessionCloseCoordinator.detach(session, in: workspace, chromeState: chromeState)
         }
@@ -6835,8 +6827,6 @@ private struct SidebarSplitPaneIconSelector: View {
             nixShellContextMenuItems(for: session.nixShellEnvironment)
 
             Divider()
-
-            AttentionToolsMenu(session: session)
 
             Button("Detach Pane") {
                 SessionCloseCoordinator.detach(session, in: workspace, chromeState: chromeState)
@@ -7744,34 +7734,18 @@ private struct SidebarAgentQuestionIndicator: View {
     }
 }
 
-enum SidebarAgentAttentionPresentation {
-    static func shouldShow(
-        prediction: TerminalAttentionPrediction?,
-        hasUnacknowledgedAttention: Bool,
-        isFocused: Bool
-    ) -> Bool {
-        !isFocused && hasUnacknowledgedAttention && prediction?.needsAttention == true
-    }
-}
-
-enum SidebarAgentWorkingPresentation {
-    static func shouldShow(prediction: TerminalAttentionPrediction?) -> Bool {
-        prediction?.turnState == .active && prediction?.needsAttention == false
-    }
-}
-
-private struct SidebarAgentAttentionIndicator: View {
-    let prediction: TerminalAttentionPrediction
+/// The program finished (`done`) or failed (`error`) a turn the user has
+/// not seen (`TerminalSession.hasUnseenAgentResult`).
+private struct SidebarAgentResultIndicator: View {
+    let failed: Bool
 
     var body: some View {
-        Image(systemName: "exclamationmark.circle.fill")
+        Image(systemName: failed ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
             .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(Color.pink)
+            .foregroundStyle(failed ? Color.red : Color.pink)
             .frame(width: 14, height: 18)
-            .help(
-                "Model: \(prediction.displayName) · \(prediction.confidenceDescription)"
-            )
-            .accessibilityLabel("Model predicts user action is needed")
+            .help(failed ? "The program failed" : "The program finished: its result is ready")
+            .accessibilityLabel(failed ? "Program failed" : "Result ready")
     }
 }
 
@@ -7927,16 +7901,9 @@ private struct SidebarTabRow: View {
                 SidebarAgentPermissionIndicator(isSelected: isSelected, palette: palette)
             } else if rowState.agentActivityState == .needsInput {
                 SidebarAgentQuestionIndicator()
-            } else if let prediction = rowState.attentionClassifierPrediction,
-                      SidebarAgentAttentionPresentation.shouldShow(
-                          prediction: prediction,
-                          hasUnacknowledgedAttention: rowState.hasUnacknowledgedAttention,
-                          isFocused: isSelected
-                      ) {
-                SidebarAgentAttentionIndicator(prediction: prediction)
-            } else if SidebarAgentWorkingPresentation.shouldShow(
-                prediction: rowState.attentionClassifierPrediction
-            ) {
+            } else if rowState.hasUnseenAgentResult, !isSelected {
+                SidebarAgentResultIndicator(failed: rowState.agentActivityState == .error)
+            } else if rowState.agentActivityState == .working {
                 SidebarAgentWorkingIndicator(isSelected: isSelected, palette: palette)
             }
 
@@ -8033,8 +8000,10 @@ private final class SidebarTabRowState: ObservableObject {
     @Published private(set) var label: SidebarTerminalPathLabel
     @Published private(set) var hasUnreadNotification: Bool
     @Published private(set) var agentActivityState: AgentActivityState
-    @Published private(set) var attentionClassifierPrediction: TerminalAttentionPrediction?
-    @Published private(set) var hasUnacknowledgedAttention: Bool
+    @Published private(set) var hasUnseenAgentResult: Bool
+    /// What the program says it is doing or waits for (its root program
+    /// status record's message): untrusted, shown as plain text.
+    @Published private(set) var programStatusMessage: String?
     @Published private(set) var nixShellEnvironment: NixShellEnvironment?
     /// Its session is shared with other clients (`TerminalSession.sharedSessionBar`).
     @Published private(set) var isShared = false
@@ -8062,8 +8031,8 @@ private final class SidebarTabRowState: ObservableObject {
         self.label = SidebarSessionLabel.label(for: session, pathDisplayMode: pathDisplayMode)
         self.hasUnreadNotification = session.hasUnreadNotification
         self.agentActivityState = session.agentActivityState
-        self.attentionClassifierPrediction = session.attentionClassifierPrediction
-        self.hasUnacknowledgedAttention = session.hasUnacknowledgedAttention
+        self.hasUnseenAgentResult = session.hasUnseenAgentResult
+        self.programStatusMessage = session.programStatus.root?.message.nilIfEmpty
         self.nixShellEnvironment = session.nixShellEnvironment
         self.remoteMachineName = session.remoteMachineName
 
@@ -8075,10 +8044,8 @@ private final class SidebarTabRowState: ObservableObject {
         if let detail = label.detail, !detail.isEmpty {
             lines.append(detail)
         }
-        if let prediction = attentionClassifierPrediction {
-            lines.append(
-                "Model: \(prediction.displayName) · \(prediction.confidenceDescription)"
-            )
+        if let programStatusMessage {
+            lines.append(programStatusMessage)
         }
         if let nixShellEnvironment {
             lines.append(nixShellEnvironment.tooltip)
@@ -8145,20 +8112,21 @@ private final class SidebarTabRowState: ObservableObject {
             }
             .store(in: &cancellables)
 
-        session.$attentionClassifierPrediction
+        session.$hasUnseenAgentResult
             .removeDuplicates()
-            .sink { [weak self] prediction in
+            .sink { [weak self] unseen in
                 Task { @MainActor [weak self] in
-                    self?.attentionClassifierPrediction = prediction
+                    self?.hasUnseenAgentResult = unseen
                 }
             }
             .store(in: &cancellables)
 
-        session.$hasUnacknowledgedAttention
+        session.$programStatus
+            .map { $0.root?.message.nilIfEmpty }
             .removeDuplicates()
-            .sink { [weak self] hasUnacknowledgedAttention in
+            .sink { [weak self] message in
                 Task { @MainActor [weak self] in
-                    self?.hasUnacknowledgedAttention = hasUnacknowledgedAttention
+                    self?.programStatusMessage = message
                 }
             }
             .store(in: &cancellables)
@@ -10426,7 +10394,7 @@ private struct TerminalSceneView: View {
         }
         .onAppear {
             configureSearchHandlersIfActive()
-            acknowledgeAttentionIfVisible()
+            acknowledgeAgentResultIfVisible()
         }
         .onChange(of: session.id) { _, _ in
             configureSearchHandlersIfActive()
@@ -10434,14 +10402,14 @@ private struct TerminalSceneView: View {
         .onChange(of: isActivePane) { _, isActivePane in
             if isActivePane {
                 configureSearchHandlersIfActive()
-                acknowledgeAttentionIfVisible()
+                acknowledgeAgentResultIfVisible()
             }
         }
-        .onChange(of: session.attentionAlertGeneration) { _, _ in
-            acknowledgeAttentionIfVisible()
+        .onChange(of: session.hasUnseenAgentResult) { _, _ in
+            acknowledgeAgentResultIfVisible()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            acknowledgeAttentionIfVisible()
+            acknowledgeAgentResultIfVisible()
         }
     }
 
@@ -10535,9 +10503,9 @@ private struct TerminalSceneView: View {
         session.ghosttyBridge.focus(in: NSApp.keyWindow)
     }
 
-    private func acknowledgeAttentionIfVisible() {
+    private func acknowledgeAgentResultIfVisible() {
         guard isActivePane, chromeState.isShowingTerminalContent, NSApp.isActive else { return }
-        session.acknowledgeAttentionAlert()
+        session.acknowledgeAgentResult()
     }
 }
 
@@ -11129,172 +11097,6 @@ private struct RoundedTerminalSplitPaneModifier: ViewModifier {
             content.clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
         } else {
             content
-        }
-    }
-}
-
-private struct AttentionToolsMenu: View {
-    let session: TerminalSession
-    let prediction: TerminalAttentionPrediction?
-    let currentTag: TerminalAttentionCorrection?
-
-    init(session: TerminalSession) {
-        self.session = session
-        prediction = session.attentionClassifierPrediction
-        currentTag = session.currentAttentionScreenTag
-    }
-
-    var body: some View {
-        Button(currentLabelTitle) {}
-            .disabled(true)
-
-        if let prediction,
-           currentTag != nil {
-            Button(modelLabelTitle(prediction)) {}
-                .disabled(true)
-        }
-        if let prediction {
-            Button("Show Attention Debug...") {
-                AttentionDebugPresenter.present(prediction)
-            }
-        }
-
-        Divider()
-
-        Menu("Tag Current Screen") {
-            Menu("Needs action from me") {
-                ForEach(
-                    [
-                        TerminalAttentionCorrection.resultReady,
-                        .waitingForInput,
-                        .waitingForApproval,
-                        .blockedOrError,
-                    ],
-                    id: \.title
-                ) { correction in
-                    Button(menuTitle(for: correction)) {
-                        save(correction)
-                    }
-                }
-            }
-
-            Menu("No action from me") {
-                ForEach(
-                    [
-                        TerminalAttentionCorrection.agentWorking,
-                        .userResponding,
-                        .idleNoActiveTask,
-                    ],
-                    id: \.title
-                ) { correction in
-                    Button(menuTitle(for: correction)) {
-                        save(correction)
-                    }
-                }
-            }
-
-            Divider()
-
-            Button(menuTitle(for: .unknown)) {
-                save(.unknown)
-            }
-        }
-    }
-
-    private func menuTitle(for correction: TerminalAttentionCorrection) -> String {
-        let checkmark = currentTag == correction ? "✓ " : ""
-        return checkmark + correction.title
-    }
-
-    private var currentLabelTitle: String {
-        if let tag = currentTag {
-            return "Current label: \(tag.title) (manual)"
-        }
-        if let prediction {
-            return "Current label: \(prediction.displayName) (\(prediction.confidenceDescription), model)"
-        }
-        return "Current label: Not tagged"
-    }
-
-    private func modelLabelTitle(_ prediction: TerminalAttentionPrediction) -> String {
-        "Model inference: \(prediction.displayName) (\(prediction.confidenceDescription))"
-    }
-
-    private func save(_ correction: TerminalAttentionCorrection) {
-        AttentionDebugPresenter.save(correction, for: session, confirmsSuccess: true)
-    }
-}
-
-@MainActor
-private enum AttentionDebugPresenter {
-    static func present(_ prediction: TerminalAttentionPrediction) {
-        let report = prediction.debugReport
-        let alert = NSAlert()
-        alert.messageText = "Attention classifier debug"
-        alert.informativeText = "The model is running locally. Native harness notifications remain unchanged."
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Done")
-        alert.addButton(withTitle: "Copy")
-
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 620, height: 320))
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.drawsBackground = false
-        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        textView.string = report
-
-        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 620, height: 320))
-        scrollView.hasVerticalScroller = true
-        scrollView.documentView = textView
-        alert.accessoryView = scrollView
-
-        if alert.runModal() == .alertSecondButtonReturn {
-            copy(report)
-        }
-    }
-
-    static func copy(_ report: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(report, forType: .string)
-    }
-
-    static func save(
-        _ correction: TerminalAttentionCorrection,
-        for session: TerminalSession,
-        confirmsSuccess: Bool
-    ) {
-        do {
-            _ = try session.captureAttentionCorrection(correction)
-            if confirmsSuccess {
-                presentResult(
-                    title: "Screen tagged",
-                    message: "Recorded “\(correction.title)” with the current terminal snapshot."
-                )
-            }
-        } catch {
-            presentResult(
-                title: "Couldn’t tag screen",
-                message: error.localizedDescription,
-                style: .warning
-            )
-        }
-    }
-
-    private static func presentResult(
-        title: String,
-        message: String,
-        style: NSAlert.Style = .informational
-    ) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        alert.alertStyle = style
-        alert.addButton(withTitle: "Done")
-
-        if let window = NSApp.keyWindow {
-            alert.beginSheetModal(for: window)
-        } else {
-            alert.runModal()
         }
     }
 }

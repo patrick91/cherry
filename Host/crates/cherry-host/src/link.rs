@@ -103,11 +103,15 @@
 //! - Version 10 adds xterm's modifyOtherKeys at level 2 (`CSI > 4 ; 2 m`),
 //!   as a field: `modify_other_keys` in `Info` and in the hello's session,
 //!   which a daemon takes as unknown from an older holder.
+//! - Version 11 adds program status records (OSC 7501) as a field:
+//!   `program_status` in `Info` and in the hello's session; an older
+//!   holder reports none.
 //!
 //! Replies (`SnapshotReply`, `ScreenReply`, `DetachDone`) come in the order
 //! of their requests, and in order with the output: a `SnapshotReply` shows
 //! exactly the output before it, up to its `offset`.
 use anyhow::{bail, Context, Result};
+use cherry_protocol::ProgramStatus;
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -116,7 +120,7 @@ use std::{
 };
 
 /// The link version this build speaks.
-pub const LINK_VERSION: u16 = 10;
+pub const LINK_VERSION: u16 = 11;
 /// The oldest link version whose holders limit screen text themselves
 /// (`ScreenRequest::max_lines`).
 pub const SCREEN_LINES_VERSION: u16 = 3;
@@ -521,6 +525,10 @@ pub struct SessionState {
     /// older holder, which never reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modify_other_keys: Option<bool>,
+    /// Version 11: the program status records (OSC 7501); none from an
+    /// older holder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub program_status: Vec<ProgramStatus>,
 }
 
 /// The `Create` that made a session, so that a daemon adopting it keeps
@@ -843,6 +851,10 @@ pub struct Info {
     /// Version 10: whether modifyOtherKeys is at level 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modify_other_keys: Option<bool>,
+    /// Version 11: the program status records (OSC 7501), all of them,
+    /// when they changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_status: Option<Vec<ProgramStatus>>,
 }
 
 impl Info {

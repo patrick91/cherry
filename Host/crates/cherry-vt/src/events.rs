@@ -24,6 +24,81 @@ pub enum VtEvent {
         state: ProgressState,
         value: Option<u8>,
     },
+    /// The program status records changed (`Terminal::program_status`):
+    /// an OSC 7501 report, a new shell prompt (OSC 133 A) or a reset.
+    ProgramStatus,
+}
+
+/// What a program status report (OSC 7501) says. Strings the program did
+/// not send are empty. `title` and `message` are decoded and hold no
+/// control characters, but are the program's text: untrusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProgramStatusReport {
+    /// None for a clear: remove the record with this id and every record
+    /// beneath it, or every record when the id is empty.
+    pub state: Option<ProgramState>,
+    /// What a blocked program needs, when it said.
+    pub kind: Option<ProgramStatusKind>,
+    /// 0–100, only for `Working` and `Blocked`.
+    pub progress: Option<u8>,
+    /// Empty for the root record; `/` separates a child from its parent.
+    pub id: String,
+    pub app: String,
+    pub title: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramState {
+    Idle,
+    Working,
+    Done,
+    Blocked,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramStatusKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+impl ProgramStatusReport {
+    /// From `GhosttyProgramStatusState` and `GhosttyProgramStatusKind`;
+    /// None for a state this version does not know.
+    pub(crate) fn from_raw(state: i32, kind: i32, progress: i32) -> Option<Self> {
+        let state = match state {
+            0 => Some(ProgramState::Idle),
+            1 => Some(ProgramState::Working),
+            2 => Some(ProgramState::Done),
+            3 => Some(ProgramState::Blocked),
+            4 => Some(ProgramState::Error),
+            5 => None,
+            _ => return None,
+        };
+        let kind = match (state, kind) {
+            (Some(ProgramState::Blocked), 1) => Some(ProgramStatusKind::Permission),
+            (Some(ProgramState::Blocked), 2) => Some(ProgramStatusKind::Question),
+            (Some(ProgramState::Blocked), 3) => Some(ProgramStatusKind::Auth),
+            _ => None,
+        };
+        let progress = match state {
+            Some(ProgramState::Working | ProgramState::Blocked) => {
+                u8::try_from(progress).ok().filter(|value| *value <= 100)
+            }
+            _ => None,
+        };
+        Some(Self {
+            state,
+            kind,
+            progress,
+            id: String::new(),
+            app: String::new(),
+            title: String::new(),
+            message: String::new(),
+        })
+    }
 }
 
 /// What a progress report asks for.
@@ -95,6 +170,7 @@ impl Pending {
                 | (Some(VtEvent::Title(_)), VtEvent::Title(_))
                 | (Some(VtEvent::Pwd(_)), VtEvent::Pwd(_))
                 | (Some(VtEvent::Progress { .. }), VtEvent::Progress { .. })
+                | (Some(VtEvent::ProgramStatus), VtEvent::ProgramStatus)
         );
         if replaces {
             let last = self.events.pop_back().expect("a last event");
@@ -110,7 +186,10 @@ impl Pending {
             let kind = std::mem::discriminant(&oldest);
             let state = matches!(
                 oldest,
-                VtEvent::Title(_) | VtEvent::Pwd(_) | VtEvent::Progress { .. }
+                VtEvent::Title(_)
+                    | VtEvent::Pwd(_)
+                    | VtEvent::Progress { .. }
+                    | VtEvent::ProgramStatus
             );
             if state
                 && !self
@@ -147,7 +226,7 @@ fn text_len(event: &VtEvent) -> usize {
     match event {
         VtEvent::Title(text) | VtEvent::Pwd(text) => text.len(),
         VtEvent::Notification { title, body } => title.len() + body.len(),
-        VtEvent::Bell | VtEvent::Progress { .. } => 0,
+        VtEvent::Bell | VtEvent::Progress { .. } | VtEvent::ProgramStatus => 0,
     }
 }
 

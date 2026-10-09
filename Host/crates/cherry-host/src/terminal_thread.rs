@@ -22,8 +22,8 @@ use crate::{
     signals::Wake,
 };
 use anyhow::{Context, Result};
-use cherry_protocol::priority;
-use cherry_vt::{Osc99, Terminal, VtEvent};
+use cherry_protocol::{priority, ProgramStatus, ProgramStatusKind, ProgramStatusState};
+use cherry_vt::{Osc99, ProgramState, Terminal, VtEvent};
 use std::{
     collections::VecDeque,
     os::unix::{io::AsRawFd, io::RawFd, net::UnixStream},
@@ -56,6 +56,8 @@ const MAX_REPLIES: usize = 1024 * 1024;
 /// What parsing reported, in order.
 pub enum Report {
     Event(VtEvent),
+    /// The program status records (OSC 7501) changed: all of them now.
+    ProgramStatus(Vec<ProgramStatus>),
     /// The terminal state changed (checked after output that holds an
     /// escape sequence, which alone can change it).
     State(TerminalState),
@@ -429,8 +431,38 @@ fn feed(terminal: &mut Terminal, bytes: &[u8], parsed: &mut Parsed) {
     for slice in bytes.chunks(SLICE) {
         let replies = terminal.feed(slice);
         parsed.replies.extend_from_slice(&replies);
-        parsed
-            .reports
-            .extend(terminal.take_events().into_iter().map(Report::Event));
+        for event in terminal.take_events() {
+            parsed.reports.push(match event {
+                VtEvent::ProgramStatus => Report::ProgramStatus(program_status(terminal)),
+                event => Report::Event(event),
+            });
+        }
     }
+}
+
+/// The terminal's program status records, as the protocol has them.
+pub fn program_status(terminal: &Terminal) -> Vec<ProgramStatus> {
+    terminal
+        .program_status()
+        .iter()
+        .map(|record| ProgramStatus {
+            id: record.id.clone(),
+            state: match record.state {
+                ProgramState::Idle => ProgramStatusState::Idle,
+                ProgramState::Working => ProgramStatusState::Working,
+                ProgramState::Done => ProgramStatusState::Done,
+                ProgramState::Blocked => ProgramStatusState::Blocked,
+                ProgramState::Error => ProgramStatusState::Error,
+            },
+            kind: record.kind.map(|kind| match kind {
+                cherry_vt::ProgramStatusKind::Permission => ProgramStatusKind::Permission,
+                cherry_vt::ProgramStatusKind::Question => ProgramStatusKind::Question,
+                cherry_vt::ProgramStatusKind::Auth => ProgramStatusKind::Auth,
+            }),
+            progress: record.progress,
+            app: record.app.clone(),
+            title: record.title.clone(),
+            message: record.message.clone(),
+        })
+        .collect()
 }

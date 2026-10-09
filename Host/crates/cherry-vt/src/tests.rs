@@ -1373,16 +1373,17 @@ fn some_saved_cursor_state_is_not_restored() {
 }
 
 #[test]
-fn a_pending_wrap_away_from_the_edge_keeps_only_its_position() {
-    // Ghostty keeps a pending wrap when the terminal widens under it; no
-    // edge holds it on the replay, so only the position comes back.
+fn a_pending_wrap_is_resolved_when_the_terminal_widens() {
+    // Ghostty moves the cursor past a pending wrap when the terminal
+    // widens under it, so no pending wrap away from the edge is left to
+    // replay, and the copy has the same position.
     let mut original = term(12, 3);
     original.feed(b"abcdefghijkl");
     original.resize(15, 3).unwrap();
     let copy = restored(&original).inspect().unwrap();
     let source = original.inspect().unwrap();
-    assert_eq!((source.cursor, source.pending_wrap), ((11, 0), true));
-    assert_eq!((copy.cursor, copy.pending_wrap), ((11, 0), false));
+    assert_eq!((source.cursor, source.pending_wrap), ((12, 0), false));
+    assert_eq!((copy.cursor, copy.pending_wrap), (source.cursor, false));
     assert_eq!(copy.active, source.active);
 }
 
@@ -2697,4 +2698,65 @@ fn clearing_a_prompt_before_the_reflow_keeps_an_unfinished_sequence() {
     terminal.feed(b"tle\x07ok");
     assert_eq!(terminal.title().as_deref(), Some("half a title"));
     assert_eq!(active(&terminal), ["$ echo hi", "hi", "", "··ok"]);
+}
+
+#[test]
+fn program_status_reports_become_records() {
+    let mut terminal = term(40, 5);
+    // The support query is answered with the same body.
+    assert_eq!(terminal.feed(b"\x1b]7501;?\x1b\\"), b"\x1b]7501;?\x1b\\");
+    // Claude Code 2.1.295's reports.
+    assert!(terminal
+        .feed(b"\x1b]7501;state=idle:app=claude-code\x1b\\")
+        .is_empty());
+    assert_eq!(terminal.take_events(), [VtEvent::ProgramStatus]);
+    terminal.feed(
+        b"\x1b]7501;state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiB0b3VjaCB6ei1wcm9iZS50eHQ=\x07",
+    );
+    assert_eq!(terminal.take_events(), [VtEvent::ProgramStatus]);
+    assert_eq!(
+        terminal.program_status(),
+        [ProgramStatusRecord {
+            id: String::new(),
+            state: ProgramState::Blocked,
+            kind: Some(ProgramStatusKind::Permission),
+            progress: None,
+            app: "claude-code".into(),
+            title: String::new(),
+            message: "approve Bash: touch zz-probe.txt".into(),
+        }]
+    );
+    // The same report again is no change.
+    terminal.feed(
+        b"\x1b]7501;state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiB0b3VjaCB6ei1wcm9iZS50eHQ=\x07",
+    );
+    assert!(terminal.take_events().is_empty());
+    // A report without a valid state is ignored whole.
+    terminal.feed(b"\x1b]7501;state=sparkle\x1b\\\x1b]7501;app=x\x1b\\");
+    assert!(terminal.take_events().is_empty());
+    // A child record, with progress, and a done one.
+    terminal.feed(b"\x1b]7501;id=build/test:state=working:progress=40\x1b\\");
+    terminal.feed(b"\x1b]7501;id=deploy:state=done\x1b\\");
+    assert_eq!(terminal.program_status().len(), 3);
+    assert_eq!(terminal.program_status()[1].progress, Some(40));
+    // A new shell prompt ends the program: only done and error stay.
+    terminal.take_events();
+    terminal.feed(b"\x1b]133;A\x07");
+    assert_eq!(terminal.take_events(), [VtEvent::ProgramStatus]);
+    assert_eq!(terminal.program_status().len(), 1);
+    assert_eq!(terminal.program_status()[0].id, "deploy");
+    // A reset clears every record.
+    terminal.feed(b"\x1bc");
+    assert!(terminal.take_events().contains(&VtEvent::ProgramStatus));
+    assert!(terminal.program_status().is_empty());
+}
+
+#[test]
+fn an_exited_program_leaves_only_its_unseen_records() {
+    let mut terminal = term(40, 5);
+    terminal.feed(b"\x1b]7501;state=working\x1b\\\x1b]7501;id=a:state=error\x1b\\");
+    assert!(terminal.end_program());
+    assert_eq!(terminal.program_status().len(), 1);
+    assert_eq!(terminal.program_status()[0].state, ProgramState::Error);
+    assert!(!terminal.end_program());
 }

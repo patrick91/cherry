@@ -1355,8 +1355,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
         subtitle: "zsh login shell",
         tint: .systemBlue,
         workingDirectory: NSHomeDirectory() + "/github/farbun-dev/fizzup.club",
-        launchShell: false,
-        attentionObservationDirectoryProvider: { nil }
+        launchShell: false
     )
     defer { session.stop() }
     let local = TerminalContextBarContent(session: session)

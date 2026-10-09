@@ -964,26 +964,6 @@ private func selectedRows(_ controller: OmniBarController) -> [String] {
 
 // MARK: - Session titles
 
-@Test func agentTitleHeartbeatCountsOnlyALiveSpinner() {
-    var heartbeat = AgentTitleHeartbeat()
-    let start = Date(timeIntervalSince1970: 1_000)
-    func beat(_ id: String, _ title: String?, at seconds: TimeInterval) -> Bool {
-        heartbeat.isWorking(id: id, title: title, now: start.addingTimeInterval(seconds))
-    }
-    // Seen once: no evidence, even with a spinner.
-    #expect(!beat("a", "⠋ Fix it", at: 0))
-    // The spinner moves: working.
-    #expect(beat("a", "⠙ Fix it", at: 1))
-    #expect(beat("a", "⠙ Fix it", at: 2))
-    // A frame left behind: no longer once it is stale.
-    #expect(!beat("a", "⠙ Fix it", at: 1 + AgentTitleHeartbeat.freshness))
-    // Settled title: idle, however recent.
-    #expect(!beat("a", "✳ Fix it", at: 10))
-    #expect(!beat("b", nil, at: 0))
-    heartbeat.keep(only: ["b"])
-    #expect(!beat("a", "⠹ Fix it", at: 11))
-}
-
 @Test func sessionTitlesDropStatusGlyphs() {
     #expect(SessionDisplayTitle.strippingStatusGlyphs("◑ Results feedback") == "Results feedback")
     #expect(SessionDisplayTitle.strippingStatusGlyphs("✳ Build plugins") == "Build plugins")

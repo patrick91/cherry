@@ -1156,7 +1156,7 @@ final class ProjectWindowRegistry {
             }
             candidate.workspace.select(session)
             candidate.chromeState?.selectTerminal()
-            session.acknowledgeAttentionAlert()
+            session.acknowledgeAgentResult()
             return true
         }
 
@@ -1194,7 +1194,7 @@ final class ProjectWindowRegistry {
         if NSApplication.shared.isActive,
            chromeState?.isShowingTerminalContent ?? true {
             workspace.clearUnreadNotificationForSelectedSession()
-            workspace.acknowledgeAttentionForSelectedSession()
+            workspace.acknowledgeAgentResultForSelectedSession()
         }
     }
 
@@ -1206,7 +1206,7 @@ final class ProjectWindowRegistry {
         }
 
         activeWorkspace?.clearUnreadNotificationForSelectedSession()
-        activeWorkspace?.acknowledgeAttentionForSelectedSession()
+        activeWorkspace?.acknowledgeAgentResultForSelectedSession()
     }
 
     func repositoryDidRefresh(_ repository: RepositoryWorkspace) {

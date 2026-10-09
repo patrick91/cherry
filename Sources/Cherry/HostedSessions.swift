@@ -207,6 +207,11 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
     /// Level 1 is off, as for Ghostty. Nil when it is not known: from an
     /// older host, or for a session whose holder predates holder link 10.
     let modifyOtherKeys: Bool?
+    /// What the programs in the session say they are doing (OSC 7501
+    /// program status), the record updated longest ago first. Empty when
+    /// none reported anything, and from a host or holder older than the
+    /// field (holder link 11).
+    let programStatus: [ProgramStatus]
     /// The `request_id` of the Create that started the session; nil when
     /// the host does not report it (an older host).
     let requestID: String?
@@ -229,6 +234,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         case applicationCursorKeys = "application_cursor_keys"
         case bracketedPaste = "bracketed_paste"
         case modifyOtherKeys = "modify_other_keys"
+        case programStatus = "program_status"
         case requestID = "request_id"
         case endedBy = "ended_by"
         case holderLog = "holder_log"
@@ -258,6 +264,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         applicationCursorKeys: Bool? = nil,
         bracketedPaste: Bool? = nil,
         modifyOtherKeys: Bool? = nil,
+        programStatus: [ProgramStatus] = [],
         requestID: String? = nil,
         endedBy: String? = nil,
         holderLog: String? = nil
@@ -285,6 +292,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         self.applicationCursorKeys = applicationCursorKeys
         self.bracketedPaste = bracketedPaste
         self.modifyOtherKeys = modifyOtherKeys
+        self.programStatus = programStatus
         self.requestID = requestID
         self.endedBy = endedBy
         self.holderLog = holderLog
@@ -317,6 +325,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
             applicationCursorKeys: try container.decodeIfPresent(Bool.self, forKey: .applicationCursorKeys),
             bracketedPaste: try container.decodeIfPresent(Bool.self, forKey: .bracketedPaste),
             modifyOtherKeys: try container.decodeIfPresent(Bool.self, forKey: .modifyOtherKeys),
+            programStatus: try container.decodeIfPresent([ProgramStatus].self, forKey: .programStatus) ?? [],
             requestID: try container.decodeIfPresent(String.self, forKey: .requestID),
             endedBy: try container.decodeIfPresent(String.self, forKey: .endedBy),
             holderLog: try container.decodeIfPresent(String.self, forKey: .holderLog)
@@ -350,6 +359,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
         try container.encodeIfPresent(applicationCursorKeys, forKey: .applicationCursorKeys)
         try container.encodeIfPresent(bracketedPaste, forKey: .bracketedPaste)
         try container.encodeIfPresent(modifyOtherKeys, forKey: .modifyOtherKeys)
+        if !programStatus.isEmpty { try container.encode(programStatus, forKey: .programStatus) }
         try container.encodeIfPresent(requestID, forKey: .requestID)
         try container.encodeIfPresent(endedBy, forKey: .endedBy)
         try container.encodeIfPresent(holderLog, forKey: .holderLog)
@@ -411,7 +421,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
             title: title, pwd: pwd, foreground: nil, clients: clients, owner: owner, tags: tags,
             createdAt: createdAt, alternateScreen: alternateScreen, kittyKeyboardFlags: kittyKeyboardFlags,
             applicationCursorKeys: applicationCursorKeys, bracketedPaste: bracketedPaste,
-            modifyOtherKeys: modifyOtherKeys, requestID: requestID,
+            modifyOtherKeys: modifyOtherKeys, programStatus: programStatus, requestID: requestID,
             endedBy: end?.reason ?? endedBy, holderLog: end?.holderLog ?? holderLog
         )
     }

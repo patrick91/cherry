@@ -172,14 +172,19 @@ private final class SettingsNativeWindowChromeView: NSView {
         configureWindowChrome()
     }
 
+    /// Runs on every update of the settings view and each time its window
+    /// becomes key, so it sets only what differs: setting a window's chrome,
+    /// even to the same value, can lay the whole window out again.
     func configureWindowChrome() {
         guard let window else { return }
-        window.titleVisibility = .visible
-        window.titlebarAppearsTransparent = false
-        window.titlebarSeparatorStyle = .none
-        window.styleMask.insert(.fullSizeContentView)
-        window.toolbarStyle = .unified
-        window.toolbar?.showsBaselineSeparator = false
+        if window.titleVisibility != .visible { window.titleVisibility = .visible }
+        if window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = false }
+        if window.titlebarSeparatorStyle != .none { window.titlebarSeparatorStyle = .none }
+        if !window.styleMask.contains(.fullSizeContentView) { window.styleMask.insert(.fullSizeContentView) }
+        if window.toolbarStyle != .unified { window.toolbarStyle = .unified }
+        if let toolbar = window.toolbar, toolbar.showsBaselineSeparator {
+            toolbar.showsBaselineSeparator = false
+        }
         removeSidebarToolbarItems()
         scheduleSidebarToolbarCleanup()
     }

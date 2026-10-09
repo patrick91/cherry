@@ -148,7 +148,16 @@ extension EnvironmentValues {
     /// The device store a device window's views read their Mac from. Only
     /// device windows set it (to `RemoteDeviceStore.shared`); tests set
     /// their own. Nil elsewhere: This Mac's windows never ask a store.
-    @Entry var remoteDeviceStore: RemoteDeviceStore? = nil
+    var remoteDeviceStore: RemoteDeviceStore? {
+        get { self[RemoteDeviceStoreKey.self] }
+        set { self[RemoteDeviceStoreKey.self] = newValue }
+    }
+}
+
+/// Spelled out rather than `@Entry`: that macro's plugin ships only with
+/// Xcode, so the Command Line Tools alone could not build Cherry.
+private struct RemoteDeviceStoreKey: EnvironmentKey {
+    static let defaultValue: RemoteDeviceStore? = nil
 }
 
 /// Gives `content` the badge of the Mac `projectKey` names (nil for This

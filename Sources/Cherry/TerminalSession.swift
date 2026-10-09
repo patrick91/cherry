@@ -239,6 +239,13 @@ final class TerminalProcessor: @unchecked Sendable {
         guard !data.isEmpty else { return }
 
         let (epoch, droppedPendingBytes) = locked { () -> (Int?, Int) in
+            // Output of a launch that already ended (or another launch's)
+            // is dropped here; output read while its launch ran is kept
+            // even when the launch ends before it is processed (below): a
+            // program's last words come just before its exit.
+            if let launchID, activeLaunchID != launchID {
+                return (nil, 0)
+            }
             if isOutputProcessingSuspended {
                 unreportedSuspendedDroppedBytes += data.count
                 if unreportedSuspendedDroppedBytes >= Self.suspendedDropReportThreshold {
@@ -266,7 +273,10 @@ final class TerminalProcessor: @unchecked Sendable {
                     }
                 }
             }
-            processOutput(data, launchID: launchID, expectedEpoch: epoch, responseWriter: responseWriter)
+            processOutput(
+                data, launchID: launchID, expectedEpoch: epoch, keepsAfterLaunchEnded: true,
+                responseWriter: responseWriter
+            )
         }
     }
 
@@ -315,10 +325,14 @@ final class TerminalProcessor: @unchecked Sendable {
         processOutput(data, launchID: launchID, expectedEpoch: nil, responseWriter: responseWriter)
     }
 
+    /// `keepsAfterLaunchEnded`: the output was taken while its launch was
+    /// active (`enqueueOutput`), so it is processed after that launch ended
+    /// too, unless another launch began since.
     private func processOutput(
         _ data: Data,
         launchID: UUID?,
         expectedEpoch: Int?,
+        keepsAfterLaunchEnded: Bool = false,
         responseWriter: (Data) -> Void
     ) {
         guard !data.isEmpty else { return }
@@ -327,7 +341,8 @@ final class TerminalProcessor: @unchecked Sendable {
             if let expectedEpoch, outputEpoch != expectedEpoch {
                 return []
             }
-            if let launchID, activeLaunchID != launchID {
+            if let launchID, activeLaunchID != launchID,
+               !(keepsAfterLaunchEnded && activeLaunchID == nil) {
                 return []
             }
             return buffer.ingest(data, viewportSize: viewportSize)

@@ -5169,6 +5169,34 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(await waitForCondition { processor.snapshot(range: 0..<processor.lineCount).contains("replayed") })
 }
 
+/// A program's last output comes just before its exit: what was read while
+/// its launch ran is kept even when the launch ends before the output is
+/// processed, and only output of a launch that ended before it came, or of
+/// an earlier launch once a new one began, is dropped.
+@MainActor
+@Test func terminalProcessorKeepsALaunchsLastOutputAfterItEnds() async throws {
+    let processor = TerminalProcessor(maxScrollback: 1_000, buffer: LiveTerminalOutputBuffer(maxScrollback: 1_000))
+    let first = UUID()
+    processor.beginLaunch(first)
+    // Enough queued that the last chunks are still waiting when the launch
+    // ends at once.
+    for n in 0..<200 {
+        processor.enqueueOutput(Data("line \(n)\r\n".utf8), launchID: first, responseWriter: { _ in })
+    }
+    processor.enqueueOutput(Data("last words\r\n".utf8), launchID: first, responseWriter: { _ in })
+    processor.endLaunch(first)
+    #expect(await waitForCondition { processor.snapshot(range: 0..<processor.lineCount).contains("last words") })
+
+    // After the launch ended, its output is dropped.
+    processor.enqueueOutput(Data("too late\r\n".utf8), launchID: first, responseWriter: { _ in })
+    // Queued for the first launch, processed once a second began: dropped.
+    let second = UUID()
+    processor.beginLaunch(second)
+    processor.enqueueOutput(Data("second\r\n".utf8), launchID: second, responseWriter: { _ in })
+    #expect(await waitForCondition { processor.snapshot(range: 0..<processor.lineCount).contains("second") })
+    #expect(!processor.snapshot(range: 0..<processor.lineCount).contains("too late"))
+}
+
 @MainActor
 @Test func terminalProcessorReplayReplacementRebuildsAfterDroppedOutput() async throws {
     let processor = TerminalProcessor(

@@ -1,9 +1,11 @@
 import Foundation
 
-/// What an agent CLI's screen says about its turn: the screen-text half of
-/// `TerminalSession`'s activity state machine (titles, notifications, input
-/// and timing are the other half). Pure functions over screen lines so the
-/// rules can be replayed against recorded observations and fixtures.
+/// What an agent CLI's screen shows, for typing into it safely: whether a
+/// task's kickoff waits in its composer or was submitted, and whether it is
+/// at its composer before a kickoff into a CLI that reports no status
+/// (`AgentTasks`, `CherryControlServer.waitForTaskKickoffReadiness`). Never
+/// an agent's state: that is only what it reports (OSC 7501,
+/// `TerminalSession.applyProgramStatus`). Pure functions over screen lines.
 ///
 /// `agent` is the normalized agent key (`claude`, `codex`, `pi`, `amp`, …).
 enum AgentScreenActivity {

@@ -2574,6 +2574,7 @@ mod tests {
             application_cursor_keys: false,
             bracketed_paste: None,
             modify_other_keys: None,
+            program_status: Vec::new(),
             request_id: None,
             ended_by: None,
             holder_log: None,

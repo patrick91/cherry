@@ -931,34 +931,6 @@ final class CherryControlServer: @unchecked Sendable {
             )
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
             return .init(result: .sendProcessInput(.init(processID: session.id.uuidString, sentBytes: sentBytes, output: output)))
-        case .captureAttentionObservation(let request):
-            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
-            guard let label = TerminalAttentionLabel(rawValue: request.label) else {
-                throw CherryControlError(
-                    code: "invalid_attention_label",
-                    message: "Unknown terminal attention label: \(request.label)"
-                )
-            }
-            let capture: (id: UUID, outputURL: URL)
-            do {
-                capture = try session.captureAttentionObservation(
-                    label: label,
-                    scenarioID: request.scenarioID,
-                    checkpoint: request.checkpoint,
-                    harnessVersion: request.harnessVersion,
-                    runID: request.runID
-                )
-            } catch TerminalAttentionRecordingError.disabled {
-                throw CherryControlError(
-                    code: "attention_recording_disabled",
-                    message: TerminalAttentionRecordingError.disabled.localizedDescription
-                )
-            }
-            return .init(result: .captureAttentionObservation(.init(
-                processID: session.id.uuidString,
-                observationID: capture.id.uuidString,
-                outputPath: capture.outputURL.path
-            )))
         case .startAllCommands(let request):
             _ = try await startAllCommands(workspace: workspace)
             if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {
@@ -1691,49 +1663,45 @@ final class CherryControlServer: @unchecked Sendable {
             runID: task?.runID,
             phase: task?.phase,
             label: task?.label,
-            resultSummary: task?.result?.summary
+            resultSummary: task?.result?.summary,
+            programStatus: session.programStatus.root.map { status in
+                ProcessProgramStatus(
+                    state: status.state.rawValue,
+                    kind: status.kind?.rawValue,
+                    progress: status.progress,
+                    app: status.app.nilIfEmpty,
+                    title: status.title.nilIfEmpty,
+                    message: status.message.nilIfEmpty
+                )
+            }
         )
     }
 
-    /// An agent's activity state as MCP reports it: `permission` also
-    /// while its screen shows a permission prompt the tab heard no
-    /// notification for (a restored agent: the notification came before
-    /// Cherry quit), so it is never reported idle while it waits for one.
-    /// `needs_input` while its screen shows a question menu
-    /// (`AgentQuestionPrompt`): the turn waits on the user's answer.
+    /// An agent's activity state as MCP reports it: what its program
+    /// status reports say (`unknown` while it sends none).
     @MainActor
     func reportedAgentActivityState(of session: TerminalSession) -> String? {
         guard session.kind == .agent else { return nil }
-        if session.isRunning, session.agentActivityState != .error, session.agentActivityState != .permission {
-            // The recognizers the app's own state uses
-            // (`TerminalSession.applyAgentAnswerMenu`), read now.
-            switch AgentScreenActivity.answerMenu(in: session.cachedScreenTailLines) {
-            case .permission?: return AgentActivityState.permission.rawValue
-            case .question?: return AgentActivityState.needsInput.rawValue
-            case nil: break
-            }
-        }
         return session.agentActivityState.rawValue
     }
 
-    /// How long after a message an agent that never looked busy may be
-    /// taken as done: a CLI shows its composer until its first working
-    /// frame, and one Cherry cannot read never shows one.
+    /// How long after a message an agent that reported no turn may be taken
+    /// as done: a CLI reports `working` a moment after the message, and one
+    /// that reports nothing never does.
     static let agentTurnStartGrace: TimeInterval = 4
 
-    /// Whether the agent's latest submitted turn showed it started: it was
-    /// at work when the message was sent (the CLI queued it behind that
-    /// turn), or showed working evidence since. Nil when Cherry saw no turn
-    /// submitted, or cannot read the agent's CLI (its screen showed no
-    /// composer, marker or spinner before the message): its output going
-    /// quiet is all there is.
+    /// Whether the agent's latest submitted turn started: it was at work
+    /// when the message was sent (the CLI queued it behind that turn), or
+    /// reported `working` since. Nil when Cherry saw no turn submitted, or
+    /// the agent sends no program status reports: its output going quiet is
+    /// all there is.
     @MainActor
     static func agentTurnStarted(_ session: TerminalSession) -> Bool? {
         guard session.kind == .agent, let submittedAt = session.lastAgentSubmitAt,
-              session.agentWasReadableAtLastSubmit
+              session.reportsProgramStatus
         else { return nil }
         if session.agentWasWorkingAtLastSubmit { return true }
-        if let evidence = session.lastStrongWorkingEvidenceAt, evidence >= submittedAt { return true }
+        if let working = session.lastWorkingReportAt, working >= submittedAt { return true }
         return false
     }
 
@@ -1909,10 +1877,9 @@ final class CherryControlServer: @unchecked Sendable {
             }
         } else {
             let input = try optionalTerminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
-            if let input, !input.payload.isEmpty {
+            if let input, !input.payload.isEmpty || request.submit == true {
                 do {
-                    try await sendTerminalInput(input, to: session)
-                    sentBytes = input.payload.count
+                    sentBytes = try await sendTerminalInput(input, submit: request.submit == true, to: session)
                 } catch {
                     mcpControlDebugLog("initial input not delivered session=\(session.id.uuidString): \(error)")
                     sentBytes = 0
@@ -2226,20 +2193,8 @@ final class CherryControlServer: @unchecked Sendable {
             }
 
             let now = Date()
-            if session.kind == .agent, session.isRunning, session.agentActivityState != .error,
-               AgentPermissionPrompt.isShowing(in: session.cachedScreenTailLines) {
-                // Its screen asks for permission (a restored agent's state
-                // never heard the notification that said so).
-                return await result(reason: .permission)
-            }
-            if session.kind == .agent, session.isRunning, session.agentActivityState != .error,
-               session.agentActivityState != .permission,
-               AgentQuestionPrompt.isShowing(in: session.cachedScreenTailLines) {
-                // It asks the user a question: its turn cannot end before
-                // someone answers.
-                return await result(reason: .needsInput)
-            }
-            if session.kind == .agent, session.agentActivityState != .unknown {
+            if session.kind == .agent, session.reportsProgramStatus {
+                // The agent says what it is doing (OSC 7501).
                 let quietInterval = TimeInterval(quietMilliseconds) / 1_000
                 let contentQuietSince = session.lastContentChangeAt ?? startedAt
                 let contentIsQuiet = (!requireNewOutput || observedNewOutput)
@@ -2253,20 +2208,14 @@ final class CherryControlServer: @unchecked Sendable {
                 case .error:
                     return await result(reason: .agentError)
                 case .idle:
-                    // The composer shows before a just-submitted turn's
-                    // first working frame: idle counts once the turn
-                    // started, or after the start grace.
+                    // Reported a moment after the message, `working` starts
+                    // the turn: idle counts once it did, or after the start
+                    // grace, and once its last output was drawn.
                     if contentIsQuiet, Self.agentTurnMayHaveEnded(session, now: now) {
                         return await result(reason: .idle)
                     }
                 case .working, .unknown:
-                    // Agents without recognizable prompt/working UI never reach
-                    // .idle on their own; fall back to the content-quiet window
-                    // unless a provider-specific working signal is active.
-                    if !session.agentActivityEvidenceIsStrong, contentIsQuiet,
-                       Self.agentTurnMayHaveEnded(session, now: now) {
-                        return await result(reason: .idle)
-                    }
+                    break
                 }
             } else if let commandFinishedAt = session.lastNativeCommandFinishedAt,
                       commandFinishedAt >= startedAt,
@@ -2921,6 +2870,30 @@ final class CherryControlServer: @unchecked Sendable {
         try await deliver(input.payload, raw: input.isRaw, to: session)
     }
 
+    /// A terminal's input, and with `submit` (asked for explicitly: a
+    /// terminal's text is not submitted by default) the Enter after it, on
+    /// its own, as for an agent: text and Enter in one write read as a paste
+    /// to a program that tells them apart (Claude Code in a terminal tab) or
+    /// to a shell that brackets pastes, which then never runs the line.
+    /// Returns the bytes sent.
+    @MainActor
+    private func sendTerminalInput(_ input: TerminalControlInput, submit: Bool, to session: TerminalSession) async throws -> Int {
+        guard submit else {
+            try await sendTerminalInput(input, to: session)
+            return input.payload.count
+        }
+        if !input.payload.isEmpty {
+            try await sendTerminalInput(input, to: session)
+            try? await Task.sleep(for: Self.terminalSubmitPause)
+        }
+        let enter = TerminalInputEncoder.enterSequence(keyboardProtocolFlags: session.keyboardProtocolFlags)
+        try await deliver(enter, raw: false, to: session, alreadySent: input.payload.count)
+        return input.payload.count + enter.count
+    }
+
+    /// Between a terminal's text and the Enter MCP submits it with.
+    static let terminalSubmitPause: Duration = .milliseconds(150)
+
     /// `alreadySent`: bytes of the same input delivered before this part
     /// (an agent message whose Enter is sent after its text). When this
     /// part fails, the error then says the text was typed but not
@@ -3035,8 +3008,7 @@ final class CherryControlServer: @unchecked Sendable {
         }
 
         let input = try terminalInputPayload(text: text, rawBase64: rawBase64, for: session)
-        try await sendTerminalInput(input, to: session)
-        return input.payload.count
+        return try await sendTerminalInput(input, submit: submit == true, to: session)
     }
 
     @MainActor
@@ -3133,18 +3105,31 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     /// MCP input never answers an agent's permission prompt: Enter (or a
-    /// letter such as `y`) typed into one approves the pending command. The
-    /// agent's screen is read as it is now (from its host when no surface
-    /// shows it, as for a restored agent whose adapter waits), and input
-    /// is refused, with nothing sent, while it shows a permission prompt.
-    /// Raw keys sent without submit (`keysOnly`) are the caller's own
-    /// answer and go through. When the screen cannot be read (its host
-    /// does not answer), nothing is sent either.
+    /// letter such as `y`) typed into one approves the pending command. An
+    /// agent that reports its status (OSC 7501) says when it is blocked on
+    /// a permission or a question; for one that does not, its screen is read
+    /// as it is now (from its host when no surface shows it, as for a
+    /// restored agent whose adapter waits) for such a prompt. Input is
+    /// refused, with nothing sent, while it waits on one. Raw keys sent
+    /// without submit (`keysOnly`) are the caller's own answer and go
+    /// through. When the screen cannot be read (its host does not answer),
+    /// nothing is sent either.
     @MainActor
     private func refuseInputIntoPermissionPrompt(of session: TerminalSession, keysOnly: Bool) async throws {
         // A tab that takes no input says so when the input is sent.
         guard session.acceptsControlInput else { return }
         let name = processName(for: session)
+        if session.reportsProgramStatus {
+            guard !keysOnly else { return }
+            switch session.agentActivityState {
+            case .permission:
+                throw Self.awaitingPermission(session: session, name: name)
+            case .needsInput:
+                throw Self.awaitingInput(session: session, name: name)
+            case .unknown, .idle, .working, .error:
+                return
+            }
+        }
         guard let lines = await session.programScreenLinesForInput() else {
             throw CherryControlError(
                 code: "input_not_delivered",
@@ -3153,20 +3138,38 @@ final class CherryControlServer: @unchecked Sendable {
         }
         guard !keysOnly else { return }
         if AgentPermissionPrompt.isShowing(in: lines) {
-            mcpControlDebugLog("agent input refused at permission prompt session=\(session.id.uuidString)")
-            throw CherryControlError(
-                code: "agent_awaiting_permission",
-                message: "Agent '\(name)' is waiting for an answer to a permission prompt; nothing was sent, so the prompt was not answered. Let the user answer it in Cherry, or send the answering keys deliberately with raw_base64 (without submit)."
-            )
+            throw Self.awaitingPermission(session: session, name: name)
         }
         if AgentQuestionPrompt.isShowing(in: lines) {
-            // Enter picks the highlighted option of a question menu.
-            mcpControlDebugLog("agent input refused at question menu session=\(session.id.uuidString)")
-            throw CherryControlError(
-                code: "agent_awaiting_input",
-                message: "Agent '\(name)' is asking the user a question with a choice menu; nothing was sent, since Enter would pick the highlighted option. Read the question with get_process_output, then let the user answer it, or answer deliberately with raw_base64 keys (without submit), such as the option's digit."
-            )
+            throw Self.awaitingInput(session: session, name: name)
         }
+    }
+
+    @MainActor
+    private static func awaitingPermission(session: TerminalSession, name: String) -> CherryControlError {
+        mcpControlDebugLog("agent input refused at permission prompt session=\(session.id.uuidString)")
+        return CherryControlError(
+            code: "agent_awaiting_permission",
+            message: "Agent '\(name)' is waiting for an answer to a permission prompt\(Self.programStatusDetail(of: session)); nothing was sent, so the prompt was not answered. Let the user answer it in Cherry, or send the answering keys deliberately with raw_base64 (without submit)."
+        )
+    }
+
+    @MainActor
+    private static func awaitingInput(session: TerminalSession, name: String) -> CherryControlError {
+        // Enter picks the highlighted option of a question menu.
+        mcpControlDebugLog("agent input refused at question menu session=\(session.id.uuidString)")
+        return CherryControlError(
+            code: "agent_awaiting_input",
+            message: "Agent '\(name)' is asking the user a question\(Self.programStatusDetail(of: session)); nothing was sent, since Enter would pick the highlighted option. Read the question with get_process_output, then let the user answer it, or answer deliberately with raw_base64 keys (without submit), such as the option's digit."
+        )
+    }
+
+    /// What the agent says it waits for (its program status message), quoted
+    /// as its own words.
+    @MainActor
+    private static func programStatusDetail(of session: TerminalSession) -> String {
+        guard let message = session.programStatus.root?.message, !message.isEmpty else { return "" }
+        return " (it reports: \"\(message.prefix(300))\")"
     }
 
     /// How long a task's first kickoff waits, after the agent's usual
@@ -3196,8 +3199,14 @@ final class CherryControlServer: @unchecked Sendable {
             await session.refreshContentFromHostIfNeeded(maximumAge: session.hostContentPollInterval, recentOnly: true)
             let changedAt = session.lastContentChangeAt ?? session.startedAt ?? .distantPast
             if Date().timeIntervalSince(changedAt) >= 1 {
-                let lines = terminalOutput(for: session, startLine: nil, lineLimit: 80).lines
-                if AgentScreenActivity.verdict(for: lines, agent: key, includesAnswerMenus: false) == .prompt { return }
+                // An agent that reports its status says when it is at its
+                // composer; another's screen is read for it.
+                if session.reportsProgramStatus {
+                    if session.agentActivityState == .idle { return }
+                } else {
+                    let lines = terminalOutput(for: session, startLine: nil, lineLimit: 80).lines
+                    if AgentScreenActivity.verdict(for: lines, agent: key, includesAnswerMenus: false) == .prompt { return }
+                }
             }
             try? await Task.sleep(for: .milliseconds(100))
         }

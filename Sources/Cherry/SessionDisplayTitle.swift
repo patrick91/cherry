@@ -24,13 +24,6 @@ enum SessionDisplayTitle {
         return value
     }
 
-    /// Whether an agent's title shows its working spinner (a braille frame
-    /// first), as `TerminalSession` counts one: a heartbeat only while it
-    /// changes (`AgentTitleHeartbeat`).
-    static func showsWorkingSpinner(_ title: String) -> Bool {
-        title.trimmingCharacters(in: .whitespaces).unicodeScalars.first.map(isBraille) ?? false
-    }
-
     /// A shell's name, first that applies: the name the user gave it
     /// (`userName`); the command in its foreground (`foreground`, the
     /// process's name), shown as the title the shell set for it when that
@@ -221,33 +214,5 @@ enum SessionDisplayTitle {
             || (0x25A0...0x25FF).contains(scalar.value)
             || (0x2700...0x27BF).contains(scalar.value)
             || scalar == "*" || scalar == "·" || scalar == "•"
-    }
-}
-
-/// Whether background agents are at work, from the one signal the host
-/// passes on: their title's spinner (a braille frame first). The spinner is
-/// a heartbeat, not a state (an agent can settle and leave its last frame
-/// behind), so it counts only while the title keeps changing: an agent is
-/// working when its title shows a spinner that changed within `freshness`.
-/// A title seen once is no evidence either way.
-struct AgentTitleHeartbeat {
-    static let freshness: TimeInterval = 3
-
-    private var seen: [String: (title: String, changedAt: Date?)] = [:]
-
-    mutating func isWorking(id: String, title: String?, now: Date) -> Bool {
-        let title = title ?? ""
-        if let previous = seen[id] {
-            if previous.title != title { seen[id] = (title, now) }
-        } else {
-            seen[id] = (title, nil)
-        }
-        guard SessionDisplayTitle.showsWorkingSpinner(title), let changedAt = seen[id]?.changedAt else { return false }
-        return now.timeIntervalSince(changedAt) < Self.freshness
-    }
-
-    /// Forgets the sessions no longer listed.
-    mutating func keep(only ids: Set<String>) {
-        seen = seen.filter { ids.contains($0.key) }
     }
 }

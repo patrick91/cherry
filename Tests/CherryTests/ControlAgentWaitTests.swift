@@ -51,23 +51,24 @@ final class ControlAgentWaitHarness {
         return try #require(workspace.session(id: spawned.process.id))
     }
 
-    /// A fake agent CLI: shows a composer, and for each submitted line
+    /// A fake agent CLI that reports its status as Claude Code does
+    /// (OSC 7501): `idle` at its composer; for each submitted line it
     /// echoes it into the transcript with the composer still visible,
-    /// thinks for `thinking` seconds without any working marker (as a
-    /// CLI does before its first spinner frame), works for `working`
-    /// seconds with Claude's "esc to interrupt" status, then answers.
+    /// thinks for `thinking` seconds before it reports `working` (as a CLI
+    /// takes a moment to start a turn), works for `working` seconds, then
+    /// answers and reports `done`.
     func fakeAgentScript(thinking: Double, working: Double) throws -> String {
         let script = projectRoot.appendingPathComponent("fake-agent.sh")
         let body = """
         #!/bin/sh
         stty -echo 2>/dev/null
-        printf '\\342\\235\\257 \\n'
+        printf '\\342\\235\\257 \\n\\033]7501;state=idle:app=fake\\033\\\\'
         while IFS= read -r line; do
           printf '> %s\\n\\n\\342\\235\\257 \\n' "$line"
           sleep \(thinking)
-          printf '\\342\\234\\266 Reticulating\\342\\200\\246 (esc to interrupt)'
+          printf '\\033]7501;state=working:app=fake\\033\\\\\\342\\234\\266 Reticulating\\342\\200\\246'
           sleep \(working)
-          printf '\\r\\033[2K\\342\\217\\272 handled %s\\n\\n\\342\\235\\257 \\n' "$line"
+          printf '\\r\\033[2K\\342\\217\\272 handled %s\\n\\n\\342\\235\\257 \\n\\033]7501;state=done:app=fake\\033\\\\' "$line"
         done
         """
         try body.write(to: script, atomically: true, encoding: .utf8)
@@ -100,6 +101,11 @@ final class ControlAgentWaitHarness {
             throw CherryControlError(code: "wait_failed", message: "Expected waitForProcessIdle result, got \(String(describing: response))")
         }
         return waited
+    }
+
+    /// The agent sends an OSC 7501 program status report with `body`.
+    func report(_ body: String, on session: TerminalSession) {
+        session.ingestTestingData(Data("\u{1B}]7501;\(body)\u{1B}\\".utf8))
     }
 
     func stop() {
@@ -165,9 +171,10 @@ struct ControlAgentWaitTests {
         defer { harness.stop() }
         harness.server.start()
         let session = try await harness.spawnAgent(named: "Claude")
-        session.ingestTestingData(Data("✶ Reticulating… (esc to interrupt)\n".utf8))
+        harness.report("state=working:app=claude-code", on: session)
         try await Task.sleep(for: .milliseconds(150))
         session.ingestTestingData(Data("\u{1B}[2J\u{1B}[H".utf8) + Data(claudeQuestionScreen.replacingOccurrences(of: "\n", with: "\r\n").utf8))
+        harness.report("state=blocked:app=claude-code:kind=question:msg=V2hpY2ggc3RvcmFnZSBiYWNrZW5kPw==", on: session)
 
         let startedAt = Date()
         let waited = try await harness.wait(session, quietMilliseconds: 500, timeoutMilliseconds: 8_000)
@@ -177,7 +184,23 @@ struct ControlAgentWaitTests {
     }
 
     /// Typing a message into a question menu answers it (Enter picks the
-    /// highlighted option): MCP refuses, as at a permission prompt.
+    /// highlighted option): MCP refuses, as at a permission prompt, when
+    /// the agent reports it is blocked on a question, and quotes it.
+    @Test func messageIsNotTypedIntoAQuestionTheAgentReports() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.start()
+        let session = try await harness.spawnAgent(named: "Claude")
+        harness.report("state=blocked:app=claude-code:kind=question:msg=V2hpY2ggc3RvcmFnZSBiYWNrZW5kPw==", on: session)
+
+        let response = try await harness.send(.sendProcessInput(.init(
+            processID: session.id.uuidString, text: "use sqlite", submit: true
+        )))
+        #expect(response.error?.code == "agent_awaiting_input")
+        #expect(response.error?.message.contains("Which storage backend?") == true)
+    }
+
+    /// An agent that reports nothing: its screen is read for the menu.
     @Test func messageIsNotTypedIntoAQuestionMenu() async throws {
         let harness = try ControlAgentWaitHarness()
         defer { harness.stop() }
@@ -198,7 +221,7 @@ struct ControlAgentWaitTests {
         defer { harness.stop() }
         harness.server.start()
         let session = try await harness.spawnAgent(named: "Claude")
-        session.ingestTestingData(Data("✶ Reticulating… (esc to interrupt)\n".utf8))
+        harness.report("state=working:app=claude-code", on: session)
         try await Task.sleep(for: .milliseconds(150))
 
         let processID = session.id.uuidString

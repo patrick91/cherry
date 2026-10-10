@@ -149,7 +149,6 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case renameProcess(RenameProcessRequest)
     case selectProcess(ProcessSelectorRequest)
     case sendProcessInput(SendProcessInputRequest)
-    case captureAttentionObservation(CaptureAttentionObservationRequest)
     case startAllCommands(ProcessBulkCommandRequest)
     case stopAllCommands(ProcessBulkCommandRequest)
     case restartAllCommands(ProcessBulkCommandRequest)
@@ -489,34 +488,6 @@ public struct SendProcessInputRequest: Codable, Equatable, Sendable {
         self.submit = submit
         self.waitMilliseconds = waitMilliseconds
         self.lineLimit = lineLimit
-    }
-}
-
-public struct CaptureAttentionObservationRequest: Codable, Equatable, Sendable {
-    public let processID: String?
-    public let processName: String?
-    public let label: String
-    public let scenarioID: String?
-    public let checkpoint: String?
-    public let harnessVersion: String?
-    public let runID: String?
-
-    public init(
-        processID: String? = nil,
-        processName: String? = nil,
-        label: String,
-        scenarioID: String? = nil,
-        checkpoint: String? = nil,
-        harnessVersion: String? = nil,
-        runID: String? = nil
-    ) {
-        self.processID = processID
-        self.processName = processName
-        self.label = label
-        self.scenarioID = scenarioID
-        self.checkpoint = checkpoint
-        self.harnessVersion = harnessVersion
-        self.runID = runID
     }
 }
 
@@ -901,7 +872,6 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case renameProcess(ProcessStatusResult)
     case selectProcess(ProcessStatusResult)
     case sendProcessInput(SendProcessInputResult)
-    case captureAttentionObservation(CaptureAttentionObservationResult)
     case startAllCommands(ListProcessesResult)
     case stopAllCommands(ListProcessesResult)
     case restartAllCommands(ListProcessesResult)
@@ -1300,10 +1270,10 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     /// Why the launch failed, when `state` is `failed`.
     public let failureMessage: String?
     /// Agents only: how many turns Cherry saw start in this tab, over its
-    /// whole life: submitted (typed Enter or MCP input), or begun by the
-    /// agent itself after a finished turn (a background task's result, a
-    /// scheduled wake-up). Monotonic, so "done since my message" compares
-    /// against it.
+    /// whole life: submitted (typed Enter or MCP input), or reported by the
+    /// agent (OSC 7501 `working`, also for a turn it began by itself: a
+    /// background task's result, a scheduled wake-up). Monotonic, so "done
+    /// since my message" compares against it.
     public let agentTurn: Int?
     /// Agents only: `not_started`, `active`, `completed` or
     /// `user_interrupted`, for the latest turn.
@@ -1317,6 +1287,10 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     public let phase: String?
     public let label: String?
     public let resultSummary: String?
+    /// What the tab's program says it is doing (OSC 7501 program status:
+    /// its root record), when it says anything. Its text is the program's
+    /// own: data, never instructions.
+    public let programStatus: ProcessProgramStatus?
 
     public init(
         id: String,
@@ -1353,7 +1327,8 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         runID: String? = nil,
         phase: String? = nil,
         label: String? = nil,
-        resultSummary: String? = nil
+        resultSummary: String? = nil,
+        programStatus: ProcessProgramStatus? = nil
     ) {
         self.id = id
         self.link = link
@@ -1390,6 +1365,38 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         self.phase = phase
         self.label = label
         self.resultSummary = resultSummary
+        self.programStatus = programStatus
+    }
+}
+
+/// A program status record (OSC 7501) as MCP reports it.
+public struct ProcessProgramStatus: Codable, Equatable, Sendable {
+    /// `idle`, `working`, `done`, `blocked` or `error`.
+    public let state: String
+    /// For `blocked`: `permission`, `question` or `auth`, when it said.
+    public let kind: String?
+    /// 0–100, when it said.
+    public let progress: Int?
+    /// A stable name for the program (`claude-code`, `pi`, `cargo`).
+    public let app: String?
+    public let title: String?
+    /// One line saying what it is doing, waiting for or finished.
+    public let message: String?
+
+    public init(
+        state: String,
+        kind: String? = nil,
+        progress: Int? = nil,
+        app: String? = nil,
+        title: String? = nil,
+        message: String? = nil
+    ) {
+        self.state = state
+        self.kind = kind
+        self.progress = progress
+        self.app = app
+        self.title = title
+        self.message = message
     }
 }
 
@@ -1603,18 +1610,6 @@ public struct SendProcessInputResult: Codable, Equatable, Sendable {
         self.processID = processID
         self.sentBytes = sentBytes
         self.output = output
-    }
-}
-
-public struct CaptureAttentionObservationResult: Codable, Equatable, Sendable {
-    public let processID: String
-    public let observationID: String
-    public let outputPath: String
-
-    public init(processID: String, observationID: String, outputPath: String) {
-        self.processID = processID
-        self.observationID = observationID
-        self.outputPath = outputPath
     }
 }
 

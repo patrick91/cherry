@@ -305,7 +305,23 @@ is posted then if none took it. The session's row shows a blue dot, and the
 tab that shows it next (Open, a restore, the Persistent Sessions sheet)
 comes up unread (`Workspaces/unread-sessions.json`, which also brings the
 list's dots back at the next launch); a tab's unread dot is also saved with
-it, so a restored or reopened tab keeps it. The panel's
+it, so a restored or reopened tab keeps it.
+
+What a background session's program reports about itself (OSC 7501 program
+status, which its holder keeps and the host sends with the session) is
+followed the same way, against what Cherry saw when it last looked: a
+program that waits for the user (`blocked`, or blocked on something else
+than before), finishes (`done`) or fails (`error`) marks its session
+unread, as the spec's "the user has not seen it yet" asks. Settings ›
+Sessions › Background Sessions decides which are also posted, its own
+message as the text ("Waiting for your permission." and the like when it
+gave none), under the notifications' limits: *Notify me when a background
+program needs me* (on) and *… finishes* (off). What it reported before
+Cherry first looked (at launch, or as its tab went away) is not news. The
+row says "needs permission", "needs you", "working", "done" or "failed"
+with an orange, blue, pink or red dot, and the menu bar icon counts a
+waiting or working program, and a failure not yet seen, as it counts the
+tabs' agents. The panel's
 **Clear Ended** removes every ended session in the list at once (nothing
 asked: nothing runs). An ended session the list has shown for 10 minutes
 of time Cherry was active (in front, the Mac awake: refreshes more than 5 s
@@ -549,7 +565,9 @@ differs from the design above.
 
 - The daemon (`cherry-host serve`) and one holder per session
   (`cherry-host hold --socket …`, link on fd 3, never the daemon's child) are
-  implemented as designed. The holder link is at `LINK_VERSION` 10, and a
+  implemented as designed. The holder link is at `LINK_VERSION` 11 (11 adds
+  `program_status`, OSC 7501 program status records, to `Info` and the
+  hello's session), and a
   daemon speaks every version from 1. Beyond the frames listed above it has
   `Launch` and `Failed` (Create goes through the holder), `Update` (rename /
   retag kept by the holder), `Info` (title/pwd/foreground, from version 3
@@ -1289,20 +1307,23 @@ differs from the design above.
   the main thread asks the lock: a Dock click opens no window (the launch
   opens them), ⌘Q quits at once (nothing of this copy's was opened or
   saved), and `markQuitting` does nothing.
-- **MCP and agents.** MCP input to an agent is checked against its current
-  screen first (read from its session host when no surface shows it). While
-  the screen shows a tool-permission prompt, input is refused with
-  `agent_awaiting_permission` and nothing is sent; raw keys sent without
-  submit still go through. `input_not_delivered` is returned when the
-  agent's screen cannot be read from its host. Cherry presses Enter on an
-  agent's startup or trust prompt only for an agent its tab just launched,
-  never for a restored, adopted or attached agent, or on a permission menu.
-  A restored or adopted agent (one its tab did not start) whose screen or
-  title shows it is at work (a working marker, a title spinner) is taken to
-  be in a turn submitted before the tab followed it (`agentTurnState`
-  `.active`), so its end notifies as a finished turn does.
+- **MCP and agents.** An agent's state is what it reports with the program
+  status protocol (OSC 7501), whose records its holder keeps
+  (`SessionInfo.program_status`), so a restored or adopted agent shows its
+  state at once. MCP input to an agent that reports it is blocked on a
+  permission or a question is refused (`agent_awaiting_permission`,
+  `agent_awaiting_input`) and nothing is sent; raw keys sent without submit
+  still go through. An agent that reports nothing has its current screen
+  checked for such a menu instead (read from its session host when no
+  surface shows it); `input_not_delivered` is returned when that screen
+  cannot be read from its host. Cherry presses Enter on an agent's startup
+  or trust prompt only for an agent its tab just launched, never for a
+  restored, adopted or attached agent, or on a permission menu. A restored
+  or adopted agent (one its tab did not start) that reports `working` is
+  taken to be in a turn submitted before the tab followed it
+  (`agentTurnState` `.active`), so its end notifies as a finished turn does.
   `wait_for_process_idle` returns `permission`, and `agent_activity_state` is
-  `permission`, whenever the screen shows a permission prompt. MCP client
+  `permission`, while the agent reports it is blocked on an approval. MCP client
   timeouts: `spawn_process` with kind `command` waits `wait_ms` + 30 s,
   other `spawn_process`, `spawn_agent` and `send_process_input` `wait_ms` +
   20 s; `start_process`, `start_all_commands` and `restart_all_commands`

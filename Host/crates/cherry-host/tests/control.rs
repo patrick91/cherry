@@ -868,6 +868,81 @@ exec sleep 60"#,
 }
 
 #[test]
+fn program_status_reports_become_session_records_until_the_program_ends() {
+    let host = Host::new();
+    let mut control = Control::subscribe(&host);
+    let dir = host.dir();
+    let (reply, blocked, exit) = (dir.join("reply"), dir.join("blocked"), dir.join("exit"));
+    // As Claude Code does: ask whether the terminal reads reports, then
+    // report only if it answered.
+    let session = host.create(shell(&format!(
+        r#"stty raw -echo
+printf '\033]7501;?\033\\'
+dd bs=1 count=10 2>/dev/null > '{reply}'
+printf '\033]7501;state=working:app=claude-code:msg=V3JpdGluZyBub3Rlcy50eHQ=\033\\'
+printf '\033]7501;id=lint:state=done:app=claude-code\033\\'
+while [ ! -e '{blocked}' ]; do sleep 0.02; done
+printf '\033]7501;state=blocked:app=claude-code:kind=question:msg=YW5zd2VyOiBUZWEgb3IgY29mZmVlPw==\007'
+while [ ! -e '{exit}' ]; do sleep 0.02; done
+exit 0"#,
+        reply = reply.display(),
+        blocked = blocked.display(),
+        exit = exit.display(),
+    )));
+    let id = session.id.clone();
+    let hear = |control: &mut Control, what: &str, check: &dyn Fn(&[ProgramStatus]) -> bool| {
+        control.events_until(what, |event| {
+            matches!(event, SessionEvent::Changed { session } if session.id == id
+                && check(&session.program_status))
+        });
+    };
+    hear(&mut control, "working", &|records| {
+        records.len() == 2 && records[0].state == ProgramStatusState::Working
+    });
+    // The host answered the support query, once, with the same body.
+    assert_eq!(fs::read(&reply).unwrap(), b"\x1b]7501;?\x1b\\");
+    assert_eq!(
+        host.session(&id).program_status,
+        [
+            ProgramStatus {
+                id: String::new(),
+                state: ProgramStatusState::Working,
+                kind: None,
+                progress: None,
+                app: "claude-code".into(),
+                title: String::new(),
+                message: "Writing notes.txt".into(),
+            },
+            ProgramStatus {
+                id: "lint".into(),
+                state: ProgramStatusState::Done,
+                kind: None,
+                progress: None,
+                app: "claude-code".into(),
+                title: String::new(),
+                message: String::new(),
+            },
+        ]
+    );
+    touch(&blocked);
+    hear(&mut control, "blocked", &|records| {
+        records.last().is_some_and(|record| {
+            record.state == ProgramStatusState::Blocked
+                && record.kind == Some(ProgramStatusKind::Question)
+                && record.message == "answer: Tea or coffee?"
+        })
+    });
+    // Attached clients are told too.
+    let (_attached, attached, ..) = host.attach(&id, 80, 24);
+    assert_eq!(attached.program_status.len(), 2);
+    // The program exits: its blocked record goes, the done one stays.
+    touch(&exit);
+    hear(&mut control, "the exit", &|records| {
+        records.len() == 1 && records[0].id == "lint"
+    });
+}
+
+#[test]
 fn clearing_history_leaves_the_screen_and_no_history_for_reads_and_reattaches() {
     let host = Host::new();
     let dir = host.dir();

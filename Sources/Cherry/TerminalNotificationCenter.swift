@@ -45,21 +45,34 @@ final class TerminalNotificationCenter {
         )
     }
 
-    /// What an attention notification says: a menu on screen says what
-    /// the agent waits for.
-    static func attentionBody(for state: AgentActivityState) -> String {
-        switch state {
-        case .needsInput: "This agent is asking you a question."
-        case .permission: "This agent is waiting for your permission."
-        default: "This agent may need your attention."
+    /// What a program status notification says: the program's own line
+    /// when it gave one (`message`, untrusted text, shown as plain text),
+    /// else what its state means.
+    nonisolated static func programStatusBody(for status: ProgramStatus) -> String {
+        if !status.message.isEmpty {
+            return String(status.message.prefix(256))
+        }
+        switch status.state {
+        case .blocked:
+            switch status.kind {
+            case .permission?: return "Waiting for your permission."
+            case .question?: return "Asking you a question."
+            case .auth?: return "Waiting for you to sign in."
+            case .unknown?, nil: return "Waiting for you."
+            }
+        case .done: return "Finished."
+        case .error: return "Failed."
+        case .idle, .working, .unknown: return "Needs your attention."
         }
     }
 
-    func postAttention(for session: TerminalSession) {
+    /// A tab's program blocked on the user, finished or failed (OSC 7501)
+    /// while the tab is not on screen.
+    func postProgramStatus(_ status: ProgramStatus, for session: TerminalSession) {
         deliver(
             title: session.title,
-            body: Self.attentionBody(for: session.agentActivityState),
-            identifierPrefix: "cherry-attention",
+            body: Self.programStatusBody(for: status),
+            identifierPrefix: "cherry-program-status",
             for: session
         )
     }
@@ -183,8 +196,9 @@ final class TerminalNotificationCenter {
     }
 }
 
-/// What the notification for a background session's bell or notification
-/// says (`TerminalNotificationCenter.postBackgroundSession`); pure, for tests.
+/// What the notification for a background session's bell, notification or
+/// program status says (`TerminalNotificationCenter.postBackgroundSession`);
+/// pure, for tests.
 struct BackgroundSessionNotificationContent: Equatable {
     /// The host session id, in `userInfo` under `sessionIDKey`.
     static let sessionIDKey = "backgroundSessionID"
@@ -201,23 +215,35 @@ struct BackgroundSessionNotificationContent: Equatable {
 
     /// `machine`: the device the session is on, nil for This Mac.
     init(session: BackgroundSession, signal: PersistentHostSignal, machine: String? = nil) {
+        let body: String
+        switch signal {
+        case .notification(let title, let text):
+            let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty {
+                body = title.isEmpty ? "Notification" : title
+            } else {
+                body = title.isEmpty ? text : "\(title): \(text)"
+            }
+        case .bell, .progress:
+            body = session.kind == .agent ? "This agent may need your attention." : "Terminal bell"
+        }
+        self.init(session: session, body: body, machine: machine)
+    }
+
+    /// Its program's status (OSC 7501): its own message, else what its
+    /// state means (`TerminalNotificationCenter.programStatusBody`).
+    init(session: BackgroundSession, programStatus: ProgramStatus, machine: String? = nil) {
+        self.init(session: session, body: TerminalNotificationCenter.programStatusBody(for: programStatus), machine: machine)
+    }
+
+    private init(session: BackgroundSession, body: String, machine: String?) {
         sessionID = session.id
         hostID = session.hostID
         title = session.title
         subtitle = machine.map { "\(session.projectName) on \($0) · in the background" }
             ?? "\(session.projectName) · in the background"
-        switch signal {
-        case .notification(let title, let body):
-            let body = body.trimmingCharacters(in: .whitespacesAndNewlines)
-            let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
-            if body.isEmpty {
-                self.body = title.isEmpty ? "Notification" : title
-            } else {
-                self.body = title.isEmpty ? body : "\(title): \(body)"
-            }
-        case .bell, .progress:
-            body = session.kind == .agent ? "This agent may need your attention." : "Terminal bell"
-        }
+        self.body = body
     }
 
     var userInfo: [String: String] {

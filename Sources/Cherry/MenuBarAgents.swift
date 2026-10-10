@@ -4,8 +4,8 @@ import SwiftUI
 // A menu-bar (an AppKit NSStatusItem, `MenuBarStatusItem`) summary of every live agent
 // across all project windows, with a glanceable aggregate state on the icon and a
 // click-to-focus list grouped by project. The per-agent state comes from
-// `TerminalSession.agentActivityState`; see the activity state machine for how idle
-// vs working vs permission is decided.
+// `TerminalSession.agentActivityState` (program status, OSC 7501); the icon also
+// counts what background sessions' programs report (`backgroundActivity`).
 
 // MARK: - Snapshot
 
@@ -18,17 +18,36 @@ enum MenuBarAggregateState: Equatable {
     case attention   // at least one agent waits on a permission prompt or a question
     case error
 
-    init(items: [MenuBarAgentItem]) {
-        if items.isEmpty {
+    /// `background`: what background sessions' programs report
+    /// (`backgroundActivity(of:isUnread:)`), counted with the tabs' agents.
+    init(items: [MenuBarAgentItem], background: [AgentActivityState] = []) {
+        let activities = items.map(\.activity) + background
+        if activities.isEmpty {
             self = .none
-        } else if items.contains(where: { $0.activity.awaitsUserAnswer }) {
+        } else if activities.contains(where: \.awaitsUserAnswer) {
             self = .attention
-        } else if items.contains(where: { $0.activity == .error }) {
+        } else if activities.contains(.error) {
             self = .error
-        } else if items.contains(where: { $0.activity == .working }) {
+        } else if activities.contains(.working) {
             self = .working
         } else {
             self = .idle
+        }
+    }
+
+    /// What a background session adds to the icon: its program waiting for
+    /// the user or at work (OSC 7501), or a failure not seen yet. Nothing
+    /// for one that reports nothing, is idle or done, or has ended.
+    static func backgroundActivity(of session: BackgroundSession, isUnread: Bool) -> AgentActivityState? {
+        switch session.programState {
+        case .blocked? where session.isRunning:
+            session.programKind == .permission ? .permission : .needsInput
+        case .working? where session.isRunning:
+            .working
+        case .error? where isUnread:
+            .error
+        default:
+            nil
         }
     }
 
@@ -222,11 +241,17 @@ final class MenuBarAgentsModel: ObservableObject {
             ))
         }
         groups.sort { $0.projectName.localizedCaseInsensitiveCompare($1.projectName) == .orderedAscending }
-        apply(groups: groups)
+        let background = BackgroundSessionsModel.shared
+        let backgroundActivities = ([background] + background.devices).flatMap { list in
+            list.sessions.compactMap { session in
+                MenuBarAggregateState.backgroundActivity(of: session, isUnread: list.unreadSessionIDs.contains(session.id))
+            }
+        }
+        apply(groups: groups, background: backgroundActivities)
     }
 
-    private func apply(groups: [MenuBarProjectGroup]) {
-        let aggregate = MenuBarAggregateState(items: groups.flatMap(\.items))
+    private func apply(groups: [MenuBarProjectGroup], background: [AgentActivityState]) {
+        let aggregate = MenuBarAggregateState(items: groups.flatMap(\.items), background: background)
         if groups != self.groups { self.groups = groups }
         if aggregate != self.aggregate { self.aggregate = aggregate }
         MenuBarShimmerModel.shared.setWorkingAgentsActive(aggregate == .working)
@@ -696,7 +721,8 @@ private struct MenuBarAgentRow: View {
 // same spot, so it ignores clicks for a moment: a double click on End is not a yes.
 private struct MenuBarBackgroundSessionRow: View {
     let item: BackgroundSession
-    /// It had a bell or notification since it went to the background.
+    /// It had a bell or notification, or its program finished, failed or
+    /// waited for the user, since it went to the background.
     let isUnread: Bool
     let open: () -> Void
     let end: () -> Void
@@ -730,7 +756,7 @@ private struct MenuBarBackgroundSessionRow: View {
                         Circle()
                             .fill(Color.blue)
                             .frame(width: 6, height: 6)
-                            .help("Rang its bell or sent a notification")
+                            .help("Rang its bell, sent a notification, or its program finished or needs you")
                     }
                     Spacer(minLength: 8)
                 }
@@ -820,6 +846,9 @@ private struct MenuBarBackgroundSessionRow: View {
 
     private static func color(for tone: BackgroundSessionPresentation.Tone) -> Color? {
         switch tone {
+        case .attention: Color(nsColor: .systemOrange)
+        case .finished: Color.pink
+        case .failed: Color(nsColor: .systemRed)
         case .active: Color(nsColor: .systemBlue)
         case .idle: Color(nsColor: .tertiaryLabelColor)
         case .ended: nil

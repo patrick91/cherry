@@ -66,7 +66,7 @@ struct ControlAgentMonitorTests {
         harness.useFastMonitors()
         harness.server.start()
         let worker = try await harness.spawnAgent(named: "Claude")
-        harness.screen("✶ Reticulating… (esc to interrupt)\n", on: worker)
+        harness.report("state=working:app=claude-code", on: worker)
         try await Task.sleep(for: .milliseconds(150))
 
         let subscribed = try await harness.subscribe(.init(processIDs: [worker.id.uuidString]))
@@ -77,7 +77,10 @@ struct ControlAgentMonitorTests {
         let none = try await harness.events(id, timeoutMilliseconds: 300)
         #expect(none.events.isEmpty && none.timedOut)
 
+        // Its last frame, then its report (as Claude Code sends them).
         harness.screen("⏺ Done.\n\n❯ \n", on: worker)
+        try await Task.sleep(for: .milliseconds(100))
+        harness.report("state=done:app=claude-code", on: worker)
         let waited = try await harness.events(id)
         #expect(waited.events.map(\.type) == [.done])
         #expect(waited.events.first?.processID == worker.id.uuidString)
@@ -95,22 +98,17 @@ struct ControlAgentMonitorTests {
         harness.useFastMonitors()
         harness.server.start()
         let worker = try await harness.spawnAgent(named: "Claude")
-        harness.screen("✶ Reticulating… (esc to interrupt)\n", on: worker)
+        harness.report("state=working:app=claude-code", on: worker)
         try await Task.sleep(for: .milliseconds(150))
         let id = try await harness.subscribe(.init(processIDs: [worker.id.uuidString])).subscription.subscriptionID
 
         harness.screen(claudeQuestionScreen, on: worker)
+        harness.report("state=blocked:app=claude-code:kind=question", on: worker)
         let question = try await harness.events(id)
         #expect(question.events.map(\.type) == [.needsInput])
 
-        harness.screen("""
-        Bash command
-          rm -rf build
-        Do you want to proceed?
-        ❯ 1. Yes
-          2. Yes, and don't ask again for rm commands
-          3. No, and tell Claude what to do differently (esc)
-        """, on: worker)
+        // "approve Bash: rm -rf build"
+        harness.report("state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiBybSAtcmYgYnVpbGQ=", on: worker)
         let permission = try await harness.events(id)
         #expect(permission.events.map(\.type) == [.permission])
 
@@ -163,7 +161,7 @@ struct ControlAgentMonitorTests {
     }
 
     /// An agent that goes back to work by itself after its turn ended (it
-    /// answers a background shell's result) starts a turn MCP sees: its
+    /// answers a background shell's result) reports `working` again: its
     /// `agent_turn` grows, its turn is active while it works, `done` fires
     /// again when that turn ends, and `wait_for_process_idle` waits for it.
     @Test func turnTheAgentResumesByItselfIsDoneAgain() async throws {
@@ -172,32 +170,30 @@ struct ControlAgentMonitorTests {
         harness.useFastMonitors()
         harness.server.start()
         let worker = try await harness.spawnAgent(named: "Claude")
+        harness.report("state=idle:app=claude-code", on: worker)
         let sent = try await harness.send(.sendProcessInput(.init(processID: worker.id.uuidString, text: "rebuild the index", submit: true)))
         #expect(sent.error == nil)
-        try await Task.sleep(for: .milliseconds(300))
-        harness.alternateScreen(AgentScreenActivityTests.claudeStaleWorkingFrame, on: worker)
+        harness.report("state=working:app=claude-code", on: worker)
         try await Task.sleep(for: .milliseconds(200))
         let id = try await harness.subscribe(.init(processIDs: [worker.id.uuidString])).subscription.subscriptionID
 
-        harness.alternateScreen(AgentScreenActivityTests.claudeFinishedTurn, on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
         let first = try await harness.events(id)
         #expect(first.events.map(\.type) == [.done])
         #expect(first.events.first?.agentTurn == 1)
         #expect(try await harness.status(of: worker).agentTurnState == "completed")
 
-        for frame in 0..<8 {
-            harness.alternateScreen(AgentScreenActivityTests.claudeResumedFrame(frame), on: worker)
-            try await Task.sleep(for: .milliseconds(250))
-        }
+        harness.report("state=working:app=claude-code:msg=UmVhZGluZyB0aGUgc2hlbGwncyBvdXRwdXQ=", on: worker)
         let resumed = try await harness.status(of: worker)
         #expect(resumed.agentTurn == 2)
         #expect(resumed.agentTurnState == "active")
         #expect(resumed.agentActivityState == "working")
+        #expect(resumed.programStatus?.message == "Reading the shell's output")
         let busy = try await harness.events(id, timeoutMilliseconds: 0)
         #expect(busy.events.isEmpty)
         #expect(busy.watching.first?.status == "working")
 
-        harness.alternateScreen(AgentScreenActivityTests.claudeResumedTurnFinished, on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
         let second = try await harness.events(id)
         #expect(second.events.map(\.type) == [.done])
         #expect(second.events.first?.agentTurn == 2)
@@ -213,13 +209,13 @@ struct ControlAgentMonitorTests {
         harness.useFastMonitors()
         harness.server.start()
         let worker = try await harness.spawnAgent(named: "Claude")
-        harness.screen("✶ Reticulating… (esc to interrupt)\n", on: worker)
+        harness.report("state=working:app=claude-code", on: worker)
         try await Task.sleep(for: .milliseconds(150))
         let subscribed = try await harness.subscribe(.init(processIDs: [worker.id.uuidString]))
         let id = subscribed.subscription.subscriptionID
         #expect(subscribed.subscription.cursor == 0)
 
-        harness.screen(claudeQuestionScreen, on: worker)
+        harness.report("state=blocked:app=claude-code:kind=question", on: worker)
         let first = try await harness.events(id, cursor: 0)
         #expect(first.events.count == 1)
         // The same cursor again: the event was not acknowledged.
@@ -275,7 +271,7 @@ struct ControlAgentMonitorTests {
         let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
         let worker = try await harness.spawnAgent(named: "Claude")
         harness.server.callerSessionResolverForTesting = { _ in orchestrator }
-        harness.screen("✶ Reticulating… (esc to interrupt)\n", on: worker)
+        harness.report("state=working:app=claude-code", on: worker)
         try await Task.sleep(for: .milliseconds(800))
 
         let subscribed = try await harness.subscribe(.init(
@@ -286,13 +282,14 @@ struct ControlAgentMonitorTests {
         let id = subscribed.subscription.subscriptionID
 
         // The orchestrator is busy: no wake line yet.
-        orchestrator.ingestTestingData(Data("\r\n✶ Thinking… (esc to interrupt)".utf8))
+        harness.report("state=working:app=fake", on: orchestrator)
         harness.screen("⏺ Done.\n\n❯ \n", on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
         try await Task.sleep(for: .milliseconds(1_200))
         #expect(!(try await harness.output(of: orchestrator)).contains("[cherry] Monitor"))
 
         // Idle again: one line, with counts only.
-        orchestrator.ingestTestingData(Data("\r\u{1B}[2K\r\n❯ \r\n".utf8))
+        harness.report("state=done:app=fake", on: orchestrator)
         var typed = ""
         for _ in 0..<60 {
             typed = try await harness.output(of: orchestrator)
@@ -301,9 +298,10 @@ struct ControlAgentMonitorTests {
         }
         #expect(typed.contains("[cherry] Monitor \(id): 1 event ready (1 done). Call the cherry wait_for_events tool with subscription_id \"\(id)\" to read them."))
         #expect(!typed.contains("Done."), "the wake line carries no worker text")
-        // The wake line is a turn submitted to the subscriber.
+        // The wake line is a turn submitted to the subscriber, after the
+        // turn it reported working on.
         #expect(orchestrator.agentSubmittedTurnCount == 1)
-        #expect(orchestrator.agentTurnCount == 1)
+        #expect(orchestrator.agentTurnCount == 2)
 
         // Not woken again for the same events.
         try await Task.sleep(for: .milliseconds(1_000))
@@ -361,9 +359,10 @@ struct ControlAgentMonitorTests {
             return
         }
         let childSession = try #require(harness.workspace.session(id: child.process.id))
-        childSession.ingestTestingData(Data("✶ Working… (esc to interrupt)".utf8))
+        harness.report("state=working:app=codex", on: childSession)
         try await Task.sleep(for: .milliseconds(300))
         harness.screen(claudeQuestionScreen, on: childSession)
+        harness.report("state=blocked:app=codex:kind=question", on: childSession)
         let events = try await harness.events(subscribed.subscription.subscriptionID)
         #expect(events.events.map(\.type) == [.needsInput])
         #expect(events.events.first?.processID == child.process.id)

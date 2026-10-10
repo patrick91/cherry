@@ -80,6 +80,10 @@ final class WatchedProcess {
     let kind: String
     /// The status the last sample saw; nil before the first.
     var lastStatus: String?
+    /// The agent's `agentTurnCount` at the last sample: a turn that began
+    /// and ended between two samples (its reports came within one) is
+    /// done too.
+    var lastTurn: Int?
     var finished = false
     var lastMatchContentVersion = -1
     var recentMatches: [Int] = []
@@ -591,8 +595,14 @@ extension CherryControlServer {
         watched.lastStatus = current
         let session = watched.session
         if let session { watched.name = processName(for: session) }
+        let turn = session?.agentTurnCount
+        let previousTurn = watched.lastTurn
+        watched.lastTurn = turn
 
-        if current != previous {
+        if current == "idle", previous == "idle", let turn, let previousTurn, turn > previousTurn {
+            // A whole turn between two samples.
+            monitors.append(.done, to: subscription, process: watched, session: session, initial: false)
+        } else if current != previous {
             switch current {
             case "closed":
                 // A tab that closed because its program ended (a terminal
@@ -680,10 +690,15 @@ extension CherryControlServer {
         }
     }
 
+    /// The subscriber is idle: it reports `idle` (OSC 7501), or, when it
+    /// reports nothing (a CLI that does not speak the protocol), its
+    /// output went quiet (below); its turn ended, and nobody types into it.
     @MainActor
     func subscriberTakesWakeLine(_ subscriber: TerminalSession, now: Date) -> Bool {
-        guard subscriber.kind == .agent, subscriber.isRunning, subscriber.acceptsControlInput,
-              reportedAgentActivityState(of: subscriber) == AgentActivityState.idle.rawValue,
+        let idle = subscriber.reportsProgramStatus
+            ? subscriber.agentActivityState == .idle
+            : subscriber.agentActivityState == .unknown
+        guard subscriber.kind == .agent, subscriber.isRunning, subscriber.acceptsControlInput, idle,
               Self.agentTurnMayHaveEnded(subscriber, now: now),
               !subscriber.humanIsComposing(within: monitors.humanTypingInterval)
         else { return false }

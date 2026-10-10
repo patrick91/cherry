@@ -4,8 +4,9 @@ import Foundation
 /// the user to approve a command, an edit or a fetch) at the bottom of its
 /// screen. Typing into such a menu answers it: Enter (and, for some CLIs,
 /// letters such as `y`) approves the pending action. MCP input to an agent
-/// therefore never goes into one (`CherryControlServer`), and MCP reports
-/// the agent as waiting for permission while one shows.
+/// that reports no status (one that does says it is blocked on a
+/// permission, OSC 7501) therefore never goes into one
+/// (`CherryControlServer.refuseInputIntoPermissionPrompt`).
 ///
 /// Only the menu counts, not prose about one: the last lines must hold a
 /// numbered "Yes…" option and a numbered "No…" option, plus a phrase only

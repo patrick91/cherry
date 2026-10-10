@@ -5,12 +5,19 @@ import MCP
 import Testing
 @testable import Cherry
 
-// MCP input to an agent never answers a permission prompt on its screen.
-// A restored agent (Cherry quit or crashed while it asked for permission)
-// is followed through its host: its screen is read from there before any
-// input goes, no startup prompt of it is ever acknowledged, and MCP reports
-// it waiting for permission rather than idle. Against the fake `cherry
-// control` (FakeControlHelper); nothing reaches a real cherry-host.
+// MCP input to an agent never answers a permission prompt. A restored agent
+// (Cherry quit or crashed while it asked for permission) is followed through
+// its host: one that reports its status (OSC 7501) is blocked by its host's
+// records, and MCP reports it waiting for permission rather than idle; for
+// one that reports nothing its screen is read from there before any input
+// goes. No startup prompt of a restored agent is ever acknowledged. Against
+// the fake `cherry control` (FakeControlHelper); nothing reaches a real
+// cherry-host.
+
+/// Claude Code's report while it asks to run `rm -rf build`.
+private let claudeBashPermissionStatus = [ProgramStatus(
+    state: .blocked, kind: .permission, app: "claude-code", message: "approve Bash: rm -rf build"
+)]
 
 /// Claude Code asking to run a command.
 private let claudeBashPermissionScreen = """
@@ -60,6 +67,7 @@ private func restoreAgent(
     _ harness: PersistentHarness,
     into workspace: TerminalWorkspace,
     screen: String,
+    programStatus: [ProgramStatus] = [],
     owned: Bool = true
 ) async throws -> TerminalSession {
     let record = WorkspaceSessionRecord(
@@ -73,7 +81,8 @@ private func restoreAgent(
             PersistentSessionTag.tab: record.id.uuidString,
             PersistentSessionTag.kind: "agent",
             PersistentSessionTag.agent: "Claude"
-        ]
+        ],
+        programStatus: programStatus
     )]
     harness.fake.screenText = screen
     let result = await harness.restorer(WorkspaceRestoreRequest(
@@ -103,7 +112,7 @@ private func typed(_ harness: PersistentHarness) -> [String] {
 
 // MARK: - A restored agent at a permission prompt
 
-@Test @MainActor func mcpInputNeverAnswersTheRestoredAgentsPermissionPrompt() async throws {
+@Test @MainActor func aRestoredAgentThatReportsItWaitsForPermissionIsNeverAnswered() async throws {
     let harness = try PersistentHarness(configuration: safetyConfiguration())
     let workspace = harness.workspace()
     let control = try ParityControlServer(workspace: workspace)
@@ -112,12 +121,14 @@ private func typed(_ harness: PersistentHarness) -> [String] {
         workspace.closeAllSessions(intent: .windowClosed)
         harness.cleanUp()
     }
-    let agent = try await restoreAgent(harness, into: workspace, screen: claudeBashPermissionScreen)
-    #expect(agent.lastInputOutputVersion == nil)
+    let agent = try await restoreAgent(
+        harness, into: workspace, screen: claudeBashPermissionScreen, programStatus: claudeBashPermissionStatus
+    )
 
     // The orchestrator's view: waiting for permission, not idle.
     let status = try await control.process(agent)
     #expect(status.agentActivityState == "permission")
+    #expect(status.programStatus?.message == "approve Bash: rm -rf build")
     let waited = try await control.send(.waitForProcessIdle(.init(
         processID: agent.id.uuidString, requireNewOutput: false, quietMilliseconds: 100, timeoutMilliseconds: 3_000
     )))
@@ -127,6 +138,33 @@ private func typed(_ harness: PersistentHarness) -> [String] {
     }
     #expect(idle.reason == .permission)
     #expect(idle.agentActivityState == "permission")
+
+    // Refused on its report, quoting it; its screen is not needed.
+    let screenReads = harness.fake.requests("screen").count
+    let message = try await control.send(.sendProcessInput(.init(
+        processID: agent.id.uuidString, text: "please also run the tests", submit: true
+    )))
+    #expect(message.error?.code == "agent_awaiting_permission")
+    #expect(message.error?.message.contains("approve Bash: rm -rf build") == true)
+    #expect(harness.fake.requests("screen").count == screenReads)
+    try await Task.sleep(for: .milliseconds(500))
+    #expect(typed(harness).isEmpty)
+}
+
+@Test @MainActor func mcpInputNeverAnswersTheRestoredAgentsPermissionPrompt() async throws {
+    let harness = try PersistentHarness(configuration: safetyConfiguration())
+    let workspace = harness.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    defer {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    // An agent that reports nothing: its state is unknown, and only its
+    // screen can say it waits for permission.
+    let agent = try await restoreAgent(harness, into: workspace, screen: claudeBashPermissionScreen)
+    #expect(agent.lastInputOutputVersion == nil)
+    #expect(try await control.process(agent).agentActivityState == "unknown")
 
     // send_agent_message (text, submitted): refused, nothing typed; above
     // all no Enter, which would approve `rm -rf build`.
@@ -165,7 +203,6 @@ private func typed(_ harness: PersistentHarness) -> [String] {
     )))
     #expect(later.error == nil)
     #expect(typed(harness) == ["\u{1B}", "run the tests", "\r"])
-    #expect(try await control.process(agent).agentActivityState != "permission")
 }
 
 @Test @MainActor func sendAgentMessageThroughMCPLeavesTheRestoredAgentsPermissionPromptAlone() async throws {
@@ -183,7 +220,9 @@ private func typed(_ harness: PersistentHarness) -> [String] {
         workspace.closeAllSessions(intent: .windowClosed)
         harness.cleanUp()
     }
-    let agent = try await restoreAgent(harness, into: workspace, screen: claudeBashPermissionScreen)
+    let agent = try await restoreAgent(
+        harness, into: workspace, screen: claudeBashPermissionScreen, programStatus: claudeBashPermissionStatus
+    )
 
     // The original report: wait_for_process_idle, then send_agent_message.
     let idle = await CherryMCPTools.call(

@@ -150,8 +150,9 @@ private final class PrivateLocalHost {
     let project = host.home.appendingPathComponent("project", isDirectory: true)
     try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
     let received = host.root.appendingPathComponent("received.log")
-    // A stand-in for Claude Code at a Bash permission prompt: it logs every
-    // byte it reads, in hex.
+    // A stand-in for Claude Code at a Bash permission prompt, which it also
+    // reports (OSC 7501, "approve Bash: rm -rf build", as Claude Code
+    // 2.1.295 does): it logs every byte it reads, in hex.
     let script = host.root.appendingPathComponent("claude")
     try """
         #!/bin/bash
@@ -164,6 +165,7 @@ private final class PrivateLocalHost {
         printf "│   2. Yes, and don't ask again for rm commands│\\n"
         printf '│   3. No, and tell Claude what to do differently (esc) │\\n'
         printf '╰──────────────────────────────────────────────╯\\n'
+        printf '\\033]7501;state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiBybSAtcmYgYnVpbGQ=\\033\\\\'
         stty raw -echo
         exec /usr/bin/perl -e 'use IO::Handle; open(my $log, ">>", $ARGV[0]) or die; $log->autoflush(1); my $c; while (sysread(STDIN, $c, 1)) { printf $log "%02x ", ord($c); }' '\(received.path)'
         """.write(to: script, atomically: true, encoding: .utf8)
@@ -210,8 +212,10 @@ private final class PrivateLocalHost {
         // is refused with nothing typed (above all no Enter).
         let server = try ParityControlServer(workspace: second)
         control = server
+        // Its host kept what it reported.
         let status = try await server.process(restored)
         #expect(status.agentActivityState == "permission")
+        #expect(status.programStatus?.message == "approve Bash: rm -rf build")
         let sent = try await server.send(.sendProcessInput(.init(
             processID: restored.id.uuidString, text: "also run the tests", submit: true
         )))

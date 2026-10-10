@@ -540,7 +540,7 @@ private func sessionID(of tab: TerminalSession) throws -> String {
     #expect(await harness.fake.wait { command.state == .exited(0) && agent.state == .exited(0) })
     try await Task.sleep(for: .milliseconds(200))
     #expect(workspace.sessions.map(\.id) == [anchor.id, command.id, agent.id])
-    #expect(agent.agentActivityState == .idle)
+    #expect(agent.agentActivityState == .unknown)
     #expect(agent.persistentSessionEndedMessage == "Session ended (exit 0)")
     #expect(harness.fake.requests("remove").isEmpty)
 }

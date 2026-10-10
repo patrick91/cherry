@@ -50,10 +50,16 @@ struct BackgroundSession: Equatable, Identifiable, Sendable {
     let createdAt: Date?
     /// The device it runs on (its name); nil for This Mac.
     var machine: String? = nil
-    /// Its agent is known to be at work: its title's spinner is live
-    /// (`AgentTitleHeartbeat`, set by `BackgroundSessionsModel.refresh`).
-    /// Unlike `isAtWork`, never for an agent that merely runs.
-    var isWorking = false
+    /// What its program says about itself: its root program status
+    /// record's state and kind (OSC 7501, set by
+    /// `BackgroundSessionsModel.refresh`), nil while it reports nothing.
+    /// Not its message, which changes as it works.
+    var programState: ProgramStatus.State?
+    var programKind: ProgramStatus.Kind?
+
+    /// Its program says it is at work: its program status reports
+    /// `working`. Unlike `isAtWork`, never for an agent that merely runs.
+    var isWorking: Bool { programState == .working }
 
     var isRunning: Bool { exitStatus == nil }
 
@@ -68,8 +74,13 @@ struct BackgroundSession: Equatable, Identifiable, Sendable {
 
 /// How a background session is named and described; pure, for tests.
 enum BackgroundSessionPresentation {
-    /// The status dot: a program at work, an idle one, or none once ended.
+    /// The status dot: a program waiting for the user, one that finished
+    /// or failed (its program said so), one at work, an idle one, or none
+    /// once ended.
     enum Tone: Equatable {
+        case attention
+        case finished
+        case failed
         case active
         case idle
         case ended
@@ -128,11 +139,19 @@ enum BackgroundSessionPresentation {
         projectRoot.map(MenuBarAgentPresentation.projectName(projectRoot:)) ?? "No project"
     }
 
-    /// "exit N" once ended, "attached" while a client shows it, what a busy
-    /// terminal runs, "running" for a command or agent, else "idle".
+    /// "exit N" once ended, what its program reports (OSC 7501), "attached"
+    /// while a client shows it, what a busy terminal runs, "running" for a
+    /// command or agent, else "idle".
     static func statusText(of session: BackgroundSession) -> String {
         if session.hostCrashed { return "host crashed" }
         if let status = session.exitStatus { return "exit \(status)" }
+        switch session.programState {
+        case .blocked?: return session.programKind == .permission ? "needs permission" : "needs you"
+        case .working?: return "working"
+        case .done?: return "done"
+        case .error?: return "failed"
+        case .idle?, .unknown?, nil: break
+        }
         if session.clients > 0 { return "attached" }
         switch session.kind {
         case .terminal:
@@ -143,7 +162,14 @@ enum BackgroundSessionPresentation {
     }
 
     static func tone(of session: BackgroundSession) -> Tone {
+        // A finished or failed program's record outlives it.
+        switch session.programState {
+        case .error?: return .failed
+        case .done?: return .finished
+        default: break
+        }
         guard session.isRunning else { return .ended }
+        if session.programState == .blocked { return .attention }
         return session.isAtWork ? .active : .idle
     }
 
@@ -299,6 +325,10 @@ final class BackgroundSessionsModel: ObservableObject {
     /// were (`notificationLimit` per minute).
     private var lastNotification: [String: Date] = [:]
     private var recentNotifications: [Date] = []
+    /// The root program status record each listed session had when last
+    /// looked at (`noteProgramStatus`), nil for one that reported none: what
+    /// a change is measured against. Only sessions in the list have one.
+    private var lastProgramStatus: [String: ProgramStatus?] = [:]
     /// The host whose saved unread marks were read into `unreadSessionIDs`.
     private var unreadLoadedForHost: String?
     /// How long the list has shown each ended session while the app was
@@ -313,6 +343,9 @@ final class BackgroundSessionsModel: ObservableObject {
     /// was suspended) does not count.
     static let endedCountMaximumGap: TimeInterval = 5
     private let postNotification: @MainActor (BackgroundSessionNotificationContent) -> Void
+    /// Whether a program status change to this state posts a notification
+    /// (Settings › Sessions: `blocked`, and `done`/`error`).
+    private let notifiesProgramState: @MainActor (ProgramStatus.State) -> Bool
     /// Removes the staged Ghostty resources no session uses any more, given
     /// the copies running sessions name (`cherry.resources`;
     /// `GhosttyResourceStager.removeStaleCopies`): once per run, from the
@@ -344,6 +377,13 @@ final class BackgroundSessionsModel: ObservableObject {
         postNotification: @escaping @MainActor (BackgroundSessionNotificationContent) -> Void = {
             TerminalNotificationCenter.shared.postBackgroundSession($0)
         },
+        notifiesProgramState: @escaping @MainActor (ProgramStatus.State) -> Bool = { state in
+            switch state {
+            case .blocked: TerminalSettings.shared.notifyWhenBackgroundProgramNeedsInput
+            case .done, .error: TerminalSettings.shared.notifyWhenBackgroundProgramFinishes
+            case .idle, .working, .unknown: false
+            }
+        },
         endedSessionGrace: TimeInterval = BackgroundSessionsModel.defaultEndedSessionGrace,
         now: @escaping @MainActor () -> Date = { Date() },
         isAppActive: @escaping @MainActor () -> Bool = { NSApp?.isActive ?? false },
@@ -364,6 +404,7 @@ final class BackgroundSessionsModel: ObservableObject {
         self.closesTabsOnCleanExit = closesTabsOnCleanExit
         self.presentAlert = presentAlert
         self.postNotification = postNotification
+        self.notifiesProgramState = notifiesProgramState
         self.endedSessionGrace = endedSessionGrace
         self.now = now
     }
@@ -423,7 +464,11 @@ final class BackgroundSessionsModel: ObservableObject {
                 switch event {
                 case .added, .removed, .exited, .resync:
                     self?.scheduleRefresh()
-                case .changed, .bell, .notification, .progress:
+                case .changed(let info):
+                    // Program status at once: the list's tick could miss
+                    // a turn that ends within it.
+                    self?.backgroundSessionDidChange(info)
+                case .bell, .notification, .progress:
                     break
                 }
             }
@@ -477,6 +522,7 @@ final class BackgroundSessionsModel: ObservableObject {
                 closesTabsOnCleanExit: closesTabsOnCleanExit,
                 presentAlert: presentAlert,
                 postNotification: postNotification,
+                notifiesProgramState: notifiesProgramState,
                 endedSessionGrace: endedSessionGrace,
                 now: now,
                 isAppActive: isAppActive,
@@ -522,6 +568,8 @@ final class BackgroundSessionsModel: ObservableObject {
         // Whether `listed` is what the host has now (unread marks of
         // sessions it no longer has go only then).
         var isLive = true
+        // Whether it is the control connection's (not a look's).
+        var isFromControl = false
         if isDevice, control.state != .connected {
             // A device is listed while its control is connected, or while
             // the panel is open from a look that started nothing there.
@@ -536,8 +584,12 @@ final class BackgroundSessionsModel: ObservableObject {
         } else {
             infos = control.sessions
             listed = knownHostID.map { backgroundSessions(in: infos, hostID: $0) } ?? []
+            isFromControl = knownHostID != nil
         }
-        listed = markingWorkingAgents(listed, from: infos)
+        listed = withProgramStatus(listed, from: infos)
+        if isFromControl, let hostID = knownHostID {
+            noteProgramStatus(of: listed, in: infos, hostID: hostID)
+        }
         listed = removeCleanlyEndedTerminals(listed)
         listed = removeExpiredEndedSessions(listed)
         removeStaleResourcesOnce()
@@ -557,21 +609,102 @@ final class BackgroundSessionsModel: ObservableObject {
         updateLease()
     }
 
-    /// Sets `isWorking` of the running agents of `listed` from their titles
-    /// in `infos` (`AgentTitleHeartbeat`).
-    private func markingWorkingAgents(_ listed: [BackgroundSession], from infos: [HostedSessionInfo]) -> [BackgroundSession] {
-        let titles = Dictionary(infos.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first })
-        let now = now()
-        agentHeartbeat.keep(only: Set(listed.map(\.id)))
+    /// Sets `programState` and `programKind` of the sessions of `listed`
+    /// from their programs' status in `infos` (OSC 7501: the root record).
+    private func withProgramStatus(_ listed: [BackgroundSession], from infos: [HostedSessionInfo]) -> [BackgroundSession] {
+        let roots = Dictionary(
+            infos.compactMap { info in info.programStatus.root.map { (info.id, $0) } },
+            uniquingKeysWith: { first, _ in first }
+        )
         return listed.map { session in
-            guard session.kind == .agent, session.isRunning else { return session }
             var session = session
-            session.isWorking = agentHeartbeat.isWorking(id: session.id, title: titles[session.id] ?? nil, now: now)
+            session.programState = roots[session.id]?.state
+            session.programKind = roots[session.id]?.kind
             return session
         }
     }
 
-    private var agentHeartbeat = AgentTitleHeartbeat()
+    /// Notes the program status of every session of `listed` (the control
+    /// connection's list) and forgets the sessions no longer in it: one
+    /// that comes back to the background is looked at afresh.
+    private func noteProgramStatus(of listed: [BackgroundSession], in infos: [HostedSessionInfo], hostID: String) {
+        let ids = Set(listed.map(\.id))
+        lastProgramStatus = lastProgramStatus.filter { ids.contains($0.key) }
+        for item in listed {
+            guard let info = infos.first(where: { $0.id == item.id }) else { continue }
+            noteProgramStatus(info, item: item, hostID: hostID)
+        }
+    }
+
+    /// The host changed a session (`HostSessionEvent.changed`): its program
+    /// status is noted at once when it is in the background, and its row
+    /// follows a new state.
+    private func backgroundSessionDidChange(_ info: HostedSessionInfo) {
+        guard let hostID = localSessions.control.hostID ?? knownHostID,
+              lastProgramStatus.keys.contains(info.id),
+              let item = backgroundSessions(in: [info], hostID: hostID).first
+        else { return }
+        noteProgramStatus(info, item: item, hostID: hostID)
+        let root = info.programStatus.root
+        if let row = sessions.first(where: { $0.id == info.id }),
+           row.programState != root?.state || row.programKind != root?.kind {
+            scheduleRefresh()
+        }
+    }
+
+    /// A background session's program status (OSC 7501, its root record)
+    /// against what it was when last looked at: a program that now waits
+    /// for the user (`blocked`, or blocked on something else), finished
+    /// (`done`) or failed (`error`) marks the session unread, as a bell
+    /// does, and is posted as the app's notification when Settings ›
+    /// Sessions asks for it (`notifiesProgramState`: by default only
+    /// `blocked`), at most every `notificationInterval` per session and
+    /// `notificationLimit` a minute. The first look at a session only notes
+    /// it: what its program reported before it went to the background, or
+    /// before this run, is not news.
+    private func noteProgramStatus(_ info: HostedSessionInfo, item: BackgroundSession, hostID: String) {
+        let root = info.programStatus.root
+        guard let previous = lastProgramStatus.updateValue(root, forKey: info.id),
+              let root, root.state != previous?.state || root.kind != previous?.kind
+        else { return }
+        switch root.state {
+        case .blocked, .done, .error:
+            markUnread(info.id, hostID: hostID)
+            guard notifiesProgramState(root.state) else { return }
+            postLimited(
+                BackgroundSessionNotificationContent(session: item, programStatus: root, machine: device?.name),
+                sessionID: info.id,
+                perSession: true
+            )
+        case .idle, .working, .unknown:
+            break
+        }
+    }
+
+    /// Marks the session unread, saved for its next tab
+    /// (`PersistentLocalSessions.noteUnread`); whether it was already.
+    @discardableResult
+    private func markUnread(_ sessionID: String, hostID: String) -> Bool {
+        let wasUnread = unreadSessionIDs.contains(sessionID)
+        localSessions.noteUnread(hostID: hostID, sessionID: sessionID)
+        unreadSessionIDs.insert(sessionID)
+        return wasUnread
+    }
+
+    /// Posts `content` unless `notificationLimit` were posted in the last
+    /// minute or, `perSession`, the session posted within
+    /// `notificationInterval`.
+    private func postLimited(_ content: BackgroundSessionNotificationContent, sessionID: String, perSession: Bool) {
+        let now = now()
+        if perSession, let last = lastNotification[sessionID], now.timeIntervalSince(last) < Self.notificationInterval {
+            return
+        }
+        recentNotifications.removeAll { now.timeIntervalSince($0) >= 60 }
+        guard recentNotifications.count < Self.notificationLimit else { return }
+        recentNotifications.append(now)
+        lastNotification[sessionID] = now
+        postNotification(content)
+    }
 
     /// The counts the app shows: This Mac's and every device's.
     private func updateSummary() {
@@ -671,25 +804,13 @@ final class BackgroundSessionsModel: ObservableObject {
               let item = backgroundSessions(in: [info], hostID: hostID).first
         else { return false }
         if case .progress = signal { return true }
-        let wasUnread = unreadSessionIDs.contains(info.id)
-        localSessions.noteUnread(hostID: hostID, sessionID: info.id)
-        unreadSessionIDs.insert(info.id)
-        let now = now()
-        switch signal {
-        case .bell:
-            guard !wasUnread else { return true }
-        case .notification:
-            if let last = lastNotification[info.id], now.timeIntervalSince(last) < Self.notificationInterval {
-                return true
-            }
-        case .progress:
-            return true
-        }
-        recentNotifications.removeAll { now.timeIntervalSince($0) >= 60 }
-        guard recentNotifications.count < Self.notificationLimit else { return true }
-        recentNotifications.append(now)
-        lastNotification[info.id] = now
-        postNotification(BackgroundSessionNotificationContent(session: item, signal: signal, machine: device?.name))
+        let wasUnread = markUnread(info.id, hostID: hostID)
+        if case .bell = signal, wasUnread { return true }
+        postLimited(
+            BackgroundSessionNotificationContent(session: item, signal: signal, machine: device?.name),
+            sessionID: info.id,
+            perSession: signal != .bell
+        )
         return true
     }
 

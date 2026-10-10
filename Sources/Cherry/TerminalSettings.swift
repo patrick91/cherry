@@ -311,24 +311,6 @@ final class TerminalSettings: ObservableObject {
         }
     }
 
-    @Published var attentionStudyEnabled: Bool {
-        didSet {
-            save(attentionStudyEnabled, forKey: Keys.attentionStudyEnabled, notifyTerminal: false)
-        }
-    }
-
-    /// Continuous attention sampling (`TerminalAttentionSampler`). Its
-    /// default depends on the app's identity
-    /// (`TerminalAttentionSampling.defaultEnabled`) and is never written:
-    /// only a change here stores a value.
-    @Published var attentionSamplesEnabled: Bool {
-        didSet {
-            guard attentionSamplesEnabled != oldValue else { return }
-            save(attentionSamplesEnabled, forKey: Keys.attentionSamplesEnabled, notifyTerminal: false)
-            attentionSamplesSettingDidChange()
-        }
-    }
-
     @Published var appearance: CherryAppearancePreference {
         didSet { save(appearance.rawValue, forKey: Keys.appearance) }
     }
@@ -370,6 +352,23 @@ final class TerminalSettings: ObservableObject {
         }
     }
 
+    /// A background session's program that waits for the user (program
+    /// status `blocked`, OSC 7501) posts a notification
+    /// (`BackgroundSessionsModel`); either way its row is marked.
+    @Published var notifyWhenBackgroundProgramNeedsInput: Bool {
+        didSet {
+            save(notifyWhenBackgroundProgramNeedsInput, forKey: Keys.notifyWhenBackgroundProgramNeedsInput, notifyTerminal: false)
+        }
+    }
+
+    /// A background session's program that finishes or fails (`done`,
+    /// `error`) posts a notification; either way its row is marked.
+    @Published var notifyWhenBackgroundProgramFinishes: Bool {
+        didSet {
+            save(notifyWhenBackgroundProgramFinishes, forKey: Keys.notifyWhenBackgroundProgramFinishes, notifyTerminal: false)
+        }
+    }
+
     var sessionPersistenceSettings: SessionPersistenceSettings {
         SessionPersistenceSettings(
             persistLocalSessions: persistLocalSessions,
@@ -379,20 +378,9 @@ final class TerminalSettings: ObservableObject {
     }
 
     private let defaults: UserDefaults
-    private let attentionSamplesSettingDidChange: @MainActor () -> Void
 
-    /// `attentionSamplesBundleIdentifier` picks the sampling default
-    /// (the app's own bundle identifier); `attentionSamplesSettingDidChange`
-    /// tells the sampler the setting changed.
-    init(
-        defaults: UserDefaults = .standard,
-        attentionSamplesBundleIdentifier: String? = Bundle.main.bundleIdentifier,
-        attentionSamplesSettingDidChange: @escaping @MainActor () -> Void = {
-            TerminalAttentionSampler.shared.settingDidChange()
-        }
-    ) {
+    init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.attentionSamplesSettingDidChange = attentionSamplesSettingDidChange
         fontSize = defaults.object(forKey: Keys.fontSize) as? Double ?? Defaults.fontSize
         cursorBlink = defaults.object(forKey: Keys.cursorBlink) as? Bool ?? Defaults.cursorBlink
         minimumContrast = defaults.object(forKey: Keys.minimumContrast) as? Double ?? Defaults.minimumContrast
@@ -404,12 +392,6 @@ final class TerminalSettings: ObservableObject {
             .flatMap(ProjectColorDisplayMode.init(rawValue:)) ?? Defaults.projectColorDisplayMode
         worktreeSpacesEnabled = defaults.object(forKey: Keys.worktreeSpacesEnabled) as? Bool
             ?? Defaults.worktreeSpacesEnabled
-        attentionStudyEnabled = defaults.object(forKey: Keys.attentionStudyEnabled) as? Bool
-            ?? Defaults.attentionStudyEnabled
-        attentionSamplesEnabled = TerminalAttentionSampling.isEnabled(
-            defaults: defaults,
-            bundleIdentifier: attentionSamplesBundleIdentifier
-        )
         appearance = (defaults.object(forKey: Keys.appearance) as? String)
             .flatMap(CherryAppearancePreference.init(rawValue:)) ?? Defaults.appearance
         lightTerminalThemeName = defaults.object(forKey: Keys.lightTerminalThemeName) as? String
@@ -426,6 +408,10 @@ final class TerminalSettings: ObservableObject {
             ?? Defaults.sessions.closeTabsOnCleanExit
         noticeBackgroundSessionsAtLaunch = defaults.object(forKey: Keys.noticeBackgroundSessionsAtLaunch) as? Bool
             ?? Defaults.noticeBackgroundSessionsAtLaunch
+        notifyWhenBackgroundProgramNeedsInput = defaults.object(forKey: Keys.notifyWhenBackgroundProgramNeedsInput) as? Bool
+            ?? Defaults.notifyWhenBackgroundProgramNeedsInput
+        notifyWhenBackgroundProgramFinishes = defaults.object(forKey: Keys.notifyWhenBackgroundProgramFinishes) as? Bool
+            ?? Defaults.notifyWhenBackgroundProgramFinishes
     }
 
     func resetTerminalAppearance() {
@@ -629,13 +615,14 @@ final class TerminalSettings: ObservableObject {
         static let sidebarTerminalPathDisplayMode = SidebarTerminalPathDisplayMode.repoFocused
         static let projectColorDisplayMode = ProjectColorDisplayMode.accent
         static let worktreeSpacesEnabled = false
-        static let attentionStudyEnabled = false
         static let appearance = CherryAppearancePreference.system
         static let lightTerminalThemeName = "Alabaster"
         static let darkTerminalThemeName = "Afterglow"
         static let defaultEditorID = ""
         static let sessions = SessionPersistenceSettings.defaults
         static let noticeBackgroundSessionsAtLaunch = true
+        static let notifyWhenBackgroundProgramNeedsInput = true
+        static let notifyWhenBackgroundProgramFinishes = false
     }
 
     private enum Keys {
@@ -646,8 +633,6 @@ final class TerminalSettings: ObservableObject {
         static let sidebarTerminalPathDisplayMode = "sidebar.terminalPathDisplayMode"
         static let projectColorDisplayMode = "sidebar.projectColorDisplayMode"
         static let worktreeSpacesEnabled = "features.worktreeSpaces"
-        static let attentionStudyEnabled = TerminalAttentionStudy.enabledDefaultsKey
-        static let attentionSamplesEnabled = TerminalAttentionSampling.enabledDefaultsKey
         static let appearance = "appearance.theme"
         static let lightTerminalThemeName = "terminal.theme.light"
         static let darkTerminalThemeName = "terminal.theme.dark"
@@ -656,6 +641,8 @@ final class TerminalSettings: ObservableObject {
         static let localSessionsOnQuit = "sessions.onQuit"
         static let closeTabsOnCleanExit = "sessions.closeTabOnExit"
         static let noticeBackgroundSessionsAtLaunch = "sessions.backgroundNoticeAtLaunch"
+        static let notifyWhenBackgroundProgramNeedsInput = "sessions.background.notifyNeedsInput"
+        static let notifyWhenBackgroundProgramFinishes = "sessions.background.notifyFinished"
     }
 
     private func terminalTheme(named name: String, fallback: String) -> GhosttyThemeDefinition {

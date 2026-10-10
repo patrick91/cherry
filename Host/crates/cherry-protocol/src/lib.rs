@@ -331,6 +331,12 @@ pub struct SessionInfo {
     /// session whose holder predates link version 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modify_other_keys: Option<bool>,
+    /// What the programs in the session say they are doing (OSC 7501
+    /// program status), the record updated longest ago first; at most
+    /// 64. Empty when none reported anything, and from a host or holder
+    /// older than the field (holder link version 11).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub program_status: Vec<ProgramStatus>,
     /// The `request_id` of the `Create` that made the session. It survives
     /// host restarts; None for a session whose host did not record it.
     #[serde(default)]
@@ -938,6 +944,67 @@ pub enum SessionEvent {
     /// This subscriber fell behind and missed events: list the sessions
     /// again.
     Resync,
+}
+
+/// A program status record (OSC 7501): the latest report a program sent
+/// about one id. The host keeps them by the specification's rules
+/// (https://www.superlogical.com/rex/docs/build/program-status): a report
+/// replaces its record whole, `working`, `blocked` and `idle` records go
+/// when the program exits or a shell starts a new prompt, a reset clears
+/// them all. The text is the program's, decoded and without control or
+/// invisible formatting characters, but untrusted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgramStatus {
+    /// Empty for the root record, the program itself; `/` separates a
+    /// child from its parent (`build/test`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub state: ProgramStatusState,
+    /// What a blocked program needs, when it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ProgramStatusKind>,
+    /// 0–100, for `working` and `blocked` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+    /// A stable name for the program (`claude-code`, `cargo`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// One line saying what the record is doing, waiting for or finished.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramStatusState {
+    /// At rest, waiting for the user's next instruction.
+    Idle,
+    Working,
+    /// Finished; the result waits for the user.
+    Done,
+    /// Can't go on until the user does something.
+    Blocked,
+    /// Failed and stopped.
+    Error,
+    /// A state a newer host knows.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramStatusKind {
+    /// Approval to do something.
+    Permission,
+    /// An answer the user has to give.
+    Question,
+    /// A login, password, token or other credential.
+    Auth,
+    /// A kind a newer host knows.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A progress report's state (OSC 9;4).
@@ -2627,6 +2694,7 @@ mod tests {
             application_cursor_keys: true,
             bracketed_paste: Some(true),
             modify_other_keys: Some(true),
+            program_status: Vec::new(),
             request_id: Some("d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3b".into()),
             ended_by: None,
             holder_log: None,

@@ -454,15 +454,23 @@ struct ControlAgentTaskPersistenceTests {
         let startedBack = try after.restoreTab(id: startedID, name: "Fakeworker", command: script)
         let restoredAt = Date()
 
+        // The worker asks for its task during the turn its kickoff starts,
+        // as a real one does: once that turn ends without it, the kickoff
+        // is typed again.
         var freshOutput = ""
-        for _ in 0..<100 {
+        for _ in 0..<200 {
             freshOutput = try await after.outputText(of: freshBack)
-            if freshOutput.contains("handled You are Cherry task \(freshTask.taskID)") { break }
-            try await Task.sleep(for: .milliseconds(100))
+            if freshOutput.contains("> You are Cherry task \(freshTask.taskID)") { break }
+            try await Task.sleep(for: .milliseconds(50))
         }
-        #expect(freshOutput.contains("handled You are Cherry task \(freshTask.taskID)"), "\(freshOutput)")
+        #expect(freshOutput.contains("> You are Cherry task \(freshTask.taskID)"), "\(freshOutput)")
         after.server.callerSessionResolverForTesting = { _ in freshBack }
         #expect(try await after.send(.getMyTask).error == nil)
+        for _ in 0..<100 where !freshOutput.contains("handled You are Cherry task \(freshTask.taskID)") {
+            try await Task.sleep(for: .milliseconds(100))
+            freshOutput = try await after.outputText(of: freshBack)
+        }
+        #expect(freshOutput.contains("handled You are Cherry task \(freshTask.taskID)"), "\(freshOutput)")
 
         // Not nudged within its grace (its turn counts start over).
         try await Task.sleep(for: .seconds(max(0, 2 - Date().timeIntervalSince(restoredAt))))

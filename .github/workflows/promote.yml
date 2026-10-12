@@ -1,0 +1,82 @@
+name: Promote
+
+# A tag vYYYY.MM.DD.N on the commit of vYYYY.MM.DD.N-pre (Scripts/promote) republishes that
+# pre-release's notarized files as a stable release, then adds its stable appcast item.
+# A tag push runs the tagged commit's copy of this file: keep it thin; scripts come from main.
+# While RELEASES_PAUSED is true, job release refuses and nothing is published.
+on:
+  push:
+    tags: ['v*', '!v*-pre']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Pre-release to promote (YYYY.MM.DD.N); empty promotes the newest
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Publish the stable release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # No environment: this job needs no secret, only the token.
+    permissions:
+      contents: write
+    concurrency:
+      group: cherry-promote
+      queue: max
+    outputs:
+      tag: ${{ steps.promote.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Promote
+        id: promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUESTED: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+          RELEASES_PAUSED: ${{ vars.RELEASES_PAUSED }}  # true: promote-release refuses, publishing nothing
+        run: Scripts/promote-release "$REQUESTED" --draft-id-file "$RUNNER_TEMP/draft-id" >> "$GITHUB_OUTPUT"
+      - name: Delete this run's draft
+        if: failure() || cancelled()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: Scripts/publish-github-release --cleanup "$RUNNER_TEMP/draft-id"
+
+  appcast:
+    name: Add the stable item to the appcast
+    needs: release
+    if: needs.release.outputs.tag != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: appcast
+    permissions:
+      contents: read
+    concurrency:
+      group: cherry-appcast
+      queue: max
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Merge the stable item into appcast.xml on R2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release.outputs.tag }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: Scripts/publish-appcast add-release "$TAG"

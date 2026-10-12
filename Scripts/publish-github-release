@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# Publishes a GitHub release safely (docs/releasing.md): a draft made through
+# the API, every file uploaded to that draft's id, each asset's size and
+# sha256 digest checked, then published; publishing a pre-release creates its
+# tag on --target. A failure or a kill deletes the draft (only while it is a
+# draft); a re-run starts over. Never deletes a tag. Portable (macOS, Linux).
+#
+#   Scripts/publish-github-release --prerelease --tag T --target SHA --title TITLE
+#       --notes FILE --draft-id-file F FILE...
+#   Scripts/publish-github-release --stable --latest true|false --verify-tag --tag T
+#       --target SHA --title TITLE --notes FILE --draft-id-file F FILE...
+#   Scripts/publish-github-release --cleanup F
+#
+# env: GH_TOKEN, GH_REPO (default: release.conf GITHUB_REPOSITORY)
+#
+# Without --verify-tag the tag must not exist yet; with it, it must exist on
+# SHA (Scripts/promote-release). The draft's id is written to F, so a later
+# step can `--cleanup F`: that deletes the release F names while it is still a
+# draft, and does nothing when F is missing or empty. Prints tag= and url= on
+# stdout; logs go to stderr.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+CONF=${CHERRY_RELEASE_CONF:-$root/Packaging/release.conf}
+conf() { sed -n "s/^$1=//p" "$CONF" | tail -n 1; }
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: Scripts/publish-github-release (--prerelease | --stable --latest true|false --verify-tag)
+         --tag T --target SHA --title TITLE --notes FILE --draft-id-file F FILE...
+       Scripts/publish-github-release --cleanup F
+EOF
+  exit 2
+}
+fail() { echo "::error::$*" >&2; exit 1; }
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d ' ' -f 1
+  else shasum -a 256 "$1" | cut -d ' ' -f 1; fi
+}
+
+GH_REPO=${GH_REPO:-$(conf GITHUB_REPOSITORY)}
+export GH_REPO
+[ -n "$GH_REPO" ] || fail "no GH_REPO and no GITHUB_REPOSITORY in $CONF"
+
+# Prints the answer of a GET; returns 1 when GitHub says the thing does not
+# exist (404, or 422 for commits/tags/T), and stops the script on any other
+# failure.
+gh_lookup() {
+  local err
+  err=$(mktemp)
+  if gh api "$@" 2>"$err"; then rm -f "$err"; return 0; fi
+  if grep -Eq 'HTTP (404|422)' "$err"; then rm -f "$err"; return 1; fi
+  cat "$err" >&2
+  rm -f "$err"
+  return 3
+}
+
+# Deletes release ID when it is still a draft.
+delete_draft() {
+  local id=$1 draft status=0
+  draft=$(gh_lookup "repos/$GH_REPO/releases/$id" --jq .draft) || status=$?
+  case $status in
+    0) ;;
+    1) echo "release $id is gone already" >&2; return 0 ;;
+    *) echo "::warning::could not look up release $id; it is left as it is" >&2; return 0 ;;
+  esac
+  if [ "$draft" = true ]; then
+    echo "deleting the draft release $id" >&2
+    gh api -X DELETE "repos/$GH_REPO/releases/$id" >/dev/null
+  else
+    echo "release $id is published; it is left as it is" >&2
+  fi
+}
+
+if [ "${1:-}" = --cleanup ]; then
+  [ $# -eq 2 ] || usage
+  if [ ! -s "$2" ]; then exit 0; fi
+  id=$(tr -d '[:space:]' < "$2")
+  [ -n "$id" ] || exit 0
+  case "$id" in *[!0-9]*) fail "$2 does not hold a release id" ;; esac
+  delete_draft "$id"
+  exit 0
+fi
+
+kind=""
+latest=""
+verify_tag=false
+tag=""
+target=""
+title=""
+notes=""
+draft_id_file=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prerelease) kind=prerelease; shift ;;
+    --stable) kind=stable; shift ;;
+    --latest) [ $# -ge 2 ] || usage; latest=$2; shift 2 ;;
+    --verify-tag) verify_tag=true; shift ;;
+    --tag) [ $# -ge 2 ] || usage; tag=$2; shift 2 ;;
+    --target) [ $# -ge 2 ] || usage; target=$2; shift 2 ;;
+    --title) [ $# -ge 2 ] || usage; title=$2; shift 2 ;;
+    --notes) [ $# -ge 2 ] || usage; notes=$2; shift 2 ;;
+    --draft-id-file) [ $# -ge 2 ] || usage; draft_id_file=$2; shift 2 ;;
+    --) shift; break ;;
+    -*) usage ;;
+    *) break ;;
+  esac
+done
+files=("$@")
+[ -n "$kind" ] && [ -n "$tag" ] && [ -n "$target" ] && [ -n "$title" ] && [ -n "$notes" ] \
+  && [ -n "$draft_id_file" ] && [ ${#files[@]} -gt 0 ] || usage
+case "$kind" in
+  prerelease)
+    [ -z "$latest" ] || fail "--latest is for --stable releases; a pre-release is never latest"
+    printf '%s\n' "$tag" | grep -Eq '^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[1-9][0-9]*-pre$' \
+      || fail "$tag is not a pre-release tag (vYYYY.MM.DD.N-pre)"
+    prerelease=true
+    make_latest=false
+    ;;
+  stable)
+    case "$latest" in true|false) ;; *) fail "--stable needs --latest true or --latest false" ;; esac
+    printf '%s\n' "$tag" | grep -Eq '^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[1-9][0-9]*$' \
+      || fail "$tag is not a stable tag (vYYYY.MM.DD.N)"
+    prerelease=false
+    make_latest=$latest
+    ;;
+esac
+printf '%s\n' "$target" | grep -Eq '^[0-9a-f]{40}$' || fail "--target $target is not a full commit SHA"
+[ -f "$notes" ] || fail "no notes file $notes"
+names=""
+for file in "${files[@]}"; do
+  [ -f "$file" ] || fail "no file $file"
+  name=$(basename "$file")
+  case " $names " in *" $name "*) fail "two files are named $name" ;; esac
+  names="$names $name"
+done
+
+# 1. Already published?
+status=0
+gh_lookup "repos/$GH_REPO/releases/tags/$tag" --jq .html_url > /dev/null || status=$?
+case $status in
+  0) fail "the release $tag is published already; a published release is never changed" ;;
+  1) ;;
+  *) exit 1 ;;
+esac
+
+# 2. The tag.
+tag_commit() {
+  gh_lookup -H 'Accept: application/vnd.github.sha' "repos/$GH_REPO/commits/tags/$tag"
+}
+if [ "$verify_tag" = true ]; then
+  status=0
+  commit=$(tag_commit) || status=$?
+  case $status in
+    0) [ "$commit" = "$target" ] || fail "the tag $tag is on $commit, not $target" ;;
+    1) fail "there is no tag $tag" ;;
+    *) exit 1 ;;
+  esac
+else
+  status=0
+  gh_lookup "repos/$GH_REPO/git/ref/tags/$tag" > /dev/null || status=$?
+  case $status in
+    0) fail "the tag $tag exists already; publishing would not put it on $target" ;;
+    1) ;;
+    *) exit 1 ;;
+  esac
+fi
+
+# 3. The draft. From here on, a failure or a kill deletes it while it is a draft.
+id=$(gh api -X POST "repos/$GH_REPO/releases" -f tag_name="$tag" -f target_commitish="$target" \
+  -f name="$title" -F draft=true -F prerelease="$prerelease" -F body=@"$notes" --jq .id)
+case "$id" in ''|*[!0-9]*) fail "creating the draft gave no release id: $id" ;; esac
+printf '%s\n' "$id" > "$draft_id_file"
+echo "created the draft release $id for $tag" >&2
+published=false
+work=$(mktemp -d)
+on_exit() {
+  local status=$?
+  if [ "$status" -ne 0 ] && [ "$published" != true ]; then
+    delete_draft "$id" || true
+  fi
+  rm -rf "$work"
+  exit "$status"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# 4. The uploads, by release id. No --retry: a POST retried after a lost
+#    answer would duplicate the asset; a re-run starts over instead.
+for file in "${files[@]}"; do
+  name=$(basename "$file")
+  echo "uploading $name ($(wc -c < "$file" | tr -d ' ') bytes)" >&2
+  curl -sS --fail-with-body -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+    -H "Content-Type: application/octet-stream" --data-binary "@$file" \
+    "https://uploads.github.com/repos/$GH_REPO/releases/$id/assets?name=$name" > "$work/upload.json" \
+    || { cat "$work/upload.json" >&2 2>/dev/null || true; fail "uploading $name failed"; }
+done
+
+# 5. The assets, as GitHub has them.
+gh api --paginate "repos/$GH_REPO/releases/$id/assets?per_page=100" \
+  --jq '.[] | [.name, .state, .size, (.digest // "")] | @tsv' > "$work/assets.tsv"
+count=$(grep -c . "$work/assets.tsv" || true)
+[ "$count" -eq "${#files[@]}" ] || fail "the draft has $count assets, not ${#files[@]}"
+for file in "${files[@]}"; do
+  name=$(basename "$file")
+  line=$(awk -F '\t' -v name="$name" '$1 == name' "$work/assets.tsv")
+  [ -n "$line" ] || fail "the draft has no asset $name"
+  state=$(printf '%s\n' "$line" | cut -f 2)
+  size=$(printf '%s\n' "$line" | cut -f 3)
+  digest=$(printf '%s\n' "$line" | cut -f 4)
+  local_size=$(wc -c < "$file" | tr -d ' ')
+  [ "$state" = uploaded ] || fail "the asset $name is $state, not uploaded"
+  [ "$size" = "$local_size" ] || fail "the asset $name is $size bytes, not $local_size"
+  if [ -n "$digest" ]; then
+    [ "$digest" = "sha256:$(sha256 "$file")" ] || fail "the asset $name has the digest $digest, not this file's"
+  fi
+done
+echo "the draft's $count assets match the files" >&2
+
+# 6. Publish.
+url=$(gh api -X PATCH "repos/$GH_REPO/releases/$id" -F draft=false -F prerelease="$prerelease" \
+  -f make_latest="$make_latest" --jq .html_url)
+published=true
+echo "published $tag: $url" >&2
+
+# 7. The tag publishing made (or --verify-tag checked) is on the target.
+status=0
+commit=$(tag_commit) || status=$?
+[ "$status" -eq 0 ] || fail "the published release $tag has no tag $tag"
+[ "$commit" = "$target" ] || fail "the published release's tag $tag is on $commit, not $target"
+
+# 8.
+echo "tag=$tag"
+echo "url=$url"
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+  printf '%s\n' "Published [$tag]($url)." "" >> "$GITHUB_STEP_SUMMARY"
+fi

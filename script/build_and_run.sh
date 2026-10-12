@@ -44,7 +44,10 @@ fi
 
 cd "$ROOT_DIR"
 
-pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+# `build` only builds the bundle: it leaves a running CherryDev alone.
+if [[ "$MODE" != build && "$MODE" != --build ]]; then
+  pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+fi
 
 if [[ "$BUNDLE_HOST" == 1 ]]; then
   # Always build: Cargo's own fingerprints decide what is stale, also when
@@ -62,6 +65,10 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_CONTENTS/Resources"
 cp "$BUILD_BINARY" "$APP_BINARY"
 chmod +x "$APP_BINARY"
+# The app binary links @rpath/Sparkle.framework (@executable_path/../Frameworks); without it dyld aborts at launch.
+[[ -d "$BUILD_BIN_DIR/Sparkle.framework" ]] || fail "Missing $BUILD_BIN_DIR/Sparkle.framework"
+mkdir -p "$APP_CONTENTS/Frameworks"
+ditto "$BUILD_BIN_DIR/Sparkle.framework" "$APP_CONTENTS/Frameworks/Sparkle.framework"
 if [[ "$BUNDLE_HOST" == 1 ]]; then
   # The GUI is named $APP_NAME, so on a case-insensitive volume `cherry`
   # stays a distinct file beside it.
@@ -120,6 +127,8 @@ case "$MODE" in
   run)
     open_app
     ;;
+  build|--build)
+    ;;
   --debug|debug)
     lldb -- "$APP_BINARY"
     ;;
@@ -137,7 +146,7 @@ case "$MODE" in
     pgrep -x "$APP_NAME" >/dev/null
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
+    echo "usage: $0 [run|build|--debug|--logs|--telemetry|--verify]" >&2
     exit 2
     ;;
 esac

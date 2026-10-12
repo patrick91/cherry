@@ -85,6 +85,86 @@ fn holders_keep_the_build_they_started_with_across_daemons() {
     host.kill(&session.id);
 }
 
+/// The path of process `pid`'s executable, as the kernel has it now.
+#[cfg(target_os = "macos")]
+fn executable_of(pid: i32) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length =
+        unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    assert!(
+        length > 0,
+        "no executable path for {pid}: {}",
+        std::io::Error::last_os_error()
+    );
+    buffer.truncate(length as usize);
+    std::ffi::OsString::from_vec(buffer).into()
+}
+
+/// An update that swaps the app bundle (Sparkle) relaunches the app before
+/// it deletes the old copy, which the daemon still runs from: the daemon
+/// says its executable changed and names the new build's, where it started
+/// from, so the new app's `cherry` hands it over, and new sessions' holders
+/// run the new build.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_daemon_whose_app_bundle_was_swapped_reports_its_executable_changed() {
+    let mut sandbox = Sandbox::new();
+    let app = sandbox.path().join("A.app");
+    let installed = app.join("Contents/MacOS/cherry-host");
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    fs::copy(BIN, &installed).unwrap();
+    sandbox.bin = installed.clone();
+    let host = Host::launch(sandbox, &[], None);
+    assert!(!status(&host).executable_changed);
+
+    // Moved aside, as the swap does with the old bundle: a move alone is no
+    // change, and the daemon's executable is where it went.
+    let old = host.dir().join("old");
+    fs::create_dir(&old).unwrap();
+    fs::rename(&app, old.join("A.app")).unwrap();
+    let old_installed = fs::canonicalize(old.join("A.app/Contents/MacOS/cherry-host")).unwrap();
+    let moved = status(&host);
+    assert!(!moved.executable_changed, "{moved:?}");
+    assert_eq!(
+        moved.executable.as_deref().map(Path::new),
+        Some(old_installed.as_path())
+    );
+
+    // The new bundle takes the old one's place while the old copy is still
+    // there.
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    fs::copy(BIN, &installed).unwrap();
+    let swapped = status(&host);
+    assert!(swapped.executable_changed, "{swapped:?}");
+    assert!(old_installed.exists());
+    // It names where new holders run from, not the old copy.
+    let new_installed = fs::canonicalize(&installed).unwrap();
+    assert_eq!(
+        swapped.executable.as_deref().map(Path::new),
+        Some(new_installed.as_path())
+    );
+    let session = host.create(shell("exec sleep 60"));
+    let holder = holder_of(&host.sandbox, &session.id);
+    assert!(is_holder(holder));
+    assert_eq!(executable_of(holder), fs::canonicalize(&installed).unwrap());
+    host.kill(&session.id);
+
+    // Once the old copy is deleted too.
+    fs::remove_dir_all(&old).unwrap();
+    let cleaned = status(&host);
+    assert!(cleaned.executable_changed, "{cleaned:?}");
+    assert_eq!(
+        cleaned.executable.as_deref().map(Path::new),
+        Some(new_installed.as_path())
+    );
+    let session = host.create(shell("exec sleep 60"));
+    let holder = holder_of(&host.sandbox, &session.id);
+    assert!(is_holder(holder));
+    assert_eq!(executable_of(holder), fs::canonicalize(&installed).unwrap());
+    host.kill(&session.id);
+}
+
 #[test]
 fn the_daemon_keeps_a_pid_file_while_it_runs() {
     let host = Host::new();

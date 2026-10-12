@@ -2,6 +2,7 @@ name: Portable session host
 
 on:
   push:
+    branches-ignore: [main]   # main runs this through prerelease.yml (workflow_call)
     paths:
       - "Host/**"
       - "Scripts/*host*"
@@ -13,6 +14,7 @@ on:
       - "Scripts/*host*"
       - ".github/workflows/host.yml"
       - ".github/actions/host-toolchain/**"
+  workflow_call:
   workflow_dispatch:
 
 permissions:

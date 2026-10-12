@@ -1,0 +1,43 @@
+name: Appcast
+
+# Takes a bad build out of https://updates.cherry.patrick.wtf/appcast.xml and keeps it out, or lets it
+# back in (docs/releasing.md, Pulling a bad release). Sparkle never downgrades: ship the fix too.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: remove takes the build out of the feed and keeps it out; restore lets it back in
+        type: choice
+        options: [remove, restore]
+        default: remove
+      version:
+        description: Version (YYYY.MM.DD.N) or build (<stamp>.<rev>)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  edit:
+    name: Edit appcast.xml
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: appcast
+    concurrency:
+      group: cherry-appcast
+      queue: max
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Remove or restore the build in appcast.xml on R2
+        shell: bash
+        env:
+          ACTION: ${{ inputs.action }}
+          VERSION: ${{ inputs.version }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: Scripts/publish-appcast "$ACTION" "$VERSION"

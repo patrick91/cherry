@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# Decides whether and what the pre-release job publishes for GITHUB_SHA
+# (docs/releasing.md): skips a commit that is not newer than the newest
+# published pre-release, heals a failed appcast write of the commit already
+# released, deletes stale pre-release drafts (never a tag), and picks the
+# build id, the version and the tag, then writes the release notes. Run by
+# .github/workflows/prerelease.yml in the repository's checkout (the current
+# directory); portable apart from the release notes' git and gh.
+#
+#   Scripts/release-plan --out DIR [--dry-run] [--no-fetch]
+#
+# env: GH_TOKEN, GH_REPO (default: release.conf GITHUB_REPOSITORY), GITHUB_SHA
+#      (default: HEAD); CHERRY_RELEASE_NOW (epoch seconds; tests only)
+#
+# Prints, on stdout: build= publish= appcast_tag= version= tag= build_id=
+# prev_tag= reason=. A dry run always builds, never publishes, deletes nothing
+# and gives no appcast_tag. --no-fetch reads the local refs and tags instead
+# of origin's. Writes DIR/notes.md (the release body) and DIR/notes.html (the
+# appcast item's description). The only write is deleting stale drafts.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+CONF=${CHERRY_RELEASE_CONF:-$root/Packaging/release.conf}
+conf() { sed -n "s/^$1=//p" "$CONF" | tail -n 1; }
+cherry_release() { "$root/Scripts/cherry-release" "$@"; }
+
+usage() { echo "Usage: Scripts/release-plan --out DIR [--dry-run] [--no-fetch]" >&2; exit 2; }
+out=""
+dry_run=false
+fetch=true
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out) [ $# -ge 2 ] || usage; out=$2; shift 2 ;;
+    --dry-run) dry_run=true; shift ;;
+    --no-fetch) fetch=false; shift ;;
+    *) usage ;;
+  esac
+done
+[ -n "$out" ] || usage
+mkdir -p "$out"
+
+GH_REPO=${GH_REPO:-$(conf GITHUB_REPOSITORY)}
+export GH_REPO
+[ -n "$GH_REPO" ] || { echo "error: no GH_REPO and no GITHUB_REPOSITORY in $CONF" >&2; exit 1; }
+sha=$(git rev-parse --verify "${GITHUB_SHA:-HEAD}^{commit}")
+
+pre_tag_pattern='^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[1-9][0-9]*-pre$'
+
+emit() { # BUILD PUBLISH APPCAST_TAG VERSION TAG BUILD_ID PREV_TAG REASON
+  printf 'build=%s\npublish=%s\nappcast_tag=%s\nversion=%s\ntag=%s\nbuild_id=%s\nprev_tag=%s\nreason=%s\n' "$@"
+  echo "release-plan: $8" >&2
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf '%s\n' "**Release plan:** $8" "" >> "$GITHUB_STEP_SUMMARY"
+  fi
+}
+
+# 1. main's tip.
+if [ "$fetch" = true ]; then
+  git fetch --quiet --force --tags origin '+refs/heads/main:refs/remotes/origin/main'
+  tip=$(git rev-parse refs/remotes/origin/main)
+else
+  tip=$(git rev-parse --verify -q refs/remotes/origin/main || git rev-parse HEAD)
+fi
+
+# 2. The releases: id, tag, draft, prerelease.
+releases="$out/releases.tsv"
+gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+  --jq '.[] | [.id, .tag_name, .draft, .prerelease] | @tsv' > "$releases"
+
+# 3. The newest published pre-release.
+prev_tag=$(awk -F '\t' '$3 == "false" && $4 == "true" { print $2 }' "$releases" \
+  | cherry_release version newest --kind prerelease)
+prev_sha=""
+if [ -n "$prev_tag" ]; then
+  prev_sha=$(git rev-parse --verify "refs/tags/$prev_tag^{commit}" 2>/dev/null) || {
+    echo "error: the pre-release $prev_tag has no tag $prev_tag in this repository (fetch its tags)" >&2
+    exit 1
+  }
+fi
+
+# 4. The guard.
+rewritten=false
+if [ -n "$prev_sha" ] && ! git merge-base --is-ancestor "$prev_sha" "$sha"; then
+  rewritten=true
+fi
+if [ "$dry_run" != true ] && [ -n "$prev_sha" ]; then
+  if [ "$sha" = "$prev_sha" ]; then
+    emit false false "$prev_tag" "" "" "" "$prev_tag" "already released as $prev_tag"
+    exit 0
+  fi
+  if git merge-base --is-ancestor "$sha" "$prev_sha"; then
+    emit false false "" "" "" "" "$prev_tag" "older than $prev_tag"
+    exit 0
+  fi
+  if [ "$rewritten" = true ]; then
+    if [ "$sha" = "$tip" ]; then
+      echo "::warning::main was rewritten: $prev_tag ($prev_sha) is not in the history of $sha; releasing main's tip" >&2
+    else
+      emit false false "" "" "" "" "$prev_tag" "not after $prev_tag in main's history, and not main's tip"
+      exit 0
+    fi
+  fi
+fi
+
+# 5. Stale drafts: a pre-release draft only this job (concurrency group
+#    cherry-prerelease) creates, left by a run that died. Tags stay: a stray
+#    vD.N-pre only makes the next N skip it.
+if [ "$dry_run" != true ]; then
+  awk -F '\t' '$3 == "true" && $4 == "true" { print $1 "\t" $2 }' "$releases" \
+  | while IFS="$(printf '\t')" read -r id tag; do
+      if printf '%s\n' "$tag" | grep -Eq "$pre_tag_pattern"; then
+        echo "release-plan: deleting the stale pre-release draft $tag (release $id)" >&2
+        gh api -X DELETE "repos/$GH_REPO/releases/$id" >/dev/null
+      fi
+    done
+fi
+
+# 6. The previous build, so the stamp never goes backwards.
+prev_build=""
+if [ -n "$prev_tag" ]; then
+  rm -rf "$out/prev"
+  if gh release download "$prev_tag" -R "$GH_REPO" -p appcast-item.xml -D "$out/prev" >&2 \
+    && prev_build=$(cherry_release appcast field "$out/prev/appcast-item.xml" version); then
+    :
+  else
+    prev_build=""
+    echo "::warning::could not read the build of $prev_tag (its appcast-item.xml); the stamp is only the clock" >&2
+  fi
+fi
+
+# 7. The build id and its UTC day.
+stamp=$(cherry_release stamp --sha "$sha" --now "${CHERRY_RELEASE_NOW:-$(date -u +%s)}" \
+  ${prev_build:+--prev-build "$prev_build"})
+build_id=$(printf '%s\n' "$stamp" | sed -n 's/^build_id=//p')
+day=$(printf '%s\n' "$stamp" | sed -n 's/^day=//p')
+
+# 8. The version: one more than any of that day's tags, here or on origin,
+#    and any release's tag (drafts included).
+{
+  if [ "$fetch" = true ]; then
+    git ls-remote --tags --refs origin | sed -n 's#^[0-9a-f]*[[:space:]]*refs/tags/##p'
+  else
+    git tag -l
+  fi
+  cut -f 2 "$releases"
+} > "$out/tags.txt"
+version=$(cherry_release version next --date "$day" < "$out/tags.txt")
+tag="v$version-pre"
+
+# 9. The notes.
+if [ -z "$prev_sha" ]; then
+  range=(-n 30 "$sha")
+elif [ "$rewritten" = true ]; then
+  if base=$(git merge-base "$prev_sha" "$sha"); then
+    range=("$base..$sha")
+  else
+    range=(-n 30 "$sha")
+  fi
+else
+  range=("$prev_sha..$sha")
+fi
+git log --no-merges --format='%H%x09%s' "${range[@]}" \
+  | cherry_release notes --repo "$GH_REPO" --tag "$tag" ${prev_tag:+--prev-tag "$prev_tag"} \
+      --build "$build_id" --md "$out/notes.md" --html "$out/notes.html"
+
+if [ "$dry_run" = true ]; then
+  emit true false "" "$version" "$tag" "$build_id" "$prev_tag" "dry run of $tag; nothing is published"
+elif [ -n "$prev_tag" ]; then
+  emit true true "" "$version" "$tag" "$build_id" "$prev_tag" "$tag follows $prev_tag"
+else
+  emit true true "" "$version" "$tag" "$build_id" "" "$tag is the first pre-release"
+fi

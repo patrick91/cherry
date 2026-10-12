@@ -178,16 +178,20 @@ It prints the daemon's build and protocol, pid and uptime, its socket, state
 directory and log, its sessions against the limit of 128 (exited ones
 included) and how many run, its connections against the limit of 1024, its
 holders (registered, still expected after a restart, lost when it started),
-its descriptor limit, whether its executable was replaced or removed since
-it started, this `cherry`'s build, and each session with the build of the
-holder that runs it (holders keep the build they started with; see
-[Updates](#updates)). `--json` prints `{"running": true, "build", "host_id",
-"protocol", "host": {…}, "pending_holders", "sessions": [{"id", "name",
-"state", "pid", "exit_code", "clients", "owner", "created_at",
-"holder_build"}], "client": {"build", "protocol"}}`; `host` is null for a
-daemon that predates `status` (its sessions are still listed). With no
-daemon running it says so (`{"running": false, "socket", "state_dir",
-"log_path", "client"}`) and exits with status 3.
+its descriptor limit, whether its executable was updated in place or removed
+since it started, this `cherry`'s build, and each session with the build of
+the holder that runs it (holders keep the build they started with; see
+[Updates](#updates)). On macOS, after an update in place (including one
+that swapped the app bundle while the old copy still exists), the executable
+it shows is where the daemon started from, which holds the new build now, and
+new sessions run that build until `cherry restart` moves the daemon to it
+too. `--json` prints `{"running": true, "build", "host_id", "protocol",
+"host": {…}, "pending_holders", "sessions": [{"id", "name", "state", "pid",
+"exit_code", "clients", "owner", "created_at", "holder_build"}], "client":
+{"build", "protocol"}}`; `host` is null for a daemon that predates `status`
+(its sessions are still listed). With no daemon running it says so
+(`{"running": false, "socket", "state_dir", "log_path", "client"}`) and exits
+with status 3.
 
 `cherry doctor` checks the local host and says how to fix what it finds,
 without starting one:
@@ -201,14 +205,15 @@ or disk image copy, a missing one, a build other than its own), the socket
 directory and socket (owner and mode, a stale socket nothing listens on, one
 another account serves, a daemon that does not answer), the running daemon
 (its protocol and build against this `cherry`'s, an executable an update
-replaced or removed, or one on a disk image, its descriptor limit against
-its connection limit, and its session and connection limits), the state
-directory, the daemon's PID file (`host.pid`: stale, or naming another
-process than the daemon that serves), the size of `host.log`, and, when no
-daemon runs, sessions whose holders still run without one. Each line is `ok`
-or `PROBLEM` followed by a `fix:` line; it exits with status 1 when it found
-a problem and 0 otherwise. With `--host` it refuses: run it on that machine
-(`ssh my-server cherry doctor`).
+installed in place (on macOS, named where the new build is) or removed, or
+one on a disk image, its descriptor limit against its connection limit, and
+its session and connection limits), the state directory, the daemon's PID
+file (`host.pid`: stale, or naming another process than the daemon that
+serves), the size of `host.log`, and, when no daemon runs, sessions whose
+holders still run without one. Each line is `ok` or `PROBLEM` followed by a
+`fix:` line; it exits with status 1 when it found a problem and 0 otherwise.
+With `--host` it refuses: run it on that machine (`ssh my-server cherry
+doctor`).
 
 `cherry control` connects as `list` does (starting a host, or replacing one
 that speaks an older protocol, when needed) and then relays protocol frames
@@ -926,9 +931,13 @@ app includes both session helpers; **This Mac** needs no separate CLI
 installation. Open a project and run a command in a tab, or choose **Create &
 Attach** in Persistent Sessions and run one there, then quit the app and
 reopen it: the tab comes back with the same program. This local build is
-ad-hoc signed by default and is not notarized. While the app runs from the
+signed as `Scripts/install-local-app` signs (Developer ID, else Apple
+Development, else ad hoc) and is not notarized. While the app runs from the
 disk image or an App Translocation location, its local tabs are ordinary tabs
 and **This Mac** is unavailable in Persistent Sessions; SSH hosts still work.
+Release builds (GitHub Releases) are Developer ID signed and notarized and
+update themselves with Sparkle; an update replaces the app in place, so the
+relaunched app hands the daemon over ([Updates](#updates)).
 
 `Scripts/install-local-app` bundles `cherry` and `cherry-host` beside the Mac
 app executable. It needs Rust for that; `CHERRY_SKIP_HOST=1` installs the app
@@ -1242,16 +1251,18 @@ than another. Locally, the next `cherry list`, `new` or `control` (never
 make way (`Restart`) and starts its own `cherry-host`, once, when that
 `cherry-host` is newer than the daemon's too and is the daemon's own
 executable (updated in place), or the daemon reports its executable was
-replaced or removed; the sessions carry on as above. It is not done while a
-systemd user service manages the daemon, nor, for an hour, again between two
-builds whose last handover came back with the older build still answering
-(recorded in `handover.json` in the state directory). A daemon of a newer
-build, of a development build, one of another installation, or one that does
-not report its build is left running, so two copies of Cherry never take
-turns replacing the daemon; `cherry restart` moves it to this build. The
-gateway does not do this for a remote host: run `cherry restart` there. (The
-Mac app's Update Session Host… does it for a device whose daemon runs an
-older install of its own; see [Remote hosts](#remote-hosts).)
+replaced or removed (including when the app bundle it started from was
+swapped for a new one, while the old copy still exists); the sessions carry
+on as above. It is not done while a systemd user service manages the daemon,
+nor, for an hour, again between two builds whose last handover came back
+with the older build still answering (recorded in `handover.json` in the
+state directory). A daemon of a newer build, of a development build, one of
+another installation, or one that does not report its build is left
+running, so two copies of Cherry never take turns replacing the daemon;
+`cherry restart` moves it to this build. The gateway does not do this for a
+remote host: run `cherry restart` there. (The Mac app's Update Session
+Host… does it for a device whose daemon runs an older install of its own;
+see [Remote hosts](#remote-hosts).)
 
 Running sessions keep the holders, and so the code, of the build that created
 them until they are removed; new sessions run the new build (`cherry status`

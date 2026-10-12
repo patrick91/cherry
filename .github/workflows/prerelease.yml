@@ -1,0 +1,283 @@
+name: Pre-release
+
+# Every push to main: the full test suite (app.yml and host.yml), then a Developer ID signed,
+# notarized pre-release vYYYY.MM.DD.N-pre and its item (channel "prerelease") in
+# https://updates.cherry.patrick.wtf/appcast.xml. docs/releasing.md.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build, sign and notarize main's tip; keep the files as a workflow artifact and publish nothing
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  app:
+    name: Mac app
+    uses: ./.github/workflows/app.yml
+    permissions:
+      contents: read
+
+  host:
+    name: Portable session host
+    uses: ./.github/workflows/host.yml
+    permissions:
+      contents: read
+
+  # The R2 credentials live in the appcast environment only; the build job
+  # (release environment) learns from this job whether they are set.
+  appcast-config:
+    name: Check the appcast credentials
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: appcast
+    permissions: {}
+    outputs:
+      secrets: ${{ steps.check.outputs.secrets }}
+    steps:
+      - name: Which appcast secrets are set
+        id: check
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          count=0
+          for name in CLOUDFLARE_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY; do
+            if [ -n "${!name:-}" ]; then count=$((count + 1)); fi
+          done
+          case $count in 0) value=none ;; 3) value=all ;; *) value=partial ;; esac
+          echo "secrets=$value" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and publish the pre-release
+    needs: [app, host, appcast-config]
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 150
+    environment: release
+    permissions:
+      contents: write          # create the release; publishing it creates its tag
+    # One build at a time, each waiting its turn (queue: max: the default would let a late,
+    # older commit evict a newer one's pending job). Scripts/release-plan skips a commit that
+    # is not newer than the last pre-release. Never cancel-in-progress (invalid with queue: max).
+    concurrency:
+      group: cherry-prerelease
+      queue: max
+    outputs:
+      tag: ${{ steps.publish.outputs.tag || steps.plan.outputs.appcast_tag }}
+    env:
+      GH_REPO: ${{ github.repository }}
+      DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0             # tags and history: the guard and the notes need them
+          persist-credentials: false # build scripts never see a token
+
+      - name: Check the release configuration
+        id: config
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          APPCAST_SECRETS: ${{ needs.appcast-config.outputs.secrets }}
+          RELEASES_PAUSED: ${{ vars.RELEASES_PAUSED }}
+        run: |
+          echo "WORK=$RUNNER_TEMP/release" >> "$GITHUB_ENV"
+          Scripts/release-preflight >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether and what to release
+        id: plan
+        if: steps.config.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$WORK"
+          args=(--out "$WORK")
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          Scripts/release-plan "${args[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Select Xcode
+        if: steps.plan.outputs.build == 'true'
+        uses: ./.github/actions/xcode
+
+      - name: Install Rust and the pinned Ghostty VT library
+        if: steps.plan.outputs.build == 'true'
+        uses: ./.github/actions/host-toolchain
+
+      # No secret is in this step's environment and no signing material exists yet:
+      # third-party build code (build.rs, SwiftPM, the Zig build) runs here. It shares
+      # the runner with the steps below that hold secrets, an accepted risk
+      # (docs/releasing.md, Secrets and variables). Release mode signs ad hoc; the
+      # next steps re-sign everything.
+      - name: Build Cherry.app
+        if: steps.plan.outputs.build == 'true'
+        timeout-minutes: 75
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          BUILD_ID: ${{ steps.plan.outputs.build_id }}
+        run: Scripts/package-release build --version "$VERSION" --build "$BUILD_ID" --out "$WORK/out"
+
+      - name: Import the Developer ID identity
+        if: steps.plan.outputs.build == 'true'
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          team=$(Scripts/cherry-release conf TEAM_ID)
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          password=$(openssl rand -base64 32)
+          p12="$RUNNER_TEMP/developer-id.p12"
+          printf '%s' "$DEVELOPER_ID_P12_BASE64" | base64 --decode > "$p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$p12" -k "$keychain" -f pkcs12 -P "$DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$p12"
+          if curl -fsSL --retry 3 https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer -o "$RUNNER_TEMP/g2.cer"; then
+            security import "$RUNNER_TEMP/g2.cer" -k "$keychain" || true
+          fi
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+          # One keychain path per word: the search list keeps the user's keychains after this one.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n "s/^ *[0-9]*) \([0-9A-F]\{40\}\) \"Developer ID Application: .*($team)\"\$/\1/p" | head -n 1)
+          [ -n "$identity" ] || { echo "::error::DEVELOPER_ID_P12_BASE64 holds no Developer ID Application identity of team $team"; exit 1; }
+          # Not CHERRY_CODESIGN_IDENTITY: Scripts/build-host reads that.
+          { echo "CHERRY_RELEASE_IDENTITY=$identity"; echo "CHERRY_KEYCHAIN=$keychain"; } >> "$GITHUB_ENV"
+
+      - name: Sign, check and smoke-test Cherry.app
+        if: steps.plan.outputs.build == 'true'
+        timeout-minutes: 25
+        env:
+          SKIP_SMOKE_TEST: ${{ vars.RELEASE_SKIP_SMOKE_TEST }}
+        run: |
+          args=(--out "$WORK/out" --identity "$CHERRY_RELEASE_IDENTITY" --keychain "$CHERRY_KEYCHAIN")
+          if [ "${SKIP_SMOKE_TEST:-}" = true ]; then
+            echo "::warning::RELEASE_SKIP_SMOKE_TEST is true: the signed app is not launched before release"
+            args+=(--no-smoke-test)
+          fi
+          Scripts/package-release sign "${args[@]}"
+
+      - name: Notarize and staple; make the zip and the disk image
+        if: steps.plan.outputs.build == 'true'
+        timeout-minutes: 80
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/notary-key"
+          export NOTARY_KEY_PATH="$RUNNER_TEMP/notary-key/AuthKey_$NOTARY_KEY_ID.p8"
+          printf '%s\n' "$NOTARY_KEY_P8" > "$NOTARY_KEY_PATH"
+          unset NOTARY_KEY_P8
+          Scripts/package-release finish --out "$WORK/out" --version "$VERSION" \
+            --identity "$CHERRY_RELEASE_IDENTITY" --keychain "$CHERRY_KEYCHAIN"
+
+      - name: Make the appcast item
+        if: steps.plan.outputs.build == 'true'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          Scripts/cherry-release appcast item --manifest "$WORK/out/release.json" --channel prerelease \
+            --tag "$TAG" --repo "$GH_REPO" --notes "$WORK/notes.html" --output "$WORK/out/appcast-item.xml"
+
+      - name: Keep the debug symbols
+        if: steps.plan.outputs.build == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cherry-${{ steps.plan.outputs.version }}-dsyms
+          path: ${{ runner.temp }}/release/out/dSYMs/
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Keep the dry run's files
+        if: steps.plan.outputs.build == 'true' && steps.plan.outputs.publish != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cherry-${{ steps.plan.outputs.version }}-dry-run
+          path: |
+            ${{ runner.temp }}/release/out/Cherry-*.zip
+            ${{ runner.temp }}/release/out/Cherry-*.dmg
+            ${{ runner.temp }}/release/out/SHA256SUMS
+            ${{ runner.temp }}/release/out/release.json
+            ${{ runner.temp }}/release/out/appcast-item.xml
+            ${{ runner.temp }}/release/out/notary/
+          retention-days: 7
+
+      - name: Publish the pre-release
+        id: publish
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          out="$WORK/out"
+          Scripts/publish-github-release --prerelease --tag "$TAG" --target "$GITHUB_SHA" \
+            --title "Cherry $VERSION (pre-release)" --notes "$WORK/notes.md" --draft-id-file "$WORK/draft-id" \
+            "$out/Cherry-$VERSION.zip" "$out/Cherry-$VERSION.dmg" "$out/SHA256SUMS" "$out/appcast-item.xml" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Delete this run's draft
+        if: (failure() || cancelled()) && steps.plan.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: Scripts/publish-github-release --cleanup "$WORK/draft-id"
+
+      - name: Remove the signing keychain and keys
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/release.keychain-db" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/notary-key" "$RUNNER_TEMP/developer-id.p12"
+
+  appcast:
+    name: Add the pre-release to the appcast
+    needs: build
+    if: needs.build.outputs.tag != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: appcast
+    permissions:
+      contents: read
+    # Shared with promote.yml and appcast.yml: one read-modify-write of appcast.xml at a time.
+    concurrency:
+      group: cherry-appcast
+      queue: max
+    steps:
+      # main's scripts and release.conf, whichever commit was released: every
+      # writer of the feed runs the same merge code.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Merge the release's item into appcast.xml on R2
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: Scripts/publish-appcast add-release "$TAG"

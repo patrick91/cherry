@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# Promotes a pre-release vV-pre to the stable release vV (docs/releasing.md):
+# the same notarized bytes (the zip, the versioned DMG and a copy named
+# Cherry.dmg), a new SHA256SUMS and the stable appcast item, published as
+# latest unless a newer stable release exists. Job release of
+# .github/workflows/promote.yml (no secrets, only the token; then job appcast
+# runs `Scripts/publish-appcast add-release vV`). Portable (macOS, Linux).
+#
+#   Scripts/promote-release REQUESTED --draft-id-file F
+#
+# REQUESTED is vV or V, or empty for the newest published pre-release.
+# env: GH_TOKEN, GH_REPO (default: release.conf GITHUB_REPOSITORY),
+#      RELEASES_PAUSED (the repository variable; `true` refuses, promoting nothing)
+#
+# Prints tag= url= already_stable=true|false on stdout. A version that is
+# stable already changes nothing (already_stable=true). It refuses a build the
+# appcast lists as pulled and a stable tag on another commit than vV-pre's;
+# with no stable tag yet (a dispatch), it makes the annotated tag on that
+# commit, once everything else checked out. Deletes only stale stable drafts
+# of vV, never a tag.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+CONF=${CHERRY_RELEASE_CONF:-$root/Packaging/release.conf}
+conf() { sed -n "s/^$1=//p" "$CONF" | tail -n 1; }
+cherry_release() { "$root/Scripts/cherry-release" "$@"; }
+
+usage() { echo "Usage: Scripts/promote-release REQUESTED --draft-id-file F" >&2; exit 2; }
+fail() { echo "::error::$*" >&2; exit 1; }
+summary() {
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; fi
+}
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"
+  else shasum -a 256 "$@"; fi
+}
+
+[ $# -ge 1 ] || usage
+requested=$1
+shift
+draft_id_file=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --draft-id-file) [ $# -ge 2 ] || usage; draft_id_file=$2; shift 2 ;;
+    *) usage ;;
+  esac
+done
+[ -n "$draft_id_file" ] || usage
+
+# Paused releases publish nothing, stable ones included. A tag pushed
+# meanwhile stays; once unpaused, Actions › Promote with its version
+# promotes it.
+if [ "${RELEASES_PAUSED:-}" = true ]; then
+  summary "Releases are paused (\`RELEASES_PAUSED\` is \`true\`): nothing was promoted." ""
+  fail "Releases are paused (RELEASES_PAUSED is true), so ${requested:-the newest pre-release} is not promoted. Unpause them (gh variable set RELEASES_PAUSED --body false), then run Actions › Promote with the version."
+fi
+
+GH_REPO=${GH_REPO:-$(conf GITHUB_REPOSITORY)}
+export GH_REPO
+[ -n "$GH_REPO" ] || fail "no GH_REPO and no GITHUB_REPOSITORY in $CONF"
+feed_url=$(conf SPARKLE_FEED_URL)
+
+# Prints the answer of a GET; returns 1 when GitHub says the thing does not
+# exist (404, or 422 for commits/tags/T), and 3 on any other failure.
+gh_lookup() {
+  local err
+  err=$(mktemp)
+  if gh api "$@" 2>"$err"; then rm -f "$err"; return 0; fi
+  if grep -Eq 'HTTP (404|422)' "$err"; then rm -f "$err"; return 1; fi
+  cat "$err" >&2
+  rm -f "$err"
+  return 3
+}
+tag_commit() { gh_lookup -H 'Accept: application/vnd.github.sha' "repos/$GH_REPO/commits/tags/$1"; }
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+  --jq '.[] | [.id, .tag_name, .draft, .prerelease] | @tsv' > "$work/releases.tsv"
+
+# 1. The version.
+if [ -z "$requested" ]; then
+  newest=$(awk -F '\t' '$3 == "false" && $4 == "true" { print $2 }' "$work/releases.tsv" \
+    | cherry_release version newest --kind prerelease)
+  [ -n "$newest" ] || fail "there is no published pre-release to promote"
+  version=${newest#v}
+  version=${version%-pre}
+  echo "promoting the newest pre-release, $newest" >&2
+else
+  version=${requested#v}
+  cherry_release version check "$version" || fail "\`$requested\` is not vYYYY.MM.DD.N"
+fi
+
+# 2.
+pre="v$version-pre"
+tag="v$version"
+
+# 3. The pre-release's commit.
+status=0
+pre_sha=$(tag_commit "$pre") || status=$?
+case $status in
+  0) ;;
+  1) fail "There is no pre-release \`$pre\`, so \`$tag\` promotes nothing. Delete the tag (\`git push origin :refs/tags/$tag\`) and promote an existing pre-release (Scripts/promote)." ;;
+  *) exit 1 ;;
+esac
+
+# 4. It must be a published pre-release.
+status=0
+pre_state=$(gh_lookup "repos/$GH_REPO/releases/tags/$pre" --jq '[.draft, .prerelease] | @tsv') || status=$?
+case $status in
+  0) [ "$pre_state" = "$(printf 'false\ttrue')" ] || fail "\`$pre\` is not a published pre-release" ;;
+  1) fail "\`$pre\` is a tag but not a published pre-release" ;;
+  *) exit 1 ;;
+esac
+
+# 5. The stable tag, when it exists, must be on the pre-release's commit.
+status=0
+gh_lookup "repos/$GH_REPO/git/ref/tags/$tag" > /dev/null || status=$?
+case $status in
+  0)
+    tag_exists=true
+    status=0
+    stable_sha=$(tag_commit "$tag") || status=$?
+    [ "$status" -eq 0 ] || fail "could not read the commit of \`$tag\`"
+    [ "$stable_sha" = "$pre_sha" ] \
+      || fail "\`$tag\` is on $stable_sha but \`$pre\` is on $pre_sha: delete it and run Scripts/promote $version."
+    ;;
+  1) tag_exists=false ;;
+  *) exit 1 ;;
+esac
+
+# 6. Already stable? Then job appcast re-merges its item, which changes nothing.
+status=0
+stable=$(gh_lookup "repos/$GH_REPO/releases/tags/$tag" --jq '[.draft, .prerelease, .html_url] | @tsv') || status=$?
+case $status in
+  0)
+    if [ "$(printf '%s\n' "$stable" | cut -f 1-2)" = "$(printf 'false\tfalse')" ]; then
+      url=$(printf '%s\n' "$stable" | cut -f 3)
+      echo "$tag is a stable release already: $url" >&2
+      echo "tag=$tag"
+      echo "url=$url"
+      echo "already_stable=true"
+      summary "\`$tag\` is a stable release already: $url" ""
+      exit 0
+    fi
+    fail "a published release \`$tag\` exists but is not a stable release; fix it by hand"
+    ;;
+  1) ;;
+  *) exit 1 ;;
+esac
+
+# 7. Pulled builds stay out.
+mkdir -p "$work/pre" "$work/stable"
+gh release download "$pre" -R "$GH_REPO" -p appcast-item.xml -D "$work/pre" >&2 \
+  || fail "could not download appcast-item.xml of \`$pre\`"
+build=$(cherry_release appcast field "$work/pre/appcast-item.xml" version)
+if [ -n "$feed_url" ] && curl -fsS "$feed_url?cb=$RANDOM" -o "$work/feed.xml" 2>"$work/feed.err"; then
+  status=0
+  cherry_release appcast is-pulled "$work/feed.xml" "$build" || status=$?
+  case $status in
+    0) fail "$version was pulled from the appcast; restore it first (Actions › Appcast › restore)." ;;
+    1) ;;
+    *) echo "::warning::could not read $feed_url; not checking whether $build was pulled" >&2 ;;
+  esac
+else
+  echo "::warning::could not fetch $feed_url; not checking whether $build was pulled" >&2
+fi
+
+# 8. Stale stable drafts of this tag (this job runs under cherry-promote, so
+#    no other promotion is uploading).
+awk -F '\t' -v tag="$tag" '$2 == tag && $3 == "true" && $4 == "false" { print $1 }' "$work/releases.tsv" \
+| while read -r id; do
+    echo "deleting the stale stable draft of $tag (release $id)" >&2
+    gh api -X DELETE "repos/$GH_REPO/releases/$id" >/dev/null
+  done
+
+# 9. The pre-release's files, checked against its SHA256SUMS.
+zip="Cherry-$version.zip"
+dmg="Cherry-$version.dmg"
+gh release download "$pre" -R "$GH_REPO" -p "$zip" -p "$dmg" -p SHA256SUMS -D "$work/pre" >&2 \
+  || fail "could not download $zip, $dmg and SHA256SUMS of \`$pre\`"
+for name in "$zip" "$dmg"; do
+  expected=$(awk -v name="$name" '$2 == name || $2 == "*" name { print $1 }' "$work/pre/SHA256SUMS")
+  [ -n "$expected" ] || fail "SHA256SUMS of \`$pre\` does not list $name"
+  actual=$(cd "$work/pre" && sha256 "$name" | cut -d ' ' -f 1)
+  [ "$actual" = "$expected" ] || fail "$name of \`$pre\` does not match its SHA256SUMS"
+done
+
+# 10. The stable files: the same bytes, Cherry.dmg, their sums and the stable item.
+cp "$work/pre/$zip" "$work/pre/$dmg" "$work/stable/"
+cp "$work/pre/$dmg" "$work/stable/Cherry.dmg"
+(cd "$work/stable" && sha256 "$zip" "$dmg" Cherry.dmg > SHA256SUMS)
+cherry_release appcast promote "$work/pre/appcast-item.xml" --tag "$tag" --repo "$GH_REPO" \
+  --zip "$work/stable/$zip" --output "$work/stable/appcast-item.xml"
+{
+  printf 'Promoted from [`%s`](https://github.com/%s/releases/tag/%s).\n\n' "$pre" "$GH_REPO" "$pre"
+  gh api "repos/$GH_REPO/releases/tags/$pre" --jq '.body // ""'
+} > "$work/notes.md"
+
+# 11. Latest, unless a newer stable release is.
+latest=true
+current=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name 2>/dev/null || true)
+if [ -n "$current" ] && cherry_release version check "${current#v}" \
+  && [ "$(cherry_release version compare "$current" "$tag")" = 1 ]; then
+  latest=false
+  echo "$current is newer, so it stays the latest release" >&2
+fi
+
+# 12. The stable tag (a dispatch has none yet), then the release.
+if [ "$tag_exists" = false ]; then
+  echo "tagging $pre_sha as $tag" >&2
+  tag_object=$(gh api -X POST "repos/$GH_REPO/git/tags" -f tag="$tag" -f message="Cherry $version" \
+    -f object="$pre_sha" -f type=commit --jq .sha)
+  gh api -X POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$tag" -f sha="$tag_object" >/dev/null
+fi
+"$root/Scripts/publish-github-release" --stable --latest "$latest" --verify-tag --tag "$tag" --target "$pre_sha" \
+  --title "Cherry $version" --notes "$work/notes.md" --draft-id-file "$draft_id_file" \
+  "$work/stable/$zip" "$work/stable/$dmg" "$work/stable/Cherry.dmg" "$work/stable/SHA256SUMS" \
+  "$work/stable/appcast-item.xml" > "$work/published.txt"
+
+# 13.
+url=$(sed -n 's/^url=//p' "$work/published.txt")
+echo "tag=$tag"
+echo "url=$url"
+echo "already_stable=false"
+summary "Promoted \`$pre\` to [\`$tag\`]($url) (latest: $latest)." ""

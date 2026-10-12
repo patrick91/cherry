@@ -2,40 +2,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIGURATION="${CHERRY_CONFIGURATION:-release}"
-APP_NAME="${CHERRY_APP_NAME:-Cherry}"
-DEFAULT_BUNDLE_ID="dev.patrick.cherry.local"
-BUNDLE_ID="${CHERRY_BUNDLE_ID:-$DEFAULT_BUNDLE_ID}"
-URL_SCHEME="${CHERRY_URL_SCHEME:-cherry}"
-APPLICATION_SUPPORT_NAME="${CHERRY_APPLICATION_SUPPORT_NAME:-Cherry}"
-CUSTOM_ICON="${CHERRY_ICON_PATH:-}"
-SKIP_HOST="${CHERRY_SKIP_HOST:-0}"
-INSTALL_DIR="${CHERRY_INSTALL_DIR:-$HOME/Applications}"
-# macOS keeps privacy grants (Downloads, Documents, …) for the app's
-# designated requirement. Ad hoc signing (`-`) makes that the binary's hash,
-# so every rebuild asks again; a certificate makes it stable across builds.
-# Default: the first "Apple Development" identity in the keychain, else ad
-# hoc. CHERRY_CODESIGN_IDENTITY overrides it (`-` forces ad hoc).
-if [ -n "${CHERRY_CODESIGN_IDENTITY:-}" ]; then
-  CODE_SIGN_IDENTITY="$CHERRY_CODESIGN_IDENTITY"
-else
-  CODE_SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
-    | sed -n 's/^ *[0-9][0-9]*) \([0-9A-F]\{40\}\) "Apple Development: .*"$/\1/p' | head -n 1)"
-  CODE_SIGN_IDENTITY="${CODE_SIGN_IDENTITY:--}"
-fi
-BUILD_DIR="$ROOT/.build/install"
-APP_PATH="$BUILD_DIR/$APP_NAME.app"
-INSTALL_PATH="$INSTALL_DIR/$APP_NAME.app"
-# Keep the GUI and CLI names distinct on case-insensitive macOS filesystems.
-GUI_EXECUTABLE="CherryApp"
-ICON_SOURCE="$ROOT/Sources/Cherry/Resources/AppIcon.icon"
-ICON_FALLBACK="$ROOT/Sources/Cherry/Resources/AppIcon.icns"
-ICON_INFO_PLIST="$BUILD_DIR/assetcatalog_generated_info.plist"
-ICON_NAME_PLIST='<key>CFBundleIconName</key><string>AppIcon</string>'
-# Only the app's runtime resource bundles. After a test build the SwiftPM bin
-# directory also holds Cherry_CherryTests.bundle (recorded terminal fixtures),
-# and it keeps bundles from removed targets; neither belongs in the app.
-RESOURCE_BUNDLES="Cherry_Cherry.bundle GhosttyKit_GhosttyTerminal.bundle"
 
 fail() {
   echo "$*" >&2
@@ -55,10 +21,144 @@ xml_escape() {
   printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
+# The release identity, its team and its update feed: Packaging/release.conf,
+# KEY=value lines that are read, never sourced. CHERRY_RELEASE_CONF names
+# another copy (tests, release-shaped local checks).
+CONF="${CHERRY_RELEASE_CONF:-$ROOT/Packaging/release.conf}"
+case "$CONF" in /*) ;; *) CONF="$PWD/$CONF" ;; esac
+[[ -f "$CONF" ]] || fail "Missing the release configuration $CONF"
+conf() {
+  sed -n "s/^$1=//p" "$CONF" | tail -n 1
+}
+RELEASE_BUNDLE_ID="$(conf RELEASE_BUNDLE_ID)"
+RELEASE_APP_NAME="$(conf RELEASE_APP_NAME)"
+TEAM_ID="$(conf TEAM_ID)"
+SPARKLE_FEED_URL="$(conf SPARKLE_FEED_URL)"
+SPARKLE_PUBLIC_ED_KEY="$(conf SPARKLE_PUBLIC_ED_KEY)"
+[[ -n "$RELEASE_BUNDLE_ID" && -n "$RELEASE_APP_NAME" && -n "$TEAM_ID" && -n "$SPARKLE_FEED_URL" ]] \
+  || fail "$CONF must set RELEASE_BUNDLE_ID, RELEASE_APP_NAME, TEAM_ID and SPARKLE_FEED_URL"
+# The local builds made before releases existed; their data is the release's.
+LEGACY_BUNDLE_ID="dev.patrick.cherry.local"
+
+# Release mode (Scripts/package-release build): the release identity, every
+# executable universal, the package's resolved versions only, and the version
+# and build it is given. Every check runs before the long builds.
+RELEASE="${CHERRY_RELEASE:-0}"
+case "$RELEASE" in
+  0|1) ;;
+  *) fail "CHERRY_RELEASE must be 0 or 1, not '$RELEASE'" ;;
+esac
+if [[ "$RELEASE" == 1 ]]; then
+  matches "${CHERRY_VERSION:-}" '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[1-9][0-9]*$' \
+    || fail "CHERRY_RELEASE=1 needs CHERRY_VERSION=YYYY.MM.DD.N, not '${CHERRY_VERSION:-}'"
+  matches "${CHERRY_BUILD_ID:-}" '^[0-9]{14}\.[0-9a-f]{7}$' \
+    || fail "CHERRY_RELEASE=1 needs CHERRY_BUILD_ID=<YYYYMMDDHHMMSS>.<first 7 hex digits of the commit>, not '${CHERRY_BUILD_ID:-}'"
+  [[ -n "${CHERRY_INSTALL_DIR:-}" ]] || fail "CHERRY_RELEASE=1 needs CHERRY_INSTALL_DIR"
+  refuse_override() {
+    if [[ -n "${!1:-}" && "${!1}" != "$2" ]]; then
+      fail "CHERRY_RELEASE=1 builds the release identity; unset $1 ('${!1}')"
+    fi
+  }
+  refuse_override CHERRY_APP_NAME "$RELEASE_APP_NAME"
+  refuse_override CHERRY_BUNDLE_ID "$RELEASE_BUNDLE_ID"
+  refuse_override CHERRY_APPLICATION_SUPPORT_NAME Cherry
+  refuse_override CHERRY_URL_SCHEME cherry
+  [[ "${CHERRY_KEEP_SURFACES_WARM:-1}" != 0 ]] || fail "CHERRY_RELEASE=1 refuses CHERRY_KEEP_SURFACES_WARM=0"
+  [[ "${CHERRY_SKIP_HOST:-0}" != 1 ]] || fail "CHERRY_RELEASE=1 refuses CHERRY_SKIP_HOST=1: a release carries the Persistent Sessions helpers"
+  [[ -z "${CHERRY_ICON_PATH:-}" ]] || fail "CHERRY_RELEASE=1 refuses CHERRY_ICON_PATH"
+  [[ -z "${CHERRY_GET_TASK_ALLOW:-}" || "${CHERRY_GET_TASK_ALLOW}" == 0 ]] \
+    || fail "CHERRY_RELEASE=1 refuses CHERRY_GET_TASK_ALLOW: a release never lets a debugger attach"
+  [[ -n "$SPARKLE_PUBLIC_ED_KEY" ]] \
+    || fail "CHERRY_RELEASE=1 needs SPARKLE_PUBLIC_ED_KEY in $CONF (Scripts/release-setup)"
+  export CHERRY_CONFIGURATION=release CHERRY_HOST_ARCHS=universal CHERRY_APP_ARCHS=universal
+  export CHERRY_SWIFT_BUILD_ARGS=--force-resolved-versions
+fi
+
+CONFIGURATION="${CHERRY_CONFIGURATION:-release}"
+APP_NAME="${CHERRY_APP_NAME:-$RELEASE_APP_NAME}"
+DEFAULT_BUNDLE_ID="$RELEASE_BUNDLE_ID"
+BUNDLE_ID="${CHERRY_BUNDLE_ID:-$DEFAULT_BUNDLE_ID}"
+URL_SCHEME="${CHERRY_URL_SCHEME:-cherry}"
+APPLICATION_SUPPORT_NAME="${CHERRY_APPLICATION_SUPPORT_NAME:-Cherry}"
+CUSTOM_ICON="${CHERRY_ICON_PATH:-}"
+SKIP_HOST="${CHERRY_SKIP_HOST:-0}"
+INSTALL_DIR="${CHERRY_INSTALL_DIR:-$HOME/Applications}"
+# native: this Mac's architecture; universal: arm64 and x86_64
+# (Scripts/build-universal), as releases are.
+APP_ARCHS="${CHERRY_APP_ARCHS:-native}"
+# 1 (local builds only): entitlements that let lldb and Instruments attach
+# under the hardened runtime.
+GET_TASK_ALLOW="${CHERRY_GET_TASK_ALLOW:-0}"
+ENTITLEMENTS="$ROOT/Packaging/Cherry.entitlements"
+# macOS keeps privacy grants (Downloads, Documents, …) for the app's
+# designated requirement. Ad hoc signing (`-`) makes that the binary's hash,
+# so every rebuild asks again; a certificate makes it stable across builds,
+# and a Developer ID of the release team makes it the releases' own, so
+# grants carry across local builds and releases. Locally the default is the
+# first Developer ID Application identity of TEAM_ID in the keychain, else
+# the first Apple Development one, else ad hoc; CHERRY_CODESIGN_IDENTITY
+# overrides it (`-` forces ad hoc). Release mode signs ad hoc unless told
+# otherwise: Scripts/package-release signs the app again.
+if [[ "$RELEASE" == 1 ]]; then
+  CODE_SIGN_IDENTITY="${CHERRY_CODESIGN_IDENTITY:--}"
+  if [[ "$CODE_SIGN_IDENTITY" == "-" ]]; then
+    IDENTITY_DESCRIPTION="ad hoc (Scripts/package-release signs the release)"
+  else
+    IDENTITY_DESCRIPTION="$CODE_SIGN_IDENTITY (CHERRY_CODESIGN_IDENTITY)"
+  fi
+elif [[ -n "${CHERRY_CODESIGN_IDENTITY:-}" ]]; then
+  CODE_SIGN_IDENTITY="$CHERRY_CODESIGN_IDENTITY"
+  IDENTITY_DESCRIPTION="$CODE_SIGN_IDENTITY (CHERRY_CODESIGN_IDENTITY)"
+else
+  IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+  # "<SHA-1> <name>" of the first valid identity whose name matches $1 (a
+  # basic regular expression).
+  first_identity() {
+    printf '%s\n' "$IDENTITIES" | sed -n "s/^ *[0-9][0-9]*) \([0-9A-F]\{40\}\) \"\($1\)\"\$/\1 \2/p" | sed -n 1p
+  }
+  CHOSEN_IDENTITY="$(first_identity "Developer ID Application: .* ($TEAM_ID)")"
+  [[ -n "$CHOSEN_IDENTITY" ]] || CHOSEN_IDENTITY="$(first_identity "Apple Development: .*")"
+  if [[ -n "$CHOSEN_IDENTITY" ]]; then
+    CODE_SIGN_IDENTITY="${CHOSEN_IDENTITY%% *}"
+    IDENTITY_DESCRIPTION="${CHOSEN_IDENTITY#* } ($CODE_SIGN_IDENTITY)"
+  else
+    CODE_SIGN_IDENTITY="-"
+    IDENTITY_DESCRIPTION="ad hoc (no Developer ID Application or Apple Development identity in the keychain)"
+  fi
+fi
+# A secure timestamp only for a release signed with a certificate: a local
+# build needs no network round trip.
+if [[ "$RELEASE" == 1 && "$CODE_SIGN_IDENTITY" != "-" ]]; then
+  TIMESTAMP_FLAG="--timestamp"
+else
+  TIMESTAMP_FLAG="--timestamp=none"
+fi
+BUILD_DIR="$ROOT/.build/install"
+APP_PATH="$BUILD_DIR/$APP_NAME.app"
+INSTALL_PATH="$INSTALL_DIR/$APP_NAME.app"
+# Keep the GUI and CLI names distinct on case-insensitive macOS filesystems.
+GUI_EXECUTABLE="CherryApp"
+ICON_SOURCE="$ROOT/Sources/Cherry/Resources/AppIcon.icon"
+ICON_FALLBACK="$ROOT/Sources/Cherry/Resources/AppIcon.icns"
+ICON_INFO_PLIST="$BUILD_DIR/assetcatalog_generated_info.plist"
+ICON_NAME_PLIST='<key>CFBundleIconName</key><string>AppIcon</string>'
+# Only the app's runtime resource bundles. After a test build the SwiftPM bin
+# directory also holds Cherry_CherryTests.bundle (recorded terminal fixtures),
+# and it keeps bundles from removed targets; neither belongs in the app.
+RESOURCE_BUNDLES="Cherry_Cherry.bundle GhosttyKit_GhosttyTerminal.bundle"
+
 case "$SKIP_HOST" in
   0) BUNDLE_HOST=1 ;;
   1) BUNDLE_HOST=0 ;;
   *) fail "CHERRY_SKIP_HOST must be 0 or 1, not '$SKIP_HOST'" ;;
+esac
+case "$APP_ARCHS" in
+  native|universal) ;;
+  *) fail "CHERRY_APP_ARCHS must be native or universal, not '$APP_ARCHS'" ;;
+esac
+case "$GET_TASK_ALLOW" in
+  0|1) ;;
+  *) fail "CHERRY_GET_TASK_ALLOW must be 0 or 1, not '$GET_TASK_ALLOW'" ;;
 esac
 
 # Validate everything before the long builds. CherryAppIdentity silently falls
@@ -78,6 +178,12 @@ fi
 case "$APP_NAME" in
   ""|.|..|*/*) fail "CHERRY_APP_NAME must be a file name without '/': '$APP_NAME'" ;;
 esac
+# The release identity updates itself (Sparkle) and owns Cherry's data and
+# scheme; only the full release identity gets the update feed.
+if [[ "$BUNDLE_ID" == "$RELEASE_BUNDLE_ID" ]] \
+  && [[ "$APP_NAME" != "$RELEASE_APP_NAME" || "$APPLICATION_SUPPORT_NAME" != "Cherry" || "$URL_SCHEME" != "cherry" ]]; then
+  fail "$RELEASE_BUNDLE_ID is the release identity, which updates itself; set CHERRY_BUNDLE_ID (and CHERRY_APPLICATION_SUPPORT_NAME, CHERRY_URL_SCHEME) for a variant."
+fi
 if [[ "$BUNDLE_ID" != "$DEFAULT_BUNDLE_ID" ]]; then
   if [[ "$APPLICATION_SUPPORT_NAME" == "Cherry" ]]; then
     echo "warning: $BUNDLE_ID shares the main Cherry's application data; set CHERRY_APPLICATION_SUPPORT_NAME for a separate variant" >&2
@@ -107,6 +213,12 @@ fi
 
 cd "$ROOT"
 
+# A release ships the notices of exactly the packages it resolves.
+if [[ "$RELEASE" == 1 ]]; then
+  "$ROOT/Scripts/app-notices" --check \
+    || fail "Packaging/THIRD_PARTY_NOTICES.txt does not match Package.resolved or GhosttyKit: run Scripts/app-notices --write and commit it."
+fi
+
 # Live-surface keep-warm is ON by default (the in-code default keeps
 # recently-used Ghostty surfaces alive across tab switches instead of freeing +
 # replaying them). Opt out (old replay-on-switch behavior) with
@@ -123,13 +235,25 @@ else
 fi
 
 echo "Building with native PTY (Ghostty owns the PTY)"
+echo "Signing with $IDENTITY_DESCRIPTION"
 
-GIT_REVISION="$(git rev-parse --short HEAD 2>/dev/null || echo local)"
-BUILD_NUMBER="$(date -u +%Y%m%d%H%M%S)"
+# CFBundleShortVersionString and CFBundleVersion. A release is given both;
+# a local build is the day's version marked -local, and its build is
+# <UTC time>.<first 7 hex digits of the commit> (`.local` outside git).
+if [[ "$RELEASE" == 1 ]]; then
+  APP_VERSION="$CHERRY_VERSION"
+  BUILD_ID="$CHERRY_BUILD_ID"
+else
+  APP_VERSION="$(date -u +%Y.%m.%d)-local"
+  GIT_REVISION="$(git rev-parse HEAD 2>/dev/null || true)"
+  GIT_REVISION="${GIT_REVISION:0:7}"
+  matches "$GIT_REVISION" '^[0-9a-f]{7}$' || GIT_REVISION="local"
+  BUILD_ID="$(date -u +%Y%m%d%H%M%S).$GIT_REVISION"
+fi
 # The helpers report the app's CFBundleVersion as their build, so that the
 # updated app's helpers hand a daemon of an older build over to theirs
 # (Host/README.md, Updates).
-export CHERRY_BUILD_ID="$BUILD_NUMBER.$GIT_REVISION"
+export CHERRY_BUILD_ID="$BUILD_ID"
 
 # The helpers build first: on a fresh checkout this downloads Zig and fetches
 # Ghostty, so a network or toolchain failure stops before the Swift build.
@@ -143,11 +267,22 @@ fi
 # agents in their tabs (docs/specs/remote-devices.md, phase 4b). Built before
 # the app, since each triple's build may share SwiftPM's products directory.
 MCP_HELPER_PATH="$("$ROOT/Scripts/build-mcp-helper" "$CONFIGURATION" | tail -n 1)"
-# shellcheck disable=SC2086 # EXTRA_BUILD_ARGS is split on purpose (see above).
-swift build -c "$CONFIGURATION" --product Cherry $EXTRA_BUILD_ARGS
+# CHERRY_SWIFT_BUILD_ARGS (release mode: --force-resolved-versions) goes to
+# every Swift build, split like EXTRA_BUILD_ARGS.
+# shellcheck disable=SC2086 # EXTRA_BUILD_ARGS and CHERRY_SWIFT_BUILD_ARGS are split on purpose (see above).
+if [[ "$APP_ARCHS" == universal ]]; then
+  BINARY_PATH="$("$ROOT/Scripts/build-universal" Cherry "$CONFIGURATION" --archs universal -- $EXTRA_BUILD_ARGS ${CHERRY_SWIFT_BUILD_ARGS:-} | tail -n 1)"
+  # This Mac's triple was built last; its products directory holds the
+  # resource bundles and Sparkle.framework.
+  MINIMUM_MACOS="$(sed -n 's/.*\.macOS(\.v\([0-9][0-9]*\)).*/\1/p' Package.swift | sed -n 1p)"
+  [[ -n "$MINIMUM_MACOS" ]] || fail "Could not read the macOS version from Package.swift"
+  BIN_DIR="$(swift build -c "$CONFIGURATION" --product Cherry --triple "$(uname -m)-apple-macosx$MINIMUM_MACOS.0" ${CHERRY_SWIFT_BUILD_ARGS:-} --show-bin-path)"
+else
+  swift build -c "$CONFIGURATION" --product Cherry $EXTRA_BUILD_ARGS ${CHERRY_SWIFT_BUILD_ARGS:-}
+  BIN_DIR="$(swift build -c "$CONFIGURATION" ${CHERRY_SWIFT_BUILD_ARGS:-} --show-bin-path)"
+  BINARY_PATH="$BIN_DIR/Cherry"
+fi
 
-BIN_DIR="$(swift build -c "$CONFIGURATION" --show-bin-path)"
-BINARY_PATH="$BIN_DIR/Cherry"
 rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BINARY_PATH" "$APP_PATH/Contents/MacOS/$GUI_EXECUTABLE"
@@ -168,10 +303,36 @@ if [[ "$BUNDLE_HOST" == 1 ]]; then
       fail "The Persistent Sessions helpers are not universal (arm64 and x86_64); see the error above."
     fi
   fi
-  mkdir -p "$APP_PATH/Contents/Resources/HostLicenses"
-  cp "$ROOT/Host/vendor/ghostty-vt/LICENSE" "$APP_PATH/Contents/Resources/HostLicenses/Ghostty-LICENSE"
-  cp "$ROOT/Host/vendor/ghostty-vt/THIRD_PARTY_NOTICES.txt" "$APP_PATH/Contents/Resources/HostLicenses/Ghostty-THIRD_PARTY_NOTICES.txt"
-  cp "$ROOT/Host/THIRD_PARTY_NOTICES.txt" "$APP_PATH/Contents/Resources/HostLicenses/Rust-THIRD_PARTY_NOTICES.txt"
+fi
+# A release runs on Apple silicon and Intel Macs alike.
+if [[ "$RELEASE" == 1 ]]; then
+  "$ROOT/Scripts/check-helper-archs" "$APP_PATH/Contents/MacOS/$GUI_EXECUTABLE" \
+    || fail "The app executable is not universal (arm64 and x86_64); see the error above."
+fi
+
+# CherryApp links @rpath/Sparkle.framework, found through the
+# @executable_path/../Frameworks run path Package.swift adds; without the
+# framework dyld aborts at launch. Its XPC services are for sandboxed apps,
+# and Sparkle documents removing them. Scripts/sign-app signs it.
+[[ -d "$BIN_DIR/Sparkle.framework" ]] || fail "Missing $BIN_DIR/Sparkle.framework (the Sparkle package's framework)"
+SPARKLE_FRAMEWORK="$APP_PATH/Contents/Frameworks/Sparkle.framework"
+mkdir -p "$APP_PATH/Contents/Frameworks"
+ditto "$BIN_DIR/Sparkle.framework" "$SPARKLE_FRAMEWORK"
+rm -rf "$SPARKLE_FRAMEWORK/Versions/B/XPCServices" "$SPARKLE_FRAMEWORK/XPCServices"
+LOAD_COMMANDS="$(otool -l "$APP_PATH/Contents/MacOS/$GUI_EXECUTABLE")"
+[[ "$LOAD_COMMANDS" == *"path @executable_path/../Frameworks "* ]] \
+  || fail "$GUI_EXECUTABLE has no @executable_path/../Frameworks run path (Package.swift's linker settings), so it cannot load the embedded Sparkle.framework."
+
+# Third-party notices: the Swift packages and GhosttyKit (Scripts/app-notices),
+# Ghostty's license, and with the helpers libghostty-vt's and the Rust
+# crates' notices.
+LICENSES_DIR="$APP_PATH/Contents/Resources/Licenses"
+mkdir -p "$LICENSES_DIR"
+cp "$ROOT/Packaging/THIRD_PARTY_NOTICES.txt" "$LICENSES_DIR/App-THIRD_PARTY_NOTICES.txt"
+cp "$ROOT/Host/vendor/ghostty-vt/LICENSE" "$LICENSES_DIR/Ghostty-LICENSE"
+if [[ "$BUNDLE_HOST" == 1 ]]; then
+  cp "$ROOT/Host/vendor/ghostty-vt/THIRD_PARTY_NOTICES.txt" "$LICENSES_DIR/Ghostty-VT-THIRD_PARTY_NOTICES.txt"
+  cp "$ROOT/Host/THIRD_PARTY_NOTICES.txt" "$LICENSES_DIR/Rust-THIRD_PARTY_NOTICES.txt"
 fi
 
 # CherryResources and GhosttyRuntimeResources explicitly resolve packaged
@@ -211,15 +372,46 @@ elif [[ -d "$ICON_SOURCE" ]] && xcrun --find actool >/dev/null 2>&1; then
     --bundle-identifier "$BUNDLE_ID" >/dev/null; then
     :
   else
-    echo "warning: failed to compile AppIcon.icon with actool; using AppIcon.icns fallback" >&2
+    # A release says so as a workflow annotation, so a run that ships the
+    # fallback icon shows it (actool can fail until `xcodebuild -runFirstLaunch`).
+    if [[ "$RELEASE" == 1 ]]; then
+      echo "::warning::failed to compile AppIcon.icon with actool; this release uses the AppIcon.icns fallback" >&2
+    else
+      echo "warning: failed to compile AppIcon.icon with actool; using AppIcon.icns fallback" >&2
+    fi
     cp "$ICON_FALLBACK" "$APP_PATH/Contents/Resources/AppIcon.icns"
   fi
 else
+  if [[ "$RELEASE" == 1 ]]; then
+    echo "::warning::no actool (or no AppIcon.icon); this release uses the AppIcon.icns fallback" >&2
+  fi
   cp "$ICON_FALLBACK" "$APP_PATH/Contents/Resources/AppIcon.icns"
 fi
 
 APP_NAME_XML="$(xml_escape "$APP_NAME")"
 APPLICATION_SUPPORT_NAME_XML="$(xml_escape "$APPLICATION_SUPPORT_NAME")"
+# What macOS shows when a program in a tab asks for a protected resource:
+# the programs are Cherry's children, so their requests are Cherry's.
+PROGRAM_WOULD_LIKE_TO="A program running in $APP_NAME_XML would like to"
+LOCATION_USAGE="$PROGRAM_WOULD_LIKE_TO use your location."
+FOLDER_USAGE="$APP_NAME_XML and the programs running in it would like to access files in this folder."
+# Sparkle's settings, only for the full release identity with a public key
+# (Packaging/release.conf): every other bundle has no feed and never updates.
+UPDATE_PLIST=""
+if [[ "$BUNDLE_ID" == "$RELEASE_BUNDLE_ID" && -n "$SPARKLE_PUBLIC_ED_KEY" ]]; then
+  UPDATE_PLIST="<key>SUFeedURL</key>
+  <string>$(xml_escape "$SPARKLE_FEED_URL")</string>
+  <key>SUPublicEDKey</key>
+  <string>$(xml_escape "$SPARKLE_PUBLIC_ED_KEY")</string>
+  <key>SUEnableAutomaticChecks</key>
+  <true/>
+  <key>SUAutomaticallyUpdate</key>
+  <true/>
+  <key>SUScheduledCheckInterval</key>
+  <integer>3600</integer>
+  <key>SUVerifyUpdateBeforeExtraction</key>
+  <true/>"
+fi
 
 cat > "$APP_PATH/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -248,7 +440,7 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0-local</string>
+  <string>$APP_VERSION</string>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
@@ -261,7 +453,7 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
     </dict>
   </array>
   <key>CFBundleVersion</key>
-  <string>$BUILD_NUMBER.$GIT_REVISION</string>
+  <string>$BUILD_ID</string>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.developer-tools</string>
   <key>LSMinimumSystemVersion</key>
@@ -272,30 +464,154 @@ cat > "$APP_PATH/Contents/Info.plist" <<PLIST
   <false/>
   <key>NSSupportsSuddenTermination</key>
   <false/>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO control other apps.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO use the camera.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO use the microphone.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO record the audio other apps play.</string>
+  <key>NSContactsUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO access your contacts.</string>
+  <key>NSCalendarsUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO access your calendars.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO access your calendars.</string>
+  <key>NSRemindersUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO access your reminders.</string>
+  <key>NSRemindersFullAccessUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO access your reminders.</string>
+  <key>NSPhotoLibraryUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO access your photo library.</string>
+  <key>NSLocationUsageDescription</key>
+  <string>$LOCATION_USAGE</string>
+  <key>NSLocationTemporaryUsageDescriptionDictionary</key>
+  <dict>
+    <key>Default</key>
+    <string>$LOCATION_USAGE</string>
+  </dict>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO use Bluetooth.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO use speech recognition.</string>
+  <key>NSSystemAdministrationUsageDescription</key>
+  <string>$PROGRAM_WOULD_LIKE_TO make changes that need an administrator.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>$APP_NAME_XML and the programs running in it connect to Macs and servers on your local network.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>$FOLDER_USAGE</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>$FOLDER_USAGE</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>$FOLDER_USAGE</string>
+  $UPDATE_PLIST
 </dict>
 </plist>
 PLIST
 
 plutil -lint "$APP_PATH/Contents/Info.plist" >/dev/null
 
-if command -v codesign >/dev/null 2>&1; then
-  # No secure timestamp: a local build needs no network round trip.
-  codesign --force --deep --timestamp=none --sign "$CODE_SIGN_IDENTITY" "$APP_PATH" >/dev/null
-  if [ "$CODE_SIGN_IDENTITY" = "-" ]; then
-    echo "Signed ad hoc: macOS asks again for privacy access after each install (set CHERRY_CODESIGN_IDENTITY to keep it)."
-  fi
+# Inside out, never --deep (Scripts/sign-app): Sparkle's helpers, the
+# framework, the helpers, then the app with its entitlements; the hardened
+# runtime and the entitlements only when the identity's certificate has a
+# Team ID (ad hoc and a self-signed certificate get neither).
+SIGNING_ENTITLEMENTS="$ENTITLEMENTS"
+if [[ "$GET_TASK_ALLOW" == 1 ]]; then
+  SIGNING_ENTITLEMENTS="$BUILD_DIR/Cherry-get-task-allow.entitlements"
+  cp "$ENTITLEMENTS" "$SIGNING_ENTITLEMENTS"
+  /usr/libexec/PlistBuddy -c 'Add :com.apple.security.get-task-allow bool true' "$SIGNING_ENTITLEMENTS" >/dev/null
+  echo "Signing with com.apple.security.get-task-allow (CHERRY_GET_TASK_ALLOW=1): debuggers may attach to this copy"
+fi
+"$ROOT/Scripts/sign-app" --identity "$CODE_SIGN_IDENTITY" ${CHERRY_KEYCHAIN:+--keychain "$CHERRY_KEYCHAIN"} \
+  "$TIMESTAMP_FLAG" --entitlements "$SIGNING_ENTITLEMENTS" "$APP_PATH"
+if [[ "$GET_TASK_ALLOW" == 1 ]]; then
+  rm -f "$SIGNING_ENTITLEMENTS"
+fi
+if [[ "$RELEASE" == 0 && "$CODE_SIGN_IDENTITY" == "-" ]]; then
+  echo "Signed ad hoc: macOS asks again for privacy access after each install (set CHERRY_CODESIGN_IDENTITY to keep it)."
 fi
 
 mkdir -p "$INSTALL_DIR"
+REPLACED_BUNDLE_ID=""
+if [[ -f "$INSTALL_PATH/Contents/Info.plist" ]]; then
+  REPLACED_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INSTALL_PATH/Contents/Info.plist" 2>/dev/null || true)"
+fi
+if [[ "$RELEASE" == 0 && "$REPLACED_BUNDLE_ID" == "$RELEASE_BUNDLE_ID" ]]; then
+  # An update Sparkle staged for the copy being replaced would be swapped in
+  # over this build when the running Cherry quits. Removing Sparkle's
+  # installer jobs (Sparkle-internal labels, as SparkleInstallerJobs) and its
+  # staged files discards it; nothing happens when there is none.
+  for job in "$RELEASE_BUNDLE_ID-sparkle-updater" "$RELEASE_BUNDLE_ID-sparkle-progress"; do
+    launchctl bootout "gui/$(id -u)/$job" 2>/dev/null || launchctl remove "$job" 2>/dev/null || true
+  done
+  rm -rf "$HOME/Library/Caches/$RELEASE_BUNDLE_ID/org.sparkle-project.Sparkle/Installation"
+  echo "note: discarded any update Cherry had downloaded; this build replaces it" >&2
+fi
 rm -rf "$INSTALL_PATH"
 ditto "$APP_PATH" "$INSTALL_PATH"
 
-if command -v xattr >/dev/null 2>&1; then
-  xattr -dr com.apple.quarantine "$INSTALL_PATH" 2>/dev/null || true
+# Whether this is the user's own copy: ~/Applications or /Applications.
+# LaunchServices registration and the search for other copies are for that
+# copy only; a staging or temporary directory (Scripts/package-dmg,
+# Scripts/package-release, checks) would leave stale LaunchServices records.
+installs_into_applications() {
+  local dir install_dir
+  install_dir="$(cd "$INSTALL_DIR" && pwd -P)" || return 1
+  for dir in "$HOME/Applications" /Applications; do
+    if [[ -d "$dir" && "$(cd "$dir" && pwd -P)" == "$install_dir" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Every other copy of this bundle id in the Applications folders or found by
+# Spotlight (best effort): Sparkle updates each one, and cherry:// links, MCP
+# paths and the CLI symlinks may name either.
+warn_about_other_copies() {
+  local candidates path id install_path build_path seen=$'\n'
+  install_path="$(cd "$INSTALL_PATH" && pwd -P)"
+  build_path="$(cd "$APP_PATH" && pwd -P)"
+  candidates="$(
+    for path in /Applications/*.app "$HOME"/Applications/*.app; do
+      if [[ -d "$path" ]]; then printf '%s\n' "$path"; fi
+    done
+    mdfind "kMDItemCFBundleIdentifier == '$BUNDLE_ID'" 2>/dev/null || true
+  )"
+  while IFS= read -r path; do
+    [[ -n "$path" && -d "$path" ]] || continue
+    path="$(cd "$path" 2>/dev/null && pwd -P)" || continue
+    case "$path" in "$install_path"|"$build_path"|"$HOME/.Trash/"*) continue ;; esac
+    case "$seen" in *$'\n'"$path"$'\n'*) continue ;; esac
+    seen="$seen$path"$'\n'
+    id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$path/Contents/Info.plist" 2>/dev/null || true)"
+    if [[ "$id" == "$BUNDLE_ID" ]]; then
+      echo "warning: Another copy of this app ($BUNDLE_ID) is at $path. Keep one: Sparkle updates each in place, and cherry:// links, MCP paths and the CLI symlinks become ambiguous." >&2
+    fi
+  done <<< "$candidates"
+}
+
+if [[ "$RELEASE" == 0 ]]; then
+  if command -v xattr >/dev/null 2>&1; then
+    xattr -dr com.apple.quarantine "$INSTALL_PATH" 2>/dev/null || true
+  fi
+  if installs_into_applications; then
+    "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister" -f "$INSTALL_PATH" || true
+    warn_about_other_copies
+  fi
+  if [[ "$REPLACED_BUNDLE_ID" == "$LEGACY_BUNDLE_ID" && "$BUNDLE_ID" == "$RELEASE_BUNDLE_ID" ]]; then
+    echo "This replaces the local build Cherry used before releases ($LEGACY_BUNDLE_ID). On first launch its settings are imported once; macOS asks again for privacy permissions and notifications. See docs/releasing.md#moving-from-a-local-build." >&2
+  fi
+  if [[ "$BUNDLE_ID" == "$RELEASE_BUNDLE_ID" && -z "$SPARKLE_PUBLIC_ED_KEY" ]]; then
+    echo "note: no SPARKLE_PUBLIC_ED_KEY in Packaging/release.conf: this copy does not update itself." >&2
+  fi
 fi
 
 echo "Installed $INSTALL_PATH"
-echo "Open it with: open '$INSTALL_PATH'"
+if [[ "$RELEASE" == 0 ]]; then
+  echo "Open it with: open '$INSTALL_PATH'"
+fi
 if [[ "$BUNDLE_HOST" == 0 ]]; then
   # A packaged app only uses its bundled helper or CHERRY_CLI_PATH from its
   # own launch environment; it ignores cherry on PATH.

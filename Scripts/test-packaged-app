@@ -3,9 +3,17 @@
 
 Run in a logged-in macOS GUI session:
     Scripts/test-packaged-app '/path/to/Cherry Sessions.app'
+    Scripts/test-packaged-app DIR/Cherry.app --sign-identity ID [--keychain KC] \
+        --entitlements Packaging/Cherry.entitlements
 
 The source app is verified, copied, given disposable preferences, and launched
 under a per-process sandbox. No shared build directories are moved or changed.
+The copy gets another bundle identifier, data folder and URL scheme, and no
+Sparkle (SU*) keys, so it never shares the original's preferences or updates
+itself. It is signed again: ad hoc with --deep by default (no hardened runtime,
+so the ad hoc Sparkle.framework loads), or with --sign-identity inside out
+through Scripts/sign-app, with the hardened runtime and the entitlements when
+its certificate has a Team ID, as a release is (Scripts/package-release sign).
 Opening a real project and reading a command's rendered terminal output catches
 resource lookup failures that a launch-only check (or the developer's checkout)
 can conceal. The temporary test window is closed when the check finishes.
@@ -44,6 +52,8 @@ import cherry_private_host  # noqa: E402
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 HELPERS = ("cherry", "cherry-host")
+LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+              "LaunchServices.framework/Support/lsregister")
 
 
 def run(*command, **kwargs):
@@ -99,10 +109,19 @@ def architectures(path):
 
 
 def check_bundle_contents(app, skip_helpers):
-    """Reject test resources and missing or wrong-architecture helpers."""
+    """Reject test resources, a Sparkle.framework that is missing or keeps its
+    XPC services, and missing or wrong-architecture helpers."""
     test_bundles = sorted(path.name for path in (app / "Contents/Resources").glob("*Tests*.bundle"))
     if test_bundles:
         raise RuntimeError(f"App bundle contains test resource bundles: {', '.join(test_bundles)}")
+    framework = app / "Contents/Frameworks/Sparkle.framework"
+    for part in ("Versions/B/Autoupdate", "Versions/B/Updater.app"):
+        if not (framework / part).exists():
+            raise RuntimeError(f"Missing {framework / part}: the app must embed Sparkle.framework")
+    for directory, subdirectories, files in os.walk(framework):
+        if "XPCServices" in subdirectories or "XPCServices" in files:
+            raise RuntimeError(f"{Path(directory) / 'XPCServices'} exists: the app embeds Sparkle "
+                               "without its XPC services")
     if skip_helpers:
         return
     with (app / "Contents/Info.plist").open("rb") as file:
@@ -219,6 +238,12 @@ def main():
                         help="Retain the isolated app, home, sandbox profile, and log for diagnosis")
     parser.add_argument("--skip-helpers", action="store_true",
                         help="The app was built with CHERRY_SKIP_HOST=1; skip the session helper checks")
+    parser.add_argument("--sign-identity",
+                        help="Sign the copy inside out with this identity and the hardened runtime "
+                             "(Scripts/sign-app) instead of ad hoc with --deep")
+    parser.add_argument("--keychain", help="The keychain that holds --sign-identity")
+    parser.add_argument("--entitlements", type=Path, default=REPOSITORY / "Packaging/Cherry.entitlements",
+                        help="The app's entitlements with --sign-identity (default: Packaging/Cherry.entitlements)")
     args = parser.parse_args()
     original = args.app.expanduser().resolve()
     if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").exists():
@@ -227,6 +252,10 @@ def main():
         parser.error(f"Not an application bundle: {original}")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.keychain and not args.sign_identity:
+        parser.error("--keychain needs --sign-identity")
+    if args.sign_identity and not args.entitlements.is_file():
+        parser.error(f"Missing entitlements file {args.entitlements}")
 
     run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(original))
     check_bundle_contents(original, args.skip_helpers)
@@ -245,6 +274,7 @@ def main():
     sandbox = None
     environment = None
     bundle_id = None
+    app = None
     success = False
     try:
         sockets.mkdir(mode=0o700)
@@ -263,10 +293,20 @@ def main():
         # the default fallback Dock icon is loaded through CherryResources.
         info.pop("CFBundleIconFile", None)
         info.pop("CFBundleIconName", None)
+        # The rewritten identity already keeps the updater off; without a
+        # feed or key it could not start either.
+        for key in [key for key in info if key.startswith("SU")]:
+            info.pop(key)
         with info_path.open("wb") as file:
             plistlib.dump(info, file)
         bundle_id = info["CFBundleIdentifier"]
-        run("/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app))
+        if args.sign_identity:
+            run(str(REPOSITORY / "Scripts/sign-app"), "--identity", args.sign_identity,
+                *(["--keychain", args.keychain] if args.keychain else []),
+                "--timestamp=none", "--entitlements", str(args.entitlements.resolve()), str(app))
+            print(f"Signed the copy inside out with {args.sign_identity} (Scripts/sign-app).", flush=True)
+        else:
+            run("/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app))
         executable = app / "Contents/MacOS" / info["CFBundleExecutable"]
 
         # Always hide this checkout. Also detect compiled SwiftPM .build paths
@@ -438,6 +478,10 @@ def main():
         if args.keep_fixture:
             print(f"Fixture retained at {fixture}", flush=True)
         else:
+            # Launching the copy registered it with LaunchServices; its record
+            # would outlive the fixture (one per run, each a unique id).
+            if app is not None:
+                subprocess.run([LSREGISTER, "-u", str(app)], capture_output=True)
             shutil.rmtree(fixture)
         if leftover:
             print("Packaged GUI session host cleanup: " + "; ".join(leftover), file=sys.stderr)

@@ -1147,6 +1147,60 @@ enum SessionQuitPlan: Equatable {
     }
 }
 
+extension SessionQuitPlan {
+    /// A Restart to Update whose busy native programs were confirmed just before Sparkle's
+    /// install block ran goes on without asking again.
+    func forUpdate(reason: CherryAppDelegate.QuitReason, stoppingConfirmed: Bool) -> SessionQuitPlan {
+        guard reason == .update, stoppingConfirmed, case .confirmStopping(_, let intent) = self else { return self }
+        return .finish(intent)
+    }
+}
+
+/// The texts of the confirmation for busy programs a quit stops
+/// (`CherryAppDelegate.confirmStoppingProcesses`, `confirmRestartToUpdate`):
+/// "Restart Cherry to update?" for an update, else "Quit Cherry?".
+struct QuitConfirmationText: Equatable {
+    let title: String
+    let message: String
+    let confirmButton: String
+    let cancelButton = "Cancel"
+
+    init(count: Int, reason: CherryAppDelegate.QuitReason) {
+        let stopped = count == 1
+            ? "1 running process will be stopped."
+            : "\(count) running processes will be stopped."
+        if reason == .update {
+            title = "Restart Cherry to update?"
+            message = "\(stopped) Persistent sessions keep running."
+            confirmButton = "Restart"
+        } else {
+            title = "Quit Cherry?"
+            message = stopped
+            confirmButton = "Quit"
+        }
+    }
+
+    /// What `applicationShouldTerminate` asks for a quit's busy programs:
+    /// the update texts only when Sparkle's installer relaunches Cherry
+    /// after this quit (`UpdateQuitRequest.relaunchArmed`). A bundle
+    /// replaced by hand makes an update quit too, but nothing relaunches it.
+    static func forQuit(count: Int, reason: CherryAppDelegate.QuitReason, relaunchArmed: Bool) -> QuitConfirmationText {
+        QuitConfirmationText(count: count, reason: reason == .update && relaunchArmed ? .update : .user)
+    }
+
+    /// A warning alert with these texts: the confirm button first.
+    @MainActor
+    func makeAlert() -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: confirmButton)
+        alert.addButton(withTitle: cancelButton)
+        return alert
+    }
+}
+
 enum SessionTeardownAnswer: Equatable, Sendable {
     case keep
     case end

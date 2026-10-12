@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Edits appcast.xml, Cherry's Sparkle feed (docs/releasing.md), on R2 through
+# its S3 API: one read-modify-write guarded by the object's ETag (or by "no
+# object yet"), retried when another writer got there first, then read back.
+# The workflows run it under the concurrency group cherry-appcast, always with
+# main's copy of the scripts. Portable (macOS, Linux; needs aws and curl).
+#
+#   Scripts/publish-appcast add ITEM          # merge an item file
+#   Scripts/publish-appcast add-release TAG   # merge the appcast-item.xml of release TAG
+#   Scripts/publish-appcast remove VERSION|BUILD    # take it out and keep it out
+#   Scripts/publish-appcast restore VERSION|BUILD   # let it back in (it is not re-added)
+#   Scripts/publish-appcast show              # print the feed
+#
+# env: CLOUDFLARE_ACCOUNT_ID, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (the R2
+#      keys); R2_BUCKET (default: release.conf); GH_TOKEN, GH_REPO (add-release)
+#
+# add checks first that the item's enclosure answers 200 with its length. A
+# feed that would not change is not written ("appcast unchanged"). After a
+# write it prints etag= on stdout and warns when the public feed does not show
+# the change yet (edge cache, max-age 300).
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+CONF=${CHERRY_RELEASE_CONF:-$root/Packaging/release.conf}
+conf() { sed -n "s/^$1=//p" "$CONF" | tail -n 1; }
+cherry_release() { "$root/Scripts/cherry-release" "$@"; }
+
+usage() {
+  echo "Usage: Scripts/publish-appcast add ITEM | add-release TAG | remove VERSION|BUILD | restore VERSION|BUILD | show" >&2
+  exit 2
+}
+fail() { echo "::error::$*" >&2; exit 1; }
+
+[ $# -ge 1 ] || usage
+action=$1
+case "$action" in
+  add|add-release|remove|restore) [ $# -eq 2 ] || usage; argument=$2 ;;
+  show) [ $# -eq 1 ] || usage; argument="" ;;
+  *) usage ;;
+esac
+
+bucket=${R2_BUCKET:-$(conf R2_BUCKET)}
+feed_url=$(conf SPARKLE_FEED_URL)
+key=appcast.xml
+[ -n "$bucket" ] || fail "no R2_BUCKET in the environment or in $CONF"
+for name in CLOUDFLARE_ACCOUNT_ID AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+  [ -n "${!name:-}" ] || fail "$name is not set (the appcast environment's R2 secrets)"
+done
+command -v aws >/dev/null 2>&1 || fail "publish-appcast needs the AWS CLI (aws)"
+export AWS_DEFAULT_REGION=auto AWS_PAGER="" AWS_REQUEST_CHECKSUM_CALCULATION=when_required \
+  AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+endpoint="https://$CLOUDFLARE_ACCOUNT_ID.r2.cloudflarestorage.com"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# Reads the feed into FILE and prints its ETag. Returns 1 when there is no
+# feed yet, and 3 (after saying why) on any other failure.
+get_feed() {
+  local file=$1 etag
+  if etag=$(aws s3api get-object --endpoint-url "$endpoint" --bucket "$bucket" --key "$key" \
+      --query ETag --output text "$file" 2>"$work/get.err"); then
+    printf '%s\n' "$etag"
+    return 0
+  fi
+  if grep -q NoSuchKey "$work/get.err"; then return 1; fi
+  cat "$work/get.err" >&2
+  echo "::error::could not read s3://$bucket/$key" >&2
+  return 3
+}
+
+if [ "$action" = show ]; then
+  status=0
+  get_feed "$work/current.xml" > /dev/null || status=$?
+  case $status in
+    0) cat "$work/current.xml"; exit 0 ;;
+    1) fail "there is no $key in the bucket $bucket yet" ;;
+    *) exit 1 ;;
+  esac
+fi
+
+if [ "$action" = add-release ]; then
+  GH_REPO=${GH_REPO:-$(conf GITHUB_REPOSITORY)}
+  export GH_REPO
+  gh release download "$argument" -R "$GH_REPO" -p appcast-item.xml -D "$work/release" >&2 \
+    || fail "could not download appcast-item.xml of the release $argument"
+  item="$work/release/appcast-item.xml"
+  url=$(cherry_release appcast field "$item" url)
+  case "$url" in
+    */releases/download/"$argument"/*) ;;
+    *) fail "the appcast-item.xml of $argument points at $url, another release" ;;
+  esac
+elif [ "$action" = add ]; then
+  item=$argument
+  [ -f "$item" ] || fail "no item file $item"
+fi
+
+if [ -n "${item:-}" ]; then
+  # The enclosure must be there, with the item's length, before Macs see it.
+  url=$(cherry_release appcast field "$item" url)
+  length=$(cherry_release appcast field "$item" length)
+  curl -fsSIL "$url" > "$work/head.txt" 2>"$work/head.err" || {
+    cat "$work/head.err" >&2
+    fail "the item's enclosure $url does not answer"
+  }
+  status_code=$(tr -d '\r' < "$work/head.txt" | grep -i '^HTTP/' | tail -n 1 | awk '{ print $2 }')
+  served_length=$(tr -d '\r' < "$work/head.txt" | grep -i '^content-length:' | tail -n 1 | awk '{ print $2 }')
+  [ "$status_code" = 200 ] || fail "the item's enclosure $url answers $status_code, not 200"
+  [ "$served_length" = "$length" ] \
+    || fail "the item's enclosure $url is ${served_length:-of unknown length} bytes, not $length"
+fi
+
+attempt=1
+while :; do
+  status=0
+  etag=$(get_feed "$work/current.xml") || status=$?
+  case $status in
+    0) condition=(--if-match "$etag") ;;
+    1)
+      echo "there is no $key yet; starting an empty feed" >&2
+      cherry_release appcast empty --output "$work/current.xml"
+      condition=(--if-none-match '*')
+      ;;
+    *) exit 1 ;;
+  esac
+
+  case "$action" in
+    add|add-release) cherry_release appcast merge "$work/current.xml" "$item" --output "$work/new.xml" ;;
+    remove) cherry_release appcast remove "$work/current.xml" "$argument" --output "$work/new.xml" ;;
+    restore) cherry_release appcast restore "$work/current.xml" "$argument" --output "$work/new.xml" ;;
+  esac
+  cherry_release appcast check "$work/new.xml"
+
+  if [ "$status" -eq 0 ] && cmp -s "$work/current.xml" "$work/new.xml"; then
+    echo "appcast unchanged" >&2
+    exit 0
+  fi
+
+  if aws s3api put-object --endpoint-url "$endpoint" --bucket "$bucket" --key "$key" --body "$work/new.xml" \
+      --content-type 'application/xml; charset=utf-8' --cache-control 'public, max-age=300' \
+      "${condition[@]}" > "$work/put.json" 2> "$work/put.err"; then
+    break
+  fi
+  if grep -Eq 'PreconditionFailed|ConditionalRequestConflict|\(412\)|\(409\)' "$work/put.err"; then
+    if [ "$attempt" -ge 5 ]; then
+      cat "$work/put.err" >&2
+      fail "another writer changed $key on each of 5 attempts"
+    fi
+    echo "another writer changed $key meanwhile; trying again ($attempt of 5)" >&2
+    sleep $((attempt * 2))
+    attempt=$((attempt + 1))
+    continue
+  fi
+  cat "$work/put.err" >&2
+  fail "could not write s3://$bucket/$key"
+done
+
+# Read it back: it must be byte-identical.
+status=0
+etag=$(get_feed "$work/readback.xml") || status=$?
+case $status in
+  0) ;;
+  1) fail "$key is gone right after it was written" ;;
+  *) exit 1 ;;
+esac
+cmp -s "$work/new.xml" "$work/readback.xml" || fail "$key read back differs from what was written"
+echo "wrote $key ($etag)" >&2
+echo "etag=$etag"
+
+# The public copy may lag behind by the edge cache's max-age.
+if [ -n "$feed_url" ]; then
+  if curl -fsS "$feed_url?cb=$RANDOM" -o "$work/public.xml" 2>"$work/public.err"; then
+    cmp -s "$work/new.xml" "$work/public.xml" \
+      || echo "::warning::$feed_url does not show the change yet (edge cache); it will within 5 minutes" >&2
+  else
+    echo "::warning::could not fetch $feed_url: $(cat "$work/public.err")" >&2
+  fi
+fi

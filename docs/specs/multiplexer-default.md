@@ -215,9 +215,10 @@ an announcement never makes them count), after which the system ends the
 sessions with the user's processes, so their busy programs are confirmed with
 the native ones in "Quit Cherry?" (`decide(systemEndsSessions:)`; Cancel
 cancels the log out); an update
-(the app bundle on disk has another `CFBundleVersion` than at launch, as
-`Scripts/install-local-app` and `Scripts/package-dmg` stamp every build, or
-`CherryAppDelegate.terminateKeepingSessions()`); and SIGTERM, SIGKILL, Force
+(a relaunch Sparkle armed, `UpdateQuitRequest.relaunchArmed`
+(docs/releasing.md), or the app bundle on disk has another
+`CFBundleVersion` than at launch, as `Scripts/install-local-app` and
+`Scripts/package-dmg` stamp every build); and SIGTERM, SIGKILL, Force
 Quit or a crash, which run no Cherry code. A second copy of the app has no
 persistent tabs to ask about. With `sessions.persistLocal` off new tabs are
 native, but tabs restored as persistent sessions still ask (so *on quit*

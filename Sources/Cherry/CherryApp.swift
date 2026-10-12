@@ -183,11 +183,21 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if Self.quitsAtOnce(lockResolved: AppInstanceLock.shared.isResolved) { return .terminateNow }
+        // An update staged before this app was replaced on disk by hand
+        // (Scripts/install-local-app, a DMG drag) would overwrite that build
+        // once Cherry quits: it is discarded first.
+        MainActor.assumeIsolated {
+            AppUpdater.shared.discardIfBundleReplacedByHand(
+                launchVersion: Self.launchBundleVersion,
+                diskVersion: Self.bundleVersionOnDisk()
+            )
+        }
         MainActor.assumeIsolated {
             ProjectWindowRegistry.shared.markCurrentActiveProjectOpened()
         }
 
         guard !isQuitConfirmed else { return .terminateNow }
+        MainActor.assumeIsolated { Self.quitIsPending = true }
 
         let reason = MainActor.assumeIsolated { Self.currentQuitReason() }
         lastQuitWasPowerOffEvent = Self.isPowerOffQuit(NSAppleEventManager.shared().currentAppleEvent)
@@ -197,6 +207,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             // (which would queue behind it and list them still) waits for
             // it. Quit again once it is answered.
             MainActor.assumeIsolated {
+                Self.quitIsPending = false
                 NSApp.activate(ignoringOtherApps: true)
                 window.makeKeyAndOrderFront(nil)
             }
@@ -215,7 +226,10 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         // confirmation for those programs. A log out, restart, shut down or
         // update asks nothing about sessions and ends none itself; a log
         // out, restart or shut down still confirms the busy programs of
-        // persistent tabs, which the system is about to end.
+        // persistent tabs, which the system is about to end. Restart to
+        // Update confirmed native tabs' busy programs before Sparkle's
+        // install block ran (`UpdateQuitRequest.confirmStopping`), so its
+        // quit does not ask again.
         let (summary, decision) = MainActor.assumeIsolated {
             let summary = ProjectWindowRegistry.shared.teardownSummary(
                 pathDisplayMode: TerminalSettings.shared.sidebarTerminalPathDisplayMode
@@ -228,7 +242,8 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             )
             return (summary, decision)
         }
-        switch SessionQuitPlan(decision, summary: summary) {
+        let stoppingConfirmed = MainActor.assumeIsolated { UpdateQuitRequest.shared.stoppingConfirmed(now: Date()) }
+        switch SessionQuitPlan(decision, summary: summary).forUpdate(reason: reason, stoppingConfirmed: stoppingConfirmed) {
         case .terminateNow:
             // Nothing running: quit immediately. Idle shells exit on the
             // SIGHUP they receive when Cherry dies, so there's nothing to
@@ -241,7 +256,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             // tabs, or saved tabs no open tab shows): end them, then quit.
             return finishQuit(intent: intent)
         case .confirmStopping(let count, let intent):
-            return confirmStoppingProcesses(count, intent: intent)
+            return confirmStoppingProcesses(count, intent: intent, reason: reason)
         case .askAboutSessions:
             return askAboutSessions(SessionTeardownQuestion(teardown: .quit, summary: summary, projectName: nil))
         }
@@ -257,17 +272,23 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         return ProjectWindowCloseDelegate.windowAskingToClose(among: windows)
     }
 
-    /// "Quit Cherry?" for `count` busy programs quitting stops.
+    /// "Quit Cherry?" for `count` busy programs quitting stops, or "Restart
+    /// Cherry to update?" for an update's quit that Sparkle relaunches
+    /// (`QuitConfirmationText`): Sparkle's own Install and Relaunch (Check
+    /// for Updates…) gets it, and cancelling it leaves the relaunch armed,
+    /// so a later quit is an update too. A bundle replaced by hand is an
+    /// update quit as well, but nothing relaunches it: "Quit Cherry?".
     @MainActor
-    private func confirmStoppingProcesses(_ count: Int, intent: SessionCloseIntent) -> NSApplication.TerminateReply {
-        let alert = NSAlert()
-        alert.messageText = "Quit Cherry?"
-        alert.informativeText = count == 1
-            ? "1 running process will be stopped."
-            : "\(count) running processes will be stopped."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Quit")
-        alert.addButton(withTitle: "Cancel")
+    private func confirmStoppingProcesses(
+        _ count: Int,
+        intent: SessionCloseIntent,
+        reason: QuitReason
+    ) -> NSApplication.TerminateReply {
+        let alert = QuitConfirmationText.forQuit(
+            count: count,
+            reason: reason,
+            relaunchArmed: UpdateQuitRequest.shared.isUpdateQuit
+        ).makeAlert()
 
         // The sheet goes on a project window the user can see: never the
         // menu bar panel (which closes as soon as it loses focus), a
@@ -367,9 +388,10 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     /// `CFBundleVersion` of the app on disk at launch (nil for `swift run`).
     @MainActor private static var launchBundleVersion: String?
     @MainActor private static var powerOffAnnouncedAt: Date?
-    /// `terminateKeepingSessions()` asked for this quit.
-    @MainActor private static var quitKeepsSessionsForUpdate = false
     @MainActor private static var powerOffObserver: NSObjectProtocol?
+    /// A quit got past its first checks and is not cancelled (it asks, or
+    /// tears down): Restart to Update waits (`mayRestartToUpdateNow`).
+    @MainActor static var quitIsPending = false
 
     @MainActor
     private static func observeQuitReasons() {
@@ -384,16 +406,6 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         }
     }
 
-    /// Quits keeping every local session running, asking nothing about
-    /// them, as an update does: for an updater that relaunches the app. On
-    /// the main thread.
-    func terminateKeepingSessions() {
-        MainActor.assumeIsolated {
-            Self.quitKeepsSessionsForUpdate = true
-            NSApp.terminate(nil)
-        }
-    }
-
     @MainActor
     private static func currentQuitReason() -> QuitReason {
         quitReason(
@@ -401,18 +413,20 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             launchBundleVersion: launchBundleVersion,
             diskBundleVersion: bundleVersionOnDisk(),
             powerOffAnnounced: powerOffAnnouncedAt.map { Date().timeIntervalSince($0) < powerOffAnnouncementLifetime } ?? false,
-            updateRequested: quitKeepsSessionsForUpdate
+            updateRequested: UpdateQuitRequest.shared.isUpdateQuit
         )
     }
 
-    /// Why this quit happens. `appleEvent`: the quit Apple event being
-    /// handled, whose `kAEQuitReason` names a log out, restart or shut down
-    /// (none for ⌘Q, which sends no event); with `powerOffAnnounced` (the
-    /// system announced one) any quit event counts. A quit is an update
+    /// Why this quit happens, in this order. `appleEvent`: the quit Apple
+    /// event being handled, whose `kAEQuitReason` names a log out, restart
+    /// or shut down (none for ⌘Q, which sends no event). `updateRequested`:
+    /// Sparkle armed its relaunch (`UpdateQuitRequest`), and its installer's
+    /// quit event, or any quit after it, installs and relaunches. With
+    /// `powerOffAnnounced` (the system announced a log out, restart or shut
+    /// down) any other quit event counts as one. A quit is an update too
     /// when the app on disk has another `CFBundleVersion` than at launch
     /// (Scripts/install-local-app and Scripts/package-dmg stamp each build,
-    /// and an install replaces the app while it runs), or when an updater
-    /// asked for it.
+    /// and an install replaces the app while it runs).
     nonisolated static func quitReason(
         appleEvent: NSAppleEventDescriptor?,
         launchBundleVersion: String?,
@@ -420,16 +434,30 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         powerOffAnnounced: Bool = false,
         updateRequested: Bool = false
     ) -> QuitReason {
-        if isPowerOffQuit(appleEvent) || (powerOffAnnounced && isQuitEvent(appleEvent)) {
+        // The event names a log out, restart or shut down.
+        if isPowerOffQuit(appleEvent) {
             return .powerOff
         }
+        // Sparkle armed a relaunch.
         if updateRequested {
             return .update
+        }
+        // Announced in the last `powerOffAnnouncementLifetime`.
+        if powerOffAnnounced && isQuitEvent(appleEvent) {
+            return .powerOff
         }
         if let launchBundleVersion, let diskBundleVersion, launchBundleVersion != diskBundleVersion {
             return .update
         }
         return .user
+    }
+
+    /// The app on disk has another `CFBundleVersion` than at launch: it was
+    /// replaced by another build while it ran.
+    @MainActor
+    static func appBundleReplacedSinceLaunch() -> Bool {
+        guard let launchBundleVersion, let diskBundleVersion = bundleVersionOnDisk() else { return false }
+        return launchBundleVersion != diskBundleVersion
     }
 
     private nonisolated static func isQuitEvent(_ event: NSAppleEventDescriptor?) -> Bool {
@@ -499,7 +527,10 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     private func cancelQuit() {
         MainActor.assumeIsolated {
             ProjectWindowRegistry.shared.cancelTermination()
-            Self.quitKeepsSessionsForUpdate = false
+            // A relaunch Sparkle armed stays armed: its installer relaunches
+            // after any later quit.
+            UpdateQuitRequest.shared.quitWasCancelled()
+            Self.quitIsPending = false
             Self.powerOffAnnouncedAt = nil
         }
     }
@@ -756,6 +787,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             Self.installMenuBarItemOnceLaunchWindowsOpened(registry: .shared) {
                 MenuBarStatusItem.shared.installSoon()
             }
+            Self.startUpdaterOnceLaunchWindowsOpened(registry: .shared)
         }
 
         // Windows that had tabs come back from the app's own list (AppKit
@@ -787,6 +819,67 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         install: @escaping @MainActor () -> Void
     ) {
         registry.whenLaunchWindowsOpened(install)
+    }
+
+    /// Sparkle (`AppUpdater.startIfEnabled`) starts once the launch's
+    /// windows are open, on a later turn.
+    @MainActor
+    static func startUpdaterOnceLaunchWindowsOpened(registry: ProjectWindowRegistry) {
+        registry.whenLaunchWindowsOpened {
+            // A later turn: the waiters can run from inside a window's registration
+            // (finishOpeningLaunchWindows), and starting publishes AppUpdateStatus.
+            DispatchQueue.main.async { MainActor.assumeIsolated { AppUpdater.shared.startIfEnabled() } }
+        }
+    }
+
+    // MARK: Restart to Update
+
+    /// The busy native (fallback) programs an update's quit stops: it keeps
+    /// sessions and asks nothing about them, as `applicationShouldTerminate`
+    /// decides for `.update`.
+    @MainActor
+    static func updateRestartStoppedProgramCount() -> Int {
+        let summary = ProjectWindowRegistry.shared.teardownSummary(
+            pathDisplayMode: TerminalSettings.shared.sidebarTerminalPathDisplayMode
+        )
+        let decision = SessionTeardownConfirmation.decide(
+            summary,
+            preference: TerminalSettings.shared.localSessionsOnQuit,
+            mayAsk: false,
+            systemEndsSessions: false
+        )
+        if case .confirmStopping(let count, _) = decision { return count }
+        return 0
+    }
+
+    /// "Restart Cherry to update?" for `count` busy programs, as a sheet on
+    /// the project window the quit confirmation would use (closing that
+    /// window answers false), else app-modal.
+    @MainActor
+    static func confirmRestartToUpdate(count: Int, answer: @escaping @MainActor (Bool) -> Void) {
+        let alert = QuitConfirmationText(count: count, reason: .update).makeAlert()
+        guard let window = visibleProjectWindowForQuitConfirmation() else {
+            answer(alert.runModal() == .alertFirstButtonReturn)
+            return
+        }
+        let confirmation = QuitConfirmationAnswer(parent: window, answer: answer)
+        alert.beginSheetModal(for: window) { response in
+            MainActor.assumeIsolated { confirmation.resolve(response == .alertFirstButtonReturn) }
+        }
+    }
+
+    /// Whether Restart to Update may go on now: not while a quit is
+    /// pending; while a window's close question is up, that window comes
+    /// forward instead.
+    @MainActor
+    static func mayRestartToUpdateNow() -> Bool {
+        guard !quitIsPending else { return false }
+        if let window = ProjectWindowCloseDelegate.windowAskingToClose(among: NSApp.windows) {
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            return false
+        }
+        return true
     }
 
     func userNotificationCenter(
@@ -908,6 +1001,12 @@ struct CherryApp: App {
     @FocusedValue(\.projectWindowChromeState) private var focusedChromeState
 
     init() {
+        // Before anything reads the defaults: a release build's first launch
+        // takes the settings of the local builds before it, once.
+        LegacyDefaultsImport.runIfNeeded()
+        // Decides only whether this copy may update itself; Sparkle starts
+        // once the launch's windows opened (`startUpdaterOnceLaunchWindowsOpened`).
+        _ = AppUpdater.shared
         LaunchTimeline.isEnabled = true
         LaunchTimeline.mark("app init")
         LaunchInteractivity.start()
@@ -1038,6 +1137,10 @@ struct CherryApp: App {
         .restorationBehavior(.disabled)
         .windowStyle(.hiddenTitleBar)
         .commands {
+            // Observes the updater's status itself: this body never does.
+            CommandGroup(after: .appInfo) {
+                UpdateMenuItems(status: AppUpdater.shared.status)
+            }
             CommandGroup(after: .appSettings) {
                 Button("End Background Sessions…") {
                     BackgroundSessionsModel.shared.confirmEndAll()

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Build a SwiftPM product for arm64 and x86_64 and join them with lipo:
+# one `swift build --triple <arch>-apple-macosx<minimum>.0` per architecture,
+# this Mac's own last. Scripts/build-mcp-helper builds CherryMCP with it, and
+# Scripts/install-local-app the app with CHERRY_APP_ARCHS=universal (release
+# mode).
+#
+#   Scripts/build-universal PRODUCT [debug|release] [--archs universal|native] [-- SWIFT_BUILD_ARGS...]
+#
+# Prints .build/universal/<configuration>/PRODUCT as its last line; the
+# builds' own output goes to stderr. --archs native builds this Mac's
+# architecture only. SWIFT_BUILD_ARGS go to every `swift build`. The product
+# needs the macOS the package declares (Package.swift) on either kind of Mac.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+
+usage() {
+  echo "Usage: Scripts/build-universal PRODUCT [debug|release] [--archs universal|native] [-- SWIFT_BUILD_ARGS...]" >&2
+  exit 2
+}
+
+[ $# -ge 1 ] || usage
+product=$1
+shift
+case "$product" in ""|-*|*/*) usage ;; esac
+configuration=release
+mode=universal
+swift_args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    debug|release) configuration=$1; shift ;;
+    --archs) [ $# -ge 2 ] || usage; mode=$2; shift 2 ;;
+    --archs=*) mode=${1#--archs=}; shift ;;
+    --) shift; swift_args=("$@"); break ;;
+    *) usage ;;
+  esac
+done
+
+case "$mode" in
+  # This Mac's own architecture last: SwiftPM may put every triple's
+  # products in one directory, which then holds this Mac's again.
+  universal) archs="$( [ "$(uname -m)" = arm64 ] && echo "x86_64 arm64" || echo "arm64 x86_64")" ;;
+  native) archs=$(uname -m) ;;
+  *) echo "--archs must be universal or native, not '$mode'" >&2; exit 2 ;;
+esac
+
+cd "$root" || exit 1
+# The deployment target the package declares, for each triple.
+minimum=$(sed -n 's/.*\.macOS(\.v\([0-9][0-9]*\)).*/\1/p' Package.swift | head -n 1)
+[ -n "$minimum" ] || { echo "could not read the macOS version from Package.swift" >&2; exit 1; }
+
+output="$root/.build/universal/$configuration"
+mkdir -p "$output"
+inputs=()
+for arch in $archs; do
+  triple="$arch-apple-macosx$minimum.0"
+  swift build -c "$configuration" --product "$product" --triple "$triple" ${swift_args[@]+"${swift_args[@]}"} >&2
+  bin=$(swift build -c "$configuration" --product "$product" --triple "$triple" ${swift_args[@]+"${swift_args[@]}"} --show-bin-path)
+  # Copied at once: the next triple's build may write the same path.
+  cp "$bin/$product" "$output/$product.$arch"
+  inputs+=("$output/$product.$arch")
+done
+staged="$output/$product.partial.$$"
+lipo -create -output "$staged" "${inputs[@]}"
+mv -f "$staged" "$output/$product"
+for arch in $archs; do rm -f "$output/$product.$arch"; done
+echo "$output/$product"

@@ -3233,6 +3233,17 @@ private struct SidebarTabsView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
 
+            // Restart to Update, while an update is staged (nothing otherwise).
+            SidebarUpdatePill(
+                status: AppUpdater.shared.status,
+                insets: EdgeInsets(
+                    top: 0,
+                    leading: SidebarLayout.trafficLightLeadingInset - floatingOuterInset,
+                    bottom: 6,
+                    trailing: SidebarLayout.trailingInset
+                )
+            )
+
             if repository.supportsWorktrees {
                 WorktreeSpaceRail(
                     repository: repository,

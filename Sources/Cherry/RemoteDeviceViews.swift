@@ -1092,6 +1092,7 @@ struct RemoteNotOpenSection: View {
     @ObservedObject var workspace: TerminalWorkspace
     let hosting: PersistentHostSessions
     @ObservedObject var control: HostControl
+    @State private var sessionToEnd: HostedSessionInfo?
 
     init(workspace: TerminalWorkspace, hosting: PersistentHostSessions) {
         self.workspace = workspace
@@ -1125,6 +1126,16 @@ struct RemoteNotOpenSection: View {
                     row(info, action: "Attach", help: "Attach — may resize it on \(hosting.profile.displayName) while both show it. Closing the tab only disconnects it.")
                 }
             }
+            .alert(
+                "End “\(sessionToEnd?.displayName ?? "")” on \(hosting.profile.displayName)?",
+                isPresented: Binding(get: { sessionToEnd != nil }, set: { if !$0 { sessionToEnd = nil } }),
+                presenting: sessionToEnd
+            ) { info in
+                Button("End Session", role: .destructive) { end(info) }
+                Button("Cancel", role: .cancel) {}
+            } message: { info in
+                Text(Self.endMessage(info, ownOwner: hosting.owner))
+            }
         }
     }
 
@@ -1144,8 +1155,39 @@ struct RemoteNotOpenSection: View {
             Button(action) { open(info) }
                 .controlSize(.mini)
                 .help(help)
+            Button {
+                sessionToEnd = info
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("End this session on \(hosting.profile.displayName)")
+            .accessibilityLabel("End Session")
         }
         .padding(.horizontal, 6)
+        .contextMenu {
+            Button(action) { open(info) }
+            Divider()
+            Button("End Session…", role: .destructive) { sessionToEnd = info }
+        }
+    }
+
+    /// What ending a not-open session stops: another owner's is still
+    /// shown elsewhere (the other Mac's Cherry, another installation, the
+    /// CLI), which loses it too.
+    static func endMessage(_ info: HostedSessionInfo, ownOwner: String) -> String {
+        let stops = info.isRunning ? "Its program stops." : "Its output is removed."
+        guard info.owner != ownOwner else { return stops }
+        return "\(stops) It is not this Cherry's (\(ownerLabel(info, ownOwner: ownOwner))): wherever else it is open, it ends there too."
+    }
+
+    private func end(_ info: HostedSessionInfo) {
+        guard let attachment = hosting.attachment(for: info) else { return }
+        hosting.end(attachment)
     }
 
     static func ownerLabel(_ info: HostedSessionInfo, ownOwner: String) -> String {

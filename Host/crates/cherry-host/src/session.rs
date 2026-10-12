@@ -302,32 +302,65 @@ fn now_millis() -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-/// The file this daemon was started from, when it started: its device and
-/// inode.
-static EXECUTABLE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+/// The file this daemon was started from, when it started: where it was
+/// (`installed_executable`), and its device and inode.
+static EXECUTABLE: OnceLock<Option<(PathBuf, (u64, u64))>> = OnceLock::new();
 
-/// Note which file this daemon runs from, so that a replacement (an update
-/// installed over it) can be told apart later.
+/// A file's device and inode.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Note which file this daemon runs from, and where, so that a replacement
+/// (an update installed over it, or where it was) can be told apart later.
 pub fn note_executable() {
-    let _ = EXECUTABLE.set(
-        installed_executable()
-            .ok()
-            .and_then(|path| std::fs::metadata(path).ok())
-            .map(|meta| (meta.dev(), meta.ino())),
-    );
+    let _ = EXECUTABLE.set(installed_executable().ok().and_then(|path| {
+        let identity = file_identity(&path)?;
+        Some((path, identity))
+    }));
 }
 
 /// Where this daemon's executable is now (or was, when it is gone), and
-/// whether that is no longer the file it started from: an update replaced
-/// or removed it (`HostStatus::executable_changed`).
+/// whether an update replaced or removed it
+/// (`HostStatus::executable_changed`): that is no longer the file it started
+/// from, or, on macOS, another file now sits where it started from (see
+/// `replaced_start_path`). A move alone, with nothing left where it
+/// started, is no change. When another build was installed where it
+/// started, that path is the one reported, not the old copy's: new holders
+/// run from it (`holder_command`), and it is what `cherry restart` starts.
 pub fn executable_status() -> (Option<PathBuf>, bool) {
     let found = installed_executable().ok();
-    let identity = found
-        .as_ref()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .map(|meta| (meta.dev(), meta.ino()));
-    let changed = matches!(EXECUTABLE.get(), Some(Some(started)) if identity != Some(*started));
-    (found.or_else(|| std::env::current_exe().ok()), changed)
+    let replaced = replaced_start_path();
+    let changed = match EXECUTABLE.get() {
+        Some(Some((_, started))) => {
+            found.as_deref().and_then(file_identity) != Some(*started) || replaced.is_some()
+        }
+        _ => false,
+    };
+    let executable = replaced
+        .map(Path::to_path_buf)
+        .or(found)
+        .or_else(|| std::env::current_exe().ok());
+    (executable, changed)
+}
+
+/// Where this daemon was started from, when another file sits there now: a
+/// new build installed in place. On macOS an update that swaps the app
+/// bundle for the new one (Sparkle) deletes the old copy only after it
+/// relaunched the app, and until then `installed_executable` follows this
+/// daemon's own file to the old copy. Elsewhere it is always None: a
+/// package upgrade replaces the file itself, which `installed_executable`
+/// finds gone.
+fn replaced_start_path() -> Option<&'static Path> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let (path, started) = EXECUTABLE.get()?.as_ref()?;
+    file_identity(path)
+        .is_some_and(|identity| identity != *started)
+        .then_some(path.as_path())
 }
 
 /// Where this daemon's executable is now. macOS follows it when it (or the
@@ -350,9 +383,12 @@ fn installed_executable() -> Result<PathBuf> {
 
 /// The program a new holder runs. On Linux it is this daemon's own image
 /// (`/proc/self/exe`), even after the installed file was replaced or
-/// removed, as package upgrades do. Elsewhere it is the executable at
-/// `installed_executable`, which, if another build was installed over this
-/// one, is that build: the link allows it (see `link`, `Launch`).
+/// removed, as package upgrades do. On macOS it is the executable where
+/// this daemon was started from when that is another file now (a new build
+/// installed in place, see `replaced_start_path`). Otherwise it is the
+/// executable at `installed_executable`, which, if another build was
+/// installed over this one, is that build: the link allows it (see `link`,
+/// `Launch`).
 fn holder_command() -> Result<std::process::Command> {
     #[cfg(target_os = "linux")]
     {
@@ -368,13 +404,13 @@ fn holder_command() -> Result<std::process::Command> {
             return Ok(command);
         }
     }
-    let path = installed_executable()?;
-    let identity = std::fs::metadata(&path)
-        .ok()
-        .map(|meta| (meta.dev(), meta.ino()));
-    if let Some(Some(started)) = EXECUTABLE.get() {
+    let path = match replaced_start_path() {
+        Some(path) => path.to_path_buf(),
+        None => installed_executable()?,
+    };
+    if let Some(Some((_, started))) = EXECUTABLE.get() {
         static REPORTED: AtomicBool = AtomicBool::new(false);
-        if identity != Some(*started) && !REPORTED.swap(true, Ordering::SeqCst) {
+        if file_identity(&path) != Some(*started) && !REPORTED.swap(true, Ordering::SeqCst) {
             daemon::log(format_args!(
                 "{} now holds another build than this host's; new sessions run that build",
                 path.display()

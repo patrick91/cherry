@@ -856,7 +856,9 @@ pub struct HostStatus {
     /// The log it writes to, when that is a file (`host.log`).
     #[serde(default)]
     pub log_path: Option<String>,
-    /// Where its executable is now, when it can tell.
+    /// Where its executable is now, when it can tell; on macOS, where it
+    /// started from once another build was installed there (an app bundle
+    /// swapped by an update), since new holders run that build.
     #[serde(default)]
     pub executable: Option<String>,
     /// Its executable was removed or replaced (by an update) since it

@@ -197,8 +197,10 @@ fn status_text(
                     .unwrap_or_else(|| "its standard error (not a file)".into()),
             );
             if let Some(executable) = &host.executable {
+                // On macOS, after an update installed in place, the daemon
+                // reports where it started from, which holds the new build.
                 let changed = if host.executable_changed {
-                    " (replaced or removed since it started; `cherry restart` runs the new one)"
+                    " (updated in place or removed since the host started; `cherry restart` runs the new one)"
                 } else {
                     ""
                 };
@@ -631,9 +633,20 @@ fn check_daemon(report: &mut Report, daemon: &Answered) {
             format!("the host's executable {executable} is gone"),
             "`cherry restart` (sessions carry on); new sessions cannot start until then",
         ),
+        // The daemon reports where it started from, which an update
+        // installed in place filled with the new build; on macOS new holders
+        // run that build, on Linux the daemon's own (cherry-host's
+        // `holder_command`).
         Some(executable) if status.executable_changed => report.problem(
-            format!("the host's executable {executable} was replaced since it started"),
-            "`cherry restart` runs the new one (sessions carry on)",
+            format!(
+                "the host's executable was updated in place since it started: another build is at {executable} now{}",
+                if cfg!(target_os = "macos") {
+                    ", and new sessions run that build"
+                } else {
+                    ""
+                }
+            ),
+            "`cherry restart` runs the new build (sessions carry on)",
         ),
         _ => {}
     }
@@ -868,6 +881,97 @@ mod tests {
         assert_eq!(duration(250_000), "4m 10s");
         assert_eq!(duration(7_500_000), "2h 5m");
         assert_eq!(duration(3 * 86_400_000 + 4 * 3_600_000), "3d 4h");
+    }
+
+    fn host_status(executable: &str, executable_changed: bool) -> HostStatus {
+        HostStatus {
+            host_id: "h".into(),
+            version: PROTOCOL_VERSION,
+            build: own_build().into(),
+            pid: 42,
+            started_at: 1,
+            uptime_ms: 2,
+            socket: "/tmp/x/host.sock".into(),
+            state_dir: "/state".into(),
+            log_path: None,
+            executable: Some(executable.into()),
+            executable_changed,
+            sessions: 0,
+            running_sessions: 0,
+            max_sessions: 128,
+            connections: 1,
+            max_connections: 1024,
+            holders_registered: 0,
+            holders_expected: 0,
+            lost_sessions: 0,
+            fd_limit: None,
+        }
+    }
+
+    /// After an update installed in place, the daemon reports where it
+    /// started from (which holds the new build), and both commands say so.
+    #[test]
+    fn an_executable_updated_in_place_is_named_as_the_new_build() {
+        // Any file that exists stands for the new build.
+        let executable = std::env::current_exe().unwrap().display().to_string();
+        let mut report = Report::default();
+        check_daemon(
+            &mut report,
+            &Answered {
+                version: PROTOCOL_VERSION,
+                build: Some(own_build().into()),
+                status: Some(host_status(&executable, true)),
+                sessions: Vec::new(),
+            },
+        );
+        assert_eq!(report.problems, 1, "{}", report.text);
+        let line = format!(
+            "PROBLEM  the host's executable was updated in place since it started: another build is at {executable} now"
+        );
+        assert!(report.text.contains(&line), "{}", report.text);
+        assert_eq!(
+            report.text.contains("new sessions run that build"),
+            cfg!(target_os = "macos"),
+            "{}",
+            report.text
+        );
+        assert!(
+            report
+                .text
+                .contains("fix: `cherry restart` runs the new build (sessions carry on)"),
+            "{}",
+            report.text
+        );
+
+        let greeting = Greeting {
+            host_id: "h",
+            build: Some(own_build()),
+            remote: None,
+        };
+        let changed = status_text(&greeting, Some(&host_status(&executable, true)), &[], 0);
+        assert!(
+            changed.contains(&format!(
+                "executable   {executable} (updated in place or removed since the host started; `cherry restart` runs the new one)\n"
+            )),
+            "{changed}"
+        );
+        let unchanged = status_text(&greeting, Some(&host_status(&executable, false)), &[], 0);
+        assert!(
+            unchanged.contains(&format!("executable   {executable}\n")),
+            "{unchanged}"
+        );
+
+        let mut report = Report::default();
+        check_daemon(
+            &mut report,
+            &Answered {
+                version: PROTOCOL_VERSION,
+                build: Some(own_build().into()),
+                status: Some(host_status(&executable, false)),
+                sessions: Vec::new(),
+            },
+        );
+        assert_eq!(report.problems, 0, "{}", report.text);
     }
 
     #[test]

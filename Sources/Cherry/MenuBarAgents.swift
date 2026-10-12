@@ -661,6 +661,10 @@ struct MenuBarAgentsPanel: View {
 
     private var footer: some View {
         VStack(spacing: 1) {
+            MenuBarUpdateRow(status: AppUpdater.shared.status) { title in
+                MenuBarActionLabel(title: title, shortcut: nil)
+            }
+
             SettingsLink {
                 MenuBarActionLabel(title: "Settings…", shortcut: "⌘,")
             }

@@ -2,6 +2,9 @@ name: Mac app
 
 on:
   push:
+    # main runs this workflow through prerelease.yml (workflow_call), which
+    # publishes a pre-release once it and host.yml pass.
+    branches-ignore: [main]
     paths:
       - "Sources/**"
       - "Tests/**"
@@ -10,8 +13,10 @@ on:
       - "ThirdParty/**"
       - "Host/**"
       - "Scripts/**"
-      - ".github/workflows/app.yml"
-      - ".github/actions/host-toolchain/**"
+      - "script/**"
+      - "Packaging/**"
+      - ".github/workflows/**"
+      - ".github/actions/**"
   pull_request:
     paths:
       - "Sources/**"
@@ -21,8 +26,11 @@ on:
       - "ThirdParty/**"
       - "Host/**"
       - "Scripts/**"
-      - ".github/workflows/app.yml"
-      - ".github/actions/host-toolchain/**"
+      - "script/**"
+      - "Packaging/**"
+      - ".github/workflows/**"
+      - ".github/actions/**"
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -41,34 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Select an Xcode for the package's Swift tools version
-        run: |
-          required=$(sed -n 's#^// swift-tools-version: *\([0-9][0-9.]*\).*#\1#p' Package.swift | head -n 1)
-          at_least() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n 1)" = "$2" ]; }
-          swift_version() {
-            DEVELOPER_DIR="$1" xcrun swift --version 2>/dev/null \
-              | sed -n 's/.*Swift version \([0-9][0-9.]*\).*/\1/p' | head -n 1
-          }
-          # Prefer the image's default Xcode, else the newest stable one.
-          selected=$(xcode-select -p)
-          if ! at_least "$(swift_version "$selected")" "$required"; then
-            selected=""
-            candidates=$(printf '%s\n' /Applications/Xcode_*.app \
-              | grep -viE 'beta|_rc|release_candidate' | sort -V -r || true)
-            while IFS= read -r app; do
-              [ -d "$app" ] || continue
-              if at_least "$(swift_version "$app/Contents/Developer")" "$required"; then
-                selected="$app/Contents/Developer"
-                break
-              fi
-            done <<< "$candidates"
-          fi
-          if [ -z "$selected" ]; then
-            echo "::error::No installed Xcode provides Swift $required"
-            ls -d /Applications/Xcode*.app
-            exit 1
-          fi
-          echo "DEVELOPER_DIR=$selected" >> "$GITHUB_ENV"
-          DEVELOPER_DIR="$selected" xcrun swift --version
+        uses: ./.github/actions/xcode
       - name: Install Rust and the pinned Ghostty VT library
         uses: ./.github/actions/host-toolchain
       # Before any Swift test: the real-host tests run Host/target/debug/cherry
@@ -81,16 +62,21 @@ jobs:
         env:
           CHERRY_TEST_HOST_INTEGRATION: "1"
         run: python3 Scripts/test_cherry_private_host.py -v
+      # Scripts/cherry-release, sparkle-key.swift and the release shell scripts
+      # (docs/releasing.md); the release-tooling job runs them on Linux too.
+      - name: Release tooling tests
+        run: python3 Scripts/test_cherry_release.py -v
       - name: Build the Swift package and tests
         run: swift build --build-tests
       # Every hosted and persistent session suite: PersistentLocal*,
       # PersistentTab*, WorkspacePersistence*, WorkspaceRestore*, HostControl*,
       # HostedSession*, HostedLaunchSpec*, NativeSurfaceRelaunch*,
-      # MultiplexerSafety*, AgentInputSafety*, SessionCloseFlow* and
-      # AppIdentity. Each group runs on its own and must pass at least one
-      # test, so a filter that stops matching (a rename) fails instead of
-      # passing with nothing run. A session test file no group selects, or a
-      # test skipped here that the real-host step does not run, fails too.
+      # MultiplexerSafety*, AgentInputSafety*, SessionCloseFlow*, AppIdentity
+      # and AppUpdate, among the groups Scripts/test-session-suites lists. Each
+      # group runs on its own and must pass at least one test, so a filter that
+      # stops matching (a rename) fails instead of passing with nothing run. A
+      # session test file no group selects, or a test skipped here that the
+      # real-host step does not run, fails too.
       - name: Hosted and persistent session tests
         timeout-minutes: 20
         run: Scripts/test-session-suites --skip-build unit
@@ -110,3 +96,28 @@ jobs:
           path: ${{ runner.temp }}/cherry-session-tests.*/*.log
           if-no-files-found: ignore
           retention-days: 14
+
+  release-tooling:
+    name: Release tooling on Linux
+    # publish-appcast, promote-release and publish-github-release run on
+    # ubuntu-24.04 in the release workflows: test them there too.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release tooling tests
+        run: python3 Scripts/test_cherry_release.py -v
+      - name: Check the release scripts
+        run: |
+          scripts="Scripts/release-preflight Scripts/release-plan Scripts/publish-github-release
+                   Scripts/publish-appcast Scripts/promote-release Scripts/promote Scripts/release-setup
+                   Scripts/sign-app Scripts/package-release Scripts/build-universal"
+          for script in $scripts; do bash -n "$script"; done
+          # shellcheck disable=SC2086
+          shellcheck -S warning $scripts
+      # actionlint 1.7.12 predates concurrency.queue (May 2026); its own
+      # shellcheck pass is off (the scripts above are checked directly).
+      - name: Lint the workflows
+        run: |
+          docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.12 \
+            -color -shellcheck= -ignore 'unexpected key "queue"'

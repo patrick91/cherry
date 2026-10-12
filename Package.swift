@@ -15,6 +15,9 @@ let package = Package(
     dependencies: [
         .package(path: "ThirdParty/libghostty-spm"),
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
+        // Exact: the framework, its tools (sign_update), the launchd job labels Cherry removes and
+        // the delegate behaviour Cherry relies on (docs/releasing.md) move together; upgrade deliberately.
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"),
     ],
     targets: [
         .target(
@@ -50,9 +53,15 @@ let package = Package(
                 .product(name: "GhosttyKit", package: "libghostty-spm"),
                 .product(name: "GhosttyTerminal", package: "libghostty-spm"),
                 .product(name: "GhosttyTheme", package: "libghostty-spm"),
+                .product(name: "Sparkle", package: "Sparkle"),
             ],
             resources: [
                 .process("Resources")
+            ],
+            // Sparkle.framework is embedded in Contents/Frameworks (Scripts/install-local-app,
+            // script/build_and_run.sh). SwiftPM's own @loader_path keeps `swift run` and tests working.
+            linkerSettings: [
+                .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])
             ]
         ),
         .testTarget(

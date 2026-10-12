@@ -96,6 +96,12 @@ private struct SettingsNativeTabView: View {
                                 MCPSettingsPane()
                             }
                         }
+
+                        if pages.contains(.updates) {
+                            Tab("Updates", systemImage: SettingsPage.updates.systemImage, value: SettingsSelection.page(.updates)) {
+                                UpdatesSettingsPane(status: AppUpdater.shared.status)
+                            }
+                        }
                     }
                 }
 
@@ -284,6 +290,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
     case projects
     case agents
     case mcp
+    case updates
 
     var id: String { rawValue }
 
@@ -295,6 +302,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .projects: "Projects"
         case .agents: "Agents"
         case .mcp: "MCP"
+        case .updates: "Updates"
         }
     }
 
@@ -306,6 +314,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .projects: "Workspaces, local features, and identity colors"
         case .agents: "Agent tools and automatic summaries"
         case .mcp: "Install commands and connection status"
+        case .updates: "Version, automatic updates, and pre-release builds"
         }
     }
 
@@ -317,6 +326,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .projects: "folder.fill"
         case .agents: "sparkles"
         case .mcp: "point.3.connected.trianglepath.dotted"
+        case .updates: "arrow.down.circle.fill"
         }
     }
 
@@ -324,6 +334,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
     var searchKeywords: String {
         switch self {
         case .sessions: "close exit shell"
+        case .updates: "version build release upgrade restart prerelease pre-release beta sparkle"
         case .general, .terminal, .projects, .agents, .mcp: ""
         }
     }

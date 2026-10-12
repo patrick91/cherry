@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Decides whether the pre-release job may build and publish (docs/releasing.md):
+# releases not paused, every release secret set, the Sparkle public key
+# committed and the private key its own. Run by .github/workflows/prerelease.yml
+# (job build, environment release) before anything else; macOS (xcrun swift).
+#
+#   Scripts/release-preflight
+#
+# env: DEVELOPER_ID_P12_BASE64 DEVELOPER_ID_P12_PASSWORD NOTARY_KEY_P8 NOTARY_KEY_ID
+#      NOTARY_ISSUER_ID SPARKLE_ED_PRIVATE_KEY (the release environment's secrets),
+#      APPCAST_SECRETS (none|all|partial: the appcast environment's R2 secrets, from
+#      the appcast-config job), RELEASES_PAUSED, DRY_RUN
+#
+# Prints ready=true or ready=false on stdout (for $GITHUB_OUTPUT). Paused, no
+# secrets at all, or no committed public key: ready=false and exit 0, so a push
+# stays green. Some secrets missing, or a private key that is not the committed
+# public key's: exit 1. Notices, warnings and errors go to stderr as workflow
+# annotations and to $GITHUB_STEP_SUMMARY; no secret is ever printed.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+CONF=${CHERRY_RELEASE_CONF:-$root/Packaging/release.conf}
+conf() { sed -n "s/^$1=//p" "$CONF" | tail -n 1; }
+
+summary() {
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then printf '%s\n' "$@" >> "$GITHUB_STEP_SUMMARY"; fi
+}
+annotate() { # LEVEL MESSAGE
+  echo "::$1::$2" >&2
+  summary "**${1}:** $2" ""
+}
+not_ready() {
+  echo "ready=false"
+  exit 0
+}
+
+[ -f "$CONF" ] || { annotate error "no release configuration at $CONF"; exit 1; }
+dry_run=${DRY_RUN:-false}
+
+# 1. Paused comes first, so a half-configured setup stays green while paused.
+if [ "${RELEASES_PAUSED:-}" = true ] && [ "$dry_run" != true ]; then
+  annotate notice "Releases are paused (RELEASES_PAUSED); a dry run still works"
+  not_ready
+fi
+
+# 2. The six signing secrets (environment release) and the R2 secrets
+#    (environment appcast, counted by the appcast-config job).
+signing_names="DEVELOPER_ID_P12_BASE64 DEVELOPER_ID_P12_PASSWORD NOTARY_KEY_P8 NOTARY_KEY_ID NOTARY_ISSUER_ID SPARKLE_ED_PRIVATE_KEY"
+appcast_names="CLOUDFLARE_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY"
+signing_set=0
+signing_missing=""
+for name in $signing_names; do
+  if [ -n "${!name:-}" ]; then
+    signing_set=$((signing_set + 1))
+  else
+    signing_missing="$signing_missing $name"
+  fi
+done
+appcast=${APPCAST_SECRETS:-none}
+case "$appcast" in
+  none|all|partial) ;;
+  *) annotate error "APPCAST_SECRETS is '$appcast', not none, all or partial"; exit 1 ;;
+esac
+
+if [ "$signing_set" -eq 0 ] && [ "$appcast" = none ]; then
+  annotate warning "Tests passed; nothing was published because the release environments have no secrets"
+  summary "Environment \`release\`: $signing_names." \
+    "" "Environment \`appcast\`: $appcast_names." \
+    "" "Run \`Scripts/release-setup\` to set them (docs/releasing.md)." ""
+  not_ready
+fi
+# A dry run publishes nothing, so it needs only the signing secrets.
+needs_appcast=true
+if [ "$dry_run" = true ]; then needs_appcast=false; fi
+if [ "$signing_set" -ne 6 ] || { [ "$appcast" != all ] && [ "$needs_appcast" = true ]; }; then
+  problems=""
+  if [ "$signing_set" -ne 6 ]; then
+    problems="the release environment lacks$signing_missing"
+  fi
+  if [ "$appcast" != all ] && [ "$needs_appcast" = true ]; then
+    [ -z "$problems" ] || problems="$problems; "
+    if [ "$appcast" = none ]; then
+      problems="${problems}the appcast environment has none of $appcast_names"
+    else
+      problems="${problems}the appcast environment has only some of $appcast_names"
+    fi
+  fi
+  annotate error "The release secrets are incomplete: $problems. Set them with Scripts/release-setup, or set RELEASES_PAUSED=true."
+  exit 1
+fi
+if [ "$appcast" != all ]; then
+  annotate notice "This dry run publishes nothing, so it goes on without the appcast environment's $appcast_names; a release needs them"
+fi
+
+# 3. The committed public key.
+public_key=$(conf SPARKLE_PUBLIC_ED_KEY)
+if [ -z "$public_key" ]; then
+  annotate warning "Packaging/release.conf has no SPARKLE_PUBLIC_ED_KEY: commit the public key (Scripts/release-setup); nothing was published"
+  not_ready
+fi
+
+# 4. The private key must be that public key's.
+if ! derived=$(printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | xcrun swift "$root/Scripts/sparkle-key.swift" derive); then
+  annotate error "SPARKLE_ED_PRIVATE_KEY is not a Sparkle private key (base64 of 32 bytes, or 96 in the legacy format)"
+  exit 1
+fi
+if [ "$derived" != "$public_key" ]; then
+  annotate error "SPARKLE_ED_PRIVATE_KEY does not match SPARKLE_PUBLIC_ED_KEY in Packaging/release.conf (its public key is $derived)"
+  exit 1
+fi
+
+# 5.
+echo "ready=true"

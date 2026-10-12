@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+# Builds, signs, notarizes and packages a Cherry release (docs/releasing.md).
+#
+#   Scripts/package-release build  --version V --build B --out DIR
+#   Scripts/package-release sign   --out DIR --identity ID [--keychain KC] [--no-smoke-test] [--no-notarize]
+#   Scripts/package-release finish --out DIR --version V --identity ID [--keychain KC] [--no-notarize]
+#   Scripts/package-release all    --version V --build B --out DIR [--identity ID|-] [--keychain KC]
+#                                  [--no-notarize] [--no-smoke-test]
+#   env (finish, unless --no-notarize): NOTARY_KEY_PATH NOTARY_KEY_ID NOTARY_ISSUER_ID
+#
+# build needs no secrets: Scripts/install-local-app in release mode
+# (CHERRY_RELEASE=1: universal, --force-resolved-versions, Sparkle embedded,
+# notices checked, signed ad hoc) into DIR/Cherry.app, its dSYMs into
+# DIR/dSYMs, then checks of the Info.plist, the architectures, the helpers'
+# build and the embedded Sparkle.framework.
+# sign signs DIR/Cherry.app again, inside out, with the Developer ID, the
+# hardened runtime, a secure timestamp and Packaging/Cherry.entitlements
+# (Scripts/sign-app), checks every component's signature and entitlements,
+# and launches a copy re-signed the same way under another identity, with a
+# private HOME and sockets (Scripts/test-packaged-app).
+# finish notarizes and staples the app, zips it (DIR/Cherry-V.zip, the
+# archive Sparkle installs), makes, signs, notarizes and staples
+# DIR/Cherry-V.dmg, and writes DIR/SHA256SUMS and DIR/release.json.
+# all runs the three in order; its identity defaults to the keychain's
+# Developer ID Application identity of the release team.
+#
+# --identity is the SHA-1 or the name of a "Developer ID Application: …
+# (TEAM_ID)" identity. With --no-notarize (local structure checks) it may be
+# any identity, or `-` (ad hoc): then sign checks only the signatures'
+# validity and entitlements, and finish writes the zip, the disk image
+# (signed if a certificate was given), SHA256SUMS and release.json without
+# notarizing. This script never installs or launches the app it builds.
+# Logs go to stderr.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONF="${CHERRY_RELEASE_CONF:-$ROOT/Packaging/release.conf}"
+case "$CONF" in /*) ;; *) CONF="$PWD/$CONF" ;; esac
+ENTITLEMENTS="$ROOT/Packaging/Cherry.entitlements"
+GUI_EXECUTABLE="CherryApp"
+HELPERS="cherry cherry-host CherryMCP"
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: Scripts/package-release build  --version V --build B --out DIR
+       Scripts/package-release sign   --out DIR --identity ID [--keychain KC] [--no-smoke-test] [--no-notarize]
+       Scripts/package-release finish --out DIR --version V --identity ID [--keychain KC] [--no-notarize]
+       Scripts/package-release all    --version V --build B --out DIR [--identity ID|-] [--keychain KC]
+                                      [--no-notarize] [--no-smoke-test]
+env (finish, unless --no-notarize): NOTARY_KEY_PATH NOTARY_KEY_ID NOTARY_ISSUER_ID
+USAGE
+  exit 2
+}
+
+log() {
+  echo "$*" >&2
+}
+
+fail() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+# Regular expressions are matched in the C locale so ranges mean ASCII.
+matches() {
+  (LC_ALL=C; [[ "$1" =~ $2 ]])
+}
+
+[ -f "$CONF" ] || fail "missing the release configuration $CONF"
+conf() {
+  sed -n "s/^$1=//p" "$CONF" | tail -n 1
+}
+RELEASE_BUNDLE_ID="$(conf RELEASE_BUNDLE_ID)"
+APP_NAME="$(conf RELEASE_APP_NAME)"
+TEAM_ID="$(conf TEAM_ID)"
+SPARKLE_FEED_URL="$(conf SPARKLE_FEED_URL)"
+SPARKLE_PUBLIC_ED_KEY="$(conf SPARKLE_PUBLIC_ED_KEY)"
+[ -n "$RELEASE_BUNDLE_ID" ] && [ -n "$APP_NAME" ] && [ -n "$TEAM_ID" ] && [ -n "$SPARKLE_FEED_URL" ] \
+  || fail "$CONF must set RELEASE_BUNDLE_ID, RELEASE_APP_NAME, TEAM_ID and SPARKLE_FEED_URL"
+
+[ $# -ge 1 ] || usage
+command=$1
+shift
+case "$command" in
+  build|sign|finish|all) ;;
+  -h|--help) usage ;;
+  *) echo "Unknown command: $command" >&2; usage ;;
+esac
+
+version=
+build=
+out=
+identity=
+keychain=
+smoke_test=1
+notarize=1
+given=" "
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --version|--build|--out|--identity|--keychain)
+      [ $# -ge 2 ] || usage
+      name=${1#--}
+      case "$name" in
+        version) version=$2 ;;
+        build) build=$2 ;;
+        out) out=$2 ;;
+        identity) identity=$2 ;;
+        keychain) keychain=$2 ;;
+      esac
+      shift 2
+      ;;
+    --no-smoke-test) name=no-smoke-test; smoke_test=0; shift ;;
+    --no-notarize) name=no-notarize; notarize=0; shift ;;
+    -h|--help) usage ;;
+    *) echo "Unknown argument: $1" >&2; usage ;;
+  esac
+  given="$given$name "
+done
+
+# Each option given must be one the command takes; each named here, given.
+allow() {
+  local name
+  for name in $given; do
+    case " $* " in *" $name "*) ;; *) fail "package-release $command does not take --$name" ;; esac
+  done
+}
+require() {
+  local name
+  for name in "$@"; do
+    case "$given" in *" $name "*) ;; *) fail "package-release $command needs --$name" ;; esac
+  done
+}
+case "$command" in
+  build) allow version build out; require version build out ;;
+  sign) allow out identity keychain no-smoke-test no-notarize; require out identity ;;
+  finish) allow out version identity keychain no-notarize; require out version identity ;;
+  all) allow version build out identity keychain no-notarize no-smoke-test; require version build out ;;
+esac
+if [ -n "$version" ]; then
+  matches "$version" '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[1-9][0-9]*$' || fail "--version must be YYYY.MM.DD.N, not '$version'"
+fi
+if [ -n "$build" ]; then
+  matches "$build" '^[0-9]{14}\.[0-9a-f]{7}$' || fail "--build must be <YYYYMMDDHHMMSS>.<7 hex digits>, not '$build'"
+fi
+[ -n "$out" ] || fail "--out must not be empty"
+if [ "$command" = build ] || [ "$command" = all ]; then
+  mkdir -p "$out"
+fi
+[ -d "$out" ] || fail "missing the output directory $out (package-release build makes it)"
+out="$(cd "$out" && pwd)"
+app="$out/$APP_NAME.app"
+framework="$app/Contents/Frameworks/Sparkle.framework"
+
+# The SHA-1 of the first valid "Developer ID Application: … ($TEAM_ID)"
+# identity that $1 names (its SHA-1, in either case, or its full name), or
+# of the first one at all when $1 is empty; nothing when there is none.
+developer_id() {
+  local wanted listing line hash name
+  wanted="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+  if [ -n "$keychain" ]; then
+    listing="$(security find-identity -v -p codesigning "$keychain" 2>/dev/null || true)"
+  else
+    listing="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+  fi
+  while IFS= read -r line; do
+    hash="$(printf '%s\n' "$line" | sed -n 's/^ *[0-9][0-9]*) \([0-9A-F]\{40\}\) ".*"$/\1/p')"
+    name="$(printf '%s\n' "$line" | sed -n 's/^ *[0-9][0-9]*) [0-9A-F]\{40\} "\(.*\)"$/\1/p')"
+    [ -n "$hash" ] || continue
+    case "$name" in "Developer ID Application: "*" ($TEAM_ID)") ;; *) continue ;; esac
+    if [ -z "$wanted" ] || [ "$hash" = "$wanted" ] || [ "$name" = "$1" ]; then
+      printf '%s\n' "$hash"
+      return 0
+    fi
+  done <<< "$listing"
+  return 0
+}
+
+# The identity sign and finish use, and whether it is a Developer ID of the
+# release team (the signature checks and notarization need one).
+is_developer_id=0
+sign_identity=
+if [ "$command" != build ]; then
+  if [ -z "$identity" ]; then
+    # all without --identity: the keychain's Developer ID, else ad hoc for a
+    # local structure check.
+    sign_identity="$(developer_id "")"
+    if [ -n "$sign_identity" ]; then
+      identity="$sign_identity"
+    elif [ "$notarize" = 0 ]; then
+      identity="-"
+      log "note: no Developer ID Application identity of team $TEAM_ID in the keychain; signing ad hoc (--no-notarize)"
+    else
+      fail "no Developer ID Application identity of team $TEAM_ID in the keychain; pass --identity, or --identity - --no-notarize for a local structure check"
+    fi
+  fi
+  if [ "$identity" = - ]; then
+    [ "$notarize" = 0 ] || fail "--identity - (ad hoc) needs --no-notarize: only a Developer ID build is notarized"
+    sign_identity="-"
+  else
+    sign_identity="$(developer_id "$identity")"
+    if [ -n "$sign_identity" ]; then
+      is_developer_id=1
+    elif [ "$notarize" = 1 ]; then
+      fail "--identity must be the SHA-1 or name of a valid \"Developer ID Application: … ($TEAM_ID)\" identity${keychain:+ in $keychain}, not '$identity' (or pass --no-notarize for a local check)"
+    else
+      sign_identity="$identity"
+      log "note: $identity is not a Developer ID Application identity of team $TEAM_ID; checking only the signatures' validity and entitlements (--no-notarize)"
+    fi
+  fi
+fi
+
+# Notarization uses an App Store Connect API key, checked before any work.
+notary_auth=()
+if [ "$notarize" = 1 ] && { [ "$command" = finish ] || [ "$command" = all ]; }; then
+  [ -n "${NOTARY_KEY_PATH:-}" ] && [ -n "${NOTARY_KEY_ID:-}" ] && [ -n "${NOTARY_ISSUER_ID:-}" ] \
+    || fail "notarizing needs NOTARY_KEY_PATH, NOTARY_KEY_ID and NOTARY_ISSUER_ID (or --no-notarize)"
+  [ -f "$NOTARY_KEY_PATH" ] || fail "missing the notary key file NOTARY_KEY_PATH ($NOTARY_KEY_PATH)"
+  notary_auth=(--key "$NOTARY_KEY_PATH" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID")
+fi
+
+plist_value() {
+  /usr/libexec/PlistBuddy -c "Print :$1" "$app/Contents/Info.plist" 2>/dev/null || true
+}
+
+expect_plist() {
+  local actual
+  actual="$(plist_value "$1")"
+  [ "$actual" = "$2" ] || fail "$app/Contents/Info.plist: $1 is '$actual', expected '$2'"
+}
+
+step_build() {
+  local binary output line services
+  rm -rf "$out/stage" "$app" "$out/dSYMs"
+  log "==> Building $APP_NAME $version ($build) into $app"
+  # Ad hoc here: no signing material exists while third-party build code
+  # runs (the sign step signs again).
+  CHERRY_RELEASE=1 CHERRY_VERSION="$version" CHERRY_BUILD_ID="$build" CHERRY_INSTALL_DIR="$out/stage" \
+    CHERRY_CODESIGN_IDENTITY=- CHERRY_KEYCHAIN='' "$ROOT/Scripts/install-local-app" >&2
+  mv "$out/stage/$APP_NAME.app" "$app"
+  rmdir "$out/stage"
+
+  # The debug maps point at the per-triple object files, still on disk.
+  log "==> Debug symbols into $out/dSYMs"
+  mkdir -p "$out/dSYMs"
+  for binary in "$GUI_EXECUTABLE" CherryMCP; do
+    if ! output="$(dsymutil "$app/Contents/MacOS/$binary" -o "$out/dSYMs/$binary.dSYM" 2>&1)"; then
+      log "warning: dsymutil failed for $binary; no dSYM for it: $output"
+      rm -rf "$out/dSYMs/$binary.dSYM"
+    elif [[ "$output" == *"no debug symbols"* ]]; then
+      log "warning: $binary has no debug information; no dSYM for it"
+      rm -rf "$out/dSYMs/$binary.dSYM"
+    elif [ -n "$output" ]; then
+      log "$output"
+    fi
+  done
+
+  log "==> Checking $app"
+  expect_plist CFBundleIdentifier "$RELEASE_BUNDLE_ID"
+  expect_plist CFBundleShortVersionString "$version"
+  expect_plist CFBundleVersion "$build"
+  expect_plist CherryApplicationSupportName Cherry
+  expect_plist CherryURLScheme cherry
+  expect_plist SUFeedURL "$SPARKLE_FEED_URL"
+  expect_plist SUPublicEDKey "$SPARKLE_PUBLIC_ED_KEY"
+  expect_plist SUVerifyUpdateBeforeExtraction true
+
+  "$ROOT/Scripts/check-helper-archs" "$app/Contents/MacOS/$GUI_EXECUTABLE" "$app/Contents/MacOS/cherry" \
+    "$app/Contents/MacOS/cherry-host" "$app/Contents/MacOS/CherryMCP" \
+    || fail "$app is not universal (arm64 and x86_64); see the error above"
+
+  for binary in cherry cherry-host; do
+    line="$("$app/Contents/MacOS/$binary" --version)" || fail "$binary --version failed"
+    case "$line" in *"(build $build)"*) ;; *) fail "$binary --version says '$line', not (build $build)" ;; esac
+  done
+  if arch -x86_64 /usr/bin/true 2>/dev/null; then
+    line="$(arch -x86_64 "$app/Contents/MacOS/cherry" --version)" || fail "cherry --version failed as x86_64"
+    case "$line" in *"(build $build)"*) ;; *) fail "x86_64 cherry --version says '$line', not (build $build)" ;; esac
+  else
+    log "note: x86_64 code cannot run here (no Rosetta); the x86_64 helpers were not run"
+  fi
+
+  [ -d "$framework/Versions/B" ] || fail "missing $framework"
+  for services in "$framework/Versions/B/XPCServices" "$framework/XPCServices"; do
+    if [ -e "$services" ] || [ -L "$services" ]; then
+      fail "$services exists; the release embeds Sparkle without its XPC services"
+    fi
+  done
+  output="$(otool -L "$app/Contents/MacOS/$GUI_EXECUTABLE")"
+  [[ "$output" == *"@rpath/Sparkle.framework/"* ]] || fail "$GUI_EXECUTABLE does not link @rpath/Sparkle.framework"
+  log "Built $app"
+}
+
+# Developer ID authority, the release team, the hardened runtime and a
+# secure timestamp.
+check_signature() {
+  local details line authority=0 team=0 runtime=0 timestamp=0
+  details="$(codesign -dvv "$1" 2>&1)" || fail "codesign -dvv $1 failed: $details"
+  while IFS= read -r line; do
+    case "$line" in
+      "Authority=Developer ID Application: "*) authority=1 ;;
+      "TeamIdentifier=$TEAM_ID") team=1 ;;
+      "Timestamp="*) timestamp=1 ;;
+      "CodeDirectory "*" flags="*"runtime"*) runtime=1 ;;
+    esac
+  done <<< "$details"
+  [ "$authority" = 1 ] || fail "$1 is not signed with a Developer ID Application identity"
+  [ "$team" = 1 ] || fail "$1 is not signed by team $TEAM_ID"
+  [ "$runtime" = 1 ] || fail "$1 is not signed with the hardened runtime"
+  [ "$timestamp" = 1 ] || fail "$1 has no secure timestamp"
+}
+
+step_sign() {
+  local component components entitlements output
+  [ -d "$app" ] || fail "missing $app (package-release build makes it)"
+  log "==> Signing $app with $sign_identity"
+  "$ROOT/Scripts/sign-app" --identity "$sign_identity" ${keychain:+--keychain "$keychain"} --timestamp \
+    --entitlements "$ENTITLEMENTS" "$app"
+  codesign --verify --deep --strict "$app" || fail "codesign --verify --deep --strict failed for $app"
+
+  components=("$app")
+  for component in $HELPERS; do
+    [ -f "$app/Contents/MacOS/$component" ] || fail "missing $app/Contents/MacOS/$component"
+    components+=("$app/Contents/MacOS/$component")
+  done
+  components+=("$framework/Versions/B/Autoupdate" "$framework/Versions/B/Updater.app" "$framework")
+  for component in "${components[@]}"; do
+    if [ "$is_developer_id" = 1 ]; then
+      check_signature "$component"
+    fi
+    entitlements="$(codesign -d --entitlements - --xml "$component" 2>/dev/null || true)"
+    if [ "$component" = "$app" ]; then
+      [[ "$entitlements" != *"get-task-allow"* ]] || fail "$app is signed with get-task-allow"
+    else
+      [[ "$entitlements" != *"<key>"* ]] || fail "$component is signed with entitlements; it must have none"
+    fi
+  done
+  if [ "$is_developer_id" = 1 ]; then
+    log "Every component of $app is signed as a release needs"
+  else
+    log "Every component of $app is validly signed, without entitlements it must not have (not a Developer ID: authority, team, runtime and timestamp not checked)"
+  fi
+
+  if [ "$is_developer_id" = 1 ] && command -v syspolicy_check >/dev/null 2>&1; then
+    if output="$(syspolicy_check notary-submission "$app" 2>&1)"; then
+      log "$output"
+    else
+      log "warning: syspolicy_check notary-submission reports:"
+      log "$output"
+    fi
+  fi
+
+  if [ "$smoke_test" = 1 ]; then
+    log "==> Launching a re-signed copy (Scripts/test-packaged-app)"
+    "$ROOT/Scripts/test-packaged-app" "$app" --sign-identity "$sign_identity" ${keychain:+--keychain "$keychain"} \
+      --entitlements "$ENTITLEMENTS" >&2
+  else
+    log "warning: --no-smoke-test: the signed app was not launched"
+  fi
+}
+
+json_value() {
+  /usr/bin/plutil -extract "$2" raw -o - "$1" 2>/dev/null || true
+}
+
+# Submits FILE and waits for Apple's verdict; always saves the notary log to
+# DIR/notary/<name>-log.json. Only "Accepted" passes.
+notarize_file() {
+  local file=$1 name submission id status
+  name="$(basename "$file")"
+  name="${name%.*}"
+  submission="$out/notary/$name-submission.json"
+  log "==> Notarizing $(basename "$file")"
+  xcrun notarytool submit "$file" "${notary_auth[@]}" --wait --timeout 35m --output-format json > "$submission" || true
+  id="$(json_value "$submission" id)"
+  status="$(json_value "$submission" status)"
+  if [ -n "$id" ]; then
+    case "$status" in
+      Accepted|Invalid|Rejected) ;;
+      *)
+        log "No final status for submission $id yet (${status:-none}); waiting"
+        xcrun notarytool wait "$id" "${notary_auth[@]}" --output-format json > "$out/notary/$name-wait.json" || true
+        status="$(json_value "$out/notary/$name-wait.json" status)"
+        ;;
+    esac
+    xcrun notarytool log "$id" "${notary_auth[@]}" "$out/notary/$name-log.json" >&2 \
+      || log "warning: could not fetch the notary log of submission $id"
+  fi
+  if [ "$status" != Accepted ]; then
+    log "Notarizing $(basename "$file") failed: status '${status:-none}', submission '${id:-none}'"
+    if [ -f "$submission" ]; then cat "$submission" >&2; fi
+    if [ -f "$out/notary/$name-log.json" ]; then cat "$out/notary/$name-log.json" >&2; fi
+    exit 1
+  fi
+  log "Notarized $(basename "$file") (submission $id)"
+}
+
+# The ticket can take a while to propagate after acceptance (error 65).
+staple_file() {
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if xcrun stapler staple "$1" >&2; then
+      xcrun stapler validate "$1" >&2 || fail "xcrun stapler validate failed for $1"
+      return 0
+    fi
+    if [ "$attempt" -lt 5 ]; then
+      log "stapling $(basename "$1") failed (attempt $attempt of 5); retrying in 20 s"
+      sleep 20
+    fi
+  done
+  fail "could not staple the notarization ticket to $1"
+}
+
+step_finish() {
+  local zip dmg stage attempt created assessment output minimum zip_length zip_sha dmg_sha app_build
+  [ -d "$app" ] || fail "missing $app (package-release build makes it)"
+  expect_plist CFBundleIdentifier "$RELEASE_BUNDLE_ID"
+  expect_plist CFBundleShortVersionString "$version"
+  app_build="$(plist_value CFBundleVersion)"
+  matches "$app_build" '^[0-9]{14}\.[0-9a-f]{7}$' || fail "$app has CFBundleVersion '$app_build', not a release build id"
+  minimum="$(plist_value LSMinimumSystemVersion)"
+  matches "$minimum" '^[0-9]+(\.[0-9]+){0,2}$' || fail "$app has LSMinimumSystemVersion '$minimum'"
+  while [[ "$minimum" != *.*.* ]]; do minimum="$minimum.0"; done
+  zip="$APP_NAME-$version.zip"
+  dmg="$APP_NAME-$version.dmg"
+
+  if [ "$notarize" = 1 ]; then
+    mkdir -p "$out/notary"
+    rm -f "$out/notary/$APP_NAME-notarize.zip"
+    ditto -c -k --keepParent "$app" "$out/notary/$APP_NAME-notarize.zip"
+    notarize_file "$out/notary/$APP_NAME-notarize.zip"
+    rm -f "$out/notary/$APP_NAME-notarize.zip"
+    staple_file "$app"
+    assessment="$(spctl -a -vvv -t exec "$app" 2>&1 || true)"
+    log "$assessment"
+    [[ "$assessment" == *"source=Notarized Developer ID"* ]] || fail "Gatekeeper does not accept $app as a notarized Developer ID app"
+  else
+    log "note: --no-notarize: $app is not notarized"
+  fi
+
+  # The archive Sparkle installs (the appcast item's enclosure).
+  log "==> $zip"
+  rm -f "$out/$zip"
+  ditto -c -k --sequesterRsrc --keepParent "$app" "$out/$zip"
+
+  log "==> $dmg"
+  stage="$out/dmg-stage"
+  rm -rf "$stage" "${out:?}/$dmg"
+  mkdir -p "$stage"
+  ditto "$app" "$stage/$APP_NAME.app"
+  ln -s /Applications "$stage/Applications"
+  created=0
+  for attempt in 1 2 3; do
+    if hdiutil create -volname "$APP_NAME" -srcfolder "$stage" -format UDZO -ov "$out/$dmg" >&2; then
+      created=1
+      break
+    fi
+    if [ "$attempt" -lt 3 ]; then
+      log "hdiutil create failed (attempt $attempt of 3; often 'Resource busy'); retrying in 5 s"
+      sleep 5
+    fi
+  done
+  rm -rf "$stage"
+  [ "$created" = 1 ] || fail "hdiutil create failed for $dmg"
+  if [ "$sign_identity" != - ]; then
+    codesign --force --sign "$sign_identity" ${keychain:+--keychain "$keychain"} --timestamp "$out/$dmg" \
+      || fail "codesign failed for $dmg"
+  fi
+  if [ "$notarize" = 1 ]; then
+    notarize_file "$out/$dmg"
+    staple_file "$out/$dmg"
+    assessment="$(spctl -a -t open --context context:primary-signature -v "$out/$dmg" 2>&1)" \
+      || fail "Gatekeeper does not accept $dmg: $assessment"
+    log "$assessment"
+  fi
+  hdiutil verify "$out/$dmg" >&2 || fail "hdiutil verify failed for $dmg"
+
+  if [ "$notarize" = 1 ] && command -v syspolicy_check >/dev/null 2>&1; then
+    if output="$(syspolicy_check distribution "$app" 2>&1)"; then
+      log "$output"
+    else
+      log "warning: syspolicy_check distribution reports:"
+      log "$output"
+    fi
+  fi
+
+  (cd "$out" && shasum -a 256 "$zip" "$dmg" > SHA256SUMS)
+  zip_length="$(wc -c < "$out/$zip" | tr -d ' ')"
+  zip_sha="$(shasum -a 256 "$out/$zip" | awk '{print $1}')"
+  dmg_sha="$(shasum -a 256 "$out/$dmg" | awk '{print $1}')"
+  printf '{"version":"%s","build":"%s","bundle_identifier":"%s","minimum_system_version":"%s",\n "zip":"%s","zip_length":%s,"zip_sha256":"%s","dmg":"%s","dmg_sha256":"%s"}\n' \
+    "$version" "$app_build" "$RELEASE_BUNDLE_ID" "$minimum" "$zip" "$zip_length" "$zip_sha" "$dmg" "$dmg_sha" \
+    > "$out/release.json"
+  log "Wrote $out/$zip, $out/$dmg, $out/SHA256SUMS and $out/release.json"
+}
+
+case "$command" in
+  build) step_build ;;
+  sign) step_sign ;;
+  finish) step_finish ;;
+  all)
+    step_build
+    step_sign
+    step_finish
+    ;;
+esac

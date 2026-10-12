@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Signs a built Cherry.app inside out, never with --deep: Sparkle's
+# Autoupdate and Updater.app, Sparkle.framework, the helpers (cherry,
+# cherry-host, CherryMCP, each if present, with today's identifiers), then
+# the app with its entitlements. Scripts/install-local-app,
+# Scripts/package-release and Scripts/test-packaged-app call it.
+#
+#   Scripts/sign-app --identity ID [--keychain KC] [--timestamp|--timestamp=none]
+#                    [--entitlements FILE] APP
+#
+# A certificate with a Team ID (Developer ID, Apple Development) signs
+# everything with the hardened runtime, and the app with FILE
+# (Packaging/Cherry.entitlements). The hardened runtime's library validation
+# loads only code of the app's own team, and a signature without a Team ID
+# never matches one, so the ad hoc identity (`-`) and a certificate with no
+# Team ID (a self-signed one) sign with neither runtime nor entitlements, or
+# dyld would refuse Sparkle.framework at launch. The Team ID is read from
+# Autoupdate's signature, the first one made. Ad hoc is never timestamped.
+# Nothing is signed with --preserve-metadata=entitlements: Autoupdate's own ad
+# hoc signature carries an entitlement only Sparkle's team may use. The
+# timestamp defaults to --timestamp for a certificate. Sparkle's XPC services
+# must already be removed (a non-sandboxed app does not use them).
+set -euo pipefail
+
+usage() {
+  echo "Usage: Scripts/sign-app --identity ID [--keychain KC] [--timestamp|--timestamp=none] [--entitlements FILE] APP" >&2
+  exit 2
+}
+
+fail() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+identity=
+keychain=
+timestamp=
+entitlements=
+app=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --identity) [ $# -ge 2 ] || usage; identity=$2; shift 2 ;;
+    --keychain) [ $# -ge 2 ] || usage; keychain=$2; shift 2 ;;
+    --timestamp|--timestamp=none) timestamp=$1; shift ;;
+    --entitlements) [ $# -ge 2 ] || usage; entitlements=$2; shift 2 ;;
+    -h|--help) usage ;;
+    -*) echo "Unknown option: $1" >&2; usage ;;
+    *) [ -z "$app" ] || usage; app=$1; shift ;;
+  esac
+done
+[ -n "$identity" ] && [ -n "$app" ] || usage
+[ -d "$app/Contents/MacOS" ] || fail "$app is not an application bundle"
+if [ -n "$entitlements" ] && [ ! -f "$entitlements" ]; then
+  fail "missing entitlements file $entitlements"
+fi
+
+framework="$app/Contents/Frameworks/Sparkle.framework"
+[ -d "$framework/Versions/B" ] || fail "missing $framework (Scripts/install-local-app embeds it)"
+
+# Finder information, quarantine and other extended attributes make
+# codesign refuse the bundle ("detritus not allowed").
+xattr -cr "$app"
+
+for services in "$framework/Versions/B/XPCServices" "$framework/XPCServices"; do
+  if [ -e "$services" ] || [ -L "$services" ]; then
+    fail "$services exists: remove Sparkle's XPC services before signing (Scripts/install-local-app does)"
+  fi
+done
+
+arguments=(--force --sign "$identity")
+if [ -n "$keychain" ]; then
+  arguments+=(--keychain "$keychain")
+fi
+if [ "$identity" = - ]; then
+  arguments+=(--timestamp=none)
+  hardened=false
+else
+  arguments+=("${timestamp:---timestamp}")
+  hardened=true
+fi
+
+# Quiet unless it fails ("replacing existing signature" for every file).
+sign() {
+  local output status=0
+  if [ "$hardened" = true ]; then
+    output=$(codesign "${arguments[@]}" --options runtime "$@" 2>&1) || status=$?
+  else
+    output=$(codesign "${arguments[@]}" "$@" 2>&1) || status=$?
+  fi
+  if [ "$status" -ne 0 ]; then
+    printf '%s\n' "$output" >&2
+    fail "codesign failed for ${*: -1}"
+  fi
+}
+
+sign "$framework/Versions/B/Autoupdate"
+if [ "$hardened" = true ]; then
+  team=$(codesign -dv "$framework/Versions/B/Autoupdate" 2>&1 | sed -n 's/^TeamIdentifier=//p') \
+    || fail "cannot read the signature of $framework/Versions/B/Autoupdate"
+  if [ -z "$team" ] || [ "$team" = "not set" ]; then
+    echo "warning: $identity has no Team ID (a self-signed certificate?): signing without the hardened runtime and entitlements, as ad hoc does, or library validation would refuse Sparkle.framework" >&2
+    hardened=false
+    sign "$framework/Versions/B/Autoupdate"
+  fi
+fi
+sign "$framework/Versions/B/Updater.app"
+sign "$framework"
+for helper in cherry cherry-host CherryMCP; do
+  if [ -e "$app/Contents/MacOS/$helper" ]; then
+    sign --identifier "$helper" "$app/Contents/MacOS/$helper"
+  fi
+done
+if [ "$hardened" = true ] && [ -n "$entitlements" ]; then
+  sign --entitlements "$entitlements" "$app"
+else
+  sign "$app"
+fi
+
+codesign --verify --deep --strict --verbose=2 "$app"

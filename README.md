@@ -11,6 +11,28 @@ Small native macOS prototype for a `libghostty`-style shell with left-side tabs.
   (see [Persistent Sessions](#persistent-sessions)), or on a native PTY when
   that is turned off or unavailable.
 
+## Install
+
+Download [Cherry.dmg](https://github.com/patrick91/cherry/releases/latest/download/Cherry.dmg),
+the newest stable release, open it and drag **Cherry** to Applications.
+Cherry requires macOS 26 or later and runs on Apple silicon and Intel Macs.
+
+Updates arrive by themselves. Cherry checks for them every hour and
+downloads a new version in the background; the sidebar then shows **Restart
+to Update** (so do the Cherry menu and the menu bar icon's panel), and
+persistent sessions keep running across the restart. If you don't click it,
+the update installs when Cherry quits. **Settings › Updates** shows the
+version and build, has the switches for checking and installing
+automatically, and **Get pre-release builds**: every change on main, once its
+tests pass. Turning that off never goes back to an older build.
+
+Until the first stable release exists, install the newest pre-release from
+the [Releases](https://github.com/patrick91/cherry/releases) page and turn
+that switch on. Keep one copy of Cherry: each copy updates itself in place,
+and `cherry://` links, MCP paths and the CLI symlinks become ambiguous with
+two. How releases are made is described in
+[docs/releasing.md](docs/releasing.md).
+
 ## Run
 
 ```bash
@@ -267,7 +289,8 @@ helpers; no separate CLI installation is needed for **This Mac**. Open a
 project, start a command or an editor in a tab, quit Cherry Sessions, and
 reopen it: the tab comes back with the same process and screen. Multiple
 devices can stay attached and type into one session. This is a local test
-build, signed ad-hoc by default and not notarized. The disk image always
+build, signed as the installer signs (below) and not notarized; it never
+updates itself. The disk image always
 includes the helpers, so building it needs the same tools as the installer
 below.
 
@@ -302,6 +325,18 @@ Scripts/install-local-app
 open ~/Applications/Cherry.app
 ```
 
+The installer builds the release identity, `dev.patrick.cherry`: the app the
+releases ship, with the same settings, data (`~/Library/Application
+Support/Cherry`) and `cherry://` scheme. It embeds Sparkle
+(`Contents/Frameworks/Sparkle.framework`), so once `SPARKLE_PUBLIC_ED_KEY` is
+set in `Packaging/release.conf` a local build updates itself like a release: a
+newer release replaces it when Cherry quits, or at **Restart to Update**. To
+keep a local build, turn off **Check for updates automatically** in Settings ›
+Updates. Running the installer again discards an update Cherry had
+downloaded, so that update never overwrites the new build. Coming from a
+local build made before releases (`dev.patrick.cherry.local`): see [Moving
+from a local build](docs/releasing.md#moving-from-a-local-build).
+
 The installer also builds the `cherry` and `cherry-host` helpers that
 persistent sessions use and bundles them inside the app. That needs Rust
 (`cargo` and `rustc`, from [rustup.rs](https://rustup.rs)) and the Xcode
@@ -331,18 +366,14 @@ beside it, else one on your login shell's `PATH`. The lookup is described in
 [Host/README.md](Host/README.md#use-in-the-mac-app).
 
 Run the installer again after making changes to replace the installed copy.
-You can customize the destination and name:
-
-```bash
-CHERRY_APP_NAME="Cherry Local" CHERRY_INSTALL_DIR="$HOME/Applications" Scripts/install-local-app
-```
-
-That copy keeps the default bundle identifier, so it shares the installed
-Cherry's settings and data. For a separate dogfood build, also set its own
-`CHERRY_BUNDLE_ID`, `CHERRY_APPLICATION_SUPPORT_NAME` (the folder in
-`~/Library/Application Support`), and `CHERRY_URL_SCHEME` (its deep links and
-MCP server name); the installer warns when a non-default bundle identifier
-still shares Cherry's data folder or `cherry://` scheme:
+`CHERRY_INSTALL_DIR` sets the destination. A copy under another name is a
+separate app, and it must set its own `CHERRY_BUNDLE_ID`,
+`CHERRY_APPLICATION_SUPPORT_NAME` (the folder in `~/Library/Application
+Support`) and `CHERRY_URL_SCHEME` (its deep links and MCP server name): the
+installer refuses `dev.patrick.cherry`, which updates itself, under another
+name, data folder or scheme, and warns when another bundle identifier still
+shares Cherry's data folder or `cherry://` scheme. Such a copy never updates
+itself:
 
 ```bash
 CHERRY_APP_NAME="Cherry Local" CHERRY_BUNDLE_ID=com.example.cherry-local \
@@ -367,17 +398,34 @@ instead, opt out:
 CHERRY_KEEP_SURFACES_WARM=0 Scripts/install-local-app
 ```
 
-By default the installer uses ad-hoc signing, which can make macOS privacy
-permissions reset after each rebuild because the code identity changes. To keep
-Desktop/Documents/etc. permissions stable, sign local builds with a persistent
-certificate:
+The installer signs with the first Developer ID Application certificate of
+Cherry's team (`TEAM_ID` in `Packaging/release.conf`) in your keychain, else
+the first Apple Development one, else ad hoc, and says which it chose; a
+certificate with a Team ID (Developer ID, Apple Development) signs with the
+hardened runtime and `Packaging/Cherry.entitlements`. macOS keeps privacy
+permissions (Desktop, Documents, …) for the app's code identity: with a
+certificate they carry across rebuilds, and a Developer ID build has the
+releases' designated requirement, so they also carry across between it and
+releases. An ad hoc signature changes with every build, so macOS asks again
+after each one. To pick the identity:
 
 ```bash
 CHERRY_CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)" Scripts/install-local-app
 ```
 
-If you do not have an Apple development certificate, create a local code-signing
-certificate in Keychain Access and pass its common name as `CHERRY_CODESIGN_IDENTITY`.
+`CHERRY_CODESIGN_IDENTITY=-` forces ad hoc. If you do not have an Apple
+certificate, create a local code-signing certificate in Keychain Access and
+pass its common name as `CHERRY_CODESIGN_IDENTITY`. Permissions carry across
+rebuilds with it too, but it has no Team ID, so `Scripts/sign-app` warns and
+signs as it signs ad hoc, without the hardened runtime and the entitlements:
+under the hardened runtime, library validation loads only code of the app's
+own team, and dyld would refuse Sparkle.framework at launch.
+`CHERRY_GET_TASK_ALLOW=1` adds the entitlement lldb and Instruments need to
+attach to a build signed with an Apple certificate (never in a release; an
+ad hoc or self-signed build has no hardened runtime, so debuggers attach
+anyway). `CHERRY_APP_ARCHS=universal` builds the app itself for arm64 and
+x86_64, as releases are; by default it is built for this Mac only (the
+helpers follow `CHERRY_HOST_ARCHS`, above).
 
 Inside the prototype:
 
@@ -388,12 +436,13 @@ Inside the prototype:
 
 ## MCP Control
 
-Cherry installs a stdio MCP helper next to the app executable. After installing
-and opening the local app, register the helper with your agent harness:
+Cherry installs a stdio MCP helper next to the app executable. Register it
+with your agent harness using the command **Settings › MCP** shows, which
+names this copy's path; for Cherry in `/Applications`:
 
 ```bash
-codex mcp add cherry -- "$HOME/Applications/Cherry.app/Contents/MacOS/CherryMCP"
-claude mcp add --transport stdio --scope user cherry -- "$HOME/Applications/Cherry.app/Contents/MacOS/CherryMCP"
+codex mcp add cherry -- /Applications/Cherry.app/Contents/MacOS/CherryMCP
+claude mcp add --transport stdio --scope user cherry -- /Applications/Cherry.app/Contents/MacOS/CherryMCP
 ```
 
 Run the Cherry app first. The helper forwards MCP tool calls to Cherry's

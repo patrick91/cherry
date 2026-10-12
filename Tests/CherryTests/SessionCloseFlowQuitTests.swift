@@ -267,6 +267,11 @@ private func quitEvent(reason: OSType?, asParameter: Bool = false, enumerated: B
     // updater asked.
     #expect(reason(nil, disk: "20260926130000.def5678") == .update)
     #expect(reason(nil, requested: true) == .update)
+    // Sparkle armed its relaunch: its installer's quit event (which names
+    // no reason) relaunches, even soon after a log out was announced; a
+    // quit event naming a restart is still the system's.
+    #expect(reason(quitEvent(reason: nil), announced: true, requested: true) == .update)
+    #expect(reason(quitEvent(reason: OSType(kAERestart)), requested: true) == .powerOff)
     // No bundle (`swift run`), or it was removed: nothing tells.
     #expect(reason(nil, launch: nil, disk: nil) == .user)
     #expect(reason(nil, disk: nil) == .user)
@@ -282,6 +287,88 @@ private func quitEvent(reason: OSType?, asParameter: Bool = false, enumerated: B
     )
     try plist.write(to: contents.appendingPathComponent("Info.plist"))
     #expect(CherryAppDelegate.bundleVersionOnDisk(bundleURL: bundle) == "20260926120000.abc1234")
+}
+
+// MARK: - Restart to Update's quit
+
+@Test @MainActor func updateQuitWithConfirmedStoppingFinishesWithoutAsking() {
+    let plan = SessionQuitPlan.confirmStopping(count: 2, intent: .appQuit)
+    // Restart to Update confirmed the busy programs just before.
+    #expect(plan.forUpdate(reason: .update, stoppingConfirmed: true) == .finish(.appQuit))
+    // Nothing confirmed, or not an update: the quit asks.
+    #expect(plan.forUpdate(reason: .update, stoppingConfirmed: false) == plan)
+    #expect(plan.forUpdate(reason: .user, stoppingConfirmed: true) == plan)
+    #expect(plan.forUpdate(reason: .powerOff, stoppingConfirmed: true) == plan)
+    // Other plans are left as they are.
+    for other: SessionQuitPlan in [.terminateNow, .finish(.appQuit), .askAboutSessions] {
+        #expect(other.forUpdate(reason: .update, stoppingConfirmed: true) == other)
+    }
+
+    // As the quit decides it: an update asks nothing about sessions and
+    // keeps them, so only native tabs' busy programs are confirmed.
+    let busy = summary(running: [true, false], nativeBusy: 2)
+    let decision = SessionTeardownConfirmation.decide(busy, preference: .end, mayAsk: false)
+    #expect(SessionQuitPlan(decision, summary: busy).forUpdate(reason: .update, stoppingConfirmed: true)
+        == .finish(.appQuit))
+    #expect(SessionQuitPlan(decision, summary: busy).forUpdate(reason: .update, stoppingConfirmed: false)
+        == .confirmStopping(count: 2, intent: .appQuit))
+}
+
+@Test @MainActor func cancelledQuitClearsTheConfirmationButNotAnArmedRelaunch() {
+    let request = UpdateQuitRequest()
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    request.confirmStopping(at: now)
+    request.noteRelaunchArmed()
+    #expect(request.isUpdateQuit)
+    #expect(request.stoppingConfirmed(now: now))
+
+    // What `CherryAppDelegate.cancelQuit` does.
+    request.quitWasCancelled()
+    #expect(!request.stoppingConfirmed(now: now))
+    // Sparkle's installer relaunches after any later quit: still an update.
+    #expect(request.isUpdateQuit)
+    #expect(CherryAppDelegate.quitReason(
+        appleEvent: nil, launchBundleVersion: "a", diskBundleVersion: "a", updateRequested: request.isUpdateQuit
+    ) == .update)
+
+    // Only Sparkle's abort clears it.
+    request.updateAborted()
+    #expect(!request.isUpdateQuit)
+}
+
+@Test @MainActor func quitConfirmationTextNamesARestartForAnUpdate() {
+    let update = QuitConfirmationText(count: 2, reason: .update)
+    #expect(update.title == "Restart Cherry to update?")
+    #expect(update.message == "2 running processes will be stopped. Persistent sessions keep running.")
+    #expect(update.confirmButton == "Restart")
+    #expect(update.cancelButton == "Cancel")
+    #expect(QuitConfirmationText(count: 1, reason: .update).message
+        == "1 running process will be stopped. Persistent sessions keep running.")
+
+    for reason: CherryAppDelegate.QuitReason in [.user, .powerOff] {
+        let quit = QuitConfirmationText(count: 3, reason: reason)
+        #expect(quit.title == "Quit Cherry?")
+        #expect(quit.message == "3 running processes will be stopped.")
+        #expect(quit.confirmButton == "Quit")
+    }
+    #expect(QuitConfirmationText(count: 1, reason: .user).message == "1 running process will be stopped.")
+
+    let alert = update.makeAlert()
+    #expect(alert.messageText == "Restart Cherry to update?")
+    #expect(alert.buttons.map(\.title) == ["Restart", "Cancel"])
+}
+
+@Test @MainActor func aQuitOffersARestartOnlyWhenSparkleRelaunchesCherry() {
+    // Sparkle's own Install and Relaunch: its installer reopens Cherry.
+    #expect(QuitConfirmationText.forQuit(count: 2, reason: .update, relaunchArmed: true)
+        == QuitConfirmationText(count: 2, reason: .update))
+    // The bundle was replaced by hand (install-local-app, a disk image): an
+    // update quit, but nothing reopens Cherry.
+    #expect(QuitConfirmationText.forQuit(count: 2, reason: .update, relaunchArmed: false).title == "Quit Cherry?")
+    // A log out, restart or shut down named by the event, even while armed.
+    #expect(QuitConfirmationText.forQuit(count: 2, reason: .powerOff, relaunchArmed: true).title == "Quit Cherry?")
+    #expect(QuitConfirmationText.forQuit(count: 1, reason: .user, relaunchArmed: false)
+        == QuitConfirmationText(count: 1, reason: .user))
 }
 
 // MARK: - Closing a window

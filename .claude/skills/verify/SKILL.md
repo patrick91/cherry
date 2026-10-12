@@ -15,6 +15,15 @@ CherryDev.app has its own bundle ID (`app.cherry.CherryDev`), UserDefaults domai
 Support folder (`~/Library/Application Support/CherryDev`: saved tabs, notes, shell integration)
 and URL scheme (`cherry-dev`), so it coexists with the user's production Cherry.app. Its
 persistent sessions are owned by `CherryDev`. The script pkills only prior CherryDev instances.
+`./script/build_and_run.sh build` builds and packages `dist/CherryDev.app` without launching it
+(and kills nothing).
+
+CherryDev.app embeds `Sparkle.framework` in `Contents/Frameworks` (CherryApp links it; without it
+dyld aborts at launch) but never starts the updater: it has another identity and no feed. Never
+launch a `dev.patrick.cherry` bundle (`Scripts/install-local-app`'s default, or a release-shaped
+`Scripts/package-release` build): it shares the user's preferences domain (cfprefsd ignores
+`CFFIXED_USER_HOME`), update feed and data. Give a build of your own another identity
+(AGENTS.md, Updates And Releases).
 
 The script first runs `Scripts/build-host debug` and copies `cherry` and `cherry-host` into
 `CherryDev.app/Contents/MacOS/`, so it needs Rust (`cargo`, `rustc`); the first build also
@@ -98,7 +107,7 @@ Prefer `--no-parallel` for full-suite runs (AGENTS.md).
 Hosted and persistent sessions, as CI runs them: `Scripts/test-session-suites unit` (each
 group — PersistentLocal, PersistentTab, WorkspacePersistence, WorkspaceRestore, HostControl,
 HostedSession, HostedLaunchSpec, NativeSurfaceRelaunch, MultiplexerSafety, AgentInputSafety,
-SessionCloseFlow, AppIdentity — on its own) and `Scripts/test-session-suites real-host` (every
+SessionCloseFlow, AppIdentity, AppUpdate — on its own) and `Scripts/test-session-suites real-host` (every
 `*RealHost*` test, each on its own daemon with a private socket and `HOME`; needs
 `Scripts/build-host debug`, sets `CHERRY_TEST_HOST_INTEGRATION=1`, fails on any skip). A new
 session suite must be named after a group in that script. Swift Testing's `--filter` matches

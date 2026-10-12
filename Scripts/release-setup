@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# Sets up Cherry's releases once (docs/releasing.md, One-time setup): pauses
+# releases, makes the GitHub environments release and appcast with their
+# branch and tag policies, and sets their secrets: the Sparkle key, the
+# Developer ID certificate, the notary key and the R2 credentials. Then it
+# prints what only a person can do. Interactive, macOS, run by the user; safe
+# to run again. It never prints a secret and never writes one to disk.
+#
+# A run without --only goes through every part: one whose file or account ID
+# is not given (an empty answer) is skipped for now, and the list of what is
+# left to do by hand names it. With --only PART an empty answer is an error.
+#
+#   Scripts/release-setup [--only pause|environments|sparkle|developer-id|notary|cloudflare]
+#                         [--p12 PATH] [--notary-key AuthKey_<ID>.p8]
+#
+# Needs gh (logged in, with admin rights on the repository), git and the Xcode
+# command line tools. The Sparkle key lives in the login keychain (generate_keys,
+# account SPARKLE_KEYCHAIN_ACCOUNT); its public key goes into
+# Packaging/release.conf, which you then commit.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+CONF=${CHERRY_RELEASE_CONF:-$root/Packaging/release.conf}
+conf() { sed -n "s/^$1=//p" "$CONF" | tail -n 1; }
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: Scripts/release-setup [--only pause|environments|sparkle|developer-id|notary|cloudflare]
+                             [--p12 PATH] [--notary-key AuthKey_<ID>.p8]
+EOF
+  exit 2
+}
+fail() { echo "error: $*" >&2; exit 1; }
+step() { printf '\n== %s\n' "$*"; }
+# ask VARIABLE PROMPT: one line of standard input; end of input is an empty answer.
+ask() { read -r -p "$2" "$1" || true; }
+ask_secret() { read -r -s -p "$2" "$1" || true; echo; }
+skipped=""
+# skip PART HOW: in a run without --only, leaves PART for later.
+skip() {
+  echo "  skipped for now: run Scripts/release-setup --only $1$2 once you have it"
+  skipped="$skipped $1"
+}
+
+only=""
+p12=""
+notary_key=""
+# The answers ask and ask_secret fill in.
+password="" issuer="" account_id="" access_key="" secret_key=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --only) [ $# -ge 2 ] || usage; only=$2; shift 2 ;;
+    --p12) [ $# -ge 2 ] || usage; p12=$2; shift 2 ;;
+    --notary-key) [ $# -ge 2 ] || usage; notary_key=$2; shift 2 ;;
+    *) usage ;;
+  esac
+done
+case "$only" in ""|pause|environments|sparkle|developer-id|notary|cloudflare) ;; *) usage ;; esac
+wants() { [ -z "$only" ] || [ "$only" = "$1" ]; }
+later=""
+[ -n "$only" ] || later=" (empty skips this part for now)"
+
+repo=$(conf GITHUB_REPOSITORY)
+account=$(conf SPARKLE_KEYCHAIN_ACCOUNT)
+bucket=$(conf R2_BUCKET)
+[ -n "$repo" ] && [ -n "$account" ] && [ -n "$bucket" ] \
+  || fail "$CONF needs GITHUB_REPOSITORY, SPARKLE_KEYCHAIN_ACCOUNT and R2_BUCKET"
+
+# 1. Prerequisites.
+command -v gh >/dev/null 2>&1 || fail "install the GitHub CLI (gh) and run gh auth login"
+# The active account's token must work; `gh auth status` also fails for an
+# inactive account with a stale token, which gh never uses here.
+gh_user=$(gh api user --jq .login 2>/dev/null) && [ -n "$gh_user" ] \
+  || fail "gh is not logged in: run gh auth login"
+echo "GitHub account: $gh_user"
+[ "$(gh api "repos/$repo" --jq .permissions.admin)" = true ] \
+  || fail "your gh account is not an admin of $repo; environments and secrets need one"
+xcode-select -p >/dev/null 2>&1 || fail "install the Xcode command line tools (xcode-select --install)"
+
+secret() { # NAME ENVIRONMENT: the value on stdin
+  gh secret set "$1" --env "$2" --repo "$repo"
+}
+
+# 2. Pause first: pushes to main stay green, and a dry run still works.
+if wants pause; then
+  step "Pausing releases (RELEASES_PAUSED=true)"
+  gh variable set RELEASES_PAUSED --body true --repo "$repo"
+fi
+
+# 3. The environments and their deployment branch and tag policies.
+if wants environments; then
+  for environment in release appcast; do
+    step "Environment $environment"
+    gh api -X PUT "repos/$repo/environments/$environment" \
+      -F 'deployment_branch_policy[protected_branches]=false' \
+      -F 'deployment_branch_policy[custom_branch_policies]=true' >/dev/null
+    existing=$(gh api --paginate "repos/$repo/environments/$environment/deployment-branch-policies" \
+      --jq '.branch_policies[] | "\(.type // "branch"):\(.name)"')
+    policies="branch:main"
+    if [ "$environment" = appcast ]; then policies="branch:main tag:v*"; fi
+    for policy in $policies; do
+      if printf '%s\n' "$existing" | grep -qxF "$policy"; then
+        echo "  $policy is there already"
+      else
+        gh api -X POST "repos/$repo/environments/$environment/deployment-branch-policies" \
+          -f name="${policy#*:}" -f type="${policy%%:*}" >/dev/null
+        echo "  added $policy"
+      fi
+    done
+  done
+fi
+
+# 4. The Sparkle key, kept in the login keychain.
+if wants sparkle; then
+  step "Sparkle key (keychain account $account)"
+  generate_keys=$(find "$root/.build/artifacts" -path '*/Sparkle/bin/generate_keys' -type f 2>/dev/null | sort | head -n 1)
+  if [ -z "$generate_keys" ]; then
+    (cd "$root" && swift package resolve)
+    generate_keys=$(find "$root/.build/artifacts" -path '*/Sparkle/bin/generate_keys' -type f 2>/dev/null | sort | head -n 1)
+  fi
+  [ -n "$generate_keys" ] || fail "no Sparkle generate_keys under .build/artifacts after swift package resolve"
+  committed=$(conf SPARKLE_PUBLIC_ED_KEY)
+  if ! public_key=$("$generate_keys" --account "$account" -p 2>/dev/null); then
+    # A key is generated only when release.conf has none: with one committed,
+    # a new key here would be a rotation, and would block importing the real one.
+    [ -z "$committed" ] || fail "${CONF#"$root"/} holds the public key $committed, but this keychain has no Sparkle key for account $account, and a new key would be a rotation (docs/releasing.md, Rotating keys). Import the backed-up private key instead: \"$generate_keys\" --account $account -f FILE, where FILE holds the key (the base64 text from your password manager, or what \`generate_keys -x\` exported on the Mac that has it); delete FILE, then run this again."
+    echo "No Sparkle key for $account in the keychain yet; generating one."
+    # Its output names the public key only; on a failure it explains why.
+    if ! output=$("$generate_keys" --account "$account" 2>&1); then
+      printf '%s\n' "$output" >&2
+      case "$output" in
+        *-25308*) fail "the login keychain would not take the key without asking you (errSecInteractionNotAllowed): run this from a Terminal window of your own Mac session, with the login keychain unlocked, not over ssh or from a sandboxed shell" ;;
+      esac
+      fail "generate_keys could not make the Sparkle key"
+    fi
+    public_key=$("$generate_keys" --account "$account" -p)
+  fi
+  public_key=$(printf '%s\n' "$public_key" | tail -n 1 | tr -d '[:space:]')
+  if [ -z "$committed" ]; then
+    staged="$CONF.partial.$$"
+    sed "s|^SPARKLE_PUBLIC_ED_KEY=.*|SPARKLE_PUBLIC_ED_KEY=$public_key|" "$CONF" > "$staged"
+    mv -f "$staged" "$CONF"
+    echo "  wrote SPARKLE_PUBLIC_ED_KEY=$public_key into ${CONF#"$root"/}; commit it"
+  elif [ "$committed" != "$public_key" ]; then
+    fail "${CONF#"$root"/} holds another public key ($committed) than the keychain's ($public_key). Changing the key is a rotation: see docs/releasing.md, Rotating keys."
+  else
+    echo "  ${CONF#"$root"/} has this key already"
+  fi
+  security find-generic-password -s https://sparkle-project.org -a "$account" -w \
+    | secret SPARKLE_ED_PRIVATE_KEY release
+  derived=$(security find-generic-password -s https://sparkle-project.org -a "$account" -w \
+    | xcrun swift "$root/Scripts/sparkle-key.swift" derive)
+  [ "$derived" = "$public_key" ] || fail "the keychain's Sparkle key does not derive $public_key (it derives $derived)"
+  echo "  set SPARKLE_ED_PRIVATE_KEY in environment release"
+  echo "Back the key up in your password manager; losing it means the next key change must ship as a Developer ID–signed DMG."
+  echo "  (Keychain Access › login › \"Private key for signing Sparkle updates\", account $account)"
+fi
+
+# 5. The Developer ID Application certificate and its private key.
+if wants developer-id; then
+  step "Developer ID Application certificate"
+  if [ -z "$p12" ]; then
+    ask p12 "Path of the Developer ID Application .p12, exported with its private key$later: "
+  fi
+  if [ -z "$p12" ] && [ -z "$only" ]; then
+    skip developer-id " --p12 PATH"
+  else
+    [ -f "$p12" ] || fail "no file ${p12:-given}"
+    ask_secret password "The .p12's export password: "
+    # GitHub stores no empty secret, and CI's import needs the password.
+    [ -n "$password" ] || fail "the .p12 needs an export password: export it again from Keychain Access with one (a random one is fine; only GitHub needs it), then run Scripts/release-setup --only developer-id --p12 PATH"
+    base64 < "$p12" | secret DEVELOPER_ID_P12_BASE64 release
+    printf '%s' "$password" | secret DEVELOPER_ID_P12_PASSWORD release
+    unset password
+    echo "  set DEVELOPER_ID_P12_BASE64 and DEVELOPER_ID_P12_PASSWORD in environment release"
+  fi
+fi
+
+# 6. The App Store Connect API key notarytool uses.
+if wants notary; then
+  step "Notary key (App Store Connect Team API key, Developer role)"
+  if [ -z "$notary_key" ]; then
+    ask notary_key "Path of AuthKey_<KEY ID>.p8$later: "
+  fi
+  if [ -z "$notary_key" ] && [ -z "$only" ]; then
+    skip notary " --notary-key AuthKey_<KEY ID>.p8"
+  else
+    [ -f "$notary_key" ] || fail "no file ${notary_key:-given}"
+    key_id=$(basename "$notary_key" | sed -n 's/^AuthKey_\([A-Za-z0-9]*\)\.p8$/\1/p')
+    [ -n "$key_id" ] || fail "$notary_key is not named AuthKey_<KEY ID>.p8"
+    ask issuer "Issuer ID (App Store Connect › Users and Access › Integrations): "
+    [ -n "$issuer" ] || fail "no issuer ID"
+    xcrun notarytool history --key "$notary_key" --key-id "$key_id" --issuer "$issuer" >/dev/null \
+      || fail "notarytool refused this key, key id or issuer"
+    secret NOTARY_KEY_P8 release < "$notary_key"
+    gh secret set NOTARY_KEY_ID --env release --repo "$repo" --body "$key_id"
+    gh secret set NOTARY_ISSUER_ID --env release --repo "$repo" --body "$issuer"
+    echo "  set NOTARY_KEY_P8, NOTARY_KEY_ID and NOTARY_ISSUER_ID in environment release"
+  fi
+fi
+
+# 7. The R2 credentials, for environment appcast only.
+if wants cloudflare; then
+  step "Cloudflare R2 (bucket $bucket)"
+  ask account_id "Cloudflare account ID$later: "
+  if [ -z "$account_id" ] && [ -z "$only" ]; then
+    skip cloudflare ""
+  else
+    [ -n "$account_id" ] || fail "no account ID"
+    ask_secret access_key "R2 Access Key ID: "
+    ask_secret secret_key "R2 Secret Access Key: "
+    [ -n "$access_key" ] && [ -n "$secret_key" ] || fail "both R2 keys are needed"
+    printf '%s' "$account_id" | secret CLOUDFLARE_ACCOUNT_ID appcast
+    printf '%s' "$access_key" | secret R2_ACCESS_KEY_ID appcast
+    printf '%s' "$secret_key" | secret R2_SECRET_ACCESS_KEY appcast
+    echo "  set CLOUDFLARE_ACCOUNT_ID, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY in environment appcast"
+    if command -v aws >/dev/null 2>&1; then
+      if AWS_ACCESS_KEY_ID=$access_key AWS_SECRET_ACCESS_KEY=$secret_key AWS_DEFAULT_REGION=auto AWS_PAGER="" \
+          aws s3api list-objects-v2 --endpoint-url "https://$account_id.r2.cloudflarestorage.com" \
+          --bucket "$bucket" --max-keys 1 >/dev/null; then
+        echo "  the token can list $bucket"
+      else
+        echo "warning: the token could not list $bucket; check the bucket and the token's permissions" >&2
+      fi
+    else
+      echo "  (aws is not installed; the token was not tried)"
+    fi
+    unset access_key secret_key
+  fi
+fi
+
+# 8. What only a person can do, after every part of a run without --only.
+if [ -z "$only" ]; then
+  if [ -n "$skipped" ]; then
+    printf '\nSkipped for now:%s. Run Scripts/release-setup --only PART for each once its step below is done.\n' \
+      "$(printf '%s' "$skipped" | sed 's/ /, /g; s/^,//')"
+  fi
+  cat <<EOF
+
+Left to do by hand (docs/releasing.md, One-time setup):
+  - Create the Developer ID Application certificate; only the Account Holder can.
+  - Create an App Store Connect Team API key with the Developer role.
+  - Create the R2 bucket $bucket.
+  - Connect the custom domain $(conf SPARKLE_FEED_URL | sed 's#^https://##; s#/.*##') to it: the zone must be
+    in the same Cloudflare account, with no DNS record of that name yet. Keep r2.dev disabled.
+  - Create an R2 Account API token with Object Read & Write on $bucket only.
+  - Check that bot protection does not challenge Sparkle:
+      curl -A 'Cherry Sparkle/2' -I $(conf SPARKLE_FEED_URL)
+  - Optionally add a tag ruleset (docs/releasing.md).
+  - Commit Packaging/release.conf.
+  - Actions › Pre-release › Run workflow with dry_run, then inspect its artifact.
+  - Unpause: gh variable set RELEASES_PAUSED --body false --repo $repo
+EOF
+fi

@@ -168,6 +168,22 @@ if wants developer-id; then
     ask_secret password "The .p12's export password: "
     # GitHub stores no empty secret, and CI's import needs the password.
     [ -n "$password" ] || fail "the .p12 needs an export password: export it again from Keychain Access with one (a random one is fine; only GitHub needs it), then run Scripts/release-setup --only developer-id --p12 PATH"
+    # Import it into a throwaway keychain as CI does, so a password that does
+    # not open this file, or a file without the team's Developer ID, never
+    # reaches GitHub.
+    team=$(conf TEAM_ID)
+    check_dir=$(mktemp -d)
+    check_keychain="$check_dir/check.keychain-db"
+    security create-keychain -p "cherry-release-setup-check" "$check_keychain" >/dev/null
+    imported=true
+    security import "$p12" -k "$check_keychain" -f pkcs12 -P "$password" >/dev/null 2>&1 || imported=false
+    identities=$(security find-identity -p codesigning "$check_keychain" 2>/dev/null || true)
+    security delete-keychain "$check_keychain" >/dev/null 2>&1 || true
+    rm -rf "$check_dir"
+    [ "$imported" = true ] || fail "that password does not open $p12 (or it is not a .p12): export it again and give the same file and password"
+    printf '%s\n' "$identities" | grep -q "\"Developer ID Application: .*($team)\"" \
+      || fail "$p12 holds no Developer ID Application identity of team $team"
+    echo "  $p12 opens with that password and holds the Developer ID Application identity of $team"
     base64 < "$p12" | secret DEVELOPER_ID_P12_BASE64 release
     printf '%s' "$password" | secret DEVELOPER_ID_P12_PASSWORD release
     unset password

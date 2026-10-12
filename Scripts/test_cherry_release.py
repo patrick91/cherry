@@ -516,7 +516,35 @@ def xcrun(args):
 
 # security, xcode-select and generate_keys (Scripts/release-setup) ---------------
 
+def security_keychain(args):
+    """create-keychain, import, find-identity and delete-keychain on a
+    throwaway keychain file. A .p12 is known by its bytes' SHA-256 in the
+    state's p12s: {"password": ..., "identity": ...}."""
+    command, path = args[0], Path(args[-1])
+    log({"tool": "security", "command": command})
+    if command == "create-keychain":
+        path.write_text(json.dumps([]))
+    elif command == "delete-keychain":
+        path.unlink()
+    elif command == "import":
+        keychain = Path(args[args.index("-k") + 1])
+        p12 = Path(args[1]).read_bytes()
+        known = load().get("p12s", {}).get(hashlib.sha256(p12).hexdigest())
+        if known is None:
+            die("security: SecKeychainItemImport: Unknown format in import.", 1)
+        if known["password"] != args[args.index("-P") + 1]:
+            die("security: SecKeychainItemImport: The user name or passphrase you entered is not correct.", 1)
+        keychain.write_text(json.dumps(json.loads(keychain.read_text()) + [known["identity"]]))
+    elif command == "find-identity":
+        identities = json.loads(path.read_text())
+        for index, identity in enumerate(identities, 1):
+            sys.stdout.write('  %d) %s "%s"\n' % (index, "AB" * 20, identity))
+        sys.stdout.write("     %d identities found\n" % len(identities))
+
+
 def security(args):
+    if args[:1] in (["create-keychain"], ["delete-keychain"], ["import"], ["find-identity"]):
+        return security_keychain(args)
     if args[:1] != ["find-generic-password"] or "-w" not in args:
         die("fake security: unsupported command " + " ".join(args), 99)
     account = args[args.index("-a") + 1]
@@ -1942,12 +1970,37 @@ class ReleaseSetupTests(unittest.TestCase):
     def test_a_given_p12_sets_both_secrets(self):
         p12 = self.sandbox.root / "developer-id.p12"
         p12.write_bytes(bytes(range(256)) * 3)
+        self.register_p12(p12, "the password", "Developer ID Application: Farbun LIMITED (Z7Q27G3R62)")
         result = self.setup("--only", "developer-id", "--p12", p12, stdin="the password\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         secrets = self.secrets()["release"]
         self.assertEqual(base64.b64decode(secrets["DEVELOPER_ID_P12_BASE64"]), p12.read_bytes())
         self.assertEqual(secrets["DEVELOPER_ID_P12_PASSWORD"], "the password")
         self.assertNotIn("the password", result.stdout + result.stderr)
+        # The throwaway keychain is gone again.
+        self.assertEqual([c["command"] for c in self.sandbox.calls("security")][-1], "delete-keychain")
+
+    def register_p12(self, p12, password, identity):
+        known = self.sandbox.state().get("p12s", {})
+        known[hashlib.sha256(p12.read_bytes()).hexdigest()] = {"password": password, "identity": identity}
+        self.sandbox.update(p12s=known)
+
+    def test_a_p12_its_password_does_not_open_or_without_the_teams_developer_id_is_refused(self):
+        p12 = self.sandbox.root / "developer-id.p12"
+        p12.write_bytes(b"a p12")
+        self.register_p12(p12, "the password", "Developer ID Application: Farbun LIMITED (Z7Q27G3R62)")
+        result = self.setup("--only", "developer-id", "--p12", p12, stdin="another password\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("that password does not open", result.stderr)
+        self.assertNotIn("release", self.secrets())
+        other = self.sandbox.root / "other.p12"
+        other.write_bytes(b"another p12")
+        self.register_p12(other, "pw", "Apple Development: Someone (ABCDE12345)")
+        result = self.setup("--only", "developer-id", "--p12", other, stdin="pw\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("holds no Developer ID Application identity of team Z7Q27G3R62", result.stderr)
+        self.assertNotIn("release", self.secrets())
+        self.assertNotIn("another password", result.stdout + result.stderr)
 
     def test_a_committed_key_the_keychain_lacks_is_never_replaced_by_a_new_one(self):
         self.sandbox.update(keychain={})

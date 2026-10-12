@@ -42,7 +42,7 @@ export GH_REPO
 [ -n "$GH_REPO" ] || fail "no GH_REPO and no GITHUB_REPOSITORY in $CONF"
 
 # Prints the answer of a GET; returns 1 when GitHub says the thing does not
-# exist (404, or 422 for commits/tags/T), and stops the script on any other
+# exist (404, or 422 for commits/refs/tags/T), and stops the script on any other
 # failure.
 gh_lookup() {
   local err
@@ -145,7 +145,7 @@ esac
 
 # 2. The tag.
 tag_commit() {
-  gh_lookup -H 'Accept: application/vnd.github.sha' "repos/$GH_REPO/commits/tags/$tag"
+  gh_lookup -H 'Accept: application/vnd.github.sha' "repos/$GH_REPO/commits/refs/tags/$tag"
 }
 if [ "$verify_tag" = true ]; then
   status=0

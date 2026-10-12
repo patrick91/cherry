@@ -269,12 +269,15 @@ def gh_api(args):
         tag = match.group(1)
         if tag not in state["tags"]:
             return not_found()
-        return emit({"ref": "refs/tags/" + tag, "object": {"sha": state["tags"][tag], "type": "commit"}}, jq)
-    match = re.match(r"^commits/tags/(.+)$", rest)
+        kind = "tag" if tag in state.get("annotated", []) else "commit"
+        return emit({"ref": "refs/tags/" + tag, "object": {"sha": state["tags"][tag], "type": kind}}, jq)
+    # GitHub resolves commits/refs/tags/T for every tag, but commits/tags/T only
+    # for a lightweight one: an annotated tag (Scripts/promote's) answers 422.
+    match = re.match(r"^commits/(refs/)?tags/(.+)$", rest)
     if match and method == "GET":
-        tag = match.group(1)
-        if tag not in state["tags"]:
-            die("gh: No commit found for SHA: tags/%s (HTTP 422)" % tag)
+        tag = match.group(2)
+        if tag not in state["tags"] or (not match.group(1) and tag in state.get("annotated", [])):
+            die("gh: No commit found for SHA: %stags/%s (HTTP 422)" % (match.group(1) or "", tag))
         if "Accept: application/vnd.github.sha" in headers:
             return emit(state["tags"][tag], None, raw=True)
         return emit({"sha": state["tags"][tag]}, jq)
@@ -289,6 +292,7 @@ def gh_api(args):
         if name in state["tags"]:
             die("gh: Reference already exists (HTTP 422)")
         state["tags"][name] = state["tag_objects"][fields["sha"]]["object"]
+        state.setdefault("annotated", []).append(name)
         save(state)
         return emit({"ref": fields["ref"]}, jq)
     die("fake gh api: no route for %s %s" % (method, endpoint), 99)
@@ -1853,6 +1857,18 @@ class PromoteReleaseTests(unittest.TestCase):
         self.assertIn(f"`v{self.VERSION}` is on {'2' * 40} but `v{self.VERSION}-pre` is on {self.PRE_SHA}: "
                       f"delete it and run Scripts/promote {self.VERSION}.", result.stderr)
         self.assertEqual(self.sandbox.writes(), [])
+
+    def test_a_stable_tag_pushed_on_the_prereleases_commit_is_promoted(self):
+        # Scripts/promote pushes an annotated tag.
+        self.sandbox.update(tags={f"v{self.VERSION}-pre": self.PRE_SHA, f"v{self.VERSION}": self.PRE_SHA},
+                            annotated=[f"v{self.VERSION}"])
+        result = self.promote(f"v{self.VERSION}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = outputs(result.stdout)
+        self.assertEqual((values["already_stable"], values["tag"]), ("false", f"v{self.VERSION}"))
+        stable = self.stable_release()
+        self.assertEqual((stable["draft"], stable["prerelease"]), (False, False))
+        self.assertEqual(self.sandbox.state()["tag_objects"], {})
 
     def test_already_stable_changes_nothing(self):
         self.sandbox.add_release(f"v{self.VERSION}", prerelease=False, commit=self.PRE_SHA)

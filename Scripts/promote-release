@@ -60,7 +60,7 @@ export GH_REPO
 feed_url=$(conf SPARKLE_FEED_URL)
 
 # Prints the answer of a GET; returns 1 when GitHub says the thing does not
-# exist (404, or 422 for commits/tags/T), and 3 on any other failure.
+# exist (404, or 422 for commits/refs/tags/T), and 3 on any other failure.
 gh_lookup() {
   local err
   err=$(mktemp)
@@ -70,7 +70,7 @@ gh_lookup() {
   rm -f "$err"
   return 3
 }
-tag_commit() { gh_lookup -H 'Accept: application/vnd.github.sha' "repos/$GH_REPO/commits/tags/$1"; }
+tag_commit() { gh_lookup -H 'Accept: application/vnd.github.sha' "repos/$GH_REPO/commits/refs/tags/$1"; }
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

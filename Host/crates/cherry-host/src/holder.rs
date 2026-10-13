@@ -1179,12 +1179,13 @@ impl Holder {
     /// most `READS_PER_PASS` reads: whether it read as much as that, so
     /// that more output is ready, is `more_output`. As far as the daemon
     /// lets it (`credit`) when `paced`; the output a program left when it
-    /// exited is read whatever the daemon said.
-    fn read_output(&mut self, paced: bool) -> bool {
+    /// exited is read whatever the daemon said. `now` is the time when it
+    /// is called, and the time the reads ended when it returns.
+    fn read_output(&mut self, paced: bool, now: &mut Instant) -> bool {
         // A kitty graphics command whose data the media layer read: its
         // transmission goes on below. One it refused is answered here,
         // after the replies to the output before it.
-        if let Some(reply) = self.media.finish(Instant::now()) {
+        if let Some(reply) = self.media.finish(*now) {
             self.settle_terminal();
             self.queue_replies(&reply);
         }
@@ -1205,7 +1206,7 @@ impl Holder {
         // than the program. As long as that finds more output.
         let mut retries = 0;
         let mut found = false;
-        let spin = self.spinning && self.flooding();
+        let spin = self.spinning && self.flooding(*now);
         while reads < READS_PER_PASS && credit > 0 {
             // No more than the daemon lets through: display output is no
             // longer than what it is read from, but for a few bytes.
@@ -1254,10 +1255,14 @@ impl Holder {
                     display.feed_into(bytes, &mut output)
                 });
         }
+        // The reads may have taken a while (a retry yields): the clock is
+        // read again, once, for what follows.
+        *now = Instant::now();
+        let now = *now;
         // Output the media layer holds is ready at once, unless it waits
         // for a read.
         if self.media.holds_output() {
-            drained = !self.media.due(Instant::now());
+            drained = !self.media.due(now);
         }
         let dropped = self.display.take_dropped_clipboard_writes();
         if dropped > 0 {
@@ -1280,7 +1285,6 @@ impl Holder {
             self.spinning = false;
         }
         if reads > 0 {
-            let now = Instant::now();
             if !continued
                 && self
                     .last_output
@@ -1293,13 +1297,13 @@ impl Holder {
             // which the terminal does not report, where they came.
             let terminal = std::mem::take(&mut output.terminal);
             let notifications = std::mem::take(&mut output.notifications);
-            self.parsing = !self.terminal.feed(terminal, notifications);
+            self.parsing = !self.terminal.feed(terminal, notifications, now);
             // A query the host answers is parsed at once, so the program
             // gets its reply without delay.
             if output.answered {
                 self.parsing = !self.terminal.flush();
             }
-            self.emit(output);
+            self.emit(output, now);
             self.activity();
         }
         open
@@ -1327,15 +1331,16 @@ impl Holder {
         self.collect_terminal();
     }
 
-    /// Whether the program floods: its output has come without a pause of
-    /// `FLOOD_PAUSE` for `FLOOD_AFTER`, and still does. Interactive output
-    /// (an echo, a prompt, an editor's repaint) comes in bursts shorter
-    /// than that, with pauses between them. A wait with output ready (for
-    /// the daemon to let more through, say) is no pause.
-    fn flooding(&self) -> bool {
+    /// Whether the program floods at `now`: its output has come without a
+    /// pause of `FLOOD_PAUSE` for `FLOOD_AFTER`, and still does.
+    /// Interactive output (an echo, a prompt, an editor's repaint) comes in
+    /// bursts shorter than that, with pauses between them. A wait with
+    /// output ready (for the daemon to let more through, say) is no pause.
+    fn flooding(&self, now: Instant) -> bool {
         match (self.run_since, self.last_output) {
             (Some(since), Some(last)) => {
-                last.saturating_duration_since(since) >= FLOOD_AFTER && last.elapsed() < FLOOD_PAUSE
+                last.saturating_duration_since(since) >= FLOOD_AFTER
+                    && now.saturating_duration_since(last) < FLOOD_PAUSE
             }
             _ => false,
         }
@@ -1351,13 +1356,13 @@ impl Holder {
     /// The time the daemon let nothing more through does not count as a
     /// pause of the program's output (see `flooding`): a flood held back
     /// for a slow client goes on as one once the client takes more.
-    fn follow_pace(&mut self) {
+    fn follow_pace(&mut self, now: Instant) {
         let held = self.credit() == 0;
         match self.held_since {
-            None if held => self.held_since = Some(Instant::now()),
+            None if held => self.held_since = Some(now),
             Some(since) if !held => {
                 self.held_since = None;
-                let held_for = since.elapsed();
+                let held_for = now.saturating_duration_since(since);
                 for at in [&mut self.run_since, &mut self.last_output]
                     .into_iter()
                     .flatten()
@@ -1419,33 +1424,33 @@ impl Holder {
         }
     }
 
-    /// Renderer output and the queries in it, in order. Without a daemon
-    /// the output only advances the offset, and queries are dropped, as
-    /// they are while nobody is attached.
-    fn emit(&mut self, output: Batch) {
+    /// Renderer output and the queries in it, in order, read at `now`.
+    /// Without a daemon the output only advances the offset, and queries
+    /// are dropped, as they are while nobody is attached.
+    fn emit(&mut self, output: Batch, now: Instant) {
         let Batch {
             display, queries, ..
         } = output;
         let mut at = 0;
         for (position, query) in queries {
             if position > at {
-                self.emit_output(&display[at..position]);
+                self.emit_output(&display[at..position], now);
                 at = position;
             }
             self.send(link::encode(kind::QUERY, &link::Empty {}, &query));
         }
         if at < display.len() {
-            self.emit_output(&display[at..]);
+            self.emit_output(&display[at..], now);
         }
     }
 
-    fn emit_output(&mut self, data: &[u8]) {
+    fn emit_output(&mut self, data: &[u8], now: Instant) {
         let offset = self.offset;
         self.offset += data.len() as u64;
         if let Some(link) = &mut self.link {
             if link.output.is_empty() {
                 link.output_offset = offset;
-                link.output_since = Some(Instant::now());
+                link.output_since = Some(now);
             }
             link.output.extend_from_slice(data);
             if link.output.len() >= OUTPUT_BATCH {
@@ -1462,11 +1467,10 @@ impl Holder {
         }
     }
 
-    fn check_foreground(&mut self) {
+    fn check_foreground(&mut self, now: Instant) {
         let Some(due) = self.foreground_due else {
             return;
         };
-        let now = Instant::now();
         if now < due {
             return;
         }
@@ -1811,7 +1815,8 @@ impl Holder {
         }
     }
 
-    fn flush_link(&mut self) {
+    /// Send what waits for the daemon, as of `now`.
+    fn flush_link(&mut self, now: Instant) {
         self.send_info();
         // Output goes as soon as the link has room; until then it gathers.
         // It also gathers, up to `GATHER_BYTES`, while the program's output
@@ -1821,14 +1826,14 @@ impl Holder {
         // clients less per byte. Output after a pause (an echo, a prompt,
         // a repaint) goes at once.
         // Nothing gathers once the daemon lets no more through.
-        let flooding = self.flooding() && self.credit() > 0;
+        let flooding = self.flooding(now) && self.credit() > 0;
         let gather = self.link.as_ref().is_some_and(|link| {
             link.output.len() < GATHER_BYTES
                 && ((self.more_output && self.reading())
                     || (flooding
-                        && link
-                            .output_since
-                            .is_some_and(|since| since.elapsed() < FLOOD_DELAY)))
+                        && link.output_since.is_some_and(|since| {
+                            now.saturating_duration_since(since) < FLOOD_DELAY
+                        })))
         });
         let Some(link) = &mut self.link else {
             self.info = link::Info::default();
@@ -1912,8 +1917,9 @@ impl Holder {
             let until = Instant::now() + media::READ_TIMEOUT;
             loop {
                 self.media.wait(until);
-                self.read_output(false);
-                if !self.media.holds_output() || Instant::now() >= until {
+                let mut now = Instant::now();
+                self.read_output(false, &mut now);
+                if !self.media.holds_output() || now >= until {
                     break;
                 }
             }
@@ -1989,11 +1995,11 @@ impl Holder {
                 .is_some_and(|manifest| !manifest.exists())
     }
 
-    fn next_wait(&self) -> Duration {
+    /// How long the holder may sleep from `now`.
+    fn next_wait(&self, now: Instant) -> Duration {
         if self.link.as_ref().is_some_and(|link| link.backlog) {
             return Duration::ZERO;
         }
-        let now = Instant::now();
         // Output the media layer holds goes on at once (see `read_output`).
         if self.reading() && self.media.due(now) {
             return Duration::ZERO;
@@ -2011,7 +2017,7 @@ impl Holder {
             wait = wait.min(due.saturating_duration_since(now));
         }
         // Output held for the terminal is handed over by `MAX_HOLD`.
-        if let Some(left) = self.terminal.hold_left() {
+        if let Some(left) = self.terminal.hold_left(now) {
             wait = wait.min(left);
         }
         // Output gathering during a flood goes by `FLOOD_DELAY` (output
@@ -2019,20 +2025,25 @@ impl Holder {
         let gathering = self
             .link
             .as_ref()
-            .filter(|link| link.writer.is_empty() && self.flooding() && self.credit() > 0)
+            .filter(|link| link.writer.is_empty() && self.flooding(now) && self.credit() > 0)
             .and_then(|link| link.output_since);
         if let Some(since) = gathering {
-            wait = wait.min(FLOOD_DELAY.saturating_sub(since.elapsed()));
+            wait = wait.min(FLOOD_DELAY.saturating_sub(now.saturating_duration_since(since)));
         }
         wait
     }
 
     fn run(mut self) {
+        // The time, read where a pass begins, once its reads ended and once
+        // its requests, input and exit check were done (any of them may
+        // take a while), rather than by everything that needs it: under a
+        // flood that cost a few percent of the holder's time.
+        let mut now = Instant::now();
         loop {
             // What the terminal made of the output so far: its replies go
             // to the program below.
             self.collect_terminal();
-            self.follow_pace();
+            self.follow_pace(now);
             // Each read, and the exit check, only when the last poll found
             // something for it (every one after a pass without a poll):
             // under a flood a pass is a few reads, so a read that finds
@@ -2040,11 +2051,9 @@ impl Holder {
             let ready = std::mem::replace(&mut self.ready, Ready::ALL);
             // Output first, and out before any request is served, so that
             // request work (a snapshot, the screen as text) never delays it.
-            if self.reading()
-                && (ready.master || self.more_output || self.media.due(Instant::now()))
-            {
-                self.eof = !self.read_output(true);
-                self.flush_link();
+            if self.reading() && (ready.master || self.more_output || self.media.due(now)) {
+                self.eof = !self.read_output(true, &mut now);
+                self.flush_link(now);
             }
             if ready.link || self.link.as_ref().is_some_and(|link| link.backlog) {
                 self.pump_link();
@@ -2056,8 +2065,9 @@ impl Holder {
             if self.state.running && (ready.child || self.termination.is_some()) {
                 self.check_exit();
             }
-            self.check_foreground();
-            self.flush_link();
+            now = Instant::now();
+            self.check_foreground(now);
+            self.flush_link(now);
             if !self.state.running && self.removed {
                 break;
             }
@@ -2075,11 +2085,12 @@ impl Holder {
                 ));
                 break;
             }
-            if self.link.is_none() && self.redial_at.is_some_and(|at| Instant::now() >= at) {
+            if self.link.is_none() && self.redial_at.is_some_and(|at| now >= at) {
                 self.redial();
+                now = Instant::now();
                 continue;
             }
-            self.wait();
+            now = self.wait(now);
         }
         if let Some(manifest) = &self.manifest {
             let _ = std::fs::remove_file(manifest);
@@ -2092,15 +2103,18 @@ impl Holder {
         }
     }
 
-    fn wait(&mut self) {
+    /// Wait for something to do, from `now`; the time it is then.
+    fn wait(&mut self, now: Instant) -> Instant {
         // Output held for the terminal waits for more to join it (see
         // `next_wait`) for at most `terminal_thread::MAX_HOLD`: during a
         // flood the terminal takes it a chunk at a time, woken once per
         // chunk rather than per pass.
-        self.poll(self.next_wait());
-        if self.terminal.has_pending() && self.terminal.due() {
+        self.poll(self.next_wait(now));
+        let now = Instant::now();
+        if self.terminal.has_pending() && self.terminal.due(now) {
             self.parsing = !self.terminal.flush();
         }
+        now
     }
 
     /// Wait up to `wait` for something to do, and note what is ready.

@@ -73,24 +73,21 @@ impl MediaGuard {
     /// written to the terminal: all of them, but commands that may name a
     /// medium (and the bytes of one held back until it is decided).
     pub fn filter<'a>(&mut self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
-        if self.state == State::Ground && memchr::memchr(ESC, bytes).is_none() {
-            // Text: an 8-bit control there is not one.
+        // Up to a kitty command, what goes out is what came in: followed
+        // without a copy.
+        let mut at = if self.state == State::Kitty {
+            0
+        } else {
+            self.skim(bytes)
+        };
+        if at == bytes.len() {
             return Cow::Borrowed(bytes);
         }
         let mut out = Vec::with_capacity(bytes.len() + 1);
-        let mut at = 0;
+        out.extend_from_slice(&bytes[..at]);
         while at < bytes.len() {
-            // Runs that change nothing go at once: text up to an ESC, and a
-            // decided command's bytes up to what may end it.
             let rest = &bytes[at..];
-            let run = match (self.state, self.decision) {
-                (State::Ground, _) => memchr::memchr(ESC, rest).unwrap_or(rest.len()),
-                (State::Kitty, Decision::Pass | Decision::Drop) => rest
-                    .iter()
-                    .position(|&b| matches!(b, ESC | CAN | SUB | 0x80..=0x9f))
-                    .unwrap_or(rest.len()),
-                _ => 0,
-            };
+            let run = self.unchanged(rest);
             if self.state != State::Kitty || self.decision == Decision::Pass {
                 out.extend_from_slice(&rest[..run]);
             }
@@ -107,13 +104,62 @@ impl MediaGuard {
         }
     }
 
+    /// Follow `bytes` up to the `G` that begins a kitty command, where it
+    /// stops (or to their end): how far it went. All of that goes on as it
+    /// is.
+    fn skim(&mut self, bytes: &[u8]) -> usize {
+        let mut at = 0;
+        loop {
+            at += self.unchanged(&bytes[at..]);
+            let Some(&byte) = bytes.get(at) else {
+                return at;
+            };
+            let state = self.after(byte);
+            if state == State::Kitty {
+                return at;
+            }
+            self.state = state;
+            at += 1;
+        }
+    }
+
+    /// How many of the bytes `rest` begins with change nothing: text up to
+    /// an ESC, the parameters of a control sequence, a string's data, and
+    /// a decided command's bytes up to what may end it.
+    fn unchanged(&self, rest: &[u8]) -> usize {
+        let end = match (self.state, self.decision) {
+            (State::Ground, _) => memchr::memchr(ESC, rest),
+            // Parameters and intermediates (the rest one at a time).
+            (State::Csi, _) => rest.iter().position(|b| !(0x20..=0x3f).contains(b)),
+            (State::Osc, _) => rest
+                .iter()
+                .position(|&b| matches!(b, 0x07 | ESC | CAN | SUB)),
+            (State::Dcs | State::String, _) | (State::Kitty, Decision::Pass | Decision::Drop) => {
+                rest.iter()
+                    .position(|&b| matches!(b, ESC | CAN | SUB | 0x80..=0x9f))
+            }
+            _ => Some(0),
+        };
+        end.unwrap_or(rest.len())
+    }
+
     fn step(&mut self, byte: u8, out: &mut Vec<u8>) {
         if self.state == State::Kitty {
             self.command(byte, out);
             return;
         }
-        out.push(byte);
-        self.state = match (self.state, byte) {
+        self.state = self.after(byte);
+        if self.state == State::Kitty {
+            self.held.push(byte);
+            self.decision = Decision::Undecided;
+        } else {
+            out.push(byte);
+        }
+    }
+
+    /// The state `byte` leads to outside a kitty command.
+    fn after(&self, byte: u8) -> State {
+        match (self.state, byte) {
             (State::Ground, ESC) => State::Escape,
             (State::Ground, _) => State::Ground,
             // Anywhere else: ESC begins a sequence, CAN and SUB end any.
@@ -133,12 +179,8 @@ impl MediaGuard {
             (State::Escape | State::EscapeIntermediate, 0x20..=0x2f) => State::EscapeIntermediate,
             (State::Escape | State::EscapeIntermediate, 0x30..=0x7e) => State::Ground,
             (State::Csi, 0x40..=0x7e) => State::Ground,
-            (State::Identify, b'G') => {
-                out.pop();
-                self.held.push(byte);
-                self.decision = Decision::Undecided;
-                State::Kitty
-            }
+            // A kitty command, held back from its `G`.
+            (State::Identify, b'G') => State::Kitty,
             // Ignored there: Ghostty identifies the string by the byte
             // after them.
             (State::Identify, 0xa0..=0xff) => State::Identify,
@@ -146,7 +188,7 @@ impl MediaGuard {
             // C0 controls, DEL and bytes Ghostty ignores, parameters and
             // data: the state holds.
             (state, _) => state,
-        };
+        }
     }
 
     /// One byte of a kitty command, or the one that ends it.
@@ -464,6 +506,114 @@ mod tests {
                 String::from_utf8_lossy(&output),
                 String::from_utf8_lossy(&out)
             );
+        }
+    }
+
+    /// Random output of text, control sequences, OSC, DCS and other
+    /// strings, and kitty commands that go on or are dropped, through the
+    /// guard in random pieces: what it lets through, and the state it is
+    /// left in, are those of stepping through the bytes one at a time (as
+    /// `filter` did but for text and decided commands).
+    #[test]
+    fn filtering_in_pieces_is_stepping_through_each_byte() {
+        const PIECES: &[&[u8]] = &[
+            b"plain text ",
+            b"\xc3\xa9\xe2\x94\x80",
+            b"\r\n",
+            b"\x1b[1;38;5;123m",
+            b"\x1b[0m",
+            b"\x1b[38;5;",
+            b"\x1b[?1049h",
+            b"\x1b[ q",
+            b"\x1b[1\x08;2H",
+            b"\x1b[3\x7f1m",
+            b"\x1b[\xa031m",
+            b"\x9b2J",
+            b"\x1b(B",
+            b"\x1b#8",
+            b"\x1b]0;title \xc4\x9f\x07",
+            b"\x1b]8;;https://example.com\x1b\\",
+            b"\x1b]2;\x9c\x85",
+            b"\x9d7;file:///\x07",
+            b"\x1bP+q544e\x1b\\",
+            b"\x1bPq#0;2;0;0;0#0~~@@vv@@~~$-\x07\x1b\\",
+            b"\x90q\x9c",
+            b"\x1b_Xother t=f\x1b\\",
+            b"\x1b^private\x9c",
+            b"\x98sos\x07\x9c",
+            b"\x1b_Ga=T,f=24,s=1,v=1,i=7;AQID\x1b\\",
+            b"\x1b_Ga=t,t=d,i=8,m=1;AAAA\x1b\\",
+            b"\x1b_Gm=0;AAAA\x9c",
+            b"\x1b_Ga=p,U=1,i=7,t=100\x1b\\",
+            b"\x1b_Ga=q,i=1,t=f;L2V0Yw==\x1b\\",
+            b"\x1b_Gt=s,\xa0i=2;AA\x9fAA\x18",
+            b"\x9fGa=d,d=a\x9c",
+            b"\x1b\xa0_G",
+            b"\x1b_G",
+            b"a=T,",
+            b"t=f,",
+            b";AAAA",
+            b"\x1b",
+            b"\x18",
+            b"\x1a",
+            b"\x85",
+            b"\x9c",
+            b"\x9f",
+            b"\x07",
+            b"G",
+            b";",
+            b"[",
+            b"]",
+            b"_",
+            b"P",
+            b"@",
+            b"\x7f",
+            b"\xa0",
+        ];
+        let parts = |guard: &MediaGuard| {
+            let held = (guard.held.clone(), guard.control.clone());
+            (guard.state, guard.decision, held)
+        };
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize % n
+        };
+        for _ in 0..3000 {
+            let mut output = Vec::new();
+            for _ in 0..1 + next(40) {
+                match next(50) {
+                    0 => output.extend_from_slice(&b",x=1".repeat(MAX_CONTROL / 4 + 1)),
+                    1 => output.extend_from_slice(&b"AAAA".repeat(1 + next(1000))),
+                    _ => output.extend_from_slice(PIECES[next(PIECES.len())]),
+                }
+            }
+            let text = String::from_utf8_lossy(&output);
+            for longest in [1, 16, 1024, output.len()] {
+                let mut guard = MediaGuard::default();
+                let mut stepped = MediaGuard::default();
+                let mut at = 0;
+                while at < output.len() {
+                    let end = output.len().min(at + 1 + next(longest));
+                    let piece = &output[at..end];
+                    let mut expected = Vec::new();
+                    for &byte in piece {
+                        stepped.step(byte, &mut expected);
+                    }
+                    let passed = guard.filter(piece);
+                    assert_eq!(*passed, expected, "{text:?} at {at}..{end}");
+                    // Borrowed exactly when nothing changed.
+                    assert_eq!(
+                        matches!(passed, Cow::Borrowed(_)),
+                        expected == piece,
+                        "{text:?} at {at}..{end}"
+                    );
+                    assert_eq!(parts(&guard), parts(&stepped), "{text:?} at {at}..{end}");
+                    at = end;
+                }
+            }
         }
     }
 }

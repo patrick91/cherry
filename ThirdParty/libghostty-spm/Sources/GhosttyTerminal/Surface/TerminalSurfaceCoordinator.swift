@@ -7,7 +7,6 @@
 
 import Foundation
 import GhosttyKit
-import MSDisplayLink
 
 /// Shared terminal state and logic used by both UIKit and AppKit views.
 ///
@@ -286,12 +285,12 @@ final class TerminalSurfaceCoordinator {
     }
     // MARK: - Frame Rendering
 
-    func tick(context: DisplayLinkCallbackContext) {
-        guard shouldRenderFrame(at: context.timestamp) else {
+    func tick(timestamp: TimeInterval) {
+        guard shouldRenderFrame(at: timestamp) else {
             return
         }
         pendingImmediateTick = false
-        lastTickTimestamp = context.timestamp
+        lastTickTimestamp = timestamp
         TerminalDebugLog.log(.render, "tick")
         controller?.tick()
         surface?.refresh()
@@ -391,14 +390,7 @@ final class TerminalSurfaceCoordinator {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.tickScheduled = false
-            let timestamp = Self.monotonicTimestamp()
-            self.tick(
-                context: .init(
-                    duration: 0,
-                    timestamp: timestamp,
-                    targetTimestamp: timestamp
-                )
-            )
+            self.tick(timestamp: Self.monotonicTimestamp())
         }
     }
 

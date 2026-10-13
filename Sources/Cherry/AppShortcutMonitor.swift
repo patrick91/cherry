@@ -3,17 +3,13 @@ import SwiftUI
 
 struct AppShortcutMonitor: NSViewRepresentable {
     @ObservedObject private var agentSettings = AgentSettings.shared
-    @AppStorage(WorktreeSwipeTuning.settleDurationKey)
-    private var worktreeSettleDuration = WorktreeSwipeTuning.defaultSettleDuration
 
     @ObservedObject var repository: RepositoryWorkspace
-    @ObservedObject var worktreeSwipeState: WorktreeSidebarSwipeState
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var todoStore: ProjectTodoStore
     let projectRoot: String?
-    let sidebarWidth: CGFloat
     let openSettings: () -> Void
 
     private var visibleCommandNames: [String] {
@@ -110,7 +106,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
     func makeCoordinator() -> Coordinator {
         Coordinator(
             repository: repository,
-            worktreeSwipeState: worktreeSwipeState,
             workspace: workspace,
             chromeState: chromeState,
             noteStore: noteStore,
@@ -119,8 +114,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
             visibleCommandNames: visibleCommandNames,
             visibleCommands: visibleCommands,
             projectFeatures: projectFeatures,
-            sidebarWidth: sidebarWidth,
-            worktreeSettleDuration: worktreeSettleDuration,
             openSettings: openSettings
         )
     }
@@ -134,7 +127,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
     func updateNSView(_ nsView: ShortcutMonitorView, context: Context) {
         context.coordinator.workspace = workspace
         context.coordinator.repository = repository
-        context.coordinator.worktreeSwipeState = worktreeSwipeState
         context.coordinator.chromeState = chromeState
         context.coordinator.noteStore = noteStore
         context.coordinator.todoStore = todoStore
@@ -142,8 +134,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
         context.coordinator.visibleCommandNames = visibleCommandNames
         context.coordinator.visibleCommands = visibleCommands
         context.coordinator.projectFeatures = projectFeatures
-        context.coordinator.sidebarWidth = sidebarWidth
-        context.coordinator.worktreeSettleDuration = worktreeSettleDuration
         context.coordinator.openSettings = openSettings
         nsView.coordinator = context.coordinator
     }
@@ -167,7 +157,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
     @MainActor
     final class Coordinator {
         weak var repository: RepositoryWorkspace?
-        weak var worktreeSwipeState: WorktreeSidebarSwipeState?
         weak var workspace: TerminalWorkspace?
         weak var chromeState: ProjectWindowChromeState?
         weak var noteStore: ProjectNoteStore?
@@ -176,15 +165,12 @@ struct AppShortcutMonitor: NSViewRepresentable {
         var visibleCommandNames: [String]
         var visibleCommands: [ProjectCommandDefinition]
         var projectFeatures: ProjectFeatureSettings
-        var sidebarWidth: CGFloat
-        var worktreeSettleDuration: Double
         var openSettings: () -> Void
         weak var window: NSWindow?
         private nonisolated(unsafe) var monitor: Any?
 
         init(
             repository: RepositoryWorkspace? = nil,
-            worktreeSwipeState: WorktreeSidebarSwipeState? = nil,
             workspace: TerminalWorkspace,
             chromeState: ProjectWindowChromeState,
             noteStore: ProjectNoteStore,
@@ -193,12 +179,9 @@ struct AppShortcutMonitor: NSViewRepresentable {
             visibleCommandNames: [String],
             visibleCommands: [ProjectCommandDefinition],
             projectFeatures: ProjectFeatureSettings,
-            sidebarWidth: CGFloat = 320,
-            worktreeSettleDuration: Double = WorktreeSwipeTuning.defaultSettleDuration,
             openSettings: @escaping () -> Void
         ) {
             self.repository = repository
-            self.worktreeSwipeState = worktreeSwipeState
             self.workspace = workspace
             self.chromeState = chromeState
             self.noteStore = noteStore
@@ -207,8 +190,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
             self.visibleCommandNames = visibleCommandNames
             self.visibleCommands = visibleCommands
             self.projectFeatures = projectFeatures
-            self.sidebarWidth = sidebarWidth
-            self.worktreeSettleDuration = worktreeSettleDuration
             self.openSettings = openSettings
             install()
         }
@@ -243,12 +224,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
                modifiers.isDisjoint(with: [.control, .shift])
             {
                 switch event.keyCode {
-                case 123:
-                    animateAdjacentWorktree(offset: -1)
-                    return repository?.supportsWorktrees == true
-                case 124:
-                    animateAdjacentWorktree(offset: 1)
-                    return repository?.supportsWorktrees == true
                 case 126:
                     cycleSidebarSelection(offset: -1)
                     return true
@@ -271,30 +246,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
             perform(action)
             return true
-        }
-
-        private func animateAdjacentWorktree(offset: Int) {
-            guard let repository,
-                  repository.supportsWorktrees,
-                  let worktreeSwipeState,
-                  let target = repository.adjacentWorktree(offset: offset),
-                  repository.prepareWorkspace(worktreeRoot: target.root) != nil
-            else {
-                return
-            }
-
-            _ = worktreeSwipeState.animateSwitch(
-                sourceRoot: repository.activeWorktreeRoot,
-                targetRoot: target.root,
-                direction: offset,
-                sidebarWidth: sidebarWidth,
-                duration: worktreeSettleDuration
-            ) { [weak repository, weak chromeState] in
-                _ = repository?.activate(
-                    worktreeRoot: target.root,
-                    chromeState: chromeState
-                )
-            }
         }
 
         private func perform(_ action: ShortcutAction) {

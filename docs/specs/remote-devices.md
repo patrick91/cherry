@@ -2,7 +2,7 @@
 
 Status: phase 0 (groundwork), phase 1 (devices and remote project
 windows), phase 2 (Add Mac… installs the session host), phase 3 (parity:
-worktrees, cherry.toml, shell integration, editors, background sessions,
+cherry.toml, shell integration, editors, background sessions,
 dropped files, master shards), phase 4a (ports, URLs and forwards for
 device tabs, and pasted images) and phase 4b (Cherry MCP for agents running
 on another Mac) implemented on `codex/persistent-sessions`; the rest of
@@ -65,8 +65,7 @@ choosing a project folder, remote previews without SSH port forwarding.
    (`sha256(key).json`), notes and todos (`ProjectNoteStore`,
    `ProjectTodoStore`: `sha256(key).json`), `CherryDeepLink.projectKey`
    (the SHA-256 of the key, never of a path resolved against the current
-   directory), `AgentSettings` (projects, commands, overrides, hidden and
-   last active worktrees). No code treats a remote key as a local path: no
+   directory), `AgentSettings` (projects, commands, overrides). No code treats a remote key as a local path: no
    `FileManager` check, no `URL(fileURLWithPath:)` standardisation, no
    `cherry.toml` read or write, no `NSWorkspace` open.
 2. **Never run a remote tab locally.** A remote hosting has
@@ -272,7 +271,7 @@ What exists (`Sources/Cherry/RemoteDevices.swift`, `RemoteDeviceCheck.swift`,
   tabs fail ("Couldn't start on an unknown Mac: …"), never local ones; its
   window keeps its saved tabs exactly as saved (no restore, no lease) until
   the device is known again. `RepositoryWorkspace` keeps the key
-  (`isRemote`: no git, no worktrees, no auto-start commands; the sidebar
+  (`isRemote`: no git, no auto-start commands; the sidebar
   hides project commands; Open in an editor is hidden), marks the hosting
   in use while open, holds a lease on the device's control connection
   while the window has tabs, and starts `HostedReconnects` wake/network
@@ -551,31 +550,21 @@ of `BackgroundSessions.swift`, `HostControlSSHMaster.swift`'s shards,
   an `error`, no text). It runs only the git `CHERRY_GIT` names (unset or
   empty: no git at all, `git_error: "git not found"`, never one from PATH,
   which on a Mac without the command line tools would pop their install
-  prompt), reads only, and never starts or talks to a daemon. The app runs it as a one-shot `sh -s`
+  prompt), reads only, and never starts or talks to a daemon. Since
+  worktree spaces were removed (2026-10-13) the app unsets `CHERRY_GIT`,
+  so no git runs there. The app runs it as a one-shot `sh -s`
   script over the device's ssh (`RemoteProjectAccess`: the master's
-  `ControlPath` while it is up, else its own BatchMode ssh), which finds a
-  git that will not ask to install the command line tools (`command -v
-  git`, Homebrew's, `/usr/bin/git` only when `xcode-select -p` answers) and
-  runs the device's cherry-host (`remoteHostPath`, else `PATH`), with
-  `CHERRY_GIT` unset when it found none. The answer
+  `ControlPath` while it is up, else its own BatchMode ssh), which runs the
+  device's cherry-host (`remoteHostPath`, else `PATH`) with `CHERRY_GIT`
+  unset. The answer
   is versioned (`version: 1`); an older cherry-host without the subcommand,
   or another version, is `RemoteProjectError.unsupported` ("update it").
   The app re-checks the cap (a text over 256 KiB is not used) and reads at
   most 4 MiB.
-- **Remote git worktrees.** `GitWorktreeService` takes a runner
-  (`GitWorktreeService(runner:isLocal:)`); a device window's is
-  `RemoteProjectAccess.gitRunner`, which runs `exec "$git" '<arg>'…` in a
-  `sh -s` script there (so any login shell runs it; an ssh failure is a
-  `GitWorktreeCommandError` with the ssh message). `RepositoryWorkspace`
-  (given `remoteProject`, the app passes `RemoteProjectAccess.app(device)`
-  for a known device) names worktrees by key (`device:<id>:<path>`) and
-  converts to the device's paths for git (`gitPath`); its refresh is one
-  `project-info` for the project, then one for the other worktrees'
-  cherry.toml; discovery, dirty status, New Worktree… (under the device's
-  `~/.cherry/worktrees`, `managedWorktreeDestination`; git makes the
-  folders), branch references, fetch, rename, remove, remove all and prune
-  run there. Hidden and last active worktrees are kept by key.
-  `GitWorktree.displayPath` shows the path, never the key.
+- **Remote git worktrees** were removed with worktree spaces
+  (2026-10-13). `RepositoryWorkspace` (given `remoteProject`, the app
+  passes `RemoteProjectAccess.app(device)` for a known device) refreshes
+  with one `project-info` for the project.
 - **cherry.toml on devices.** `RemoteProjectFiles` keeps each device
   project's text by key (from `project-info`), and `CherryProjectFile`
   parses it (commands, features, appearance) as it parses a local file.
@@ -588,8 +577,7 @@ of `BackgroundSessions.swift`, `HostControlSSHMaster.swift`'s shards,
   for This Mac; restart on exit is unchanged. A device that cannot be
   reached when its window opens is read again once its control connects
   (`refreshRemoteProjectOnConnection`), and auto-start keeps waiting until
-  then. New Worktree… asks a device whose home is not recorded for it
-  (`printf "$HOME"`, then recorded) and refuses when it cannot say.
+  then.
 - **Shell integration there.** The installer copies Ghostty's terminfo and
   shell integration (this Cherry's bundled resources, `RemoteHostResources`)
   next to the helpers as `<build>/terminfo` and `<build>/Ghostty`, in the
@@ -688,8 +676,7 @@ of `BackgroundSessions.swift`, `HostControlSSHMaster.swift`'s shards,
   dropped files and scp's options) and `HostControlSSHMasterTests` (shards,
   a shard that cannot log in stopping further shards for its backoff, an
   idle shard kept as the spare) and `RemoteDeviceRealHostParityTests`
-  through `Scripts/fake-remote-mac` (worktrees created, dirty and removed on
-  the device through the runner; cherry.toml commands auto-started and
+  through `Scripts/fake-remote-mac` (cherry.toml commands auto-started and
   restarted there, local overrides, the 256 KiB cap, an old cherry-host;
   the terminfo and zsh integration installed, `TERM=xterm-ghostty` with a
   working `infocmp`, OSC 7 reaching the tab, the next tab's directory;
@@ -698,8 +685,7 @@ of `BackgroundSessions.swift`, `HostControlSSHMaster.swift`'s shards,
   directly when the master refuses every session; a look at a device
   without a daemon starting none, and listing one that runs; a window
   opened while its device is offline reading its project and starting its
-  commands once it connects; New Worktree… asking the device for its
-  home). The fake Mac's shim gained
+  commands once it connects). The fake Mac's shim gained
   stand-in masters (`DIR/masters`) and a MaxSessions stand-in
   (`DIR/max-sessions`). `Scripts/test-remote-mac-loopback`'s sshd has
   `MaxSessions 3` and runs the shard test over real SSH (a fourth session
@@ -985,7 +971,7 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
     with `outside_caller_mac` when it is another device's key; the window
     is the device window with that path, or the one whose path contains it;
     never through `standardizedProjectRoot`;
-  - Open Project (`activate_worktree`) opens only a known key of its Mac,
+  - Open Project (`open_project`) opens only a known key of its Mac,
     matched exactly;
   - the one choke point, `requireOnRemoteDevice`, at the top of
     `handleUnscoped` (which every tool runs through after all mapping),
@@ -1274,8 +1260,8 @@ the device.
    additive, or `cherry list-dir` over the control connection; not SFTP).
    A device that cannot be reached shows its projects disabled with the
    reason.
-3. **Remote windows.** `RepositoryWorkspace` for a remote key: no git or
-   worktree scan (a single worktree whose root is the key), its
+3. **Remote windows.** `RepositoryWorkspace` for a remote key: no git, its
+   one workspace's root is the key, its
    `SessionBackendPolicy.localSessions` is the device's hosting, restore
    uses `WorkspaceSessionRestorers.hostedByDefault(localSessions: device
    hosting, …)`, and the orphan scan runs against that host with the

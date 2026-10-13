@@ -417,7 +417,6 @@ private func session(
         session("d", owner: nil, project: nil),
     ]
     let model = TitlebarProjectMenuModel(
-        worktrees: nil,
         projects: [
             .init(root: "/Users/local/site", name: "site", isSelected: false),
         ],
@@ -526,20 +525,13 @@ private func session(
     #expect(RemoteDeviceConnectionState.failure(.identityMismatch("x")) == .identityChanged(reason: "x"))
     #expect(RemoteDeviceConnectionState.failure(.unavailable("The session host speaks protocol 6, but this Cherry speaks 7.")).offersReconnect)
     #expect(!RemoteDeviceConnectionState.connected(sessionCount: 0).offersReconnect)
-    // This Mac's projects and the worktrees are listed as before.
+    // This Mac's projects are listed as before.
     let model = TitlebarProjectMenuModel(
-        worktrees: [.init(root: "/p", name: "main", isActive: true, isHidden: false), .init(root: "/p-x", name: "x", isActive: false, isHidden: true)],
         projects: [],
         devices: [],
         currentProjectKey: "/p"
     )
     #expect(model.snapshot == """
-    ## Worktrees
-    [x] main
-    x — Hidden
-    New Worktree...
-    Manage Worktrees...
-    ---
     No Projects (off)
     ---
     Add Project...
@@ -634,15 +626,14 @@ private func session(
     defer { repository.closeAllSessions(intent: .windowClosed) }
     #expect(repository.isRemote)
     #expect(repository.repositoryRoot == key)
-    #expect(repository.initialWorktreeRoot == key)
+    #expect(repository.workspaceRoot == key)
     #expect(repository.repositoryName == "app")
     #expect(repository.remoteHosting === hosting)
-    #expect(!repository.supportsWorktrees)
-    #expect(repository.activeWorkspace.projectRoot == key)
-    #expect(repository.activeWorkspace.launchRoot == "/Users/me/work/app")
+    #expect(repository.workspace.projectRoot == key)
+    #expect(repository.workspace.launchRoot == "/Users/me/work/app")
     // A device's policy runs tabs there whatever the local setting.
-    #expect(repository.activeWorkspace.backendPolicy.prefersPersistentLocalSessions)
-    #expect(repository.activeWorkspace.backendPolicy.persistentHostingForNewTab() === hosting)
+    #expect(repository.workspace.backendPolicy.prefersPersistentLocalSessions)
+    #expect(repository.workspace.backendPolicy.persistentHostingForNewTab() === hosting)
 }
 
 // MARK: - Ends and keys while a device is offline (fake control)
@@ -983,7 +974,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     // The picker offers no change to a copy that cannot make it.
     let device = RemoteDevice(id: UUID(), name: "Studio", sshDestination: "studio", homeDirectory: "/Users/me")
     let menu = TitlebarProjectMenuModel(
-        worktrees: nil, projects: [],
+        projects: [],
         devices: [.init(device: device, state: .identityChanged(reason: "x"), sessions: [session("a", owner: "Cherry", project: "/Users/me/app")])],
         currentProjectKey: nil, canModifyDevices: false
     )
@@ -1152,7 +1143,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     #expect(repository.deviceHosting === hosting)
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
-    #expect(repository.activeWorkspace.sessions.isEmpty)
+    #expect(repository.workspace.sessions.isEmpty)
     #expect(repository.remoteTabsWaitingCount == 1)
     repository.flushPersistentState()
     let after = try #require(store.load(repositoryRoot: key)?.worktrees.first?.sessions.first)
@@ -1186,7 +1177,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
     try await Task.sleep(for: .milliseconds(500))
-    #expect(repository.activeWorkspace.session(withID: orphanTab) == nil)
+    #expect(repository.workspace.session(withID: orphanTab) == nil)
     #expect(!repository.isRestoringSessions)
 }
 
@@ -1340,13 +1331,11 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
 
 @Test func RemoteDeviceWindowTitleNamesTheMacOnlyForDeviceWindows() {
     #expect(ProjectWindowTitle.title(project: "cherry") == "cherry")
-    #expect(ProjectWindowTitle.title(project: "cherry", worktree: "main", tab: "zsh") == "cherry / main — zsh")
+    #expect(ProjectWindowTitle.title(project: "cherry", tab: "zsh") == "cherry — zsh")
     #expect(ProjectWindowTitle.title(project: "cherry", tab: "  ") == "cherry")
     #expect(ProjectWindowTitle.title(project: "fizzup.club", deviceName: "patstudio") == "fizzup.club — patstudio")
     #expect(ProjectWindowTitle.title(project: "fizzup.club", deviceName: "patstudio", tab: "claude")
         == "fizzup.club — patstudio — claude")
-    #expect(ProjectWindowTitle.title(project: "fizzup.club", worktree: "feature", deviceName: "patstudio")
-        == "fizzup.club / feature — patstudio")
 }
 
 @Test @MainActor func RemoteDeviceBreadcrumbStartsWithTheMacOnlyForDeviceTabs() {
@@ -1419,10 +1408,8 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
             settings: AgentSettings.shared,
             repository: repository,
             chromeState: ProjectWindowChromeState(),
-            swipeState: WorktreeSidebarSwipeState(),
             projectRoot: repository.repositoryRoot,
             presentation: .docked,
-            sidebarWidth: 320,
             maximumWidth: 240
         )
         // As a device window sets it (`RemoteDeviceStore.shared` there).
@@ -1452,6 +1439,6 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     let remoteHeader = try await header(for: remote)
     #expect(contains(.titlebarProjectPickerAnchor, in: remoteHeader))
     #expect(contains(.remoteDeviceChipAnchor, in: remoteHeader))
-    // Two lines (name over the chip) fit the header the worktree line uses.
+    // Two lines (name over the chip) fit the header.
     #expect(remoteHeader.fittingSize.height <= 40)
 }

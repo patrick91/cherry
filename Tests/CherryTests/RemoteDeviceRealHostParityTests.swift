@@ -7,7 +7,7 @@ import Testing
 
 // Phase 3 of devices (docs/specs/remote-devices.md) against a fake remote
 // Mac (Scripts/fake-remote-mac): the real `cherry`, `cherry-host` (its
-// `project-info`), git, scp and zsh, reached through the ssh shim with the
+// `project-info`), scp and zsh, reached through the ssh shim with the
 // fake Mac's private HOME. Gated like the other real-host suites
 // (CHERRY_TEST_HOST_INTEGRATION=1, Scripts/build-host debug).
 //
@@ -19,29 +19,11 @@ import Testing
 private let parityRealHostEnabled = ProcessInfo.processInfo.environment["CHERRY_TEST_HOST_INTEGRATION"] == "1"
 
 @MainActor
-private func git(_ directory: String, _ arguments: [String]) throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    process.arguments = ["git", "-C", directory] + arguments
-    process.environment = ProcessInfo.processInfo.environment.merging([
-        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
-        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
-    ]) { _, new in new }
-    process.standardOutput = FileHandle.nullDevice
-    process.standardError = FileHandle.nullDevice
-    try process.run()
-    process.waitUntilExit()
-    guard process.terminationStatus == 0 else {
-        throw HostedSessionError.message("git \(arguments.joined(separator: " ")) exited \(process.terminationStatus)")
-    }
-}
-
-@MainActor
 private func access(_ mac: FakeRemoteMac, remoteHostPath: String? = nil) -> RemoteProjectAccess {
     let shell = mac.shell
     return RemoteProjectAccess(
         deviceID: mac.deviceID, deviceName: "Studio", destination: mac.name,
-        remoteHostPath: remoteHostPath, homeDirectory: mac.home.path, shell: { shell }
+        remoteHostPath: remoteHostPath, shell: { shell }
     )
 }
 
@@ -67,79 +49,6 @@ private func deviceWindow(
         restoredTabLaunchQueue: RestoredTabLaunchQueue(),
         remoteProject: access
     )
-}
-
-// MARK: - Git worktrees on the device
-
-@Test(.enabled(if: parityRealHostEnabled))
-@MainActor func RemoteDeviceRealHostWorktreesRunGitOnTheDeviceThroughTheRunner() async throws {
-    let mac = try FakeRemoteMac()
-    let previous = TerminalSettings.shared.worktreeSpacesEnabled
-    TerminalSettings.shared.worktreeSpacesEnabled = true
-    defer { TerminalSettings.shared.worktreeSpacesEnabled = previous }
-    let control = mac.makeControl()
-    let hosting = mac.makeHosting(control: control)
-    var window: RepositoryWorkspace?
-    do {
-        // A repository on the device, with a linked worktree.
-        try git(mac.projectPath, ["init", "-q", "-b", "main"])
-        try git(mac.projectPath, ["commit", "-q", "--allow-empty", "-m", "first"])
-        let linked = mac.home.appendingPathComponent("wt/feature").path
-        try git(mac.projectPath, ["worktree", "add", "-q", "-b", "feature", linked])
-        let device = access(mac)
-        let repository = deviceWindow(mac, hosting: hosting, access: device, autoStartCommands: { _ in [] })
-        window = repository
-        #expect(!repository.remoteProjectLoaded)
-        await repository.refresh()
-        #expect(repository.remoteProjectLoaded)
-        #expect(repository.remoteProjectNote == nil)
-        // The device's worktrees, by key.
-        #expect(repository.worktrees.map(\.root) == [mac.projectKey, device.key(forPath: linked)])
-        #expect(repository.worktrees.map(\.displayPath) == [mac.projectPath, linked])
-        #expect(repository.worktrees.map(\.branch) == ["main", "feature"])
-        #expect(repository.supportsWorktrees)
-        #expect(repository.commonDirectory == mac.projectPath + "/.git")
-        #expect(repository.dirtyByRoot == [mac.projectKey: false, device.key(forPath: linked): false])
-        // Everything went through the shim: `sh -s` scripts on the device.
-        #expect(mac.calls.contains { $0.hasSuffix("-- \(mac.name) sh -s") })
-
-        // New Worktree… puts it under the device's home.
-        let destination = try await repository.managedWorktreeDestination(branchName: "topic/new")
-        let destinationPath = ProjectLocation.launchPath(forKey: destination)
-        #expect(ProjectLocation.isRemoteKey(destination))
-        #expect(destinationPath.hasPrefix(mac.home.path + "/.cherry/worktrees/app-"))
-        #expect(destinationPath.hasSuffix("/topic-new"))
-        try await repository.validateBranchName("topic/new")
-        await #expect(throws: GitWorktreeCommandError.self) { try await repository.validateBranchName("bad..name") }
-        try await repository.create(.newBranch(name: "topic/new", startPoint: "HEAD", destination: destination), chromeState: nil)
-        #expect(FileManager.default.fileExists(atPath: destinationPath + "/.git"))
-        #expect(repository.worktrees.count == 3)
-        #expect(repository.activeWorktreeRoot == destination)
-        #expect(repository.activeWorkspace.projectRoot == destination)
-        #expect(try await repository.branchReferences().contains { $0.displayName == "topic/new" })
-
-        // Its status there.
-        try "x".write(toFile: destinationPath + "/untracked.txt", atomically: true, encoding: .utf8)
-        await repository.refreshDirtyStatus()
-        #expect(repository.dirtyByRoot[destination] == true)
-        let worktree = try #require(repository.worktrees.first { $0.root == destination })
-        #expect(await repository.removalBlockers(for: worktree).isDirty)
-        // Removed there (forced: it has a file of its own).
-        try await repository.remove(worktree, force: true, chromeState: nil)
-        #expect(!FileManager.default.fileExists(atPath: destinationPath))
-        #expect(repository.worktrees.map(\.root) == [mac.projectKey, device.key(forPath: linked)])
-        #expect(repository.activeWorktreeRoot != destination)
-
-        // No local folder is ever looked at: this Mac has none of these
-        // keys, and git ran with the device's paths.
-        #expect(!FileManager.default.fileExists(atPath: destination))
-    } catch {
-        window?.closeAllSessions(intent: .windowClosed)
-        await mac.tearDown()
-        throw error
-    }
-    window?.closeAllSessions(intent: .windowClosedEndingSessions)
-    await mac.tearDown()
 }
 
 // MARK: - cherry.toml on the device
@@ -178,11 +87,11 @@ private func deviceWindow(
         repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
         // As the window opens: auto-start waits for project-info.
         repository.autoStartInitialCommandsIfNeeded()
-        #expect(repository.activeWorkspace.commandSession(named: "server") == nil)
+        #expect(repository.workspace.commandSession(named: "server") == nil)
         await repository.refresh()
         #expect(CherryProjectFile.loadCommands(projectRoot: key).map(\.name) == ["server", "flaky", "manual"])
         #expect(AgentSettings.shared.launchableProjectCommands(for: key).map(\.name) == ["server", "flaky", "manual"])
-        let workspace = repository.activeWorkspace
+        let workspace = repository.workspace
         try await mac.waitFor("the auto-started command") { workspace.commandSession(named: "server")?.persistentSession != nil }
         let server = try #require(workspace.commandSession(named: "server"))
         #expect(workspace.commandSession(named: "manual") == nil)
@@ -599,7 +508,7 @@ private func hostName() -> String {
         // Not read: auto-start keeps waiting, and the window says why.
         #expect(!repository.remoteProjectLoaded)
         #expect(repository.remoteProjectNote?.contains("could not be reached") == true)
-        #expect(repository.activeWorkspace.commandSession(named: "server") == nil)
+        #expect(repository.workspace.commandSession(named: "server") == nil)
         // The device answers and its control connects: its project is read,
         // and its commands start.
         mac.set("offline", false)
@@ -608,7 +517,7 @@ private func hostName() -> String {
         try await mac.waitFor("the control to connect") { (try? await control.list()) != nil }
         try await mac.waitFor("the project to be read") { repository.remoteProjectLoaded }
         try await mac.waitFor("the auto-started command") {
-            repository.activeWorkspace.commandSession(named: "server")?.persistentSession != nil
+            repository.workspace.commandSession(named: "server")?.persistentSession != nil
         }
     } catch {
         mac.set("offline", false)
@@ -617,40 +526,5 @@ private func hostName() -> String {
         throw error
     }
     window?.closeAllSessions(intent: .windowClosedEndingSessions)
-    await mac.tearDown()
-}
-
-// MARK: - New Worktree without a recorded home
-
-@Test(.enabled(if: parityRealHostEnabled))
-@MainActor func RemoteDeviceRealHostNewWorktreeAsksTheDeviceForItsHome() async throws {
-    let mac = try FakeRemoteMac(startsDaemon: false)
-    do {
-        try git(mac.projectPath, ["init", "-q", "-b", "main"])
-        try git(mac.projectPath, ["commit", "-q", "--allow-empty", "-m", "first"])
-        var recorded: [String] = []
-        let shell = mac.shell
-        let access = RemoteProjectAccess(
-            deviceID: mac.deviceID, deviceName: "Studio", destination: mac.name,
-            remoteHostPath: nil, homeDirectory: nil, shell: { shell }, recordHome: { recorded.append($0) }
-        )
-        // No daemon there, and none needed: the window's control never
-        // starts one (it would outlive the test).
-        let control = mac.makeControl(startsHost: false)
-        let repository = deviceWindow(mac, hosting: mac.makeHosting(control: control), access: access, autoStartCommands: { _ in [] })
-        let destination = ProjectLocation.launchPath(forKey: try await repository.managedWorktreeDestination(branchName: "b"))
-        // Under the device's home, never next to the project.
-        #expect(destination.hasPrefix(mac.home.path + "/.cherry/worktrees/app-"))
-        #expect(recorded == [mac.home.path])
-        // Offline, with no home recorded: refused, not guessed.
-        mac.set("offline", true)
-        await #expect(throws: RemoteProjectError.self) { _ = try await repository.managedWorktreeDestination(branchName: "c") }
-        mac.set("offline", false)
-        repository.closeAllSessions(intent: .windowClosed)
-    } catch {
-        mac.set("offline", false)
-        await mac.tearDown()
-        throw error
-    }
     await mac.tearDown()
 }

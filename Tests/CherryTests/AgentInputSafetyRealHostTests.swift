@@ -196,11 +196,11 @@ private final class PrivateLocalHost {
         first.closeAllSessions(intent: .appQuit)
         #expect(try await host.control.list().sessions.first { $0.id == sessionID }?.isRunning == true)
 
-        // Relaunch: the tab comes back (its adapter left for later, as in a
-        // worktree not shown), following the same session.
+        // Relaunch: the tab comes back (its adapter left for later, as for
+        // a tab not shown yet), following the same session.
         let restorer = WorkspaceSessionRestorers.hostedByDefault(localSessions: host.hosting, control: { _ in host.control })
         let result = await restorer(WorkspaceRestoreRequest(
-            repositoryRoot: project.path, worktreeRoot: project.path, records: record.sessions, workspace: second
+            repositoryRoot: project.path, records: record.sessions, workspace: second
         ))
         second.restoreSessions(result.sessions, from: record, launchingAdapters: false)
         let restored = try #require(second.session(withID: agent.id))

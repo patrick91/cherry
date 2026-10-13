@@ -576,7 +576,7 @@ private func remoteRepository(
         #expect(RemoteDeviceDiscovery.projects(sessions: listed, added: [], hidden: [mac.projectPath]).projects.isEmpty)
         let device = RemoteDevice(id: mac.deviceID, name: "Studio", sshDestination: "studio", homeDirectory: mac.home.path)
         let menu = TitlebarProjectMenuModel(
-            worktrees: nil, projects: [], devices: [.init(device: device, state: .connected(sessionCount: listed.count), sessions: listed)],
+            projects: [], devices: [.init(device: device, state: .connected(sessionCount: listed.count), sessions: listed)],
             currentProjectKey: mac.projectKey
         )
         #expect(menu.snapshot.contains("[x] app — 2 sessions · \(mac.projectPath)"))
@@ -597,7 +597,7 @@ private func remoteRepository(
             settings: { .defaults }, localSessions: theirHosting
         ))
         let theirRestore = await WorkspaceSessionRestorers.hostedByDefault(localSessions: theirHosting)(WorkspaceRestoreRequest(
-            repositoryRoot: mac.projectPath, worktreeRoot: mac.projectPath, records: [], workspace: theirWorkspace,
+            repositoryRoot: mac.projectPath, records: [], workspace: theirWorkspace,
             unboundRecords: [WorkspaceSessionRecord(
                 id: tab.id, kind: .terminal, title: "Remote", workingDirectory: mac.projectPath,
                 launchRequestID: PersistentHostSessions.launchRequestID(of: ours)
@@ -606,7 +606,7 @@ private func remoteRepository(
         #expect(theirRestore.sessions.isEmpty)
         // Ours of a tab with their tab's id finds nothing of theirs.
         let ourRestore = await WorkspaceSessionRestorers.hostedByDefault(localSessions: hosting, control: { _ in control })(WorkspaceRestoreRequest(
-            repositoryRoot: mac.projectKey, worktreeRoot: mac.projectKey, records: [], workspace: workspace,
+            repositoryRoot: mac.projectKey, records: [], workspace: workspace,
             unboundRecords: [WorkspaceSessionRecord(
                 id: theirTab, kind: .terminal, title: "Theirs", workingDirectory: mac.projectPath,
                 launchRequestID: PersistentHostSessions.launchRequestID(of: theirs), hostKey: mac.host.id
@@ -671,7 +671,7 @@ private func remoteRepository(
         repositories.append(first)
         first.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await first.waitForPendingRestores()
-        let workspace = first.activeWorkspace
+        let workspace = first.workspace
         // The window's default shell ran on the device.
         let tab = try #require(workspace.sessions.first)
         try await mac.waitFor("the tab's session") { tab.persistentSession != nil }
@@ -698,12 +698,12 @@ private func remoteRepository(
         repositories.append(second)
         second.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await second.waitForPendingRestores()
-        let restored = try #require(second.activeWorkspace.session(withID: tab.id))
+        let restored = try #require(second.workspace.session(withID: tab.id))
         #expect(restored.isPersistentLocalSession)
         #expect(restored.persistentSession?.sessionID == sessionID)
         #expect(restored.systemSessionEnd == nil)
         #expect(restored.isRunning)
-        #expect(second.activeWorkspace.sessions.count == 1)
+        #expect(second.workspace.sessions.count == 1)
         second.flushPersistentState()
         second.closeAllSessions(intent: .appQuit)
         store.flush()
@@ -716,13 +716,13 @@ private func remoteRepository(
         repositories.append(third)
         third.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await third.waitForPendingRestores()
-        let ended = try #require(third.activeWorkspace.session(withID: tab.id))
+        let ended = try #require(third.workspace.session(withID: tab.id))
         #expect(ended.systemSessionEnd == .hostRestart)
         #expect(ended.persistentSessionEndedMessage == "Ended when Studio restarted")
         #expect(!ended.isRunning)
         // Restart starts it on the device again, never here.
         #expect(ended.remoteMachineName == "Studio")
-        #expect(third.activeWorkspace.restart(ended))
+        #expect(third.workspace.restart(ended))
         try await mac.waitFor("the restarted tab's new session") { ended.persistentSession != nil }
         #expect(ended.persistentSession?.host == mac.host)
     } catch {
@@ -754,7 +754,7 @@ private func remoteRepository(
         repositories.append(first)
         first.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await first.waitForPendingRestores()
-        let tab = try #require(first.activeWorkspace.sessions.first)
+        let tab = try #require(first.workspace.sessions.first)
         try await mac.waitFor("the tab's session") { tab.persistentSession != nil }
         first.flushPersistentState()
         first.closeAllSessions(intent: .appQuit)
@@ -768,13 +768,13 @@ private func remoteRepository(
         second.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await second.waitForPendingRestores()
         // The saved tab waits; no tab, and no new shell, runs meanwhile.
-        #expect(second.activeWorkspace.sessions.isEmpty)
+        #expect(second.workspace.sessions.isEmpty)
         #expect(second.remoteTabsWaitingCount == 1)
         #expect(second.savedRecordsAwaitingRestore().map(\.id) == [tab.id])
 
         // Still waiting a while later: nothing here runs it instead.
         try await Task.sleep(for: .seconds(1))
-        #expect(second.activeWorkspace.sessions.isEmpty)
+        #expect(second.workspace.sessions.isEmpty)
         #expect(control.state != .connected)
 
         // Back online: the waiting tab comes back by itself (its restore
@@ -782,9 +782,9 @@ private func remoteRepository(
         // tabs; a wake or a network change would try at once).
         mac.set("offline", false)
         try await mac.waitFor("the waiting tab to come back", timeout: 30) {
-            second.activeWorkspace.session(withID: tab.id) != nil
+            second.workspace.session(withID: tab.id) != nil
         }
-        let restored = try #require(second.activeWorkspace.session(withID: tab.id))
+        let restored = try #require(second.workspace.session(withID: tab.id))
         #expect(restored.isPersistentLocalSession && restored.isRunning)
         #expect(second.remoteTabsWaitingCount == 0)
 
@@ -792,7 +792,7 @@ private func remoteRepository(
         // runs a local shell.
         mac.set("offline", true)
         control.disconnect()
-        let offlineTab = second.activeWorkspace.addSession()
+        let offlineTab = second.workspace.addSession()
         #expect(offlineTab.isPersistentLocalSession)
         try await mac.waitFor("the offline tab to fail") { offlineTab.persistentLaunchFailureReason != nil }
         #expect(offlineTab.persistentLaunchFailureReason?.hasPrefix("Couldn't start on Studio: ") == true)
@@ -831,7 +831,7 @@ private func remoteRepository(
         repository = window
         window.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await window.waitForPendingRestores()
-        let tab = try #require(window.activeWorkspace.sessions.first)
+        let tab = try #require(window.workspace.sessions.first)
         try await mac.waitFor("the tab's session") { tab.persistentSession != nil }
         let sessionID = try #require(tab.persistentSession?.sessionID)
 

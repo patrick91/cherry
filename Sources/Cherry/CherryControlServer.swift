@@ -672,9 +672,8 @@ final class CherryControlServer: @unchecked Sendable {
         return location
     }
 
-    /// The open window of the device's project at `projectRoot` (or the
-    /// project containing it, a worktree's window first), matched by
-    /// location: the same device and the path, never through
+    /// The open window of the device's project at `projectRoot` (or of the
+    /// project containing it), matched by location: the same device and the path, never through
     /// `standardizedProjectRoot`.
     @MainActor
     private func remoteWorkspace(projectRoot: String, deviceID: UUID) throws -> TerminalWorkspace {
@@ -1478,33 +1477,12 @@ final class CherryControlServer: @unchecked Sendable {
                 let root = agentSettings.repositoryRoot(for: requestedRoot) ?? requestedRoot
                 let standardizedRoot = standardizedProjectRoot(root)
                 guard seenRepositoryRoots.insert(standardizedRoot).inserted else { return nil }
-                let repository = ProjectWindowRegistry.shared.repository(for: root)
-                let worktrees = repository?.supportsWorktrees == true ? repository?.worktrees.map { worktree in
-                    WorktreeInfo(
-                        root: worktree.root,
-                        branch: worktree.branch,
-                        head: worktree.head,
-                        main: worktree.isMain,
-                        detached: worktree.isDetached,
-                        locked: worktree.lockReason != nil,
-                        hidden: repository?.hiddenWorktreeRoots.contains(worktree.root) ?? false,
-                        loaded: repository?.loadedWorktreeRoots.contains(worktree.root) ?? false,
-                        active: repository?.activeWorktreeRoot == worktree.root
-                    )
-                } ?? [] : []
-                let isOpen = openRoots.contains(standardizedRoot)
-                    || worktrees.contains { openRoots.contains(standardizedProjectRoot($0.root)) }
-                let activeWorktreeRoot = repository?.supportsWorktrees == true
-                    ? repository?.activeWorktreeRoot
-                    : nil
                 return ProjectInfo(
                     root: root,
                     name: URL(fileURLWithPath: root, isDirectory: true).lastPathComponent,
                     active: standardizedRoot == activeRepositoryRoot.map(standardizedProjectRoot),
-                    open: isOpen,
-                    features: projectFeatureAvailability(for: root),
-                    worktrees: worktrees,
-                    activeWorktreeRoot: activeWorktreeRoot
+                    open: openRoots.contains(standardizedRoot),
+                    features: projectFeatureAvailability(for: root)
                 )
             }
         )

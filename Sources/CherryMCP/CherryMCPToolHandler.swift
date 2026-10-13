@@ -52,14 +52,14 @@ public enum CherryMCPTools {
         ),
         tool(
             "list_projects",
-            "List saved/open Cherry projects, their discovered worktrees, and the active worktree without changing the Cherry UI.",
+            "List saved and open Cherry projects without changing the Cherry UI.",
             properties: [:]
         ),
         tool(
-            "activate_worktree",
-            "Focus an existing Cherry project window and activate one of its discovered worktrees. This does not create, remove, or modify worktrees.",
+            "open_project",
+            "Focus a Cherry project's window, opening it when the project is saved in Cherry but its window is closed.",
             properties: [
-                "project_root": string("Absolute path of the worktree to activate.")
+                "project_root": string("Absolute path of the project to open.")
             ],
             required: ["project_root"]
         ),
@@ -749,9 +749,8 @@ public enum CherryMCPTools {
         if case .scoped = request {
             return request
         }
-        // The requested root is the target of the activation itself. Wrapping
-        // this in a scoped request would require the lazy worktree workspace to
-        // exist before Cherry gets a chance to activate it.
+        // The requested root is the target of the open itself, whose window
+        // may not exist yet: it is not scoped to the caller's project.
         if case .openProject = request {
             return request
         }
@@ -793,8 +792,7 @@ public enum CherryMCPTools {
         }
 
         return payload.projects
-            .flatMap { project in [project.root] + project.worktrees.map(\.root) }
-            .map(standardizedPath)
+            .map { standardizedPath($0.root) }
             .filter { contains(path: workingDirectory, inProjectRoot: $0) }
             .max { $0.count < $1.count }
     }
@@ -870,7 +868,7 @@ public enum CherryMCPTools {
         switch name {
         case "list_projects":
             return .listProjects
-        case "activate_worktree":
+        case "open_project":
             return .openProject(.init(projectRoot: try requiredString("project_root", in: arguments)))
         case "get_project_status":
             return .getProjectStatus

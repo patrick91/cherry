@@ -6,7 +6,10 @@ import Foundation
 
 // MARK: - Saved records
 
-/// One project window's tabs: every worktree workspace of one repository.
+/// One project window's tabs. A window saves one `WorktreeStateRecord`, for
+/// its folder; a file saved while Cherry had worktree spaces can have one
+/// for each worktree the window showed (`workspaceRecord(root:)` folds
+/// them). The keys stay as they were, so older builds read the file.
 struct RepositoryStateRecord: Codable, Equatable, Sendable {
     static let currentVersion = 1
 
@@ -14,6 +17,7 @@ struct RepositoryStateRecord: Codable, Equatable, Sendable {
     /// (`WorkspaceStateStore`), never written over.
     var version: Int
     var repositoryRoot: String
+    /// The window's folder (`RepositoryWorkspace.workspaceRoot`).
     var activeWorktreeRoot: String?
     var worktrees: [WorktreeStateRecord]
     var savedAt: Date?
@@ -39,9 +43,26 @@ struct RepositoryStateRecord: Codable, Equatable, Sendable {
     func worktree(root: String) -> WorktreeStateRecord? {
         worktrees.first { $0.root == root }
     }
+
+    /// The window's tabs as one record for `root`: the record saved for
+    /// that folder (or for `repositoryRoot`) first, then the other records'
+    /// tabs with their saved layout, as `WorktreeStateRecord.merging(kept:)`
+    /// adds them. Nil when it saved none.
+    func workspaceRecord(root: String) -> WorktreeStateRecord? {
+        guard !worktrees.isEmpty else { return nil }
+        let first = worktrees.firstIndex { $0.root == root }
+            ?? worktrees.firstIndex { $0.root == repositoryRoot }
+            ?? worktrees.startIndex
+        var record = worktrees[first]
+        record.root = root
+        for (index, other) in worktrees.enumerated() where index != first {
+            record = record.merging(kept: other)
+        }
+        return record
+    }
 }
 
-/// One worktree's `TerminalWorkspace`.
+/// The tabs of one folder's `TerminalWorkspace`.
 struct WorktreeStateRecord: Codable, Equatable, Sendable {
     var root: String
     /// In `TerminalWorkspace.sessions` order.
@@ -253,7 +274,7 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
     }
 
     /// A saved tab that may own a session of This Mac (a persistent tab,
-    /// which closing or a worktree removal ends): bound to a local session
+    /// which closing ends): bound to a local session
     /// it did not only attach to, or saved while its Create was under way.
     var mayOwnLocalSession: Bool {
         mayOwnSession(on: .local)
@@ -453,8 +474,8 @@ struct OpenProjectWindowsRecord: Codable, Equatable, Sendable {
     }
 }
 
-/// Saved tabs forgotten with their worktree (it was removed, or no longer
-/// exists) whose sessions of This Mac are still to be ended. An entry stays
+/// Saved tabs no open tab showed whose sessions of This Mac are still to be
+/// ended (a window closed, or a quit, that ended sessions). An entry stays
 /// until the host's list shows none of its sessions running, so a session
 /// this run could not end before it quit (the host could not be reached)
 /// is ended at the next launch
@@ -500,8 +521,7 @@ struct SystemQuitsRecord: Codable, Equatable, Sendable {
 }
 
 /// Sessions of This Mac this app ended on purpose, oldest first: a tab's
-/// close, End Sessions, Background Sessions → End, a removed worktree's
-/// tabs, a clean exit's removal, a restart's previous session, or
+/// close, End Sessions, Background Sessions → End, a clean exit's removal, a restart's previous session, or
 /// Persistent Sessions → Terminate or Remove. A saved tab that names one
 /// never comes back as ended by the system (`SystemEndedSessions`), even
 /// after a restart: a closed window's record still names the sessions
@@ -1324,11 +1344,10 @@ final class WorkspaceStateStore: @unchecked Sendable {
 
 // MARK: - Restore
 
-/// What a restorer brings back for one worktree.
+/// What a restorer brings back for one project window.
 @MainActor
 struct WorkspaceRestoreRequest {
     let repositoryRoot: String
-    let worktreeRoot: String
     /// The records a tab can come back for (bound to a hosted session), in
     /// saved order.
     let records: [WorkspaceSessionRecord]
@@ -1336,7 +1355,7 @@ struct WorkspaceRestoreRequest {
     /// `makeRestoredPersistentSession`), but do not add them: the restore
     /// adds them with the saved layout.
     let workspace: TerminalWorkspace
-    /// The worktree's other records (no hosted binding saved: a native tab,
+    /// The window's other records (no hosted binding saved: a native tab,
     /// or a local tab whose session's Create had not answered when it was
     /// saved). A restorer may bring one back when the local host has a
     /// session of this app that its saved Create started
@@ -1344,7 +1363,7 @@ struct WorkspaceRestoreRequest {
     /// others are dropped, as native tabs are.
     var unboundRecords: [WorkspaceSessionRecord] = []
     /// Cancelled when the workspace is torn down (its window closed, the app
-    /// quit) or its worktree forgotten while this restore runs: the restore
+    /// quit) while this restore runs: the restore
     /// then builds no more tabs, and ends those it built that it has not
     /// handed back yet (with the workspace's close intent), so no stale tab
     /// goes on owning a session a new window's restore should bring back.
@@ -1532,7 +1551,7 @@ final class WorkspaceRestoreCancellation {
 }
 
 /// This app's sessions on This Mac that no saved tab names, which the
-/// window adopts as tabs of the worktree they were started in (their
+/// window of the project they were started in adopts as tabs (their
 /// `cherry.project` tag), instead of leaving them running unseen: sessions
 /// whose tab was never saved (the app crashed within the save delay after
 /// opening it) or whose saved record was lost. A session qualifies when
@@ -1619,7 +1638,7 @@ struct OrphanedSessionCriteria: Sendable {
         return created < createdBefore ? tabID : nil
     }
 
-    /// The directory of the worktree `info` was started in, as its tab saw it.
+    /// The project folder `info` was started in, as its tab saw it.
     static func projectRoot(of info: HostedSessionInfo) -> String? {
         info.tags[PersistentSessionTag.project]?.nilIfEmpty
     }
@@ -1654,7 +1673,7 @@ struct OrphanedSessionCriteria: Sendable {
     }
 }
 
-/// What a restorer brought back for one worktree.
+/// What a restorer brought back for one project window.
 @MainActor
 struct WorkspaceRestoreResult {
     /// Tabs built for saved records (not added to the workspace).
@@ -1704,8 +1723,8 @@ struct WorkspaceRestoreResult {
     }
 
     /// Ends the tabs of `result`, and of its remainder when that finishes,
-    /// as `workspace` ended its other tabs (the window closed, the app quit
-    /// or the worktree was removed while the restore ran).
+    /// as `workspace` ended its other tabs (the window closed or the app
+    /// quit while the restore ran).
     static func discard(_ result: WorkspaceRestoreResult, in workspace: TerminalWorkspace) {
         workspace.discardRestoredSessions(result.sessions)
         guard let remainder = result.remainder else { return }

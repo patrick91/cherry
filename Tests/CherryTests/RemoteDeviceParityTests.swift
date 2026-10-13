@@ -111,7 +111,9 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     RemoteDeviceShell.DataOutput(status: status, standardOutput: Data(text.utf8), standardError: errors)
 }
 
-@Test func RemoteDeviceProjectInfoIsParsedWithItsWorktreesAndCherryToml() throws {
+@Test func RemoteDeviceProjectInfoIsParsedWithItsCherryToml() throws {
+    // A report with git (what the host gives when CHERRY_GIT names one)
+    // still parses; Cherry reads none of it.
     let json = """
     {"version":1,"projects":[{"path":"/Users/me/app","exists":true,"is_directory":true,\
     "git":{"top_level":"/Users/me/app","common_dir":"/Users/me/app/.git",\
@@ -126,14 +128,8 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     #expect(app.isDirectory && app.exists)
     #expect(app.cherryTomlText == "[commands.web]\ncommand = \"npm run\"\n")
     #expect(app.cherryTomlProblem == nil)
-    let snapshot = try #require(app.git).snapshot()
-    #expect(snapshot.commonDirectory == "/Users/me/app/.git")
-    #expect(snapshot.worktrees.map(\.root) == ["/Users/me/app", "/Users/me/wt/feature"])
-    #expect(snapshot.worktrees.map(\.branch) == ["main", "feature"])
-    #expect(snapshot.worktrees[0].isMain && !snapshot.worktrees[1].isMain)
-    #expect(snapshot.worktrees[1].isLocked)
     let missing = try #require(report.project(at: "/Users/me/none"))
-    #expect(!missing.exists && missing.git == nil && missing.cherryTomlText == nil)
+    #expect(!missing.exists && missing.cherryTomlText == nil)
 }
 
 @Test func RemoteDeviceProjectInfoCapsAndFailuresAreReported() throws {
@@ -183,35 +179,13 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     }
 }
 
-@Test func RemoteDeviceProjectInfoAndGitScriptsQuoteEveryPathForSh() throws {
+@Test func RemoteDeviceProjectInfoScriptQuotesEveryPathForSh() throws {
     let script = RemoteProjectAccess.projectInfoScript(
         paths: ["/Users/me/it's here", "/Users/me/$(oops)"],
         remoteHostPath: "~/Library/Application Support/cherry-host/bin/b/cherry-host"
     )
     #expect(script.contains("host=\"$HOME\"/'Library/Application Support/cherry-host/bin/b/cherry-host'"))
     #expect(script.contains("exec \"$host\" project-info --json '/Users/me/it'\\''s here' '/Users/me/$(oops)'"))
-    #expect(script.contains("CHERRY_GIT=$git; export CHERRY_GIT"))
-    // /usr/bin/git only with the command line tools (else it asks to
-    // install them on that Mac's screen).
-    #expect(script.contains("/usr/bin/xcode-select -p"))
-    let git = RemoteProjectAccess.gitScript(["-C", "/Users/me/a b", "worktree", "list", "--porcelain", "-z"], machine: "Studio")
-    #expect(git.hasSuffix("exec \"$git\" '-C' '/Users/me/a b' 'worktree' 'list' '--porcelain' '-z'\n"))
-    #expect(git.contains("GIT_TERMINAL_PROMPT=0"))
-    // Run through sh, the script finds this Mac's git and runs it.
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/sh")
-    process.arguments = ["-s"]
-    let input = Pipe()
-    let out = Pipe()
-    process.standardInput = input
-    process.standardOutput = out
-    try process.run()
-    input.fileHandleForWriting.write(Data(RemoteProjectAccess.gitScript(["--version"], machine: "Studio").utf8))
-    try input.fileHandleForWriting.close()
-    let printed = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-    process.waitUntilExit()
-    #expect(process.terminationStatus == 0)
-    #expect(printed.hasPrefix("git version"))
 }
 
 @Test @MainActor func RemoteDeviceCherryTomlIsReadFromWhatTheDeviceReportedAndNeverWritten() throws {
@@ -253,7 +227,7 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     #expect(CherryProjectFile.remoteReadOnlyNote.contains("on this Mac only"))
 }
 
-@Test func RemoteDeviceProjectInfoWithoutAGitThereRunsNoGit() throws {
+@Test func RemoteDeviceProjectInfoRunsNoGit() throws {
     // A stand-in cherry-host that says whether CHERRY_GIT reached it.
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-nogit-\(UUID().uuidString.prefix(8))")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -261,31 +235,21 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     let host = directory.appendingPathComponent("cherry-host")
     try "#!/bin/sh\nprintf 'git=[%s]\\n' \"${CHERRY_GIT-unset}\"\n".write(to: host, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: host.path)
-    func run(_ candidates: [String]) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-s"]
-        // An inherited CHERRY_GIT is dropped too.
-        process.environment = ["PATH": "/bin", "CHERRY_GIT": "/usr/bin/git"]
-        let input = Pipe()
-        let out = Pipe()
-        process.standardInput = input
-        process.standardOutput = out
-        try process.run()
-        input.fileHandleForWriting.write(Data(RemoteProjectAccess.projectInfoScript(
-            paths: ["/p"], remoteHostPath: host.path, gitCandidates: candidates
-        ).utf8))
-        try input.fileHandleForWriting.close()
-        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        process.waitUntilExit()
-        return text
-    }
-    #expect(try run(["/nonexistent/git", "\"$(command -v git 2>/dev/null)\""]).contains("git=[unset]"))
-    // With one found, it is passed.
-    let git = directory.appendingPathComponent("git")
-    try "#!/bin/sh\n".write(to: git, atomically: true, encoding: .utf8)
-    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: git.path)
-    #expect(try run([git.path]).contains("git=[\(git.path)]"))
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-s"]
+    // An inherited CHERRY_GIT is dropped too.
+    process.environment = ["PATH": "/bin:/usr/bin", "CHERRY_GIT": "/usr/bin/git"]
+    let input = Pipe()
+    let out = Pipe()
+    process.standardInput = input
+    process.standardOutput = out
+    try process.run()
+    input.fileHandleForWriting.write(Data(RemoteProjectAccess.projectInfoScript(paths: ["/p"], remoteHostPath: host.path).utf8))
+    try input.fileHandleForWriting.close()
+    let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    process.waitUntilExit()
+    #expect(text.contains("git=[unset]"))
 }
 
 // MARK: - Shell integration on the device

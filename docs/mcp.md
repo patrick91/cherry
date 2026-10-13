@@ -121,15 +121,15 @@ those configurations otherwise.
 1 on an error), and `CherryMCP --version` says what it is; both are for
 checks without an MCP client.
 
-## Worktree Tools
+## Project Tools
 
-- `list_projects` includes discovered worktrees, their branch/HEAD state, and
-  whether each checkout is active, loaded, hidden, detached, or locked.
-- `activate_worktree` focuses an existing checkout by absolute
-  `project_root`.
+- `list_projects` lists the saved and open projects: each one's root, name,
+  whether it is active or open, and its notes and to-dos features.
+- `open_project` focuses a project's window by absolute `project_root`,
+  opening it when the project is saved in Cherry but its window is closed.
 
-Worktree creation, removal, fetch, and prune are intentionally not exposed to
-MCP. Those lifecycle actions stay in Cherry's confirmation-based UI.
+Cherry has no Git worktree support: a worktree is a folder, opened as a
+project like any other.
 
 ## Process Tools
 
@@ -184,8 +184,8 @@ opens again. MCP treats them like native tabs:
   program gets `CHERRY_PROCESS_ID`, so a CherryMCP helper started inside it
   identifies its tab. A tab restored after Cherry relaunched keeps its
   `process_id`.
-- While the tab's terminal is not attached yet (a restored tab in a worktree
-  that is not shown, or one whose attach adapter is being launched or is
+- While the tab's terminal is not attached yet (a restored tab that is not
+  shown yet, or one whose attach adapter is being launched or is
   reconnecting), output is read from the host and input is sent through the
   host. `line_count` is then the host's line count. The process stays
   `live` while its program runs.
@@ -204,8 +204,8 @@ opens again. MCP treats them like native tabs:
   holder link version 4) reports the mode as off for its whole life, so
   its cursor keys go as `ESC [ x` even under `less` or `vim`. With an
   older session host, which reports no mode at all, these
-  sequences to a tab without a live attach adapter (a restored tab in a
-  hidden worktree, or one whose adapter just launched) launch or wait for
+  sequences to a tab without a live attach adapter (a restored tab not
+  shown yet, or one whose adapter just launched) launch or wait for
   the adapter, up to 3 s, and go through the terminal; if no adapter
   attaches in time, the host types them as they were sent.
 
@@ -670,7 +670,7 @@ option: the input is refused with `agent_awaiting_input`. Both errors quote
 what the agent says it waits for. For an agent that reports nothing, its
 current screen is checked for such a menu instead; the screen is read from
 its session host when no terminal shows it, for example for a restored agent
-in a worktree that is not shown, and when it cannot be read the input fails
+whose tab is not shown yet, and when it cannot be read the input fails
 with `input_not_delivered` and nothing is sent.
 
 Cherry presses Enter on an agent's startup or trust prompt only for an agent

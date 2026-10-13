@@ -3,13 +3,12 @@ import Foundation
 
 // The Omni bar (⌘P, ⌘O and the title-bar project button): one floating
 // bar that finds projects on every Mac, the Macs, the tabs of every window
-// and the background sessions, the current project's worktrees, and the
-// commands. Everything here is pure: the live layer (`OmniBarLive.swift`)
-// gathers `OmniSources` from the app's state without connecting to any
-// host, `OmniProviders` turns them into rows, `OmniMatcher` and
-// `OmniRanking` order them, and `OmniBarController` is the bar's state
-// (scopes, query, selection, the ⌘K action list). The view is
-// `OmniBarView.swift`.
+// and the background sessions, and the commands. Everything here is pure:
+// the live layer (`OmniBarLive.swift`) gathers `OmniSources` from the app's
+// state without connecting to any host, `OmniProviders` turns them into
+// rows, `OmniMatcher` and `OmniRanking` order them, and `OmniBarController`
+// is the bar's state (scopes, query, selection, the ⌘K action list). The
+// view is `OmniBarView.swift`.
 
 // MARK: - Items
 
@@ -20,7 +19,6 @@ enum OmniKind: String, Equatable {
     case tab
     /// A background session (`BackgroundSessionsModel`).
     case session
-    case worktree
     case command
     case agent
     /// A folder of folder completion (`OmniFolderRows`).
@@ -44,7 +42,6 @@ enum OmniScope: Hashable {
     /// A Mac drilled into: its tabs and sessions, then its projects.
     case mac(ProjectSwitcherModel.Machine, name: String)
     case tabs
-    case worktrees
     case commands
     /// The launchable agents (New Agent).
     case agents
@@ -59,7 +56,6 @@ enum OmniScope: Hashable {
         case .macs: "Macs"
         case .mac(_, let name): name
         case .tabs: "Tabs & Sessions"
-        case .worktrees: "Worktrees"
         case .commands: "Commands"
         case .agents: "Agents"
         case .agentPresets: "Add Agent"
@@ -81,7 +77,6 @@ enum OmniScope: Hashable {
         case ">": .commands
         case "@": .macs
         case "#": .tabs
-        case "/": .worktrees
         default: nil
         }
     }
@@ -104,8 +99,6 @@ enum OmniMenuCommand: String, CaseIterable {
     // Ids of the command palette's commands, kept so their usage carries
     // over (`OmniFrecencyStore`).
     case addProject
-    case newWorktree
-    case manageWorktrees
     case toggleAppearance
 }
 
@@ -119,8 +112,6 @@ enum OmniCommand: Equatable {
     case openProjectInEditor(key: String, editorID: String)
     case revealInFinder(path: String)
     case copyPath(String)
-    /// New Worktree… in the open window of this project.
-    case newWorktreeInProject(key: String)
     case removeProject(key: String)
     /// One of the picker menu's actions (`ProjectSwitcherActions.perform`).
     case switcher(TitlebarProjectMenuModel.Action)
@@ -134,11 +125,6 @@ enum OmniCommand: Equatable {
     case closeTab(UUID)
     case openBackgroundSession(id: String)
     case endBackgroundSession(id: String)
-    case activateWorktree(root: String)
-    /// New worktree “<name>”: New Worktree with the branch name filled in.
-    case createWorktree(name: String)
-    case renameWorktree(root: String)
-    case removeWorktree(root: String)
     case menu(OmniMenuCommand)
     case launchAgent(id: String)
     case configureAgentPreset(id: String)
@@ -206,7 +192,7 @@ struct OmniItem: Equatable, Identifiable {
     var detailColor: RemoteDeviceColor? = nil
     /// Added to its frecency in Recent: an open project, a working agent.
     var liveBoost: Double = 0
-    /// Whether ↵ records it as used (not a "New worktree" row).
+    /// Whether ↵ records it as used.
     var recordsUse = true
     /// What ⇥ puts in the field (a folder's path and "/").
     var completion: String? = nil
@@ -494,16 +480,6 @@ struct OmniBackgroundSession: Equatable {
     }
 }
 
-/// A worktree of the window's project.
-struct OmniWorktree: Equatable {
-    var root: String
-    var name: String
-    var branch: String?
-    var isActive: Bool
-    var canRename: Bool
-    var canRemove: Bool
-}
-
 struct OmniEditor: Equatable {
     var id: String
     var name: String
@@ -525,7 +501,6 @@ struct OmniWindowContext: Equatable {
     var canDetach = false
     var canReopenClosedTab = false
     var hasProject = false
-    var supportsWorktrees = false
     var isSidebarHidden = false
     var detachTitle = "Detach Tab"
     var closeTitle = "Close Tab"
@@ -540,13 +515,9 @@ struct OmniSources: Equatable {
     var devices: [TitlebarProjectMenuModel.Device] = []
     var tabs: [OmniTab] = []
     var backgroundSessions: [OmniBackgroundSession] = []
-    var repositoryName = ""
-    var worktrees: [OmniWorktree] = []
     var window = OmniWindowContext()
     /// Local projects in Settings › Projects (Remove from Projects).
     var listedLocalProjects: Set<String> = []
-    /// Keys of open windows whose project has worktrees (New Worktree…).
-    var worktreeProjectKeys: Set<String> = []
     /// The default editor each project opens in (Open in <editor>).
     var editorsByProjectKey: [String: OmniEditor] = [:]
     /// The editors the window's project opens in; the default one first.
@@ -619,9 +590,6 @@ enum OmniProviders {
             actions.append(.init(title: "Reveal in Finder", command: .revealInFinder(path: location.path)))
         }
         actions.append(.init(title: "Copy Path", command: .copyPath(location.path)))
-        if sources.worktreeProjectKeys.contains(location.key) {
-            actions.append(.init(title: "New Worktree…", command: .newWorktreeInProject(key: location.key)))
-        }
         switch location.machine {
         case .thisMac:
             if sources.listedLocalProjects.contains(location.key) {
@@ -849,53 +817,6 @@ enum OmniProviders {
         return [brand?.displayName ?? agentKey]
     }
 
-    // MARK: Worktrees
-
-    static func worktrees(_ sources: OmniSources) -> [OmniItem] {
-        guard sources.window.supportsWorktrees else { return [] }
-        return sources.worktrees.map { worktree in
-            var actions: [OmniAction] = []
-            if worktree.canRename {
-                actions.append(.init(title: "Rename Branch…", command: .renameWorktree(root: worktree.root)))
-            }
-            if worktree.canRemove {
-                actions.append(.init(title: "Remove…", command: .removeWorktree(root: worktree.root), isDestructive: true))
-            }
-            return OmniItem(
-                id: "worktree:\(worktree.root)",
-                kind: .worktree,
-                title: worktree.name,
-                detail: sources.repositoryName,
-                status: worktree.isActive ? .idle : nil,
-                symbol: "arrow.triangle.branch",
-                primaryLabel: "Switch",
-                primary: .activateWorktree(root: worktree.root),
-                actions: actions,
-                keywords: [worktree.branch].compactMap { $0 }
-            )
-        }
-    }
-
-    /// "New worktree “<query>”", when the query names no worktree.
-    static func newWorktreeItem(query: String, sources: OmniSources) -> OmniItem? {
-        let name = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard sources.window.supportsWorktrees, !name.isEmpty else { return nil }
-        let folded = name.lowercased()
-        let exists = sources.worktrees.contains { worktree in
-            worktree.name.lowercased() == folded || worktree.branch?.lowercased() == folded
-        }
-        guard !exists else { return nil }
-        return OmniItem(
-            id: "worktree-new:\(name)",
-            kind: .worktree,
-            title: "New worktree “\(name)”",
-            symbol: "plus",
-            primaryLabel: "Create",
-            primary: .createWorktree(name: name),
-            recordsUse: false
-        )
-    }
-
     // MARK: Commands
 
     static func command(
@@ -983,18 +904,6 @@ enum OmniProviders {
             primary: .drill(.projects)
         ))
         items += OmniFolderRows.browseItems(sources, on: .thisMac)
-        if window.supportsWorktrees {
-            items.append(OmniItem(
-                id: "command:worktrees",
-                kind: .command,
-                title: "Worktrees",
-                symbol: "arrow.triangle.branch",
-                primaryLabel: "Show",
-                primary: .drill(.worktrees)
-            ))
-            items.append(command(.newWorktree, title: "New Worktree…", symbol: "plus"))
-            items.append(command(.manageWorktrees, title: "Manage Worktrees…", symbol: "list.bullet"))
-        }
         items.append(OmniItem(
             id: "command:addAgent",
             kind: .command,
@@ -1090,7 +999,7 @@ enum OmniProviders {
     /// and each Mac's Add Project and Open Folder rows.
     static func everything(_ sources: OmniSources) -> [OmniItem] {
         projects(sources) + tabs(sources) + backgroundSessions(sources) + macs(sources)
-            + worktrees(sources) + commands(sources) + OmniFolderRows.browseItems(sources)
+            + commands(sources) + OmniFolderRows.browseItems(sources)
             + OmniUnaddedRows.items(sources, withQuery: true)
     }
 
@@ -1174,12 +1083,6 @@ enum OmniSections {
             )
         case .tabs?:
             return ranked(OmniProviders.tabs(sources) + OmniProviders.backgroundSessions(sources))
-        case .worktrees?:
-            var sections = ranked(OmniProviders.worktrees(sources))
-            if !isEmpty, let create = OmniProviders.newWorktreeItem(query: query, sources: sources) {
-                sections.append(OmniSection(title: nil, rows: [OmniRow(item: create)]))
-            }
-            return merged(sections)
         case .commands?:
             return ranked(OmniProviders.commands(sources))
         case .agents?:
@@ -1314,7 +1217,7 @@ final class OmniBarController: ObservableObject {
         if let request = folderRequest {
             return "Folders on \(sources.projects.name(of: request.machine)) · ⇥ completes"
         }
-        return scope == nil ? "~/ Folders   @ Macs   # Tabs   / Worktrees   > Commands" : "⌫ to go back"
+        return scope == nil ? "~/ Folders   @ Macs   # Tabs   > Commands" : "⌫ to go back"
     }
 
     /// The listing the query asks for, when it is a path query.
@@ -1428,13 +1331,9 @@ final class OmniBarController: ObservableObject {
     }
 
     /// The field's text changed. At the root, a first character that is a
-    /// scope's prefix (`>`, `@`, `#`, `/`) enters that scope instead.
+    /// scope's prefix (`>`, `@`, `#`) enters that scope instead.
     func setQuery(_ text: String) {
-        // A pasted path ("/Users/…") is a query, not the Worktrees scope.
-        let isPastedPath = text.first == "/" && text.dropFirst().contains("/")
-        // Without worktrees, "/" starts a path.
-        let isPath = text.first == "/" && !sources.window.supportsWorktrees
-        if stack.isEmpty, query.isEmpty, !isPastedPath, !isPath, let first = text.first, let scope = OmniScope.forPrefix(first) {
+        if stack.isEmpty, query.isEmpty, let first = text.first, let scope = OmniScope.forPrefix(first) {
             stack = [scope]
             query = String(text.dropFirst().drop(while: \.isWhitespace))
             recompute(resetSelection: true)

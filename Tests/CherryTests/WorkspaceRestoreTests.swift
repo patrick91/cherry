@@ -85,7 +85,6 @@ private extension PersistentHarness {
         let restorer = control.map { WorkspaceSessionRestorers.hostedByDefault(localSessions: hosting, control: $0) } ?? restorer
         return await restorer(WorkspaceRestoreRequest(
             repositoryRoot: project.path,
-            worktreeRoot: project.path,
             records: records,
             workspace: workspace,
             unboundRecords: unbound,
@@ -435,7 +434,7 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
     }
     repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
     await repository.waitForPendingRestores()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
 
     #expect(workspace.sessions.map(\.id) == [left.id, parent.id, child.id, orphan.id, right.id])
     let tree = workspace.agentSessionTreeSnapshot()
@@ -453,7 +452,7 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
 
 // MARK: - Duplicates
 
-@Test @MainActor func aHostSessionComesBackInOneTabAcrossWindowsAndWorktrees() async throws {
+@Test @MainActor func aHostSessionComesBackInOneTabAcrossWindows() async throws {
     let harness = try PersistentHarness()
     let windowA = harness.workspace()
     let windowB = harness.workspace()
@@ -468,13 +467,13 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
         id: "s-shared", name: "Server", cwd: project, pid: 90, owner: "CherryTests",
         tags: [PersistentSessionTag.tab: owner.id.uuidString]
     )]
-    // Two records of one worktree naming one session: one tab.
+    // Two records of one window naming one session: one tab.
     var copy = owner
     copy.id = UUID()
     let first = await harness.restore([owner, copy], into: windowA)
     #expect(first.sessions.map(\.id) == [owner.id])
     windowA.restoreSessions(first.sessions, from: WorktreeStateRecord(root: project, sessions: [owner, copy]))
-    // Another window (or worktree) saved the same tab, or another owner
+    // Another window saved the same tab, or another owner
     // record for it: never a second tab owning the session.
     #expect(await harness.restore([owner], into: windowB).sessions.isEmpty)
     var otherOwner = owner
@@ -527,7 +526,7 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
     repository.autoStartInitialCommandsIfNeeded()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
 
     // Nothing could come back: the window opens its default shell, the
     // records stay saved, and the kept command does not start a second copy.
@@ -617,7 +616,7 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
     repository.autoStartInitialCommandsIfNeeded()
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     let webTab = try #require(workspace.session(withID: web.id))
     let workerTab = try #require(workspace.session(withID: worker.id))
 
@@ -824,7 +823,7 @@ private func repositoryKey(_ root: URL) -> String {
         try? FileManager.default.removeItem(at: storeDirectory)
     }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
 
     // This Mac's tab comes back while the SSH host has not answered.
     #expect(await harness.fake.wait { workspace.sessions.map(\.id) == [editor.id] })
@@ -889,7 +888,7 @@ private func repositoryKey(_ root: URL) -> String {
     }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     repository.autoStartInitialCommandsIfNeeded()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
 
     // Auto-start does not wait for the SSH host; the default shell does,
     // since the tabs may still come back.
@@ -947,7 +946,7 @@ private func repositoryKey(_ root: URL) -> String {
     }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     repository.autoStartInitialCommandsIfNeeded()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(await harness.fake.wait { workspace.sessions.map(\.id) == [editor.id] })
     // The command's tab may still come back: auto-start and MCP or sidebar
     // starts wait for it rather than start a second server.
@@ -1007,7 +1006,7 @@ private func repositoryKey(_ root: URL) -> String {
     }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     #expect(await harness.fake.wait { gate.waiting == 1 })
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(workspace.isRestoringCommand(named: "server"))
     #expect(workspace.isRestoringCommand(named: nil))
 
@@ -1113,105 +1112,63 @@ private func repositoryKey(_ root: URL) -> String {
     subscriptions.removeAll()
 }
 
-// MARK: - Worktrees
+// MARK: - Files saved with worktree spaces
 
-private func runGit(_ arguments: [String]) throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    process.arguments = ["git"] + arguments
-    process.standardOutput = FileHandle.nullDevice
-    process.standardError = FileHandle.nullDevice
-    try process.run()
-    process.waitUntilExit()
-    guard process.terminationStatus == 0 else {
-        throw CocoaError(.executableLoad, userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed"])
-    }
-}
-
-@Test @MainActor func onlyTheShownWorktreeAttachesItsTabsAndRemovingOneStillRestoringAsksFirst() async throws {
+/// A file saved while Cherry had worktree spaces has a record for each
+/// worktree its window showed: all their tabs come back in the project's
+/// window, the project's own first with its selection, nothing is ended,
+/// and the next save writes them as the window's one record.
+@Test @MainActor func tabsSavedForSeveralWorktreesComeBackInTheProjectsWindow() async throws {
     let harness = try PersistentHarness()
-    let container = try canonicalDirectory("cherry-restore-worktree-attach")
+    let container = try canonicalDirectory("cherry-restore-folded-worktrees")
     let root = container.appendingPathComponent("repo", isDirectory: true)
     let feature = container.appendingPathComponent("feature", isDirectory: true)
-    let other = container.appendingPathComponent("other", isDirectory: true)
     let storeDirectory = container.appendingPathComponent("store", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-    try runGit(["-C", root.path, "init", "-b", "main"])
-    try runGit(["-C", root.path, "-c", "user.name=Cherry Tests", "-c", "user.email=cherry@example.invalid",
-                "commit", "--allow-empty", "-m", "Initial"])
-    try runGit(["-C", root.path, "worktree", "add", "-b", "feature", feature.path])
-    try runGit(["-C", root.path, "worktree", "add", "-b", "other", other.path])
-    let settings = TerminalSettings.shared
-    let previousWorktreeSpacesEnabled = settings.worktreeSpacesEnabled
-    settings.worktreeSpacesEnabled = true
+    try FileManager.default.createDirectory(at: feature, withIntermediateDirectories: true)
 
     let store = WorkspaceStateStore(directory: storeDirectory)
     let main = localRecord(title: "Main", sessionID: "s-main", workingDirectory: root.path)
     let featureTab = localRecord(title: "Feature", sessionID: "s-feature", workingDirectory: feature.path)
-    let otherTab = localRecord(kind: .command, title: "server", sessionID: "s-other", commandName: "server", workingDirectory: other.path)
-    harness.fake.sessions = [main, featureTab, otherTab].map { record in
+    let server = localRecord(kind: .command, title: "server", sessionID: "s-server", commandName: "server", workingDirectory: feature.path)
+    harness.fake.sessions = [main, featureTab, server].map { record in
         HostedSessionInfo(id: record.hosted!.sessionID, name: record.title, cwd: record.workingDirectory, pid: 100,
                           owner: "CherryTests", tags: [PersistentSessionTag.tab: record.id.uuidString])
     }
     store.saveSynchronously(RepositoryStateRecord(
         repositoryRoot: repositoryKey(root),
-        activeWorktreeRoot: root.path,
+        activeWorktreeRoot: feature.path,
         worktrees: [
-            WorktreeStateRecord(root: root.path, sessions: [main]),
-            WorktreeStateRecord(root: feature.path, sessions: [featureTab]),
-            WorktreeStateRecord(root: other.path, sessions: [otherTab])
+            WorktreeStateRecord(root: feature.path, sessions: [featureTab, server], selectedSessionID: server.id),
+            WorktreeStateRecord(root: root.path, sessions: [main], selectedSessionID: main.id)
         ]
     ))
-    let gate = RestorerGate()
-    let restorer = harness.restorer
     let repository = RepositoryWorkspace(
         projectRoot: root.path,
         backendPolicy: harness.policy,
         stateStore: store,
-        sessionRestorer: { request in
-            if request.worktreeRoot == other.path { await gate.wait() }
-            return await restorer(request)
-        },
+        sessionRestorer: harness.restorer,
         autoStartCommands: { _ in [] },
         restoredTabLaunchQueue: RestoredTabLaunchQueue()
     )
     defer {
-        gate.open()
         repository.closeAllSessions(intent: .windowClosed)
-        settings.worktreeSpacesEnabled = previousWorktreeSpacesEnabled
         harness.cleanUp()
         try? FileManager.default.removeItem(at: container)
     }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
+
+    let workspace = repository.workspace
+    #expect(workspace.sessions.map(\.id) == [main.id, featureTab.id, server.id])
+    #expect(workspace.selectedSessionID == main.id)
     #expect(await harness.fake.wait { harness.attached("s-main") })
-
-    // Discovery restores the other worktrees; a worktree not shown gets its
-    // tabs back (following their programs) but builds no surface yet.
-    await repository.refresh()
-    #expect(await harness.fake.wait { repository.workspaceIfLoaded(for: feature.path)?.sessions.count == 1 })
-    let restoredFeature = try #require(repository.workspaceIfLoaded(for: feature.path)?.sessions.first)
-    try await Task.sleep(for: .milliseconds(200))
-    #expect(restoredFeature.isAwaitingDeferredLaunch)
-    #expect(restoredFeature.isRunning)
-    #expect(!harness.attached("s-feature"))
-    // Shown: its tabs attach.
-    repository.activate(worktreeRoot: feature.path, chromeState: nil)
-    #expect(await harness.fake.wait { harness.attached("s-feature") })
-
-    // A worktree whose restore still runs: its tabs count as running, so a
-    // removal that did not confirm them is refused, and nothing is ended.
-    #expect(gate.waiting == 1)
-    let otherWorktree = try #require(repository.worktrees.first { $0.root == other.path })
-    #expect(await repository.removalBlockers(for: otherWorktree).runningProcessCount == 1)
-    await #expect(throws: GitWorktreeCommandError.self) {
-        try await repository.remove(otherWorktree, chromeState: nil)
-    }
-    #expect(repository.workspaceIfLoaded(for: other.path) != nil)
     #expect(harness.fake.requests("kill").isEmpty)
-    gate.open()
-    await repository.waitForPendingRestores()
-    #expect(repository.workspaceIfLoaded(for: other.path)?.commandSessions.map(\.id) == [otherTab.id])
+
+    repository.flushPersistentState()
+    let saved = try #require(store.load(repositoryRoot: repository.repositoryRoot))
+    #expect(saved.worktrees.map(\.root) == [repository.workspaceRoot])
+    #expect(saved.worktrees.first?.sessions.map(\.id) == [main.id, featureTab.id, server.id])
 }
 
 @Test @MainActor func aRetryThatFiresAsItIsSubscribedCanKeepAndRetryAgain() async throws {
@@ -1263,7 +1220,7 @@ private func runGit(_ arguments: [String]) throws {
     }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     repository.autoStartInitialCommandsIfNeeded()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(await harness.fake.wait { calls.value == 2 })
     await repository.waitForPendingRestores()
     // Kept twice: the command waits for its tab, nothing started for it
@@ -1415,7 +1372,7 @@ private func runGit(_ arguments: [String]) throws {
     }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     repository.autoStartInitialCommandsIfNeeded()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     await repository.waitForPendingRestores()
     let createdKinds = { harness.creates().compactMap { ($0.json["tags"] as? [String: String])?[PersistentSessionTag.kind] } }
     // Kept: auto-start waits for the tabs instead of starting a second copy
@@ -1506,7 +1463,7 @@ private func runGit(_ arguments: [String]) throws {
     WorkspaceRestoreResult.discard(result, in: workspace)
 }
 
-@Test @MainActor func aTabSavedWhileItsCreateWasUnderWayComesBackEvenAsItsWorktreesOnlyTab() async throws {
+@Test @MainActor func aTabSavedWhileItsCreateWasUnderWayComesBackEvenAsItsWindowsOnlyTab() async throws {
     let harness = try PersistentHarness()
     let root = try canonicalDirectory("cherry-restore-request-id")
     let storeDirectory = try canonicalDirectory("cherry-restore-request-id-store")
@@ -1548,7 +1505,7 @@ private func runGit(_ arguments: [String]) throws {
         worktrees: [WorktreeStateRecord(root: root.path, sessions: [record], selectedSessionID: record.id)]
     ))
 
-    // Relaunch: the worktree has no bound tab, yet the host is asked, and
+    // Relaunch: the window has no bound tab, yet the host is asked, and
     // the tab comes back owning that session instead of a new shell.
     let repository = RepositoryWorkspace(
         projectRoot: root.path,
@@ -1560,7 +1517,7 @@ private func runGit(_ arguments: [String]) throws {
     )
     defer { repository.closeAllSessions(intent: .windowClosed) }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(await harness.fake.wait { workspace.sessions.map(\.id) == [record.id] })
     let restored = try #require(workspace.sessions.first)
     #expect(restored.isPersistentLocalSession)
@@ -1670,7 +1627,7 @@ private func beforeTheLastBoot() throws -> Date {
     }
     repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
     await repository.waitForPendingRestores()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
 
     // Every tab back in its place (no default shell), the split, the agent
     // tree and the selection too.
@@ -1784,7 +1741,7 @@ private func beforeTheLastBoot() throws -> Date {
     }
     repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
     await repository.waitForPendingRestores()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     // Dropped, as before; the window opens its default shell instead.
     #expect(workspace.session(withID: gone.id) == nil)
     #expect(workspace.sessions.count == 1)
@@ -1809,7 +1766,7 @@ private func beforeTheLastBoot() throws -> Date {
     let endedHere = localRecord(title: "Ended here", sessionID: "s-ended", workingDirectory: project)
     // Persistent Sessions → Terminate or Remove.
     let terminated = localRecord(title: "Terminated", sessionID: "s-terminated", workingDirectory: project)
-    // Closed (⌘W) or forgotten with its worktree: a session still to end.
+    // Closed (⌘W), or ended with its window: a session still to end.
     let closed = localRecord(title: "Closed", sessionID: "s-closed", workingDirectory: project)
     // Only attached to a session it did not own, or never a session at all.
     let attached = localRecord(title: "Attached", sessionID: "s-attached", owned: false, workingDirectory: project)
@@ -1859,7 +1816,7 @@ private func beforeTheLastBoot() throws -> Date {
     defer { repository.closeAllSessions(intent: .windowClosed) }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(workspace.sessions.map(\.id) == [creating.id, lost.id])
     #expect(workspace.sessions.allSatisfy { $0.systemSessionEnd == .restart })
 }
@@ -1966,7 +1923,7 @@ private func beforeTheLastBoot() throws -> Date {
     repository.autoStartInitialCommandsIfNeeded()
     repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
     await repository.waitForPendingRestores()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(workspace.sessions.map(\.id) == [shell.id, web.id, worker.id])
     let shellTab = try #require(workspace.session(withID: shell.id))
     #expect(shellTab.systemSessionEnd == .logout)
@@ -2051,7 +2008,7 @@ private func beforeTheLastBoot() throws -> Date {
     defer { repository.closeAllSessions(intent: .windowClosed) }
     repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
     await repository.waitForPendingRestores()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     // The clean exit would have closed its tab: dropped.
     #expect(workspace.sessions.map(\.id) == [failed.id, paused.id, live.id])
     let failedTab = try #require(workspace.session(withID: failed.id))
@@ -2118,7 +2075,7 @@ private func beforeTheLastBoot() throws -> Date {
     let first = open()
     first.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await first.waitForPendingRestores()
-    #expect(first.activeWorkspace.session(withID: shell.id) == nil)
+    #expect(first.workspace.session(withID: shell.id) == nil)
     first.flushPersistentState()
     let resaved = try #require(store.load(repositoryRoot: first.repositoryRoot))
     #expect((resaved.savedAt ?? .distantPast) > beforeBoot)
@@ -2135,7 +2092,7 @@ private func beforeTheLastBoot() throws -> Date {
     defer { second.closeAllSessions(intent: .windowClosed) }
     second.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await second.waitForPendingRestores()
-    #expect(second.activeWorkspace.session(withID: shell.id)?.systemSessionEnd == .restart)
+    #expect(second.workspace.session(withID: shell.id)?.systemSessionEnd == .restart)
 }
 
 @Test @MainActor func aTabSavedEndedTakesTheSessionARestartStartedForItBeforeItsBindingWasSaved() async throws {
@@ -2217,7 +2174,7 @@ private func beforeTheLastBoot() throws -> Date {
     defer { repository.closeAllSessions(intent: .windowClosed) }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
-    #expect(repository.activeWorkspace.session(withID: shell.id)?.systemSessionEnd == .logout)
+    #expect(repository.workspace.session(withID: shell.id)?.systemSessionEnd == .logout)
 }
 
 // MARK: - Tabs of another Mac's host (docs/specs/remote-devices.md)
@@ -2353,7 +2310,7 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
     #expect(registry.register(
         window: window,
         projectRoot: root.path,
-        workspace: repository.activeWorkspace,
+        workspace: repository.workspace,
         repository: repository,
         noteStore: nil,
         todoStore: nil,
@@ -2363,14 +2320,14 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
     #expect(window.ignoresMouseEvents)
     // What the window has once it may show.
     var tabsWhenSettled: [UUID]?
-    repository.whenInitialRestoreSettles { tabsWhenSettled = repository.activeWorkspace.sessions.map(\.id) }
+    repository.whenInitialRestoreSettles { tabsWhenSettled = repository.workspace.sessions.map(\.id) }
 
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     #expect(await harness.fake.wait { gate.waiting == 1 })
     // The host has not answered: still off screen, and empty.
     try await Task.sleep(for: .milliseconds(50))
     #expect(window.alphaValue == 0)
-    #expect(repository.activeWorkspace.sessions.isEmpty)
+    #expect(repository.workspace.sessions.isEmpty)
     #expect(tabsWhenSettled == nil)
 
     gate.open()
@@ -2380,7 +2337,7 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
     // On the next turn, with its tab.
     #expect(await eventually { window.alphaValue == 1 })
     #expect(!window.ignoresMouseEvents)
-    #expect(repository.activeWorkspace.sessions.map(\.id) == [shell.id])
+    #expect(repository.workspace.sessions.map(\.id) == [shell.id])
 }
 
 /// A host that is slow to answer never leaves the user without the window:
@@ -2427,7 +2384,7 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
     #expect(registry.register(
         window: window,
         projectRoot: root.path,
-        workspace: repository.activeWorkspace,
+        workspace: repository.workspace,
         repository: repository,
         noteStore: nil,
         todoStore: nil,
@@ -2445,7 +2402,7 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
     gate.open()
     await repository.waitForPendingRestores()
     #expect(!repository.isAwaitingInitialRestore)
-    #expect(repository.activeWorkspace.sessions.map(\.id) == [shell.id])
+    #expect(repository.workspace.sessions.map(\.id) == [shell.id])
     #expect(window.alphaValue == 1)
 }
 
@@ -2481,7 +2438,7 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
     #expect(registry.register(
         window: window,
         projectRoot: root.path,
-        workspace: repository.activeWorkspace,
+        workspace: repository.workspace,
         repository: repository,
         noteStore: nil,
         todoStore: nil,

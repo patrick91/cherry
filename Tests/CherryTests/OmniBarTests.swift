@@ -6,7 +6,7 @@ import Testing
 
 // The Omni bar (⌘P, ⌘O): its fuzzy matcher and ranking, frecency, the
 // root's Recent, scopes and their prefixes, the backspace and Esc stack,
-// a Mac's drill, the worktree create row, each kind's ⌘K actions and ⌘K's
+// a Mac's drill, each kind's ⌘K actions and ⌘K's
 // routing. Everything runs on injected sources: no window comes on screen,
 // no host is asked and no real store is touched.
 
@@ -48,7 +48,7 @@ private let tabPix = UUID()
 private let tabStudio = UUID()
 
 /// Design D's data, real-shaped: projects on two Macs, tabs of several
-/// windows, a background session, worktrees and an agent.
+/// windows, a background session and an agent.
 private func fixture(extraProjects: Int = 0) -> OmniSources {
     let thisMac = ProjectSwitcherModel.MachineInfo(
         machine: .thisMac, name: "This Mac", status: "14 sessions", dot: .green, sessionCount: 14, detail: "",
@@ -83,18 +83,11 @@ private func fixture(extraProjects: Int = 0) -> OmniSources {
     sources.backgroundSessions = [
         OmniBackgroundSession(id: "s-graphql", title: "GraphQL core 3.3 references update", machine: .thisMac, isWorking: true),
     ]
-    sources.repositoryName = "cherry"
-    sources.worktrees = [
-        OmniWorktree(root: "/Users/me/code/cherry", name: "main", branch: "main", isActive: false, canRename: false, canRemove: false),
-        OmniWorktree(root: "/Users/me/wt/persistent", name: "codex/persistent-sessions", branch: "codex/persistent-sessions", isActive: true, canRename: true, canRemove: true),
-        OmniWorktree(root: "/Users/me/wt/jank", name: "fix-titlebar-jank", branch: "fix-titlebar-jank", isActive: false, canRename: true, canRemove: true),
-    ]
     sources.window = OmniWindowContext(
         hasWorkspace: true, hasSelectedTab: true, canSplit: true, canDetach: true, canReopenClosedTab: true,
-        hasProject: true, supportsWorktrees: true
+        hasProject: true
     )
     sources.listedLocalProjects = ["/Users/me/code/cherry", "/Users/me/code/pix"]
-    sources.worktreeProjectKeys = ["/Users/me/code/cherry"]
     sources.editorsByProjectKey = ["/Users/me/code/cherry": OmniEditor(id: "zed", name: "Zed")]
     sources.editors = [OmniEditor(id: "zed", name: "Zed"), OmniEditor(id: "xcode", name: "Xcode")]
     sources.agents = [OmniAgent(id: "claude", name: "Claude Code", commandLine: "claude")]
@@ -263,10 +256,8 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     #expect(controller.rows.count == OmniSections.rootResultLimit)
     controller.setQuery("persistent")
     // Every kind competes: a title that starts with the query first.
-    #expect(titles(controller) == [
-        "Persistent Sessions…", "codex/persistent-sessions", "Codex persistent-sessions multiplexer",
-    ])
-    #expect(controller.rows.map(\.item.kind) == [.command, .worktree, .tab])
+    #expect(titles(controller) == ["Persistent Sessions…", "Codex persistent-sessions multiplexer"])
+    #expect(controller.rows.map(\.item.kind) == [.command, .tab])
     controller.setQuery("new claude")
     #expect(controller.rows.first?.item.title == "New Claude Code agent")
     controller.setQuery("zzzz")
@@ -277,7 +268,7 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
 
 @Test @MainActor func omniPrefixesEnterTheirScopesOnlyAsTheFirstCharacterAtTheRoot() {
     let controller = OmniRecorder().controller()
-    let prefixes: [(String, OmniScope)] = [(">", .commands), ("@", .macs), ("#", .tabs), ("/", .worktrees)]
+    let prefixes: [(String, OmniScope)] = [(">", .commands), ("@", .macs), ("#", .tabs)]
     for (prefix, scope) in prefixes {
         controller.open(at: nil)
         controller.setQuery(prefix)
@@ -301,18 +292,15 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     controller.open(at: .projects)
     controller.setQuery("@")
     #expect(controller.stack == [.projects] && controller.query == "@")
-    // A pasted path lists This Mac's folders, not Worktrees.
+    // "/" starts a path: typed, or pasted, it lists This Mac's folders.
     controller.open(at: nil)
     controller.setQuery("/Users/me/notes")
     #expect(controller.stack.isEmpty)
     #expect(controller.folderRequest == OmniFolderRequest(machine: .thisMac, directory: "/Users/me/"))
-    // Without worktrees, "/" alone starts a path too.
-    var plain = fixture()
-    plain.window.supportsWorktrees = false
-    let other = OmniRecorder().controller(plain)
-    other.setQuery("/")
-    #expect(other.stack.isEmpty && other.query == "/")
-    #expect(other.folderRequest == OmniFolderRequest(machine: .thisMac, directory: "/"))
+    controller.open(at: nil)
+    controller.setQuery("/")
+    #expect(controller.stack.isEmpty && controller.query == "/")
+    #expect(controller.folderRequest == OmniFolderRequest(machine: .thisMac, directory: "/"))
 }
 
 @Test @MainActor func omniBackspaceAndEscapeStepOutOneLevelAtATime() {
@@ -407,36 +395,6 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     #expect(controller.rows[4].item.primaryLabel == "Open in Tab")
 }
 
-@Test @MainActor func omniWorktreesOfferANewWorktreeForAQueryThatNamesNone() throws {
-    let recorder = OmniRecorder()
-    let controller = recorder.controller()
-    controller.open(at: .worktrees)
-    #expect(titles(controller) == ["main", "codex/persistent-sessions", "fix-titlebar-jank"])
-    #expect(controller.rows.map(\.item.detail) == ["cherry", "cherry", "cherry"])
-    controller.setQuery("MAIN")
-    #expect(!titles(controller).contains { $0.hasPrefix("New worktree") })
-    controller.setQuery("feature-x")
-    #expect(titles(controller) == ["New worktree “feature-x”"])
-    #expect(controller.primaryLabel == "Create")
-    controller.activate()
-    #expect(recorder.run == [.createWorktree(name: "feature-x")])
-    // A "New worktree" row is not remembered as used.
-    #expect(recorder.used.isEmpty)
-    controller.setQuery("jank")
-    #expect(titles(controller) == ["fix-titlebar-jank", "New worktree “jank”"])
-    controller.activate()
-    #expect(recorder.run.last == .activateWorktree(root: "/Users/me/wt/jank"))
-    #expect(recorder.used == ["worktree:/Users/me/wt/jank"])
-
-    // A project without worktrees has none, and no create row.
-    var plain = fixture()
-    plain.window.supportsWorktrees = false
-    let other = OmniRecorder().controller(plain)
-    other.open(at: .worktrees)
-    other.setQuery("feature")
-    #expect(other.rows.isEmpty)
-}
-
 @Test @MainActor func omniCommandsAreThePalettesAndTheMenusWithTheirShortcuts() throws {
     let controller = OmniRecorder().controller()
     controller.open(at: .commands)
@@ -450,8 +408,8 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     #expect(shortcuts["Clear Scrollback"] == "⌘K")
     #expect(shortcuts["Settings"] == "⌘,")
     for title in [
-        "Add Mac…", "End Background Sessions…", "New Agent", "Add Project…", "Projects", "Worktrees",
-        "New Worktree…", "Manage Worktrees…", "Add Agent…", "Toggle Light/Dark Mode", "Open in Zed",
+        "Add Mac…", "End Background Sessions…", "New Agent", "Add Project…", "Projects",
+        "Add Agent…", "Toggle Light/Dark Mode", "Open in Zed",
         "Open in Other Editor…", "Persistent Sessions…", "New Claude Code agent",
     ] {
         #expect(shortcuts[title] != nil, "missing \(title)")
@@ -460,6 +418,8 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     #expect(rows.first { $0.title == "New Claude Code agent" }?.primary == .launchAgent(id: "claude"))
     // Commands have no ⌘K actions.
     #expect(rows.filter { $0.kind == .command }.allSatisfy { $0.actions.isEmpty })
+    // Nothing about worktrees.
+    #expect(!rows.contains { $0.title.localizedCaseInsensitiveContains("worktree") })
 
     // New Agent lists the agents and Add Agent…, which lists the presets.
     try select("New Agent", in: controller)
@@ -479,7 +439,7 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     bare.canModifyDevices = false
     let limited = OmniProviders.commands(bare).map(\.title)
     for title in ["Split Right", "Detach Tab", "Close Tab", "Reopen Closed Tab", "Clear Scrollback",
-                  "End Background Sessions…", "Add Mac…", "Worktrees", "New Agent", "Open in Zed"] {
+                  "End Background Sessions…", "Add Mac…", "New Agent", "Open in Zed"] {
         #expect(!limited.contains(title), "offered \(title)")
     }
 }
@@ -492,7 +452,7 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
         items.first { $0.title == title && (detail == nil || $0.detail == detail) }?.actions.map(\.title) ?? ["<none>"]
     }
     let projects = OmniProviders.projects(sources)
-    #expect(actions(projects, "cherry", detail: "") == ["Open in Zed", "Reveal in Finder", "Copy Path", "New Worktree…", "Remove from Projects"])
+    #expect(actions(projects, "cherry", detail: "") == ["Open in Zed", "Reveal in Finder", "Copy Path", "Remove from Projects"])
     #expect(actions(projects, "sqlmodel") == ["Reveal in Finder", "Copy Path"])
     #expect(actions(projects, "cherry", detail: "patstudio") == ["Copy Path", "Remove from Projects"])
 
@@ -505,10 +465,6 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     let session = try #require(OmniProviders.backgroundSessions(sources).first)
     #expect(session.actions.map(\.title) == ["Open in Tab", "End Session"])
     #expect(session.actions.map(\.isDestructive) == [false, true])
-
-    let worktrees = OmniProviders.worktrees(sources)
-    #expect(worktrees[0].actions.isEmpty) // the main checkout
-    #expect(worktrees[1].actions.map(\.title) == ["Rename Branch…", "Remove…"])
 
     let thisMac = try #require(OmniProviders.macs(sources).first)
     #expect(thisMac.actions.map(\.title) == [
@@ -584,11 +540,6 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     #expect(chrome.omniBar?.scope == .projects && chrome.omniBar?.id != first)
     chrome.dismissOmniBar()
     #expect(chrome.omniBar == nil)
-
-    chrome.presentNewWorktree(branchName: "feature-x")
-    #expect(chrome.isNewWorktreePresented && chrome.newWorktreeBranchName == "feature-x")
-    chrome.presentNewWorktree()
-    #expect(chrome.newWorktreeBranchName == nil)
 }
 
 // MARK: - Selection
@@ -730,10 +681,6 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     )
     performer.perform(.copyPath("/Users/me/code/cherry"))
     #expect(pasteboard.string(forType: .string) == "/Users/me/code/cherry")
-    performer.perform(.createWorktree(name: "feature-x"))
-    #expect(chrome.isNewWorktreePresented && chrome.newWorktreeBranchName == "feature-x")
-    performer.perform(.menu(.manageWorktrees))
-    #expect(chrome.isWorktreeManagerPresented && !chrome.isNewWorktreePresented)
     performer.perform(.menu(.addMac))
     #expect(chrome.isAddDevicePresented)
     performer.perform(.switcher(.addDeviceProject(studioID)))
@@ -931,7 +878,7 @@ private func selectedRows(_ controller: OmniBarController) -> [String] {
     controller.update(frecency: ["editor:zed": 100])
     controller.setQuery("")
     #expect(controller.rows.allSatisfy { $0.matched.isEmpty })
-    for scope: OmniScope in [.projects, .tabs, .commands, .editors, .worktrees] {
+    for scope: OmniScope in [.projects, .tabs, .commands, .editors] {
         controller.open(at: scope)
         controller.setQuery("e")
         controller.setQuery("")

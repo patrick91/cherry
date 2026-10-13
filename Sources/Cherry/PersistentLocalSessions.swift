@@ -298,8 +298,8 @@ final class PersistentHostSessions {
         /// (or another host answering) stops it sooner.
         var endRetryDelay: (initial: Duration, maximum: Duration) = (.milliseconds(250), .seconds(4))
         var endRetryWindow: Duration = .seconds(60)
-        /// Sessions of saved tabs that will never come back (their worktree
-        /// was removed) are looked for this long while the host cannot be
+        /// Sessions of saved tabs that will never come back (a window close
+        /// or quit that ended sessions) are looked for this long while the host cannot be
         /// listed (or still lists them). Those still running then are left
         /// to the next launch, which looks for them again when the tabs
         /// were recorded in a store (`SessionsToEndRecord`); the Persistent
@@ -898,9 +898,9 @@ final class PersistentHostSessions {
         }
     }
 
-    /// Ends the sessions of saved tabs that will never come back: their
-    /// worktree was removed (or no longer exists) while they were kept,
-    /// set aside or not restored yet, so no tab is left to end them. Only
+    /// Ends the sessions of saved tabs that will never come back: a window
+    /// close or quit ended sessions while they were kept, set aside or not
+    /// restored yet, so no tab is left to end them. Only
     /// sessions this app created for a tab that owned them count: a record's
     /// own binding (`owned`), the session its saved Create started
     /// (`launchRequestID`), or one tagged with its tab id; records that were

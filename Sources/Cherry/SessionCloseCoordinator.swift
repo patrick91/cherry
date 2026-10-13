@@ -36,8 +36,6 @@ enum SessionCloseIntent: String, CaseIterable, Sendable {
     case appQuitEndingSessions
     /// A second window for an already open project is discarded.
     case duplicateWindowTeardown
-    /// The tab's worktree was removed.
-    case worktreeRemoved
     /// Restart (menu, MCP `restart_process`): end the program and start it
     /// again in the same tab.
     case restart
@@ -51,7 +49,7 @@ enum SessionCloseIntent: String, CaseIterable, Sendable {
         switch self {
         case .windowClosed, .windowClosedEndingSessions, .appQuit, .appQuitEndingSessions, .duplicateWindowTeardown:
             true
-        case .userClosedTab, .userDetachedTab, .mcpClose, .worktreeRemoved, .restart, .programExited:
+        case .userClosedTab, .userDetachedTab, .mcpClose, .restart, .programExited:
             false
         }
     }
@@ -181,8 +179,8 @@ enum SessionClosePolicy {
         switch intent {
         case .userDetachedTab, .windowClosed, .appQuit, .duplicateWindowTeardown:
             .detach
-        case .userClosedTab, .mcpClose, .windowClosedEndingSessions, .appQuitEndingSessions, .worktreeRemoved,
-             .restart, .programExited:
+        case .userClosedTab, .mcpClose, .windowClosedEndingSessions, .appQuitEndingSessions, .restart,
+             .programExited:
             .terminate
         }
     }
@@ -237,31 +235,19 @@ enum SessionCloseCoordinator {
             && sessions.contains { closeEndsProgram(of: $0, policy: policy) }
     }
 
-    static func hasOpenSessionsInOtherWorktrees(
-        than workspace: TerminalWorkspace,
-        repository: RepositoryWorkspace?
-    ) -> Bool {
-        repository?.allLoadedWorkspaces().contains { candidate in
-            candidate !== workspace && !candidate.sessions.isEmpty
-        } ?? false
-    }
-
-    static func shouldCloseWindow(
-        for workspace: TerminalWorkspace,
-        repository: RepositoryWorkspace?
-    ) -> Bool {
-        guard workspace.sessions.count <= 1 else { return false }
-        return !hasOpenSessionsInOtherWorktrees(than: workspace, repository: repository)
+    /// Whether closing a tab of `workspace` closes its window: it is the
+    /// window's last tab.
+    static func shouldCloseWindow(for workspace: TerminalWorkspace) -> Bool {
+        workspace.sessions.count <= 1
     }
 
     /// ⌘W and Close Tab: closes the selected tab as the user closing it
     /// (`close`: its program ends, a persistent tab's session too, asking
     /// first when that stops a program at work; a tab attached to a session
     /// it does not own only disconnects), which ⌘Z can undo for a while
-    /// (`closeTabs`). When it is the window's last tab
-    /// (no other worktree of the window has tabs), the window closes after
-    /// the tab, with nothing left to ask about: closing the window with the
-    /// tab in it would ask whether to keep the tab's session running
+    /// (`closeTabs`). When it is the window's last tab, the window closes
+    /// after the tab, with nothing left to ask about: closing the window
+    /// with the tab in it would ask whether to keep the tab's session running
     /// (`SessionTeardownQuestion`) to bring it back next time. A program the
     /// close leaves running asks nothing: the window's toast says where it
     /// went, or, when the window closes with its last tab, another project
@@ -278,7 +264,7 @@ enum SessionCloseCoordinator {
             return
         }
         let registry = registry ?? repository?.windowRegistry ?? .shared
-        let closesWindow = shouldCloseWindow(for: workspace, repository: repository)
+        let closesWindow = shouldCloseWindow(for: workspace)
         guard let session = workspace.selectedSession ?? (closesWindow ? workspace.sessions.first : nil) else {
             if closesWindow { window?.performClose(nil) }
             return
@@ -287,7 +273,6 @@ enum SessionCloseCoordinator {
             session,
             in: workspace,
             chromeState: chromeState,
-            allowEmptyWorkspace: hasOpenSessionsInOtherWorktrees(than: workspace, repository: repository),
             closingWindow: closesWindow ? window : nil,
             registry: registry
         )
@@ -313,32 +298,26 @@ enum SessionCloseCoordinator {
             session,
             in: workspace,
             chromeState: chromeState,
-            allowEmptyWorkspace: hasOpenSessionsInOtherWorktrees(than: workspace, repository: repository),
-            closingWindow: shouldCloseWindow(for: workspace, repository: repository) ? window : nil,
+            closingWindow: shouldCloseWindow(for: workspace) ? window : nil,
             registry: registry
         )
     }
 
     /// A terminal tab whose shell exited with status 0 closes
     /// (`programExited`), as ⌘W closes it but without asking, since nothing
-    /// runs: on the window's last tab (no other worktree of the window has
-    /// tabs) the window closes after it. Without a window, while a sheet is
-    /// on it, or while it shows a note (⌘W would close the note, not the
-    /// window), that last tab stays and shows its exit.
+    /// runs: on the window's last tab the window closes after it. Without a
+    /// window, while a sheet is on it, or while it shows a note (⌘W would
+    /// close the note, not the window), that last tab stays and shows its
+    /// exit.
     static func closeTabAfterCleanExit(
         _ session: TerminalSession,
         in workspace: TerminalWorkspace,
-        repository: RepositoryWorkspace?,
         chromeState: ProjectWindowChromeState? = nil,
         window: NSWindow?
     ) {
         guard workspace.sessions.contains(where: { $0 === session }) else { return }
-        guard shouldCloseWindow(for: workspace, repository: repository) else {
-            workspace.close(
-                session,
-                allowEmptyWorkspace: hasOpenSessionsInOtherWorktrees(than: workspace, repository: repository),
-                intent: .programExited
-            )
+        guard shouldCloseWindow(for: workspace) else {
+            workspace.close(session, intent: .programExited)
             return
         }
         guard let window, window.attachedSheet == nil, chromeState?.selectedNoteID == nil else { return }
@@ -515,8 +494,7 @@ enum SessionCloseCoordinator {
         let entry = chromeState.closedTabs.record(
             tabs,
             action: intent == .userDetachedTab ? .detach : .close,
-            workspace: workspace,
-            repository: registry.repository(for: chromeState)
+            workspace: workspace
         )
         if let entry, notice == nil || tabs.contains(where: { $0.pendingEnd != nil }) {
             showClosedToast(names: tabs.map(\.name), entry: entry, on: chromeState)
@@ -630,7 +608,7 @@ enum SessionCloseCoordinator {
             Task { @MainActor in
                 for target in targets {
                     await reopen(
-                        target, hosting: hosting, into: repository?.activeWorkspace ?? workspace,
+                        target, hosting: hosting, into: repository?.workspace ?? workspace,
                         chromeState: chromeState, registry: registry
                     )
                 }
@@ -652,10 +630,10 @@ enum SessionCloseCoordinator {
     /// (`ProjectWindowRegistry.showBackgroundSession`: its project's
     /// window, opened again when it closed with its last tab, adopted with
     /// its tab id, kind, agent and command); a session the tab did not own
-    /// is attached again in the worktree it was closed from, its window
-    /// opened again likewise
+    /// is attached again in the project window it was closed from, its
+    /// window opened again likewise
     /// (`ProjectWindowRegistry.workspaceOpeningWindow`). `workspace` (the
-    /// toast's window's) takes a session whose worktree no window shows.
+    /// toast's window's) takes a session whose project no window shows.
     /// Nothing when a session of This Mac is gone; an SSH host's is not
     /// asked.
     @discardableResult
@@ -667,13 +645,13 @@ enum SessionCloseCoordinator {
         registry: ProjectWindowRegistry
     ) async -> TerminalSession? {
         switch target {
-        case .attach(let attachment, let worktreeRoot):
+        case .attach(let attachment, let projectRoot):
             if attachment.host == .local, let hosting, hosting.control.hostID == attachment.hostID {
                 _ = try? await hosting.control.list()
                 guard hosting.sessionInfo(attachment.sessionID) != nil else { return nil }
             }
             var destination = workspace
-            if let worktreeRoot, let own = await registry.workspaceOpeningWindow(worktreeRoot: worktreeRoot) {
+            if let projectRoot, let own = await registry.workspaceOpeningWindow(projectRoot: projectRoot) {
                 destination = own
             }
             guard let destination, !destination.isTornDown else { return nil }
@@ -775,7 +753,7 @@ struct TabCloseRequest: Identifiable {
     let sessionID: UUID
     weak var workspace: TerminalWorkspace?
     /// The close may leave the workspace without tabs (its window closes
-    /// with it, or other worktrees of the window have tabs).
+    /// with it).
     let allowEmptyWorkspace: Bool
     /// The window that closes after the tab, its last (⌘W).
     weak var closingWindow: NSWindow?
@@ -891,8 +869,8 @@ struct ClosedTabNotice: Equatable {
         /// This app's own session, now in Background Sessions.
         case backgroundSession(id: String)
         /// A session the tab was attached to without owning it, and the
-        /// worktree the tab was closed from.
-        case attach(HostedSessionAttachment, worktreeRoot: String?)
+        /// project folder of the window the tab was closed from.
+        case attach(HostedSessionAttachment, projectRoot: String?)
     }
 
     static let backgroundSessionsMessage = "Open or end it from Background Sessions in the Cherry menu bar icon."
@@ -961,14 +939,14 @@ struct ClosedTabNotice: Equatable {
         }
     }
 
-    /// The notice for closing `session`'s tab in `worktreeRoot`'s workspace
+    /// The notice for closing `session`'s tab in `projectRoot`'s workspace
     /// with `intent`, read before it closes: nil when the close ends its
     /// program (asked about or not), or, for a close that is not a detach,
     /// when its program is not at work (`programIsAtWork`).
     @MainActor
     static func make(
         for session: TerminalSession,
-        in worktreeRoot: String? = nil,
+        in projectRoot: String? = nil,
         intent: SessionCloseIntent = .userClosedTab,
         policy: SessionBackendPolicy,
         pathDisplayMode: SidebarTerminalPathDisplayMode = TerminalSettings.shared.sidebarTerminalPathDisplayMode
@@ -978,17 +956,17 @@ struct ClosedTabNotice: Equatable {
         else { return nil }
         return ClosedTabNotice(
             tabName: SidebarSessionLabel.label(for: session, pathDisplayMode: pathDisplayMode).title,
-            reopen: reopenTarget(for: session, in: worktreeRoot),
+            reopen: reopenTarget(for: session, in: projectRoot),
             attached: session.hostedAttachment != nil
         )
     }
 
-    /// The session a tab of `worktreeRoot`'s workspace shows, as Reopen
+    /// The session a tab of `projectRoot`'s workspace shows, as Reopen
     /// finds it again once the tab closed.
     @MainActor
-    static func reopenTarget(for session: TerminalSession, in worktreeRoot: String? = nil) -> Reopen? {
+    static func reopenTarget(for session: TerminalSession, in projectRoot: String? = nil) -> Reopen? {
         if let attachment = session.hostedAttachment {
-            return .attach(attachment, worktreeRoot: worktreeRoot)
+            return .attach(attachment, projectRoot: projectRoot)
         }
         return session.persistentSession.map { .backgroundSession(id: $0.sessionID) }
     }
@@ -1024,8 +1002,7 @@ struct SessionTeardownSummary: Equatable {
         let hostSessionID: String?
         /// The tab's name, as the sidebar shows it.
         let title: String
-        /// Its project (a quit), or its worktree (a window with tabs in
-        /// several); nil otherwise.
+        /// Its project (a quit); nil otherwise.
         let place: String?
         /// Its program is busy (`TerminalSession.hasRunningProcess`): a
         /// command, an agent, or a shell running a job.

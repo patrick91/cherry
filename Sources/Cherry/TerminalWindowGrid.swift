@@ -4,10 +4,9 @@ import AppKit
 /// new persistent tab's Create starts its program at, and what a restored
 /// tab no window shows attaches at (`TerminalWindowGridWait`). Each surface
 /// laid out in the window notes its grid as Ghostty reports it
-/// (`GhosttySessionBridge.reportWindowGrid`); one is shared by every
-/// worktree's workspace of a window (`RepositoryWorkspace`), and it keeps
-/// the last grid after its surface goes (another tab shown, a worktree with
-/// no tabs).
+/// (`GhosttySessionBridge.reportWindowGrid`); each window's workspace has
+/// one (`RepositoryWorkspace`), and it keeps the last grid after its
+/// surface goes (another tab shown).
 @MainActor
 final class TerminalWindowGrid {
     struct Record {

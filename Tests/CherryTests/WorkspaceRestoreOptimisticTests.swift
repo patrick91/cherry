@@ -122,7 +122,7 @@ private struct OptimisticWindow {
         )
     }
 
-    var workspace: TerminalWorkspace { repository.activeWorkspace }
+    var workspace: TerminalWorkspace { repository.workspace }
 
     /// Begins the restore and waits until it asks the (held) host.
     func begin() async {
@@ -606,7 +606,7 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
     harness.fake.sessions = [running("s-shown", shown, pid: 1), running("s-hidden", hidden, pid: 2)]
     queue.holdBackgroundTabs(atMost: 60)
     let result = await harness.restorer(WorkspaceRestoreRequest(
-        repositoryRoot: root, worktreeRoot: root, records: [shown, hidden], workspace: workspace
+        repositoryRoot: root, records: [shown, hidden], workspace: workspace
     ))
     workspace.restoreSessions(result.sessions, from: WorktreeStateRecord(
         root: root, sessions: [shown, hidden], selectedSessionID: shown.id
@@ -881,7 +881,7 @@ private final class HeldHostLists: @unchecked Sendable {
     }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(workspace.sessions.map(\.id) == [a.id, b.id, c.id, d.id])
     #expect(workspace.terminalSplitGroups.map(\.paneSessionIDs) == [[b.id, c.id]])
     #expect(workspace.terminalDisplayItems == [.single(a.id), .split(group), .single(d.id)])

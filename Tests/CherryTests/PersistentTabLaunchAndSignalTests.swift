@@ -47,7 +47,7 @@ private func typed(_ harness: PersistentHarness, into sessionID: String? = nil) 
 }
 
 /// Restores a terminal tab whose session the fake host runs, its adapter
-/// left for later (a worktree not shown).
+/// left for later (a tab not shown yet).
 @MainActor
 private func restoreTerminal(
     _ harness: PersistentHarness,
@@ -64,7 +64,7 @@ private func restoreTerminal(
         tags: [PersistentSessionTag.tab: record.id.uuidString]
     ))
     let result = await harness.restorer(WorkspaceRestoreRequest(
-        repositoryRoot: harness.project.path, worktreeRoot: harness.project.path,
+        repositoryRoot: harness.project.path,
         records: [record], workspace: workspace
     ))
     workspace.restoreSessions(
@@ -318,7 +318,7 @@ private func restoreTerminal(
 
     // The next launch's restore finds it by the saved record's request id.
     let restored = await harness.restorer(WorkspaceRestoreRequest(
-        repositoryRoot: harness.project.path, worktreeRoot: harness.project.path,
+        repositoryRoot: harness.project.path,
         records: [], workspace: next, unboundRecords: saved.sessions
     ))
     let back = try #require(restored.sessions.first)

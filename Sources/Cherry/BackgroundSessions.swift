@@ -33,7 +33,7 @@ struct BackgroundSession: Equatable, Identifiable, Sendable {
     /// The agent (`cherry.agent`), for its logo.
     let agentKey: String?
     let commandName: String?
-    /// The worktree its tab ran in (`cherry.project`).
+    /// The project folder its tab ran in (`cherry.project`).
     let projectRoot: String?
     let projectName: String
     /// What a busy terminal runs in its foreground.
@@ -1174,9 +1174,9 @@ enum ProjectRemoval {
     ) -> Void
 
     /// The background sessions of the project at `root`: those whose
-    /// project (`cherry.project`, a worktree) belongs to it rather than to
+    /// project (`cherry.project`, a folder) belongs to it rather than to
     /// another of `projectRoots` (the registered projects, `root` among
-    /// them): a worktree the settings know goes to its repository
+    /// them): a folder the settings know goes to its project
     /// (`repositoryRoot`, asked before the project is removed), else the
     /// longest registered root that contains it wins, so a project nested
     /// inside another keeps its own sessions.
@@ -1193,7 +1193,7 @@ enum ProjectRemoval {
         }
     }
 
-    /// The registered project a worktree belongs to.
+    /// The registered project a tab's folder belongs to.
     static func owningProject(
         of projectRoot: String,
         among registered: Set<String>,

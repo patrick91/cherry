@@ -223,7 +223,7 @@ private func openProject(
         restoredTabLaunchQueue: RestoredTabLaunchQueue()
     )
     _ = registry.register(
-        window: window, projectRoot: root.path, workspace: repository.activeWorkspace, repository: repository,
+        window: window, projectRoot: root.path, workspace: repository.workspace, repository: repository,
         noteStore: nil, todoStore: nil, chromeState: chromeState
     )
     repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
@@ -315,7 +315,7 @@ private func openProject(
     #expect(await harness.waitUntilAttached(creating))
     #expect(harness.hosting.owningTab(of: "s-creating") === creating)
 
-    // The session of a forgotten saved tab (its worktree was removed) that
+    // The session of a forgotten saved tab (a window close ended it) that
     // is about to be ended is left out too.
     harness.fake.killEndsSession = true
     let background2 = try #require(harness.hosting.sessionInfo("s-background"))
@@ -443,7 +443,7 @@ private func openProject(
 
     // A copy of the server started meanwhile runs: the restored server tab
     // is set aside, its session still running and its record saved.
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     let started = workspace.addCommandSession(
         command: ProjectCommandDefinition(name: "server", command: "serve"), projectRoot: root.path, select: false
     )
@@ -460,7 +460,6 @@ private func openProject(
     let info = try #require(harness.hosting.sessionInfo("s-server"))
     let shown = repository.showBackgroundSession(
         PersistentSessionLaunch(attachment: try #require(harness.hosting.attachment(for: info)), info: info),
-        worktreeRoot: root.path,
         hosting: harness.hosting
     )
     #expect(shown === started)
@@ -1142,7 +1141,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
         repository.closeAllSessions(intent: .windowClosed)
         harness.cleanUp()
     }
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     // The window's default shell.
     #expect(await harness.fake.wait { harness.creates().count == 1 })
     let agentTab = UUID()
@@ -1158,7 +1157,6 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
         let info = try #require(list.sessions.first { $0.id == id })
         return repository.showBackgroundSession(
             PersistentSessionLaunch(attachment: try #require(harness.hosting.attachment(for: info)), info: info),
-            worktreeRoot: project,
             hosting: harness.hosting
         )
     }
@@ -1230,7 +1228,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     await model.open(item)?.value
     #expect(opened.map(resolved) == [resolved(root.path)])
     let repository = try #require(reopened)
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     // The window's own restore brought back its tabs; the one asked for is shown.
     #expect(workspace.sessions.map(\.id) == [editor.id, logs.id])
     #expect(workspace.selectedSessionID == logs.id)
@@ -1274,7 +1272,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     let repository = openProject(root, store: store, harness: harness, registry: registry, window: window)
     reopened = repository
     await repository.waitForPendingRestores()
-    #expect(repository.activeWorkspace.sessions.map(\.id) == [editor.id])
+    #expect(repository.workspace.sessions.map(\.id) == [editor.id])
     repository.flushPersistentState()
     #expect(store.load(repositoryRoot: repository.repositoryRoot)?.worktree(root: root.path)?.sessions.map(\.id) == [editor.id])
 }
@@ -1316,7 +1314,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     let repository = openProject(root, store: store, harness: harness, registry: registry, window: window)
     reopened = repository
     await repository.waitForPendingRestores()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(workspace.sessions.map(\.id) == [editor.id])
     #expect(harness.hosting.owningTab(of: "s-logs") == nil)
 
@@ -1351,10 +1349,10 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
         harness.cleanUp()
     }
     #expect(registry.register(
-        window: window, projectRoot: project, workspace: repository.activeWorkspace, repository: repository,
+        window: window, projectRoot: project, workspace: repository.workspace, repository: repository,
         noteStore: nil, todoStore: nil, chromeState: nil
     ))
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(await harness.fake.wait { harness.creates().count == 1 })
     let tabs = workspace.sessions.map(\.id)
     harness.fake.sessions += [ownSession("s-kept", project: project, name: "Kept")]
@@ -1808,11 +1806,11 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     let server = try #require(harness.hosting.owningTab(of: "s-server"))
     #expect(server.id == serverTab)
     #expect(server.kind == .command)
-    #expect(repositoryA.activeWorkspace.sessions.contains { $0 === server })
+    #expect(repositoryA.workspace.sessions.contains { $0 === server })
     let agent = try #require(harness.hosting.owningTab(of: "s-agent"))
     #expect(agent.id == agentTab)
     #expect(agent.kind == .agent)
-    #expect(try #require(repositoryB).activeWorkspace.sessions.contains { $0 === agent })
+    #expect(try #require(repositoryB).workspace.sessions.contains { $0 === agent })
     model.refresh()
     #expect(model.sessions.isEmpty)
     #expect(harness.fake.requests("kill").isEmpty)
@@ -2231,7 +2229,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     let tab = try #require(harness.hosting.owningTab(of: "s-agent"))
     #expect(tab.id == agentTab)
     #expect(tab.kind == .agent)
-    #expect(repository.activeWorkspace.selectedSessionID == agentTab)
+    #expect(repository.workspace.selectedSessionID == agentTab)
 }
 
 // MARK: - Removing ended sessions

@@ -1142,8 +1142,8 @@ final class TerminalWorkspace: ObservableObject {
     /// Set once the workspace's window or the app tore it down; its sessions
     /// are gone and must not be saved as an empty workspace.
     private(set) var isTornDown = false
-    /// Why every tab was last closed at once (window closed, app quit,
-    /// worktree removed): tabs a restore finishes afterwards end the same way.
+    /// Why every tab was last closed at once (window closed, app quit): tabs
+    /// a restore finishes afterwards end the same way.
     private(set) var closeAllIntent: SessionCloseIntent?
     /// Launches restored tabs' attach adapters a few at a time (tests give
     /// a workspace its own).
@@ -1256,8 +1256,7 @@ final class TerminalWorkspace: ObservableObject {
     /// (`TerminalWindowGrid`): what a new persistent tab's Create starts its
     /// program at once it settled (`TerminalWindowGridWait`), and what a
     /// restored tab no window shows attaches at (`detachedSurfaceSize`,
-    /// `RestoredTabLaunchQueue`). A repository's worktrees share their
-    /// window's (`RepositoryWorkspace`).
+    /// `RestoredTabLaunchQueue`): its window's (`RepositoryWorkspace`).
     var windowGrid = TerminalWindowGrid()
 
     /// The cell size, in pixels, that a terminal of `grid` in this
@@ -1362,8 +1361,8 @@ final class TerminalWorkspace: ObservableObject {
     /// Running tabs that closing everything for `intent` would end: native
     /// ones, and persistent ones whose close action terminates their session
     /// (tabs that only detach, as in a window close or quit that keeps
-    /// sessions running, are not counted). Drives the quit, window-close and
-    /// worktree-removal confirmations.
+    /// sessions running, are not counted). Drives the quit and window-close
+    /// confirmations.
     func sessionsWithRunningProcess(endingWith intent: SessionCloseIntent) -> [TerminalSession] {
         sessions.filter { session in
             backendPolicy.closeAction(for: session, intent: intent) != .detach && session.hasRunningProcess()
@@ -1576,8 +1575,7 @@ final class TerminalWorkspace: ObservableObject {
     ) -> TerminalSession {
         // Match Ghostty's new-surface behavior: when no cwd is requested,
         // inherit the selected session's last trusted OSC 7 cwd report. In an
-        // empty workspace (worktree spaces start with no sessions) fall back
-        // to the project root rather than the process home directory. A tab
+        // empty workspace fall back to the project root rather than the process home directory. A tab
         // of This Mac's host (persistent, or attached to a local session)
         // seeds it like a native one; an SSH host's directory never seeds a
         // local shell. In a device's window (docs/specs/remote-devices.md,
@@ -1971,8 +1969,7 @@ final class TerminalWorkspace: ObservableObject {
     /// them (the restore that opened the workspace).
     /// `launchingAdapters`: restored tabs whose adapter a restore deferred
     /// are attached a few at a time (`restoredTabLaunchQueue`), the shown
-    /// ones first; false leaves them to `launchRestoredAdapters()` (a
-    /// worktree not shown now) or to being shown.
+    /// ones first; false leaves them to being shown.
     @discardableResult
     func restoreSessions(
         _ restoredSessions: [TerminalSession],
@@ -2125,13 +2122,9 @@ final class TerminalWorkspace: ObservableObject {
         return setAside
     }
 
-    /// Queues the attach adapters that restored tabs are still waiting for
+    /// Queues the attach adapters that `tabs` are still waiting for
     /// (`restoredTabLaunchQueue`): the selected tab and the other panes of
-    /// its split first. A worktree's workspace calls this when it is shown.
-    func launchRestoredAdapters() {
-        launchRestoredAdapters(sessions)
-    }
-
+    /// its split first.
     private func launchRestoredAdapters(_ tabs: [TerminalSession]) {
         let waiting = tabs.filter(\.isAwaitingDeferredLaunch)
         guard !waiting.isEmpty else { return }

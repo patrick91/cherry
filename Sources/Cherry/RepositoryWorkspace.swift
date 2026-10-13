@@ -3,102 +3,71 @@ import Combine
 import Darwin
 import Foundation
 
-struct WorktreeRemovalBlockers: Equatable {
-    let runningProcessCount: Int
-    let isDirty: Bool
-    let lockReason: String?
-    let pruneReason: String?
-
-    var canRemove: Bool {
-        canRemove(closingRunningProcesses: false)
-    }
-
-    func canRemove(
-        closingRunningProcesses: Bool,
-        force: Bool = false
-    ) -> Bool {
-        (closingRunningProcesses || runningProcessCount == 0)
-            && (force || (!isDirty && lockReason == nil))
-            && pruneReason == nil
-    }
-}
-
+/// A project window's model: its folder's tabs (`workspace`), which it
+/// saves and restores, and for a project on another Mac what that Mac says
+/// about it.
 @MainActor
 final class RepositoryWorkspace: ObservableObject {
-    @Published private(set) var worktrees: [GitWorktree]
-    @Published private(set) var activeWorktreeRoot: String
-    @Published private(set) var commonDirectory: String?
-    @Published private(set) var isRefreshing = false
-    @Published private(set) var discoveryError: String?
-    @Published private(set) var dirtyByRoot: [String: Bool] = [:]
-    @Published private(set) var loadedWorktreeRoots: Set<String>
-    @Published private(set) var hiddenWorktreeRoots: Set<String>
-
+    /// The project, as the window registry and the saved state name it.
     let repositoryRoot: String
-    /// The worktree the window opened on; its commands auto-start from the
-    /// window once its saved tabs are restored.
-    let initialWorktreeRoot: String
+    /// The project's folder as its tabs name it: `repositoryRoot` with its
+    /// links resolved (a device's project: its key).
+    let workspaceRoot: String
+    /// The window's tabs.
+    let workspace: TerminalWorkspace
 
-    private let service: GitWorktreeService
     private let backendPolicy: SessionBackendPolicy
     private let stateStore: WorkspaceStateStore?
     private let sessionRestorer: WorkspaceSessionRestorer
     private let autoStartCommands: @MainActor (String) -> [ProjectCommandDefinition]
-    private var workspaces: [String: TerminalWorkspace]
-    /// The grid this window gives its terminals (`TerminalWindowGrid`), the
-    /// same for each worktree's workspace: a worktree's first tab starts at
-    /// it as the window's other tabs do.
+    /// The grid this window gives its terminals (`TerminalWindowGrid`).
     private let windowGrid = TerminalWindowGrid()
-    private var resolvedPathsByInput: [String: String]
-    private var autoStartedRoots: Set<String> = []
-    private var selectionByRoot: [String: WorktreeSelectionState] = [:]
-    private var pendingAutoStartTask: Task<Void, Never>?
-    private var activeRootPersistenceTask: Task<Void, Never>?
+    private var didAutoStart = false
 
     // Workspace persistence. Nothing is saved before the window claimed its
     // project (`beginRestoringSavedStateIfNeeded`), so a duplicate window
     // never writes, and nothing is saved once a teardown intent closed it.
-    /// Saved worktrees whose tabs are not restored yet. Saves carry them
-    /// over unchanged, so an unfinished or skipped restore loses nothing.
-    private var pendingWorktreeRecords: [String: WorktreeStateRecord]
-    /// Saved tabs a restore has not brought back or dropped yet, by root:
-    /// kept for a later launch (their helper or host was unavailable), still
-    /// being restored (`inFlightRecordIDs`), or set aside (a command tab
-    /// opened meanwhile runs that command). Saves merge them into the live
-    /// worktree, so none of them is forgotten.
-    private var keptWorktreeRecords: [String: WorktreeStateRecord] = [:]
+    /// Saved tabs not restored yet. Saves carry them over unchanged, so an
+    /// unfinished or skipped restore loses nothing.
+    private var pendingRecord: WorktreeStateRecord?
+    /// Saved tabs a restore has not brought back or dropped yet: kept for a
+    /// later launch (their helper or host was unavailable), still being
+    /// restored (`inFlightRecordIDs`), or set aside (a command tab opened
+    /// meanwhile runs that command). Saves merge them into the live
+    /// workspace, so none of them is forgotten.
+    private var keptRecord: WorktreeStateRecord?
     /// Kept records whose host had not answered when the restore added the
     /// others: the restore's remainder brings them back, keeps or drops
-    /// them. By root.
-    private var inFlightRecordIDs: [String: Set<UUID>] = [:]
+    /// them.
+    private var inFlightRecordIDs: Set<UUID> = []
     /// Kept records of restored command tabs that a tab opened meanwhile
     /// runs the command of (`TerminalWorkspace.restoreSessions`): saved for
-    /// the next launch, not restored again during this run. By root.
-    private var setAsideRecordIDs: [String: Set<UUID>] = [:]
-    private var restoreTasks: [String: Task<Void, Never>] = [:]
-    /// The records the restore task of a root asks for.
-    private var restoreTaskRecordIDs: [String: Set<UUID>] = [:]
-    /// Restores' remainders (hosts that answered late), by root.
-    private var restoreRemainders: [String: [UUID: Task<Void, Never>]] = [:]
-    /// The selection a workspace had when its restore added its first tabs,
-    /// while more are in flight: a later tab that is the saved selection is
-    /// selected only while that has not changed.
-    private var selectionsAwaitingRestore: [String: SelectionMark] = [:]
+    /// the next launch, not restored again during this run.
+    private var setAsideRecordIDs: Set<UUID> = []
+    private var restoreTask: Task<Void, Never>?
+    /// The records the restore task asks for.
+    private var restoreTaskRecordIDs: Set<UUID> = []
+    /// Restores' remainders (hosts that answered late).
+    private var restoreRemainders: [UUID: Task<Void, Never>] = [:]
+    /// The selection the workspace had when its restore added its first
+    /// tabs, while more are in flight: a later tab that is the saved
+    /// selection is selected only while that has not changed.
+    private var selectionAwaitingRestore: SelectionMark?
     private let restoredTabLaunchQueue: RestoredTabLaunchQueue
-    private var restoreWaiters: [String: [@MainActor () -> Void]] = [:]
+    private var restoreWaiters: [@MainActor () -> Void] = []
     /// Kept records that come back when their host becomes reachable during
-    /// this run (`WorkspaceRestoreResult.retryWhenAvailable`), by root.
-    private var restoreRetries: [String: AnyCancellable] = [:]
+    /// this run (`WorkspaceRestoreResult.retryWhenAvailable`).
+    private var restoreRetry: AnyCancellable?
     /// Auto-start commands not started because a kept record (its host was
     /// unreachable) may bring back their tab; they start once it has come
-    /// back, by root.
-    private var autoStartsWaitingForRetry: [String: [ProjectCommandDefinition]] = [:]
+    /// back.
+    private var autoStartsWaitingForRetry: [ProjectCommandDefinition] = []
     private var didBeginRestore = false
     private(set) var isTearingDown = false
-    /// Every restore request made, by root: cancelled when the window tears
-    /// down or the worktree is forgotten, so a restore still under way
-    /// builds no more tabs and ends those it has not handed back.
-    private var restoreCancellations: [String: [WorkspaceRestoreCancellation]] = [:]
+    /// Every restore request made: cancelled when the window tears down, so
+    /// a restore still under way builds no more tabs and ends those it has
+    /// not handed back.
+    private var restoreCancellations: [WorkspaceRestoreCancellation] = []
     /// Which of this app's sessions no saved tab names (`OrphanedSessionCriteria`),
     /// from the state loaded when the window opened; nil when this window
     /// saves nothing or runs no local sessions.
@@ -112,44 +81,44 @@ final class RepositoryWorkspace: ObservableObject {
     /// this run, which its toast names and Restart All starts
     /// (`announceSystemEndedTabs`).
     private var systemEndedTabs: [WeakSession] = []
-    /// Worktrees whose orphaned sessions were looked for (once per run).
-    private var orphanScannedRoots: Set<String> = []
-    /// Saved tabs forgotten with their worktree during this run, whose
-    /// sessions are being ended: never adopted.
-    private var forgottenRecordIDs: Set<UUID> = []
+    /// Whether orphaned sessions were looked for (once per run).
+    private var didScanForOrphans = false
     private var orphanScanTask: Task<Void, Never>?
     private var orphanScanRetry: AnyCancellable?
     /// When the first window of this app run opened: sessions created
     /// since belong to this run's tabs, never to a tab whose record was lost.
     private static let appRunStartedAt = Date()
-    private var persistenceSubscriptions: [ObjectIdentifier: AnyCancellable] = [:]
+    private var persistenceSubscription: AnyCancellable?
     /// A device's window keeps its host's control connection up while it
     /// has tabs (`updateRemoteLease`): its tabs follow their programs, and
     /// an offline Mac is retried (backoff, wake, network changes).
     private var remoteLease: HostControlLease?
-    private var remoteLeaseSubscriptions: [ObjectIdentifier: AnyCancellable] = [:]
+    private var remoteLeaseSubscription: AnyCancellable?
     /// Saved tabs of a device's window a restore kept because the device
     /// could not be reached: they come back once it answers.
     @Published private(set) var remoteTabsWaitingCount = 0
-    /// Whether the restore that opens the window's first worktree has not
-    /// brought its saved tabs back yet: the window stays off screen until it
-    /// has (`ProjectWindowReveal`), and says it is restoring them if it has
-    /// to show first (`WindowRestoringBar`). False for a window with nothing
+    /// Whether the restore that opens the window has not brought its saved
+    /// tabs back yet: the window stays off screen until it has
+    /// (`ProjectWindowReveal`), and says it is restoring them if it has to
+    /// show first (`WindowRestoringBar`). False for a window with nothing
     /// to restore.
     @Published private(set) var isAwaitingInitialRestore: Bool
     private var initialRestoreWaiters: [@MainActor () -> Void] = []
-    /// Whether the first worktree's saved persistent tabs are shown at once,
-    /// before This Mac's host answers (`OptimisticRestore`). The app's
-    /// windows do; tests opt in.
+    /// Whether the saved persistent tabs are shown at once, before This
+    /// Mac's host answers (`OptimisticRestore`). The app's windows do;
+    /// tests opt in.
     let showsSavedTabsBeforeHostAnswers: Bool
-    /// Tabs shown before the host answered, by root and record id, until
-    /// the restore confirms or withdraws each (`reconcileOptimisticTabs`).
-    private var optimisticTabs: [String: [UUID: TerminalSession]] = [:]
+    /// Tabs shown before the host answered, by record id, until the restore
+    /// confirms or withdraws each (`reconcileOptimisticTabs`).
+    private var optimisticTabs: [UUID: TerminalSession] = [:]
     /// The selection once those tabs were shown: the restore's answer
     /// selects the saved tab only while nobody changed it since.
-    private var optimisticSelections: [String: SelectionMark] = [:]
+    private var optimisticSelection: SelectionMark?
     private var chromeStateSubscription: AnyCancellable?
     private weak var chromeState: ProjectWindowChromeState?
+    /// Agent groups a restore collapsed while the window had given no
+    /// chrome state (tests): saved with the tabs.
+    private var collapsedAgentGroupIDsWithoutChrome: Set<UUID> = []
     /// The registry this repository's window registered with
     /// (`ProjectWindowRegistry.register`): it names that window.
     weak var windowRegistry: ProjectWindowRegistry?
@@ -160,7 +129,6 @@ final class RepositoryWorkspace: ObservableObject {
     /// tests get native tabs and no persistence unless they opt in.
     init(
         projectRoot: String,
-        service: GitWorktreeService = GitWorktreeService(),
         backendPolicy: SessionBackendPolicy = .native,
         stateStore: WorkspaceStateStore? = nil,
         sessionRestorer: @escaping WorkspaceSessionRestorer = WorkspaceSessionRestorers.none,
@@ -177,25 +145,20 @@ final class RepositoryWorkspace: ObservableObject {
         self.showsSavedTabsBeforeHostAnswers = showsSavedTabsBeforeHostAnswers
         let runStartedAt = Self.appRunStartedAt
         // A project on another Mac (docs/specs/remote-devices.md) keeps its
-        // key: no directory here, no git and no worktrees.
+        // key: no directory here.
         let location = ProjectLocation(key: projectRoot)
         let root: String
-        let initialRoot: String
+        let folder: String
         if location.isRemote {
             root = location.key
-            initialRoot = root
+            folder = root
         } else {
             root = URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL.path
-            let savedRoot = TerminalSettings.shared.worktreeSpacesEnabled
-                ? AgentSettings.shared.lastActiveWorktreeRoot(for: root) ?? root
-                : root
-            let existingRoot = FileManager.default.fileExists(atPath: savedRoot) ? savedRoot : root
-            initialRoot = Self.resolvedPath(existingRoot)
+            folder = Self.resolvedPath(root)
         }
         isRemote = location.isRemote
         repositoryRoot = root
-        initialWorktreeRoot = initialRoot
-        self.service = service
+        workspaceRoot = folder
         self.remoteProject = location.isRemote ? remoteProject : nil
         self.remoteProjectFiles = remoteProjectFiles ?? (location.isRemote && remoteProject != nil ? .shared : nil)
         remoteProjectLoaded = !(location.isRemote && remoteProject != nil)
@@ -204,32 +167,28 @@ final class RepositoryWorkspace: ObservableObject {
         self.sessionRestorer = sessionRestorer
         self.autoStartCommands = autoStartCommands
         self.restoredTabLaunchQueue = restoredTabLaunchQueue
-        activeWorktreeRoot = initialRoot
 
         // Only tabs bound to a hosted session can come back, and, when local
         // tabs run in the host, tabs saved while their session's Create had
-        // not answered; a worktree with none restores nothing, and its
-        // native tabs are dropped.
+        // not answered; a window with none restores nothing, and its native
+        // tabs are dropped. A file saved while Cherry had worktree spaces
+        // can name several folders: their tabs all come back here.
         let mayAdoptUnbound = backendPolicy.localSessions != nil
         let savedState = stateStore?.load(repositoryRoot: root)
-        var pendingRecords: [String: WorktreeStateRecord] = [:]
-        for record in savedState?.worktrees ?? []
-        where (mayAdoptUnbound
-            ? record.hasRestorableSessions
-            : record.sessions.contains { $0.isRestorable || $0.systemEnd != nil })
-            && pendingRecords[record.root] == nil {
+        if var record = savedState?.workspaceRecord(root: folder),
+           mayAdoptUnbound
+               ? record.hasRestorableSessions
+               : record.sessions.contains(where: { $0.isRestorable || $0.systemEnd != nil }) {
             // Each record says when an open tab last saved it, so saving it
             // again unchanged (kept for later) keeps that.
-            var record = record
             record.sessions = record.sessions.map { session in
                 var session = session
                 session.savedAt = session.savedAt ?? savedState?.savedAt
                 return session
             }
-            pendingRecords[record.root] = record
+            pendingRecord = record
         }
-        pendingWorktreeRecords = pendingRecords
-        isAwaitingInitialRestore = pendingRecords[initialRoot] != nil
+        isAwaitingInitialRestore = pendingRecord != nil
         if let stateStore, stateStore.isEnabled, let localSessions = backendPolicy.localSessions {
             let sessionsToEnd = stateStore.loadSessionsToEnd()
             orphanCriteria = OrphanedSessionCriteria(
@@ -261,34 +220,22 @@ final class RepositoryWorkspace: ObservableObject {
             systemEnds = nil
         }
 
-        let initialWorkspace = TerminalWorkspace(
-            projectRoot: initialRoot,
-            createInitialSession: pendingRecords[initialRoot] == nil,
+        let workspace = TerminalWorkspace(
+            projectRoot: folder,
+            createInitialSession: pendingRecord == nil,
             backendPolicy: backendPolicy
         )
-        initialWorkspace.restoredTabLaunchQueue = restoredTabLaunchQueue
-        initialWorkspace.windowGrid = windowGrid
-        workspaces = [initialRoot: initialWorkspace]
-        var initialResolvedPaths = [root: initialRoot]
-        initialResolvedPaths[initialRoot] = initialRoot
-        resolvedPathsByInput = initialResolvedPaths
-        loadedWorktreeRoots = [initialRoot]
-        hiddenWorktreeRoots = location.isRemote
-            ? (remoteProject == nil ? [] : AgentSettings.shared.hiddenWorktreeRoots(for: root))
-            : Set(AgentSettings.shared.hiddenWorktreeRoots(for: root).map(Self.resolvedPath))
-        worktrees = [GitWorktree(
-            root: initialRoot,
-            head: "",
-            branch: nil,
-            isMain: true,
-            isBare: false,
-            isDetached: false,
-            lockReason: nil,
-            pruneReason: nil
-        )]
-        closeTabsAfterCleanExit(in: initialWorkspace)
-        observePersistentState(of: initialWorkspace)
-        observeRemoteTabs(of: initialWorkspace)
+        workspace.restoredTabLaunchQueue = restoredTabLaunchQueue
+        workspace.windowGrid = windowGrid
+        self.workspace = workspace
+        if !location.isRemote {
+            // Its tabs name the folder with its links resolved: they use
+            // the project's settings.
+            AgentSettings.shared.registerProjectFolder(folder, projectRoot: root)
+        }
+        closeTabsAfterCleanExit()
+        observePersistentState()
+        observeRemoteTabs()
         if let hosting = remoteHosting {
             // A wake or a network change reconnects the device at once
             // (its restore may be waiting for it with no tab open yet).
@@ -300,9 +247,9 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     /// A device's window: follows whether it has tabs (`updateRemoteLease`).
-    private func observeRemoteTabs(of workspace: TerminalWorkspace) {
+    private func observeRemoteTabs() {
         guard isRemote else { return }
-        remoteLeaseSubscriptions[ObjectIdentifier(workspace)] = workspace.$sessions
+        remoteLeaseSubscription = workspace.$sessions
             .dropFirst()
             .sink { [weak self] _ in
                 // `$sessions` fires before the change.
@@ -316,7 +263,7 @@ final class RepositoryWorkspace: ObservableObject {
     /// (and is not torn down), releasing it otherwise.
     func updateRemoteLease() {
         guard let hosting = remoteHosting else { return }
-        let hasTabs = !isTearingDown && workspaces.values.contains { !$0.isTornDown && !$0.sessions.isEmpty }
+        let hasTabs = !isTearingDown && !workspace.isTornDown && !workspace.sessions.isEmpty
         if hasTabs, remoteLease == nil {
             remoteLease = hosting.control.retain()
             // Wakes and network changes reconnect it at once.
@@ -327,63 +274,29 @@ final class RepositoryWorkspace: ObservableObject {
         }
     }
 
-    var activeWorkspace: TerminalWorkspace {
-        workspace(for: activeWorktreeRoot)
-    }
-
-    var visibleWorktrees: [GitWorktree] {
-        worktrees.filter { worktree in
-            worktree.isMain
-                || worktree.root == activeWorktreeRoot
-                || !hiddenWorktreeRoots.contains(worktree.root)
-        }
-    }
-
-    var activeWorktree: GitWorktree? {
-        worktrees.first { $0.root == activeWorktreeRoot }
-    }
-
     var repositoryName: String {
         let path = ProjectLocation.launchPath(forKey: repositoryRoot)
         return URL(fileURLWithPath: path, isDirectory: true).lastPathComponent
     }
 
     /// A project on another Mac (docs/specs/remote-devices.md): its tabs run
-    /// there; its git worktrees and cherry.toml are read there
-    /// (`remoteProject`), never on this Mac's disk.
+    /// there; its cherry.toml is read there (`remoteProject`), never on this
+    /// Mac's disk.
     let isRemote: Bool
 
-    /// How a device's window reaches that Mac for git and `project-info`
-    /// (phase 3); nil for This Mac's projects, and for a device window
-    /// without it (an unknown device: no git, worktrees or commands).
+    /// How a device's window reaches that Mac for `project-info` (phase 3);
+    /// nil for This Mac's projects, and for a device window without it (an
+    /// unknown device: no commands).
     let remoteProject: RemoteProjectAccess?
     /// Where a device project's cherry.toml goes once read.
     private let remoteProjectFiles: RemoteProjectFiles?
     /// Whether the device project's `project-info` answered (or failed)
     /// once: its auto-start commands wait for it. True for This Mac's.
     @Published private(set) var remoteProjectLoaded: Bool
-    /// What stands in the way of the device project's git worktrees or
-    /// cherry.toml (an older session host there, a cherry.toml too large).
+    /// What stands in the way of the device project's cherry.toml (an older
+    /// session host there, a cherry.toml too large).
     @Published private(set) var remoteProjectNote: String?
     private var remoteProjectWaiters: [@MainActor () -> Void] = []
-
-    /// The git that runs this repository's worktree commands: This Mac's,
-    /// or the device's over its SSH master.
-    private func gitService() async -> GitWorktreeService {
-        if let remoteProject { return await remoteProject.gitService() }
-        return service
-    }
-
-    /// A worktree's path where git runs (a device key's path there).
-    private func gitPath(_ root: String) -> String {
-        isRemote ? ProjectLocation.launchPath(forKey: root) : root
-    }
-
-    /// A path git reported, as this window names worktrees (a key on a
-    /// device).
-    private func worktreeKey(_ path: String) -> String {
-        remoteProject?.key(forPath: path) ?? path
-    }
 
     /// The device's hosting when this is another Mac's project.
     /// Nil for a device Cherry no longer knows (its stand-in hosting holds
@@ -405,83 +318,22 @@ final class RepositoryWorkspace: ObservableObject {
     /// Whether this window told its device's hosting it uses it.
     private var usesRemoteHosting = false
 
-    var supportsWorktrees: Bool {
-        TerminalSettings.shared.worktreeSpacesEnabled && commonDirectory != nil
-    }
-
-    func workspaceIfLoaded(for root: String) -> TerminalWorkspace? {
-        workspaces[standardized(root)]
-    }
-
-    func allLoadedWorkspaces() -> [TerminalWorkspace] {
-        worktrees.compactMap { workspaces[$0.root] }
-    }
-
-    func contains(worktreeRoot: String) -> Bool {
-        let root = standardized(worktreeRoot)
-        return worktrees.contains { $0.root == root }
-    }
-
+    /// Reads what a device's project is there (its cherry.toml); a project
+    /// of This Mac has nothing to read.
     func refresh() async {
-        if isRemote {
-            await refreshRemoteProject()
-            return
-        }
-        guard TerminalSettings.shared.worktreeSpacesEnabled else { return }
-        isRefreshing = true
-        defer { isRefreshing = false }
-
-        do {
-            let snapshot = try await service.discover(projectRoot: repositoryRoot)
-            await apply(snapshot)
-        } catch {
-            discoveryError = error.localizedDescription
-            commonDirectory = nil
-        }
-    }
-
-    /// The worktrees git reported (their roots as this window names them).
-    private func apply(_ snapshot: GitRepositorySnapshot) async {
-        commonDirectory = snapshot.commonDirectory
-        worktrees = snapshot.worktrees
-        for worktree in snapshot.worktrees {
-            resolvedPathsByInput[worktree.root] = worktree.root
-        }
-        discoveryError = nil
-        hiddenWorktreeRoots.formIntersection(Set(snapshot.worktrees.map(\.root)))
-        persistHiddenWorktrees()
-        AgentSettings.shared.registerWorktreeRoots(
-            snapshot.worktrees.map(\.root),
-            repositoryRoot: repositoryRoot
-        )
-        if !snapshot.worktrees.contains(where: { $0.root == activeWorktreeRoot }) {
-            let fallback = snapshot.worktrees.first?.root ?? repositoryRoot
-            activate(worktreeRoot: fallback, chromeState: nil)
-        }
-        restorePendingWorktrees(droppingUndiscovered: true)
-        // Worktrees discovered now may have sessions no saved tab names.
-        scanForOrphanedSessions()
-        AgentSettings.shared.markWorktreeOpened(
-            activeWorktreeRoot,
-            repositoryRoot: repositoryRoot
-        )
-        ProjectWindowRegistry.shared.repositoryDidRefresh(self)
-        await refreshDirtyStatus()
+        guard isRemote else { return }
+        await refreshRemoteProject()
     }
 
     /// A device's project (docs/specs/remote-devices.md, phase 3): one
-    /// `cherry-host project-info` there says whether the folder exists, its
-    /// git worktrees and its cherry.toml; the other worktrees' cherry.toml
-    /// come in a second call. Worktrees are listed only with worktree
-    /// spaces on, as for This Mac's projects. Auto-start commands wait for
-    /// the first answer (`whenRemoteProjectLoaded`).
+    /// `cherry-host project-info` there says whether the folder exists and
+    /// what its cherry.toml says. Auto-start commands wait for the first
+    /// answer (`whenRemoteProjectLoaded`).
     private func refreshRemoteProject() async {
         guard let access = remoteProject, !isTearingDown else {
             finishRemoteProjectLoad()
             return
         }
-        isRefreshing = true
-        defer { isRefreshing = false }
         let rootPath = access.path(forKey: repositoryRoot)
         do {
             let report: RemoteProjectInfoReport
@@ -490,7 +342,7 @@ final class RepositoryWorkspace: ObservableObject {
             } catch RemoteProjectError.unreachable(let reason) {
                 // Offline now: read it once the device's control connects,
                 // and keep auto-start waiting for that answer.
-                remoteProjectNote = "\(access.deviceName) could not be reached (\(reason)); its commands and worktrees show once it is."
+                remoteProjectNote = "\(access.deviceName) could not be reached (\(reason)); its commands show once it is."
                 refreshRemoteProjectOnConnection()
                 return
             }
@@ -505,34 +357,9 @@ final class RepositoryWorkspace: ObservableObject {
                 notes.append("\(rootPath) is not a folder on \(access.deviceName).")
             }
             if let problem = info.cherryTomlProblem { notes.append("\(problem) on \(access.deviceName); its commands are not read.") }
-            guard TerminalSettings.shared.worktreeSpacesEnabled, let git = info.git, !isTearingDown else {
-                remoteProjectNote = notes.isEmpty ? nil : notes.joined(separator: " ")
-                commonDirectory = nil
-                return
-            }
-            let snapshot = try git.snapshot()
-            let others = snapshot.worktrees.map(\.root).filter { $0 != rootPath }
-            if !others.isEmpty, let more = try? await access.projectInfo(paths: others) {
-                for other in more.projects { remoteProjectFiles?.record(other, for: access.key(forPath: other.path)) }
-            }
-            if git.truncated { notes.append("\(access.deviceName) has more worktrees than Cherry lists.") }
             remoteProjectNote = notes.isEmpty ? nil : notes.joined(separator: " ")
-            guard !isTearingDown else { return }
-            await apply(GitRepositorySnapshot(
-                primaryRoot: worktreeKey(snapshot.primaryRoot),
-                commonDirectory: snapshot.commonDirectory,
-                worktrees: snapshot.worktrees.map { worktree in
-                    GitWorktree(
-                        root: worktreeKey(worktree.root), head: worktree.head, branch: worktree.branch,
-                        isMain: worktree.isMain, isBare: worktree.isBare, isDetached: worktree.isDetached,
-                        lockReason: worktree.lockReason, pruneReason: worktree.pruneReason
-                    )
-                }
-            ))
         } catch {
-            discoveryError = error.localizedDescription
             remoteProjectNote = error.localizedDescription
-            commonDirectory = nil
         }
     }
 
@@ -574,323 +401,8 @@ final class RepositoryWorkspace: ObservableObject {
         remoteProjectWaiters.append(action)
     }
 
-    func refreshDirtyStatus() async {
-        guard supportsWorktrees else { return }
-        let roots = worktrees.filter { !$0.isBare && !$0.isPrunable }.map(\.root)
-        // Keep the probes in one background task. A task group here can crash in
-        // Swift's TaskGroup::offer when several Git processes complete together.
-        let service = await gitService()
-        let statuses = await service.dirtyStatuses(worktreeRoots: roots.map(gitPath))
-        dirtyByRoot = Dictionary(uniqueKeysWithValues: roots.compactMap { root in
-            statuses[gitPath(root)].map { (root, $0) }
-        })
-    }
-
-    func disableWorktreeSpaces(chromeState: ProjectWindowChromeState?) {
-        discoveryError = nil
-        guard activeWorktreeRoot != repositoryRoot else { return }
-        _ = activate(worktreeRoot: repositoryRoot, chromeState: chromeState)
-    }
-
-    @discardableResult
-    func activate(
-        worktreeRoot requestedRoot: String,
-        chromeState: ProjectWindowChromeState?
-    ) -> TerminalWorkspace? {
-        let root = standardized(requestedRoot)
-        guard worktrees.contains(where: { $0.root == root }) || root == repositoryRoot else {
-            return nil
-        }
-        guard root != activeWorktreeRoot else {
-            return workspaces[root]
-        }
-
-        if let chromeState {
-            selectionByRoot[activeWorktreeRoot] = WorktreeSelectionState(chromeState: chromeState)
-        }
-        let nextWorkspace = workspace(for: root)
-        activeWorktreeRoot = root
-        restoreSavedWorktreeIfNeeded(root: root)
-        // Restored tabs of a worktree not shown attach once it is.
-        nextWorkspace.launchRestoredAdapters()
-        scheduleActiveRootPersistence(root: root)
-        if let chromeState {
-            (selectionByRoot[root] ?? .terminal).apply(to: chromeState)
-        }
-        autoStartCommandsIfNeeded(workspace: nextWorkspace, root: root)
-        ProjectWindowRegistry.shared.repositoryDidActivate(self)
-        return nextWorkspace
-    }
-
-    func activateAdjacent(offset: Int, chromeState: ProjectWindowChromeState?) {
-        guard let worktree = adjacentWorktree(offset: offset) else { return }
-        _ = activate(worktreeRoot: worktree.root, chromeState: chromeState)
-    }
-
-    func adjacentWorktree(offset: Int) -> GitWorktree? {
-        let visible = visibleWorktrees
-        guard offset != 0,
-              visible.count > 1,
-              let currentIndex = visible.firstIndex(where: { $0.root == activeWorktreeRoot })
-        else {
-            return nil
-        }
-        let nextIndex = (currentIndex + offset + visible.count) % visible.count
-        return visible[nextIndex]
-    }
-
-    @discardableResult
-    func prepareWorkspace(worktreeRoot requestedRoot: String) -> TerminalWorkspace? {
-        let root = standardized(requestedRoot)
-        guard worktrees.contains(where: { $0.root == root }) else { return nil }
-        return workspace(for: root)
-    }
-
-    func hide(_ worktree: GitWorktree, chromeState: ProjectWindowChromeState?) {
-        guard !worktree.isMain else { return }
-        if worktree.root == activeWorktreeRoot {
-            let fallback = visibleWorktrees.first { $0.root != worktree.root }
-            if let fallback {
-                _ = activate(worktreeRoot: fallback.root, chromeState: chromeState)
-            }
-        }
-        hiddenWorktreeRoots.insert(worktree.root)
-        persistHiddenWorktrees()
-    }
-
-    func show(_ worktree: GitWorktree) {
-        hiddenWorktreeRoots.remove(worktree.root)
-        persistHiddenWorktrees()
-    }
-
-    func branchReferences() async throws -> [GitBranchReference] {
-        try await gitService().branchReferences(repositoryRoot: gitPath(repositoryRoot))
-    }
-
-    func fetch() async throws {
-        try await gitService().fetch(repositoryRoot: gitPath(repositoryRoot))
-        await refresh()
-    }
-
-    /// Checks a new branch name with git (the device's for its projects).
-    func validateBranchName(_ name: String) async throws {
-        try await gitService().validateBranchName(name, repositoryRoot: gitPath(repositoryRoot))
-    }
-
-    /// Where New Worktree… puts a worktree for `branchName`:
-    /// `~/.cherry/worktrees/<repository>-<id>/<branch>` in the home of the
-    /// Mac it is on (a key for a device's project).
-    ///
-    /// A device whose home is not recorded is asked for it first (and it is
-    /// recorded); one that cannot say is refused, never guessed.
-    func managedWorktreeDestination(branchName: String) async throws -> String {
-        guard isRemote else {
-            return GitWorktreeService.managedWorktreeRoot(
-                repositoryName: repositoryName,
-                repositoryIdentity: commonDirectory ?? repositoryRoot,
-                branchName: branchName
-            )
-        }
-        guard let remoteProject else {
-            throw GitWorktreeCommandError(arguments: ["worktree", "add"], exitCode: 1, standardError: "This Mac is not among your devices.")
-        }
-        let rootPath = gitPath(repositoryRoot)
-        let home = try await remoteProject.resolveHomeDirectory()
-        let taken = Set(worktrees.map { gitPath($0.root) })
-        let path = GitWorktreeService.managedWorktreeRoot(
-            repositoryName: repositoryName,
-            repositoryIdentity: commonDirectory ?? rootPath,
-            branchName: branchName,
-            homeDirectory: home,
-            isTaken: { taken.contains($0) }
-        )
-        return worktreeKey(path)
-    }
-
-    func create(
-        _ creation: GitWorktreeCreation,
-        chromeState: ProjectWindowChromeState?
-    ) async throws {
-        let onGit: GitWorktreeCreation = switch creation {
-        case .newBranch(let name, let startPoint, let destination):
-            .newBranch(name: name, startPoint: startPoint, destination: gitPath(destination))
-        case .localBranch(let name, let destination):
-            .localBranch(name: name, destination: gitPath(destination))
-        case .remoteBranch(let remoteName, let localName, let destination):
-            .remoteBranch(remoteName: remoteName, localName: localName, destination: gitPath(destination))
-        }
-        try await gitService().create(onGit, repositoryRoot: gitPath(repositoryRoot))
-        await refresh()
-        _ = activate(worktreeRoot: creation.destination, chromeState: chromeState)
-    }
-
-    func canRename(_ worktree: GitWorktree) -> Bool {
-        !worktree.isMain
-            && !worktree.isBare
-            && !worktree.isDetached
-            && !worktree.isLocked
-            && !worktree.isPrunable
-            && worktree.branch != nil
-    }
-
-    func rename(_ worktree: GitWorktree, to requestedName: String) async throws {
-        guard canRename(worktree), let currentName = worktree.branch else {
-            throw GitWorktreeCommandError(
-                arguments: ["branch", "-m", requestedName],
-                exitCode: 1,
-                standardError: "Cherry can only rename linked worktrees on local branches."
-            )
-        }
-        let newName = requestedName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard newName != currentName else { return }
-        let service = await gitService()
-        try await service.validateBranchName(newName, repositoryRoot: gitPath(repositoryRoot))
-        try await service.renameBranch(worktreeRoot: gitPath(worktree.root), newName: newName)
-        await refresh()
-    }
-
-    func removalBlockers(for worktree: GitWorktree) async -> WorktreeRemovalBlockers {
-        // Removing the worktree ends its persistent tabs' sessions too, so
-        // their running commands, agents and busy terminals count, and so do
-        // the saved tabs of this Mac's sessions that are not tabs (yet):
-        // those a restore is still bringing back, those kept while the host
-        // could not be reached, and those set aside. A removal ends them
-        // too (`forgetWorktree`).
-        let runningProcessCount = (workspaces[worktree.root]?
-            .sessionsWithRunningProcess(endingWith: .worktreeRemoved).count ?? 0)
-            + savedRecordsNotOpen(root: worktree.root).filter(\.mayOwnLocalSession).count
-        let isDirty: Bool
-        do {
-            isDirty = try await gitService().isDirty(worktreeRoot: gitPath(worktree.root))
-        } catch {
-            isDirty = true
-        }
-        return WorktreeRemovalBlockers(
-            runningProcessCount: runningProcessCount,
-            isDirty: isDirty,
-            lockReason: worktree.lockReason,
-            pruneReason: worktree.pruneReason
-        )
-    }
-
-    func canRemove(_ worktree: GitWorktree) -> Bool {
-        !worktree.isMain
-    }
-
-    func remove(
-        _ worktree: GitWorktree,
-        force: Bool = false,
-        chromeState: ProjectWindowChromeState?
-    ) async throws {
-        guard !worktree.isMain else {
-            throw GitWorktreeCommandError(
-                arguments: ["worktree", "remove", worktree.root],
-                exitCode: 1,
-                standardError: "The primary checkout cannot be removed from Cherry."
-            )
-        }
-        let isCurrent = activeWorktreeRoot == worktree.root
-        if worktree.isPrunable {
-            guard force else {
-                throw GitWorktreeCommandError(
-                    arguments: ["worktree", "prune"],
-                    exitCode: 1,
-                    standardError: "The checkout is already missing. Prune its stale Git entry instead."
-                )
-            }
-        } else {
-            let blockers = await removalBlockers(for: worktree)
-            let closesRunningProcesses = isCurrent || force
-            guard blockers.canRemove(
-                closingRunningProcesses: closesRunningProcesses,
-                force: force
-            ) else {
-                throw GitWorktreeCommandError(
-                    arguments: ["worktree", "remove", worktree.root],
-                    exitCode: 1,
-                    standardError: Self.removalBlockerMessage(
-                        blockers,
-                        closingRunningProcesses: closesRunningProcesses
-                    )
-                )
-            }
-        }
-
-        let wasActive = isCurrent
-        let fallback = visibleWorktrees.first { $0.root != worktree.root }
-            ?? worktrees.first { $0.root != worktree.root }
-        let gitRoot = gitPath(worktrees.first(where: \.isMain)?.root ?? repositoryRoot)
-        let service = await gitService()
-        if worktree.isPrunable {
-            try await service.prune(repositoryRoot: gitRoot)
-        } else {
-            try await service.remove(
-                worktreeRoot: gitPath(worktree.root),
-                repositoryRoot: gitRoot,
-                force: force
-            )
-        }
-        forgetWorktree(worktree)
-        if wasActive, let fallback {
-            _ = activate(worktreeRoot: fallback.root, chromeState: chromeState)
-        }
-        await refresh()
-    }
-
-    func removeAllLinkedWorktrees(
-        chromeState: ProjectWindowChromeState?
-    ) async throws {
-        let targets = worktrees.filter { !$0.isMain }
-        guard !targets.isEmpty else { return }
-        let mainRoot = worktrees.first(where: \.isMain)?.root ?? repositoryRoot
-        let gitRoot = gitPath(mainRoot)
-        let service = await gitService()
-
-        if targets.contains(where: { $0.root == activeWorktreeRoot }) {
-            _ = activate(worktreeRoot: mainRoot, chromeState: chromeState)
-        }
-
-        var failures: [String] = []
-        for worktree in targets where !worktree.isPrunable {
-            do {
-                try await service.remove(
-                    worktreeRoot: gitPath(worktree.root),
-                    repositoryRoot: gitRoot,
-                    force: true
-                )
-                forgetWorktree(worktree)
-            } catch {
-                failures.append("\(worktree.displayName): \(error.localizedDescription)")
-            }
-        }
-
-        let staleWorktrees = targets.filter(\.isPrunable)
-        if !staleWorktrees.isEmpty {
-            do {
-                try await service.prune(repositoryRoot: gitRoot)
-                staleWorktrees.forEach(forgetWorktree)
-            } catch {
-                failures.append("Missing entries: \(error.localizedDescription)")
-            }
-        }
-
-        await refresh()
-        guard failures.isEmpty else {
-            throw GitWorktreeCommandError(
-                arguments: ["worktree", "remove", "--force", "--force"],
-                exitCode: 1,
-                standardError: "Some linked worktrees could not be removed:\n" + failures.joined(separator: "\n")
-            )
-        }
-    }
-
-    func prune() async throws {
-        try await gitService().prune(repositoryRoot: gitPath(repositoryRoot))
-        await refresh()
-    }
-
-    /// Closes every worktree's tabs. A teardown intent (window closed, app
-    /// quit, duplicate window) stops workspace persistence first, so the file
+    /// Closes the window's tabs. A teardown intent (window closed, app quit,
+    /// duplicate window) stops workspace persistence first, so the file
     /// keeps the tabs saved before it.
     func closeAllSessions(intent: SessionCloseIntent = .windowClosed) {
         closeAllSessions(intent: intent) { $0.closeAllSessions(intent: intent) }
@@ -903,7 +415,7 @@ final class RepositoryWorkspace: ObservableObject {
     func closeSessionsForQuit(intent: SessionCloseIntent) -> Bool {
         var stoppedNativeProgram = false
         closeAllSessions(intent: intent) { workspace in
-            stoppedNativeProgram = workspace.closeSessionsForQuit(intent: intent) || stoppedNativeProgram
+            stoppedNativeProgram = workspace.closeSessionsForQuit(intent: intent)
         }
         return stoppedNativeProgram
     }
@@ -922,9 +434,9 @@ final class RepositoryWorkspace: ObservableObject {
             isTearingDown = true
             pendingStateSaveTask?.cancel()
             pendingStateSaveTask = nil
-            restoreTasks.values.forEach { $0.cancel() }
+            restoreTask?.cancel()
             restoreWaiters.removeAll()
-            restoreRetries.removeAll()
+            restoreRetry = nil
             remoteProjectRetry = nil
             remoteProjectWaiters.removeAll()
             autoStartsWaitingForRetry.removeAll()
@@ -933,80 +445,45 @@ final class RepositoryWorkspace: ObservableObject {
             orphanScanRetry = nil
             settleInitialRestore()
         }
-        workspaces.values.forEach(close)
+        close(workspace)
         if intent.tearsDownWorkspace {
-            remoteLeaseSubscriptions.removeAll()
+            remoteLeaseSubscription = nil
             remoteLease?.release()
             remoteLease = nil
             if usesRemoteHosting {
                 usesRemoteHosting = false
                 remoteHosting?.endUse()
             }
-        }
-        if intent.tearsDownWorkspace {
-            // After the workspaces closed: restores under way end the tabs
+            // After the workspace closed: restores under way end the tabs
             // they built with the same intent, and build no more.
-            let cancellations = restoreCancellations.values.flatMap { $0 }
+            let cancellations = restoreCancellations
             restoreCancellations.removeAll()
             cancellations.forEach { $0.cancel() }
         }
     }
 
-    /// What closing every worktree's tabs for `teardown` would do
-    /// (`TerminalWorkspace.teardownSummary`), over the workspaces
-    /// `closeAllSessions` closes. A quit names each session's project; a
-    /// window close names its worktree when more than one of the window's
-    /// worktrees has tabs.
+    /// What closing the window's tabs for `teardown` would do
+    /// (`TerminalWorkspace.teardownSummary`). A quit names each session's
+    /// project.
     func teardownSummary(
         _ teardown: SessionTeardown,
         pathDisplayMode: SidebarTerminalPathDisplayMode
     ) -> SessionTeardownSummary {
-        let withTabs = workspaces.filter { !$0.value.sessions.isEmpty }
-        let order = worktrees.map(\.root)
-        let roots = withTabs.keys.sorted { lhs, rhs in
-            (order.firstIndex(of: lhs) ?? order.count, lhs) < (order.firstIndex(of: rhs) ?? order.count, rhs)
-        }
-        var summary = roots.reduce(SessionTeardownSummary()) { summary, root in
-            guard let workspace = withTabs[root] else { return summary }
-            let worktreeName = worktrees.first { $0.root == root }?.displayName
-                ?? URL(fileURLWithPath: root).lastPathComponent
+        var summary = SessionTeardownSummary()
+        if !workspace.sessions.isEmpty {
             let place: String? = switch teardown {
             case .quit: repositoryName
-            case .windowClose: withTabs.count > 1 ? worktreeName : nil
+            case .windowClose: nil
             }
-            return summary + workspace.teardownSummary(teardown, place: place, pathDisplayMode: pathDisplayMode)
+            summary = summary + workspace.teardownSummary(teardown, place: place, pathDisplayMode: pathDisplayMode)
         }
         summary.savedSessionsNotOpen = savedRecordsWhoseSessionsEndWithTheWindow().count
         return summary
     }
 
-    func root(containing sessionID: UUID) -> String? {
-        workspaces.first { _, workspace in
-            workspace.sessions.contains { $0.id == sessionID }
-        }?.key
-    }
-
-    private func workspace(for root: String) -> TerminalWorkspace {
-        if let existing = workspaces[root] {
-            return existing
-        }
-        // Worktree spaces start empty: eagerly spawning a shell here builds a
-        // ghostty surface synchronously (~350ms+ measured), which lands on the
-        // first tick of a swipe gesture via `prepareWorkspace`. The user opens
-        // terminals explicitly; loaded workspaces then stay in memory.
-        let workspace = TerminalWorkspace(
-            projectRoot: root,
-            createInitialSession: false,
-            backendPolicy: backendPolicy
-        )
-        workspace.restoredTabLaunchQueue = restoredTabLaunchQueue
-        workspace.windowGrid = windowGrid
-        workspaces[root] = workspace
-        loadedWorktreeRoots.insert(root)
-        closeTabsAfterCleanExit(in: workspace)
-        observePersistentState(of: workspace)
-        observeRemoteTabs(of: workspace)
-        return workspace
+    /// Whether one of the window's tabs is the tab `sessionID`.
+    func contains(sessionID: UUID) -> Bool {
+        workspace.sessions.contains { $0.id == sessionID }
     }
 
     /// A terminal tab whose shell exited cleanly closes as ⌘W closes it: on
@@ -1014,57 +491,28 @@ final class RepositoryWorkspace: ObservableObject {
     /// this repository's chrome state belongs to (the window that claimed
     /// the project, in the registry it registered with), never another
     /// window of the same project.
-    private func closeTabsAfterCleanExit(in workspace: TerminalWorkspace) {
+    private func closeTabsAfterCleanExit() {
         workspace.closeTabAfterCleanExit = { [weak self] workspace, session in
             guard let self, !self.isTearingDown else { return }
             let chromeState = self.chromeState
             SessionCloseCoordinator.closeTabAfterCleanExit(
                 session,
                 in: workspace,
-                repository: self,
                 chromeState: chromeState,
                 window: chromeState.flatMap { self.windowRegistry?.window(for: $0) }
             )
         }
     }
 
-    /// Starts the initial worktree's auto-start commands once its saved tabs
-    /// are restored, skipping commands a restored tab already runs.
+    /// Starts the project's auto-start commands once its saved tabs are
+    /// restored, skipping commands a restored tab already runs.
     func autoStartInitialCommandsIfNeeded() {
-        let root = initialWorktreeRoot
-        guard autoStartedRoots.insert(root).inserted else { return }
-        whenRestored(root: root) { [weak self] in
+        guard !didAutoStart else { return }
+        didAutoStart = true
+        whenRestored { [weak self] in
             // A device's commands are known once its cherry.toml was read.
             self?.whenRemoteProjectLoaded { [weak self] in
-                guard let self, let workspace = self.workspaces[root] else { return }
-                self.startAutoStartCommands(in: workspace, root: workspace.projectRoot ?? root, worktreeRoot: root)
-            }
-        }
-    }
-
-    private func autoStartCommandsIfNeeded(workspace: TerminalWorkspace, root: String) {
-        guard !autoStartedRoots.contains(root) else { return }
-        pendingAutoStartTask?.cancel()
-        // Process/session construction is main-actor work. Wait briefly for rapid
-        // workspace navigation to settle so passing over a workspace does not
-        // launch all of its commands on the switching path.
-        pendingAutoStartTask = Task { @MainActor [weak self, weak workspace] in
-            try? await Task.sleep(for: .milliseconds(150))
-            guard let self,
-                  let workspace,
-                  !Task.isCancelled,
-                  self.activeWorktreeRoot == root,
-                  self.workspaces[root] === workspace,
-                  self.autoStartedRoots.insert(root).inserted
-            else {
-                return
-            }
-            self.pendingAutoStartTask = nil
-            self.whenRestored(root: root) { [weak self, weak workspace] in
-                self?.whenRemoteProjectLoaded { [weak self, weak workspace] in
-                    guard let self, let workspace, self.workspaces[root] === workspace else { return }
-                    self.startAutoStartCommands(in: workspace, root: root)
-                }
+                self?.startAutoStartCommands()
             }
         }
     }
@@ -1077,21 +525,14 @@ final class RepositoryWorkspace: ObservableObject {
     /// late), or was kept because its host could not be reached, waits for
     /// that tab to come back during this run (`startAutoStartsNoLongerWaiting`)
     /// instead of starting a second copy beside the one that may still run.
-    /// `worktreeRoot`: the worktree's key when `root` (its project root)
-    /// is spelled differently.
-    private func startAutoStartCommands(
-        in workspace: TerminalWorkspace,
-        root: String,
-        worktreeRoot: String? = nil,
-        commands: [ProjectCommandDefinition]? = nil
-    ) {
+    private func startAutoStartCommands(_ commands: [ProjectCommandDefinition]? = nil) {
         guard !isTearingDown else { return }
-        let key = worktreeRoot ?? root
-        let waitingNames = commandNamesAutoStartWaitsFor(root: key)
+        let root = workspace.projectRoot ?? workspaceRoot
+        let waitingNames = commandNamesAutoStartWaitsFor()
         for command in commands ?? autoStartCommands(root) {
             if waitingNames.contains(AgentToolDefinition.normalizedName(command.name)),
                workspace.commandSession(named: command.name) == nil {
-                autoStartsWaitingForRetry[key, default: []].append(command)
+                autoStartsWaitingForRetry.append(command)
                 continue
             }
             let session = workspace.addCommandSession(command: command, projectRoot: root, select: false)
@@ -1101,51 +542,11 @@ final class RepositoryWorkspace: ObservableObject {
         }
     }
 
-    private func scheduleActiveRootPersistence(root: String) {
-        activeRootPersistenceTask?.cancel()
-        activeRootPersistenceTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(250))
-            guard let self,
-                  !Task.isCancelled,
-                  self.activeWorktreeRoot == root
-            else {
-                return
-            }
-            AgentSettings.shared.markWorktreeOpened(root, repositoryRoot: self.repositoryRoot)
-            self.activeRootPersistenceTask = nil
-        }
-    }
-
-    private func persistHiddenWorktrees() {
-        AgentSettings.shared.setHiddenWorktreeRoots(hiddenWorktreeRoots, for: repositoryRoot)
-    }
-
-    private func forgetWorktree(_ worktree: GitWorktree) {
-        if let workspace = workspaces.removeValue(forKey: worktree.root) {
-            persistenceSubscriptions.removeValue(forKey: ObjectIdentifier(workspace))
-            workspace.setCommandNamesBeingRestored([])
-            workspace.closeAllSessions(intent: .worktreeRemoved)
-        }
-        restoreTasks.removeValue(forKey: worktree.root)?.cancel()
-        restoreTaskRecordIDs.removeValue(forKey: worktree.root)
-        // Its saved tabs that are not tabs (not restored yet, kept while the
-        // host was unreachable, set aside) end like its tabs did, instead of
-        // running on with no record.
-        forgetSavedRecords(root: worktree.root)
-        selectionsAwaitingRestore.removeValue(forKey: worktree.root)
-        autoStartsWaitingForRetry.removeValue(forKey: worktree.root)
-        loadedWorktreeRoots.remove(worktree.root)
-        hiddenWorktreeRoots.remove(worktree.root)
-        selectionByRoot.removeValue(forKey: worktree.root)
-        autoStartedRoots.remove(worktree.root)
-        scheduleStateSave()
-    }
-
     // MARK: Workspace persistence
 
     /// Called once the window owns this project (never for a duplicate
     /// window): restores saved tabs and starts saving. `chromeState` supplies
-    /// the active worktree's collapsed agent groups.
+    /// the collapsed agent groups.
     func beginRestoringSavedStateIfNeeded(chromeState: ProjectWindowChromeState?) {
         if let chromeState, self.chromeState !== chromeState {
             self.chromeState = chromeState
@@ -1155,20 +556,20 @@ final class RepositoryWorkspace: ObservableObject {
         }
         guard !didBeginRestore, !isTearingDown else { return }
         didBeginRestore = true
-        restorePendingWorktrees(droppingUndiscovered: false)
+        restoreSavedTabsIfNeeded()
         scanForOrphanedSessions()
-        // Sessions of tabs forgotten with their worktree that an earlier
-        // run could not end before it quit (once per run).
+        // Sessions of saved tabs that an earlier run could not end before
+        // it quit (once per run).
         if let stateStore, let localSessions = backendPolicy.localSessions {
             localSessions.resumeEndingSessions(recordedIn: stateStore)
         }
     }
 
-    /// Saved tabs of `root` that are not open tabs: not restored yet, still
-    /// being restored, kept for later or set aside.
-    private func savedRecordsNotOpen(root: String) -> [WorkspaceSessionRecord] {
+    /// Saved tabs that are not open tabs: not restored yet, still being
+    /// restored, kept for later or set aside.
+    private func savedRecordsNotOpen() -> [WorkspaceSessionRecord] {
         var seen = Set<UUID>()
-        return ((pendingWorktreeRecords[root]?.sessions ?? []) + (keptWorktreeRecords[root]?.sessions ?? []))
+        return ((pendingRecord?.sessions ?? []) + (keptRecord?.sessions ?? []))
             .filter { seen.insert($0.id).inserted }
     }
 
@@ -1179,17 +580,13 @@ final class RepositoryWorkspace: ObservableObject {
     /// sessions run unseen until the next launch.
     func savedRecordsAwaitingRestore() -> [WorkspaceSessionRecord] {
         guard !isTearingDown else { return [] }
-        let roots = Set(pendingWorktreeRecords.keys).union(keptWorktreeRecords.keys)
-        return roots.sorted().flatMap { root in
-            let setAside = setAsideRecordIDs[root] ?? []
-            return savedRecordsNotOpen(root: root).filter { !setAside.contains($0.id) }
-        }
+        return savedRecordsNotOpen().filter { !setAsideRecordIDs.contains($0.id) }
     }
 
     /// Whether a restore (or a late host's part of one) or a look for
     /// orphaned sessions is under way.
     var isRestoringSessions: Bool {
-        !restoreTasks.isEmpty || !restoreRemainders.isEmpty || orphanScanTask != nil
+        restoreTask != nil || !restoreRemainders.isEmpty || orphanScanTask != nil
     }
 
     /// Waits until no restore or look for orphaned sessions is under way, or
@@ -1202,33 +599,26 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     /// Shows a session of this app that no open tab shows (Background
-    /// Sessions → Open) in `worktreeRoot`'s workspace, or else the active
-    /// one, and selects its tab:
+    /// Sessions → Open) in the window, and selects its tab:
     /// - the tab of this window that owns it already (its window's restore
     ///   brought it back);
     /// - a session this window may own (`canAdopt`) becomes its tab, with
     ///   the kind, agent, command and tab id its tags name, the way an
-    ///   orphaned session is adopted: when a tab of that workspace runs the
+    ///   orphaned session is adopted: when a tab of the window runs the
     ///   same command, it is set aside (saved, still running) and that
     ///   command's tab is shown instead;
     /// - any other session (another client shows it) is attached.
     @discardableResult
     func showBackgroundSession(
         _ launch: PersistentSessionLaunch,
-        worktreeRoot: String?,
         hosting: PersistentLocalSessions
     ) -> TerminalSession? {
-        guard !isTearingDown else { return nil }
+        guard !isTearingDown, !workspace.isTornDown else { return nil }
         let info = launch.info
-        if let owner = hosting.owningTab(of: info.id), let root = root(containing: owner.id),
-           let workspace = workspaces[root] {
+        if let owner = hosting.owningTab(of: info.id), contains(sessionID: owner.id) {
             workspace.select(owner)
             return owner
         }
-        let workspace = worktreeRoot.flatMap { prepareWorkspace(worktreeRoot: $0) } ?? activeWorkspace
-        guard !workspace.isTornDown,
-              let root = workspaces.first(where: { $0.value === workspace })?.key
-        else { return nil }
         guard hosting.canAdopt(info) else {
             return workspace.attachHostedSession(launch.attachment, info: info)
         }
@@ -1241,11 +631,9 @@ final class RepositoryWorkspace: ObservableObject {
         )
         let tab = workspace.makeRestoredPersistentSession(launch, record: record, hosting: hosting, deferringLaunch: true)
         applyRestoreStep(
-            root: root,
             asked: [],
             result: WorkspaceRestoreResult(sessions: [tab]),
-            layout: WorktreeStateRecord(root: root, sessions: [record]),
-            workspace: workspace,
+            layout: WorktreeStateRecord(root: workspaceRoot, sessions: [record]),
             step: .orphans
         )
         let shown = workspace.session(withID: tab.id).flatMap { $0 === tab ? $0 : nil }
@@ -1254,35 +642,14 @@ final class RepositoryWorkspace: ObservableObject {
         return shown
     }
 
-    /// Forgets `root`'s saved tabs that are not open (its worktree was
-    /// removed or no longer exists), ending the sessions of This Mac they
-    /// own, and stops the restores still under way for it. Those tabs are
-    /// recorded as sessions to end (`SessionsToEndRecord`) before the next
-    /// save drops them, so a session this run cannot end (the host stays
-    /// unreachable, the app quits first) is ended at the next launch.
-    private func forgetSavedRecords(root: String) {
-        let forgotten = savedRecordsNotOpen(root: root)
-        forgottenRecordIDs.formUnion(forgotten.map(\.id))
-        restoreCancellations.removeValue(forKey: root)?.forEach { $0.cancel() }
-        dropPendingWorktreeRecord(root: root)
-        keptWorktreeRecords.removeValue(forKey: root)
-        inFlightRecordIDs.removeValue(forKey: root)
-        setAsideRecordIDs.removeValue(forKey: root)
-        restoreRetries.removeValue(forKey: root)
-        if !forgotten.isEmpty {
-            backendPolicy.localSessions?.endSessions(ofForgottenTabs: forgotten, recordedIn: stateStore)
-        }
-    }
-
     /// A window close or quit that ends sessions (End Sessions, or
     /// Settings › Sessions) also ends the sessions of this window's saved
     /// tabs that no open tab shows: still being restored, kept while their
-    /// host was unavailable, set aside, or in worktrees not restored yet.
-    /// Only sessions this app created for those tabs, as when their
-    /// worktree is removed; they are recorded as sessions to end, so what
-    /// this run cannot end (it quits first) is ended at the next launch.
-    /// The saved tabs themselves stay: the next restore drops them once
-    /// their sessions are gone.
+    /// host was unavailable, set aside, or not restored yet. Only sessions
+    /// this app created for those tabs; they are recorded as sessions to
+    /// end, so what this run cannot end (it quits first) is ended at the
+    /// next launch. The saved tabs themselves stay: the next restore drops
+    /// them once their sessions are gone.
     private func endSavedSessionsNotOpen() {
         let records = savedRecordsWhoseSessionsEndWithTheWindow()
         guard let localSessions = backendPolicy.localSessions, !records.isEmpty else { return }
@@ -1299,7 +666,7 @@ final class RepositoryWorkspace: ObservableObject {
         guard !isTearingDown else { return [] }
         // Open persistent tabs of any host (a device's too): recorded by
         // host identity, so This Mac's and each device's stay apart.
-        let open = workspaces.values.flatMap(\.sessions).compactMap { tab -> (hostID: String, sessionID: String)? in
+        let open = workspace.sessions.compactMap { tab -> (hostID: String, sessionID: String)? in
             guard tab.isPersistentLocalSession, let binding = tab.persistentSession else { return nil }
             return (binding.hostID, binding.sessionID)
         }
@@ -1313,27 +680,21 @@ final class RepositoryWorkspace: ObservableObject {
     /// (`endSavedSessionsNotOpen`).
     private func savedRecordsWhoseSessionsEndWithTheWindow() -> [WorkspaceSessionRecord] {
         guard let hosting = backendPolicy.localSessions, backendPolicy.hostedLocalTabsFollowSettings else { return [] }
-        let roots = Set(pendingWorktreeRecords.keys).union(keptWorktreeRecords.keys)
         let host = hosting.profile.host
-        return roots.sorted().flatMap(savedRecordsNotOpen(root:)).filter { $0.mayOwnSession(on: host) }
+        return savedRecordsNotOpen().filter { $0.mayOwnSession(on: host) }
     }
 
     // MARK: Orphaned sessions
 
-    /// The worktrees this window knows now.
-    private var knownWorktreeRoots: Set<String> {
-        Set(worktrees.map(\.root)).union([activeWorktreeRoot, initialWorktreeRoot])
-    }
-
-    /// Looks, once per worktree, for this app's sessions no saved tab names
+    /// Looks once for this app's sessions no saved tab names
     /// (`OrphanedSessionCriteria`: a tab whose record was never saved
     /// because the app crashed right after opening it, or whose record was
-    /// lost) and adopts them as tabs of the worktree they were started in,
-    /// after the tabs open there. Only when local tabs run as persistent
-    /// sessions and this copy of the app owns them; when the host cannot be
-    /// listed, again once it can.
+    /// lost) that were started in this project, and adopts them as tabs
+    /// after the tabs open. Only when local tabs run as persistent sessions
+    /// and this copy of the app owns them; when the host cannot be listed,
+    /// again once it can.
     private func scanForOrphanedSessions() {
-        guard didBeginRestore, !isTearingDown, orphanScanTask == nil, orphanScanRetry == nil,
+        guard didBeginRestore, !isTearingDown, !didScanForOrphans, orphanScanTask == nil, orphanScanRetry == nil,
               let criteria = orphanCriteria,
               let localSessions = backendPolicy.localSessions,
               // Only This Mac's: the criteria compare sessions' creation
@@ -1344,8 +705,6 @@ final class RepositoryWorkspace: ObservableObject {
               backendPolicy.prefersPersistentLocalSessions,
               localSessions.installationProblem() == nil
         else { return }
-        let roots = knownWorktreeRoots.subtracting(orphanScannedRoots)
-        guard !roots.isEmpty else { return }
         let generation = localSessions.connectionGeneration
         orphanScanTask = Task { @MainActor [weak self] in
             let list = try? await localSessions.completeList()
@@ -1362,7 +721,7 @@ final class RepositoryWorkspace: ObservableObject {
                     }
                 return
             }
-            adoptOrphanedSessions(in: list, roots: roots, criteria: criteria, localSessions: localSessions)
+            adoptOrphanedSessions(in: list, criteria: criteria, localSessions: localSessions)
             if list.awaitsHolders {
                 // A restarted daemon lists a session only once its holder
                 // registered: look again once none is expected.
@@ -1374,36 +733,29 @@ final class RepositoryWorkspace: ObservableObject {
                             self?.scanForOrphanedSessions()
                         }
                     }
-                return
             }
-            // Worktrees discovered while it listed.
-            scanForOrphanedSessions()
         }
     }
 
     private func adoptOrphanedSessions(
         in list: HostedSessionList,
-        roots: Set<String>,
         criteria: OrphanedSessionCriteria,
         localSessions: PersistentLocalSessions
     ) {
         // Scanned for good only from a list that is complete.
-        if !list.awaitsHolders { orphanScannedRoots.formUnion(roots) }
-        // A worktree removed while the host was listed is not brought back.
-        let roots = roots.intersection(knownWorktreeRoots)
-        var found: [String: [(info: HostedSessionInfo, record: WorkspaceSessionRecord)]] = [:]
+        if !list.awaitsHolders { didScanForOrphans = true }
+        var orphans: [(info: HostedSessionInfo, record: WorkspaceSessionRecord)] = []
         for info in list.sessions {
             guard let tabID = criteria.orphanTabID(of: info),
-                  !forgottenRecordIDs.contains(tabID),
                   localSessions.owningTab(of: info.id) == nil,
                   !localSessions.isEnding(info.id),
                   !localSessions.isScheduledToEnd(info, hostID: list.hostID),
                   !localSessions.hasOpenTab(withID: tabID),
                   !OpenHostedTabs.shared.hasOpenTab(withID: tabID),
                   let project = OrphanedSessionCriteria.projectRoot(of: info),
-                  let root = Self.worktreeRoot(forProjectRoot: project, among: roots)
+                  names(project)
             else { continue }
-            found[root, default: []].append((info, OrphanedSessionCriteria.record(
+            orphans.append((info, OrphanedSessionCriteria.record(
                 for: info, tabID: tabID, hostID: list.hostID, host: localSessions.profile.host
             )))
         }
@@ -1411,58 +763,44 @@ final class RepositoryWorkspace: ObservableObject {
         if backendPolicy.settings().closeTabsOnCleanExit {
             // A terminal whose shell exited with status 0 would have closed
             // its tab: its ended session is removed instead of adopted.
-            for (root, orphans) in found {
-                let ended = orphans.filter { $0.record.kind == .terminal && PersistentLocalSessions.endedCleanly($0.info) }
-                guard !ended.isEmpty else { continue }
-                ended.forEach { localSessions.end(listing.attachment($0.info)) }
-                let others = orphans.filter { orphan in !ended.contains { $0.info.id == orphan.info.id } }
-                found[root] = others.isEmpty ? nil : others
-            }
+            let ended = orphans.filter { $0.record.kind == .terminal && PersistentLocalSessions.endedCleanly($0.info) }
+            ended.forEach { localSessions.end(listing.attachment($0.info)) }
+            orphans.removeAll { orphan in ended.contains { $0.info.id == orphan.info.id } }
         }
-        for root in found.keys.sorted() {
-            guard let orphans = found[root] else { continue }
-            let workspace = workspace(for: root)
-            guard !workspace.isTornDown else { continue }
-            let tabs = orphans.map { orphan in
-                workspace.makeRestoredPersistentSession(
-                    PersistentSessionLaunch(attachment: listing.attachment(orphan.info), info: orphan.info),
-                    record: orphan.record,
-                    hosting: localSessions,
-                    deferringLaunch: true
-                )
-            }
-            fputs("Cherry: \(tabs.count) session(s) of this app that no saved tab named came back as tabs of \(root)\n", stderr)
-            applyRestoreStep(
-                root: root,
-                asked: [],
-                result: WorkspaceRestoreResult(sessions: tabs),
-                layout: WorktreeStateRecord(root: root, sessions: orphans.map(\.record)),
-                workspace: workspace,
-                step: .orphans
+        guard !orphans.isEmpty, !workspace.isTornDown else { return }
+        let tabs = orphans.map { orphan in
+            workspace.makeRestoredPersistentSession(
+                PersistentSessionLaunch(attachment: listing.attachment(orphan.info), info: orphan.info),
+                record: orphan.record,
+                hosting: localSessions,
+                deferringLaunch: true
             )
         }
+        fputs("Cherry: \(tabs.count) session(s) of this app that no saved tab named came back as tabs of \(workspaceRoot)\n", stderr)
+        applyRestoreStep(
+            asked: [],
+            result: WorkspaceRestoreResult(sessions: tabs),
+            layout: WorktreeStateRecord(root: workspaceRoot, sessions: orphans.map(\.record)),
+            step: .orphans
+        )
     }
 
-    /// The worktree among `roots` a tab's project root names.
-    private static func worktreeRoot(forProjectRoot project: String, among roots: Set<String>) -> String? {
+    /// Whether a tab's project root names this window's folder.
+    private func names(_ project: String) -> Bool {
         // A device's session names its project by key.
         if ProjectLocation.isRemoteKey(project) {
-            let key = ProjectLocation(key: project).key
-            return roots.contains(key) ? key : nil
+            return ProjectLocation(key: project).key == workspaceRoot
         }
         let standardized = URL(fileURLWithPath: project, isDirectory: true).standardizedFileURL.path
-        for candidate in [project, standardized, resolvedPath(standardized)] where roots.contains(candidate) {
-            return candidate
-        }
-        return nil
+        return [project, standardized, Self.resolvedPath(standardized)].contains(workspaceRoot)
     }
 
     /// Waits for every restore that has started, their remainders included.
     func waitForPendingRestores() async {
         while true {
-            if let task = restoreTasks.values.first {
+            if let task = restoreTask {
                 await task.value
-            } else if let task = restoreRemainders.values.lazy.flatMap(\.values).first {
+            } else if let task = restoreRemainders.values.first {
                 await task.value
             } else {
                 return
@@ -1478,33 +816,32 @@ final class RepositoryWorkspace: ObservableObject {
         saveState(synchronously: true)
     }
 
-    /// The saved form of every worktree: restored or live workspaces with the
-    /// tabs their restore kept for later, plus saved worktrees whose restore
-    /// has not finished, unchanged.
+    /// The saved form of the window's tabs: the live workspace with the
+    /// tabs its restore kept for later, or the saved tabs unchanged while
+    /// their restore has not finished.
     func makeStateRecord() -> RepositoryStateRecord {
         let now = Date()
-        var records = pendingWorktreeRecords
-        for (root, workspace) in workspaces
-        where records[root] == nil && !workspace.isTornDown && !workspace.sessions.isEmpty {
-            var record = workspace.makeStateRecord(
-                root: root,
-                collapsedAgentGroupIDs: collapsedAgentGroupIDs(for: root)
+        var record = pendingRecord
+        if record == nil, !workspace.isTornDown, !workspace.sessions.isEmpty {
+            var live = workspace.makeStateRecord(
+                root: workspaceRoot,
+                collapsedAgentGroupIDs: chromeState?.collapsedAgentGroupIDs ?? collapsedAgentGroupIDsWithoutChrome
             )
             // Open tabs: saved now. Kept ones below keep their time.
-            record.sessions = record.sessions.map { session in
+            live.sessions = live.sessions.map { session in
                 var session = session
                 session.savedAt = now
                 return session
             }
-            records[root] = record
+            record = live
         }
-        for (root, kept) in keptWorktreeRecords where pendingWorktreeRecords[root] == nil {
-            records[root] = records[root]?.merging(kept: kept) ?? kept
+        if pendingRecord == nil, let keptRecord {
+            record = record?.merging(kept: keptRecord) ?? keptRecord
         }
         return RepositoryStateRecord(
             repositoryRoot: repositoryRoot,
-            activeWorktreeRoot: activeWorktreeRoot,
-            worktrees: records.keys.sorted().compactMap { records[$0] },
+            activeWorktreeRoot: workspaceRoot,
+            worktrees: record.map { [$0] } ?? [],
             savedAt: now
         )
     }
@@ -1515,10 +852,10 @@ final class RepositoryWorkspace: ObservableObject {
         stateStore != nil
             && didBeginRestore
             && !isTearingDown
-            && !workspaces.values.contains(where: \.isTornDown)
+            && !workspace.isTornDown
     }
 
-    private func observePersistentState(of workspace: TerminalWorkspace) {
+    private func observePersistentState() {
         guard stateStore != nil else { return }
         // A new persistent tab is saved at once, not after the usual delay:
         // its session is being created now, and a record saved later would
@@ -1548,7 +885,7 @@ final class RepositoryWorkspace: ObservableObject {
                 guard let self, let workspace, !workspace.isTornDown else { return }
                 self.scheduleStateSave()
             }
-        persistenceSubscriptions[ObjectIdentifier(workspace)] = AnyCancellable {
+        persistenceSubscription = AnyCancellable {
             addedTabs.cancel()
             debounced.cancel()
         }
@@ -1583,43 +920,15 @@ final class RepositoryWorkspace: ObservableObject {
         }
     }
 
-    private func collapsedAgentGroupIDs(for root: String) -> Set<UUID> {
-        if root == activeWorktreeRoot, let chromeState {
-            return chromeState.collapsedAgentGroupIDs
-        }
-        return selectionByRoot[root]?.collapsedAgentGroupIDs ?? []
-    }
-
-    /// Restores the saved worktrees the window knows: the active one, and
-    /// every discovered one. After a discovery, the saved tabs of a worktree
-    /// that no longer exists are forgotten, and the sessions of This Mac
-    /// they own are ended (as removing it in Cherry would have).
-    private func restorePendingWorktrees(droppingUndiscovered: Bool) {
-        guard didBeginRestore, !isTearingDown else { return }
-        let knownRoots = Set(worktrees.map(\.root)).union([activeWorktreeRoot])
-        for root in pendingWorktreeRecords.keys.sorted() where knownRoots.contains(root) {
-            restoreSavedWorktreeIfNeeded(root: root)
-        }
-        if droppingUndiscovered {
-            let vanished = Set(pendingWorktreeRecords.keys).union(keptWorktreeRecords.keys).subtracting(knownRoots)
-            for root in vanished.sorted() where restoreTasks[root] == nil {
-                forgetSavedRecords(root: root)
-            }
-            inFlightRecordIDs = inFlightRecordIDs.filter { knownRoots.contains($0.key) || restoreTasks[$0.key] != nil }
-            setAsideRecordIDs = setAsideRecordIDs.filter { knownRoots.contains($0.key) || restoreTasks[$0.key] != nil }
-            restoreRetries = restoreRetries.filter { knownRoots.contains($0.key) || restoreTasks[$0.key] != nil }
-        }
-    }
-
-    private func restoreSavedWorktreeIfNeeded(root: String) {
+    private func restoreSavedTabsIfNeeded() {
         guard didBeginRestore,
               !isTearingDown,
-              restoreTasks[root] == nil,
-              let record = pendingWorktreeRecords[root]
+              restoreTask == nil,
+              let record = pendingRecord
         else {
             return
         }
-        let workspace = workspace(for: root)
+        let workspace = workspace
         // A local tab saved before its session's Create answered has no
         // binding; the local host may still run its session (tagged with
         // its tab id). Only asked when local tabs run as sessions.
@@ -1628,7 +937,6 @@ final class RepositoryWorkspace: ObservableObject {
         // settings.
         let request = WorkspaceRestoreRequest(
             repositoryRoot: repositoryRoot,
-            worktreeRoot: root,
             records: record.sessions.filter(\.isRestorable),
             workspace: workspace,
             unboundRecords: record.sessions.filter { !$0.isRestorable && (mayAdoptUnbound || $0.systemEnd != nil) },
@@ -1636,19 +944,17 @@ final class RepositoryWorkspace: ObservableObject {
         )
         let asked = Set((request.records + request.unboundRecords).map(\.id))
         let restorer = sessionRestorer
-        restoreCancellations[root, default: []].append(request.cancellation)
-        restoreTaskRecordIDs[root] = asked
-        let name = URL(fileURLWithPath: root).lastPathComponent
+        restoreCancellations.append(request.cancellation)
+        restoreTaskRecordIDs = asked
+        let name = URL(fileURLWithPath: workspaceRoot).lastPathComponent
         LaunchTimeline.mark("restore began \(name) records=\(asked.count)")
-        let showsBeforeHostAnswers = showsSavedTabsBeforeHostAnswers && root == initialWorktreeRoot
-        restoreTasks[root] = Task { @MainActor [weak self] in
+        let showsBeforeHostAnswers = showsSavedTabsBeforeHostAnswers
+        restoreTask = Task { @MainActor [weak self] in
             var request = request
             if showsBeforeHostAnswers, let self, !request.cancellation.isCancelled {
                 // On this turn, not in the SwiftUI update that registered
                 // the window.
-                request.optimisticTabs = self.showOptimisticTabs(
-                    root: root, record: record, records: request.records, workspace: workspace
-                )
+                request.optimisticTabs = self.showOptimisticTabs(record: record, records: request.records)
             }
             let result = await restorer(request)
             LaunchTimeline.mark("restore answered \(name) tabs=\(result.sessions.count) pending=\(result.pendingRecordIDs.count)")
@@ -1656,47 +962,43 @@ final class RepositoryWorkspace: ObservableObject {
                 WorkspaceRestoreResult.discard(result, in: workspace)
                 return
             }
-            self.finishRestoring(root: root, record: record, asked: asked, workspace: workspace, result: result)
+            self.finishRestoring(record: record, asked: asked, result: result)
         }
-        updateCommandsBeingRestored(root: root)
+        updateCommandsBeingRestored()
     }
 
     private func finishRestoring(
-        root: String,
         record: WorktreeStateRecord,
         asked: Set<UUID>,
-        workspace: TerminalWorkspace,
         result: WorkspaceRestoreResult
     ) {
-        restoreTasks[root] = nil
-        restoreTaskRecordIDs[root] = nil
+        restoreTask = nil
+        restoreTaskRecordIDs = []
         // Whatever happens next, the window waits for nothing more.
-        defer { if root == initialWorktreeRoot { settleInitialRestore() } }
-        guard !isTearingDown, workspaces[root] === workspace else {
-            // The window closed, the app quit or the worktree was removed
-            // meanwhile: end these tabs the way that close ended the others.
+        defer { settleInitialRestore() }
+        guard !isTearingDown else {
+            // The window closed or the app quit meanwhile: end these tabs
+            // the way that close ended the others.
             WorkspaceRestoreResult.discard(result, in: workspace)
             return
         }
-        pendingWorktreeRecords[root] = nil
+        pendingRecord = nil
         // Every record asked for stays saved until the restore answers for it.
-        keptWorktreeRecords[root] = record.restricted(to: asked)
-        applyRestoreStep(root: root, asked: asked, result: result, layout: record, workspace: workspace, step: .initial)
+        keptRecord = record.restricted(to: asked)
+        applyRestoreStep(asked: asked, result: result, layout: record, step: .initial)
     }
 
-    /// Shows, before This Mac's host answers, the saved persistent tabs of
-    /// `root` whose sessions probably still run (`OptimisticRestore`), with
-    /// the saved layout and selection: the window comes on screen with
-    /// them, and the selected one's adapter starts attaching at once. The
-    /// restore then confirms each tab (the host lists its session as the
-    /// record's) or withdraws it (`reconcileOptimisticTabs`).
+    /// Shows, before This Mac's host answers, the saved persistent tabs
+    /// whose sessions probably still run (`OptimisticRestore`), with the
+    /// saved layout and selection: the window comes on screen with them,
+    /// and the selected one's adapter starts attaching at once. The restore
+    /// then confirms each tab (the host lists its session as the record's)
+    /// or withdraws it (`reconcileOptimisticTabs`).
     private func showOptimisticTabs(
-        root: String,
         record: WorktreeStateRecord,
-        records: [WorkspaceSessionRecord],
-        workspace: TerminalWorkspace
+        records: [WorkspaceSessionRecord]
     ) -> [UUID: TerminalSession] {
-        guard !isTearingDown, workspaces[root] === workspace,
+        guard !isTearingDown,
               let localSessions = backendPolicy.localSessions, let systemEnds,
               localSessions.profile.isThisMac, localSessions.installationProblem() == nil
         else { return [:] }
@@ -1721,24 +1023,20 @@ final class RepositoryWorkspace: ObservableObject {
             built.append(tab)
         }
         guard !built.isEmpty else { return [:] }
-        workspace.restoreSessions(
-            built, from: record, selectingSavedTab: true, addingAfterOpenTabs: false,
-            launchingAdapters: root == activeWorktreeRoot
-        )
+        workspace.restoreSessions(built, from: record, selectingSavedTab: true, addingAfterOpenTabs: false)
         let shown = built.filter { tab in tab.isProvisionalRestore && workspace.sessions.contains { $0 === tab } }
         guard !shown.isEmpty else { return [:] }
-        optimisticSelections[root] = SelectionMark(selection: workspace.selectedSessionID)
-        let name = URL(fileURLWithPath: root).lastPathComponent
+        optimisticSelection = SelectionMark(selection: workspace.selectedSessionID)
+        let name = URL(fileURLWithPath: workspaceRoot).lastPathComponent
         LaunchTimeline.mark("restore shown before the host answered \(name) tabs=\(shown.count)")
         // The window shows once its saved selection is among them (else it
         // waits for the answer, as before).
-        if root == initialWorktreeRoot,
-           record.selectedSessionID.map({ id in shown.contains { $0.id == id } }) ?? true {
+        if record.selectedSessionID.map({ id in shown.contains { $0.id == id } }) ?? true {
             settleInitialRestore()
         }
         let tabs = Dictionary(shown.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        optimisticTabs[root] = tabs
-        workspace.awaitsRestoreDecision = { [weak self] id in self?.optimisticTabs[root]?[id] != nil }
+        optimisticTabs = tabs
+        workspace.awaitsRestoreDecision = { [weak self] id in self?.optimisticTabs[id] != nil }
         return tabs
     }
 
@@ -1758,21 +1056,19 @@ final class RepositoryWorkspace: ObservableObject {
     /// Also whether the step may select the saved tab (nobody changed the
     /// selection since they were shown; nil when none was shown).
     private func reconcileOptimisticTabs(
-        root: String,
         asked: Set<UUID>,
         result: WorkspaceRestoreResult,
         layout: WorktreeStateRecord,
-        workspace: TerminalWorkspace,
         step: RestoreStep
     ) -> (tabs: [TerminalSession], selectsSavedTab: Bool?) {
-        guard var shown = optimisticTabs[root] else { return (result.sessions, nil) }
-        let mark = optimisticSelections[root]
+        guard !optimisticTabs.isEmpty else { return (result.sessions, nil) }
+        var shown = optimisticTabs
         let pending = result.pendingRecordIDs.intersection(asked)
         let decided = Set(shown.keys).intersection(asked).subtracting(pending)
         var remaining = result.sessions
         var withdrawn: [TerminalSession] = []
         // Before anything is withdrawn (which moves the selection).
-        let selectsSavedTab = mark.map { $0.selection == workspace.selectedSessionID }
+        let selectsSavedTab = optimisticSelection.map { $0.selection == workspace.selectedSessionID }
         for id in decided.sorted(by: { $0.uuidString < $1.uuidString }) {
             shown.removeValue(forKey: id)
             guard !result.confirmedOptimisticRecordIDs.contains(id),
@@ -1788,8 +1084,8 @@ final class RepositoryWorkspace: ObservableObject {
         if !withdrawn.isEmpty {
             workspace.withdrawRestoredTabs(withdrawn)
         }
-        optimisticTabs[root] = shown.isEmpty ? nil : shown
-        if shown.isEmpty { optimisticSelections[root] = nil }
+        optimisticTabs = shown
+        if shown.isEmpty { optimisticSelection = nil }
         guard step == .initial else { return (remaining, selectsSavedTab) }
         // Laid out again with the step's tabs: every open tab of a saved
         // record (shown early, confirmed or pending, restarted, or brought
@@ -1801,11 +1097,11 @@ final class RepositoryWorkspace: ObservableObject {
         return (kept + remaining, selectsSavedTab)
     }
 
-    /// Runs `body` once the restore that opens the window's first worktree
-    /// has put its tabs, layout and selection in place (or the window was
-    /// torn down first): at once when there is nothing to wait for. Hosts
-    /// that did not answer within the restore's initial wait come back
-    /// later, into the window already shown.
+    /// Runs `body` once the restore that opens the window has put its tabs,
+    /// layout and selection in place (or the window was torn down first):
+    /// at once when there is nothing to wait for. Hosts that did not answer
+    /// within the restore's initial wait come back later, into the window
+    /// already shown.
     func whenInitialRestoreSettles(_ body: @escaping @MainActor () -> Void) {
         guard isAwaitingInitialRestore else {
             body()
@@ -1823,7 +1119,7 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     private enum RestoreStep: Equatable {
-        /// The restore that opens a worktree's workspace.
+        /// The restore that opens the workspace.
         case initial
         /// Hosts of that restore that answered late.
         case remainder
@@ -1835,40 +1131,34 @@ final class RepositoryWorkspace: ObservableObject {
         case orphans
     }
 
-    /// Adds what one restore step brought back to `workspace`, with the
+    /// Adds what one restore step brought back to the workspace, with the
     /// saved `layout`, and updates the records still kept: those the step
     /// brought back or dropped go, those it kept or set aside stay, and
     /// those still pending stay in flight until its remainder answers.
     private func applyRestoreStep(
-        root: String,
         asked: Set<UUID>,
         result: WorkspaceRestoreResult,
         layout: WorktreeStateRecord,
-        workspace: TerminalWorkspace,
         step: RestoreStep
     ) {
         let selectingSavedTab: Bool = switch step {
         case .initial: true
         // Tabs that come late take the saved selection only while nobody
         // changed the selection since the first ones came.
-        case .remainder: selectionsAwaitingRestore[root].map { $0.selection == workspace.selectedSessionID } ?? false
+        case .remainder: selectionAwaitingRestore.map { $0.selection == workspace.selectedSessionID } ?? false
         case .retry, .orphans: false
         }
         // What a late part of this step is: a retry's stays a retry.
         let laterStep: RestoreStep = step == .retry ? .retry : .remainder
-        let reconciled = reconcileOptimisticTabs(
-            root: root, asked: asked, result: result, layout: layout, workspace: workspace, step: step
-        )
+        let reconciled = reconcileOptimisticTabs(asked: asked, result: result, layout: layout, step: step)
         let setAside = workspace.restoreSessions(
             reconciled.tabs,
             from: layout,
             selectingSavedTab: reconciled.selectsSavedTab ?? selectingSavedTab,
-            addingAfterOpenTabs: step != .initial,
-            launchingAdapters: root == activeWorktreeRoot
+            addingAfterOpenTabs: step != .initial
         )
         let pending = result.pendingRecordIDs.intersection(asked)
         updateKeptRecords(
-            root: root,
             asked: asked,
             kept: result.keptRecordIDs.intersection(asked).union(setAside).subtracting(pending),
             pending: pending,
@@ -1878,21 +1168,21 @@ final class RepositoryWorkspace: ObservableObject {
             // An adopted command whose command a tab runs already: saved,
             // set aside, so its session does not run on with no record.
             let aside = layout.restricted(to: setAside)
-            keptWorktreeRecords[root] = keptWorktreeRecords[root]?.merging(kept: aside) ?? aside
-            setAsideRecordIDs[root, default: []].formUnion(setAside)
+            keptRecord = keptRecord?.merging(kept: aside) ?? aside
+            setAsideRecordIDs.formUnion(setAside)
         }
         if step == .retry || step == .orphans {
             // Only the restore that opened the workspace applies the saved
             // selection and the default shell.
-        } else if inFlightRecordIDs[root] == nil {
-            selectionsAwaitingRestore[root] = nil
+        } else if inFlightRecordIDs.isEmpty {
+            selectionAwaitingRestore = nil
             // The window's default shell, once nothing more is coming. After
             // a remainder, auto-start may have added commands meanwhile.
             // A device's window whose saved tabs wait for the device to
             // answer opens no new tab there meanwhile (it could not start
             // either): they come back once it answers.
-            let waitsForDevice = isRemote && !(keptWorktreeRecords[root]?.sessions.isEmpty ?? true)
-            if root == initialWorktreeRoot, !waitsForDevice {
+            let waitsForDevice = isRemote && !(keptRecord?.sessions.isEmpty ?? true)
+            if !waitsForDevice {
                 switch step {
                 case .initial: workspace.addInitialSessionIfEmpty()
                 case .remainder: workspace.addInitialSessionIfEmpty(ignoringCommands: true)
@@ -1900,28 +1190,28 @@ final class RepositoryWorkspace: ObservableObject {
                 }
             }
         } else {
-            selectionsAwaitingRestore[root] = SelectionMark(selection: workspace.selectedSessionID)
+            selectionAwaitingRestore = SelectionMark(selection: workspace.selectedSessionID)
         }
-        applyCollapsedAgentGroupIDs(layout.collapsedAgentGroupIDs, root: root, workspace: workspace)
+        applyCollapsedAgentGroupIDs(layout.collapsedAgentGroupIDs)
         if let remainder = result.remainder, !pending.isEmpty {
-            awaitRemainder(remainder, root: root, asked: pending, layout: layout, workspace: workspace, step: laterStep)
+            awaitRemainder(remainder, asked: pending, layout: layout, step: laterStep)
         }
-        if restoreRetries[root] == nil, let trigger = result.retryWhenAvailable, !recordIDsToRetry(root: root).isEmpty {
-            retryKeptRecords(root: root, when: trigger)
+        if restoreRetry == nil, let trigger = result.retryWhenAvailable, !recordIDsToRetry().isEmpty {
+            retryKeptRecords(when: trigger)
         }
-        updateCommandsBeingRestored(root: root)
-        startAutoStartsNoLongerWaiting(root: root, workspace: workspace)
+        updateCommandsBeingRestored()
+        startAutoStartsNoLongerWaiting()
         // Adopted sessions never finish a restore: those waiting for the
-        // worktree's saved tabs go on waiting.
-        if step == .initial || (step != .orphans && restoreTasks[root] == nil) {
-            runRestoreWaiters(root: root)
+        // window's saved tabs go on waiting.
+        if step == .initial || (step != .orphans && restoreTask == nil) {
+            runRestoreWaiters()
         }
         // Tabs whose sessions the system ended, found now (not saved ended),
         // once auto-start (the waiters above) started its commands again.
         let savedEnded = Set(layout.sessions.filter { $0.systemEnd != nil }.map(\.id))
         announceSystemEndedTabs(result.sessions.filter { tab in
             !savedEnded.contains(tab.id) && workspace.session(withID: tab.id) === tab
-        }, root: root)
+        })
         scheduleStateSave()
     }
 
@@ -1931,16 +1221,15 @@ final class RepositoryWorkspace: ObservableObject {
     /// back still ended. Once per run for each tab: tabs saved ended come
     /// back without a toast.
     /// Not a tab that starts again by itself: one auto-start started (or
-    /// will, when its worktree is shown), a command that restarts when it
-    /// exits, or one whose program had exited before (it shows that exit,
-    /// and Restart All leaves it).
-    private func announceSystemEndedTabs(_ candidates: [TerminalSession], root: String) {
+    /// will), a command that restarts when it exits, or one whose program
+    /// had exited before (it shows that exit, and Restart All leaves it).
+    private func announceSystemEndedTabs(_ candidates: [TerminalSession]) {
         var autoStarted: Set<String>?
         let tabs = candidates.filter { tab in
             guard tab.systemSessionEnd != nil, !tab.isRunning, tab.savedExitStatus == nil else { return false }
             guard tab.kind == .command else { return true }
             guard !tab.restartOnExit, let name = tab.commandName else { return !tab.restartOnExit }
-            let names = autoStarted ?? Set(autoStartCommands(root).map { AgentToolDefinition.normalizedName($0.name) })
+            let names = autoStarted ?? Set(autoStartCommands(workspaceRoot).map { AgentToolDefinition.normalizedName($0.name) })
             autoStarted = names
             return !names.contains(AgentToolDefinition.normalizedName(name))
         }
@@ -1961,28 +1250,24 @@ final class RepositoryWorkspace: ObservableObject {
         guard !isTearingDown else { return }
         for tab in systemEndedTabs.compactMap(\.session)
         where tab.systemSessionEnd != nil && !tab.isRunning && tab.savedExitStatus == nil {
-            guard let root = root(containing: tab.id), let workspace = workspaces[root],
-                  workspace.session(withID: tab.id) === tab
-            else { continue }
+            guard workspace.session(withID: tab.id) === tab else { continue }
             workspace.restart(tab)
         }
         systemEndedTabs.removeAll()
     }
 
-    /// `keptWorktreeRecords[root]` after a restore step that asked for
-    /// `asked`: of those, the ones it kept (or set aside) and the ones still
-    /// pending stay; the others (restored or dropped) go.
-    private func updateKeptRecords(root: String, asked: Set<UUID>, kept: Set<UUID>, pending: Set<UUID>, setAside: Set<UUID>) {
-        guard let current = keptWorktreeRecords[root] else { return }
+    /// `keptRecord` after a restore step that asked for `asked`: of those,
+    /// the ones it kept (or set aside) and the ones still pending stay; the
+    /// others (restored or dropped) go.
+    private func updateKeptRecords(asked: Set<UUID>, kept: Set<UUID>, pending: Set<UUID>, setAside: Set<UUID>) {
+        guard let current = keptRecord else { return }
         let answered = asked.subtracting(pending)
         let remaining = Set(current.sessions.map(\.id)).subtracting(answered.subtracting(kept))
-        keptWorktreeRecords[root] = remaining.isEmpty ? nil : current.restricted(to: remaining)
-        let inFlight = (inFlightRecordIDs[root] ?? []).subtracting(asked).union(pending).intersection(remaining)
-        inFlightRecordIDs[root] = inFlight.isEmpty ? nil : inFlight
-        let aside = (setAsideRecordIDs[root] ?? []).union(setAside).intersection(remaining)
-        setAsideRecordIDs[root] = aside.isEmpty ? nil : aside
+        keptRecord = remaining.isEmpty ? nil : current.restricted(to: remaining)
+        inFlightRecordIDs = inFlightRecordIDs.subtracting(asked).union(pending).intersection(remaining)
+        setAsideRecordIDs = setAsideRecordIDs.union(setAside).intersection(remaining)
         if isRemote {
-            let waiting = keptWorktreeRecords.values.reduce(0) { $0 + $1.sessions.count }
+            let waiting = keptRecord?.sessions.count ?? 0
             if remoteTabsWaitingCount != waiting { remoteTabsWaitingCount = waiting }
         }
     }
@@ -1990,204 +1275,167 @@ final class RepositoryWorkspace: ObservableObject {
     /// Adds what a restore's remainder brings back once it answers.
     private func awaitRemainder(
         _ remainder: Task<WorkspaceRestoreResult, Never>,
-        root: String,
         asked: Set<UUID>,
         layout: WorktreeStateRecord,
-        workspace: TerminalWorkspace,
         step: RestoreStep
     ) {
         let token = UUID()
-        restoreRemainders[root, default: [:]][token] = Task { @MainActor [weak self] in
+        let workspace = workspace
+        restoreRemainders[token] = Task { @MainActor [weak self] in
             let result = await remainder.value
             guard let self else {
                 WorkspaceRestoreResult.discard(result, in: workspace)
                 return
             }
-            self.restoreRemainders[root]?[token] = nil
-            if self.restoreRemainders[root]?.isEmpty == true {
-                self.restoreRemainders[root] = nil
-            }
-            guard !self.isTearingDown, self.workspaces[root] === workspace, !workspace.isTornDown else {
+            self.restoreRemainders[token] = nil
+            guard !self.isTearingDown, !workspace.isTornDown else {
                 WorkspaceRestoreResult.discard(result, in: workspace)
                 return
             }
-            self.applyRestoreStep(root: root, asked: asked, result: result, layout: layout, workspace: workspace, step: step)
+            self.applyRestoreStep(asked: asked, result: result, layout: layout, step: step)
         }
     }
 
     /// Kept records a retry asks for: not in flight, not set aside. A kept
     /// record without a binding is one whose Create was under way when it
     /// was saved, kept while a restarted host still expected holders.
-    private func recordIDsToRetry(root: String) -> Set<UUID> {
-        let excluded = (inFlightRecordIDs[root] ?? []).union(setAsideRecordIDs[root] ?? [])
-        return Set((keptWorktreeRecords[root]?.sessions ?? [])
+    private func recordIDsToRetry() -> Set<UUID> {
+        let excluded = inFlightRecordIDs.union(setAsideRecordIDs)
+        return Set((keptRecord?.sessions ?? [])
             .filter { $0.mayComeBack && !excluded.contains($0.id) }
             .map(\.id))
     }
 
-    /// Restores `root`'s kept records again once `trigger` fires (their host
+    /// Restores the kept records again once `trigger` fires (their host
     /// became reachable), into the workspace as it is then: the tabs come
     /// back with their saved layout, after the tabs opened meanwhile, and
     /// the selection stays. Auto-start commands that waited for them start
     /// afterwards.
-    private func retryKeptRecords(root: String, when trigger: AnyPublisher<Void, Never>?) {
+    private func retryKeptRecords(when trigger: AnyPublisher<Void, Never>?) {
         guard let trigger else {
-            restoreRetries[root] = nil
+            restoreRetry = nil
             return
         }
         // The trigger may fire while this subscribes (the host came up
         // already): the retry then runs on the next turn, once this
         // subscription is stored and can be replaced by the retry's own.
-        restoreRetries[root] = trigger
+        restoreRetry = trigger
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in
-                MainActor.assumeIsolated { self?.restoreKeptRecords(root: root) }
+                MainActor.assumeIsolated { self?.restoreKeptRecords() }
             }
     }
 
-    private func restoreKeptRecords(root: String) {
-        restoreRetries[root] = nil
-        let retried = recordIDsToRetry(root: root)
+    private func restoreKeptRecords() {
+        restoreRetry = nil
+        let retried = recordIDsToRetry()
         guard !isTearingDown,
-              restoreTasks[root] == nil,
-              let kept = keptWorktreeRecords[root],
-              let workspace = workspaces[root],
+              restoreTask == nil,
+              let kept = keptRecord,
               !workspace.isTornDown
         else { return }
         guard !retried.isEmpty else {
-            startAutoStartsNoLongerWaiting(root: root, workspace: workspace)
+            startAutoStartsNoLongerWaiting()
             return
         }
+        let workspace = workspace
         let layout = kept
         let retriedRecords = kept.sessions.filter { retried.contains($0.id) }
         let request = WorkspaceRestoreRequest(
             repositoryRoot: repositoryRoot,
-            worktreeRoot: root,
             records: retriedRecords.filter(\.isRestorable),
             workspace: workspace,
             unboundRecords: retriedRecords.filter { !$0.isRestorable },
             systemEnds: systemEnds
         )
         let restorer = sessionRestorer
-        restoreCancellations[root, default: []].append(request.cancellation)
-        restoreTaskRecordIDs[root] = retried
-        restoreTasks[root] = Task { @MainActor [weak self] in
+        restoreCancellations.append(request.cancellation)
+        restoreTaskRecordIDs = retried
+        restoreTask = Task { @MainActor [weak self] in
             let result = await restorer(request)
             guard let self else {
                 WorkspaceRestoreResult.discard(result, in: workspace)
                 return
             }
-            self.restoreTasks[root] = nil
-            self.restoreTaskRecordIDs[root] = nil
-            guard !self.isTearingDown, self.workspaces[root] === workspace, !workspace.isTornDown else {
+            self.restoreTask = nil
+            self.restoreTaskRecordIDs = []
+            guard !self.isTearingDown, !workspace.isTornDown else {
                 WorkspaceRestoreResult.discard(result, in: workspace)
                 return
             }
-            self.applyRestoreStep(root: root, asked: retried, result: result, layout: layout, workspace: workspace, step: .retry)
+            self.applyRestoreStep(asked: retried, result: result, layout: layout, step: .retry)
         }
-        updateCommandsBeingRestored(root: root)
+        updateCommandsBeingRestored()
     }
 
     /// Saved records a restore under way (its task, or a remainder) may
-    /// still bring back for `root`.
-    private func recordsBeingRestored(root: String) -> [WorkspaceSessionRecord] {
-        var ids = inFlightRecordIDs[root] ?? []
-        if restoreTasks[root] != nil {
-            ids.formUnion(restoreTaskRecordIDs[root] ?? [])
+    /// still bring back.
+    private func recordsBeingRestored() -> [WorkspaceSessionRecord] {
+        var ids = inFlightRecordIDs
+        if restoreTask != nil {
+            ids.formUnion(restoreTaskRecordIDs)
         }
         guard !ids.isEmpty else { return [] }
-        var seen = Set<UUID>()
-        return ((pendingWorktreeRecords[root]?.sessions ?? []) + (keptWorktreeRecords[root]?.sessions ?? []))
-            .filter { ids.contains($0.id) && seen.insert($0.id).inserted }
+        return savedRecordsNotOpen().filter { ids.contains($0.id) }
     }
 
     private static func commandNames(of records: [WorkspaceSessionRecord]) -> Set<String> {
         Set(records.filter { $0.kind == .command }.compactMap { $0.commandName.map(AgentToolDefinition.normalizedName) })
     }
 
-    /// Tells `root`'s workspace which commands a restore under way may bring
+    /// Tells the workspace which commands a restore under way may bring
     /// back, so sidebar and MCP starts of them wait for it
     /// (`TerminalWorkspace.waitUntilRestored(commandNamed:)`).
-    private func updateCommandsBeingRestored(root: String) {
-        workspaces[root]?.setCommandNamesBeingRestored(Self.commandNames(of: recordsBeingRestored(root: root)))
+    private func updateCommandsBeingRestored() {
+        workspace.setCommandNamesBeingRestored(Self.commandNames(of: recordsBeingRestored()))
     }
 
     /// Commands auto-start leaves to a saved tab that may still come back:
     /// one being restored, or kept while a retry waits for its host.
-    private func commandNamesAutoStartWaitsFor(root: String) -> Set<String> {
-        var names = Self.commandNames(of: recordsBeingRestored(root: root))
-        if restoreRetries[root] != nil {
-            let retried = recordIDsToRetry(root: root)
-            names.formUnion(Self.commandNames(of: (keptWorktreeRecords[root]?.sessions ?? []).filter { retried.contains($0.id) }))
+    private func commandNamesAutoStartWaitsFor() -> Set<String> {
+        var names = Self.commandNames(of: recordsBeingRestored())
+        if restoreRetry != nil {
+            let retried = recordIDsToRetry()
+            names.formUnion(Self.commandNames(of: (keptRecord?.sessions ?? []).filter { retried.contains($0.id) }))
         }
         return names
     }
 
     /// Starts the auto-start commands that waited for saved tabs which have
     /// now come back, or will not during this run.
-    private func startAutoStartsNoLongerWaiting(root: String, workspace: TerminalWorkspace) {
-        guard let waiting = autoStartsWaitingForRetry[root], !waiting.isEmpty else { return }
-        let names = commandNamesAutoStartWaitsFor(root: root)
-        let ready = waiting.filter { !names.contains(AgentToolDefinition.normalizedName($0.name)) }
+    private func startAutoStartsNoLongerWaiting() {
+        guard !autoStartsWaitingForRetry.isEmpty else { return }
+        let names = commandNamesAutoStartWaitsFor()
+        let ready = autoStartsWaitingForRetry.filter { !names.contains(AgentToolDefinition.normalizedName($0.name)) }
         guard !ready.isEmpty else { return }
-        let stillWaiting = waiting.filter { names.contains(AgentToolDefinition.normalizedName($0.name)) }
-        autoStartsWaitingForRetry[root] = stillWaiting.isEmpty ? nil : stillWaiting
-        startAutoStartCommands(in: workspace, root: workspace.projectRoot ?? root, worktreeRoot: root, commands: ready)
+        autoStartsWaitingForRetry.removeAll { !names.contains(AgentToolDefinition.normalizedName($0.name)) }
+        startAutoStartCommands(ready)
     }
 
-    private func applyCollapsedAgentGroupIDs(
-        _ savedIDs: [UUID],
-        root: String,
-        workspace: TerminalWorkspace
-    ) {
+    private func applyCollapsedAgentGroupIDs(_ savedIDs: [UUID]) {
         let collapsedIDs = Set(savedIDs).intersection(workspace.sessions.map(\.id))
         guard !collapsedIDs.isEmpty else { return }
-        if root == activeWorktreeRoot, let chromeState {
+        if let chromeState {
             chromeState.collapsedAgentGroupIDs.formUnion(collapsedIDs)
         } else {
-            var selection = selectionByRoot[root] ?? .terminal
-            selection.collapsedAgentGroupIDs.formUnion(collapsedIDs)
-            selectionByRoot[root] = selection
+            collapsedAgentGroupIDsWithoutChrome.formUnion(collapsedIDs)
         }
     }
 
-    /// Runs `action` once `root`'s saved tabs are restored (now, when it has
-    /// none pending).
-    private func whenRestored(root: String, perform action: @escaping @MainActor () -> Void) {
-        guard pendingWorktreeRecords[root] != nil || restoreTasks[root] != nil else {
+    /// Runs `action` once the saved tabs are restored (now, when none are
+    /// pending).
+    private func whenRestored(perform action: @escaping @MainActor () -> Void) {
+        guard pendingRecord != nil || restoreTask != nil else {
             action()
             return
         }
-        restoreWaiters[root, default: []].append(action)
+        restoreWaiters.append(action)
     }
 
-    private func dropPendingWorktreeRecord(root: String) {
-        pendingWorktreeRecords[root] = nil
-        if restoreTasks[root] == nil {
-            runRestoreWaiters(root: root)
-        }
-    }
-
-    private func runRestoreWaiters(root: String) {
-        let waiters = restoreWaiters.removeValue(forKey: root) ?? []
+    private func runRestoreWaiters() {
+        let waiters = restoreWaiters
+        restoreWaiters.removeAll()
         waiters.forEach { $0() }
-    }
-
-    private func standardized(_ root: String) -> String {
-        if ProjectLocation.isRemoteKey(root) { return ProjectLocation(key: root).key }
-        let standardized = URL(fileURLWithPath: root, isDirectory: true)
-            .standardizedFileURL
-            .path
-        if let resolved = resolvedPathsByInput[standardized] {
-            return resolved
-        }
-        if worktrees.contains(where: { $0.root == standardized }) {
-            resolvedPathsByInput[standardized] = standardized
-            return standardized
-        }
-        let resolved = Self.resolvedPath(standardized)
-        resolvedPathsByInput[standardized] = resolved
-        return resolved
     }
 
     private static func resolvedPath(_ root: String) -> String {
@@ -2199,26 +1447,6 @@ final class RepositoryWorkspace: ObservableObject {
         }
         defer { free(resolved) }
         return String(cString: resolved)
-    }
-
-    private static func removalBlockerMessage(
-        _ blockers: WorktreeRemovalBlockers,
-        closingRunningProcesses: Bool
-    ) -> String {
-        var reasons: [String] = []
-        if blockers.runningProcessCount > 0, !closingRunningProcesses {
-            reasons.append("\(blockers.runningProcessCount) foreground process\(blockers.runningProcessCount == 1 ? " is" : "es are") still running")
-        }
-        if blockers.isDirty {
-            reasons.append("the worktree has modified or untracked files")
-        }
-        if let lockReason = blockers.lockReason {
-            reasons.append("the worktree is locked: \(lockReason)")
-        }
-        if let pruneReason = blockers.pruneReason {
-            reasons.append("the worktree is prunable: \(pruneReason)")
-        }
-        return "Cherry cannot remove this worktree because " + reasons.joined(separator: ", ") + "."
     }
 }
 
@@ -2232,69 +1460,4 @@ private final class WeakSession {
 /// A workspace's selection at one moment (nil: none).
 private struct SelectionMark {
     let selection: UUID?
-}
-
-@MainActor
-private struct WorktreeSelectionState {
-    var selectedNoteID: UUID?
-    var selectedTodoID: UUID?
-    var isTodoPanePresented: Bool
-    var selectedTodoTagFilterIDs: Set<String>
-    var collapsedAgentGroupIDs: Set<UUID>
-    var focusedIdleCommandName: String?
-
-    static let terminal = WorktreeSelectionState(
-        selectedNoteID: nil,
-        selectedTodoID: nil,
-        isTodoPanePresented: false,
-        selectedTodoTagFilterIDs: [],
-        collapsedAgentGroupIDs: [],
-        focusedIdleCommandName: nil
-    )
-
-    init(chromeState: ProjectWindowChromeState) {
-        selectedNoteID = chromeState.selectedNoteID
-        selectedTodoID = chromeState.selectedTodoID
-        isTodoPanePresented = chromeState.isTodoPanePresented
-        selectedTodoTagFilterIDs = chromeState.selectedTodoTagFilterIDs
-        collapsedAgentGroupIDs = chromeState.collapsedAgentGroupIDs
-        focusedIdleCommandName = chromeState.focusedIdleCommandName
-    }
-
-    init(
-        selectedNoteID: UUID?,
-        selectedTodoID: UUID?,
-        isTodoPanePresented: Bool,
-        selectedTodoTagFilterIDs: Set<String>,
-        collapsedAgentGroupIDs: Set<UUID>,
-        focusedIdleCommandName: String?
-    ) {
-        self.selectedNoteID = selectedNoteID
-        self.selectedTodoID = selectedTodoID
-        self.isTodoPanePresented = isTodoPanePresented
-        self.selectedTodoTagFilterIDs = selectedTodoTagFilterIDs
-        self.collapsedAgentGroupIDs = collapsedAgentGroupIDs
-        self.focusedIdleCommandName = focusedIdleCommandName
-    }
-
-    func apply(to chromeState: ProjectWindowChromeState) {
-        if chromeState.selectedNoteID != selectedNoteID {
-            chromeState.selectedNoteID = selectedNoteID
-        }
-        if chromeState.selectedTodoID != selectedTodoID {
-            chromeState.selectedTodoID = selectedTodoID
-        }
-        if chromeState.isTodoPanePresented != isTodoPanePresented {
-            chromeState.isTodoPanePresented = isTodoPanePresented
-        }
-        if chromeState.selectedTodoTagFilterIDs != selectedTodoTagFilterIDs {
-            chromeState.selectedTodoTagFilterIDs = selectedTodoTagFilterIDs
-        }
-        if chromeState.collapsedAgentGroupIDs != collapsedAgentGroupIDs {
-            chromeState.collapsedAgentGroupIDs = collapsedAgentGroupIDs
-        }
-        if chromeState.focusedIdleCommandName != focusedIdleCommandName {
-            chromeState.focusedIdleCommandName = focusedIdleCommandName
-        }
-    }
 }

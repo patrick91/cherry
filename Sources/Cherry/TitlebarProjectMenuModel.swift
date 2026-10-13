@@ -1,20 +1,13 @@
 import CherryControl
 import Foundation
 
-/// The project picker's menu model: the window's worktrees, This Mac's
-/// projects, and the user's other Macs with their projects
+/// The project picker's menu model: This Mac's projects, and the user's
+/// other Macs with their projects
 /// (docs/specs/remote-devices.md). Pure, built from cached state. The Omni
 /// bar offers each device's items (`deviceItem`) as its Mac row's ⌘K
 /// actions (`OmniProviders.macActions`) and opens projects through its
 /// actions (`ProjectSwitcherActions`).
 struct TitlebarProjectMenuModel: Equatable {
-    struct Worktree: Equatable {
-        var root: String
-        var name: String
-        var isActive: Bool
-        var isHidden: Bool
-    }
-
     struct Project: Equatable {
         var root: String
         var name: String
@@ -52,9 +45,6 @@ struct TitlebarProjectMenuModel: Equatable {
     }
 
     enum Action: Equatable {
-        case activateWorktree(String)
-        case newWorktree
-        case manageWorktrees
         case openProject(String)
         case addProject
         case editProjects
@@ -98,10 +88,8 @@ struct TitlebarProjectMenuModel: Equatable {
 
     var entries: [Entry]
 
-    /// `worktrees`: nil when the window's project has no worktree spaces.
     /// `currentProjectKey`: the window's project, checked where it is listed.
     init(
-        worktrees: [Worktree]?,
         projects: [Project],
         devices: [Device],
         currentProjectKey: String?,
@@ -109,19 +97,6 @@ struct TitlebarProjectMenuModel: Equatable {
         now: Date = Date()
     ) {
         var entries: [Entry] = []
-        if let worktrees {
-            entries.append(.header("Worktrees"))
-            for worktree in worktrees {
-                entries.append(.item(Item(
-                    title: worktree.name + (worktree.isHidden ? " — Hidden" : ""),
-                    isOn: worktree.isActive,
-                    action: .activateWorktree(worktree.root)
-                )))
-            }
-            entries.append(.item(Item(title: "New Worktree...", action: .newWorktree)))
-            entries.append(.item(Item(title: "Manage Worktrees...", action: .manageWorktrees)))
-            entries.append(.separator)
-        }
         if projects.isEmpty {
             entries.append(.item(Item(title: "No Projects", isEnabled: false)))
         } else {

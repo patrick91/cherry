@@ -421,10 +421,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private var isReleased = false
     private(set) var isNativePTYBacked: Bool
     private var detachedSurfaceReleaseTask: Task<Void, Never>?
-    private var settledRenderHandler: (() -> Void)?
-    private var settledRenderTask: Task<Void, Never>?
-    private var settledRenderGeneration: UInt64 = 0
-    private var hasRenderedSinceSettledRenderRequest = false
     private var isScrollbarSynchronizationScheduled = false
     private var didLogLaunchContent = false
     private var launchContentCheck = LaunchContentCheck()
@@ -470,7 +466,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
         terminalView.onPostRender = { [weak self] in
             TerminalPerformanceMonitor.recordRenderTick()
-            self?.handlePostRender()
             self?.noteLaunchContentFrame()
             if let self { LaunchInteractivity.noteFrame(of: self) }
         }
@@ -562,7 +557,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func detach(from container: GhosttyTerminalContainerView, preservingSurface: Bool = false) {
         guard !isReleased, scrollContainer === container else { return }
-        cancelSettledRenderHandler()
         let canPreserveSurface = preservingSurface
             && container.bounds.width > 0
             && container.bounds.height > 0
@@ -714,7 +708,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
         terminalView.delegate = nil
         terminalView.onPostRender = nil
-        cancelSettledRenderHandler()
         searchState = nil
         searchPresentationHandler = nil
         searchDismissalHandler = nil
@@ -724,11 +717,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func finish(exitCode: UInt32) {
         inMemorySession.finish(exitCode: exitCode, runtimeMilliseconds: 0)
-    }
-
-    func performAfterRenderedViewportSettles(_ handler: @escaping () -> Void) {
-        cancelSettledRenderHandler()
-        settledRenderHandler = handler
     }
 
     /// Logs, once per surface and only during the launch, the first frame
@@ -752,40 +740,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         LaunchContentFrames.noteContentFrame(in: window)
     }
 
-    private func handlePostRender() {
-        hasRenderedSinceSettledRenderRequest = true
-        scheduleSettledRenderCompletionIfPossible()
-    }
-
-    private func scheduleSettledRenderCompletionIfPossible() {
-        guard settledRenderHandler != nil,
-              hasRenderedSinceSettledRenderRequest,
-              isMountedViewportReadyForReveal
-        else { return }
-
-        // A fit first paints Ghostty's resized grid, then the foreground TUI
-        // reacts to SIGWINCH and paints its new layout. Debounce render ticks so
-        // the outgoing snapshot is only removed once that short redraw burst has
-        // gone quiet, rather than exposing the intermediate composition.
-        settledRenderTask?.cancel()
-        settledRenderGeneration &+= 1
-        let generation = settledRenderGeneration
-        settledRenderTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(80))
-            guard !Task.isCancelled,
-                  let self,
-                  generation == self.settledRenderGeneration,
-                  self.isMountedViewportReadyForReveal,
-                  let handler = self.settledRenderHandler
-            else { return }
-
-            self.settledRenderHandler = nil
-            self.settledRenderTask = nil
-            self.hasRenderedSinceSettledRenderRequest = false
-            handler()
-        }
-    }
-
     private var isMountedViewportReadyForReveal: Bool {
         guard let gridMetrics,
               gridMetrics.columns > 0,
@@ -800,18 +754,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             cellWidthPixels: Int(gridMetrics.cellWidthPixels),
             cellHeightPixels: Int(gridMetrics.cellHeightPixels)
         )
-    }
-
-    private func cancelSettledRenderHandler() {
-        settledRenderGeneration &+= 1
-        settledRenderTask?.cancel()
-        settledRenderTask = nil
-        settledRenderHandler = nil
-        hasRenderedSinceSettledRenderRequest = false
-    }
-
-    func simulatePostRenderForTesting() {
-        handlePostRender()
     }
 
     /// Respawn the native (EXEC) child in place. ghostty only rebuilds a
@@ -993,12 +935,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             "pixels=\(size.widthPixels)x\(size.heightPixels) " +
             "terminalBounds=\(terminalView.bounds.size)"
         )
-        // A resize invalidates any render that was about to reveal this
-        // surface. Require a fresh post-render at the new mounted grid.
-        settledRenderGeneration &+= 1
-        settledRenderTask?.cancel()
-        settledRenderTask = nil
-        hasRenderedSinceSettledRenderRequest = false
         gridMetrics = size
         announceAdapterWindowSize()
         reportWindowGrid()
@@ -1009,10 +945,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func terminalDidUpdateScrollbar(_ metrics: TerminalScrollbarMetrics) {
         scrollbarMetrics = metrics
         scheduleScrollbarSynchronization()
-        // Scrollbar metrics reposition the document-hosted surface even when
-        // Ghostty does not need another paint. Treat that layout update as part
-        // of the same settling burst before revealing the incoming viewport.
-        scheduleSettledRenderCompletionIfPossible()
     }
 
     private func scheduleScrollbarSynchronization() {
@@ -2665,9 +2597,6 @@ final class GhosttyTerminalContainerView: NSView {
     private var isSidebarAnimating = false
     private var isSyncFrozen = false
     private var snapshotLayer: CALayer?
-    private var surfaceTransitionSnapshotLayer: CALayer?
-    private var surfaceTransitionFallbackTask: Task<Void, Never>?
-    private var surfaceTransitionGeneration: UInt64 = 0
     private var activeColorScheme: ColorScheme = .dark
     private var appliedDocumentBackgroundScheme: ColorScheme?
     private var appliedDocumentBackgroundRevision: UInt64?
@@ -2715,7 +2644,6 @@ final class GhosttyTerminalContainerView: NSView {
         colorScheme: ColorScheme,
         allowsAutoFocus: Bool = true,
         isActivePane: Bool = true,
-        usesWorktreeSurfaceTransition: Bool = false,
         onActivate: (() -> Void)? = nil
     ) {
         TerminalPerformanceMonitor.recordContainerConfigure()
@@ -2728,18 +2656,6 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         if activeSession !== session {
-            // Terminal selection is intentionally immediate. Only worktree
-            // navigation keeps the outgoing pixels briefly while the incoming
-            // surface fits and its foreground TUI redraws.
-            let transitionGeneration: UInt64? = activeSession.flatMap { source -> UInt64? in
-                guard usesWorktreeSurfaceTransition
-                    || isWorktreeTransition(from: source, to: session)
-                else {
-                    cancelSurfaceTransition()
-                    return nil
-                }
-                return beginSurfaceTransitionIfPossible()
-            } ?? nil
             resetSidebarAnimationStateForSurfaceChange()
             if let activeSession {
                 if GhosttySessionBridge.liveSurfaceLimit != nil {
@@ -2753,16 +2669,7 @@ final class GhosttyTerminalContainerView: NSView {
                 }
             }
             activeSession = session
-            let bridge = session.ghosttyBridge
-            if let transitionGeneration {
-                bridge.performAfterRenderedViewportSettles { [weak self] in
-                    Task { @MainActor [weak self] in
-                        await Task.yield()
-                        self?.completeSurfaceTransition(generation: transitionGeneration)
-                    }
-                }
-            }
-            bridge.attach(to: self)
+            session.ghosttyBridge.attach(to: self)
             if isActivePane {
                 requestTerminalFocus()
             }
@@ -2770,7 +2677,6 @@ final class GhosttyTerminalContainerView: NSView {
             // Disconnecting a hosted session releases its bridge while this
             // container still displays the same session. Mount the replacement
             // after reconnecting; session identity alone cannot detect it.
-            cancelSurfaceTransition()
             resetSidebarAnimationStateForSurfaceChange()
             session.ghosttyBridge.attach(to: self)
             if isActivePane {
@@ -2896,7 +2802,6 @@ final class GhosttyTerminalContainerView: NSView {
         releasesBridge: Bool = true,
         preservingSurface: Bool = false
     ) {
-        cancelSurfaceTransition()
         guard let session = activeSession else {
             activeBridge = nil
             pendingTerminalFocus = false
@@ -3042,66 +2947,6 @@ final class GhosttyTerminalContainerView: NSView {
         didApplyEarlyFit = false
         pendingPostAnimationDelta = 0
         removeSnapshotLayer(animated: false)
-    }
-
-    private func beginSurfaceTransitionIfPossible() -> UInt64? {
-        guard scrollView.frame.width > 0,
-              scrollView.frame.height > 0,
-              let capture = captureTerminalLayerContents()
-        else {
-            cancelSurfaceTransition()
-            return nil
-        }
-
-        cancelSurfaceTransition()
-        surfaceTransitionGeneration &+= 1
-        let generation = surfaceTransitionGeneration
-        surfaceTransitionSnapshotLayer = makeSnapshotLayer(
-            capture: capture,
-            frame: scrollView.frame,
-            zPosition: 1_100
-        )
-        surfaceTransitionFallbackTask = Task { @MainActor [weak self] in
-            // Safety valve for a stopped or otherwise non-rendering surface.
-            // Normal transitions complete through the stable-render callback.
-            try? await Task.sleep(for: .milliseconds(240))
-            guard !Task.isCancelled else { return }
-            self?.completeSurfaceTransition(generation: generation)
-        }
-        return generation
-    }
-
-    private func completeSurfaceTransition(generation: UInt64) {
-        guard generation == surfaceTransitionGeneration,
-              let fadingLayer = surfaceTransitionSnapshotLayer
-        else { return }
-
-        surfaceTransitionFallbackTask?.cancel()
-        surfaceTransitionFallbackTask = nil
-        fadingLayer.removeFromSuperlayer()
-        surfaceTransitionSnapshotLayer = nil
-    }
-
-    private func cancelSurfaceTransition() {
-        surfaceTransitionFallbackTask?.cancel()
-        surfaceTransitionFallbackTask = nil
-        surfaceTransitionSnapshotLayer?.removeFromSuperlayer()
-        surfaceTransitionSnapshotLayer = nil
-    }
-
-    private func isWorktreeTransition(
-        from source: TerminalSession,
-        to target: TerminalSession
-    ) -> Bool {
-        guard let sourceRoot = source.projectRoot,
-              let targetRoot = target.projectRoot,
-              sourceRoot != targetRoot,
-              let sourceRepositoryRoot = AgentSettings.shared.repositoryRoot(for: sourceRoot),
-              let targetRepositoryRoot = AgentSettings.shared.repositoryRoot(for: targetRoot)
-        else {
-            return false
-        }
-        return sourceRepositoryRoot == targetRepositoryRoot
     }
 
     private func applyEarlyFitIfPossible() {
@@ -3300,7 +3145,7 @@ final class GhosttyTerminalContainerView: NSView {
     }
 
     private func updateSnapshotLayerFrame() {
-        guard snapshotLayer != nil || surfaceTransitionSnapshotLayer != nil else { return }
+        guard snapshotLayer != nil else { return }
         // Track the current visible area so the snapshot stays aligned with
         // the underlying scroll view as the container resizes during the
         // animation. Disable implicit layer animations or the snapshot will
@@ -3308,7 +3153,6 @@ final class GhosttyTerminalContainerView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         snapshotLayer?.frame = scrollView.frame
-        surfaceTransitionSnapshotLayer?.frame = scrollView.frame
         CATransaction.commit()
     }
 
@@ -3827,10 +3671,6 @@ final class GhosttyTerminalContainerView: NSView {
 
     var hasSidebarSnapshotForTesting: Bool {
         snapshotLayer?.superlayer != nil
-    }
-
-    var hasSurfaceTransitionSnapshotForTesting: Bool {
-        surfaceTransitionSnapshotLayer?.superlayer != nil
     }
 
     var activeSessionIDForTesting: UUID? {

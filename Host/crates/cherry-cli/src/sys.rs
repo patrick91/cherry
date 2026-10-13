@@ -3,7 +3,10 @@ use anyhow::{bail, Context, Result};
 use std::{
     cell::RefCell,
     io,
-    os::fd::RawFd,
+    os::{
+        fd::{IntoRawFd, RawFd},
+        unix::net::UnixStream,
+    },
     sync::{
         atomic::{AtomicBool, AtomicI32, Ordering},
         Arc,
@@ -14,6 +17,10 @@ use std::{
 static TERMINATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
 static RECONNECT_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// The socket the signal handler makes readable (`signal_wake_fd`), and the
+/// end it writes to; -1 until `SignalGuard::install`.
+static SIGNAL_WAKE: AtomicI32 = AtomicI32::new(-1);
+static SIGNAL_WAKE_SENDER: AtomicI32 = AtomicI32::new(-1);
 
 thread_local! {
     /// Set on a thread whose work another thread may abandon (an
@@ -36,6 +43,48 @@ extern "C" fn handle_signal(signal: libc::c_int) {
     } else {
         TERMINATION_SIGNAL.store(signal, Ordering::Relaxed);
     }
+    // After the flag, so the poll the byte ends finds it set. A full buffer
+    // already wakes the next poll.
+    let fd = SIGNAL_WAKE_SENDER.load(Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe {
+            let errno = errno();
+            let saved = *errno;
+            libc::write(fd, [1u8].as_ptr().cast(), 1);
+            *errno = saved;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn errno() -> *mut libc::c_int {
+    libc::__error()
+}
+#[cfg(not(target_os = "macos"))]
+unsafe fn errno() -> *mut libc::c_int {
+    libc::__errno_location()
+}
+
+/// Readable once one of the signals `SignalGuard` handles arrived, until
+/// `clear_signal_wake`. A poll that includes it ends for the signal even
+/// when it came just before the poll or went to another thread (neither
+/// interrupts the poll), so such a poll need not wake up to look for
+/// signals. -1, which poll ignores, without the guard.
+pub fn signal_wake_fd() -> RawFd {
+    SIGNAL_WAKE.load(Ordering::Relaxed)
+}
+
+/// Read what made `signal_wake_fd` readable: right after the poll, before
+/// the signals' flags are looked at, so that one arriving later wakes the
+/// next poll. Only the main thread polls it: a read on another thread
+/// could leave the main thread's poll asleep.
+pub fn clear_signal_wake() {
+    let fd = signal_wake_fd();
+    if fd < 0 {
+        return;
+    }
+    let mut buffer = [0u8; 64];
+    while let Ok(Some(1..)) = read_some(fd, &mut buffer) {}
 }
 
 /// The termination signal received so far, if any.
@@ -80,6 +129,19 @@ pub struct SignalGuard {
 
 impl SignalGuard {
     pub fn install() -> Result<Self> {
+        if SIGNAL_WAKE.load(Ordering::Relaxed) < 0 {
+            // Open for the life of the process (a handler on another thread
+            // may still write once the guard dropped); closed on exec.
+            let (wake, sender) = UnixStream::pair()
+                .and_then(|(wake, sender)| {
+                    wake.set_nonblocking(true)?;
+                    sender.set_nonblocking(true)?;
+                    Ok((wake, sender))
+                })
+                .context("could not create the signal socket")?;
+            SIGNAL_WAKE.store(wake.into_raw_fd(), Ordering::SeqCst);
+            SIGNAL_WAKE_SENDER.store(sender.into_raw_fd(), Ordering::SeqCst);
+        }
         let mut guard = Self { saved: Vec::new() };
         for signal in [
             libc::SIGWINCH,
@@ -275,5 +337,30 @@ pub fn read_some(fd: RawFd, buffer: &mut [u8]) -> io::Result<Option<usize>> {
     match error.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(None),
         _ => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_signal_another_thread_took_wakes_a_poll_of_the_signal_socket() {
+        let _guard = SignalGuard::install().unwrap();
+        clear_signal_wake();
+        let _ = take_resize();
+        // Its handler runs on that thread, so no EINTR would end a poll
+        // here: only the socket does.
+        std::thread::spawn(|| unsafe { libc::raise(libc::SIGWINCH) })
+            .join()
+            .unwrap();
+        let mut fds = [pollfd(signal_wake_fd(), libc::POLLIN)];
+        poll(&mut fds, Duration::from_secs(5)).unwrap();
+        assert_ne!(fds[0].revents & libc::POLLIN, 0);
+        clear_signal_wake();
+        assert!(take_resize());
+        // Once read, a poll waits again.
+        poll(&mut fds, Duration::ZERO).unwrap();
+        assert_eq!(fds[0].revents, 0);
     }
 }

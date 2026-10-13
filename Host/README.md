@@ -1362,7 +1362,11 @@ cherry-host.service` also moves the daemon to it.
   client's socket itself when nothing waits ahead of it.
 - **Heartbeat.** An attached client sends `Ping` every 15 seconds, also while
   a slow terminal is still taking its output, so a slow terminal does not get
-  the attachment evicted; so does a subscribed control connection. The host
+  the attachment evicted; so does a subscribed control connection. Between
+  Pings an idle `cherry attach` sleeps, and `cherry control` (which relays
+  the app's) sleeps until something arrives: the signals they handle (a
+  resize, SIGUSR1, those that end them) wake them through a socket the
+  signal handler writes to, so no wait ends early to look for one. The host
   drops an attached or subscribed connection that sends nothing for 45
   seconds, so a vanished laptop stops constraining the shared grid; a client
   whose input it holds back is exempt (see input backpressure). A connection

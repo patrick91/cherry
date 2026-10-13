@@ -1385,13 +1385,11 @@ differs from the design above.
     and the record is kept if holders are still pending then; kept records
     are restored again once the host expects none
     (`HostControl.holdersRegistered()`), or at the next launch. A complete
-    list (`pending_holders` 0) drops the record at once. A host without
-    `pending_holders` (an older one) is listed once more after
-    `disappearanceConfirmationDelay` (2 s); still missing, the record is
-    dropped. A local host that now has another identity (its state was
-    reset) drops it at once. Whenever a record of This Mac would be dropped
-    this way, one whose session the system ended comes back as an ended tab
-    instead (next bullet).
+    list (`pending_holders` 0) drops the record at once. A local host that
+    now has another identity (its state was reset) drops it at once.
+    Whenever a record of This Mac would be dropped this way, one whose
+    session the system ended comes back as an ended tab instead (next
+    bullet).
   - Unreachable, an SSH host that answers with an identity other than the
     trusted one, or this app cannot run local sessions: the record stays
     saved, and so does a record saved while its Create had not answered

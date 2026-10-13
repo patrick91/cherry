@@ -1238,9 +1238,8 @@ final class HostControl: ObservableObject {
     /// Lists the host again every `pollInterval` while a daemon that just
     /// restarted still expects holders to register (`pendingHolders` > 0),
     /// until none is pending or `timeout` passed; returns the last list
-    /// (check `isComplete`). `first` is a list taken already. A host that
-    /// does not report pending holders is listed once. Throws what a list
-    /// throws, and CancellationError.
+    /// (check `isComplete`). `first` is a list taken already. Throws what a
+    /// list throws, and CancellationError.
     func listUntilHoldersRegistered(
         after first: HostedSessionList? = nil,
         timeout: Duration,

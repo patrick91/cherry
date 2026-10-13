@@ -8,8 +8,8 @@ import Foundation
 /// input. Given `--expected-host-id` for another identity it exits before
 /// the Welcome with the CLI's message.
 ///
-/// Defaults: subscribe → ok, list → the sessions (with `pendingHolders`, nil
-/// for a host that does not report it), create → a running session
+/// Defaults: subscribe → ok, list → the sessions (with `pendingHolders`, 0
+/// unless set), create → a running session
 /// `session-<request id>` that reports its `request_id`, kill → ok and,
 /// after `exitDelay`, `exited` + `changed` events (unless `killEndsSession`
 /// is false), remove → ok, ping → pong, send_input/update → ok, screen → a
@@ -105,7 +105,7 @@ final class FakeControlHelper: @unchecked Sendable {
     private var _respond: ((Request, Connection) -> Reply?)?
     private var _screenText = "fake screen"
     private var _screenIsAlternate = false
-    private var _pendingHolders: Int?
+    private var _pendingHolders = 0
     private var _lostSessionIDs: Set<String> = []
     let exitDelay: TimeInterval
 
@@ -157,9 +157,9 @@ final class FakeControlHelper: @unchecked Sendable {
         set { lock.withLock { _screenIsAlternate = newValue } }
     }
 
-    /// What `list` reports as `pending_holders`; nil leaves it out (a host
-    /// from before it was reported).
-    var pendingHolders: Int? {
+    /// What `list` reports as `pending_holders`: holders a daemon that just
+    /// restarted still expects (0, a complete list, unless set).
+    var pendingHolders: Int {
         get { lock.withLock { _pendingHolders } }
         set { lock.withLock { _pendingHolders = newValue } }
     }

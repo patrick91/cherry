@@ -246,13 +246,6 @@ final class PersistentHostSessions {
         /// When the answer to Create never came, the host is listed after
         /// each of these delays to end a session it may have made anyway.
         var lostCreateChecks: [Duration] = [.seconds(2), .seconds(12), .seconds(30)]
-        /// A running session missing from the list of a host that does not
-        /// report pending holders (an older host) is listed again after
-        /// this long before its tab takes it as gone: a restarted daemon
-        /// lists a session only once its holder registered again. A restore
-        /// looks for a saved tab's missing session again after it too,
-        /// before it drops the tab.
-        var disappearanceConfirmationDelay: Duration = .seconds(2)
         /// A host that reports holders it still expects after a restart is
         /// listed again this often until it expects none, for at most
         /// `pendingHoldersWait`, before a session missing from its list is
@@ -1188,18 +1181,13 @@ final class PersistentHostSessions {
 
     /// The program's state after the host's list lacked its session while it
     /// ran, so a session whose holder registers late with a restarted
-    /// daemon is not taken for gone: from a list that is complete (the host
-    /// is listed until it expects no more holders, at most
-    /// `pendingHoldersWait`), or, from a host that does not report pending
-    /// holders, from a fresh list after `disappearanceConfirmationDelay`.
-    /// `.unknown` when the host cannot be listed, or still expects holders.
+    /// daemon is not taken for gone: from a fresh list that is complete
+    /// (the host is listed until it expects no more holders, at most
+    /// `pendingHoldersWait`). `.unknown` when the host cannot be listed, or
+    /// still expects holders.
     func confirmedProgramState(of binding: HostedSessionAttachment) async -> PersistentProgramState {
         guard var list = try? await control.list() else { return .unknown }
-        if list.pendingHolders == nil {
-            try? await Task.sleep(for: configuration.disappearanceConfirmationDelay)
-            guard let later = try? await control.list() else { return .unknown }
-            list = later
-        } else if list.awaitsHolders {
+        if list.awaitsHolders {
             guard let later = try? await completeList(after: list) else { return .unknown }
             list = later
         }

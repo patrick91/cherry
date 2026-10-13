@@ -452,16 +452,16 @@ struct HostedSessionList: Codable, Equatable, Sendable {
     let sessions: [HostedSessionInfo]
     /// Session holders a daemon that just restarted still expects to
     /// register again: their sessions may be missing from `sessions` for
-    /// now. 0 when the list is complete; nil when the host does not say (an
-    /// older host), so a missing session may still be a late holder's.
-    let pendingHolders: Int?
+    /// now. 0 when the list is complete. Every host this app can talk to
+    /// (protocol 7) reports it; a list without it is taken as complete.
+    let pendingHolders: Int
     /// Sessions whose holders were gone when the daemon started, without
     /// having ended (killed at a log out or restart, or by a signal): not
     /// in `sessions`. Never a session ended on purpose (Kill, Remove, its
     /// program's exit). Empty from an older host.
     let lostSessionIDs: Set<String>
 
-    init(hostID: String, sessions: [HostedSessionInfo], pendingHolders: Int? = nil, lostSessionIDs: Set<String> = []) {
+    init(hostID: String, sessions: [HostedSessionInfo], pendingHolders: Int = 0, lostSessionIDs: Set<String> = []) {
         self.hostID = hostID
         self.sessions = sessions
         self.pendingHolders = pendingHolders
@@ -472,7 +472,7 @@ struct HostedSessionList: Codable, Equatable, Sendable {
     var isComplete: Bool { pendingHolders == 0 }
 
     /// Holders are still expected: sessions missing now may come back.
-    var awaitsHolders: Bool { (pendingHolders ?? 0) > 0 }
+    var awaitsHolders: Bool { pendingHolders > 0 }
 
     enum CodingKeys: String, CodingKey {
         case hostID = "host_id"
@@ -486,7 +486,7 @@ struct HostedSessionList: Codable, Equatable, Sendable {
         self.init(
             hostID: try container.decode(String.self, forKey: .hostID),
             sessions: try container.decode([HostedSessionInfo].self, forKey: .sessions),
-            pendingHolders: try container.decodeIfPresent(UInt32.self, forKey: .pendingHolders).map(Int.init),
+            pendingHolders: try container.decodeIfPresent(UInt32.self, forKey: .pendingHolders).map(Int.init) ?? 0,
             lostSessionIDs: Set(try container.decodeIfPresent([String].self, forKey: .lostSessionIDs) ?? [])
         )
     }
@@ -495,7 +495,7 @@ struct HostedSessionList: Codable, Equatable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(hostID, forKey: .hostID)
         try container.encode(sessions, forKey: .sessions)
-        try container.encodeIfPresent(pendingHolders.map { UInt32(clamping: max($0, 0)) }, forKey: .pendingHolders)
+        try container.encode(UInt32(clamping: pendingHolders), forKey: .pendingHolders)
         if !lostSessionIDs.isEmpty {
             try container.encode(lostSessionIDs.sorted(), forKey: .lostSessionIDs)
         }

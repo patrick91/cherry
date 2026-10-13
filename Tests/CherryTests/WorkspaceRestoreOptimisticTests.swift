@@ -259,12 +259,12 @@ private struct OptimisticWindow {
     #expect(saved.sessions.first { $0.id == restarted.id }?.hosted?.sessionID == "s-new")
 }
 
-/// A session missing from a host that does not say whether holders are
-/// still to come is looked for again: its tab stays shown meanwhile, and
-/// goes once the second look misses it too.
+/// A session missing from a list while the host still expects holders is
+/// looked for again: its tab stays shown meanwhile, and goes once the host
+/// expects none and the second look misses it too.
 @Test @MainActor func aTabShownForASessionMissingFromTheFirstListStaysUntilTheSecondLook() async throws {
     let harness = try PersistentHarness()
-    harness.fake.pendingHolders = nil
+    harness.fake.pendingHolders = 1
     let rootURL = try canonicalTemporaryDirectory("cherry-optimistic-second-look")
     let root = rootURL.path
     let live = savedTab(title: "Live", sessionID: "s-live", workingDirectory: root)
@@ -280,6 +280,7 @@ private struct OptimisticWindow {
     #expect(await harness.fake.wait { workspace.session(withID: live.id)?.isProvisionalRestore == false })
     #expect(workspace.session(withID: late.id) === lateTab)
     #expect(lateTab.isProvisionalRestore)
+    harness.fake.pendingHolders = 0
     await window.repository.waitForPendingRestores()
     #expect(workspace.sessions.map(\.id) == [live.id])
     #expect(harness.requestIDs("kill").isEmpty)

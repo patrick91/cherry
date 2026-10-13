@@ -94,7 +94,6 @@ final class PersistentHarness {
         configuration.terminationTimeout = .seconds(3)
         configuration.restartExitTimeout = .seconds(3)
         configuration.reconnectDelay = (0.05, 0.2)
-        configuration.disappearanceConfirmationDelay = .milliseconds(400)
         configuration.lostCreateChecks = [.milliseconds(200), .milliseconds(800)]
         return configuration
     }()
@@ -954,19 +953,26 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     #expect(await harness.waitUntilAttached(command))
     let sessionID = try #require(command.persistentSession?.sessionID)
     let listed = harness.fake.sessions
+    let withoutIt = listed.filter { $0.id != sessionID }
 
-    // The daemon restarted and listed before the session's holder had
-    // registered again: HostControl reports the session removed.
-    harness.fake.sessions = listed.filter { $0.id != sessionID }
+    // The first list after a reconnect lacks the session: HostControl
+    // reports it removed. The tab takes it as gone only when a later list
+    // agrees, and the next one has it again.
     let connections = harness.fake.connections.count
+    let lists = harness.fake.requests("list").count
+    let missingFromNextList = FakeCountdown(1)
+    harness.fake.respond = { [fake = harness.fake] request, connection in
+        guard request.op == "list", connection.number >= connections, missingFromNextList.take() else { return nil }
+        return .answer(.sessions(HostedSessionList(hostID: fake.hostID, sessions: withoutIt)))
+    }
     harness.fake.dropAll()
     #expect(await harness.fake.wait {
-        harness.fake.connections.count > connections
-            && harness.control.state == .connected
-            && !harness.control.sessions.contains { $0.id == sessionID }
+        harness.fake.connections.count > connections && harness.control.state == .connected
+            && harness.fake.requests("list").count >= lists + 2
+            && harness.control.sessions.contains { $0.id == sessionID }
     })
-    harness.fake.sessions = listed
-    try await Task.sleep(for: .milliseconds(900))
+    harness.fake.respond = nil
+    try await Task.sleep(for: .milliseconds(300))
     #expect(command.isRunning)
     #expect(command.state == .live)
     #expect(command.persistentSession?.sessionID == sessionID)
@@ -977,7 +983,7 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
 
     // Missing again when checked: the program is gone with its session, and
     // the command starts again in a new one.
-    harness.fake.sessions = listed.filter { $0.id != sessionID }
+    harness.fake.sessions = withoutIt
     harness.fake.dropAll()
     #expect(await harness.fake.wait(timeout: 10) {
         command.persistentSession.map { $0.sessionID != sessionID } ?? false && command.state == .live
@@ -987,8 +993,6 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
 
 @Test @MainActor func aSessionARestartedDaemonStillExpectsKeepsItsTabAndOneMissingFromACompleteListIsGone() async throws {
     var configuration = PersistentHarness.fastConfiguration
-    // Never waited for: this host says which lists are complete.
-    configuration.disappearanceConfirmationDelay = .seconds(30)
     configuration.pendingHoldersPollInterval = .milliseconds(50)
     let harness = try PersistentHarness(configuration: configuration)
     let workspace = harness.workspace()

@@ -874,9 +874,7 @@ private extension PersistentHarness {
 }
 
 @Test @MainActor func aSessionMissingFromTheFirstListIsLookedForAgainBeforeItsTabIsDropped() async throws {
-    var configuration = PersistentHarness.fastConfiguration
-    configuration.disappearanceConfirmationDelay = .seconds(1)
-    let harness = try PersistentHarness(configuration: configuration)
+    let harness = try PersistentHarness()
     let root = try canonicalTemporaryDirectory("cherry-restore-late-holder")
     let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-late-holder-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
@@ -888,8 +886,9 @@ private extension PersistentHarness {
                           tags: [PersistentSessionTag.tab: record.id.uuidString])
     }
     // A daemon that just restarted: the server's holder has not registered
-    // again yet.
+    // again yet, and the host still expects it.
     harness.fake.sessions = [info(editor, pid: 96)]
+    harness.fake.pendingHolders = 1
     store.saveSynchronously(RepositoryStateRecord(
         repositoryRoot: repositoryKey(root),
         activeWorktreeRoot: root.path,
@@ -919,14 +918,17 @@ private extension PersistentHarness {
     #expect(workspace.isRestoringCommand(named: "Server"))
     #expect(workspace.commandSessions.isEmpty)
 
-    // Its holder registers; the second look finds it.
+    // Its holder registers, and the host expects no more: the second look
+    // finds it.
     harness.fake.sessions = [info(editor, pid: 96), info(server, pid: 97)]
+    harness.fake.pendingHolders = 0
     await repository.waitForPendingRestores()
     #expect(workspace.sessions.map(\.id) == [editor.id, server.id])
     #expect(workspace.commandSessions.first?.persistentSession?.sessionID == "s-server")
     #expect(!workspace.isRestoringCommand(named: "server"))
     #expect(harness.creates().isEmpty)
-    // A session missing from both lists is gone: its tab is dropped.
+    // A session missing from the complete list too is gone: its tab is
+    // dropped.
     repository.flushPersistentState()
     #expect(store.load(repositoryRoot: repository.repositoryRoot)?.worktree(root: root.path)?.sessions.map(\.id)
         == [editor.id, server.id])
@@ -1207,8 +1209,6 @@ private extension PersistentHarness {
 
 @Test @MainActor func aRestartedDaemonIsListedUntilItsHoldersRegisteredBeforeMissingTabsAreDropped() async throws {
     var configuration = PersistentHarness.fastConfiguration
-    // Never waited for: this host reports the holders it still expects.
-    configuration.disappearanceConfirmationDelay = .seconds(30)
     configuration.pendingHoldersPollInterval = .milliseconds(50)
     configuration.pendingHoldersWait = .seconds(5)
     let harness = try PersistentHarness(configuration: configuration)
@@ -1254,7 +1254,6 @@ private extension PersistentHarness {
 
 @Test @MainActor func aCompleteListDropsMissingTabsAtOnceAndHoldersThatNeverCameBackKeepThem() async throws {
     var configuration = PersistentHarness.fastConfiguration
-    configuration.disappearanceConfirmationDelay = .seconds(30)
     configuration.pendingHoldersPollInterval = .milliseconds(20)
     configuration.pendingHoldersWait = .milliseconds(300)
     let harness = try PersistentHarness(configuration: configuration)
@@ -1301,7 +1300,6 @@ private extension PersistentHarness {
 
 @Test @MainActor func autoStartWaitsForCommandsWhoseHoldersARestartedDaemonStillExpectsUntilItExpectsNone() async throws {
     var configuration = PersistentHarness.fastConfiguration
-    configuration.disappearanceConfirmationDelay = .seconds(30)
     configuration.pendingHoldersPollInterval = .milliseconds(20)
     configuration.pendingHoldersWait = .milliseconds(300)
     let harness = try PersistentHarness(configuration: configuration)
@@ -1781,7 +1779,6 @@ private func beforeTheLastBoot() throws -> Date {
 
 @Test @MainActor func aLogOutOrALostHolderBringsTabsBackOnlyOnceNothingMoreIsComing() async throws {
     var configuration = PersistentHarness.fastConfiguration
-    configuration.disappearanceConfirmationDelay = .milliseconds(200)
     configuration.pendingHoldersPollInterval = .milliseconds(20)
     configuration.pendingHoldersWait = .milliseconds(300)
     let harness = try PersistentHarness(configuration: configuration)
@@ -1824,16 +1821,21 @@ private func beforeTheLastBoot() throws -> Date {
     #expect(normal.sessions.isEmpty)
     #expect(normal.keptRecordIDs.isEmpty)
 
-    // A host that does not report pending holders: only after its second
-    // look, as a dropped tab would be.
-    harness.fake.pendingHolders = nil
-    let older = await harness.restore([gone], into: workspace, systemEnds: evidence(quits: [justNow.addingTimeInterval(5)]))
-    #expect(older.sessions.isEmpty)
-    #expect(older.pendingRecordIDs == [gone.id])
-    let olderRest = try await #require(older.remainder).value
-    #expect(olderRest.sessions.map(\.id) == [gone.id])
-    #expect(olderRest.sessions.first?.systemSessionEnd == .logout)
-    WorkspaceRestoreResult.discard(olderRest, in: workspace)
+    // Holders still expected at first: only once the host expects none, as
+    // a dropped tab would be.
+    let expectsAHolderOnce = FakeCountdown(1)
+    harness.fake.respond = { [fake = harness.fake] request, _ in
+        guard request.op == "list", expectsAHolderOnce.take() else { return nil }
+        return .answer(.sessions(HostedSessionList(hostID: fake.hostID, sessions: fake.sessions, pendingHolders: 1)))
+    }
+    let registering = await harness.restore([gone], into: workspace, systemEnds: evidence(quits: [justNow.addingTimeInterval(5)]))
+    #expect(registering.sessions.isEmpty)
+    #expect(registering.pendingRecordIDs == [gone.id])
+    let registered = try await #require(registering.remainder).value
+    #expect(registered.sessions.map(\.id) == [gone.id])
+    #expect(registered.sessions.first?.systemSessionEnd == .logout)
+    WorkspaceRestoreResult.discard(registered, in: workspace)
+    harness.fake.respond = nil
 
     // Holders still expected when the wait runs out: kept, not ended.
     harness.fake.pendingHolders = 2

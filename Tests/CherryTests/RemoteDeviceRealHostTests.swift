@@ -201,7 +201,6 @@ final class FakeRemoteMac {
         configuration.terminationTimeout = .seconds(5)
         configuration.restartExitTimeout = .seconds(5)
         configuration.reconnectDelay = (0.1, 0.5)
-        configuration.disappearanceConfirmationDelay = .milliseconds(400)
         configuration.lostCreateChecks = [.milliseconds(300)]
         return configuration
     }()

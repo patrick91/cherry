@@ -3257,11 +3257,16 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// `cleanExitMinimumRunTime` is measured from.
     private(set) var programStartedAt: Date?
     @Published private(set) var exitedAt: Date?
-    @Published private(set) var lastOutputAt: Date?
-    @Published private(set) var outputVersion = 0
-    @Published private(set) var lastInputOutputVersion: Int?
-    @Published private(set) var lastContentChangeAt: Date?
-    @Published private(set) var contentVersion = 0
+    // The output and content counters are not published: no view shows
+    // them, and MCP waits, monitors and tasks read them when they poll.
+    // Each would otherwise re-render every view observing the tab (the
+    // pane, its bars, the window title) on every content change, many
+    // times a second while a program writes, and once per typed key.
+    private(set) var lastOutputAt: Date?
+    private(set) var outputVersion = 0
+    private(set) var lastInputOutputVersion: Int?
+    private(set) var lastContentChangeAt: Date?
+    private(set) var contentVersion = 0
     @Published private(set) var childProcessID: Int32?
     @Published private(set) var exitCode: Int32?
     @Published private(set) var nixShellEnvironment: NixShellEnvironment?
@@ -3711,6 +3716,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var automaticTitle: String?
     private var pendingResolvedCommandLine: String?
 
+    /// Advanced (`bumpRevision`) when something the views observing the tab
+    /// show changed with no published property of its own (`isRunning`,
+    /// the bars' messages): re-renders them.
     @Published private(set) var revision = 0
     /// `ghosttyBridge` is launching a restored tab's adapter for a view
     /// being built: `bumpRevision` publishes on the next turn instead.
@@ -3757,8 +3765,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         readsContentFromHost || usesLiveNativeSurface
     }
     /// OSC 133 command-end signal (native). A precise "back at prompt / command
-    /// done" marker for non-TUI commands; published so idle detection can use it.
-    @Published private(set) var lastNativeCommandFinishedAt: Date?
+    /// done" marker for non-TUI commands, which idle detection reads; not
+    /// published, like the output counters.
+    private(set) var lastNativeCommandFinishedAt: Date?
     let hostInputWriter = TerminalInputWriter()
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
@@ -7151,11 +7160,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         applyAgentDraftInputEffect(Self.agentDraftInputEffect(input))
     }
 
-    /// Assigns only a changed value: every keystroke comes here, and
-    /// publishing an unchanged one would re-render every view observing
-    /// the tab once per key.
+    /// Where the output was when input last came: every keystroke comes
+    /// here, and publishes nothing.
     private func noteInputOutputBaseline() {
-        guard lastInputOutputVersion != outputVersion else { return }
         lastInputOutputVersion = outputVersion
     }
 
@@ -7412,8 +7419,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastNativeCommandFinishedAt = Date()
         // Capture the command's final output and advance the counters so idle
         // detection converges on the real boundary, not a heuristic timeout.
+        // Nothing a view shows changed: nothing is published.
         refreshNativeContentNow()
-        bumpRevision()
     }
 
     // MARK: - Native-PTY content model (search / idle under EXEC)
@@ -7581,7 +7588,9 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     /// Takes `text` as the tab's lines (`lines`: the caller's split of it,
     /// if it has one); when it changed, advances the output and content
-    /// counters. An unchanged text costs only its hash.
+    /// counters. An unchanged text costs only its hash. Publishes nothing
+    /// but the first output's `live` state: no view shows the lines or the
+    /// counters, and the surface draws the screen itself.
     @discardableResult
     private func replaceNativeContent(with text: String, lines: [String]? = nil) -> Bool {
         let hash = TerminalScreenText.contentHash(of: text)
@@ -7594,7 +7603,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         outputVersion &+= 1
         lastContentChangeAt = Date()
         contentVersion &+= 1
-        bumpRevision()
         return true
     }
 

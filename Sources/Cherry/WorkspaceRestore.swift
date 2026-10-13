@@ -794,6 +794,21 @@ final class OpenHostedTabs {
     func showsSession(hostID: String, sessionID: String) -> Bool {
         tab(showingSession: sessionID, hostID: hostID) != nil
     }
+
+    /// The ids of the open tabs, and the sessions of the host `hostID` they
+    /// are attached to: `hasOpenTab(withID:)` and `showsSession` for many
+    /// sessions at once (`PersistentHostSessions.openTabsShowing`).
+    func showing(hostID: String) -> (tabIDs: Set<UUID>, sessionIDs: Set<String>) {
+        var tabIDs = Set<UUID>()
+        var sessionIDs = Set<String>()
+        for tab in tabs.values.compactMap(\.object) {
+            tabIDs.insert(tab.id)
+            if let attachment = tab.hostedAttachment, attachment.hostID == hostID {
+                sessionIDs.insert(attachment.sessionID)
+            }
+        }
+        return (tabIDs, sessionIDs)
+    }
 }
 
 // MARK: - Staggered attach

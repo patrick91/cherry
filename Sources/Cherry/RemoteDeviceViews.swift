@@ -1067,7 +1067,7 @@ struct RemoteNotOpenSection: View {
             in: control.sessions,
             projectPath: ProjectLocation.launchPath(forKey: key),
             owner: hosting.owner,
-            isShown: { hosting.isShownByOpenTab($0, hostID: hostID) },
+            isShown: hosting.openTabsShowing(hostID: hostID).shows,
             isEnding: { hosting.isEnding($0.id) }
         )
     }

@@ -188,28 +188,32 @@ enum BackgroundSessions {
     /// This app's sessions in `sessions` (of the local host `hostID`) that
     /// are in the background: `owner`'s, not shown by an open tab
     /// (`isShown`), not being ended (`isEnding`), and not named by a saved
-    /// tab an open window may still restore (`awaitingRestore`). Running
-    /// and ended ones, by project, running first, newest first. `machine`:
-    /// the device they run on (its name); nil for This Mac.
+    /// tab an open window may still restore (`awaitingRestore`, read only
+    /// when a session is neither). Running and ended ones, by project,
+    /// running first, newest first. `machine`: the device they run on (its
+    /// name); nil for This Mac. `row` makes each one's row
+    /// (`BackgroundSessionPresentation.session` when nil).
     static func classify(
         _ sessions: [HostedSessionInfo],
         hostID: String,
         owner: String,
         isShown: (HostedSessionInfo) -> Bool,
         isEnding: (HostedSessionInfo) -> Bool,
-        awaitingRestore: [WorkspaceSessionRecord],
-        machine: String? = nil
+        awaitingRestore: @autoclosure () -> [WorkspaceSessionRecord],
+        machine: String? = nil,
+        row: ((HostedSessionInfo) -> BackgroundSession)? = nil
     ) -> [BackgroundSession] {
-        sessions
+        lazy var awaiting = awaitingRestore()
+        return sessions
             .filter { info in
                 info.owner == owner
                     && !isShown(info)
                     && !isEnding(info)
-                    && !awaitingRestore.contains { record in
+                    && !awaiting.contains { record in
                         PersistentLocalSessions.record(record, names: info, hostID: hostID, owner: owner, includingAttached: true)
                     }
             }
-            .map { BackgroundSessionPresentation.session($0, hostID: hostID, machine: machine) }
+            .map { row?($0) ?? BackgroundSessionPresentation.session($0, hostID: hostID, machine: machine) }
             .sorted { lhs, rhs in
                 let byProject = lhs.projectName.localizedCaseInsensitiveCompare(rhs.projectName)
                 if byProject != .orderedSame { return byProject == .orderedAscending }
@@ -219,6 +223,28 @@ enum BackgroundSessions {
                 if lhsCreated != rhsCreated { return lhsCreated > rhsCreated }
                 return lhs.id < rhs.id
             }
+    }
+}
+
+/// The rows last made from the host's infos: a row
+/// (`BackgroundSessionPresentation.session`) follows from its info, host and
+/// machine alone, and naming a session anew was most of what a refresh of
+/// an unchanged list did, so one whose info is the same again keeps its row.
+struct BackgroundSessionRows {
+    private var made: [String: (info: HostedSessionInfo, hostID: String, machine: String?, row: BackgroundSession)] = [:]
+
+    mutating func row(for info: HostedSessionInfo, hostID: String, machine: String?) -> BackgroundSession {
+        if let made = made[info.id], made.hostID == hostID, made.machine == machine, made.info == info {
+            return made.row
+        }
+        let row = BackgroundSessionPresentation.session(info, hostID: hostID, machine: machine)
+        made[info.id] = (info, hostID, machine, row)
+        return row
+    }
+
+    /// Forgets the rows of sessions other than `ids`.
+    mutating func keep(_ ids: Set<String>) {
+        made = made.filter { ids.contains($0.key) }
     }
 }
 
@@ -285,6 +311,10 @@ final class BackgroundSessionsModel: ObservableObject {
 
     @Published private(set) var sessions: [BackgroundSession] = []
     let summary = BackgroundSessionsSummary()
+    /// Sent after each of the list's one-second refreshes (`start`): the
+    /// menu bar's agents (`MenuBarAgentsModel`) refresh on the same wakeup,
+    /// after this list, rather than on a timer of their own.
+    let ticks = PassthroughSubject<Void, Never>()
     let localSessions: PersistentLocalSessions
     /// The device these sessions are on (a section of This Mac's model);
     /// nil for This Mac's own model.
@@ -332,6 +362,8 @@ final class BackgroundSessionsModel: ObservableObject {
     /// looked at (`noteProgramStatus`), nil for one that reported none: what
     /// a change is measured against. Only sessions in the list have one.
     private var lastProgramStatus: [String: ProgramStatus?] = [:]
+    /// The rows of the sessions listed (`BackgroundSessionRows`).
+    private var rows = BackgroundSessionRows()
     /// The host whose saved unread marks were read into `unreadSessionIDs`.
     private var unreadLoadedForHost: String?
     /// How long the list has shown each ended session while the app was
@@ -446,7 +478,10 @@ final class BackgroundSessionsModel: ObservableObject {
                 timer.invalidate()
                 return
             }
-            MainActor.assumeIsolated { self.refresh() }
+            MainActor.assumeIsolated {
+                self.refresh()
+                self.ticks.send()
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
@@ -589,6 +624,7 @@ final class BackgroundSessionsModel: ObservableObject {
             listed = knownHostID.map { backgroundSessions(in: infos, hostID: $0) } ?? []
             isFromControl = knownHostID != nil
         }
+        rows.keep(Set(listed.map(\.id)))
         if isFromControl, let hostID = knownHostID {
             noteProgramStatus(of: listed, in: infos, hostID: hostID)
         }
@@ -617,8 +653,14 @@ final class BackgroundSessionsModel: ObservableObject {
     private func noteProgramStatus(of listed: [BackgroundSession], in infos: [HostedSessionInfo], hostID: String) {
         let ids = Set(listed.map(\.id))
         lastProgramStatus = lastProgramStatus.filter { ids.contains($0.key) }
+        // Each listed session's info (the first `infos` has), found in one
+        // pass rather than a search of `infos` per session.
+        var listedInfos: [String: HostedSessionInfo] = [:]
+        for info in infos where ids.contains(info.id) && listedInfos[info.id] == nil {
+            listedInfos[info.id] = info
+        }
         for item in listed {
-            guard let info = infos.first(where: { $0.id == item.id }) else { continue }
+            guard let info = listedInfos[item.id] else { continue }
             noteProgramStatus(info, item: item, hostID: hostID)
         }
     }
@@ -831,20 +873,22 @@ final class BackgroundSessionsModel: ObservableObject {
         guard localSessions.instanceUnavailableReason == nil,
               sessions.contains(where: { $0.owner == localSessions.owner })
         else { return [] }
-        let attachedTabs = attachedTabs
+        let showing = localSessions.openTabsShowing(hostID: hostID, attachedTabs: attachedTabs)
         let endsRequested = endsRequested
+        let machine = device?.name
         return BackgroundSessions.classify(
             sessions,
             hostID: hostID,
             owner: localSessions.owner,
-            isShown: { localSessions.isShownByOpenTab($0, hostID: hostID, attachedTabs: attachedTabs) },
+            isShown: showing.shows,
             isEnding: { info in
                 endsRequested.contains(info.id)
                     || localSessions.isEnding(info.id)
                     || localSessions.isScheduledToEnd(info, hostID: hostID)
             },
             awaitingRestore: registry.sessionRecordsAwaitingRestore(),
-            machine: device?.name
+            machine: machine,
+            row: { self.rows.row(for: $0, hostID: hostID, machine: machine) }
         )
     }
 

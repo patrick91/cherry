@@ -55,8 +55,7 @@ private let loginEnvironment: [String: String] = [
 private let account = HostedLaunchAccount(
     userName: "tester",
     homeDirectory: "/Users/tester",
-    shell: "/bin/zsh",
-    hushLogin: false
+    shell: "/bin/zsh"
 )
 
 private func context(
@@ -524,14 +523,10 @@ func hostedLaunchMatchesNativeLaunchForEveryTabKind(shell: String) throws {
 @Test func hostedLaunchRunsNoLoginWrapperAndFallsBackWithoutAnAccount() {
     // login(1) exits 0 whatever the shell's status, so hosted sessions run
     // without it; there is no banner for ~/.hushlogin to silence.
-    var quiet = account
-    quiet.hushLogin = true
     let terminal = configuration(.terminal, shell: "/bin/zsh")
-    for account in [account, quiet] {
-        let argv = HostedLaunchSpec.make(for: terminal, context: context(account: account)).argv
-        #expect(argv == ["/bin/bash", "--noprofile", "--norc", "-c", "exec -l /bin/zsh -l"])
-        #expect(!argv.contains(HostedLaunchSpec.loginProgram))
-    }
+    let argv = HostedLaunchSpec.make(for: terminal, context: context(account: account)).argv
+    #expect(argv == ["/bin/bash", "--noprofile", "--norc", "-c", "exec -l /bin/zsh -l"])
+    #expect(!argv.contains("/usr/bin/login"))
 
     let unwrapped = HostedLaunchSpec.make(for: terminal, context: context(account: nil))
     #expect(unwrapped.argv == ["/bin/sh", "-c", "/bin/zsh -l"])
@@ -544,7 +539,6 @@ func hostedLaunchMatchesNativeLaunchForEveryTabKind(shell: String) throws {
     #expect(current.userName == String(cString: record.pointee.pw_name))
     #expect(current.homeDirectory == String(cString: record.pointee.pw_dir))
     #expect(current.shell == String(cString: record.pointee.pw_shell))
-    #expect(current.hushLogin == FileManager.default.fileExists(atPath: "\(current.homeDirectory)/.hushlogin"))
 }
 
 // MARK: - Ghostty shell integration

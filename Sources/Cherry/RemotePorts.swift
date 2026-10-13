@@ -230,12 +230,7 @@ final class RemotePortForwards {
         self.masters = masters
         self.shell = shell
         self.freePort = freePort
-        stopObserver = NotificationCenter.default.addObserver(
-            forName: HostSSHMasterManager.masterDidStopNotification, object: masters, queue: .main
-        ) { [weak self] notification in
-            guard let destination = notification.userInfo?[HostSSHMasterManager.destinationKey] as? String else { return }
-            MainActor.assumeIsolated { self?.masterStopped(destination) }
-        }
+        stopObserver = masters.observeStops { [weak self] destination in self?.masterStopped(destination) }
     }
 
     deinit {
@@ -340,9 +335,8 @@ final class RemotePortForwards {
                 destination: destination, machine: machine, remoteHost: remoteHost,
                 remotePort: remotePort, localPort: localPort
             )
-            let result = await Self.runSSH(
-                shell: shell,
-                arguments: Self.commandArguments("forward", forward: forward, controlPath: controlPath)
+            let result = await shell.runMasterCommand(
+                Self.commandArguments("forward", forward: forward, controlPath: controlPath)
             )
             if result.status == 0 {
                 forwards[key] = forward
@@ -399,31 +393,15 @@ final class RemotePortForwards {
         guard let controlPath = masters.controlPathIfUp(for: forward.destination) else { return }
         let shell = shell
         Task { @MainActor in
-            _ = await Self.runSSH(
-                shell: await shell(),
-                arguments: Self.commandArguments("cancel", forward: forward, controlPath: controlPath)
-            )
+            _ = await shell().runMasterCommand(Self.commandArguments("cancel", forward: forward, controlPath: controlPath))
         }
     }
 
     /// `ssh -o ControlPath=<master> -O forward|cancel -L <spec> -- <destination>`.
     static func commandArguments(_ command: String, forward: RemotePortForward, controlPath: String) -> [String] {
-        [
-            "-o", HostSSHMasterManager.controlPathOption(controlPath),
-            "-o", "BatchMode=yes",
-            "-O", command,
-            "-L", forward.specification,
-            "--", forward.destination,
-        ]
-    }
-
-    private static func runSSH(shell: RemoteDeviceShell, arguments: [String]) async -> (status: Int32?, errors: String) {
-        await Task.detached(priority: .userInitiated) {
-            let result = HostSpawnedProcess.run(
-                executable: shell.sshExecutable, arguments: arguments, environment: shell.environment, timeout: 15
-            )
-            return (status: result.exitCode, errors: result.errors)
-        }.value
+        HostSSHMasterManager.commandArguments(
+            command, destination: forward.destination, controlPath: controlPath, extra: ["-L", forward.specification]
+        )
     }
 
     /// A TCP port no one listens on at This Mac's IPv4 loopback (where

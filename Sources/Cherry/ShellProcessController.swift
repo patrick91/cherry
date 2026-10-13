@@ -525,17 +525,12 @@ final class ShellProcessController: @unchecked Sendable {
         } else if let startupCommand = configuration.startupCommand, !startupCommand.isEmpty {
             // No shell integration: a login+interactive shell that execs the
             // startup command (as `launch()`'s argv does).
-            command = "\(shellPath) -l -i -c \(singleQuoted("exec \(startupCommand)"))"
+            command = "\(shellPath) -l -i -c \(ShellQuoting.singleQuoted("exec \(startupCommand)"))"
         } else {
             command = "\(shellPath) -l"
         }
 
         return (command, environment)
-    }
-
-    /// POSIX single-quote a token so ghostty's shell-style splitter keeps it whole.
-    private static func singleQuoted(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     struct TerminfoSelection {

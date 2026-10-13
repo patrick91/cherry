@@ -4,6 +4,14 @@ import Foundation
 import Testing
 @testable import Cherry
 
+/// A flag the fake helper's reply closures set and read off the main actor.
+private final class HostControlFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+    func set() { lock.withLock { storage = true } }
+    var value: Bool { lock.withLock { storage } }
+}
+
 @MainActor
 private final class EventRecorder {
     private(set) var events: [HostSessionEvent] = []
@@ -46,7 +54,7 @@ private func waitFor(_ timeout: TimeInterval = 5, _ condition: () -> Bool) async
     #expect(list.sessions.map(\.id) == ["s1", "s2"])
     #expect(local.state == .connected)
     #expect(local.hostID == "host-a")
-    #expect(local.isSubscribed)
+    #expect(fake.requests("subscribe").count == 1)
     #expect(local.sessions == list.sessions)
     // The helper is `cherry control`, with the login shell's variables and
     // none of a Cherry tab's identity (the test may run inside a Cherry tab).
@@ -129,7 +137,6 @@ private final class HeldRequests: @unchecked Sendable {
     let control = makeFakeHostControl(fake, hostStore: store)
     defer { control.disconnect() }
     let recorder = EventRecorder(control)
-    let stream = control.eventStream()
     try await control.connect()
     let connection = try #require(fake.connections.last)
 
@@ -152,12 +159,6 @@ private final class HeldRequests: @unchecked Sendable {
 
     #expect(await recorder.wait { $0.count == sent.count + 1 })
     #expect(recorder.events == sent + [.bell(id: "last")])
-    var streamed: [HostSessionEvent] = []
-    for await event in stream {
-        streamed.append(event)
-        if streamed.count == sent.count + 1 { break }
-    }
-    #expect(streamed == recorder.events)
     // added → listed, changed → replaced, exited → exited, removed → gone.
     #expect(control.sessions == [titled])
 
@@ -572,28 +573,6 @@ private final class HeldRequests: @unchecked Sendable {
     }
     #expect(await waitFor { fake.launches.count == 2 && control.state == .connected })
     #expect(fake.connections.first?.isClosed == true)
-
-    // Without events the idle limit applies, so pings come more often than
-    // the heartbeat interval.
-    #expect(HostProtocol.idleTimeout / 2 < HostProtocol.heartbeatInterval)
-}
-
-@Test @MainActor func HostControlWithoutEventsPollsForASessionToEnd() async throws {
-    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
-    defer { defaults.removePersistentDomain(forName: suite) }
-    let fake = FakeControlHelper(sessions: [hostedSession("s1")])
-    fake.supportsSubscribe = false
-    let control = makeFakeHostControl(fake, hostStore: store)
-    defer { control.disconnect() }
-    try await control.connect()
-    #expect(!control.isSubscribed)
-    #expect(control.state == .connected)
-
-    fake.sessions = [hostedSession("s1", state: .exited, exitCode: 0)]
-    let lists = fake.requests("list").count
-    #expect(try await control.waitForSession("s1", timeout: .seconds(5)) { $0?.isRunning == false })
-    #expect(fake.requests("list").count > lists)
-    #expect(try await !control.waitForSession("s1", timeout: .milliseconds(80)) { $0 == nil })
 }
 
 @Test @MainActor func HostControlWaitingForEventsFallsBackToPollingWhenTheConnectionDrops() async throws {
@@ -603,7 +582,7 @@ private final class HeldRequests: @unchecked Sendable {
     let control = makeFakeHostControl(fake, hostStore: store)
     defer { control.disconnect() }
     try await control.connect()
-    #expect(control.isSubscribed)
+    #expect(fake.requests("subscribe").count == 1)
 
     let waiting = Task { try await control.waitForSession("s1", timeout: .seconds(5)) { $0?.isRunning == false } }
     try await Task.sleep(for: .milliseconds(50))

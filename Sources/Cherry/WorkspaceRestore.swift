@@ -661,13 +661,7 @@ private final class ControlPlaneRestore {
             }
             guard claimed.insert(Self.key(hostID: list.hostID, sessionID: info.id)).inserted else { continue }
             let attachment = HostedSessionAttachment(
-                host: host,
-                hostID: list.hostID,
-                sessionID: info.id,
-                name: info.name,
-                remoteWorkingDirectory: info.cwd,
-                executablePath: executable.path,
-                environment: environment
+                host: host, hostID: list.hostID, info: info, executablePath: executable.path, environment: environment
             )
             result.sessions.append(built(request.workspace.makeRestoredHostedSession(
                 attachment,
@@ -978,12 +972,8 @@ final class RestoredTabLaunchQueue {
             } else {
                 delay = max(now - started, .seconds(interval))
             }
-            schedule(after: Self.seconds(delay))
+            schedule(after: delay.timeInterval)
         }
-    }
-
-    private static func seconds(_ duration: Duration) -> TimeInterval {
-        Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
     }
 
     /// The next tab to launch: a shown one, else a background one whose

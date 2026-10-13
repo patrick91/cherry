@@ -406,12 +406,7 @@ final class RemoteMCPForwards {
         self.masters = masters
         self.shell = shell
         self.server = server
-        stopObserver = NotificationCenter.default.addObserver(
-            forName: HostSSHMasterManager.masterDidStopNotification, object: masters, queue: .main
-        ) { [weak self] notification in
-            guard let destination = notification.userInfo?[HostSSHMasterManager.destinationKey] as? String else { return }
-            MainActor.assumeIsolated { self?.masterStopped(destination) }
-        }
+        stopObserver = masters.observeStops { [weak self] destination in self?.masterStopped(destination) }
     }
 
     deinit {
@@ -495,16 +490,14 @@ final class RemoteMCPForwards {
         temporaryDirectoryFound(deviceID, temporary)
         let remote = directory + "/control.sock"
         let local = try server.addDeviceListener(deviceID: deviceID)
-        let result = await Self.runSSH(
-            shell: shell,
-            arguments: Self.commandArguments("forward", remote: remote, local: local.path, controlPath: controlPath, destination: target.destination)
+        let result = await shell.runMasterCommand(
+            Self.commandArguments("forward", remote: remote, local: local.path, controlPath: controlPath, destination: target.destination)
         )
         guard generations[deviceID, default: 0] == generation else {
             // Stopped meanwhile: the forward just made goes too.
             if result.status == 0 {
-                _ = await Self.runSSH(
-                    shell: shell,
-                    arguments: Self.commandArguments("cancel", remote: remote, local: local.path, controlPath: controlPath, destination: target.destination)
+                _ = await shell.runMasterCommand(
+                    Self.commandArguments("cancel", remote: remote, local: local.path, controlPath: controlPath, destination: target.destination)
                 )
                 _ = await shell.run(Self.cleanupScript(directoryName: name), on: target.destination)
             }
@@ -535,9 +528,8 @@ final class RemoteMCPForwards {
         else { return }
         var shell = await shell()
         shell.controlPath = controlPath
-        _ = await Self.runSSH(
-            shell: shell,
-            arguments: Self.commandArguments("cancel", remote: remote, local: local, controlPath: controlPath, destination: target.destination)
+        _ = await shell.runMasterCommand(
+            Self.commandArguments("cancel", remote: remote, local: local, controlPath: controlPath, destination: target.destination)
         )
         _ = await shell.run(
             Self.cleanupScript(directoryName: RemoteMCPPaths.directoryName(installationID: target.installationID, deviceID: deviceID)),
@@ -561,13 +553,9 @@ final class RemoteMCPForwards {
 
     /// `ssh -o ControlPath=<master> -O forward|cancel -R <there>:<here> -- <destination>`.
     nonisolated static func commandArguments(_ command: String, remote: String, local: String, controlPath: String, destination: String) -> [String] {
-        [
-            "-o", HostSSHMasterManager.controlPathOption(controlPath),
-            "-o", "BatchMode=yes",
-            "-O", command,
-            "-R", "\(remote):\(local)",
-            "--", destination,
-        ]
+        HostSSHMasterManager.commandArguments(
+            command, destination: destination, controlPath: controlPath, extra: ["-R", "\(remote):\(local)"]
+        )
     }
 
     /// Whether ssh's error says the server refused the forward (sshd's
@@ -611,14 +599,5 @@ final class RemoteMCPForwards {
             "if [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -O \"$d\" ]; then /bin/rm -f \"$d/control.sock\"; /bin/rmdir \"$d\" 2>/dev/null; fi",
             "exit 0",
         ].joined(separator: "\n") + "\n"
-    }
-
-    private static func runSSH(shell: RemoteDeviceShell, arguments: [String]) async -> (status: Int32?, errors: String) {
-        await Task.detached(priority: .userInitiated) {
-            let result = HostSpawnedProcess.run(
-                executable: shell.sshExecutable, arguments: arguments, environment: shell.environment, timeout: 15
-            )
-            return (status: result.exitCode, errors: result.errors)
-        }.value
     }
 }

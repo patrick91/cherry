@@ -60,8 +60,6 @@ struct HostedLaunchSpec: Equatable, Sendable {
 
     /// The shell layer between the host and the user's login shell.
     static let launchShell = "/bin/bash"
-    /// Native tabs' login(1) wrapper, which hosted sessions leave out.
-    static let loginProgram = "/usr/bin/login"
     /// The TERM a session gets when no staged terminfo describes
     /// `xterm-ghostty`, as Ghostty itself does without its resources.
     static let fallbackTerm = "xterm-256color"
@@ -440,15 +438,11 @@ struct HostedLaunchAccount: Equatable, Sendable {
     var userName: String
     var homeDirectory: String
     var shell: String
-    /// `~/.hushlogin` exists. Ghostty checks it itself and passes `-q` to
-    /// login(1) for native tabs; hosted sessions run no login(1), so they
-    /// print no banner either way.
-    var hushLogin: Bool
 
     /// The current user's passwd entry, or nil when there is none (Ghostty
     /// then runs the command without the login wrapper, and a hosted
     /// session through `/bin/sh`).
-    static func current(fileManager: FileManager = .default) -> HostedLaunchAccount? {
+    static func current() -> HostedLaunchAccount? {
         let suggested = sysconf(_SC_GETPW_R_SIZE_MAX)
         var capacity = suggested > 0 ? max(Int(suggested), 1024) : 16384
         while capacity <= 1 << 20 {
@@ -471,12 +465,7 @@ struct HostedLaunchAccount: Equatable, Sendable {
                 continue
             }
             guard let entry = lookup.entry, !entry.name.isEmpty else { return nil }
-            return HostedLaunchAccount(
-                userName: entry.name,
-                homeDirectory: entry.home,
-                shell: entry.shell,
-                hushLogin: !entry.home.isEmpty && fileManager.fileExists(atPath: "\(entry.home)/.hushlogin")
-            )
+            return HostedLaunchAccount(userName: entry.name, homeDirectory: entry.home, shell: entry.shell)
         }
         return nil
     }

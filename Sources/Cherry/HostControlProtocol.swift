@@ -29,20 +29,12 @@ enum HostProtocol {
     static let maxTagBytes = 16 * 1_024
     static let defaultCols = 120
     static let defaultRows = 32
-    /// A connection that is neither attached nor subscribed must send a frame
-    /// at least this often.
-    static let idleTimeout: Duration = .seconds(10)
     /// Subscribed connections send `Ping` at least this often.
     static let heartbeatInterval: Duration = .seconds(15)
-    /// The host drops a subscribed connection that sent nothing for this long.
-    static let heartbeatTimeout: Duration = .seconds(45)
 
     enum ErrorCode {
         static let versionMismatch = "version_mismatch"
-        static let requestFailed = "request_failed"
-        static let unsupportedOperation = "unsupported_operation"
         static let unknownSession = "unknown_session"
-        static let notRunning = "not_running"
     }
 
     static func isValidSize(cols: Int, rows: Int) -> Bool {

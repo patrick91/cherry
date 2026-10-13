@@ -371,8 +371,7 @@ final class ProjectWindowRevealGate {
     typealias Schedule = @MainActor (_ delay: Duration, _ body: @escaping @MainActor () -> Void) -> Void
 
     static let mainQueueSchedule: Schedule = { delay, body in
-        let seconds = Double(delay.components.seconds) + Double(delay.components.attoseconds) / 1e18
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay.timeInterval) {
             MainActor.assumeIsolated { body() }
         }
     }

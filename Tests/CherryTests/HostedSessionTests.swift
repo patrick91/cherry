@@ -48,8 +48,8 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     for invalid in ["", "-oProxyCommand=bad", "host -p 22", "host\nother", "host\u{0}", "host;sh", "$(touch-bad)"] {
         #expect(throws: HostedSessionError.self) { try HostedSessionHost.ssh(invalid) }
     }
-    #expect(try HostedSessionHost.ssh(" user@work ").arguments == ["--host", "user@work"])
-    #expect(HostedSessionHost.local.arguments.isEmpty)
+    #expect(try HostedSessionHost.ssh(" user@work ").arguments(sshControlPath: nil) == ["--host", "user@work"])
+    #expect(HostedSessionHost.local.arguments(sshControlPath: nil).isEmpty)
     #expect(try HostedSessionHost.ssh("local").id != HostedSessionHost.local.id)
 }
 
@@ -150,11 +150,11 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
         name: "Editor", remoteWorkingDirectory: "/remote", executablePath: "/tmp/it's cherry"
     )
     let statusFile = URL(fileURLWithPath: "/tmp/it's status/status.json")
-    #expect(attachment.execCommand(statusFile: statusFile, takeover: true) == "'/tmp/it'\\''s cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'attach' 'id'\\'';$(touch bad)' '--takeover' '--detach-key' 'none' '--status-file' '/tmp/it'\\''s status/status.json'")
-    #expect(attachment.arguments(statusFile: nil) == [
+    #expect(attachment.execCommand(statusFile: statusFile, takeover: true, sshControlPath: nil) == "'/tmp/it'\\''s cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'attach' 'id'\\'';$(touch bad)' '--takeover' '--detach-key' 'none' '--status-file' '/tmp/it'\\''s status/status.json'")
+    #expect(attachment.arguments(statusFile: nil, sshControlPath: nil) == [
         "--host", "devbox", "--expected-host-id", "host-a", "attach", "id';$(touch bad)", "--detach-key", "none"
     ])
-    #expect(attachment.execCommand(statusFile: nil, clientID: "tab';$(touch bad)") == "'/tmp/it'\\''s cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'attach' 'id'\\'';$(touch bad)' '--detach-key' 'none' '--client-id' 'tab'\\'';$(touch bad)'")
+    #expect(attachment.execCommand(statusFile: nil, sshControlPath: nil, clientID: "tab';$(touch bad)") == "'/tmp/it'\\''s cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'attach' 'id'\\'';$(touch bad)' '--detach-key' 'none' '--client-id' 'tab'\\'';$(touch bad)'")
 }
 
 /// The fake CLI takes `--client-id` as the real one does (1 to 128 bytes),
@@ -251,10 +251,10 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     let permissions = try FileManager.default.attributesOfItem(atPath: first.path)[.posixPermissions] as? Int
     #expect(permissions == 0o700)
     // Nothing written yet: the adapter is still running.
-    #expect(HostedAttachmentStatusFile.read(from: first) == nil)
+    #expect(HostedAttachmentStatusFile.readEnding(from: first)?.status == nil)
     try Data(#"{"outcome":"taken_over","exit_code":null,"signal":null,"message":null}"#.utf8)
         .write(to: HostedAttachmentStatusFile.statusFileURL(in: first))
-    #expect(HostedAttachmentStatusFile.read(from: first) == .takenOver)
+    #expect(HostedAttachmentStatusFile.readEnding(from: first)?.status == .takenOver)
     HostedAttachmentStatusFile.removeLaunchDirectory(first, after: 0)
     #expect(!FileManager.default.fileExists(atPath: first.path))
 }
@@ -283,12 +283,12 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     let file = HostedAttachmentStatusFile.statusFileURL(in: launch)
     // A running adapter's state is no outcome: it has not ended.
     try HostedSessionFakeCLI.writeStatus(HostedSessionFakeCLI.attachedStatus(reconnecting: true), to: file)
-    #expect(HostedAttachmentStatusFile.read(from: launch) == nil)
+    #expect(HostedAttachmentStatusFile.readEnding(from: launch)?.status == nil)
     #expect(HostedAttachmentStatusFile.readLive(from: launch) == HostedAdapterLiveStatus(reconnecting: true))
     // A live state left behind by an adapter that was killed means it ended.
     #expect(HostedAttachmentStatusFile.status(from: try Data(contentsOf: file)) == .disconnected(nil))
     try HostedSessionFakeCLI.writeStatus(#"{"outcome":"exited","exit_code":2,"signal":null,"message":null}"#, to: file)
-    #expect(HostedAttachmentStatusFile.read(from: launch) == .exited(code: 2, signal: nil))
+    #expect(HostedAttachmentStatusFile.readEnding(from: launch)?.status == .exited(code: 2, signal: nil))
     #expect(HostedAttachmentStatusFile.readLive(from: launch) == nil)
 }
 

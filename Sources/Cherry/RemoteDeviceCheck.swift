@@ -42,17 +42,11 @@ struct RemoteDeviceShell: Sendable {
             let environment = HostControl.sshMasterEnvironment(
                 base: ProcessInfo.processInfo.environment, login: HostedSessionLoginEnvironment.shared.resolve()
             )
-            return RemoteDeviceShell(sshExecutable: sshExecutable(environment: environment), environment: environment)
+            // The same ssh as the masters its scripts may go through.
+            return RemoteDeviceShell(
+                sshExecutable: HostSSHMasterManager.sshExecutable(in: environment), environment: environment
+            )
         }.value
-    }
-
-    /// `ssh` on the environment's PATH, else /usr/bin/ssh.
-    static func sshExecutable(environment: [String: String]) -> String {
-        for directory in (environment["PATH"] ?? "").split(separator: ":") where !directory.isEmpty {
-            let candidate = "\(directory)/ssh"
-            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
-        }
-        return "/usr/bin/ssh"
     }
 
     /// The ssh arguments for running `sh -s` on `destination`.
@@ -80,6 +74,21 @@ struct RemoteDeviceShell: Sendable {
         let shell = self
         return await Self.onOwnThread {
             shell.runSynchronously(script, on: destination).text
+        }
+    }
+
+    /// Runs `ssh <arguments>`, a command to a master
+    /// (`HostSSHMasterManager.commandArguments`), with this ssh and
+    /// environment for at most 15 s, on a thread of its own: its exit
+    /// status (nil when it was signalled or outlived that) and the start of
+    /// its standard error.
+    func runMasterCommand(_ arguments: [String]) async -> (status: Int32?, errors: String) {
+        let shell = self
+        return await Self.onOwnThread {
+            let result = HostSpawnedProcess.run(
+                executable: shell.sshExecutable, arguments: arguments, environment: shell.environment, timeout: 15
+            )
+            return (status: result.exitCode, errors: result.errors)
         }
     }
 
@@ -165,43 +174,21 @@ struct RemoteDeviceShell: Sendable {
         input: String,
         timeout: TimeInterval
     ) -> DataOutput {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.environment = environment
-        let stdin = Pipe()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardInput = stdin
-        process.standardOutput = stdout
-        process.standardError = stderr
-        do {
-            try process.run()
-        } catch {
-            return DataOutput(status: 255, standardOutput: Data(), standardError: "Could not run ssh: \(error.localizedDescription)")
+        let result = CapturedProcess.run(
+            executable: URL(fileURLWithPath: executable),
+            arguments: arguments,
+            environment: environment,
+            input: Data(input.utf8),
+            timeout: timeout
+        )
+        if let launchError = result.launchError {
+            return DataOutput(status: 255, standardOutput: Data(), standardError: "Could not run ssh: \(launchError.localizedDescription)")
         }
-        let group = DispatchGroup()
-        let outData = PipeOutputBox()
-        let errData = PipeOutputBox()
-        readToEnd(stdout.fileHandleForReading, into: outData, group: group)
-        readToEnd(stderr.fileHandleForReading, into: errData, group: group)
-        stdin.fileHandleForWriting.write(Data(input.utf8))
-        try? stdin.fileHandleForWriting.close()
-        var timedOut = false
-        if group.wait(timeout: .now() + timeout) == .timedOut {
-            timedOut = true
-            process.terminate()
-            if group.wait(timeout: .now() + 2) == .timedOut {
-                kill(process.processIdentifier, SIGKILL)
-                _ = group.wait(timeout: .now() + 2)
-            }
-        }
-        process.waitUntilExit()
         return DataOutput(
-            status: timedOut ? 255 : process.terminationStatus,
-            standardOutput: outData.data,
-            standardError: String(decoding: errData.data, as: UTF8.self),
-            timedOut: timedOut
+            status: result.timedOut ? 255 : result.status,
+            standardOutput: result.standardOutput,
+            standardError: String(decoding: result.standardError, as: UTF8.self),
+            timedOut: result.timedOut
         )
     }
 }
@@ -444,8 +431,9 @@ enum RemoteDeviceProbe {
         return singleQuoted(path)
     }
 
+    /// `ShellQuoting.singleQuoted`, which the device scripts here use.
     nonisolated static func singleQuoted(_ text: String) -> String {
-        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        ShellQuoting.singleQuoted(text)
     }
 
     /// Parses what the script printed (and how ssh ended).

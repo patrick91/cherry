@@ -207,41 +207,21 @@ struct MacOSServiceDetector: ServiceDetecting {
         )
     }
 
-    /// Runs `path` and returns its standard output, when it exits (not killed
-    /// by a signal, as the watchdog does after `timeout`) with one of
-    /// `acceptedStatuses`.
+    /// Runs `path` and returns its standard output, when it exits within
+    /// `timeout` (else it is stopped) with one of `acceptedStatuses`.
     static func runTool(
         path: String,
         arguments: [String],
         timeout: TimeInterval = 4.0,
         acceptedStatuses: Set<Int32> = [0]
     ) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = arguments
-
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-
         let startedAt = Date()
-        try process.run()
-
-        // Bound the wait: if ps/lsof ever hangs (weird network/filesystem state) it
-        // must not block forever even off the main actor. Terminating closes the
-        // pipe, which unblocks the read below.
-        let watchdog = DispatchWorkItem {
-            if process.isRunning { process.terminate() }
-        }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
-
-        // Read BEFORE waitUntilExit: large output (many listeners) can exceed the
-        // 64KB pipe buffer and deadlock if we wait first. readDataToEndOfFile drains
-        // until EOF (process exit or watchdog kill).
-        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        watchdog.cancel()
+        // Bounded: if ps/lsof ever hangs (weird network/filesystem state) it
+        // must not block forever even off the main actor.
+        let result = CapturedProcess.run(
+            executable: URL(fileURLWithPath: path), arguments: arguments, environment: nil, input: nil, timeout: timeout
+        )
+        if let launchError = result.launchError { throw launchError }
 
         // Diagnostic: service detection used to run on the main actor; if these ever
         // get slow under load it explains MCP latency. Now off-actor, but worth a log.
@@ -250,12 +230,11 @@ struct MacOSServiceDetector: ServiceDetecting {
             NSLog("[cherry] service-detect %@ took %.2fs", path, elapsed)
         }
 
-        if process.terminationReason == .exit, acceptedStatuses.contains(process.terminationStatus) {
-            return String(decoding: output, as: UTF8.self)
+        if result.exitedNormally, !result.timedOut, acceptedStatuses.contains(result.status) {
+            return String(decoding: result.standardOutput, as: UTF8.self)
         }
 
-        let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        let message = String(decoding: errorOutput, as: UTF8.self)
+        let message = String(decoding: result.standardError, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         throw CherryControlError(
             code: "service_detection_failed",

@@ -161,6 +161,16 @@ final class HostSSHMasterManager: @unchecked Sendable {
     static let masterDidStopNotification = Notification.Name("CherrySSHMasterDidStop")
     static let destinationKey = "destination"
 
+    /// Calls `handler` on the main actor with the destination of each of
+    /// this manager's first masters that stops (`masterDidStopNotification`).
+    /// The caller removes the observer it returns.
+    func observeStops(_ handler: @escaping @MainActor @Sendable (String) -> Void) -> NSObjectProtocol {
+        NotificationCenter.default.addObserver(forName: Self.masterDidStopNotification, object: self, queue: .main) { notification in
+            guard let destination = notification.userInfo?[Self.destinationKey] as? String else { return }
+            MainActor.assumeIsolated { handler(destination) }
+        }
+    }
+
     let configuration: Configuration
     private let lock = NSLock()
     private var masters: [String: Master] = [:]
@@ -368,15 +378,9 @@ final class HostSSHMasterManager: @unchecked Sendable {
         }
     }
 
+    /// The destination's first master's status.
     func status(of destination: String) -> Status? {
-        lock.withLock {
-            masters[destination].map {
-                Status(
-                    phase: $0.phase, controlPath: $0.controlPath, lastError: $0.lastError,
-                    leases: $0.leases.count, launches: $0.launches.count, failures: $0.failures
-                )
-            }
-        }
+        shardStatuses(of: destination).first { $0.shard == 1 }
     }
 
     /// Stops every master now and for good (the app is quitting). Returns
@@ -439,7 +443,14 @@ final class HostSSHMasterManager: @unchecked Sendable {
         return directory
     }
 
-    private static let sweepOnce = HostControlFlag()
+    /// Starts the sweep the first time it is read: a static is initialised
+    /// once.
+    private static let sweep: Void = {
+        let parents = candidateParentDirectories
+        DispatchQueue.global(qos: .utility).async {
+            for parent in parents { removeAbandonedDirectories(in: parent) }
+        }
+    }()
 
     /// Stops the masters that app runs which are no longer running left
     /// behind (a crash, a kill), and removes their socket directories, in
@@ -449,12 +460,7 @@ final class HostSSHMasterManager: @unchecked Sendable {
     /// manager calls it when it is first used, whether or not any master is
     /// ever needed.
     static func sweepAbandonedMasters() {
-        guard !sweepOnce.value else { return }
-        sweepOnce.set()
-        let parents = candidateParentDirectories
-        DispatchQueue.global(qos: .utility).async {
-            for parent in parents { removeAbandonedDirectories(in: parent) }
-        }
+        _ = sweep
     }
 
     /// Moves a stopped master to starting; the caller then calls `launch`.
@@ -722,9 +728,12 @@ final class HostSSHMasterManager: @unchecked Sendable {
         ]
     }
 
-    /// `ssh -O <command>` against the master's socket.
-    static func commandArguments(_ command: String, destination: String, controlPath: String) -> [String] {
-        ["-o", controlPathOption(controlPath), "-o", "BatchMode=yes", "-O", command, "--", destination]
+    /// `ssh -O <command>` against the master's socket; `extra` (a forward's
+    /// `-L` or `-R` and its specification) goes before the destination.
+    static func commandArguments(
+        _ command: String, destination: String, controlPath: String, extra: [String] = []
+    ) -> [String] {
+        ["-o", controlPathOption(controlPath), "-o", "BatchMode=yes", "-O", command] + extra + ["--", destination]
     }
 
     /// ssh binds the socket at `<path>.<16 random characters>` before
@@ -823,22 +832,5 @@ final class HostSSHMasterManager: @unchecked Sendable {
     }
 }
 
-/// Keeps an SSH master running while held. Releasing twice is harmless.
-final class HostSSHMasterLease: @unchecked Sendable {
-    private let lock = NSLock()
-    private var onRelease: (@Sendable () -> Void)?
-
-    init(onRelease: @escaping @Sendable () -> Void) {
-        self.onRelease = onRelease
-    }
-
-    deinit { release() }
-
-    func release() {
-        let action = lock.withLock { () -> (@Sendable () -> Void)? in
-            defer { onRelease = nil }
-            return onRelease
-        }
-        action?()
-    }
-}
+/// Keeps an SSH master running while held (`HostLease`).
+typealias HostSSHMasterLease = HostLease

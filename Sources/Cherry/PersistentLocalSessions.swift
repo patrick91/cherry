@@ -522,13 +522,7 @@ final class PersistentHostSessions {
     /// This app cannot run local sessions: a disk image or App Translocation
     /// copy, or no `cherry` helper. Cheap (file checks only).
     static func localInstallationUnavailableReason() -> String? {
-        if let reason = HostedSessionInstallation.localHostUnavailableReason() { return reason }
-        do {
-            _ = try HostedSessionClient.installed()
-            return nil
-        } catch {
-            return (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
-        }
+        HostedSessionInstallation.localHostUnavailableReason() ?? remoteInstallationUnavailableReason()
     }
 
     /// This app cannot reach other Macs' hosts: no `cherry` helper (it runs
@@ -539,7 +533,7 @@ final class PersistentHostSessions {
             _ = try HostedSessionClient.installed()
             return nil
         } catch {
-            return (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
+            return error.localizedDescription
         }
     }
 
@@ -672,7 +666,7 @@ final class PersistentHostSessions {
             status.lastLaunchFailure = failure
         }
         guard Self.meansHostUnavailable(error) else { return }
-        let reason = "\(Self.capitalizedFirst(profile.hostPhrase)) could not start a session: \(Self.errorMessage(error))"
+        let reason = "\(Self.capitalizedFirst(profile.hostPhrase)) could not start a session: \(error.localizedDescription)"
         launchFailure = (reason, Date().addingTimeInterval(configuration.unavailableRetryInterval))
         publish(instanceUnavailableReason ?? installationCheck?.reason ?? reason)
     }
@@ -682,11 +676,7 @@ final class PersistentHostSessions {
     /// (the session limit, a holder that failed to start, a daemon whose
     /// executable was removed), else what went wrong reaching it.
     nonisolated static func launchFailureReason(_ error: Error) -> String {
-        errorMessage(error)
-    }
-
-    private nonisolated static func errorMessage(_ error: Error) -> String {
-        (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
+        error.localizedDescription
     }
 
     /// Whether a failed Create says the local host cannot run sessions now:
@@ -775,7 +765,7 @@ final class PersistentHostSessions {
             cols: min(max(request.columns, 2), 500),
             rows: min(max(request.rows, 1), 200),
             owner: owner,
-            tags: Self.tags(for: request, requestID: requestID, resourcesCopy: spec.resourcesCopy),
+            tags: Self.tags(for: request, resourcesCopy: spec.resourcesCopy),
             // A program that asks sees the colours of the terminal it is
             // shown in, as in a native tab.
             colors: terminalColors(),
@@ -805,13 +795,8 @@ final class PersistentHostSessions {
         noteLaunchSucceeded()
         return PersistentSessionLaunch(
             attachment: HostedSessionAttachment(
-                host: profile.host,
-                hostID: hostID,
-                sessionID: info.id,
-                name: info.name,
-                remoteWorkingDirectory: info.cwd,
-                executablePath: executable.path,
-                environment: loginEnvironment ?? [:]
+                host: profile.host, hostID: hostID, info: info,
+                executablePath: executable.path, environment: loginEnvironment ?? [:]
             ),
             info: info,
             loginPathProblem: spec.loginPathProblem
@@ -839,13 +824,7 @@ final class PersistentHostSessions {
         let host = profile.host
         return (list, { info in
             HostedSessionAttachment(
-                host: host,
-                hostID: list.hostID,
-                sessionID: info.id,
-                name: info.name,
-                remoteWorkingDirectory: info.cwd,
-                executablePath: executablePath,
-                environment: environment
+                host: host, hostID: list.hostID, info: info, executablePath: executablePath, environment: environment
             )
         })
     }
@@ -856,13 +835,8 @@ final class PersistentHostSessions {
         let control = control
         guard let hostID = control.hostID, let executable = control.executableURL else { return nil }
         return HostedSessionAttachment(
-            host: profile.host,
-            hostID: hostID,
-            sessionID: info.id,
-            name: info.name,
-            remoteWorkingDirectory: info.cwd,
-            executablePath: executable.path,
-            environment: control.loginEnvironment?.environment ?? [:]
+            host: profile.host, hostID: hostID, info: info,
+            executablePath: executable.path, environment: control.loginEnvironment?.environment ?? [:]
         )
     }
 
@@ -885,13 +859,7 @@ final class PersistentHostSessions {
                     && self.owningTab(of: info.id) == nil
                     && self.endings[info.id] == nil {
                     self.end(HostedSessionAttachment(
-                        host: profile.host,
-                        hostID: hostID,
-                        sessionID: info.id,
-                        name: info.name,
-                        remoteWorkingDirectory: info.cwd,
-                        executablePath: control.executableURL?.path ?? "",
-                        environment: [:]
+                        host: profile.host, hostID: hostID, info: info, executablePath: control.executableURL?.path ?? ""
                     ))
                 }
             }
@@ -1682,7 +1650,7 @@ final class PersistentHostSessions {
             do {
                 try await control.update(binding.sessionID, name: name, expectedHostID: binding.hostID)
             } catch {
-                SessionLog.error("could not rename session \(binding.sessionID): \(Self.errorMessage(error))")
+                SessionLog.error("could not rename session \(binding.sessionID): \(error.localizedDescription)")
             }
         }
     }
@@ -1847,11 +1815,11 @@ final class PersistentHostSessions {
         !info.isRunning && info.exitCode == 0 && info.exitSignal == nil
     }
 
-    static func tags(for request: PersistentSessionRequest, requestID: UUID, resourcesCopy: String? = nil) -> [String: String] {
+    static func tags(for request: PersistentSessionRequest, resourcesCopy: String? = nil) -> [String: String] {
         var tags = [
             PersistentSessionTag.tab: request.tabID.uuidString,
             PersistentSessionTag.kind: request.kind.rawValue,
-            PersistentSessionTag.launch: requestID.uuidString.lowercased()
+            PersistentSessionTag.launch: request.requestID.uuidString.lowercased()
         ]
         if let agentName = request.agentName?.nilIfEmpty { tags[PersistentSessionTag.agent] = agentName }
         if let commandName = request.commandName?.nilIfEmpty { tags[PersistentSessionTag.command] = commandName }

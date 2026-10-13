@@ -3313,7 +3313,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var hostedLaunchSizeFile: URL?
     private var announcedAdapterWindowSize: HostedAttachmentSizeFile.Content?
     /// The latest adapter's outcome may be resumed by launching it again
-    /// (`HostedAttachmentStatusFile.isRetryable`).
+    /// (`HostedAttachmentStatusFile.readEnding`'s `retryable`).
     private var hostedLaunchRetryable = false
     /// Brings this tab back when its adapter gave up while attached to an
     /// SSH host's session (`HostedReconnects`): the workspace's

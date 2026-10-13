@@ -24,15 +24,13 @@ struct HostedSessionHost: Codable, Hashable, Identifiable, Sendable {
         return HostedSessionHost(sshDestination: destination)
     }
 
-    /// The CLI's global options for this host. While the app's SSH master for
-    /// the destination is up, `--ssh-control-path` makes the CLI's ssh share
-    /// it. A process started with these arguments must hold a master lease
+    /// The CLI's global options for this host. With the control path of the
+    /// app's SSH master for the destination (while it is up),
+    /// `--ssh-control-path` makes the CLI's ssh share it: a process started
+    /// with these arguments must then hold a master lease
     /// (`HostSSHMasterManager`) for as long as it runs, or the master may
     /// stop under it.
-    var arguments: [String] {
-        arguments(sshControlPath: sshDestination.flatMap { HostSSHMasterManager.shared.controlPathIfUp(for: $0) })
-    }
-
+    ///
     /// `sshControlPath` is ignored for This Mac. `remoteHostPaths` says
     /// where the destination's cherry-host is when it is not on its login
     /// shell's PATH (a Mac Cherry installed it on,
@@ -162,10 +160,10 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
     let command: [String]
     let cols: Int
     let rows: Int
-    let state: HostedSessionState
+    private(set) var state: HostedSessionState
     let pid: UInt32?
-    let exitCode: UInt32?
-    let exitSignal: Int32?
+    private(set) var exitCode: UInt32?
+    private(set) var exitSignal: Int32?
     let attached: Bool
     /// The title the program set (OSC 0 or 2), when it set a non-empty one.
     let title: String?
@@ -173,7 +171,7 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
     /// percent-encoded `file://host/path` URI (OSC 7) or a plain path. See
     /// `reportedWorkingDirectory`.
     let pwd: String?
-    let foreground: HostedSessionForeground?
+    private(set) var foreground: HostedSessionForeground?
     /// How many clients are attached.
     let clients: Int
     /// The app variant that created the session.
@@ -219,10 +217,10 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
     /// `holder_lost` when its holder died (a crash, a kill), so the exit
     /// status (1) says nothing about the program. Nil while it runs, for an
     /// ordinary exit, and from an older host.
-    let endedBy: String?
+    private(set) var endedBy: String?
     /// Where the host logs what its holders report (a holder's panic): the
     /// file to look at when `endedBy` is `holder_lost`; nil when unknown.
-    let holderLog: String?
+    private(set) var holderLog: String?
 
     enum CodingKeys: String, CodingKey {
         case id, name, cwd, command, cols, rows, state, pid, attached, title, pwd, foreground, clients, owner, tags
@@ -415,15 +413,14 @@ struct HostedSessionInfo: Codable, Equatable, Identifiable, Sendable {
 
     /// This session after the host reported it exited.
     func exited(code: UInt32, signal: Int32?, end: HostSessionEnd? = nil) -> HostedSessionInfo {
-        HostedSessionInfo(
-            id: id, name: name, cwd: cwd, command: command, cols: cols, rows: rows,
-            state: .exited, pid: pid, exitCode: code, exitSignal: signal, attached: attached,
-            title: title, pwd: pwd, foreground: nil, clients: clients, owner: owner, tags: tags,
-            createdAt: createdAt, alternateScreen: alternateScreen, kittyKeyboardFlags: kittyKeyboardFlags,
-            applicationCursorKeys: applicationCursorKeys, bracketedPaste: bracketedPaste,
-            modifyOtherKeys: modifyOtherKeys, programStatus: programStatus, requestID: requestID,
-            endedBy: end?.reason ?? endedBy, holderLog: end?.holderLog ?? holderLog
-        )
+        var info = self
+        info.state = .exited
+        info.exitCode = code
+        info.exitSignal = signal
+        info.foreground = nil
+        info.endedBy = end?.reason ?? endedBy
+        info.holderLog = end?.holderLog ?? holderLog
+        return info
     }
 }
 
@@ -517,38 +514,16 @@ struct HostedSessionAttachment: Equatable, Sendable {
     /// adapter runs ssh, so it needs what a terminal tab's shell would see.
     var environment: [String: String] = [:]
 
-    /// The embedded adapter has no in-band detach key: Ctrl-] belongs to the
-    /// program (Vim tag jumps), and the tab's Disconnect button detaches.
-    ///
-    /// While the app's SSH master for the host is up, a launch (named by its
-    /// status file's private directory) shares it: the launch keeps the
-    /// master running until `HostedAttachmentStatusFile.removeLaunchDirectory`
-    /// removes that directory. Otherwise the adapter runs its own ssh, which
-    /// can still prompt in the tab.
-    ///
-    /// Compute this only to launch the adapter: the result depends on the
-    /// master's state at that moment. Once the launch directory is gone the
-    /// launch has ended, and computing it again keeps no master running.
-    func arguments(
-        statusFile: URL?,
-        takeover: Bool = false,
-        clientID: String? = nil,
-        masters: HostSSHMasterManager = .shared
-    ) -> [String] {
-        arguments(
-            statusFile: statusFile,
-            takeover: takeover,
-            sshControlPath: statusFile.flatMap { registerAdapterLaunch(statusFile: $0, masters: masters) },
-            clientID: clientID
-        )
-    }
-
     /// Registers one adapter launch (named by its status file's private
     /// directory) with the host's SSH master while the master is up, and
     /// returns the ControlPath the launch shares; nil for This Mac or when
-    /// the adapter runs its own ssh. The launch keeps the master running
-    /// until `HostedAttachmentStatusFile.removeLaunchDirectory` removes that
-    /// directory. Call it once per launch, when it starts.
+    /// the adapter runs its own ssh (which can still prompt in the tab).
+    /// The launch keeps the master running until
+    /// `HostedAttachmentStatusFile.removeLaunchDirectory` removes that
+    /// directory. Call it once per launch, when it starts: the result
+    /// depends on the master's state at that moment, and once the launch
+    /// directory is gone the launch has ended, so registering again keeps
+    /// no master running.
     func registerAdapterLaunch(statusFile: URL, masters: HostSSHMasterManager = .shared) -> String? {
         guard let destination = host.sshDestination else { return nil }
         let launch = HostedAttachmentStatusFile.launchKey(ofStatusFile: statusFile)
@@ -559,6 +534,9 @@ struct HostedSessionAttachment: Equatable, Sendable {
 
     /// The adapter's arguments for a launch registered with
     /// `registerAdapterLaunch` (`sshControlPath` is what it returned). Pure.
+    ///
+    /// The embedded adapter has no in-band detach key: Ctrl-] belongs to the
+    /// program (Vim tag jumps), and the tab's Disconnect button detaches.
     ///
     /// `clientID` names the client the adapter attaches as (a tab passes
     /// its id): when an adapter attaches a session with the id of one of
@@ -574,7 +552,7 @@ struct HostedSessionAttachment: Equatable, Sendable {
     /// changing (a full-screen transition).
     func arguments(
         statusFile: URL?,
-        takeover: Bool,
+        takeover: Bool = false,
         sshControlPath: String?,
         clientID: String? = nil,
         sizeFile: URL? = nil
@@ -589,16 +567,12 @@ struct HostedSessionAttachment: Equatable, Sendable {
         return arguments
     }
 
-    func execCommand(statusFile: URL?, takeover: Bool = false, clientID: String? = nil) -> String {
-        ([executablePath] + arguments(statusFile: statusFile, takeover: takeover, clientID: clientID))
-            .map(Self.shellQuote).joined(separator: " ")
-    }
-
-    /// `execCommand` for a launch registered with `registerAdapterLaunch`.
-    /// Pure: computing it again gives the same command.
+    /// The adapter's command line, shell-quoted, for a launch registered
+    /// with `registerAdapterLaunch`. Pure: computing it again gives the
+    /// same command.
     func execCommand(
         statusFile: URL?,
-        takeover: Bool,
+        takeover: Bool = false,
         sshControlPath: String?,
         clientID: String? = nil,
         sizeFile: URL? = nil
@@ -610,15 +584,33 @@ struct HostedSessionAttachment: Equatable, Sendable {
             clientID: clientID,
             sizeFile: sizeFile
         ))
-            .map(Self.shellQuote).joined(separator: " ")
+            .map(ShellQuoting.singleQuoted).joined(separator: " ")
     }
 
     var adapterEnvironment: [String: String] {
         environment.merging(["TERM": "xterm-256color", "COLORTERM": "truecolor"]) { _, adapter in adapter }
     }
+}
 
-    private static func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+extension HostedSessionAttachment {
+    /// The adapter details for `info`, one of the sessions of the host
+    /// `hostID` names. In an extension, so the memberwise init stays.
+    init(
+        host: HostedSessionHost,
+        hostID: String,
+        info: HostedSessionInfo,
+        executablePath: String,
+        environment: [String: String] = [:]
+    ) {
+        self.init(
+            host: host,
+            hostID: hostID,
+            sessionID: info.id,
+            name: info.name,
+            remoteWorkingDirectory: info.cwd,
+            executablePath: executablePath,
+            environment: environment
+        )
     }
 }
 
@@ -921,14 +913,6 @@ enum HostedAttachmentStatusFile {
         launchKey(ofDirectory: statusFile.deletingLastPathComponent())
     }
 
-    /// The adapter's final outcome; nil when it has not written one yet
-    /// (nothing, or its live "attached" state: it still runs).
-    static func read(from directory: URL) -> HostedAttachmentStatus? {
-        guard let data = try? Data(contentsOf: statusFileURL(in: directory)) else { return nil }
-        if liveStatus(from: data) != nil { return nil }
-        return status(from: data)
-    }
-
     /// The adapter's live state, when the file holds it (`outcome`
     /// "attached"); nil for nothing yet, a final outcome or an unreadable file.
     static func readLive(from directory: URL) -> HostedAdapterLiveStatus? {
@@ -952,6 +936,10 @@ enum HostedAttachmentStatusFile {
     /// never replaced (it was killed).
     static func status(from data: Data) -> HostedAttachmentStatus {
         guard let record = try? JSONDecoder().decode(Record.self, from: data) else { return .disconnected(nil) }
+        return status(of: record)
+    }
+
+    private static func status(of record: Record) -> HostedAttachmentStatus {
         let message = record.message?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         switch record.outcome {
         case "exited":
@@ -969,27 +957,23 @@ enum HostedAttachmentStatusFile {
         }
     }
 
-    /// Whether an adapter that ended with this status file may be launched
-    /// again to resume its attachment once the host answers: it lost its
-    /// connection and gave up reconnecting (`disconnected`), or could not
-    /// attach (`failed`, such as an SSH host it could not reach), and did
-    /// not say that connecting again can never resolve it
-    /// (`"reconnectable": false`: another host identity answered, one
-    /// speaking a protocol it cannot use, or the host no longer has the
-    /// session). A detach, a takeover, a replacement, an exit, or a file it
-    /// never finished is never retried.
-    static func isRetryable(from data: Data) -> Bool {
-        guard let record = try? JSONDecoder().decode(Record.self, from: data) else { return false }
-        return ["disconnected", "failed"].contains(record.outcome) && record.reconnectable != false
-    }
-
-    /// The final outcome in `directory`, and whether it may be retried
-    /// (`isRetryable`); nil when the adapter has not written one.
+    /// The final outcome in `directory` (`status(from:)`); nil when the
+    /// adapter has not written one yet (nothing, or its live "attached"
+    /// state: it still runs).
+    ///
+    /// `retryable` says whether the adapter may be launched again to resume
+    /// its attachment once the host answers: it lost its connection and gave
+    /// up reconnecting (`disconnected`), or could not attach (`failed`, such
+    /// as an SSH host it could not reach), and did not say that connecting
+    /// again can never resolve it (`"reconnectable": false`: another host
+    /// identity answered, one speaking a protocol it cannot use, or the host
+    /// no longer has the session). A detach, a takeover, a replacement, an
+    /// exit, or a file it never finished is never retried.
     static func readEnding(from directory: URL) -> (status: HostedAttachmentStatus, retryable: Bool)? {
-        guard let data = try? Data(contentsOf: statusFileURL(in: directory)), liveStatus(from: data) == nil else {
-            return nil
-        }
-        return (status(from: data), isRetryable(from: data))
+        guard let data = try? Data(contentsOf: statusFileURL(in: directory)) else { return nil }
+        guard let record = try? JSONDecoder().decode(Record.self, from: data) else { return (.disconnected(nil), false) }
+        guard record.outcome != liveOutcome else { return nil }
+        return (status(of: record), ["disconnected", "failed"].contains(record.outcome) && record.reconnectable != false)
     }
 
     /// An adapter that is being stopped may still write its status while it
@@ -1820,74 +1804,30 @@ final class HostedSessionLoginEnvironment: @unchecked Sendable {
             environment: [String: String],
             workingDirectory: String
         ) -> DetachedShell? {
-            var descriptors: [Int32] = [-1, -1]
-            guard pipe(&descriptors) == 0 else { return nil }
-            let (readEnd, writeEnd) = (descriptors[0], descriptors[1])
-            // Keep both ends out of processes other threads start meanwhile.
-            _ = fcntl(readEnd, F_SETFD, FD_CLOEXEC)
-            _ = fcntl(writeEnd, F_SETFD, FD_CLOEXEC)
-            defer { close(writeEnd) }
-
-            var inputEnd: Int32 = -1
+            guard (input?.count ?? 0) <= 4_096,
+                  let process = try? HostSpawnedProcess.spawn(
+                      executable: path,
+                      // `arguments` starts with argv[0], which spawn adds.
+                      arguments: Array(arguments.dropFirst()),
+                      environment: environment,
+                      workingDirectory: workingDirectory,
+                      input: input != nil,
+                      output: true
+                  )
+            else { return nil }
+            let shell = DetachedShell(pid: process.pid, output: process.output)
             if let input {
-                guard input.count <= 4_096, pipe(&descriptors) == 0 else {
-                    close(readEnd)
-                    return nil
-                }
-                inputEnd = descriptors[0]
-                let inputWriteEnd = descriptors[1]
-                _ = fcntl(inputEnd, F_SETFD, FD_CLOEXEC)
-                _ = fcntl(inputWriteEnd, F_SETFD, FD_CLOEXEC)
-                // Written before the shell starts: an empty pipe takes it
-                // whole, and the shell reads end of file after it.
-                let written = input.withUnsafeBytes { write(inputWriteEnd, $0.baseAddress, $0.count) }
-                close(inputWriteEnd)
+                // An empty pipe takes it whole, and the shell reads end of
+                // file after it.
+                let written = input.withUnsafeBytes { write(process.input, $0.baseAddress, $0.count) }
+                close(process.input)
                 guard written == input.count else {
-                    close(inputEnd)
-                    close(readEnd)
+                    close(process.output)
+                    shell.finish(completed: false)
                     return nil
                 }
             }
-            defer { if inputEnd >= 0 { close(inputEnd) } }
-
-            var actions: posix_spawn_file_actions_t?
-            posix_spawn_file_actions_init(&actions)
-            defer { posix_spawn_file_actions_destroy(&actions) }
-            if inputEnd >= 0 {
-                posix_spawn_file_actions_adddup2(&actions, inputEnd, 0)
-            } else {
-                posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
-            }
-            posix_spawn_file_actions_adddup2(&actions, writeEnd, 1)
-            posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
-            posix_spawn_file_actions_addchdir(&actions, workingDirectory)
-
-            var attributes: posix_spawnattr_t?
-            posix_spawnattr_init(&attributes)
-            defer { posix_spawnattr_destroy(&attributes) }
-            var noSignals = sigset_t()
-            var allSignals = sigset_t()
-            sigemptyset(&noSignals)
-            sigfillset(&allSignals)
-            posix_spawnattr_setsigmask(&attributes, &noSignals)
-            posix_spawnattr_setsigdefault(&attributes, &allSignals)
-            // CLOEXEC_DEFAULT passes on only the three descriptors set up above.
-            posix_spawnattr_setflags(&attributes, Int16(
-                POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF
-            ))
-
-            let argv = arguments.map { strdup($0) } + [nil]
-            let envp = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
-            defer {
-                argv.forEach { free($0) }
-                envp.forEach { free($0) }
-            }
-            var pid: pid_t = 0
-            guard posix_spawn(&pid, path, &actions, &attributes, argv, envp) == 0, pid > 1 else {
-                close(readEnd)
-                return nil
-            }
-            return DetachedShell(pid: pid, output: readEnd)
+            return shell
         }
 
         /// Everything up to the second `marker`, or nil if the shell ends or

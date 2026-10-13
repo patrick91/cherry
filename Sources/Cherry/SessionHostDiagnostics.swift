@@ -248,41 +248,24 @@ final class SessionHostDiagnostics: ObservableObject {
         }
     }
 
-    private final class Collected: @unchecked Sendable {
-        var data = Data()
-    }
-
     private nonisolated static func runProcess(
         _ executable: URL,
         arguments: [String],
         environment: [String: String]
     ) throws -> HostCommandOutput {
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = arguments
-        process.environment = environment
-        process.currentDirectoryURL = URL(fileURLWithPath: "/")
-        let output = Pipe()
-        let errors = Pipe()
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = output
-        process.standardError = errors
-        try process.run()
-        // Read both to the end before waiting, so neither pipe fills.
-        let group = DispatchGroup()
-        let errorData = Collected()
-        group.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
-            errorData.data = errors.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
-        }
-        let outputData = output.fileHandleForReading.readDataToEndOfFile()
-        group.wait()
-        process.waitUntilExit()
+        let result = CapturedProcess.run(
+            executable: executable,
+            arguments: arguments,
+            environment: environment,
+            input: nil,
+            currentDirectory: URL(fileURLWithPath: "/"),
+            timeout: nil
+        )
+        if let launchError = result.launchError { throw launchError }
         return HostCommandOutput(
-            status: process.terminationStatus,
-            output: String(decoding: outputData, as: UTF8.self),
-            errors: String(decoding: errorData.data, as: UTF8.self)
+            status: result.status,
+            output: String(decoding: result.standardOutput, as: UTF8.self),
+            errors: String(decoding: result.standardError, as: UTF8.self)
         )
     }
 }

@@ -398,7 +398,6 @@ private func openProject(
     #expect(model.sessions.allSatisfy { $0.projectName == harness.project.lastPathComponent })
     let command = try #require(model.sessions.first { $0.kind == .command })
     #expect(command.title == "server")
-    #expect(command.commandName == "server")
     #expect(BackgroundSessionPresentation.statusText(of: command) == "running")
 
     // End Sessions: none goes to the background.
@@ -1051,7 +1050,6 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     let command = row(ownSession("c", project: project, name: "npm", kind: "command", command: "web"))
     #expect(command.title == "web")
     #expect(command.kind == .command)
-    #expect(command.commandName == "web")
     #expect(command.projectName == "cherry")
     #expect(BackgroundSessionPresentation.statusText(of: command) == "running")
     #expect(BackgroundSessionPresentation.tone(of: command) == .active)

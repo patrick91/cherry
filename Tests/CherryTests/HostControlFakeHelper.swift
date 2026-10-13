@@ -95,7 +95,6 @@ final class FakeControlHelper: @unchecked Sendable {
     private var _hostID = "host-a"
     private var _version: UInt32 = HostProtocol.version
     private var _sessions: [HostedSessionInfo] = []
-    private var _supportsSubscribe = true
     private var _killEndsSession = true
     private var _welcome = true
     private var _launchFailure: String?
@@ -128,11 +127,6 @@ final class FakeControlHelper: @unchecked Sendable {
     var sessions: [HostedSessionInfo] {
         get { lock.withLock { _sessions } }
         set { lock.withLock { _sessions = newValue } }
-    }
-
-    var supportsSubscribe: Bool {
-        get { lock.withLock { _supportsSubscribe } }
-        set { lock.withLock { _supportsSubscribe = newValue } }
     }
 
     var killEndsSession: Bool {
@@ -275,7 +269,7 @@ final class FakeControlHelper: @unchecked Sendable {
     func defaultReply(to request: Request, on connection: Connection) -> Reply {
         switch request.op {
         case "subscribe":
-            return .answer(supportsSubscribe ? .ok : .error(code: "unsupported_operation", message: "not supported"))
+            return .answer(.ok)
         case "list":
             return .answer(.sessions(HostedSessionList(
                 hostID: hostID, sessions: sessions, pendingHolders: pendingHolders, lostSessionIDs: lostSessionIDs

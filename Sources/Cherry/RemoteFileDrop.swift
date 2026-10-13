@@ -130,9 +130,9 @@ struct RemoteFileCopier: Sendable {
         let timeout = timeout
         let run: @Sendable (String?) async -> (status: Int32, errors: String) = { [files, destination, ssh = shell.sshExecutable] controlPath in
             let arguments = Self.scpArguments(files: files, folder: folder, destination: destination, ssh: ssh, controlPath: controlPath)
-            return await Task.detached(priority: .userInitiated) {
+            return await RemoteDeviceShell.onOwnThread {
                 Self.run(scp, arguments, environment: environment, timeout: timeout)
-            }.value
+            }
         }
         var result = await run(shell.controlPath)
         if shell.controlPath != nil, result.status != 0, RemoteDeviceShell.isRefusedByMaster(result.errors) {
@@ -146,37 +146,19 @@ struct RemoteFileCopier: Sendable {
     }
 
     private static func run(_ executable: String, _ arguments: [String], environment: [String: String], timeout: TimeInterval) -> (status: Int32, errors: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.environment = environment
-        let errors = Pipe()
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = errors
-        do {
-            try process.run()
-        } catch {
-            return (127, "Could not run scp: \(error.localizedDescription)")
+        let result = CapturedProcess.run(
+            executable: URL(fileURLWithPath: executable),
+            arguments: arguments,
+            environment: environment,
+            input: nil,
+            captureOutput: false,
+            timeout: timeout
+        )
+        if let launchError = result.launchError {
+            return (127, "Could not run scp: \(launchError.localizedDescription)")
         }
-        let box = DropOutputBox()
-        let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global().async {
-            box.data = errors.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
-        }
-        if group.wait(timeout: .now() + timeout) == .timedOut {
-            process.terminate()
-            _ = group.wait(timeout: .now() + 2)
-        }
-        process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: box.data, as: UTF8.self))
+        return (result.status, String(decoding: result.standardError, as: UTF8.self))
     }
-}
-
-private final class DropOutputBox: @unchecked Sendable {
-    var data = Data()
 }
 
 /// Asks about files pasted or dropped on a device's tab, copies them there

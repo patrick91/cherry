@@ -275,8 +275,7 @@ final class ProjectWindowRegistry {
             body()
         }
         launchWindowShownWaiters[root, default: []].append(once)
-        let seconds = Double(limit.components.seconds) + Double(limit.components.attoseconds) / 1e18
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + limit.timeInterval) {
             MainActor.assumeIsolated { once() }
         }
     }

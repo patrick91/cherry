@@ -214,7 +214,7 @@ enum RemoteLaunchSpec {
                 )
                 argv = HostedLaunchSpec.argv(
                     command: command,
-                    account: HostedLaunchAccount(userName: "remote", homeDirectory: "", shell: loginShell, hushLogin: false)
+                    account: HostedLaunchAccount(userName: "remote", homeDirectory: "", shell: loginShell)
                 )
             }
         } else {

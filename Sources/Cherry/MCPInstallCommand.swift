@@ -40,7 +40,7 @@ enum MCPInstallCommandBuilder {
         guard let helperPath else {
             return "CherryMCP"
         }
-        return shellQuoted(helperPath)
+        return ShellQuoting.singleQuoted(helperPath)
     }
 
     static func commands(identity: CherryAppIdentity = .current) -> [MCPInstallCommand] {
@@ -59,11 +59,6 @@ enum MCPInstallCommandBuilder {
                 command: "pi mcp add \(identity.urlScheme) --exposure direct -- \(helperCommand)"
             ),
         ]
-    }
-
-    static func shellQuoted(_ value: String) -> String {
-        guard !value.isEmpty else { return "''" }
-        return "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
 

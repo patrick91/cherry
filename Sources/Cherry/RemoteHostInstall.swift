@@ -201,20 +201,12 @@ struct RemoteHostHelpers: Equatable, Sendable {
     }
 
     private static func runHelper(_ executable: URL, arguments: [String]) throws -> String {
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = arguments
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        process.standardInput = FileHandle.nullDevice
-        try process.run()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw HostedSessionError.message("\(executable.path) \(arguments.joined(separator: " ")) exited \(process.terminationStatus).")
+        let result = CapturedProcess.run(executable: executable, arguments: arguments, environment: nil, input: nil, timeout: nil)
+        if let launchError = result.launchError { throw launchError }
+        guard result.status == 0 else {
+            throw HostedSessionError.message("\(executable.path) \(arguments.joined(separator: " ")) exited \(result.status).")
         }
-        return String(decoding: data, as: UTF8.self)
+        return String(decoding: result.standardOutput, as: UTF8.self)
     }
 
     /// Whether a Mac of `architecture` (`uname -m`) can run them.

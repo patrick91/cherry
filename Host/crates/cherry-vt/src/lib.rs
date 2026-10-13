@@ -409,19 +409,20 @@ enum PromptRedraw {
 
 impl PromptRedraw {
     fn observe(&mut self, bytes: &[u8]) {
-        let mut rest = bytes;
-        while let Some(at) = rest.iter().position(|&byte| byte == 0x1b) {
-            rest = &rest[at + 1..];
-            if rest.first() == Some(&b'c') {
+        const RESET: &[u8] = b"\x1bc";
+        const PROMPT: &[u8] = b"\x1b]133;";
+        // Resets and OSC 133, in order. memmem finds each by its ESC and
+        // the bytes after it at once, where looking at every ESC would stop
+        // every few bytes in colourful output.
+        let mut resets = memchr::memmem::find_iter(bytes, RESET).peekable();
+        for at in memchr::memmem::find_iter(bytes, PROMPT) {
+            while resets.next_if(|&reset| reset < at).is_some() {
                 *self = Self::All;
-                continue;
             }
-            let Some(body) = rest.strip_prefix(b"]133;") else {
-                continue;
-            };
-            // Up to its BEL or ST (whose ESC the loop looks at next).
-            let Some(end) = body.iter().position(|&byte| byte == 0x07 || byte == 0x1b) else {
-                return;
+            let body = &bytes[at + PROMPT.len()..];
+            // Up to its BEL or ST (an ESC c ending it is a reset after it).
+            let Some(end) = memchr::memchr2(0x07, 0x1b, body) else {
+                break;
             };
             let mut fields = body[..end].split(|&byte| byte == b';');
             if !matches!(fields.next(), Some(b"A" | b"N")) {
@@ -436,6 +437,9 @@ impl PromptRedraw {
                     _ => {}
                 }
             }
+        }
+        if resets.next().is_some() {
+            *self = Self::All;
         }
     }
 }

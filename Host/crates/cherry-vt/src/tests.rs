@@ -2676,6 +2676,37 @@ fn resize_leaves_prompts_it_cannot_clear_whole_to_ghostty() {
 }
 
 #[test]
+fn the_last_prompt_mark_or_reset_in_a_feed_says_what_the_shell_redraws() {
+    use PromptRedraw::{All, LastLine, Nothing};
+    for (bytes, from, expected) in [
+        (&b"\x1bc\x1b]133;A;redraw=0\x07"[..], All, Nothing),
+        (b"\x1b]133;A;redraw=0\x07\x1bc", LastLine, All),
+        (
+            b"\x1b]133;A;redraw=0\x1b\\\x1b]133;N;redraw=last\x07",
+            All,
+            LastLine,
+        ),
+        // A reset ends the OSC and comes after it.
+        (b"\x1b]133;A;redraw=0\x1bc", Nothing, All),
+        // A mark that changes nothing, or is unfinished, leaves it.
+        (b"\x1b]133;A;redraw=0\x07\x1b]133;A\x07", All, Nothing),
+        (b"\x1b]133;B;redraw=last\x07", Nothing, Nothing),
+        (b"\x1b]133;A;redraw=0", LastLine, LastLine),
+        // The first occurrence of the option counts.
+        (
+            b"\x1b\x1b]133;A;cl=line;redraw=last;redraw=1\x07",
+            All,
+            LastLine,
+        ),
+        (b"\x1b[0m\x1b]0;c\x07", Nothing, Nothing),
+    ] {
+        let mut redraw = from;
+        redraw.observe(bytes);
+        assert_eq!(redraw, expected, "{:?}", String::from_utf8_lossy(bytes));
+    }
+}
+
+#[test]
 fn clearing_a_prompt_before_the_reflow_keeps_an_unfinished_sequence() {
     let mut terminal = term(60, 6);
     at_two_line_prompt(&mut terminal, TOP);

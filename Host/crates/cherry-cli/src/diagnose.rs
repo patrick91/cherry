@@ -1,7 +1,11 @@
 //! `cherry status` (what the daemon says about itself and its sessions) and
 //! `cherry doctor` (what is wrong with the local host, and how to fix it).
 //! Neither starts a host.
-use crate::{handover::own_build, transport::Transport, unexpected};
+use crate::{
+    handover::own_build,
+    transport::{Transport, RPC_TIMEOUT},
+    unexpected,
+};
 use anyhow::Result;
 use cherry_protocol::{
     error_code, process_runs, read_frame, write_frame, ClientMessage, HostStatus, ServerMessage,
@@ -100,30 +104,29 @@ pub fn not_running(socket: &Path, as_json: bool) -> Result<u32> {
     Ok(NOT_RUNNING)
 }
 
+/// The `Status` of the host on a connection that said Hello, or None from a
+/// host that predates it.
+pub fn request_status(transport: &mut Transport) -> Result<Option<HostStatus>> {
+    transport.send(&ClientMessage::Status)?;
+    match transport.receive(RPC_TIMEOUT)? {
+        ServerMessage::Status { status } => Ok(Some(status)),
+        ServerMessage::Error { code, .. } if code == error_code::UNSUPPORTED_OPERATION => Ok(None),
+        message => Err(unexpected("status", message)),
+    }
+}
+
 /// `cherry status` on a connection that said Hello: the host's `Status`
 /// (a host that predates it says less), then its sessions.
 pub fn status(transport: &mut Transport, greeting: &Greeting, as_json: bool) -> Result<u32> {
-    let rpc = crate::transport::RPC_TIMEOUT;
-    transport.send(&ClientMessage::Status)?;
-    let host = match transport.receive(rpc)? {
-        ServerMessage::Status { status } => Some(status),
-        ServerMessage::Error { code, .. } if code == error_code::UNSUPPORTED_OPERATION => None,
-        message => {
-            unexpected("status", message)?;
-            unreachable!()
-        }
-    };
+    let host = request_status(transport)?;
     transport.send(&ClientMessage::List)?;
-    let (sessions, pending_holders) = match transport.receive(rpc)? {
+    let (sessions, pending_holders) = match transport.receive(RPC_TIMEOUT)? {
         ServerMessage::Sessions {
             sessions,
             pending_holders,
             ..
         } => (sessions, pending_holders),
-        message => {
-            unexpected("session list", message)?;
-            unreachable!()
-        }
+        message => return Err(unexpected("session list", message)),
     };
     let text = if as_json {
         let sessions: Vec<_> = sessions.iter().map(session_json).collect();

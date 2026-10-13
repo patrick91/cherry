@@ -129,6 +129,37 @@ pub fn set_nonblocking(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
+/// A descriptor made non-blocking, its flags restored on drop.
+pub struct NonBlocking {
+    fd: RawFd,
+    original_flags: i32,
+}
+
+impl NonBlocking {
+    /// Make `fd` non-blocking; `what` names it in errors.
+    pub fn set(fd: RawFd, what: &str) -> Result<Self> {
+        let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if original_flags < 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("could not read {what} flags"));
+        }
+        set_nonblocking(fd)?;
+        Ok(Self { fd, original_flags })
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
+impl Drop for NonBlocking {
+    fn drop(&mut self) {
+        unsafe {
+            libc::fcntl(self.fd, libc::F_SETFL, self.original_flags);
+        }
+    }
+}
+
 /// A regular file or /dev/null: reading and writing never wait. Darwin's
 /// poll rejects both even though read and write work; a file has bytes or
 /// its end available at once, and null is always at its end.

@@ -117,32 +117,23 @@ impl Tracker {
                     }
                     None => break,
                 },
-                // Everything up to BEL, ESC, CAN or SUB is the string's.
-                State::Osc => match rest
-                    .iter()
-                    .position(|&byte| matches!(byte, 0x07 | 0x18 | 0x1a | 0x1b))
-                {
-                    Some(found) => {
-                        at += found + 1;
-                        if rest[found] == 0x1b {
-                            self.escape();
-                        } else {
-                            self.state = State::Ground;
-                        }
+                // Everything up to ESC, CAN or SUB (or, in an OSC, BEL) is
+                // the string's.
+                State::Osc | State::DcsData => {
+                    let found = if matches!(self.state, State::Osc) {
+                        rest.iter()
+                            .position(|&byte| matches!(byte, 0x07 | 0x18 | 0x1a | 0x1b))
+                    } else {
+                        memchr3(0x1b, 0x18, 0x1a, rest)
+                    };
+                    let Some(found) = found else { break };
+                    at += found + 1;
+                    if rest[found] == 0x1b {
+                        self.escape();
+                    } else {
+                        self.state = State::Ground;
                     }
-                    None => break,
-                },
-                State::DcsData => match memchr3(0x1b, 0x18, 0x1a, rest) {
-                    Some(found) => {
-                        at += found + 1;
-                        if rest[found] == 0x1b {
-                            self.escape();
-                        } else {
-                            self.state = State::Ground;
-                        }
-                    }
-                    None => break,
-                },
+                }
                 // Parameters and intermediates, taken as a run.
                 State::Csi => {
                     let run = rest
@@ -263,16 +254,7 @@ impl Tracker {
     }
 
     fn push(&mut self, byte: u8) {
-        if self.discarding {
-            return;
-        }
-        if self.pending.len() >= MAX_SEQUENCE {
-            self.discarding = true;
-            self.pending.clear();
-            self.pending.shrink_to(64);
-            return;
-        }
-        self.pending.push(byte);
+        self.push_run(&[byte]);
     }
 
     fn push_run(&mut self, bytes: &[u8]) {

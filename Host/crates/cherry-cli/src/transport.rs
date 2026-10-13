@@ -2,7 +2,7 @@
 //! `cherry-host gateway` through the system ssh.
 use crate::{
     stderr_relay::StderrRelay,
-    sys::{interrupted, poll, pollfd, read_some, set_nonblocking},
+    sys::{interrupted, poll, pollfd, read_some, set_nonblocking, write_some},
     timing::timing,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -467,20 +467,12 @@ impl Transport {
 
     fn write_available(&mut self) -> io::Result<()> {
         while self.pending() > 0 {
-            let bytes = &self.outgoing[self.written..];
-            let n = unsafe { libc::write(self.write_fd(), bytes.as_ptr().cast(), bytes.len()) };
-            if n > 0 {
-                self.written += n as usize;
-                self.sent_total += n as u64;
-                self.progress = Instant::now();
-                continue;
-            }
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => break,
-                _ => return Err(error),
-            }
+            let Some(n) = write_some(self.write_fd(), &self.outgoing[self.written..])? else {
+                break;
+            };
+            self.written += n;
+            self.sent_total += n as u64;
+            self.progress = Instant::now();
         }
         if self.pending() == 0 {
             self.outgoing.clear();

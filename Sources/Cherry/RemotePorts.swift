@@ -587,23 +587,17 @@ struct RemoteInspectableProcess {
 }
 
 /// The services of tabs of other Macs, for MCP's `get_process_ports`,
-/// `services_list` and `wait_for_bound_port`. `forwarding`: forward each
-/// port found (only for an explicit probe, `wait_for_bound_port` with
-/// `probe_http`); otherwise nothing is forwarded.
+/// `services_list` and `wait_for_bound_port`: asks each device
+/// (`RemotePortScanner`) which ports its tabs' programs listen on. A record
+/// names the Mac (`machine`) and the URL there (`remoteURL`). `forwarding`:
+/// forward each port found (only for an explicit probe,
+/// `wait_for_bound_port` with `probe_http`); otherwise nothing is
+/// forwarded, so a record's `url` is the forwarded one only when the port
+/// is forwarded already (a clicked link) or `forwarding` asks for it (an
+/// HTTP probe), with `forwardedFrom` naming the Mac; otherwise it is the
+/// URL there. A port that could not be forwarded says why (`forwardError`).
 @MainActor
-protocol RemoteServiceDetecting {
-    func detectServices(processes: [RemoteInspectableProcess], forwarding: Bool) async throws -> [ServiceRecord]
-}
-
-/// Asks each device (`RemotePortScanner`) which ports its tabs' programs
-/// listen on. A record names the Mac (`machine`) and the URL there
-/// (`remoteURL`); listing forwards nothing, so its `url` is the forwarded
-/// one only when the port is forwarded already (a clicked link) or
-/// `forwarding` asks for it (an HTTP probe), with `forwardedFrom` naming
-/// the Mac; otherwise it is the URL there. A port that could not be
-/// forwarded says why (`forwardError`).
-@MainActor
-struct DeviceServiceDetector: RemoteServiceDetecting {
+struct DeviceServiceDetector {
     var device: @MainActor (HostedSessionHost) -> RemoteDevice? = { host in
         RemoteDeviceStore.shared.devices.first { $0.host == host }
     }

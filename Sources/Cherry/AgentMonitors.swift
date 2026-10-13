@@ -410,7 +410,7 @@ extension CherryControlServer {
             return resolver(Self.callerPeerPID)
         }
         guard let peerPID = Self.callerPeerPID else { return nil }
-        let ancestry = Set(Self.processAncestry(of: peerPID))
+        let ancestry = Set(CherryControl.processAncestry(of: peerPID))
         for attached in [false, true] {
             for workspace in workspaces {
                 for session in workspace.sessions where (session.hostedAttachment != nil) == attached {

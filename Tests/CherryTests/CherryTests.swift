@@ -488,13 +488,11 @@ private struct MCPProcessStatusPayload: Decodable {
 }
 
 private struct MCPBindSessionProcessPayload: Decodable {
-    let mcpSessionID: String?
     let boundProcessID: String
     let previousBoundProcessID: String?
     let process: MCPProcessReference
 
     private enum CodingKeys: String, CodingKey {
-        case mcpSessionID = "mcp_session_id"
         case boundProcessID = "bound_process_id"
         case previousBoundProcessID = "previous_bound_process_id"
         case process
@@ -574,14 +572,12 @@ private struct MCPAgentWait: Decodable {
 }
 
 private struct MCPWhoamiPayload: Decodable {
-    let mcpSessionID: String?
     let effectiveProjectRoot: String?
     let callerProcessID: String?
     let boundProcessID: String?
     let selectedProcessID: String?
 
     private enum CodingKeys: String, CodingKey {
-        case mcpSessionID = "mcp_session_id"
         case effectiveProjectRoot = "effective_project_root"
         case callerProcessID = "caller_process_id"
         case boundProcessID = "bound_process_id"
@@ -1320,8 +1316,8 @@ private struct MCPWhoamiPayload: Decodable {
 
 @Test func cherryControlNoteRequestsRoundTrip() async throws {
     let noteID = UUID().uuidString
-    let create = CherryControlRequest.createNote(.init(title: "Review", markdown: "# Review", open: true))
-    let update = CherryControlRequest.updateNote(.init(noteID: noteID, title: "Updated", markdown: "- item", open: false))
+    let create = CherryControlRequest.createNote(.init(title: "Review", markdown: "# Review"))
+    let update = CherryControlRequest.updateNote(.init(noteID: noteID, title: "Updated", markdown: "- item"))
     let append = CherryControlRequest.appendNote(.init(noteID: noteID, markdown: "- more"))
     let rename = CherryControlRequest.renameNote(.init(noteID: noteID, title: "Renamed"))
     let search = CherryControlRequest.searchNotes(.init(query: "Review", caseSensitive: false, maxMatches: 10))
@@ -1341,9 +1337,9 @@ private struct MCPWhoamiPayload: Decodable {
     let afterTodoID = UUID().uuidString
     let terminalID = UUID().uuidString
     let commentID = UUID().uuidString
-    let create = CherryControlRequest.createTodo(.init(title: "Review", markdown: "# Review", status: .ready, tags: ["UI", "Bug"], open: true))
-    let update = CherryControlRequest.updateTodo(.init(todoID: todoID, title: "Updated", markdown: "- item", status: .doing, tags: ["Docs"], open: false))
-    let move = CherryControlRequest.moveTodo(.init(todoID: todoID, status: .blocked, afterTodoID: afterTodoID, open: true))
+    let create = CherryControlRequest.createTodo(.init(title: "Review", markdown: "# Review", status: .ready, tags: ["UI", "Bug"]))
+    let update = CherryControlRequest.updateTodo(.init(todoID: todoID, title: "Updated", markdown: "- item", status: .doing, tags: ["Docs"]))
+    let move = CherryControlRequest.moveTodo(.init(todoID: todoID, status: .blocked, afterTodoID: afterTodoID))
     let get = CherryControlRequest.getTodo(.init(todoID: todoID))
     let delete = CherryControlRequest.deleteTodo(.init(todoID: todoID))
     let select = CherryControlRequest.selectTodo(.init(todoID: todoID))
@@ -1351,8 +1347,7 @@ private struct MCPWhoamiPayload: Decodable {
         todoID: todoID,
         markdown: "Handing this off",
         author: "Codex",
-        terminalID: terminalID,
-        open: true
+        terminalID: terminalID
     ))
     let comments = CherryControlRequest.listTodoComments(.init(todoID: todoID))
     let updateComment = CherryControlRequest.updateTodoComment(.init(
@@ -1393,7 +1388,7 @@ private struct MCPWhoamiPayload: Decodable {
         .renameProcess(.init(processID: processID, title: "Build")),
         .selectProcess(.init(processID: processID)),
         .sendProcessInput(.init(processID: processID, text: "status", rawBase64: nil, submit: true, waitMilliseconds: 100, lineLimit: 20)),
-        .startAllCommands(.init(waitMilliseconds: 100, lineLimit: 20)),
+        .startAllCommands(.init(waitMilliseconds: 100)),
         .stopAllCommands(.init()),
         .restartAllCommands(.init())
     ]
@@ -2781,7 +2776,7 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
 
-    let context = CherryMCPToolContext.bound(sessionID: "test-session")
+    let context = CherryMCPToolContext.bound()
     let bindResult = await CherryMCPTools.call(
         name: "bind_session_process",
         arguments: ["process_id": .string(started.process.id)],
@@ -2789,7 +2784,6 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let bound = try decodeMCPToolResult(MCPBindSessionProcessPayload.self, from: bindResult)
 
-    #expect(bound.mcpSessionID == "test-session")
     #expect(bound.boundProcessID == started.process.id)
     #expect(bound.previousBoundProcessID == nil)
     #expect(bound.process.id == started.process.id)
@@ -2809,7 +2803,6 @@ private struct MCPWhoamiPayload: Decodable {
         context: context
     )
     let whoami = try decodeMCPToolResult(MCPWhoamiPayload.self, from: whoamiResult)
-    #expect(whoami.mcpSessionID == "test-session")
     #expect(whoami.effectiveProjectRoot == harness.projectRoot.path)
     #expect(whoami.callerProcessID == nil)
     #expect(whoami.boundProcessID == started.process.id)
@@ -2845,7 +2838,7 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound(sessionID: "agent-session")
+    let context = CherryMCPToolContext.bound()
     let spawnResult = await CherryMCPTools.call(
         name: "spawn_agent",
         arguments: [
@@ -2926,7 +2919,7 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound(sessionID: "agent-session")
+    let context = CherryMCPToolContext.bound()
     let spawnResult = await CherryMCPTools.call(
         name: "spawn_agent",
         arguments: [
@@ -3029,7 +3022,7 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Codex", command: scriptURL.path))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound(sessionID: "codex-agent-session")
+    let context = CherryMCPToolContext.bound()
     let spawnResult = await CherryMCPTools.call(
         name: "spawn_agent",
         arguments: [
@@ -3089,7 +3082,7 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: scriptURL.path))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound(sessionID: "claude-agent-session")
+    let context = CherryMCPToolContext.bound()
     let spawnResult = await CherryMCPTools.call(
         name: "spawn_agent",
         arguments: [
@@ -3146,7 +3139,7 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Pi", command: scriptURL.path))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound(sessionID: "pi-agent-session")
+    let context = CherryMCPToolContext.bound()
     let spawnResult = await CherryMCPTools.call(
         name: "spawn_agent",
         arguments: [
@@ -3213,7 +3206,7 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Pi", command: scriptURL.path))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound(sessionID: "pi-newline-session")
+    let context = CherryMCPToolContext.bound()
     let spawnResult = await CherryMCPTools.call(
         name: "spawn_agent",
         arguments: [
@@ -3403,7 +3396,7 @@ private struct MCPWhoamiPayload: Decodable {
     let parentSession = try #require(harness.workspace.session(id: parent.terminalID))
     #expect(await waitForCondition { parentSession.childProcessID != nil })
     let parentPID = try #require(parentSession.childProcessID)
-    let inferredCallerID = await CherryMCPTools.inferredCallerProcessID(parentPID: parentPID)
+    let inferredCallerID = await CherryMCPTools.inferredCallerProcessID(parentPIDs: [parentPID])
 
     #expect(inferredCallerID == parent.terminalID)
 
@@ -3531,13 +3524,14 @@ private struct MCPWhoamiPayload: Decodable {
 
     let todoResponse = try await harness.send(.createTodo(.init(
         title: "Focused launch",
-        markdown: "",
-        open: true
+        markdown: ""
     )))
     guard case .createTodo(let createdTodo)? = todoResponse.result else {
         Issue.record("Expected createTodo result, got \(String(describing: todoResponse))")
         return
     }
+    let selectTodoResponse = try await harness.send(.selectTodo(.init(todoID: createdTodo.todo.id.uuidString)))
+    #expect(selectTodoResponse.error == nil)
     #expect(harness.chromeState.selectedTodoID == createdTodo.todo.id)
     #expect(harness.chromeState.isTodoPanePresented == true)
 
@@ -3593,8 +3587,7 @@ private struct MCPWhoamiPayload: Decodable {
 
     let createResponse = try await harness.send(.createNote(.init(
         title: "Review Notes",
-        markdown: "# Findings",
-        open: true
+        markdown: "# Findings"
     )))
     guard case .createNote(let created)? = createResponse.result else {
         Issue.record("Expected createNote result, got \(String(describing: createResponse))")
@@ -3604,7 +3597,10 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(createResponse.error == nil)
     #expect(created.note.title == "Review Notes")
     #expect(created.note.markdown == "# Findings")
-    #expect(created.selected == true)
+    #expect(created.selected == false)
+
+    let selectResponse = try await harness.send(.selectNote(.init(noteID: created.note.id.uuidString)))
+    #expect(selectResponse.error == nil)
     #expect(harness.chromeState.selectedNoteID == created.note.id)
 
     let listResponse = try await harness.send(.listNotes)
@@ -3619,8 +3615,7 @@ private struct MCPWhoamiPayload: Decodable {
     let updateResponse = try await harness.send(.updateNote(.init(
         noteID: created.note.id.uuidString,
         title: "Updated",
-        markdown: "- done",
-        open: false
+        markdown: "- done"
     )))
     guard case .updateNote(let updated)? = updateResponse.result else {
         Issue.record("Expected updateNote result, got \(String(describing: updateResponse))")
@@ -3916,8 +3911,7 @@ private struct MCPWhoamiPayload: Decodable {
         title: "Review Todo",
         markdown: "# Findings",
         status: .ready,
-        tags: ["Bug", "UI"],
-        open: true
+        tags: ["Bug", "UI"]
     )))
     guard case .createTodo(let created)? = createResponse.result else {
         Issue.record("Expected createTodo result, got \(String(describing: createResponse))")
@@ -3929,15 +3923,17 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(created.todo.markdown == "# Findings")
     #expect(created.todo.status == .ready)
     #expect(created.todo.tags.map(\.name) == ["Bug", "UI"])
-    #expect(created.selected == true)
+    #expect(created.selected == false)
+
+    let selectResponse = try await harness.send(.selectTodo(.init(todoID: created.todo.id.uuidString)))
+    #expect(selectResponse.error == nil)
     #expect(harness.chromeState.selectedTodoID == created.todo.id)
     #expect(harness.chromeState.isTodoPanePresented == true)
 
     let secondResponse = try await harness.send(.createTodo(.init(
         title: "Second",
         markdown: "",
-        status: .ready,
-        open: false
+        status: .ready
     )))
     guard case .createTodo(let second)? = secondResponse.result else {
         Issue.record("Expected second createTodo result, got \(String(describing: secondResponse))")
@@ -3947,8 +3943,7 @@ private struct MCPWhoamiPayload: Decodable {
     let moveResponse = try await harness.send(.moveTodo(.init(
         todoID: second.todo.id.uuidString,
         status: .doing,
-        afterTodoID: nil,
-        open: false
+        afterTodoID: nil
     )))
     guard case .moveTodo(let moved)? = moveResponse.result else {
         Issue.record("Expected moveTodo result, got \(String(describing: moveResponse))")
@@ -3965,8 +3960,7 @@ private struct MCPWhoamiPayload: Decodable {
     let commentResponse = try await harness.send(.addTodoComment(.init(
         todoID: created.todo.id.uuidString,
         markdown: "Taking a look",
-        terminalID: agentSession.id.uuidString,
-        open: true
+        terminalID: agentSession.id.uuidString
     )))
     guard case .addTodoComment(let commented)? = commentResponse.result else {
         Issue.record("Expected addTodoComment result, got \(String(describing: commentResponse))")
@@ -4022,8 +4016,7 @@ private struct MCPWhoamiPayload: Decodable {
         title: "Updated",
         markdown: "- done",
         status: .blocked,
-        tags: ["Docs"],
-        open: false
+        tags: ["Docs"]
     )))
     guard case .updateTodo(let updated)? = updateResponse.result else {
         Issue.record("Expected updateTodo result, got \(String(describing: updateResponse))")

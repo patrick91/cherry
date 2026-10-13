@@ -21,7 +21,7 @@ public struct CherryControlClient: Sendable {
         self.socketURL = socketURL
         self.timeout = max(timeout, 0.1)
         self.credentials = credentials
-        self.controlMachine = controlMachine?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmptyString
+        self.controlMachine = controlMachine?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     }
 
     /// "Cherry on <Mac> is not reachable": the forward of its control
@@ -59,12 +59,11 @@ public struct CherryControlClient: Sendable {
         guard fd >= 0 else {
             throw CherryControlError(code: "socket_failed", message: "Failed to create local socket.")
         }
-        setCloseOnExec(fileDescriptor: fd)
+        UnixIO.setCloseOnExec(fd)
         // A server that refused the request before reading it (and closed)
         // makes the write fail with EPIPE, never SIGPIPE; its answer is
         // still read.
-        var noSigpipe: Int32 = 1
-        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
+        UnixIO.setNoSigPipe(fd)
         defer {
             close(fd)
         }
@@ -118,27 +117,9 @@ public struct CherryControlClient: Sendable {
     }
 
     private func connect(fileDescriptor fd: Int32) throws {
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-
         let path = socketURL.path
-        let maximumPathLength = MemoryLayout.size(ofValue: address.sun_path)
-        guard path.utf8.count < maximumPathLength else {
+        guard let result = UnixIO.withSocketAddress(path: path, { Darwin.connect(fd, $0, $1) }) else {
             throw CherryControlError(code: "socket_path_too_long", message: "Cherry control socket path is too long: \(path)")
-        }
-
-        withUnsafeMutablePointer(to: &address.sun_path) { pointer in
-            path.withCString { pathPointer in
-                let rawPointer = UnsafeMutableRawPointer(pointer).assumingMemoryBound(to: CChar.self)
-                strncpy(rawPointer, pathPointer, maximumPathLength)
-            }
-        }
-
-        let length = socklen_t(MemoryLayout<sa_family_t>.size + path.utf8.count + 1)
-        let result = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                Darwin.connect(fd, socketAddress, length)
-            }
         }
 
         guard result == 0 else {
@@ -170,20 +151,9 @@ public struct CherryControlClient: Sendable {
             }
         }
     }
-
-    private func setCloseOnExec(fileDescriptor fd: Int32) {
-        let flags = fcntl(fd, F_GETFD)
-        guard flags >= 0 else { return }
-        _ = fcntl(fd, F_SETFD, flags | FD_CLOEXEC)
-    }
 }
 
-private extension String {
-    var nilIfEmptyString: String? { isEmpty ? nil : self }
-}
-
-private func + (lhs: Data, rhs: Data) -> Data {
-    var data = lhs
-    data.append(rhs)
-    return data
+public extension String {
+    /// Nil for the empty string (the app and CherryMCP use it too).
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }

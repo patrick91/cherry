@@ -42,10 +42,6 @@ public enum CherryControl {
             .appendingPathComponent("control.sock", isDirectory: false)
     }
 
-    public static var socketDirectoryURL: URL {
-        socketURL.deletingLastPathComponent()
-    }
-
     public static func socketNamespace(
         environment: [String: String],
         executableURL: URL?
@@ -108,6 +104,17 @@ public enum CherryControl {
             hash &*= 1_099_511_628_211
         }
         return String(format: "%016llx", hash)
+    }
+
+    /// A This Mac project root (or a path in one) as the app and CherryMCP
+    /// compare them: standardized, `.` and `..` resolved.
+    public static func standardizedProjectRoot(_ path: String) -> String {
+        URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+    }
+
+    /// Whether `path` is `projectRoot` or inside it (both standardized).
+    public static func path(_ path: String, isInsideProjectRoot projectRoot: String) -> Bool {
+        path == projectRoot || path.hasPrefix(projectRoot.hasSuffix("/") ? projectRoot : projectRoot + "/")
     }
 }
 
@@ -180,8 +187,6 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case selectTerminal(TerminalIDRequest)
     case sendInput(SendInputRequest)
     case getTerminalOutput(GetTerminalOutputRequest)
-    case getTerminalRawOutput(GetTerminalRawOutputRequest)
-    case searchOutput(SearchOutputRequest)
     case clearOutput(TerminalIDRequest)
     case restartTerminal(TerminalIDRequest)
     case closeTerminal(CloseTerminalRequest)
@@ -493,11 +498,9 @@ public struct SendProcessInputRequest: Codable, Equatable, Sendable {
 
 public struct ProcessBulkCommandRequest: Codable, Equatable, Sendable {
     public let waitMilliseconds: Int?
-    public let lineLimit: Int?
 
-    public init(waitMilliseconds: Int? = nil, lineLimit: Int? = nil) {
+    public init(waitMilliseconds: Int? = nil) {
         self.waitMilliseconds = waitMilliseconds
-        self.lineLimit = lineLimit
     }
 }
 
@@ -542,12 +545,10 @@ public struct ResolveDeepLinkRequest: Codable, Equatable, Sendable {
 public struct CreateNoteRequest: Codable, Equatable, Sendable {
     public let title: String
     public let markdown: String
-    public let open: Bool?
 
-    public init(title: String, markdown: String, open: Bool? = nil) {
+    public init(title: String, markdown: String) {
         self.title = title
         self.markdown = markdown
-        self.open = open
     }
 }
 
@@ -555,13 +556,11 @@ public struct UpdateNoteRequest: Codable, Equatable, Sendable {
     public let noteID: String
     public let title: String?
     public let markdown: String?
-    public let open: Bool?
 
-    public init(noteID: String, title: String? = nil, markdown: String? = nil, open: Bool? = nil) {
+    public init(noteID: String, title: String? = nil, markdown: String? = nil) {
         self.noteID = noteID
         self.title = title
         self.markdown = markdown
-        self.open = open
     }
 }
 
@@ -602,14 +601,12 @@ public struct CreateTodoRequest: Codable, Equatable, Sendable {
     public let markdown: String
     public let status: TodoStatus?
     public let tags: [String]?
-    public let open: Bool?
 
-    public init(title: String, markdown: String = "", status: TodoStatus? = nil, tags: [String]? = nil, open: Bool? = nil) {
+    public init(title: String, markdown: String = "", status: TodoStatus? = nil, tags: [String]? = nil) {
         self.title = title
         self.markdown = markdown
         self.status = status
         self.tags = tags
-        self.open = open
     }
 }
 
@@ -619,22 +616,19 @@ public struct UpdateTodoRequest: Codable, Equatable, Sendable {
     public let markdown: String?
     public let status: TodoStatus?
     public let tags: [String]?
-    public let open: Bool?
 
     public init(
         todoID: String,
         title: String? = nil,
         markdown: String? = nil,
         status: TodoStatus? = nil,
-        tags: [String]? = nil,
-        open: Bool? = nil
+        tags: [String]? = nil
     ) {
         self.todoID = todoID
         self.title = title
         self.markdown = markdown
         self.status = status
         self.tags = tags
-        self.open = open
     }
 }
 
@@ -642,13 +636,11 @@ public struct MoveTodoRequest: Codable, Equatable, Sendable {
     public let todoID: String
     public let status: TodoStatus?
     public let afterTodoID: String?
-    public let open: Bool?
 
-    public init(todoID: String, status: TodoStatus? = nil, afterTodoID: String? = nil, open: Bool? = nil) {
+    public init(todoID: String, status: TodoStatus? = nil, afterTodoID: String? = nil) {
         self.todoID = todoID
         self.status = status
         self.afterTodoID = afterTodoID
-        self.open = open
     }
 }
 
@@ -657,20 +649,17 @@ public struct AddTodoCommentRequest: Codable, Equatable, Sendable {
     public let markdown: String
     public let author: String?
     public let terminalID: String?
-    public let open: Bool?
 
     public init(
         todoID: String,
         markdown: String,
         author: String? = nil,
-        terminalID: String? = nil,
-        open: Bool? = nil
+        terminalID: String? = nil
     ) {
         self.todoID = todoID
         self.markdown = markdown
         self.author = author
         self.terminalID = terminalID
-        self.open = open
     }
 }
 
@@ -799,30 +788,6 @@ public struct GetTerminalOutputRequest: Codable, Equatable, Sendable {
     }
 }
 
-public struct GetTerminalRawOutputRequest: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let maxBytes: Int?
-
-    public init(terminalID: String, maxBytes: Int?) {
-        self.terminalID = terminalID
-        self.maxBytes = maxBytes
-    }
-}
-
-public struct SearchOutputRequest: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let query: String
-    public let caseSensitive: Bool?
-    public let maxMatches: Int?
-
-    public init(terminalID: String, query: String, caseSensitive: Bool?, maxMatches: Int?) {
-        self.terminalID = terminalID
-        self.query = query
-        self.caseSensitive = caseSensitive
-        self.maxMatches = maxMatches
-    }
-}
-
 public struct CherryControlResponse: Codable, Equatable, Sendable {
     public let result: CherryControlResult?
     public let error: CherryControlError?
@@ -903,8 +868,6 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case selectTerminal(SelectTerminalResult)
     case sendInput(SendInputResult)
     case getTerminalOutput(TerminalOutputResult)
-    case getTerminalRawOutput(TerminalRawOutputResult)
-    case searchOutput(SearchOutputResult)
     case clearOutput(ClearOutputResult)
     case restartTerminal(TerminalSummaryResult)
     case closeTerminal(CloseTerminalResult)
@@ -936,7 +899,6 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
     public let lineCount: Int
     public let kind: String?
     public let agentName: String?
-    public let summary: String?
     public let parentAgentID: String?
     public let childAgentCount: Int?
 
@@ -950,7 +912,6 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
         link: String? = nil,
         kind: String? = nil,
         agentName: String? = nil,
-        summary: String? = nil,
         parentAgentID: String? = nil,
         childAgentCount: Int? = nil
     ) {
@@ -963,7 +924,6 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
         self.lineCount = lineCount
         self.kind = kind
         self.agentName = agentName
-        self.summary = summary
         self.parentAgentID = parentAgentID
         self.childAgentCount = childAgentCount
     }
@@ -1006,26 +966,6 @@ public struct ProjectInfo: Codable, Equatable, Sendable {
         self.active = active
         self.open = open
         self.features = features
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case root
-        case name
-        case active
-        case open
-        case features
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        root = try container.decode(String.self, forKey: .root)
-        name = try container.decode(String.self, forKey: .name)
-        active = try container.decode(Bool.self, forKey: .active)
-        open = try container.decode(Bool.self, forKey: .open)
-        features = try container.decodeIfPresent(
-            ProjectFeatureAvailability.self,
-            forKey: .features
-        ) ?? .init(notesEnabled: false, todosEnabled: false)
     }
 }
 
@@ -1105,22 +1045,22 @@ public struct ProjectStatusResult: Codable, Equatable, Sendable {
 }
 
 public struct TerminalPerformanceCounters: Codable, Equatable, Sendable {
-    public let ptyChunks: Int
-    public let ptyBytes: Int
-    public let ghosttyFeedChunks: Int
-    public let ghosttyFeedBytes: Int
-    public let processorBacklogDropCount: Int
-    public let processorBacklogDroppedBytes: Int
-    public let backgroundOutputThrottleCount: Int
-    public let processorChanges: Int
-    public let representableUpdates: Int
-    public let containerConfigures: Int
-    public let bridgeAttaches: Int
-    public let reusedBridgeAttaches: Int
-    public let fitToSizeCalls: Int
-    public let settingsApplies: Int
-    public let settingsReconfigures: Int
-    public let renderTicks: Int
+    public var ptyChunks: Int
+    public var ptyBytes: Int
+    public var ghosttyFeedChunks: Int
+    public var ghosttyFeedBytes: Int
+    public var processorBacklogDropCount: Int
+    public var processorBacklogDroppedBytes: Int
+    public var backgroundOutputThrottleCount: Int
+    public var processorChanges: Int
+    public var representableUpdates: Int
+    public var containerConfigures: Int
+    public var bridgeAttaches: Int
+    public var reusedBridgeAttaches: Int
+    public var fitToSizeCalls: Int
+    public var settingsApplies: Int
+    public var settingsReconfigures: Int
+    public var renderTicks: Int
 
     public init(
         ptyChunks: Int = 0,
@@ -1213,7 +1153,6 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     public let commandLine: String?
     public let lineCount: Int
     public let outputVersion: Int
-    public let summary: String?
     public let selected: Bool
     public let agentName: String?
     public let commandName: String?
@@ -1265,7 +1204,6 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         commandLine: String?,
         lineCount: Int,
         outputVersion: Int = 0,
-        summary: String?,
         selected: Bool,
         agentName: String?,
         commandName: String?,
@@ -1302,7 +1240,6 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         self.commandLine = commandLine
         self.lineCount = lineCount
         self.outputVersion = outputVersion
-        self.summary = summary
         self.selected = selected
         self.agentName = agentName
         self.commandName = commandName

@@ -1081,7 +1081,7 @@ extension CherryControlServer {
     @MainActor
     private func awayWorkerTaskOfCaller() -> AgentTask? {
         guard Self.remoteDevice == nil, callerSessionResolverForTesting == nil, let peerPID = Self.callerPeerPID else { return nil }
-        let ancestry = Set(Self.processAncestry(of: peerPID))
+        let ancestry = Set(CherryControl.processAncestry(of: peerPID))
         for id in tasks.taskOrder.reversed() {
             guard let task = tasks.tasks[id], task.state != .cancelled, locateWorker(task) == nil,
                   let hosting = hosting(of: task), let sessionID = task.hostSessionID ?? task.workerSession?.sessionID,

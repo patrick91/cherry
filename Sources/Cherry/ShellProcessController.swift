@@ -882,7 +882,7 @@ final class ShellProcessController: @unchecked Sendable {
         setMasterFD(master)
         childPID = pid
 
-        Self.setCloseOnExec(fileDescriptor: master)
+        UnixIO.setCloseOnExec(master)
 
         let currentFlags = fcntl(master, F_GETFL)
         if currentFlags >= 0 {
@@ -1393,11 +1393,5 @@ final class ShellProcessController: @unchecked Sendable {
         for fileDescriptor in 3..<Int32(maximumDescriptor) {
             _ = close(fileDescriptor)
         }
-    }
-
-    private static func setCloseOnExec(fileDescriptor: Int32) {
-        let flags = fcntl(fileDescriptor, F_GETFD)
-        guard flags >= 0 else { return }
-        _ = fcntl(fileDescriptor, F_SETFD, flags | FD_CLOEXEC)
     }
 }

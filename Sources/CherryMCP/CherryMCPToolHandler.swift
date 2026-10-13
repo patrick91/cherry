@@ -12,7 +12,6 @@ private func cherryMCPClient(timeout: TimeInterval?) -> CherryControlClient {
 }
 
 public final class CherryMCPToolContext: @unchecked Sendable {
-    public let sessionID: String?
     public let callerProcessID: String?
     private let lock = NSLock()
     private var storedBoundProcessID: String?
@@ -23,14 +22,13 @@ public final class CherryMCPToolContext: @unchecked Sendable {
         return storedBoundProcessID
     }
 
-    private init(sessionID: String?, callerProcessID: String?) {
-        self.sessionID = sessionID
+    private init(callerProcessID: String?) {
         self.callerProcessID = callerProcessID
         self.storedBoundProcessID = callerProcessID
     }
 
-    public static func bound(sessionID: String? = nil, callerProcessID: String? = nil) -> CherryMCPToolContext {
-        CherryMCPToolContext(sessionID: sessionID, callerProcessID: callerProcessID)
+    public static func bound(callerProcessID: String? = nil) -> CherryMCPToolContext {
+        CherryMCPToolContext(callerProcessID: callerProcessID)
     }
 
     @discardableResult
@@ -574,15 +572,12 @@ public enum CherryMCPTools {
         }
 
         let statusResponse = try cherryMCPClient().send(scopedRequest(.getProjectStatus, arguments: arguments))
-        if let error = statusResponse.error {
-            return try toolError(error)
-        }
-        guard case .getProjectStatus(let status)? = statusResponse.result else {
-            return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for whoami."))
+        let status: ProjectStatusResult = try unwrap(statusResponse, "whoami") {
+            guard case .getProjectStatus(let value) = $0 else { return nil }
+            return value
         }
 
         return try encodedResult(MCPWhoamiPayload(
-            mcpSessionID: context?.sessionID,
             callerProcessID: context?.callerProcessID,
             activeProjectRoot: activeProjectRoot,
             effectiveProjectRoot: status.projectRoot,
@@ -606,16 +601,13 @@ public enum CherryMCPTools {
         }
 
         let response = try cherryMCPClient().send(scopedRequest(.getProcessStatus(selector), arguments: arguments))
-        if let error = response.error {
-            return try toolError(error)
-        }
-        guard case .getProcessStatus(let status)? = response.result else {
-            return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for bind_session_process."))
+        let status: ProcessStatusResult = try unwrap(response, "bind_session_process") {
+            guard case .getProcessStatus(let value) = $0 else { return nil }
+            return value
         }
 
         let previous = context.bindProcessID(status.process.id)
         return try encodedResult(MCPBindSessionProcessPayload(
-            mcpSessionID: context.sessionID,
             boundProcessID: status.process.id,
             previousBoundProcessID: previous,
             process: status.process
@@ -656,11 +648,9 @@ public enum CherryMCPTools {
 
         let response = try cherryMCPClient(timeout: clientTimeout(for: "spawn_agent", arguments: arguments))
             .send(scopedRequest(request, arguments: arguments))
-        if let error = response.error {
-            return try toolError(error)
-        }
-        guard case .spawnProcess(let spawned)? = response.result else {
-            return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for spawn_agent."))
+        let spawned: SpawnProcessResult = try unwrap(response, "spawn_agent") {
+            guard case .spawnProcess(let value) = $0 else { return nil }
+            return value
         }
 
         let shouldBind = boolArgument("bind_session", in: arguments) ?? false
@@ -686,11 +676,9 @@ public enum CherryMCPTools {
         let client = cherryMCPClient(timeout: clientTimeout(for: "send_agent_message", arguments: arguments))
 
         let statusResponse = try client.send(scopedRequest(.getProcessStatus(selector), arguments: arguments))
-        if let error = statusResponse.error {
-            return try toolError(error)
-        }
-        guard case .getProcessStatus(let status)? = statusResponse.result else {
-            return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for send_agent_message status lookup."))
+        let status: ProcessStatusResult = try unwrap(statusResponse, "send_agent_message status lookup") {
+            guard case .getProcessStatus(let value) = $0 else { return nil }
+            return value
         }
         guard status.process.kind == "agent" else {
             return try toolError(.init(
@@ -705,11 +693,9 @@ public enum CherryMCPTools {
             submit: true
         ))
         let sendResponse = try client.send(scopedRequest(sendRequest, arguments: arguments))
-        if let error = sendResponse.error {
-            return try toolError(error)
-        }
-        guard case .sendProcessInput(let sent)? = sendResponse.result else {
-            return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for send_agent_message input."))
+        let sent: SendProcessInputResult = try unwrap(sendResponse, "send_agent_message input") {
+            guard case .sendProcessInput(let value) = $0 else { return nil }
+            return value
         }
 
         let shouldWait = boolArgument("wait_for_idle", in: arguments) ?? true
@@ -730,11 +716,9 @@ public enum CherryMCPTools {
             lineLimit: intArgument("line_limit", in: arguments)
         ))
         let waitResponse = try client.send(scopedRequest(waitRequest, arguments: arguments))
-        if let error = waitResponse.error {
-            return try toolError(error)
-        }
-        guard case .waitForProcessIdle(let wait)? = waitResponse.result else {
-            return try toolError(.init(code: "unexpected_response", message: "Cherry returned an unexpected response for send_agent_message idle wait."))
+        let wait: WaitForProcessIdleResult = try unwrap(waitResponse, "send_agent_message idle wait") {
+            guard case .waitForProcessIdle(let value) = $0 else { return nil }
+            return value
         }
 
         return try encodedResult(MCPSendAgentMessagePayload(
@@ -743,6 +727,23 @@ public enum CherryMCPTools {
             output: wait.output,
             wait: wait
         ))
+    }
+
+    /// The result `extract` finds in `response`. Throws Cherry's error, or
+    /// `unexpected_response` for any other result (`call` returns either
+    /// as the tool's error).
+    private static func unwrap<T>(
+        _ response: CherryControlResponse,
+        _ what: String,
+        _ extract: (CherryControlResult) -> T?
+    ) throws -> T {
+        if let error = response.error {
+            throw error
+        }
+        guard let result = response.result, let value = extract(result) else {
+            throw CherryControlError(code: "unexpected_response", message: "Cherry returned an unexpected response for \(what).")
+        }
+        return value
     }
 
     private static func scopedRequest(_ request: CherryControlRequest, arguments: [String: Value] = [:]) -> CherryControlRequest {
@@ -784,7 +785,7 @@ public enum CherryMCPTools {
     }
 
     private static func inferredProjectRootFromWorkingDirectory() -> String? {
-        let workingDirectory = standardizedPath(FileManager.default.currentDirectoryPath)
+        let workingDirectory = CherryControl.standardizedProjectRoot(FileManager.default.currentDirectoryPath)
         guard let response = try? cherryMCPClient().send(.listProjects),
               case .listProjects(let payload)? = response.result
         else {
@@ -792,72 +793,39 @@ public enum CherryMCPTools {
         }
 
         return payload.projects
-            .map { standardizedPath($0.root) }
-            .filter { contains(path: workingDirectory, inProjectRoot: $0) }
+            .map { CherryControl.standardizedProjectRoot($0.root) }
+            .filter { CherryControl.path(workingDirectory, isInsideProjectRoot: $0) }
             .max { $0.count < $1.count }
-    }
-
-    private static func standardizedPath(_ path: String) -> String {
-        URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
-    }
-
-    private static func contains(path: String, inProjectRoot projectRoot: String) -> Bool {
-        path == projectRoot || path.hasPrefix(projectRoot.hasSuffix("/") ? projectRoot : projectRoot + "/")
     }
 
     private static func statusResult() throws -> CallTool.Result {
         let socketURL = CherryControl.socketURL
         let socketExists = FileManager.default.fileExists(atPath: socketURL.path)
 
+        var terminals: ListTerminalsResult?
+        var statusError: CherryControlError?
         do {
             let response = try cherryMCPClient().send(scopedRequest(.listTerminals))
             if let error = response.error {
-                return try encodedResult(MCPStatusPayload(
-                    socketPath: socketURL.path,
-                    socketExists: socketExists,
-                    cherryReachable: false,
-                    terminalCount: nil,
-                    selectedTerminalID: nil,
-                    error: error
-                ))
+                statusError = error
+            } else if case .listTerminals(let result)? = response.result {
+                terminals = result
+            } else {
+                statusError = .init(code: "unexpected_status_response", message: "Cherry returned an unexpected status response.")
             }
-            guard case .listTerminals(let terminals)? = response.result else {
-                return try encodedResult(MCPStatusPayload(
-                    socketPath: socketURL.path,
-                    socketExists: socketExists,
-                    cherryReachable: false,
-                    terminalCount: nil,
-                    selectedTerminalID: nil,
-                    error: .init(code: "unexpected_status_response", message: "Cherry returned an unexpected status response.")
-                ))
-            }
-            return try encodedResult(MCPStatusPayload(
-                socketPath: socketURL.path,
-                socketExists: socketExists,
-                cherryReachable: true,
-                terminalCount: terminals.terminals.count,
-                selectedTerminalID: terminals.selectedTerminalID,
-                error: nil
-            ))
         } catch let error as CherryControlError {
-            return try encodedResult(MCPStatusPayload(
-                socketPath: socketURL.path,
-                socketExists: socketExists,
-                cherryReachable: false,
-                terminalCount: nil,
-                selectedTerminalID: nil,
-                error: error
-            ))
+            statusError = error
         } catch {
-            return try encodedResult(MCPStatusPayload(
-                socketPath: socketURL.path,
-                socketExists: socketExists,
-                cherryReachable: false,
-                terminalCount: nil,
-                selectedTerminalID: nil,
-                error: .init(code: "status_failed", message: error.localizedDescription)
-            ))
+            statusError = .init(code: "status_failed", message: error.localizedDescription)
         }
+        return try encodedResult(MCPStatusPayload(
+            socketPath: socketURL.path,
+            socketExists: socketExists,
+            cherryReachable: terminals != nil,
+            terminalCount: terminals?.terminals.count,
+            selectedTerminalID: terminals?.selectedTerminalID,
+            error: statusError
+        ))
     }
 
     private static func controlRequest(
@@ -1040,8 +1008,7 @@ public enum CherryMCPTools {
         case "create_note":
             return .createNote(.init(
                 title: try requiredString("title", in: arguments),
-                markdown: try requiredString("markdown", in: arguments),
-                open: false
+                markdown: try requiredString("markdown", in: arguments)
             ))
         case "get_note":
             return .getNote(.init(noteID: try requiredString("note_id", in: arguments)))
@@ -1049,8 +1016,7 @@ public enum CherryMCPTools {
             return .updateNote(.init(
                 noteID: try requiredString("note_id", in: arguments),
                 title: stringArgument("title", in: arguments),
-                markdown: stringArgument("markdown", in: arguments),
-                open: false
+                markdown: stringArgument("markdown", in: arguments)
             ))
         case "append_note":
             return .appendNote(.init(
@@ -1077,8 +1043,7 @@ public enum CherryMCPTools {
                 title: try requiredString("title", in: arguments),
                 markdown: stringArgument("markdown", in: arguments) ?? "",
                 status: try todoStatusArgument("status", in: arguments),
-                tags: try stringArrayArgument("tags", in: arguments),
-                open: false
+                tags: try stringArrayArgument("tags", in: arguments)
             ))
         case "get_todo":
             return .getTodo(.init(todoID: try requiredString("todo_id", in: arguments)))
@@ -1088,15 +1053,13 @@ public enum CherryMCPTools {
                 title: stringArgument("title", in: arguments),
                 markdown: stringArgument("markdown", in: arguments),
                 status: try todoStatusArgument("status", in: arguments),
-                tags: try stringArrayArgument("tags", in: arguments),
-                open: false
+                tags: try stringArrayArgument("tags", in: arguments)
             ))
         case "move_todo":
             return .moveTodo(.init(
                 todoID: try requiredString("todo_id", in: arguments),
                 status: try todoStatusArgument("status", in: arguments),
-                afterTodoID: stringArgument("after_todo_id", in: arguments),
-                open: false
+                afterTodoID: stringArgument("after_todo_id", in: arguments)
             ))
         case "delete_todo":
             return .deleteTodo(.init(todoID: try requiredString("todo_id", in: arguments)))
@@ -1107,8 +1070,7 @@ public enum CherryMCPTools {
                 todoID: try requiredString("todo_id", in: arguments),
                 markdown: try requiredString("markdown", in: arguments),
                 author: stringArgument("author", in: arguments),
-                terminalID: stringArgument("process_id", in: arguments),
-                open: false
+                terminalID: stringArgument("process_id", in: arguments)
             ))
         case "list_todo_comments":
             return .listTodoComments(.init(todoID: try requiredString("todo_id", in: arguments)))
@@ -1258,10 +1220,6 @@ public enum CherryMCPTools {
             return try encodedResult(payload)
         case .getTerminalOutput(let payload):
             return try encodedResult(payload)
-        case .getTerminalRawOutput(let payload):
-            return try encodedResult(payload)
-        case .searchOutput(let payload):
-            return try encodedResult(payload)
         case .clearOutput(let payload):
             return try encodedResult(payload)
         case .restartTerminal(let payload):
@@ -1374,25 +1332,15 @@ public enum CherryMCPTools {
         return processID
     }
 
-    public static func callerProcessID(processPID: Int32, parentPID: Int32?) async -> String? {
+    /// The process (tab) whose program `processPID` descends from: the
+    /// environment's, else the nearest of its (at most 12) ancestors that
+    /// is a process of the project.
+    public static func callerProcessID(processPID: Int32) async -> String? {
         if let processID = environmentProcessID() {
             return processID
         }
-        return await inferredCallerProcessID(parentPIDs: parentPIDs(processPID: processPID, parentPID: parentPID))
-    }
-
-    public static func callerProcessID(parentPID: Int32?) async -> String? {
-        if let processID = environmentProcessID() {
-            return processID
-        }
-        return await inferredCallerProcessID(parentPIDs: parentPID.map { [$0] } ?? [])
-    }
-
-    public static func inferredCallerProcessID(parentPID: Int32?) async -> String? {
-        guard let parentPID, parentPID > 0 else {
-            return nil
-        }
-        return await inferredCallerProcessID(parentPIDs: [parentPID])
+        let ancestors = Array(CherryControl.processAncestry(of: processPID, maxDepth: 12).dropFirst())
+        return await inferredCallerProcessID(parentPIDs: ancestors)
     }
 
     public static func inferredCallerProcessID(parentPIDs: [Int32]) async -> String? {
@@ -1413,39 +1361,6 @@ public enum CherryMCPTools {
             }
         }
         return nil
-    }
-
-    public static func parentPIDs(processPID: Int32, parentPID: Int32?, maxDepth: Int = 12) -> [Int32] {
-        var output: [Int32] = []
-        var seen = Set<Int32>()
-        var currentPID = parentPID ?? Self.parentPID(of: processPID)
-
-        while let pid = currentPID, pid > 1, !seen.contains(pid), output.count < maxDepth {
-            output.append(pid)
-            seen.insert(pid)
-            currentPID = Self.parentPID(of: pid)
-        }
-
-        return output
-    }
-
-    private static func parentPID(of pid: Int32) -> Int32? {
-        guard pid > 1 else {
-            return nil
-        }
-
-        var mib = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
-        var processInfo = kinfo_proc()
-        var size = MemoryLayout<kinfo_proc>.stride
-        let result = mib.withUnsafeMutableBufferPointer { pointer in
-            sysctl(pointer.baseAddress, u_int(pointer.count), &processInfo, &size, nil, 0)
-        }
-        guard result == 0, size >= MemoryLayout<kinfo_proc>.stride else {
-            return nil
-        }
-
-        let parentPID = processInfo.kp_eproc.e_ppid
-        return parentPID > 0 ? parentPID : nil
     }
 
     /// An argument as JSON, whatever its type.
@@ -1567,10 +1482,7 @@ public enum CherryMCPTools {
     }
 
     private static func processBulkCommand(in arguments: [String: Value]) -> ProcessBulkCommandRequest {
-        ProcessBulkCommandRequest(
-            waitMilliseconds: intArgument("wait_ms", in: arguments),
-            lineLimit: intArgument("line_limit", in: arguments)
-        )
+        ProcessBulkCommandRequest(waitMilliseconds: intArgument("wait_ms", in: arguments))
     }
 
     private static func waitForProcessIdleRequest(
@@ -1723,8 +1635,7 @@ public enum CherryMCPTools {
 
     private static func bulkCommandProperties() -> [String: Value] {
         [
-            "wait_ms": integer("Optional wait before returning process list. Max 5000."),
-            "line_limit": integer("Reserved output line limit for lifecycle symmetry.")
+            "wait_ms": integer("Optional wait before returning process list. Max 5000.")
         ]
     }
 }
@@ -1734,7 +1645,6 @@ private struct ErrorPayload: Codable {
 }
 
 private struct MCPWhoamiPayload: Codable {
-    let mcpSessionID: String?
     let callerProcessID: String?
     let activeProjectRoot: String?
     let effectiveProjectRoot: String?
@@ -1744,7 +1654,6 @@ private struct MCPWhoamiPayload: Codable {
 }
 
 private struct MCPBindSessionProcessPayload: Codable {
-    let mcpSessionID: String?
     let boundProcessID: String
     let previousBoundProcessID: String?
     let process: ProcessSummary
@@ -1776,10 +1685,4 @@ private struct MCPStatusPayload: Codable {
     let terminalCount: Int?
     let selectedTerminalID: String?
     let error: CherryControlError?
-}
-
-private extension String {
-    var nilIfEmpty: String? {
-        isEmpty ? nil : self
-    }
 }

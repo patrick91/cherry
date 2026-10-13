@@ -309,12 +309,6 @@ private extension NSLock {
     }
 }
 
-extension String {
-    var nilIfEmpty: String? {
-        isEmpty ? nil : self
-    }
-}
-
 final class TerminalInputWriter: @unchecked Sendable {
     typealias WriteHandler = @Sendable (Data) -> Void
     typealias InputHandler = @MainActor @Sendable (Data) -> Void
@@ -1372,10 +1366,6 @@ final class TerminalWorkspace: ObservableObject {
 
     func childAgentSessions(of parent: TerminalSession) -> [TerminalSession] {
         childAgentSessions(parentID: parent.id)
-    }
-
-    func childAgentCount(of parent: TerminalSession) -> Int {
-        childAgentSessions(of: parent).count
     }
 
     func descendantAgentSessions(of parent: TerminalSession) -> [TerminalSession] {

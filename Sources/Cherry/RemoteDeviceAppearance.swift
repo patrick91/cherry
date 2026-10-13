@@ -4,10 +4,11 @@ import SwiftUI
 
 // How a window on another Mac (a device window, `device:<uuid>:<path>`)
 // says so: each device's colour (`RemoteDeviceColor`, chosen in Settings ›
-// Sessions › Other Macs or derived from its id), the Mac chip under the
-// sidebar header's project name, the Mac-name prefix of the tab header's
-// path, a thin tinted line along the window's top edge, and the window
-// title. This Mac's windows show none of it.
+// Sessions › Other Macs or derived from its id), "@ <Mac>" after the
+// sidebar header's project name (which also shows whether the Mac answers),
+// the Mac-name prefix of the tab header's path, and the window title
+// "<project> @ <Mac>". The Mac is named once per place: tab rows do not
+// repeat it. This Mac's windows show none of it.
 
 /// A device's colour: a small palette that reads in light and dark and
 /// stays clear of the sidebar's selection purple (no violet or indigo).
@@ -112,12 +113,6 @@ struct RemoteDeviceBadge: Equatable, Sendable {
         self.init(deviceID: device.id, name: device.name, color: device.effectiveColor)
     }
 
-    /// A laptop for a Mac whose name says it is one, else a display.
-    var symbolName: String {
-        let name = name.lowercased()
-        return name.contains("book") || name.contains("laptop") ? "laptopcomputer" : "desktopcomputer"
-    }
-
     /// The badge of the Mac a project key names; nil for This Mac's keys
     /// (the store is never asked then). A device the store no longer knows
     /// still gets one ("Unknown Mac"), so its window still says it is not
@@ -131,12 +126,12 @@ struct RemoteDeviceBadge: Equatable, Sendable {
 }
 
 /// The window title (Window menu, Mission Control, ⌘`): "<project>", with
-/// " — <Mac>" for a device window, and " — <tab>" when its selected tab has
-/// a title.
+/// " @ <Mac>" for a device window, as its header says it, and " — <tab>"
+/// when its selected tab has a title.
 enum ProjectWindowTitle {
     static func title(project: String, deviceName: String? = nil, tab: String? = nil) -> String {
         var title = project
-        if let deviceName, !deviceName.isEmpty { title += " — \(deviceName)" }
+        if let deviceName, !deviceName.isEmpty { title += " @ \(deviceName)" }
         let tab = tab?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !tab.isEmpty { title += " — \(tab)" }
         return title
@@ -186,51 +181,154 @@ struct RemoteDeviceBadgeReader<Content: View>: View {
     }
 }
 
-/// The sidebar header's Mac chip: a display (or laptop) and the Mac's
-/// name, in its colour.
-struct RemoteDeviceHeaderChip: View {
-    static let fontSize: CGFloat = 11
-    static let symbolWidth: CGFloat = 13
-    static let spacing: CGFloat = 3
-    static let horizontalPadding: CGFloat = 5
+/// Whether a device window's Mac answers, as its header shows it: the name
+/// in its colour, dimmed while it reconnects, grey with a warning when the
+/// user has to act (the tab's or the window's bar says how).
+enum RemoteDeviceHeaderStatus: Equatable {
+    /// Connected, or not asked to connect (a window with no tabs leases
+    /// no connection): nothing to say.
+    case normal
+    case reconnecting
+    /// What stands in the way (`RemoteDeviceAvailability.text`).
+    case needsYou(String)
 
-    @Environment(\.colorScheme) private var colorScheme
-    let badge: RemoteDeviceBadge
-
-    var body: some View {
-        let tint = badge.color.color(for: colorScheme)
-        HStack(spacing: Self.spacing) {
-            Image(systemName: badge.symbolName)
-                .font(.system(size: 9, weight: .semibold))
-                .frame(width: Self.symbolWidth)
-            Text(badge.name)
-                .font(.system(size: Self.fontSize, weight: .semibold))
-                .lineLimit(1)
-                .truncationMode(.tail)
+    static func of(_ state: HostControl.ConnectionState, installationProblem: String?, machine: String) -> Self {
+        if installationProblem == nil, state == .idle { return .normal }
+        switch RemoteDeviceAvailability.of(state, installationProblem: installationProblem) {
+        case .online: return .normal
+        case .reconnecting: return .reconnecting
+        case let availability: return .needsYou(availability.text(machine: machine))
         }
-        .foregroundStyle(tint)
-        .padding(.horizontal, Self.horizontalPadding)
-        .background(Capsule(style: .continuous).fill(tint.opacity(0.14)))
-        .fixedSize(horizontal: false, vertical: true)
-        .background(RemoteDeviceChipAnchor())
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("On \(badge.name)")
     }
 
-    private static let font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
-
-    /// Its width, for the header's own measuring.
-    static func width(of badge: RemoteDeviceBadge) -> CGFloat {
-        let text = ceil((badge.name as NSString).size(withAttributes: [.font: font]).width)
-        return symbolWidth + spacing + text + horizontalPadding * 2
+    /// The header's help and spoken text after "<project> on <Mac>".
+    func detail(machine: String) -> String? {
+        switch self {
+        case .normal: nil
+        case .reconnecting: "Reconnecting to \(machine)…"
+        case .needsYou(let text): text
+        }
     }
 }
 
-/// Marks the Mac chip for tests that look for it.
-private struct RemoteDeviceChipAnchor: NSViewRepresentable {
+/// Gives `content` the header status of `hosting`'s Mac (`.normal` without
+/// one), kept current as its control connects, drops and retries.
+struct RemoteDeviceStatusReader<Content: View>: View {
+    let hosting: PersistentHostSessions?
+    @ViewBuilder let content: (RemoteDeviceHeaderStatus) -> Content
+
+    var body: some View {
+        if let hosting {
+            Observing(hosting: hosting, control: hosting.control, content: content)
+        } else {
+            content(.normal)
+        }
+    }
+
+    private struct Observing: View {
+        let hosting: PersistentHostSessions
+        @ObservedObject var control: HostControl
+        let content: (RemoteDeviceHeaderStatus) -> Content
+
+        var body: some View {
+            content(RemoteDeviceHeaderStatus.of(
+                control.state,
+                // A device Cherry no longer knows: its stand-in says why.
+                installationProblem: hosting.profile.isKnownDevice ? nil : hosting.installationProblem(),
+                machine: hosting.profile.displayName
+            ))
+        }
+    }
+}
+
+/// What follows the project name in a device window's sidebar header:
+/// "@ <Mac>", the name in its Mac's colour. While the Mac reconnects the
+/// name dims (and pulses for a while, unless Reduce Motion is on); when
+/// the user has to act it turns grey and a warning follows it. The name
+/// truncates before the project's does.
+struct RemoteDeviceHeaderAddress: View {
+    static let spacing: CGFloat = 4
+    static let warningWidth: CGFloat = 13
+    /// Room the name keeps when the project's name is long ("pat…").
+    static let minimumNameWidth: CGFloat = 30
+    /// Pulses, then stays dim: a Mac asleep for hours does not animate
+    /// the window all that time.
+    private static let pulseCount = 12
+    private static let pulseInterval: Duration = .milliseconds(800)
+
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let badge: RemoteDeviceBadge
+    let status: RemoteDeviceHeaderStatus
+    let fontSize: CGFloat
+    /// The header's text colour, which "@" and a grey name are shades of.
+    let textColor: Color
+
+    @State private var pulseIsDim = false
+
+    var body: some View {
+        HStack(spacing: Self.spacing) {
+            Text("@")
+                .font(.system(size: fontSize, weight: .regular))
+                .foregroundStyle(textColor.opacity(0.45))
+                .fixedSize()
+            Text(badge.name)
+                .font(.system(size: fontSize, weight: .medium))
+                .foregroundStyle(nameColor)
+                .opacity(nameOpacity)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(minWidth: min(Self.nameWidth(badge.name, fontSize: fontSize), Self.minimumNameWidth), alignment: .leading)
+                .background(RemoteDeviceHeaderAnchor())
+            if case .needsYou = status {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: fontSize - 4, weight: .semibold))
+                    .foregroundStyle(.orange)
+                    .frame(width: Self.warningWidth)
+            }
+        }
+        .accessibilityHidden(true)
+        .task(id: status == .reconnecting && !reduceMotion) {
+            guard status == .reconnecting, !reduceMotion else {
+                pulseIsDim = false
+                return
+            }
+            for _ in 0..<Self.pulseCount {
+                withAnimation(.easeInOut(duration: 0.8)) { pulseIsDim.toggle() }
+                do { try await Task.sleep(for: Self.pulseInterval) } catch { return }
+            }
+            withAnimation(.easeInOut(duration: 0.8)) { pulseIsDim = false }
+        }
+    }
+
+    private var nameColor: Color {
+        if case .needsYou = status { return textColor.opacity(0.55) }
+        return badge.color.color(for: colorScheme)
+    }
+
+    private var nameOpacity: Double {
+        guard status == .reconnecting else { return 1 }
+        return pulseIsDim ? 0.3 : 0.5
+    }
+
+    /// Its width, for the header's own measuring.
+    static func width(of badge: RemoteDeviceBadge, status: RemoteDeviceHeaderStatus, fontSize: CGFloat) -> CGFloat {
+        let at = ceil(("@" as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: fontSize, weight: .regular)]).width)
+        var width = at + spacing + nameWidth(badge.name, fontSize: fontSize)
+        if case .needsYou = status { width += spacing + warningWidth }
+        return width
+    }
+
+    private static func nameWidth(_ name: String, fontSize: CGFloat) -> CGFloat {
+        ceil((name as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: fontSize, weight: .medium)]).width)
+    }
+}
+
+/// Marks a device window's "@ <Mac>" for tests that look for it.
+private struct RemoteDeviceHeaderAnchor: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
-        view.identifier = .remoteDeviceChipAnchor
+        view.identifier = .remoteDeviceHeaderAnchor
         return view
     }
 
@@ -238,7 +336,7 @@ private struct RemoteDeviceChipAnchor: NSViewRepresentable {
 }
 
 extension NSUserInterfaceItemIdentifier {
-    static let remoteDeviceChipAnchor = NSUserInterfaceItemIdentifier("Cherry.RemoteDeviceChipAnchor")
+    static let remoteDeviceHeaderAnchor = NSUserInterfaceItemIdentifier("Cherry.RemoteDeviceHeaderAnchor")
 }
 
 /// Settings › Sessions › Other Macs: a device's colour, Automatic or one

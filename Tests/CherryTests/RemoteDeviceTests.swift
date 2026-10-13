@@ -1333,9 +1333,39 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     #expect(ProjectWindowTitle.title(project: "cherry") == "cherry")
     #expect(ProjectWindowTitle.title(project: "cherry", tab: "zsh") == "cherry — zsh")
     #expect(ProjectWindowTitle.title(project: "cherry", tab: "  ") == "cherry")
-    #expect(ProjectWindowTitle.title(project: "fizzup.club", deviceName: "patstudio") == "fizzup.club — patstudio")
+    #expect(ProjectWindowTitle.title(project: "fizzup.club", deviceName: "patstudio") == "fizzup.club @ patstudio")
     #expect(ProjectWindowTitle.title(project: "fizzup.club", deviceName: "patstudio", tab: "claude")
-        == "fizzup.club — patstudio — claude")
+        == "fizzup.club @ patstudio — claude")
+}
+
+@Test func RemoteDeviceHeaderDimsWhileItsMacReconnectsAndWarnsWhenItNeedsYou() {
+    typealias S = RemoteDeviceHeaderStatus
+    func status(_ state: HostControl.ConnectionState, problem: String? = nil) -> S {
+        S.of(state, installationProblem: problem, machine: "Studio")
+    }
+    #expect(status(.connected) == .normal)
+    // A window with no tabs leases no connection: idle says nothing.
+    #expect(status(.idle) == .normal)
+    #expect(status(.connecting) == .reconnecting)
+    #expect(status(.waitingToReconnect(.unavailable("ssh: connect to host s port 22: Connection timed out"))) == .reconnecting)
+    #expect(status(.waitingToReconnect(.unavailable("s: Permission denied (publickey)."))) == .needsYou("Studio refused the SSH login"))
+    #expect(status(.failed(.identityMismatch("x"))) == .needsYou("Another identity answers for Studio"))
+    #expect(status(.failed(.unavailable("boom"))) == .needsYou("boom"))
+    // A device Cherry no longer knows: its stand-in's reason, even idle.
+    #expect(status(.idle, problem: "This Mac is not among your devices.") == .needsYou("This Mac is not among your devices."))
+
+    #expect(S.normal.detail(machine: "Studio") == nil)
+    #expect(S.reconnecting.detail(machine: "Studio") == "Reconnecting to Studio…")
+    #expect(S.needsYou("Studio refused the SSH login").detail(machine: "Studio") == "Studio refused the SSH login")
+
+    // The warning widens the address; the name is measured whole.
+    let badge = RemoteDeviceBadge(deviceID: UUID(), name: "patstudio", color: .teal)
+    let normal = RemoteDeviceHeaderAddress.width(of: badge, status: .normal, fontSize: 14)
+    #expect(RemoteDeviceHeaderAddress.width(of: badge, status: .reconnecting, fontSize: 14) == normal)
+    #expect(RemoteDeviceHeaderAddress.width(of: badge, status: .needsYou("x"), fontSize: 14)
+        == normal + RemoteDeviceHeaderAddress.spacing + RemoteDeviceHeaderAddress.warningWidth)
+    let longer = RemoteDeviceBadge(deviceID: UUID(), name: "Patrick’s MacBook Pro", color: .teal)
+    #expect(RemoteDeviceHeaderAddress.width(of: longer, status: .normal, fontSize: 14) > normal)
 }
 
 @Test @MainActor func RemoteDeviceBreadcrumbStartsWithTheMacOnlyForDeviceTabs() {
@@ -1373,10 +1403,10 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     #expect(unknown?.color == .automatic(for: gone))
 }
 
-/// The sidebar header (`TitlebarProjectPicker`) shows the Mac chip only
-/// in a device window. Laid out in a window that is never put on screen.
-@Test @MainActor func RemoteDeviceSidebarHeaderShowsTheMacChipOnlyForDeviceWindows() async throws {
-    let directory = try temporaryDirectory("device-chip")
+/// The sidebar header (`TitlebarProjectPicker`) shows "@ <Mac>" only in a
+/// device window. Laid out in a window that is never put on screen.
+@Test @MainActor func RemoteDeviceSidebarHeaderShowsTheMacOnlyForDeviceWindows() async throws {
+    let directory = try temporaryDirectory("device-header")
     defer { try? FileManager.default.removeItem(at: directory) }
     let (hostStore, _, suite) = try makeIsolatedHostedSessionHostStore()
     defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
@@ -1434,11 +1464,13 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
 
     let localHeader = try await header(for: local)
     #expect(contains(.titlebarProjectPickerAnchor, in: localHeader))
-    #expect(!contains(.remoteDeviceChipAnchor, in: localHeader))
+    #expect(!contains(.remoteDeviceHeaderAnchor, in: localHeader))
 
     let remoteHeader = try await header(for: remote)
     #expect(contains(.titlebarProjectPickerAnchor, in: remoteHeader))
-    #expect(contains(.remoteDeviceChipAnchor, in: remoteHeader))
-    // Two lines (name over the chip) fit the header.
-    #expect(remoteHeader.fittingSize.height <= 40)
+    #expect(contains(.remoteDeviceHeaderAnchor, in: remoteHeader))
+    // One line, as tall as This Mac's.
+    #expect(remoteHeader.fittingSize.height == localHeader.fittingSize.height)
+    // "fizzup.club @ patstudio" is wider than the project alone would be.
+    #expect(remoteHeader.fittingSize.width > localHeader.fittingSize.width)
 }

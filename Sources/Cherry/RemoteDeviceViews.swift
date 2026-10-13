@@ -1057,30 +1057,6 @@ private struct RemoteWindowWaitingBarContent: View {
     }
 }
 
-// MARK: - The device chip
-
-/// "􀙗 Studio": which Mac a tab or window runs on.
-struct RemoteDeviceChip: View {
-    let name: String
-    var isSelected = false
-
-    var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: "desktopcomputer")
-                .font(.system(size: 8, weight: .semibold))
-            Text(name)
-                .font(.system(size: 9, weight: .semibold))
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 5)
-        .padding(.vertical, 2)
-        .foregroundStyle(.secondary)
-        .background(Color.primary.opacity(isSelected ? 0.12 : 0.07), in: Capsule())
-        .help("Runs on \(name)")
-        .accessibilityLabel("Runs on \(name)")
-    }
-}
-
 // MARK: - Not open here
 
 /// A device window's "Not open here" group: the project's sessions on that

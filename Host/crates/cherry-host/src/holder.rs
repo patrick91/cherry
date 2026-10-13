@@ -39,16 +39,15 @@ use cherry_protocol::{
     priority, valid_size, ProgramStatus, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_GRAPHICS_BYTES,
 };
 use cherry_vt::{GraphicsReplay, ProgressState, Terminal, VtEvent};
-use portable_pty::{native_pty_system, MasterPty, PtySize};
 use std::{
     collections::VecDeque,
-    ffi::OsStr,
+    ffi::{CStr, OsStr},
     fs::OpenOptions,
     io,
     os::unix::{
         ffi::OsStrExt,
         fs::OpenOptionsExt,
-        io::{AsRawFd, FromRawFd, RawFd},
+        io::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         net::UnixStream,
         process::CommandExt,
     },
@@ -239,14 +238,14 @@ fn panic_report(session: Option<&str>, at: SystemTime, panic: &str) -> String {
 
 /// The PTY's size: its pixels are the grid's in cells of `cell` pixels, or
 /// 0×0 while neither the Create nor a client gave a cell size.
-fn size(cols: u16, rows: u16, cell: Option<(u32, u32)>) -> PtySize {
+fn size(cols: u16, rows: u16, cell: Option<(u32, u32)>) -> libc::winsize {
     let (width, height) = cell.unwrap_or((0, 0));
     let pixels = |cells: u16, side: u32| u16::try_from(u32::from(cells) * side).unwrap_or(u16::MAX);
-    PtySize {
-        cols,
-        rows,
-        pixel_width: pixels(cols, width),
-        pixel_height: pixels(rows, height),
+    libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: pixels(cols, width),
+        ws_ypixel: pixels(rows, height),
     }
 }
 
@@ -299,19 +298,59 @@ fn with_ssh_tty(env: &[(Vec<u8>, Vec<u8>)], tty: &Path) -> Vec<(Vec<u8>, Vec<u8>
         .collect()
 }
 
+/// A new PTY of `size`: its master and its terminal's end, both
+/// close-on-exec.
+fn openpty(mut size: libc::winsize) -> Result<(OwnedFd, OwnedFd)> {
+    let (mut master, mut slave) = (-1, -1);
+    let opened = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::addr_of_mut!(size),
+        )
+    };
+    if opened != 0 {
+        return Err(io::Error::last_os_error()).context("opening a PTY");
+    }
+    let pty = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    for fd in [pty.0.as_raw_fd(), pty.1.as_raw_fd()] {
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+                return Err(io::Error::last_os_error()).context("making a PTY close-on-exec");
+            }
+        }
+    }
+    Ok(pty)
+}
+
+/// The path of the terminal `fd` is open on.
+fn tty_name(fd: RawFd) -> Option<PathBuf> {
+    let mut name = vec![0; 128];
+    loop {
+        match unsafe { libc::ttyname_r(fd, name.as_mut_ptr(), name.len()) } {
+            0 => break,
+            // macOS says this of a buffer it finds too big as well.
+            libc::ERANGE if name.len() <= 64 * 1024 => name.resize(name.len() * 2, 0),
+            _ => return None,
+        }
+    }
+    let name = unsafe { CStr::from_ptr(name.as_ptr()) };
+    Some(PathBuf::from(OsStr::from_bytes(name.to_bytes())))
+}
+
 /// Start the session's program on a new PTY of `size`. Returns the master
 /// and the session leader.
 fn spawn(
     command: &[String],
     cwd: &[u8],
     env: &[(Vec<u8>, Vec<u8>)],
-    size: PtySize,
-) -> Result<(Box<dyn MasterPty + Send>, libc::pid_t)> {
-    let pair = native_pty_system().openpty(size)?;
-    let fd = pair
-        .master
-        .as_raw_fd()
-        .context("PTY implementation has no Unix descriptor")?;
+    size: libc::winsize,
+) -> Result<(OwnedFd, libc::pid_t)> {
+    let (master, opened_slave) = openpty(size)?;
+    let fd = master.as_raw_fd();
     // One thread does all I/O. Nonblocking writes keep a child that stops
     // reading its input from wedging output, termination or the link.
     unsafe {
@@ -320,7 +359,7 @@ fn spawn(
             return Err(io::Error::last_os_error().into());
         }
     }
-    let tty = pair.master.tty_name().context("PTY has no terminal name")?;
+    let tty = tty_name(opened_slave.as_raw_fd()).context("PTY has no terminal name")?;
     let env = with_ssh_tty(env, &tty);
     let slave = OpenOptions::new()
         .read(true)
@@ -328,7 +367,7 @@ fn spawn(
         .custom_flags(libc::O_NOCTTY)
         .open(&tty)
         .with_context(|| format!("opening {}", tty.display()))?;
-    drop(pair.slave);
+    drop(opened_slave);
     set_iutf8(slave.as_raw_fd()).context("setting IUTF8 on the session's terminal")?;
     let mut child = std::process::Command::new(&command[0]);
     child
@@ -378,7 +417,7 @@ fn spawn(
     let child = child
         .spawn()
         .with_context(|| format!("launching {}", command[0]))?;
-    Ok((pair.master, child.id() as libc::pid_t))
+    Ok((master, child.id() as libc::pid_t))
 }
 
 /// Bytes waiting for the PTY. Terminal replies (no lease) outlive
@@ -723,7 +762,7 @@ struct Holder {
     state: link::SessionState,
     receipt: Option<link::Receipt>,
     /// Closed once the session has exited, which hangs up the terminal.
-    master: Option<Box<dyn MasterPty + Send>>,
+    master: Option<OwnedFd>,
     pid: libc::pid_t,
     /// The headless terminal, parsing on a thread of its own.
     terminal: TerminalThread,
@@ -937,10 +976,7 @@ impl Holder {
     }
 
     fn master_fd(&self) -> libc::c_int {
-        self.master
-            .as_ref()
-            .and_then(|master| master.as_raw_fd())
-            .unwrap_or(-1)
+        self.master.as_ref().map_or(-1, |master| master.as_raw_fd())
     }
 
     /// Queue a frame for the daemon, behind the output before it.
@@ -1447,7 +1483,7 @@ impl Holder {
             .master
             .as_ref()
             .filter(|_| self.state.running)
-            .and_then(|master| master.process_group_leader())
+            .map(|master| unsafe { libc::tcgetpgrp(master.as_raw_fd()) })
             .filter(|&group| group > 0);
         let foreground = group.map(|group| link::Foreground {
             pid: group as u32,
@@ -1489,10 +1525,12 @@ impl Holder {
             }
         };
         if let Some(master) = &self.master {
-            if let Err(error) = master.resize(size(cols, rows, cell)) {
+            let winsize = size(cols, rows, cell);
+            if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &winsize) } != 0 {
                 log(format_args!(
-                    "session {}: resizing the terminal failed: {error:#}",
-                    self.id
+                    "session {}: resizing the terminal failed: {}",
+                    self.id,
+                    io::Error::last_os_error()
                 ));
             }
         }

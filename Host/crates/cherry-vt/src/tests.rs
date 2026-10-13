@@ -472,19 +472,12 @@ fn leaving_the_alternate_screen_restores_the_primary_cursor_frames_painted() {
     assert_eq!(shown.active[..5], source.active[..]);
 }
 
+/// The host forwards `TN` to the renderer (`route_xtgettcap` in
+/// cherry-host), which answers it alone.
 #[test]
-fn terminfo_name_answers_xtgettcap_tn() {
+fn xtgettcap_tn_goes_unanswered() {
     let mut t = term(20, 4);
-    let query = b"\x1bP+q544e\x1b\\";
-    assert!(t.feed(query).is_empty(), "no name is reported by default");
-    t.set_terminfo_name("xterm-256color").unwrap();
-    assert_eq!(
-        t.feed(query),
-        b"\x1bP1+r544E=787465726D2D323536636F6C6F72\x1b\\"
-    );
-    assert!(t.set_terminfo_name(&"x".repeat(129)).is_err());
-    t.set_terminfo_name("").unwrap();
-    assert!(t.feed(query).is_empty());
+    assert!(t.feed(b"\x1bP+q544e\x1b\\").is_empty());
 }
 
 #[test]
@@ -1481,7 +1474,6 @@ fn events_split_across_reads_are_reported_once_complete() {
     assert!(terminal.take_events().is_empty());
     terminal.feed(b" done");
     assert!(terminal.take_events().is_empty());
-    assert_eq!(terminal.title(), None);
     terminal.feed(b"\x1b\\");
     assert_eq!(terminal.take_events(), [VtEvent::Title("half done".into())]);
 }
@@ -1489,30 +1481,24 @@ fn events_split_across_reads_are_reported_once_complete() {
 #[test]
 fn title_and_working_directory_follow_the_program() {
     let mut terminal = term(40, 5);
-    assert_eq!((terminal.title(), terminal.pwd()), (None, None));
     terminal.feed(b"\x1b]0;vim \xe2\x80\x94 main.rs\x07");
-    assert_eq!(terminal.title().as_deref(), Some("vim \u{2014} main.rs"));
     terminal.feed(b"\x1b]7;file://studio/tmp\x07");
-    assert_eq!(terminal.pwd().as_deref(), Some("file://studio/tmp"));
     terminal.feed(b"\x1b]1337;CurrentDir=/Users/me\x07");
-    assert_eq!(terminal.pwd().as_deref(), Some("/Users/me"));
-    terminal.feed(b"\x1b]9;9;/opt/work\x07");
-    assert_eq!(terminal.pwd().as_deref(), Some("/opt/work"));
     assert_eq!(
         terminal.take_events(),
         [
             VtEvent::Title("vim \u{2014} main.rs".into()),
-            VtEvent::Pwd("/opt/work".into()),
+            VtEvent::Pwd("/Users/me".into()),
         ]
     );
+    terminal.feed(b"\x1b]9;9;/opt/work\x07");
+    assert_eq!(terminal.take_events(), [VtEvent::Pwd("/opt/work".into())]);
     // The icon name is not the title, and a title that is not UTF-8 is
     // ignored.
     terminal.feed(b"\x1b]1;icon\x07\x1b]2;bad \xff\x07");
-    assert_eq!(terminal.title().as_deref(), Some("vim \u{2014} main.rs"));
     assert!(terminal.take_events().is_empty());
     // Clearing them.
     terminal.feed(b"\x1b]2;\x07\x1b]7;\x07");
-    assert_eq!((terminal.title(), terminal.pwd()), (None, None));
     assert_eq!(
         terminal.take_events(),
         [VtEvent::Title(String::new()), VtEvent::Pwd(String::new())]
@@ -1524,14 +1510,12 @@ fn title_and_working_directory_follow_the_program() {
     assert!(terminal.take_events().is_empty());
     // Titles are cut to 1024 bytes.
     terminal.feed(format!("\x1b]2;{}\x07", "t".repeat(1500)).as_bytes());
-    assert_eq!(terminal.title().unwrap().len(), 1024);
     assert!(matches!(&terminal.take_events()[..], [VtEvent::Title(title)] if title.len() == 1024));
     // A reset clears both without a callback; that is reported too, after
     // the progress report a reset makes.
     terminal.feed(b"\x1b]7;file://studio/tmp\x07");
     terminal.take_events();
     terminal.feed(b"\x1bc");
-    assert_eq!((terminal.title(), terminal.pwd()), (None, None));
     assert_eq!(
         terminal.take_events(),
         [
@@ -1683,7 +1667,9 @@ fn snapshots_resizes_and_inspection_report_no_events() {
     let mut terminal = term(40, 5);
     terminal.feed(EVENTFUL);
     terminal.feed(b"\x1b[?1049h\x1b]2;vim\x07\x07");
-    terminal.take_events();
+    assert!(terminal
+        .take_events()
+        .contains(&VtEvent::Title("vim".into())));
     let snapshot = terminal.snapshot().unwrap();
     terminal.refresh().unwrap();
     terminal.snapshot_limited(1024 * 1024).unwrap();
@@ -1693,7 +1679,6 @@ fn snapshots_resizes_and_inspection_report_no_events() {
     terminal.screen_text().unwrap();
     assert!(terminal.resize(30, 4).unwrap().is_empty());
     assert!(terminal.take_events().is_empty());
-    assert_eq!(terminal.title().as_deref(), Some("vim"));
     // A snapshot carries neither title nor working directory: its replay
     // reports only what its reset does.
     let mut copy = replay(&terminal, &snapshot);
@@ -1704,7 +1689,6 @@ fn snapshots_resizes_and_inspection_report_no_events() {
             value: None
         }]
     );
-    assert_eq!((copy.title(), copy.pwd()), (None, None));
 }
 
 #[test]
@@ -1714,13 +1698,15 @@ fn kitty_notifications_are_left_to_osc99() {
     let mut terminal = term(40, 5);
     assert!(terminal.feed(sequence).is_empty());
     assert!(terminal.take_events().is_empty());
-    assert_eq!(parse_osc99(sequence), Some(notification("Hello world", "")));
+    // A fresh `Osc99` reads a single sequence.
+    let single = |sequence: &[u8]| Osc99::default().feed(sequence);
+    assert_eq!(single(sequence), Some(notification("Hello world", "")));
     assert_eq!(
-        parse_osc99(b"\x1b]99;i=1:p=body;done; really\x07"),
+        single(b"\x1b]99;i=1:p=body;done; really\x07"),
         Some(notification("", "done; really"))
     );
     assert_eq!(
-        parse_osc99(b"\x1b]99;e=1;SGVsbG8g4pyT\x07"),
+        single(b"\x1b]99;e=1;SGVsbG8g4pyT\x07"),
         Some(notification("Hello \u{2713}", ""))
     );
     for sequence in [
@@ -1735,7 +1721,7 @@ fn kitty_notifications_are_left_to_osc99() {
         b"\x1b]9;not kitty\x07",
         b"99;;bare\x07",
     ] {
-        assert_eq!(parse_osc99(sequence), None, "{sequence:?}");
+        assert_eq!(single(sequence), None, "{sequence:?}");
     }
 }
 
@@ -1987,7 +1973,8 @@ fn clearing_history_keeps_the_screen_and_an_unfinished_sequence() {
     terminal.feed(&numbered(10));
     terminal.feed(b"$ a\xe2\x94");
     assert!(!terminal.clear_history().unwrap());
-    terminal.feed(b"\x80b");
+    // That feed's own replies still come.
+    assert_eq!(terminal.feed(b"\x80b\x1b[6n"), b"\x1b[3;6R");
     let cleared = terminal.inspect().unwrap();
     assert!(cleared.history.is_empty(), "{:?}", cleared.history);
     let mut plain = term(20, 3);
@@ -2696,7 +2683,9 @@ fn clearing_a_prompt_before_the_reflow_keeps_an_unfinished_sequence() {
     terminal.resize(30, 6).unwrap();
     assert_eq!(active(&terminal), ["$ echo hi", "hi"]);
     terminal.feed(b"tle\x07ok");
-    assert_eq!(terminal.title().as_deref(), Some("half a title"));
+    assert!(terminal
+        .take_events()
+        .contains(&VtEvent::Title("half a title".into())));
     assert_eq!(active(&terminal), ["$ echo hi", "hi", "", "··ok"]);
 }
 

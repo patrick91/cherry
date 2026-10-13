@@ -132,8 +132,7 @@ impl ProgressState {
 /// At most this many events wait to be taken: beyond it, the oldest are
 /// dropped, except that the latest title, working directory and progress
 /// report are kept apart when no later one of their kind waits (see
-/// `Terminal::take_events`). `Terminal::title()` and `Terminal::pwd()`
-/// always give the current values.
+/// `Terminal::take_events`), so the current values are never lost.
 pub const MAX_PENDING_EVENTS: usize = 256;
 /// The text of the events waiting to be taken is at most this long in all
 /// (besides the title and working directory kept apart).
@@ -342,12 +341,6 @@ impl Osc99 {
         let body = String::from_utf8_lossy(&notification.body).into_owned();
         (!title.is_empty() || !body.is_empty()).then_some(VtEvent::Notification { title, body })
     }
-}
-
-/// The notification one OSC 99 sequence shows on its own (see
-/// [`Osc99::feed`]); None when it is only a chunk or not a notification.
-pub fn parse_osc99(sequence: &[u8]) -> Option<VtEvent> {
-    Osc99::default().feed(sequence)
 }
 
 /// Kitty's notification identifiers: `[A-Za-z0-9_+.-]`, not empty.

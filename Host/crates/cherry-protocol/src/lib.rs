@@ -410,12 +410,6 @@ pub enum SessionState {
     Exited,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionList {
-    pub host_id: String,
-    pub sessions: Vec<SessionInfo>,
-}
-
 /// A frame from a client: a message and the optional request ID that the
 /// host echoes on its reply. Without `req` it is exactly the bare message,
 /// and a bare message decodes as a `Request` without one. `req` is reserved:

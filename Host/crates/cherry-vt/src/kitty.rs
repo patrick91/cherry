@@ -88,7 +88,8 @@ impl Default for Control {
 }
 
 impl Control {
-    fn put(&mut self, key: u8, value: u32) {
+    /// Set `key` (a letter) to `value`; one already given keeps its place.
+    pub fn set(&mut self, key: u8, value: u32) {
         let Some(at) = index(key) else {
             return;
         };
@@ -104,19 +105,6 @@ impl Control {
     pub fn get(&self, key: u8) -> Option<u32> {
         let at = index(key)?;
         (self.present & (1 << at) != 0).then_some(self.values[at])
-    }
-
-    /// Set `key` (a letter) to `value`; one already given keeps its place.
-    pub fn set(&mut self, key: u8, value: u32) {
-        self.put(key, value);
-    }
-
-    /// Drop `key`.
-    pub fn remove(&mut self, key: u8) {
-        if let Some(at) = index(key) {
-            self.present &= !(1 << at);
-            self.order.retain(|&k| k != key);
-        }
     }
 
     /// The value of `key` as a byte, when it is one.
@@ -319,11 +307,6 @@ impl Parser {
         false
     }
 
-    /// Whether the payload began (`feed` returned true).
-    pub fn in_payload(&self) -> bool {
-        self.state == State::Payload
-    }
-
     /// The control data so far, whatever Ghostty would make of the command.
     pub fn control(&self) -> &Control {
         &self.control
@@ -358,32 +341,7 @@ impl Parser {
                 }
             }
             b'd' => {
-                if !matches!(
-                    letter(b'd')?,
-                    None | Some(
-                        b'a' | b'A'
-                            | b'i'
-                            | b'I'
-                            | b'n'
-                            | b'N'
-                            | b'c'
-                            | b'C'
-                            | b'f'
-                            | b'F'
-                            | b'p'
-                            | b'P'
-                            | b'q'
-                            | b'Q'
-                            | b'r'
-                            | b'R'
-                            | b'x'
-                            | b'X'
-                            | b'y'
-                            | b'Y'
-                            | b'z'
-                            | b'Z'
-                    )
-                ) {
+                if !letter(b'd')?.is_none_or(|d| b"aAiInNcCfFpPqQrRxXyYzZ".contains(&d)) {
                     return None;
                 }
             }
@@ -409,12 +367,12 @@ impl Parser {
         self.len = 0;
         if let [byte] = *text {
             if !byte.is_ascii_digit() {
-                self.control.put(self.key, u32::from(byte));
+                self.control.set(self.key, u32::from(byte));
                 return;
             }
         }
         match number(text, signed(self.key)) {
-            Some(value) => self.control.put(self.key, value),
+            Some(value) => self.control.set(self.key, value),
             None => self.failed = true,
         }
     }
@@ -433,31 +391,19 @@ fn number(text: &[u8], signed: bool) -> Option<u32> {
     if digits.first().is_none_or(|&b| b == b'_') || digits.last() == Some(&b'_') {
         return None;
     }
-    let digits = digits.iter().filter(|&&b| b != b'_');
+    // Each digit only grows the magnitude, so checking the range at the
+    // end is checking it at each digit; an `i64` overflows only past both.
+    let mut value: i64 = 0;
+    for &byte in digits.iter().filter(|&&b| b != b'_') {
+        let digit = i64::from(byte.is_ascii_digit().then(|| byte - b'0')?);
+        value = value
+            .checked_mul(10)?
+            .checked_add(if negative { -digit } else { digit })?;
+    }
     if signed {
-        let mut value: i32 = 0;
-        for &byte in digits {
-            let digit = i32::from(byte.is_ascii_digit().then(|| byte - b'0')?);
-            value = value.checked_mul(10)?;
-            value = if negative {
-                value.checked_sub(digit)?
-            } else {
-                value.checked_add(digit)?
-            };
-        }
-        Some(value as u32)
+        i32::try_from(value).ok().map(|value| value as u32)
     } else {
-        let mut value: u32 = 0;
-        for &byte in digits {
-            let digit = u32::from(byte.is_ascii_digit().then(|| byte - b'0')?);
-            value = value.checked_mul(10)?;
-            value = if negative {
-                value.checked_sub(digit)?
-            } else {
-                value.checked_add(digit)?
-            };
-        }
-        Some(value)
+        u32::try_from(value).ok()
     }
 }
 

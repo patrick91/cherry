@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 public struct CherryDeepLink: Codable, Equatable, Sendable {
@@ -57,8 +56,7 @@ public struct CherryDeepLink: Codable, Equatable, Sendable {
         let path = location.isRemote
             ? location.key
             : URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL.path
-        let digest = SHA256.hash(data: Data(path.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
+        return sha256Hex(path)
     }
 
     public static func parse(_ value: String) throws -> CherryDeepLink {

@@ -400,11 +400,6 @@ final class PersistentHostSessions {
     private var installationCheck: (reason: String?, checkedAt: Date)?
     private var launchFailure: (reason: String, retryAt: Date)?
 
-    private final class WeakTab {
-        weak var session: TerminalSession?
-        init(_ session: TerminalSession) { self.session = session }
-    }
-
     /// A session whose tab a user closed (⌘W) while that close can still be
     /// undone (`deferEnd`), and how it ends once it cannot.
     private struct DeferredEnd {
@@ -417,11 +412,11 @@ final class PersistentHostSessions {
 
     /// Tabs by the host session their program runs in, while it runs: they
     /// follow its events.
-    private var boundTabs: [String: WeakTab] = [:]
+    private var boundTabs: [String: WeakReference<TerminalSession>] = [:]
     /// Every open tab built to run as a persistent session (even one that
     /// then fell back to the native backend), until it closes. The owner of
     /// a session is the open one that names it (`owningTab(of:)`).
-    private var openTabs: [ObjectIdentifier: WeakTab] = [:]
+    private var openTabs: [ObjectIdentifier: WeakReference<TerminalSession>] = [:]
     private var creatingCount = 0
 
     /// How long a tab waits for the session it is about to create
@@ -1006,8 +1001,8 @@ final class PersistentHostSessions {
 
     /// Records an open tab built to run as a persistent session.
     func register(_ tab: TerminalSession) {
-        openTabs = openTabs.filter { $0.value.session != nil }
-        openTabs[ObjectIdentifier(tab)] = WeakTab(tab)
+        openTabs = openTabs.filter { $0.value.object != nil }
+        openTabs[ObjectIdentifier(tab)] = WeakReference(tab)
     }
 
     /// The tab closed: it no longer owns the session it names, which another
@@ -1022,14 +1017,14 @@ final class PersistentHostSessions {
     /// showing it is only attached (`hostedAttachment`), and closing that
     /// tab only disconnects.
     func owningTab(of sessionID: String) -> TerminalSession? {
-        openTabs.values.lazy.compactMap(\.session).first { tab in
+        openTabs.values.lazy.compactMap(\.object).first { tab in
             tab.isPersistentLocalSession && tab.persistentSession?.sessionID == sessionID
         }
     }
 
     /// Whether any tab built to run as a persistent session here is open.
     var hasOpenTabs: Bool {
-        openTabs.values.contains { $0.session != nil }
+        openTabs.values.contains { $0.object != nil }
     }
 
     /// Windows that use this hosting (`beginUse`), even while they have no
@@ -1092,12 +1087,12 @@ final class PersistentHostSessions {
 
     /// Whether an open tab built to run as a persistent session has this id.
     func hasOpenTab(withID id: UUID) -> Bool {
-        openTabs.values.contains { $0.session?.id == id }
+        openTabs.values.contains { $0.object?.id == id }
     }
 
     /// Whether an open tab other than `tab` has this id.
     func hasOpenTab(withID id: UUID, besides tab: TerminalSession?) -> Bool {
-        openTabs.values.contains { $0.session?.id == id && $0.session !== tab }
+        openTabs.values.contains { $0.object?.id == id && $0.object !== tab }
     }
 
     /// How a tab's adapter reaches the session `binding` names on this
@@ -1136,7 +1131,7 @@ final class PersistentHostSessions {
             return true
         }
         guard info.owner == owner, let launchID = Self.launchRequestID(of: info) else { return false }
-        return openTabs.values.contains { $0.session?.persistentLaunchRequestID == launchID }
+        return openTabs.values.contains { $0.object?.persistentLaunchRequestID == launchID }
     }
 
     /// Whether a tab of this app may own `info`'s session (Persistent
@@ -1153,11 +1148,11 @@ final class PersistentHostSessions {
     /// Follows the session for `session`: its exit, pid and removal. Only
     /// its owner follows a session; another tab is never bound in its place.
     func bind(_ session: TerminalSession, to sessionID: String) {
-        if let bound = boundTabs[sessionID]?.session, bound !== session {
+        if let bound = boundTabs[sessionID]?.object, bound !== session {
             SessionLog.notice("session \(sessionID) already belongs to tab \(bound.id.uuidString); tab \(session.id.uuidString) does not follow it")
             return
         }
-        boundTabs[sessionID] = WeakTab(session)
+        boundTabs[sessionID] = WeakReference(session)
         updateLease()
         // What the program signalled before its tab followed it (while no
         // app ran, or before its Create answer arrived).
@@ -1177,13 +1172,13 @@ final class PersistentHostSessions {
 
     /// Stops following the session for `session`, unless another tab does.
     func unbind(_ session: TerminalSession, from sessionID: String) {
-        guard let bound = boundTabs[sessionID], bound.session == nil || bound.session === session else { return }
+        guard let bound = boundTabs[sessionID], bound.object == nil || bound.object === session else { return }
         unbind(sessionID: sessionID)
     }
 
     /// The tab that runs its program in this session, if one is open.
     func boundTab(for sessionID: String) -> TerminalSession? {
-        boundTabs[sessionID]?.session
+        boundTabs[sessionID]?.object
     }
 
     /// The session as the host last reported it.
@@ -1665,7 +1660,7 @@ final class PersistentHostSessions {
     // MARK: Events
 
     private func updateLease() {
-        boundTabs = boundTabs.filter { $0.value.session != nil }
+        boundTabs = boundTabs.filter { $0.value.object != nil }
         let needed = creatingCount > 0 || !boundTabs.isEmpty || !endings.isEmpty || !deferredEnds.isEmpty
             || !inputChains.isEmpty || forgottenTabSearches > 0
         if needed, lease == nil {
@@ -1706,7 +1701,7 @@ final class PersistentHostSessions {
         case .resync:
             // Events may have been missed: take the list as it is now.
             for (id, weakTab) in boundTabs {
-                guard let tab = weakTab.session else { continue }
+                guard let tab = weakTab.object else { continue }
                 if let info = sessionInfo(id) {
                     if info.isRunning {
                         tab.persistentSessionDidChange(info)

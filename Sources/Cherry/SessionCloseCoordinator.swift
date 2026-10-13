@@ -132,28 +132,8 @@ enum SessionClosePolicy {
     /// Local tabs run as persistent sessions by default, and closing one
     /// follows its intent (`hostedLocalAction(for:)`): a window close or
     /// quit carries Settings › Sessions' choice (or its question's answer)
-    /// in its intent. False makes a local persistent tab detach for every
-    /// intent.
-    static let hostedLocalTabsFollowSettings = true
-
-    @MainActor
-    static func closeAction(
-        for session: TerminalSession,
-        intent: SessionCloseIntent,
-        hostedLocalTabsFollowSettings: Bool = hostedLocalTabsFollowSettings
-    ) -> SessionCloseAction {
-        closeAction(
-            for: SessionCloseBackend(session),
-            intent: intent,
-            hostedLocalTabsFollowSettings: hostedLocalTabsFollowSettings
-        )
-    }
-
-    static func closeAction(
-        for backend: SessionCloseBackend,
-        intent: SessionCloseIntent,
-        hostedLocalTabsFollowSettings: Bool = hostedLocalTabsFollowSettings
-    ) -> SessionCloseAction {
+    /// in its intent.
+    static func closeAction(for backend: SessionCloseBackend, intent: SessionCloseIntent) -> SessionCloseAction {
         switch backend {
         case .native:
             // Restart relaunches after the stop. A native tab cannot detach
@@ -163,7 +143,6 @@ enum SessionClosePolicy {
             // Restart reconnects after the detach.
             return .detach
         case .hostedLocal:
-            guard hostedLocalTabsFollowSettings else { return .detach }
             return hostedLocalAction(for: intent)
         }
     }
@@ -683,8 +662,8 @@ enum SessionCloseCoordinator {
     ) {
         let panes = group.paneSessionIDs.compactMap { workspace.session(withID: $0) }
         let alert = splitGroupCloseAlert(for: panes, policy: workspace.backendPolicy)
-        let answer = splitGroupCloseAnswer(
-            for: alert.runModal(), detachOffered: canDetachInstead(panes, policy: workspace.backendPolicy)
+        let answer = TabCloseAnswer(
+            response: alert.runModal(), detachOffered: canDetachInstead(panes, policy: workspace.backendPolicy)
         )
         guard answer != .cancel else { return }
         let intent: SessionCloseIntent = answer == .detach ? .userDetachedTab : .userClosedTab
@@ -720,18 +699,6 @@ enum SessionCloseCoordinator {
         alert.addButton(withTitle: "Cancel")
         return alert
     }
-
-    /// What a button of `splitGroupCloseAlert` answered.
-    nonisolated static func splitGroupCloseAnswer(
-        for response: NSApplication.ModalResponse,
-        detachOffered: Bool
-    ) -> TabCloseAnswer {
-        switch response {
-        case .alertFirstButtonReturn: .close
-        case .alertSecondButtonReturn where detachOffered: .detach
-        default: .cancel
-        }
-    }
 }
 
 // MARK: - "Close “<name>”?"
@@ -743,6 +710,17 @@ enum TabCloseAnswer: Equatable, Sendable {
     case close
     case detach
     case cancel
+
+    /// What a button of a close question answered: the first closes, the
+    /// second detaches when the question offers Detach Instead, any other
+    /// keeps the tab.
+    init(response: NSApplication.ModalResponse, detachOffered: Bool) {
+        switch response {
+        case .alertFirstButtonReturn: self = .close
+        case .alertSecondButtonReturn where detachOffered: self = .detach
+        default: self = .cancel
+        }
+    }
 }
 
 /// A user's close of a tab whose program is at work, waiting for its
@@ -831,11 +809,7 @@ struct TabCloseQuestion: Equatable {
 
     /// What a button of `makeAlert()` answered.
     func answer(for response: NSApplication.ModalResponse) -> TabCloseAnswer {
-        switch response {
-        case .alertFirstButtonReturn: .close
-        case .alertSecondButtonReturn where canDetach: .detach
-        default: .cancel
-        }
+        TabCloseAnswer(response: response, detachOffered: canDetach)
     }
 
     /// The subject of "… is running".
@@ -887,11 +861,9 @@ struct ClosedTabNotice: Equatable {
     let reopen: [Reopen]
 
     /// `tabName`: the tab's sidebar name.
-    init(tabName: String, reopen: Reopen?, attached: Bool? = nil) {
+    init(tabName: String, reopen: Reopen?) {
         tabNames = [tabName]
-        if let attached {
-            attachedCount = attached ? 1 : 0
-        } else if case .attach = reopen {
+        if case .attach = reopen {
             attachedCount = 1
         } else {
             attachedCount = 0
@@ -956,8 +928,7 @@ struct ClosedTabNotice: Equatable {
         else { return nil }
         return ClosedTabNotice(
             tabName: SidebarSessionLabel.label(for: session, pathDisplayMode: pathDisplayMode).title,
-            reopen: reopenTarget(for: session, in: projectRoot),
-            attached: session.hostedAttachment != nil
+            reopen: reopenTarget(for: session, in: projectRoot)
         )
     }
 

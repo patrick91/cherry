@@ -7,12 +7,19 @@ import SwiftUI
 final class ProjectWindowRegistry {
     static let shared = ProjectWindowRegistry()
 
-    private var windows: [String: WeakWindow] = [:]
-    private var workspaces: [String: WeakWorkspace] = [:]
-    private var repositories: [String: WeakRepositoryWorkspace] = [:]
-    private var noteStores: [String: WeakNoteStore] = [:]
-    private var todoStores: [String: WeakTodoStore] = [:]
-    private var chromeStates: [String: WeakChromeState] = [:]
+    /// A registered project window and what it shows. Weak: its scene
+    /// owns them.
+    private struct WindowEntry {
+        weak var window: NSWindow?
+        weak var workspace: TerminalWorkspace?
+        weak var repository: RepositoryWorkspace?
+        weak var noteStore: ProjectNoteStore?
+        weak var todoStore: ProjectTodoStore?
+        weak var chromeState: ProjectWindowChromeState?
+    }
+
+    /// The registered project windows, by repository root.
+    private var entries: [String: WindowEntry] = [:]
     /// The project windows (their repository roots) in the order they were
     /// last active, the most recent last.
     private var activationOrder: [String] = []
@@ -202,7 +209,7 @@ final class ProjectWindowRegistry {
                 }
                 beforeLaterWindows { self?.openLaterLaunchWindows(later, open: open) }
             }
-            if let window = windows[repositoryRoot(for: front)]?.window {
+            if let window = entries[repositoryRoot(for: front)]?.window {
                 LaunchContentFrames.whenContentShown(in: window, waitingAtMost: Self.launchContentWait, openLater)
             } else {
                 openLater()
@@ -292,7 +299,7 @@ final class ProjectWindowRegistry {
     /// Mac's and each device's; they are recorded by host identity), and
     /// the saved tabs' of This Mac.
     func localSessionsEndedByAQuit() -> [(hostID: String, sessionID: String)] {
-        repositories.values.compactMap(\.repository).flatMap { $0.localSessionsEndedByAQuit() }
+        entries.values.compactMap(\.repository).flatMap { $0.localSessionsEndedByAQuit() }
             + pendingLaunchWindowRecords().compactMap { record in
                 record.hosted.map { (hostID: $0.hostID, sessionID: $0.sessionID) }
             }
@@ -315,7 +322,7 @@ final class ProjectWindowRegistry {
     /// Saves every project's tabs and the open windows now, synchronously.
     func flushWorkspacePersistence() {
         pruneStaleWindows()
-        repositories.values.compactMap(\.repository).forEach { $0.flushPersistentState() }
+        entries.values.compactMap(\.repository).forEach { $0.flushPersistentState() }
         saveOpenWindowRootsIfChanged(synchronously: true)
         workspaceStateStore?.flush()
     }
@@ -357,7 +364,7 @@ final class ProjectWindowRegistry {
         endClosedTabsAwaitingUndo()
         var stoppedNativeProgram = false
         // Repositories first: they stop saving before their workspaces empty.
-        for repository in repositories.values.compactMap(\.repository) {
+        for repository in entries.values.compactMap(\.repository) {
             stoppedNativeProgram = repository.closeSessionsForQuit(intent: intent) || stoppedNativeProgram
         }
         for workspace in allWorkspaces() {
@@ -376,7 +383,7 @@ final class ProjectWindowRegistry {
     /// and those closed with ⌘W end (`ClosedTabHistory.endAll`).
     func endClosedTabsAwaitingUndo() {
         pruneStaleWindows()
-        for chromeState in chromeStates.values.compactMap(\.chromeState) {
+        for chromeState in entries.values.compactMap(\.chromeState) {
             chromeState.closedTabs.endAll()
         }
     }
@@ -385,9 +392,9 @@ final class ProjectWindowRegistry {
         guard let workspaceStateStore, !isTerminating else { return }
         // The repository's own root: its saved tabs are keyed by it, and a
         // reopened window passes it to `RepositoryWorkspace` again.
-        let open = windows.compactMap { root, weakWindow -> String? in
-            guard weakWindow.window != nil else { return nil }
-            return repositories[root]?.repository?.repositoryRoot ?? root
+        let open = entries.compactMap { root, entry -> String? in
+            guard entry.window != nil else { return nil }
+            return entry.repository?.repositoryRoot ?? root
         }
         let roots = Array(Set(open + pendingLaunchWindowRoots)).sorted()
         guard roots != lastSavedOpenWindowRoots else { return }
@@ -422,7 +429,7 @@ final class ProjectWindowRegistry {
 
     var hasRegisteredProjectWindow: Bool {
         pruneStaleWindows()
-        return !workspaces.isEmpty
+        return !entries.isEmpty
     }
 
     /// A live project window still owned by the registry. AppKit can retain a
@@ -432,18 +439,18 @@ final class ProjectWindowRegistry {
     func firstRegisteredProjectWindow() -> NSWindow? {
         pruneStaleWindows()
         if let activeProjectRoot,
-           let window = windows[repositoryRoot(for: activeProjectRoot)]?.window {
+           let window = entries[repositoryRoot(for: activeProjectRoot)]?.window {
             return window
         }
-        return windows.values.lazy.compactMap(\.window).first
+        return entries.values.lazy.compactMap(\.window).first
     }
 
     /// Live workspaces across every registered project window.
     func allWorkspaces() -> [TerminalWorkspace] {
         pruneStaleWindows()
-        let repositoryWorkspaces = repositories.values.compactMap { $0.repository?.workspace }
+        let repositoryWorkspaces = entries.values.compactMap { $0.repository?.workspace }
         let repositoryWorkspaceIDs = Set(repositoryWorkspaces.map(ObjectIdentifier.init))
-        let legacyWorkspaces = workspaces.values.compactMap(\.workspace).filter {
+        let legacyWorkspaces = entries.values.compactMap(\.workspace).filter {
             !repositoryWorkspaceIDs.contains(ObjectIdentifier($0))
         }
         return repositoryWorkspaces + legacyWorkspaces
@@ -461,12 +468,12 @@ final class ProjectWindowRegistry {
     /// `tearDownForQuit` closes; each session is placed by its project.
     func teardownSummary(pathDisplayMode: SidebarTerminalPathDisplayMode) -> SessionTeardownSummary {
         pruneStaleWindows()
-        let repositorySummary = repositories.values.compactMap(\.repository).reduce(SessionTeardownSummary()) {
+        let repositorySummary = entries.values.compactMap(\.repository).reduce(SessionTeardownSummary()) {
             $0 + $1.teardownSummary(.quit, pathDisplayMode: pathDisplayMode)
         }
         // Windows without a repository.
-        let others = workspaces.compactMap { root, entry in
-            repositories[root]?.repository == nil ? entry.workspace : nil
+        let others = entries.values.compactMap { entry in
+            entry.repository == nil ? entry.workspace : nil
         }
         return others.reduce(repositorySummary) { summary, workspace in
             summary + workspace.teardownSummary(
@@ -505,7 +512,7 @@ final class ProjectWindowRegistry {
     /// The repository of every open project window.
     var allRepositories: [RepositoryWorkspace] {
         pruneStaleWindows()
-        return repositories.values.compactMap(\.repository)
+        return entries.values.compactMap(\.repository)
     }
 
     /// Saved tabs the open windows may still restore
@@ -615,17 +622,12 @@ final class ProjectWindowRegistry {
         revealSession(id: tab.id, projectRoot: root)
     }
 
-    var projectRoots: [String] {
-        pruneStaleWindows()
-        return allWorkspaces().compactMap(\.projectRoot)
-    }
-
     /// Every root that can be focused through an open project window: each
     /// window's key and its tabs' folder.
     var knownProjectRoots: [String] {
         pruneStaleWindows()
-        let repositoryRoots = repositories.values.compactMap { $0.repository?.workspaceRoot }
-        return Array(Set(repositoryRoots + Array(workspaces.keys))).sorted()
+        let repositoryRoots = entries.values.compactMap { $0.repository?.workspaceRoot }
+        return Array(Set(repositoryRoots + Array(entries.keys))).sorted()
     }
 
     /// Each open project window, by its key (`canonicalProjectRoot`), with
@@ -634,9 +636,9 @@ final class ProjectWindowRegistry {
     func openProjectWindowStatuses() -> [String: ProjectSwitcherModel.OpenStatus] {
         pruneStaleWindows()
         var statuses: [String: ProjectSwitcherModel.OpenStatus] = [:]
-        for (root, weakWindow) in windows where weakWindow.window != nil {
+        for (root, entry) in entries where entry.window != nil {
             var status = ProjectSwitcherModel.OpenStatus(tabs: 0, workingAgents: 0)
-            if let workspace = repositories[root]?.repository?.workspace ?? workspaces[root]?.workspace {
+            if let workspace = entry.repository?.workspace ?? entry.workspace {
                 status.tabs = workspace.sessions.count
                 status.workingAgents = workspace.agentSessions.filter { $0.agentActivityState == .working }.count
             }
@@ -651,14 +653,14 @@ final class ProjectWindowRegistry {
 
     func hasWindow(for projectRoot: String) -> Bool {
         pruneStaleWindows()
-        return windows[repositoryRoot(for: projectRoot)]?.window != nil
+        return entries[repositoryRoot(for: projectRoot)]?.window != nil
     }
 
     func projectRoot(forProjectKey projectKey: String) -> String? {
         pruneStaleWindows()
         let normalizedKey = projectKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        var roots = repositories.values.compactMap { $0.repository?.workspaceRoot }
-        roots.append(contentsOf: workspaces.keys)
+        var roots = entries.values.compactMap { $0.repository?.workspaceRoot }
+        roots.append(contentsOf: entries.keys)
         roots.append(contentsOf: AgentSettings.shared.projects.map(\.root))
         if let activeProjectRoot {
             roots.append(activeProjectRoot)
@@ -678,7 +680,7 @@ final class ProjectWindowRegistry {
         if let repository = repository(for: projectRoot) {
             return repository.workspace
         }
-        return workspaces[projectRoot]?.workspace
+        return entries[projectRoot]?.workspace
     }
 
     /// Workspace belonging to the current key window. Menu actions must
@@ -689,7 +691,7 @@ final class ProjectWindowRegistry {
     var keyWindowWorkspace: TerminalWorkspace? {
         pruneStaleWindows()
         guard let projectRoot = projectRoot(for: NSApp.keyWindow) else { return nil }
-        return workspaces[projectRoot]?.workspace
+        return entries[projectRoot]?.workspace
     }
 
     /// Repository belonging to the current key window. Used with
@@ -697,7 +699,7 @@ final class ProjectWindowRegistry {
     var keyWindowRepository: RepositoryWorkspace? {
         pruneStaleWindows()
         guard let projectRoot = projectRoot(for: NSApp.keyWindow) else { return nil }
-        return repositories[projectRoot]?.repository
+        return entries[projectRoot]?.repository
     }
 
     /// Chrome state belonging to the current key window. See
@@ -705,24 +707,18 @@ final class ProjectWindowRegistry {
     var keyWindowChromeState: ProjectWindowChromeState? {
         pruneStaleWindows()
         guard let projectRoot = projectRoot(for: NSApp.keyWindow) else { return nil }
-        return chromeStates[projectRoot]?.chromeState
+        return entries[projectRoot]?.chromeState
     }
 
     func window(for chromeState: ProjectWindowChromeState) -> NSWindow? {
         pruneStaleWindows()
-        guard let projectRoot = chromeStates.first(where: { _, weakState in
-            weakState.chromeState === chromeState
-        })?.key else { return nil }
-        return windows[projectRoot]?.window
+        return entries.values.first { $0.chromeState === chromeState }?.window
     }
 
     /// The repository of the window `chromeState` belongs to.
     func repository(for chromeState: ProjectWindowChromeState) -> RepositoryWorkspace? {
         pruneStaleWindows()
-        guard let projectRoot = chromeStates.first(where: { _, weakState in
-            weakState.chromeState === chromeState
-        })?.key else { return nil }
-        return repositories[projectRoot]?.repository
+        return entries.values.first { $0.chromeState === chromeState }?.repository
     }
 
     /// A project window on screen (`windowIsOnScreen`) other than `window`
@@ -734,13 +730,14 @@ final class ProjectWindowRegistry {
         chromeState excludedChromeState: ProjectWindowChromeState?
     ) -> (chromeState: ProjectWindowChromeState, workspace: TerminalWorkspace, repository: RepositoryWorkspace?)? {
         pruneStaleWindows()
-        let roots = activationOrder.reversed() + windows.keys.sorted()
+        let roots = activationOrder.reversed() + entries.keys.sorted()
         for root in roots {
-            guard let candidate = windows[root]?.window, candidate !== window, windowIsOnScreen(candidate),
-                  let chromeState = chromeStates[root]?.chromeState, chromeState !== excludedChromeState,
-                  let workspace = workspaces[root]?.workspace
+            guard let entry = entries[root],
+                  let candidate = entry.window, candidate !== window, windowIsOnScreen(candidate),
+                  let chromeState = entry.chromeState, chromeState !== excludedChromeState,
+                  let workspace = entry.workspace
             else { continue }
-            let repository = repositories[root]?.repository
+            let repository = entry.repository
             return (chromeState, repository?.workspace ?? workspace, repository)
         }
         return nil
@@ -751,12 +748,12 @@ final class ProjectWindowRegistry {
     func frontmostLocalWorkspace() -> TerminalWorkspace? {
         pruneStaleWindows()
         if let key = projectRoot(for: NSApp.keyWindow), !ProjectLocation.isRemoteKey(key),
-           let workspace = repositories[key]?.repository?.workspace ?? workspaces[key]?.workspace {
+           let entry = entries[key], let workspace = entry.repository?.workspace ?? entry.workspace {
             return workspace
         }
-        for root in activationOrder.reversed() + windows.keys.sorted() where !ProjectLocation.isRemoteKey(root) {
-            guard windows[root]?.window != nil,
-                  let workspace = repositories[root]?.repository?.workspace ?? workspaces[root]?.workspace
+        for root in activationOrder.reversed() + entries.keys.sorted() where !ProjectLocation.isRemoteKey(root) {
+            guard let entry = entries[root], entry.window != nil,
+                  let workspace = entry.repository?.workspace ?? entry.workspace
             else { continue }
             return workspace
         }
@@ -765,24 +762,24 @@ final class ProjectWindowRegistry {
 
     func noteStore(for projectRoot: String) -> ProjectNoteStore? {
         pruneStaleWindows()
-        return noteStores[repositoryRoot(for: projectRoot)]?.noteStore
+        return entries[repositoryRoot(for: projectRoot)]?.noteStore
     }
 
     func todoStore(for projectRoot: String) -> ProjectTodoStore? {
         pruneStaleWindows()
-        return todoStores[repositoryRoot(for: projectRoot)]?.todoStore
+        return entries[repositoryRoot(for: projectRoot)]?.todoStore
     }
 
     func chromeState(for projectRoot: String) -> ProjectWindowChromeState? {
         pruneStaleWindows()
-        return chromeStates[repositoryRoot(for: projectRoot)]?.chromeState
+        return entries[repositoryRoot(for: projectRoot)]?.chromeState
     }
 
     /// The chrome state of the project window `window`: where a notice
     /// about it shows its toast.
     func chromeState(for window: NSWindow) -> ProjectWindowChromeState? {
         pruneStaleWindows()
-        return projectRoot(for: window).flatMap { chromeStates[$0]?.chromeState }
+        return projectRoot(for: window).flatMap { entries[$0]?.chromeState }
     }
 
     @discardableResult
@@ -798,7 +795,7 @@ final class ProjectWindowRegistry {
         guard let requestedRoot = projectRoot else { return false }
         pruneStaleWindows()
         let projectRoot = repositoryRoot(for: requestedRoot)
-        if let existing = windows[projectRoot]?.window, existing !== window {
+        if let existing = entries[projectRoot]?.window, existing !== window {
             // Another window already owns this project. Refuse to claim the
             // slot so the caller can close this duplicate. SwiftUI's
             // WindowGroup<Value> can spawn an extra default (value=nil)
@@ -813,7 +810,7 @@ final class ProjectWindowRegistry {
         // snapshots the window on the main thread (25–135 ms stalls, longer
         // for bigger windows).
         window.isRestorable = false
-        if windows[projectRoot]?.window !== window {
+        if entries[projectRoot]?.window !== window {
             // Newly claimed (a window registers again on every update): it
             // takes the frame its project's window last had.
             let restoresFullScreen = adoptSavedFrame(of: window, projectRoot: projectRoot)
@@ -851,20 +848,17 @@ final class ProjectWindowRegistry {
                 keyHold?.release(window)
             }
         }
-        windows[projectRoot] = WeakWindow(window)
-        workspaces[projectRoot] = WeakWorkspace(workspace)
+        // The stores a registration leaves out stay as they were.
+        var entry = entries[projectRoot] ?? WindowEntry()
+        entry.window = window
+        entry.workspace = workspace
+        entry.repository = repository ?? entry.repository
+        entry.noteStore = noteStore ?? entry.noteStore
+        entry.todoStore = todoStore ?? entry.todoStore
+        entry.chromeState = chromeState ?? entry.chromeState
+        entries[projectRoot] = entry
         if let repository {
-            repositories[projectRoot] = WeakRepositoryWorkspace(repository)
             repository.windowRegistry = self
-        }
-        if let noteStore {
-            noteStores[projectRoot] = WeakNoteStore(noteStore)
-        }
-        if let todoStore {
-            todoStores[projectRoot] = WeakTodoStore(todoStore)
-        }
-        if let chromeState {
-            chromeStates[projectRoot] = WeakChromeState(chromeState)
         }
 
         if activeWorkspace == nil || window.isKeyWindow || window.isMainWindow {
@@ -891,8 +885,9 @@ final class ProjectWindowRegistry {
     /// bar), and only the terminal of that window.
     private func focusSelectedTerminal(in window: NSWindow, projectRoot: String) {
         guard window.isKeyWindow,
-              let workspace = workspaces[projectRoot]?.workspace,
-              chromeStates[projectRoot]?.chromeState.map({ $0.isShowingTerminalContent && !$0.isOmniBarPresented }) ?? true,
+              let entry = entries[projectRoot],
+              let workspace = entry.workspace,
+              entry.chromeState.map({ $0.isShowingTerminalContent && !$0.isOmniBarPresented }) ?? true,
               let bridge = workspace.selectedSession?.loadedGhosttyBridge,
               bridge.terminalView.window === window
         else { return }
@@ -921,22 +916,11 @@ final class ProjectWindowRegistry {
     func unregister(window: NSWindow, projectRoot: String?) {
         guard let requestedRoot = projectRoot else { return }
         let projectRoot = repositoryRoot(for: requestedRoot)
-        guard windows[projectRoot]?.window === window else { return }
-        windowFrameSavers.removeValue(forKey: projectRoot)?.saveNow()
-        windows.removeValue(forKey: projectRoot)
-        workspaces.removeValue(forKey: projectRoot)
-        repositories.removeValue(forKey: projectRoot)
-        noteStores.removeValue(forKey: projectRoot)
-        todoStores.removeValue(forKey: projectRoot)
-        chromeStates.removeValue(forKey: projectRoot)
-        activationOrder.removeAll { $0 == projectRoot }
+        guard entries[projectRoot]?.window === window else { return }
+        windowFrameSavers[projectRoot]?.saveNow()
+        let wasActive = forgetWindow(projectRoot)
         saveOpenWindowRootsIfChanged()
-        if activeProjectRoot.map(repositoryRoot(for:)) == projectRoot {
-            activeProjectRoot = nil
-            activeWorkspace = nil
-            activeNoteStore = nil
-            activeTodoStore = nil
-            activeChromeState = nil
+        if wasActive {
             refreshActiveWindow()
             Task { @MainActor in
                 ProjectWindowRegistry.shared.refreshActiveWindow()
@@ -946,27 +930,25 @@ final class ProjectWindowRegistry {
 
     func focus(projectRoot: String) -> Bool {
         let repositoryRoot = repositoryRoot(for: projectRoot)
-        guard let window = windows[repositoryRoot]?.window else {
-            windows.removeValue(forKey: repositoryRoot)
-            return false
-        }
+        // A window that closed is forgotten by the next `pruneStaleWindows`.
+        guard let entry = entries[repositoryRoot], let window = entry.window else { return false }
 
-        if let repository = repositories[repositoryRoot]?.repository {
+        if let repository = entry.repository {
             let workspace = repository.workspace
             activate(
                 projectRoot: workspace.projectRoot ?? repositoryRoot,
                 workspace: workspace,
-                noteStore: noteStores[repositoryRoot]?.noteStore,
-                todoStore: todoStores[repositoryRoot]?.todoStore,
-                chromeState: chromeStates[repositoryRoot]?.chromeState
+                noteStore: entry.noteStore,
+                todoStore: entry.todoStore,
+                chromeState: entry.chromeState
             )
-        } else if let workspace = workspaces[repositoryRoot]?.workspace {
+        } else if let workspace = entry.workspace {
             activate(
                 projectRoot: projectRoot,
                 workspace: workspace,
-                noteStore: noteStores[repositoryRoot]?.noteStore,
-                todoStore: todoStores[repositoryRoot]?.todoStore,
-                chromeState: chromeStates[repositoryRoot]?.chromeState
+                noteStore: entry.noteStore,
+                todoStore: entry.todoStore,
+                chromeState: entry.chromeState
             )
         } else {
             AgentSettings.shared.markProjectOpened(repositoryRoot)
@@ -979,7 +961,7 @@ final class ProjectWindowRegistry {
     func select(_ deepLink: CherryDeepLink, projectRoot: String) -> Bool {
         let repositoryRoot = repositoryRoot(for: projectRoot)
         guard CherryDeepLink.projectKey(forProjectRoot: projectRoot) == deepLink.projectKey,
-              let chromeState = chromeStates[repositoryRoot]?.chromeState
+              let chromeState = entries[repositoryRoot]?.chromeState
         else {
             return false
         }
@@ -990,7 +972,7 @@ final class ProjectWindowRegistry {
                 return false
             }
             guard let noteID = UUID(uuidString: deepLink.targetID),
-                  noteStores[repositoryRoot]?.noteStore?.notes.contains(where: { $0.id == noteID }) == true
+                  entries[repositoryRoot]?.noteStore?.notes.contains(where: { $0.id == noteID }) == true
             else {
                 return false
             }
@@ -1001,7 +983,7 @@ final class ProjectWindowRegistry {
                 return false
             }
             guard let todoID = UUID(uuidString: deepLink.targetID),
-                  todoStores[repositoryRoot]?.todoStore?.todos.contains(where: { $0.id == todoID }) == true
+                  entries[repositoryRoot]?.todoStore?.todos.contains(where: { $0.id == todoID }) == true
             else {
                 return false
             }
@@ -1046,10 +1028,10 @@ final class ProjectWindowRegistry {
 
     func projectRoot(containing sessionID: UUID) -> String? {
         pruneStaleWindows()
-        for repository in repositories.values.compactMap(\.repository) where repository.contains(sessionID: sessionID) {
+        for repository in entries.values.compactMap(\.repository) where repository.contains(sessionID: sessionID) {
             return repository.workspaceRoot
         }
-        return workspaces.values.compactMap(\.workspace).first { workspace in
+        return entries.values.compactMap(\.workspace).first { workspace in
             workspace.sessions.contains { $0.id == sessionID }
         }?.projectRoot
     }
@@ -1057,11 +1039,11 @@ final class ProjectWindowRegistry {
     func isSessionVisible(_ session: TerminalSession) -> Bool {
         pruneStaleWindows()
 
-        for (projectRoot, weakWorkspace) in workspaces {
-            guard let workspace = weakWorkspace.workspace,
+        for entry in entries.values {
+            guard let workspace = entry.workspace,
                   workspace.sessions.contains(where: { $0.id == session.id }),
-                  chromeStates[projectRoot]?.chromeState?.isShowingTerminalContent ?? true,
-                  let window = windows[projectRoot]?.window
+                  entry.chromeState?.isShowingTerminalContent ?? true,
+                  let window = entry.window
             else {
                 continue
             }
@@ -1102,37 +1084,20 @@ final class ProjectWindowRegistry {
 
     @discardableResult
     func focusSession(sessionID: UUID, projectRoot requestedProjectRoot: String?) -> Bool {
-        let candidates: [(projectRoot: String?, workspace: TerminalWorkspace, chromeState: ProjectWindowChromeState?)] =
-            workspacesByProjectRoot().compactMap { candidate in
-                if let requestedProjectRoot,
-                   candidate.projectRoot != requestedProjectRoot,
-                   repositoryRoot(for: candidate.projectRoot) != repositoryRoot(for: requestedProjectRoot) {
-                    return nil
-                }
-                return (
-                    projectRoot: candidate.projectRoot,
-                    workspace: candidate.workspace,
-                    chromeState: chromeState(for: candidate.projectRoot)
-                )
-            }
-
-        for candidate in candidates {
-            guard let session = candidate.workspace.sessions.first(where: { $0.id == sessionID }) else {
+        for (projectRoot, workspace) in workspacesByProjectRoot() {
+            if let requestedProjectRoot,
+               projectRoot != requestedProjectRoot,
+               repositoryRoot(for: projectRoot) != repositoryRoot(for: requestedProjectRoot) {
                 continue
             }
-
-            if let projectRoot = candidate.projectRoot {
-                _ = focus(projectRoot: projectRoot)
-            } else {
-                NSApp.activate(ignoringOtherApps: true)
-                NSApp.windows.first?.makeKeyAndOrderFront(nil)
-            }
-            candidate.workspace.select(session)
-            candidate.chromeState?.selectTerminal()
+            guard let session = workspace.sessions.first(where: { $0.id == sessionID }) else { continue }
+            let chrome = chromeState(for: projectRoot)
+            _ = focus(projectRoot: projectRoot)
+            workspace.select(session)
+            chrome?.selectTerminal()
             session.acknowledgeAgentResult()
             return true
         }
-
         return false
     }
 
@@ -1184,13 +1149,14 @@ final class ProjectWindowRegistry {
 
     func repository(for projectRoot: String) -> RepositoryWorkspace? {
         pruneStaleWindows()
-        return repositories[repositoryRoot(for: projectRoot)]?.repository
+        return entries[repositoryRoot(for: projectRoot)]?.repository
     }
 
     private func refreshActiveWindow() {
         pruneStaleWindows()
         guard let projectRoot = projectRoot(for: NSApp.keyWindow) ?? projectRoot(for: NSApp.mainWindow),
-              let workspace = workspaces[projectRoot]?.workspace
+              let entry = entries[projectRoot],
+              let workspace = entry.workspace
         else {
             return
         }
@@ -1198,57 +1164,49 @@ final class ProjectWindowRegistry {
         activate(
             projectRoot: projectRoot,
             workspace: workspace,
-            noteStore: noteStores[projectRoot]?.noteStore,
-            todoStore: todoStores[projectRoot]?.todoStore,
-            chromeState: chromeStates[projectRoot]?.chromeState
+            noteStore: entry.noteStore,
+            todoStore: entry.todoStore,
+            chromeState: entry.chromeState
         )
     }
 
     private func projectRoot(for window: NSWindow?) -> String? {
         guard let window else { return nil }
-        return windows.first { _, weakWindow in
-            weakWindow.window === window
+        return entries.first { _, entry in
+            entry.window === window
         }?.key
     }
 
     private func repositoryRoot(for projectRoot: String) -> String {
         // A project on another Mac is its key, never a path here.
         if ProjectLocation.isRemoteKey(projectRoot) { return ProjectLocation(key: projectRoot).key }
-        let standardizedRoot = URL(
-            fileURLWithPath: projectRoot,
-            isDirectory: true
-        ).standardizedFileURL.path
-        let normalizedRoot: String
-        if let resolved = standardizedRoot.withCString({ realpath($0, nil) }) {
-            normalizedRoot = String(cString: resolved)
-            free(resolved)
-        } else {
-            normalizedRoot = standardizedRoot
-        }
-        return normalizedRoot
+        return RepositoryWorkspace.resolvedPath(projectRoot)
     }
 
     private func pruneStaleWindows() {
-        let staleProjectRoots = windows.compactMap { projectRoot, weakWindow in
-            weakWindow.window == nil || workspaces[projectRoot]?.workspace == nil ? projectRoot : nil
+        let staleProjectRoots = entries.compactMap { projectRoot, entry in
+            entry.window == nil || entry.workspace == nil ? projectRoot : nil
         }
         for projectRoot in staleProjectRoots {
-            windows.removeValue(forKey: projectRoot)
-            workspaces.removeValue(forKey: projectRoot)
-            repositories.removeValue(forKey: projectRoot)
-            noteStores.removeValue(forKey: projectRoot)
-            todoStores.removeValue(forKey: projectRoot)
-            chromeStates.removeValue(forKey: projectRoot)
-            windowFrameSavers.removeValue(forKey: projectRoot)
-            activationOrder.removeAll { $0 == projectRoot }
-            if activeProjectRoot.map(repositoryRoot(for:)) == projectRoot {
-                activeProjectRoot = nil
-                activeWorkspace = nil
-                activeNoteStore = nil
-                activeTodoStore = nil
-                activeChromeState = nil
-            }
+            forgetWindow(projectRoot)
         }
+    }
+
+    /// Forgets the window registered under `projectRoot` (a repository
+    /// root) with its frame saver and its place in the activation order.
+    /// True when it was the active window, which none is now.
+    @discardableResult
+    private func forgetWindow(_ projectRoot: String) -> Bool {
+        entries.removeValue(forKey: projectRoot)
+        windowFrameSavers.removeValue(forKey: projectRoot)
+        activationOrder.removeAll { $0 == projectRoot }
+        guard activeProjectRoot.map(repositoryRoot(for:)) == projectRoot else { return false }
+        activeProjectRoot = nil
+        activeWorkspace = nil
+        activeNoteStore = nil
+        activeTodoStore = nil
+        activeChromeState = nil
+        return true
     }
 }
 
@@ -1311,54 +1269,6 @@ final class ProjectWindowFrameSaver: NSObject {
     func saveNow() {
         guard let window else { return }
         store.save(window, projectRoot: projectRoot)
-    }
-}
-
-private final class WeakWindow {
-    weak var window: NSWindow?
-
-    init(_ window: NSWindow) {
-        self.window = window
-    }
-}
-
-private final class WeakWorkspace {
-    weak var workspace: TerminalWorkspace?
-
-    init(_ workspace: TerminalWorkspace) {
-        self.workspace = workspace
-    }
-}
-
-private final class WeakRepositoryWorkspace {
-    weak var repository: RepositoryWorkspace?
-
-    init(_ repository: RepositoryWorkspace) {
-        self.repository = repository
-    }
-}
-
-private final class WeakNoteStore {
-    weak var noteStore: ProjectNoteStore?
-
-    init(_ noteStore: ProjectNoteStore) {
-        self.noteStore = noteStore
-    }
-}
-
-private final class WeakTodoStore {
-    weak var todoStore: ProjectTodoStore?
-
-    init(_ todoStore: ProjectTodoStore) {
-        self.todoStore = todoStore
-    }
-}
-
-private final class WeakChromeState {
-    weak var chromeState: ProjectWindowChromeState?
-
-    init(_ chromeState: ProjectWindowChromeState) {
-        self.chromeState = chromeState
     }
 }
 

@@ -1,5 +1,5 @@
 import AppKit
-import CryptoKit
+import CherryControl
 import Darwin
 import Foundation
 
@@ -743,8 +743,7 @@ final class HostSSHMasterManager: @unchecked Sendable {
     /// A short, fixed name per destination. Nil when the path would be too
     /// long for a socket or holds characters ssh's option parser splits on.
     static func controlPath(in directory: URL, destination: String) -> String? {
-        let digest = SHA256.hash(data: Data(destination.utf8))
-        let name = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        let name = sha256Hex(destination, bytes: 8)
         let path = directory.path + "/" + name
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-")
         guard path.utf8.count <= maximumControlPathBytes,

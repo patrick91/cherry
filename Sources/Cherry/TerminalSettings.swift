@@ -134,9 +134,6 @@ struct SessionPersistenceSettings: Equatable, Sendable {
 struct SessionBackendPolicy {
     /// Read at every decision, so a settings change applies to the next one.
     var settings: @MainActor () -> SessionPersistenceSettings
-    /// Whether closing a local persistent tab follows its intent; see
-    /// `SessionClosePolicy.hostedLocalTabsFollowSettings`.
-    var hostedLocalTabsFollowSettings = SessionClosePolicy.hostedLocalTabsFollowSettings
     /// Ends a local persistent tab's session on its host after a
     /// `.terminate` close action detached the tab: Kill, then Remove once the
     /// host reports the exit (bounded). For a user's close in a window that
@@ -228,11 +225,7 @@ struct SessionBackendPolicy {
     }
 
     func closeAction(for session: TerminalSession, intent: SessionCloseIntent) -> SessionCloseAction {
-        SessionClosePolicy.closeAction(
-            for: session,
-            intent: intent,
-            hostedLocalTabsFollowSettings: hostedLocalTabsFollowSettings
-        )
+        SessionClosePolicy.closeAction(for: SessionCloseBackend(session), intent: intent)
     }
 }
 

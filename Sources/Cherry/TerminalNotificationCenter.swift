@@ -157,16 +157,6 @@ final class TerminalNotificationCenter {
         handleResponse(userInfo: userInfo)
     }
 
-    func handleResponse(sessionIDString: String?, projectRoot: String?) {
-        guard let sessionIDString,
-              let sessionID = UUID(uuidString: sessionIDString)
-        else {
-            return
-        }
-
-        focusSession(sessionID: sessionID, projectRoot: projectRoot?.nilIfEmpty)
-    }
-
     private func focusSession(sessionID: UUID, projectRoot: String?) {
         ProjectWindowRegistry.shared.focusSession(sessionID: sessionID, projectRoot: projectRoot)
     }

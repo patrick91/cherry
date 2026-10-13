@@ -802,16 +802,11 @@ enum OptimisticRestore {
 final class OpenHostedTabs {
     static let shared = OpenHostedTabs()
 
-    private final class WeakTab {
-        weak var session: TerminalSession?
-        init(_ session: TerminalSession) { self.session = session }
-    }
-
-    private var tabs: [ObjectIdentifier: WeakTab] = [:]
+    private var tabs: [ObjectIdentifier: WeakReference<TerminalSession>] = [:]
 
     func register(_ tab: TerminalSession) {
-        tabs = tabs.filter { $0.value.session != nil }
-        tabs[ObjectIdentifier(tab)] = WeakTab(tab)
+        tabs = tabs.filter { $0.value.object != nil }
+        tabs[ObjectIdentifier(tab)] = WeakReference(tab)
     }
 
     func unregister(_ tab: TerminalSession) {
@@ -819,12 +814,12 @@ final class OpenHostedTabs {
     }
 
     func hasOpenTab(withID id: UUID) -> Bool {
-        tabs.values.contains { $0.session?.id == id }
+        tabs.values.contains { $0.object?.id == id }
     }
 
     /// The open tab attached to this session of the host `hostID`.
     func tab(showingSession sessionID: String, hostID: String) -> TerminalSession? {
-        tabs.values.lazy.compactMap(\.session).first { tab in
+        tabs.values.lazy.compactMap(\.object).first { tab in
             tab.hostedAttachment?.hostID == hostID && tab.hostedAttachment?.sessionID == sessionID
         }
     }
@@ -836,7 +831,7 @@ final class OpenHostedTabs {
 
 // MARK: - Staggered attach
 
-/// Launches restored tabs' attach adapters `batchSize` per main run loop turn,
+/// Launches restored tabs' attach adapters one per main run loop turn,
 /// so a launch that restores many tabs never builds every surface at once.
 /// The pause between turns is `interval`, or as long as the last turn took
 /// when that was longer (each launch builds a surface on the main actor), so
@@ -863,8 +858,6 @@ final class OpenHostedTabs {
 final class RestoredTabLaunchQueue {
     static let shared = RestoredTabLaunchQueue()
 
-    /// Adapters launched per turn (each builds a surface on the main actor).
-    var batchSize = 1
     /// The shortest pause between turns.
     var interval: TimeInterval = 0.05
 
@@ -956,17 +949,18 @@ final class RestoredTabLaunchQueue {
     private func runBatch() {
         isScheduled = false
         let started = ContinuousClock.now
-        var launched = 0
-        while launched < max(1, batchSize), let tab = next() {
+        // One adapter per turn: each builds a surface on the main actor.
+        var launched = false
+        while !launched, let tab = next() {
             if tab.launchDeferredAdapterIfNeeded() {
-                launched += 1
+                launched = true
                 LaunchTimeline.mark("adapter launched \(tab.title)")
             }
         }
         if !shown.isEmpty || (!background.isEmpty && !isHoldingBackgroundTabs) {
             let now = ContinuousClock.now
             let delay: Duration
-            if launched == 0, let look = nextWindowGridLook {
+            if !launched, let look = nextWindowGridLook {
                 // Only tabs waiting for their window's grid: look again then.
                 delay = max(look - now, .zero)
             } else {

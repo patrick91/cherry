@@ -152,7 +152,6 @@ private final class RecordingBackendPolicy {
     var policy: SessionBackendPolicy {
         SessionBackendPolicy(
             settings: { [self] in settings },
-            hostedLocalTabsFollowSettings: true,
             terminateHostedSession: { [self] session, intent in
                 terminated.append((session.hostedAttachment?.sessionID ?? "native", intent))
             }
@@ -650,27 +649,19 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 
 @Test func sessionClosePolicyMatchesTodayAndTheSpecTable() {
     // Native tabs stop and remote (attached) tabs detach, whatever the
-    // intent; local persistent tabs follow their intent, unless a policy
-    // turns that off, when they detach too.
-    #expect(SessionClosePolicy.hostedLocalTabsFollowSettings)
+    // intent; local persistent tabs follow their intent.
     for intent in SessionCloseIntent.allCases {
         #expect(SessionClosePolicy.closeAction(for: .native, intent: intent) == .stop)
         #expect(SessionClosePolicy.closeAction(for: .hostedRemote, intent: intent) == .detach)
         #expect(SessionClosePolicy.closeAction(for: .hostedLocal, intent: intent)
             == SessionClosePolicy.hostedLocalAction(for: intent))
-        #expect(SessionClosePolicy.closeAction(
-            for: .hostedLocal, intent: intent, hostedLocalTabsFollowSettings: false
-        ) == .detach)
-        #expect(SessionClosePolicy.closeAction(
-            for: .native, intent: intent, hostedLocalTabsFollowSettings: false
-        ) == .stop)
     }
 
     // The spec's local hosted column. A tab close ends its session and a
     // detach keeps it; a window close or quit carries its answer (or the
     // quit preference) in its intent.
     func local(_ intent: SessionCloseIntent) -> SessionCloseAction {
-        SessionClosePolicy.closeAction(for: .hostedLocal, intent: intent, hostedLocalTabsFollowSettings: true)
+        SessionClosePolicy.closeAction(for: .hostedLocal, intent: intent)
     }
     #expect(local(.userClosedTab) == .terminate)
     #expect(local(.userDetachedTab) == .detach)
@@ -697,7 +688,6 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     let settingsBox = Box(SessionPersistenceSettings.defaults)
     let policy = SessionBackendPolicy(
         settings: { settingsBox.value },
-        hostedLocalTabsFollowSettings: true,
         terminateHostedSession: { session, intent in
             terminatedBox.value.append((session.hostedAttachment?.sessionID ?? "native", intent))
         }

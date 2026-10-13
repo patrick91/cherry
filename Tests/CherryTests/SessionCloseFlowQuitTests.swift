@@ -1385,11 +1385,4 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
     #expect(store.loadSystemQuits().count == 2)
     #expect(asked.value == 1)
     #expect(store.wasEndedOnPurpose(record))
-
-    // The launch hands the store to the local sessions, which record what
-    // they end.
-    let localSessions = PersistentLocalSessions(owner: "CherryTests", installationUnavailableReason: { "tests" })
-    #expect(localSessions.endedSessionsStore == nil)
-    CherryAppDelegate.configureSessionRecords(localSessions: localSessions, store: store)
-    #expect(localSessions.endedSessionsStore === store)
 }

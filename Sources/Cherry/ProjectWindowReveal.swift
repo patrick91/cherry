@@ -104,7 +104,7 @@ final class LaunchWindowCover {
     private var covered: [ObjectIdentifier: Covered] = [:]
     private var observers: [NSObjectProtocol] = []
     /// Windows handed over already (`claim`), never covered again.
-    private var claimed: [WeakWindowReference] = []
+    private var claimed: [WeakReference<NSWindow>] = []
 
     init(
         fallbackWait: Duration = ProjectWindowReveal.defaultMaximumWait,
@@ -158,7 +158,7 @@ final class LaunchWindowCover {
     /// in and made it key or main).
     func windowAppeared(_ window: NSWindow) {
         guard expected > 0, covered[ObjectIdentifier(window)] == nil,
-              !claimed.contains(where: { $0.window === window }), isCandidate(window)
+              !claimed.contains(where: { $0.object === window }), isCandidate(window)
         else { return }
         expected -= 1
         if expected == 0 { stopObserving() }
@@ -179,9 +179,9 @@ final class LaunchWindowCover {
     /// The registry takes `window` over: true when this hid it (it is still
     /// transparent, and its reveal is the registry's now).
     func claim(_ window: NSWindow) -> Bool {
-        claimed.removeAll { $0.window == nil }
-        if !claimed.contains(where: { $0.window === window }) {
-            claimed.append(WeakWindowReference(window))
+        claimed.removeAll { $0.object == nil }
+        if !claimed.contains(where: { $0.object === window }) {
+            claimed.append(WeakReference(window))
         }
         return covered.removeValue(forKey: ObjectIdentifier(window)) != nil
     }
@@ -215,12 +215,7 @@ final class HiddenWindowKeyHold {
         let event: NSEvent
     }
 
-    private final class WeakWindow {
-        weak var window: NSWindow?
-        init(_ window: NSWindow) { self.window = window }
-    }
-
-    private var windows: [ObjectIdentifier: WeakWindow] = [:]
+    private var windows: [ObjectIdentifier: WeakReference<NSWindow>] = [:]
     private var held: [Held] = []
     private var holdsWindowlessKeys = false
     private var windowlessDeadline: Task<Void, Never>?
@@ -257,7 +252,7 @@ final class HiddenWindowKeyHold {
     func hold(_ window: NSWindow) {
         dropClosedWindows()
         guard windows[ObjectIdentifier(window)] == nil else { return }
-        windows[ObjectIdentifier(window)] = WeakWindow(window)
+        windows[ObjectIdentifier(window)] = WeakReference(window)
         startMonitoring()
     }
 
@@ -300,7 +295,7 @@ final class HiddenWindowKeyHold {
 
     /// Forgets windows that closed while held, and their keys.
     private func dropClosedWindows() {
-        windows = windows.filter { $0.value.window != nil }
+        windows = windows.filter { $0.value.object != nil }
         held.removeAll { held in held.window.map { windows[$0] == nil } ?? false }
     }
 
@@ -600,11 +595,6 @@ struct WindowRestoringBar: View {
             .transition(.opacity)
         }
     }
-}
-
-private final class WeakWindowReference {
-    weak var window: NSWindow?
-    init(_ window: NSWindow) { self.window = window }
 }
 
 /// The order the launch opens its saved windows in

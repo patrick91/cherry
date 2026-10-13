@@ -12,7 +12,6 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     /// only one within `powerOffAnnouncementLifetime` of the system
     /// announcing one (which a cancelled log out leaves behind).
     private var lastQuitWasPowerOffEvent = false
-    private var didScheduleInitialWindowOpen = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         LaunchTimeline.mark("will finish launching")
@@ -20,18 +19,13 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
             // Keys typed once the app is active, before its first window
             // shows with a terminal to take them, are held for that window.
             HiddenWindowKeyHold.shared.holdWindowlessKeys(atMost: .seconds(3))
-            Self.configureSessionRecords(localSessions: .shared, store: .shared)
+            // Before any window restores or closes tabs: the sessions this
+            // app ends on purpose, and those the host reports lost, are
+            // recorded in the store (`SystemEndedSessions`).
+            PersistentLocalSessions.shared.endedSessionsStore = .shared
             // Each device's hosting records the same (docs/specs/remote-devices.md).
             RemoteDeviceStore.shared.endedSessionsStore = .shared
         }
-    }
-
-    /// Before any window restores or closes tabs: the sessions this app ends
-    /// on purpose, and those the host reports lost, are recorded in `store`
-    /// (`SystemEndedSessions`).
-    @MainActor
-    static func configureSessionRecords(localSessions: PersistentLocalSessions, store: WorkspaceStateStore) {
-        localSessions.endedSessionsStore = store
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -230,18 +224,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         // Update confirmed native tabs' busy programs before Sparkle's
         // install block ran (`UpdateQuitRequest.confirmStopping`), so its
         // quit does not ask again.
-        let (summary, decision) = MainActor.assumeIsolated {
-            let summary = ProjectWindowRegistry.shared.teardownSummary(
-                pathDisplayMode: TerminalSettings.shared.sidebarTerminalPathDisplayMode
-            )
-            let decision = SessionTeardownConfirmation.decide(
-                summary,
-                preference: TerminalSettings.shared.localSessionsOnQuit,
-                mayAsk: reason == .user,
-                systemEndsSessions: reason == .powerOff
-            )
-            return (summary, decision)
-        }
+        let (summary, decision) = MainActor.assumeIsolated { Self.quitTeardown(reason: reason) }
         let stoppingConfirmed = MainActor.assumeIsolated { UpdateQuitRequest.shared.stoppingConfirmed(now: Date()) }
         switch SessionQuitPlan(decision, summary: summary).forUpdate(reason: reason, stoppingConfirmed: stoppingConfirmed) {
         case .terminateNow:
@@ -726,8 +709,6 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
 
     @MainActor
     private func scheduleDefaultWindowOpenIfNeeded() {
-        guard !didScheduleInitialWindowOpen else { return }
-        didScheduleInitialWindowOpen = true
         let openDefaultProjectWindow = openDefaultProjectWindow
         let openProjectWindow = openProjectWindow
 
@@ -750,8 +731,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                     let recency = registry.projectRecency
                     // A quit before the later windows open ends (or keeps)
                     // their sessions as theirs would.
-                    let policy = SessionBackendPolicy.userSettings
-                    registry.launchWindowHosting = policy.hostedLocalTabsFollowSettings ? policy.localSessions : nil
+                    registry.launchWindowHosting = SessionBackendPolicy.userSettings.localSessions
                     // Tabs no window shows attach once the windows are up.
                     RestoredTabLaunchQueue.shared.holdBackgroundTabs(atMost: 3)
                     registry.openLaunchWindows(
@@ -839,17 +819,25 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
     /// decides for `.update`.
     @MainActor
     static func updateRestartStoppedProgramCount() -> Int {
+        if case .confirmStopping(let count, _) = quitTeardown(reason: .update).decision { return count }
+        return 0
+    }
+
+    /// What a quit for `reason` would do across every window, and what it
+    /// asks or confirms first: only a user's quit may ask about sessions,
+    /// and a log out, restart or shut down counts what ending them stops.
+    @MainActor
+    static func quitTeardown(reason: QuitReason) -> (summary: SessionTeardownSummary, decision: SessionTeardownConfirmation) {
         let summary = ProjectWindowRegistry.shared.teardownSummary(
             pathDisplayMode: TerminalSettings.shared.sidebarTerminalPathDisplayMode
         )
         let decision = SessionTeardownConfirmation.decide(
             summary,
             preference: TerminalSettings.shared.localSessionsOnQuit,
-            mayAsk: false,
-            systemEndsSessions: false
+            mayAsk: reason == .user,
+            systemEndsSessions: reason == .powerOff
         )
-        if case .confirmStopping(let count, _) = decision { return count }
-        return 0
+        return (summary, decision)
     }
 
     /// "Restart Cherry to update?" for `count` busy programs, as a sheet on
@@ -893,23 +881,14 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse
     ) async {
-        let userInfo = response.notification.request.content.userInfo
-        let sessionIDString = userInfo["sessionID"] as? String
-        let projectRoot = userInfo["projectRoot"] as? String
-        let backgroundSessionID = userInfo[BackgroundSessionNotificationContent.sessionIDKey] as? String
+        // Cherry's notifications carry strings only: a tab's id and project,
+        // or a background session's id and host.
+        let userInfo = response.notification.request.content.userInfo.reduce(into: [String: String]()) { strings, entry in
+            if let key = entry.key as? String, let value = entry.value as? String { strings[key] = value }
+        }
 
         await MainActor.run {
-            if let backgroundSessionID {
-                TerminalNotificationCenter.shared.handleResponse(
-                    userInfo: [BackgroundSessionNotificationContent.sessionIDKey: backgroundSessionID],
-                    backgroundSessions: .shared
-                )
-                return
-            }
-            TerminalNotificationCenter.shared.handleResponse(
-                sessionIDString: sessionIDString,
-                projectRoot: projectRoot
-            )
+            TerminalNotificationCenter.shared.handleResponse(userInfo: userInfo, backgroundSessions: .shared)
         }
     }
 }
@@ -1111,9 +1090,7 @@ struct CherryApp: App {
                     }, chromeStateProvider: {
                         ProjectWindowRegistry.shared.activeChromeState
                     }, openProjectProvider: { projectRoot in
-                        agentSettings.markProjectOpened(projectRoot)
-                        guard !ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) else { return }
-                        openWindow(id: Self.projectWindowSceneID, value: projectRoot)
+                        showProject(projectRoot)
                     })
                     // MCP tasks survive a relaunch: the last run's are read
                     // back (off this thread) before any request is handled.
@@ -1326,9 +1303,7 @@ struct CherryApp: App {
         }
         let openDefaultProjectWindow: @MainActor @Sendable () -> Void = {
             if let projectRoot = agentSettings.projectRoot(for: nil) {
-                agentSettings.markProjectOpened(projectRoot)
-                guard !ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) else { return }
-                openWindow(id: Self.projectWindowSceneID, value: projectRoot)
+                showProject(projectRoot)
             } else {
                 openWindow(id: Self.projectWindowSceneID)
             }
@@ -1340,10 +1315,15 @@ struct CherryApp: App {
                 openDefaultProjectWindow()
                 return
             }
-            agentSettings.markProjectOpened(projectRoot)
-            guard !ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) else { return }
-            openWindow(id: Self.projectWindowSceneID, value: projectRoot)
+            showProject(projectRoot)
         }
+    }
+
+    /// Brings the window of `projectRoot` forward, or opens one.
+    private func showProject(_ projectRoot: String) {
+        agentSettings.markProjectOpened(projectRoot)
+        guard !ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) else { return }
+        openWindow(id: Self.projectWindowSceneID, value: projectRoot)
     }
 }
 

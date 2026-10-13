@@ -487,7 +487,7 @@ final class OmniFolderBrowser {
 @MainActor
 final class OmniRepositoryScanner {
     static let shared = OmniRepositoryScanner(
-        cacheURL: AppInstanceLock.defaultFileURL().deletingLastPathComponent()
+        cacheURL: CherryAppIdentity.applicationSupportDirectory()
             .appendingPathComponent(OmniRepositoryScanner.fileName, isDirectory: false),
         canWrite: { AppInstanceLock.shared.isHeld }
     )

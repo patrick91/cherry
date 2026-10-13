@@ -320,7 +320,7 @@ enum RemoteHostResources {
         for file in files {
             listing += "\(try RemoteHostHelpers.sha256(file.url))  \(file.path)\n"
         }
-        return SHA256.hash(data: Data(listing.utf8)).map { String(format: "%02x", $0) }.joined()
+        return sha256Hex(listing)
     }
 
     private static func collectFiles(in directory: URL, relativePath: String, into files: inout [(path: String, url: URL)]) throws {

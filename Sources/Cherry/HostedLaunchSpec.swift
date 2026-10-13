@@ -649,10 +649,7 @@ enum GhosttyResourceStaging {
         applicationSupportName: String = CherryAppIdentity.current.applicationSupportName,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> URL {
-        homeDirectory
-            .appendingPathComponent("Library", isDirectory: true)
-            .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent(applicationSupportName, isDirectory: true)
+        CherryAppIdentity.applicationSupportDirectory(applicationSupportName: applicationSupportName, homeDirectory: homeDirectory)
             .appendingPathComponent("GhosttyResources", isDirectory: true)
     }
 

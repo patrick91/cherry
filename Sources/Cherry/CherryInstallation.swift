@@ -1,4 +1,4 @@
-import CryptoKit
+import CherryControl
 import Foundation
 import IOKit
 
@@ -29,7 +29,7 @@ struct CherryInstallation: Sendable {
     let machine: @Sendable () -> String?
 
     static let shared = CherryInstallation(
-        directory: AppInstanceLock.defaultFileURL().deletingLastPathComponent(),
+        directory: CherryAppIdentity.applicationSupportDirectory(),
         instanceLock: .shared,
         machine: { CherryInstallation.thisMacHash }
     )
@@ -52,13 +52,9 @@ struct CherryInstallation: Sendable {
         guard instanceLock?.isHeld ?? true else { return nil }
         let record = Record(id: UUID(), machine: machine)
         do {
-            try FileManager.default.createDirectory(
-                at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]
-            )
-            let data = try JSONEncoder().encode(record)
-            // Atomic: a reader sees the old file or the new one, never part.
-            try data.write(to: fileURL, options: [.atomic])
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+            // Atomic and owner-only: a reader sees the old file or the new
+            // one, never part.
+            try PrivateFile.write(JSONEncoder().encode(record), to: fileURL)
         } catch {
             SessionLog.error("could not save the installation id at \(fileURL.path): \(error.localizedDescription)")
             return nil
@@ -83,6 +79,6 @@ struct CherryInstallation: Sendable {
     }()
 
     static func hash(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+        sha256Hex(text)
     }
 }

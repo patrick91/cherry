@@ -1619,7 +1619,7 @@ extension CherryControlServer {
             if let end = worker.systemSessionEnd {
                 // It came back ended: the system ended its session while
                 // Cherry was closed.
-                let reason = "its session " + AgentTaskRegistry.lowercasedFirst(end.message)
+                let reason = "its session " + end.endedClause()
                 tasks.update(task, to: .failed, event: .failed, text: "The worker's session is gone: \(reason).", reason: reason)
                 continue
             }

@@ -1,5 +1,4 @@
 import CherryControl
-import CryptoKit
 import Foundation
 
 private final class ProjectNotePersistence: @unchecked Sendable {
@@ -78,18 +77,11 @@ final class ProjectNoteStore: ObservableObject {
     }
 
     static func defaultStorageDirectory() -> URL {
-        FileManager.default
-            .homeDirectoryForCurrentUser
-            .appendingPathComponent("Library", isDirectory: true)
-            .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent(CherryAppIdentity.current.applicationSupportName, isDirectory: true)
-            .appendingPathComponent("Notes", isDirectory: true)
+        CherryAppIdentity.applicationSupportDirectory().appendingPathComponent("Notes", isDirectory: true)
     }
 
     static func projectStorageName(projectRoot: String) -> String {
-        let digest = SHA256.hash(data: Data(projectRoot.utf8))
-        let hex = digest.map { String(format: "%02x", $0) }.joined()
-        return "\(hex).json"
+        CherryAppIdentity.projectFileName(for: projectRoot)
     }
 
     func create(title: String, markdown: String) throws -> ProjectNote {
@@ -126,9 +118,7 @@ final class ProjectNoteStore: ObservableObject {
     }
 
     private func mutate(id: UUID, title: String?, markdown: String?) throws -> ProjectNote {
-        guard let index = notes.firstIndex(where: { $0.id == id }) else {
-            throw CherryControlError(code: "note_not_found", message: "No Cherry note exists with id \(id.uuidString).")
-        }
+        guard let index = notes.firstIndex(where: { $0.id == id }) else { throw Self.notFound(id) }
         var note = notes[index]
         if let title {
             note.title = normalizedTitle(title)
@@ -146,18 +136,18 @@ final class ProjectNoteStore: ObservableObject {
         try requireLoaded()
         let originalCount = notes.count
         notes.removeAll { $0.id == id }
-        guard notes.count != originalCount else {
-            throw CherryControlError(code: "note_not_found", message: "No Cherry note exists with id \(id.uuidString).")
-        }
+        guard notes.count != originalCount else { throw Self.notFound(id) }
         try save()
     }
 
     func note(id: UUID) throws -> ProjectNote {
         try requireLoaded()
-        guard let note = notes.first(where: { $0.id == id }) else {
-            throw CherryControlError(code: "note_not_found", message: "No Cherry note exists with id \(id.uuidString).")
-        }
+        guard let note = notes.first(where: { $0.id == id }) else { throw Self.notFound(id) }
         return note
+    }
+
+    private static func notFound(_ id: UUID) -> CherryControlError {
+        CherryControlError(code: "note_not_found", message: "No Cherry note exists with id \(id.uuidString).")
     }
 
     private func load() {

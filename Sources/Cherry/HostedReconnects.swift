@@ -45,14 +45,9 @@ final class HostedReconnects: ObservableObject {
     /// change or Retry Now probes once more.
     @Published private(set) var pausedReasons: [String: String] = [:]
 
-    private final class WeakTab {
-        weak var tab: TerminalSession?
-        init(_ tab: TerminalSession) { self.tab = tab }
-    }
-
     private final class Group {
         let host: HostedSessionHost
-        var tabs: [ObjectIdentifier: WeakTab] = [:]
+        var tabs: [ObjectIdentifier: WeakReference<TerminalSession>] = [:]
         /// Probes since a tab of this host last attached: the backoff.
         var attempts = 0
         var timer: Task<Void, Never>?
@@ -66,7 +61,7 @@ final class HostedReconnects: ObservableObject {
             self.host = host
         }
 
-        var liveTabs: [TerminalSession] { tabs.values.compactMap(\.tab) }
+        var liveTabs: [TerminalSession] { tabs.values.compactMap(\.object) }
     }
 
     let configuration: Configuration
@@ -111,7 +106,7 @@ final class HostedReconnects: ObservableObject {
         startMonitoringSystem()
         let group = groups[host.id] ?? Group(host: host)
         groups[host.id] = group
-        group.tabs[ObjectIdentifier(tab)] = WeakTab(tab)
+        group.tabs[ObjectIdentifier(tab)] = WeakReference(tab)
         tab.setWaitingForHost(true)
         publishCounts()
         if group.timer == nil, group.probe == nil, group.paused == nil {
@@ -276,7 +271,7 @@ final class HostedReconnects: ObservableObject {
     /// Schedules the next probe while tabs still wait; forgets a host none
     /// waits for (keeping its backoff until one of its tabs attaches).
     private func settle(_ group: Group) {
-        group.tabs = group.tabs.filter { $0.value.tab != nil }
+        group.tabs = group.tabs.filter { $0.value.object != nil }
         if group.tabs.isEmpty {
             group.timer?.cancel()
             group.timer = nil

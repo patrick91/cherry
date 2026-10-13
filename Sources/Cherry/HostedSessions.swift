@@ -1405,8 +1405,7 @@ struct LoginEnvironmentCache: Sendable {
     }
 
     static let shared = LoginEnvironmentCache(
-        fileURL: AppInstanceLock.defaultFileURL().deletingLastPathComponent()
-            .appendingPathComponent(fileName, isDirectory: false),
+        fileURL: CherryAppIdentity.applicationSupportDirectory().appendingPathComponent(fileName, isDirectory: false),
         shellPath: ShellProcessController.defaultShellPath,
         // Never takes the lock itself (nor waits for a quitting holder).
         canWrite: { AppInstanceLock.shared.isResolved && AppInstanceLock.shared.isHeld },
@@ -1440,16 +1439,7 @@ struct LoginEnvironmentCache: Sendable {
 
     func load() -> HostedSessionLoginEnvironment.Capture? {
         // This user's own private regular file only, never through a link.
-        var info = stat()
-        guard lstat(fileURL.path, &info) == 0,
-              info.st_mode & S_IFMT == S_IFREG,
-              info.st_uid == getuid(),
-              info.st_mode & 0o077 == 0
-        else { return nil }
-        let descriptor = open(fileURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-        guard descriptor >= 0 else { return nil }
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-        guard let data = try? handle.readToEnd() else { return nil }
+        guard let data = PrivateFile.contents(of: fileURL) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .secondsSince1970
         guard let record = try? decoder.decode(Record.self, from: data),
@@ -1482,23 +1472,9 @@ struct LoginEnvironmentCache: Sendable {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .secondsSince1970
         guard let data = try? encoder.encode(record) else { return }
-        let directory = fileURL.deletingLastPathComponent()
-        let manager = FileManager.default
-        do {
-            try manager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        } catch {
-            return
-        }
         // Readable by this user only from the start, then renamed over the
         // old one.
-        var temporary = directory.appendingPathComponent(".\(Self.fileName).\(UUID().uuidString)", isDirectory: false)
-        guard manager.createFile(atPath: temporary.path, contents: data, attributes: [.posixPermissions: 0o600]) else { return }
-        var values = URLResourceValues()
-        values.isExcludedFromBackup = true
-        try? temporary.setResourceValues(values)
-        if rename(temporary.path, fileURL.path) != 0 {
-            try? manager.removeItem(at: temporary)
-        }
+        try? PrivateFile.write(data, to: fileURL, durable: false, excludedFromBackup: true)
     }
 }
 

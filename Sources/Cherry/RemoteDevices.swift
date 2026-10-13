@@ -181,7 +181,7 @@ final class RemoteDeviceStore: ObservableObject {
     static let fileName = "devices.json"
 
     static let shared = RemoteDeviceStore(
-        fileURL: AppInstanceLock.defaultFileURL().deletingLastPathComponent()
+        fileURL: CherryAppIdentity.applicationSupportDirectory()
             .appendingPathComponent(RemoteDeviceStore.fileName, isDirectory: false),
         canWrite: { AppInstanceLock.shared.isHeld },
         hostStore: .shared,

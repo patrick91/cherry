@@ -41,8 +41,7 @@ import Security
 /// with the same program, and its token works again.
 final class RemoteMCPTokens: @unchecked Sendable {
     static let shared = RemoteMCPTokens(
-        keyURL: AppInstanceLock.defaultFileURL().deletingLastPathComponent()
-            .appendingPathComponent("mcp-token-key", isDirectory: false)
+        keyURL: CherryAppIdentity.applicationSupportDirectory().appendingPathComponent("mcp-token-key", isDirectory: false)
     )
 
     private let keyURL: URL?
@@ -127,8 +126,7 @@ final class RemoteMCPTokens: @unchecked Sendable {
     private func loadGenerationsLocked() -> [UUID: Generation] {
         if let generations { return generations }
         var loaded: [UUID: Generation] = [:]
-        if let url = generationsURL, Self.isPrivateFile(url.path),
-           let data = FileManager.default.contents(atPath: url.path),
+        if let url = generationsURL, let data = PrivateFile.contents(of: url),
            let decoded = try? JSONDecoder().decode([String: Generation].self, from: data) {
             let oldest = Date().addingTimeInterval(-Self.generationLifetime)
             for (key, value) in decoded where value.madeAt > oldest {
@@ -144,16 +142,7 @@ final class RemoteMCPTokens: @unchecked Sendable {
         guard let url = generationsURL else { return }
         let encoded = Dictionary(uniqueKeysWithValues: all.map { ($0.key.uuidString, $0.value) })
         guard let data = try? JSONEncoder().encode(encoded) else { return }
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let temporary = url.deletingLastPathComponent().appendingPathComponent(".mcp-generations.\(UUID().uuidString)")
-        guard FileManager.default.createFile(atPath: temporary.path, contents: data, attributes: [.posixPermissions: 0o600]) else { return }
-        if rename(temporary.path, url.path) != 0 { unlink(temporary.path) }
-    }
-
-    private static func isPrivateFile(_ path: String) -> Bool {
-        var status = stat()
-        return lstat(path, &status) == 0 && status.st_mode & S_IFMT == S_IFREG
-            && status.st_uid == geteuid() && status.st_mode & 0o077 == 0
+        try? PrivateFile.write(data, to: url, durable: false)
     }
 
     /// 32 random bytes in a file only this user can read: made with
@@ -162,10 +151,10 @@ final class RemoteMCPTokens: @unchecked Sendable {
     /// read it.
     static func loadOrCreateKey(at url: URL) -> SymmetricKey? {
         let path = url.path
-        if let key = readKey(at: path) { return key }
+        if let key = readKey(at: url) { return key }
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
-        if fd < 0 { return errno == EEXIST ? readKey(at: path) : nil }
+        if fd < 0 { return errno == EEXIST ? readKey(at: url) : nil }
         defer { close(fd) }
         let key = SymmetricKey(size: .bits256)
         let written = key.withUnsafeBytes { raw in write(fd, raw.baseAddress, raw.count) }
@@ -176,12 +165,8 @@ final class RemoteMCPTokens: @unchecked Sendable {
         return key
     }
 
-    private static func readKey(at path: String) -> SymmetricKey? {
-        var status = stat()
-        guard lstat(path, &status) == 0, status.st_mode & S_IFMT == S_IFREG,
-              status.st_uid == geteuid(), status.st_mode & 0o077 == 0,
-              let data = FileManager.default.contents(atPath: path), data.count == 32
-        else { return nil }
+    private static func readKey(at url: URL) -> SymmetricKey? {
+        guard let data = PrivateFile.contents(of: url), data.count == 32 else { return nil }
         return SymmetricKey(data: data)
     }
 }
@@ -194,7 +179,7 @@ enum RemoteMCPPaths {
 
     /// 16 hex digits of the SHA-256 of `text`.
     static func shortHash(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        sha256Hex(text, bytes: 8)
     }
 
     /// Names a device's listener here (`mcp-<name>.sock`).

@@ -178,17 +178,10 @@ final class AgentTaskStore: @unchecked Sendable {
     }
 
     private static func read(_ fileURL: URL) -> AgentTasksFileRecord? {
-        var info = stat()
-        guard lstat(fileURL.path, &info) == 0 else { return nil }
         // This user's own private regular file only, never through a link.
-        guard info.st_mode & S_IFMT == S_IFREG, info.st_uid == getuid(), info.st_mode & 0o077 == 0 else {
+        guard let data = PrivateFile.contents(of: fileURL, refused: {
             SessionLog.debug("[task] not reading \(fileURL.lastPathComponent): not this user's private regular file")
-            return nil
-        }
-        let descriptor = open(fileURL.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-        guard descriptor >= 0 else { return nil }
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-        guard let data = try? handle.readToEnd() else { return nil }
+        }) else { return nil }
         // Dates as `Date` encodes them (exact to the bit).
         let decoder = JSONDecoder()
         if let record = try? decoder.decode(AgentTasksFileRecord.self, from: data),
@@ -197,24 +190,9 @@ final class AgentTaskStore: @unchecked Sendable {
         }
         struct VersionOnly: Decodable { let version: Int }
         let label = (try? decoder.decode(VersionOnly.self, from: data)).map { "v\($0.version)" } ?? "unreadable"
-        setAside(fileURL, label: label)
+        // Moved out of the way of the next save, beside it.
+        _ = try? PrivateFile.setAside(fileURL, label: label)
         return nil
-    }
-
-    /// Moves a file this version cannot use out of the way of the next
-    /// save, beside it (`WorkspaceStateStore.pruneSetAsideFiles` removes
-    /// old ones).
-    private static func setAside(_ fileURL: URL, label: String) {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        let destination = fileURL.deletingLastPathComponent().appendingPathComponent(
-            "\(fileURL.lastPathComponent).\(label)-\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(8)).bak"
-        )
-        if rename(fileURL.path, destination.path) == 0 {
-            fputs("Cherry: \(fileURL.lastPathComponent) cannot be used by this version (\(label)); moved it to \(destination.lastPathComponent)\n", stderr)
-        }
     }
 
     private static func writeLogged(_ record: AgentTasksFileRecord, to fileURL: URL) {
@@ -225,38 +203,13 @@ final class AgentTaskStore: @unchecked Sendable {
         }
     }
 
-    /// A private temporary file beside the destination, renamed over it:
-    /// readers see the old file or the new one, never part of one. The
-    /// rename replaces whatever is there (a link included), never what a
-    /// link points to.
+    /// Owner-only and left out of backups, replacing the file atomically
+    /// (`PrivateFile.write`): readers see the old file or the new one,
+    /// never part of one, and a link there is replaced, never followed.
     static func write(_ record: AgentTasksFileRecord, to fileURL: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let data = try encoder.encode(record)
-        let directory = fileURL.deletingLastPathComponent()
-        let manager = FileManager.default
-        try manager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        var temporary = directory.appendingPathComponent(".\(fileURL.lastPathComponent).\(UUID().uuidString).tmp", isDirectory: false)
-        guard manager.createFile(atPath: temporary.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
-            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: temporary.path])
-        }
-        do {
-            let handle = try FileHandle(forWritingTo: temporary)
-            defer { try? handle.close() }
-            try handle.write(contentsOf: data)
-            try handle.synchronize()
-        } catch {
-            try? manager.removeItem(at: temporary)
-            throw error
-        }
-        var values = URLResourceValues()
-        values.isExcludedFromBackup = true
-        try? temporary.setResourceValues(values)
-        guard rename(temporary.path, fileURL.path) == 0 else {
-            let code = POSIXErrorCode(rawValue: errno) ?? .EIO
-            try? manager.removeItem(at: temporary)
-            throw POSIXError(code)
-        }
+        try PrivateFile.write(encoder.encode(record), to: fileURL, excludedFromBackup: true)
     }
 }
 
@@ -708,16 +661,8 @@ enum AgentTaskHostLookup {
             savedAt: savedAt, bootTime: SystemEndedSessions.currentBootTime(),
             systemQuits: stateStore.loadSystemQuits(), lostByHost: lost
         ) {
-            return .gone(reason: "its session " + AgentTaskRegistry.lowercasedFirst(end.message), cancels: false)
+            return .gone(reason: "its session " + end.endedClause(), cancels: false)
         }
         return .gone(reason: "its session ended while Cherry was closed", cancels: false)
-    }
-}
-
-extension AgentTaskRegistry {
-    /// "Ended when the Mac restarted" → "ended when the Mac restarted".
-    nonisolated static func lowercasedFirst(_ text: String) -> String {
-        guard let first = text.first else { return text }
-        return first.lowercased() + text.dropFirst()
     }
 }

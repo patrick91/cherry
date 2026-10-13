@@ -23,10 +23,7 @@ struct ShellIntegrationBootstrap: Equatable, Sendable {
             return nil
         }
 
-        let directory = homeDirectory
-            .appendingPathComponent("Library", isDirectory: true)
-            .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent(CherryAppIdentity.current.applicationSupportName, isDirectory: true)
+        let directory = CherryAppIdentity.applicationSupportDirectory(homeDirectory: homeDirectory)
             .appendingPathComponent("ShellIntegration", isDirectory: true)
             .appendingPathComponent("zsh", isDirectory: true)
 

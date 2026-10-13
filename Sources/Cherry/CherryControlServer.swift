@@ -2597,12 +2597,6 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func link(for session: TerminalSession) -> String? {
-        guard let projectRoot = ProjectWindowRegistry.shared.projectRoot(containing: session.id) else { return nil }
-        return CherryDeepLink.terminalURL(projectRoot: projectRoot, terminalID: session.id)
-    }
-
-    @MainActor
     private func summary(for session: TerminalSession, workspace: TerminalWorkspace) -> TerminalSummaryResult {
         TerminalSummaryResult(
             terminalID: session.id.uuidString,

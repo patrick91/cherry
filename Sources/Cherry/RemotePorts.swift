@@ -190,10 +190,6 @@ final class RemotePortForwards {
         var remotePort: Int
     }
 
-    /// Runs `ssh <arguments>` (off the main actor); its exit status and
-    /// standard error.
-    typealias SSHRunner = @Sendable (_ arguments: [String]) async -> (status: Int32?, errors: String)
-
     let masters: HostSSHMasterManager
     /// The ssh and the environment it runs with (the login shell's).
     let shell: @MainActor () async -> RemoteDeviceShell

@@ -678,10 +678,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         terminalView.controller = nil
     }
 
-    func finish(exitCode: UInt32) {
-        inMemorySession.finish(exitCode: exitCode, runtimeMilliseconds: 0)
-    }
-
     /// Logs, once per surface and only during the launch, the first frame
     /// that shows text in an on-screen window (`LaunchTimeline`: "first
     /// content win=<window number>").

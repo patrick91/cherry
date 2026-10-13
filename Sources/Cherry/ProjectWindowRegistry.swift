@@ -10,7 +10,6 @@ final class ProjectWindowRegistry {
     private var windows: [String: WeakWindow] = [:]
     private var workspaces: [String: WeakWorkspace] = [:]
     private var repositories: [String: WeakRepositoryWorkspace] = [:]
-    private var repositoryRootByWorktreeRoot: [String: String] = [:]
     private var noteStores: [String: WeakNoteStore] = [:]
     private var todoStores: [String: WeakTodoStore] = [:]
     private var chromeStates: [String: WeakChromeState] = [:]
@@ -358,8 +357,7 @@ final class ProjectWindowRegistry {
         // whatever the quit does with the others.
         endClosedTabsAwaitingUndo()
         var stoppedNativeProgram = false
-        // Repositories first: they stop saving before their workspaces empty,
-        // and they own worktree workspaces `allWorkspaces()` cannot see yet.
+        // Repositories first: they stop saving before their workspaces empty.
         for repository in repositories.values.compactMap(\.repository) {
             stoppedNativeProgram = repository.closeSessionsForQuit(intent: intent) || stoppedNativeProgram
         }
@@ -444,9 +442,7 @@ final class ProjectWindowRegistry {
     /// Live workspaces across every registered project window.
     func allWorkspaces() -> [TerminalWorkspace] {
         pruneStaleWindows()
-        let repositoryWorkspaces = repositories.values.flatMap {
-            $0.repository?.allLoadedWorkspaces() ?? []
-        }
+        let repositoryWorkspaces = repositories.values.compactMap { $0.repository?.workspace }
         let repositoryWorkspaceIDs = Set(repositoryWorkspaces.map(ObjectIdentifier.init))
         let legacyWorkspaces = workspaces.values.compactMap(\.workspace).filter {
             !repositoryWorkspaceIDs.contains(ObjectIdentifier($0))
@@ -531,12 +527,12 @@ final class ProjectWindowRegistry {
     }
 
     /// Background Sessions → Open: shows a session of this app that no open
-    /// tab shows. Its project (`cherry.project`, a worktree) names the
+    /// tab shows. Its project (`cherry.project`, a folder) names the
     /// window: the open one, or else the project's window is opened, and its
     /// restore brings a closed window's session back with its sibling tabs
     /// and layout. Once that window's restore and look for orphaned
     /// sessions are done, the session's tab is revealed: the one that shows
-    /// it now, or else it is adopted into that worktree
+    /// it now, or else it is adopted into that window
     /// (`RepositoryWorkspace.showBackgroundSession`). A session with no
     /// project, or whose window does not open, goes to the active window.
     func showBackgroundSession(
@@ -545,10 +541,10 @@ final class ProjectWindowRegistry {
         attachedTabs: OpenHostedTabs = .shared,
         restoreWait: Duration = .seconds(10)
     ) async {
-        let worktree = OrphanedSessionCriteria.projectRoot(of: info)
-        var repository = worktree.flatMap { self.repository(for: $0) }
-        if repository == nil, let worktree,
-           let root = AgentSettings.shared.repositoryRoot(for: worktree), let opener = projectWindowOpener {
+        let project = OrphanedSessionCriteria.projectRoot(of: info)
+        var repository = project.flatMap { self.repository(for: $0) }
+        if repository == nil, let project,
+           let root = AgentSettings.shared.repositoryRoot(for: project), let opener = projectWindowOpener {
             opener(root)
             repository = await waitForRepository(projectRoot: root)
         }
@@ -567,7 +563,7 @@ final class ProjectWindowRegistry {
             repository = allRepositories.first
         }
         guard let repository else { return }
-        _ = focus(projectRoot: worktree.flatMap { repository.contains(worktreeRoot: $0) ? $0 : nil } ?? repository.repositoryRoot)
+        _ = focus(projectRoot: repository.repositoryRoot)
         await repository.waitUntilSessionsRestored(before: ContinuousClock.now + restoreWait)
 
         let hostID = localSessions.control.hostID
@@ -587,38 +583,34 @@ final class ProjectWindowRegistry {
               !localSessions.isScheduledToEnd(current, hostID: attachment.hostID),
               let tab = repository.showBackgroundSession(
                 PersistentSessionLaunch(attachment: attachment, info: current),
-                worktreeRoot: worktree,
                 hosting: localSessions
               )
         else { return }
         reveal(tab, repository: repository)
     }
 
-    /// The workspace of `worktreeRoot` in its project window, which is
+    /// The workspace of the project window of `projectRoot`, which is
     /// opened again (`projectWindowOpener`) when it closed, then given the
     /// time its restore takes: where a toast's Reopen attaches a session
     /// again after its tab closed, perhaps with its window. nil when no
     /// window shows or opens for it.
     func workspaceOpeningWindow(
-        worktreeRoot: String,
+        projectRoot: String,
         restoreWait: Duration = .seconds(10)
     ) async -> TerminalWorkspace? {
-        if let repository = repository(for: worktreeRoot) {
-            return repository.prepareWorkspace(worktreeRoot: worktreeRoot) ?? repository.activeWorkspace
-        }
-        if let workspace = workspace(for: worktreeRoot) {
+        if let workspace = workspace(for: projectRoot) {
             return workspace
         }
-        guard let root = AgentSettings.shared.repositoryRoot(for: worktreeRoot), let opener = projectWindowOpener else {
+        guard let root = AgentSettings.shared.repositoryRoot(for: projectRoot), let opener = projectWindowOpener else {
             return nil
         }
         opener(root)
         guard let repository = await waitForRepository(projectRoot: root) else { return nil }
         await repository.waitUntilSessionsRestored(before: ContinuousClock.now + restoreWait)
-        return repository.prepareWorkspace(worktreeRoot: worktreeRoot) ?? repository.activeWorkspace
+        return repository.workspace
     }
 
-    /// Focuses the window and worktree that has `tab`, and selects it.
+    /// Focuses the window that has `tab`, and selects it.
     private func reveal(_ tab: TerminalSession, repository: RepositoryWorkspace) {
         let root = projectRoot(containing: tab.id) ?? repository.repositoryRoot
         revealSession(id: tab.id, projectRoot: root)
@@ -629,29 +621,25 @@ final class ProjectWindowRegistry {
         return allWorkspaces().compactMap(\.projectRoot)
     }
 
-    /// Every root that can be focused through an open project window, including
-    /// discovered worktrees whose terminal workspace has not been created yet.
+    /// Every root that can be focused through an open project window: each
+    /// window's key and its tabs' folder.
     var knownProjectRoots: [String] {
         pruneStaleWindows()
-        let repositoryRoots = repositories.values.flatMap {
-            $0.repository?.worktrees.map(\.root) ?? []
-        }
+        let repositoryRoots = repositories.values.compactMap { $0.repository?.workspaceRoot }
         return Array(Set(repositoryRoots + Array(workspaces.keys))).sorted()
     }
 
     /// Each open project window, by its key (`canonicalProjectRoot`), with
-    /// how many tabs its loaded workspaces hold and how many of its agents
-    /// are working (the project switcher's status line).
+    /// how many tabs it holds and how many of its agents are working (the
+    /// project switcher's status line).
     func openProjectWindowStatuses() -> [String: ProjectSwitcherModel.OpenStatus] {
         pruneStaleWindows()
         var statuses: [String: ProjectSwitcherModel.OpenStatus] = [:]
         for (root, weakWindow) in windows where weakWindow.window != nil {
-            let loaded = repositories[root]?.repository?.allLoadedWorkspaces()
-                ?? workspaces[root]?.workspace.map { [$0] } ?? []
             var status = ProjectSwitcherModel.OpenStatus(tabs: 0, workingAgents: 0)
-            for workspace in loaded {
-                status.tabs += workspace.sessions.count
-                status.workingAgents += workspace.agentSessions.filter { $0.agentActivityState == .working }.count
+            if let workspace = repositories[root]?.repository?.workspace ?? workspaces[root]?.workspace {
+                status.tabs = workspace.sessions.count
+                status.workingAgents = workspace.agentSessions.filter { $0.agentActivityState == .working }.count
             }
             statuses[root] = status
         }
@@ -670,7 +658,7 @@ final class ProjectWindowRegistry {
     func projectRoot(forProjectKey projectKey: String) -> String? {
         pruneStaleWindows()
         let normalizedKey = projectKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        var roots = repositories.values.flatMap { $0.repository?.worktrees.map(\.root) ?? [] }
+        var roots = repositories.values.compactMap { $0.repository?.workspaceRoot }
         roots.append(contentsOf: workspaces.keys)
         roots.append(contentsOf: AgentSettings.shared.projects.map(\.root))
         if let activeProjectRoot {
@@ -689,7 +677,7 @@ final class ProjectWindowRegistry {
     func workspace(for projectRoot: String) -> TerminalWorkspace? {
         pruneStaleWindows()
         if let repository = repository(for: projectRoot) {
-            return repository.workspaceIfLoaded(for: projectRoot)
+            return repository.workspace
         }
         return workspaces[projectRoot]?.workspace
     }
@@ -741,7 +729,7 @@ final class ProjectWindowRegistry {
     /// A project window on screen (`windowIsOnScreen`) other than `window`
     /// (and the one `chromeState` belongs to), the one active most recently
     /// first: where a toast goes about a tab whose window closed with it.
-    /// Its workspace is its repository's active one.
+    /// Its workspace is its repository's.
     func mostRecentlyActiveProjectWindow(
         excluding window: NSWindow?,
         chromeState excludedChromeState: ProjectWindowChromeState?
@@ -754,7 +742,7 @@ final class ProjectWindowRegistry {
                   let workspace = workspaces[root]?.workspace
             else { continue }
             let repository = repositories[root]?.repository
-            return (chromeState, repository?.activeWorkspace ?? workspace, repository)
+            return (chromeState, repository?.workspace ?? workspace, repository)
         }
         return nil
     }
@@ -764,12 +752,12 @@ final class ProjectWindowRegistry {
     func frontmostLocalWorkspace() -> TerminalWorkspace? {
         pruneStaleWindows()
         if let key = projectRoot(for: NSApp.keyWindow), !ProjectLocation.isRemoteKey(key),
-           let workspace = repositories[key]?.repository?.activeWorkspace ?? workspaces[key]?.workspace {
+           let workspace = repositories[key]?.repository?.workspace ?? workspaces[key]?.workspace {
             return workspace
         }
         for root in activationOrder.reversed() + windows.keys.sorted() where !ProjectLocation.isRemoteKey(root) {
             guard windows[root]?.window != nil,
-                  let workspace = repositories[root]?.repository?.activeWorkspace ?? workspaces[root]?.workspace
+                  let workspace = repositories[root]?.repository?.workspace ?? workspaces[root]?.workspace
             else { continue }
             return workspace
         }
@@ -869,7 +857,6 @@ final class ProjectWindowRegistry {
         if let repository {
             repositories[projectRoot] = WeakRepositoryWorkspace(repository)
             repository.windowRegistry = self
-            updateWorktreeMappings(repositoryRoot: projectRoot, repository: repository)
         }
         if let noteStore {
             noteStores[projectRoot] = WeakNoteStore(noteStore)
@@ -936,7 +923,6 @@ final class ProjectWindowRegistry {
         guard let requestedRoot = projectRoot else { return }
         let projectRoot = repositoryRoot(for: requestedRoot)
         guard windows[projectRoot]?.window === window else { return }
-        repositoryRootByWorktreeRoot = repositoryRootByWorktreeRoot.filter { $0.value != projectRoot }
         windowFrameSavers.removeValue(forKey: projectRoot)?.saveNow()
         windows.removeValue(forKey: projectRoot)
         workspaces.removeValue(forKey: projectRoot)
@@ -959,7 +945,7 @@ final class ProjectWindowRegistry {
         }
     }
 
-    func focus(projectRoot: String, activateWorktree: Bool = true) -> Bool {
+    func focus(projectRoot: String) -> Bool {
         let repositoryRoot = repositoryRoot(for: projectRoot)
         guard let window = windows[repositoryRoot]?.window else {
             windows.removeValue(forKey: repositoryRoot)
@@ -967,14 +953,7 @@ final class ProjectWindowRegistry {
         }
 
         if let repository = repositories[repositoryRoot]?.repository {
-            if activateWorktree, repository.contains(worktreeRoot: projectRoot) {
-                _ = repository.activate(
-                    worktreeRoot: projectRoot,
-                    chromeState: chromeStates[repositoryRoot]?.chromeState
-                )
-            }
-            let workspace = repository.activeWorkspace
-            workspaces[repositoryRoot] = WeakWorkspace(workspace)
+            let workspace = repository.workspace
             activate(
                 projectRoot: workspace.projectRoot ?? repositoryRoot,
                 workspace: workspace,
@@ -1046,10 +1025,7 @@ final class ProjectWindowRegistry {
     func markCurrentActiveProjectOpened() {
         refreshActiveWindow()
         guard let activeProjectRoot else { return }
-        AgentSettings.shared.markWorktreeOpened(
-            activeProjectRoot,
-            repositoryRoot: repositoryRoot(for: activeProjectRoot)
-        )
+        AgentSettings.shared.markProjectOpened(repositoryRoot(for: activeProjectRoot))
     }
 
     func activateWindow(
@@ -1071,10 +1047,8 @@ final class ProjectWindowRegistry {
 
     func projectRoot(containing sessionID: UUID) -> String? {
         pruneStaleWindows()
-        for repository in repositories.values {
-            if let root = repository.repository?.root(containing: sessionID) {
-                return root
-            }
+        for repository in repositories.values.compactMap(\.repository) where repository.contains(sessionID: sessionID) {
+            return repository.workspaceRoot
         }
         return workspaces.values.compactMap(\.workspace).first { workspace in
             workspace.sessions.contains { $0.id == sessionID }
@@ -1187,7 +1161,7 @@ final class ProjectWindowRegistry {
             // published values is not allowed.
             let repositoryRoot = repositoryRoot(for: projectRoot)
             DispatchQueue.main.async {
-                AgentSettings.shared.markWorktreeOpened(effectiveRoot, repositoryRoot: repositoryRoot)
+                AgentSettings.shared.markProjectOpened(repositoryRoot)
             }
         }
 
@@ -1207,35 +1181,6 @@ final class ProjectWindowRegistry {
 
         activeWorkspace?.clearUnreadNotificationForSelectedSession()
         activeWorkspace?.acknowledgeAgentResultForSelectedSession()
-    }
-
-    func repositoryDidRefresh(_ repository: RepositoryWorkspace) {
-        guard let repositoryRoot = repositories.first(where: {
-            $0.value.repository === repository
-        })?.key else {
-            return
-        }
-        updateWorktreeMappings(repositoryRoot: repositoryRoot, repository: repository)
-    }
-
-    func repositoryDidActivate(_ repository: RepositoryWorkspace) {
-        guard let repositoryRoot = repositories.first(where: {
-            $0.value.repository === repository
-        })?.key else {
-            return
-        }
-        let workspace = repository.activeWorkspace
-        workspaces[repositoryRoot] = WeakWorkspace(workspace)
-        if windows[repositoryRoot]?.window?.isKeyWindow == true {
-            activate(
-                projectRoot: repository.activeWorktreeRoot,
-                workspace: workspace,
-                noteStore: noteStores[repositoryRoot]?.noteStore,
-                todoStore: todoStores[repositoryRoot]?.todoStore,
-                chromeState: chromeStates[repositoryRoot]?.chromeState,
-                recordsOpening: false
-            )
-        }
     }
 
     func repository(for projectRoot: String) -> RepositoryWorkspace? {
@@ -1281,20 +1226,7 @@ final class ProjectWindowRegistry {
         } else {
             normalizedRoot = standardizedRoot
         }
-        return repositoryRootByWorktreeRoot[normalizedRoot] ?? normalizedRoot
-    }
-
-    private func updateWorktreeMappings(
-        repositoryRoot: String,
-        repository: RepositoryWorkspace
-    ) {
-        repositoryRootByWorktreeRoot = repositoryRootByWorktreeRoot.filter {
-            $0.value != repositoryRoot
-        }
-        repositoryRootByWorktreeRoot[repositoryRoot] = repositoryRoot
-        for worktree in repository.worktrees {
-            repositoryRootByWorktreeRoot[worktree.root] = repositoryRoot
-        }
+        return normalizedRoot
     }
 
     private func pruneStaleWindows() {
@@ -1302,9 +1234,6 @@ final class ProjectWindowRegistry {
             weakWindow.window == nil || workspaces[projectRoot]?.workspace == nil ? projectRoot : nil
         }
         for projectRoot in staleProjectRoots {
-            repositoryRootByWorktreeRoot = repositoryRootByWorktreeRoot.filter {
-                $0.value != projectRoot
-            }
             windows.removeValue(forKey: projectRoot)
             workspaces.removeValue(forKey: projectRoot)
             repositories.removeValue(forKey: projectRoot)
@@ -1466,11 +1395,6 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isAddDevicePresented = false
     /// Add Project on <Mac>…: the device.
     @Published var addProjectDevice: RemoteDeviceReference?
-    @Published var isNewWorktreePresented = false
-    /// The branch name New Worktree starts with ("New worktree “q”").
-    @Published var newWorktreeBranchName: String?
-    @Published var isWorktreeManagerPresented = false
-    @Published var worktreeToRename: GitWorktree?
     @Published var isTerminalSearchPresented = false
     @Published var terminalSearchFocusRequest = 0
     @Published var isIconDebugOverlayPresented = false
@@ -1620,27 +1544,6 @@ final class ProjectWindowChromeState: ObservableObject {
         guard omniBar != nil else { return false }
         omniBarActionsRequest &+= 1
         return true
-    }
-
-    func presentNewWorktree(branchName: String? = nil) {
-        isWorktreeManagerPresented = false
-        worktreeToRename = nil
-        newWorktreeBranchName = branchName
-        isNewWorktreePresented = true
-    }
-
-    func presentWorktreeManager() {
-        isNewWorktreePresented = false
-        worktreeToRename = nil
-        isWorktreeManagerPresented = true
-    }
-
-    func presentRenameWorktree(_ worktree: GitWorktree) {
-        isNewWorktreePresented = false
-        isWorktreeManagerPresented = false
-        DispatchQueue.main.async {
-            self.worktreeToRename = worktree
-        }
     }
 
     func presentTerminalSearch() {
@@ -1905,7 +1808,7 @@ private final class ProjectWindowBinderView: NSView {
                 guard let self, let workspace = self.workspace else { return }
                 ProjectWindowRegistry.shared.activateWindow(
                     projectRoot: self.projectRoot,
-                    workspace: self.repository?.activeWorkspace ?? workspace,
+                    workspace: self.repository?.workspace ?? workspace,
                     noteStore: self.noteStore,
                     todoStore: self.todoStore,
                     chromeState: self.chromeState

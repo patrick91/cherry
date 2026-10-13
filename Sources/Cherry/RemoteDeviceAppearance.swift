@@ -130,13 +130,12 @@ struct RemoteDeviceBadge: Equatable, Sendable {
     }
 }
 
-/// The window title (Window menu, Mission Control, ⌘`): "<project>",
-/// "<project> / <worktree>", with " — <Mac>" for a device window, and
-/// " — <tab>" when its selected tab has a title.
+/// The window title (Window menu, Mission Control, ⌘`): "<project>", with
+/// " — <Mac>" for a device window, and " — <tab>" when its selected tab has
+/// a title.
 enum ProjectWindowTitle {
-    static func title(project: String, worktree: String? = nil, deviceName: String? = nil, tab: String? = nil) -> String {
+    static func title(project: String, deviceName: String? = nil, tab: String? = nil) -> String {
         var title = project
-        if let worktree, !worktree.isEmpty { title += " / \(worktree)" }
         if let deviceName, !deviceName.isEmpty { title += " — \(deviceName)" }
         let tab = tab?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !tab.isEmpty { title += " — \(tab)" }

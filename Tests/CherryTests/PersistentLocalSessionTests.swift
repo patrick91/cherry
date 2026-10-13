@@ -485,12 +485,12 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     harness.fake.connections.last?.push(.event(.changed(busy)))
     #expect(await harness.fake.wait { terminal.hasRunningProcess() })
 
-    // What quitting, closing the window or removing the worktree would end:
-    // a quit or window close keeping sessions ends none of them.
+    // What quitting or closing the window would end: a quit or window
+    // close keeping sessions ends none of them.
     #expect(workspace.sessionsWithRunningProcess(endingWith: .appQuit).isEmpty)
     #expect(workspace.sessionsWithRunningProcess(endingWith: .windowClosed).isEmpty)
     #expect(workspace.persistentSessionsEnded(by: .appQuit).isEmpty)
-    #expect(Set(workspace.sessionsWithRunningProcess(endingWith: .worktreeRemoved).map(\.id)) == [terminal.id, command.id])
+    #expect(Set(workspace.sessionsWithRunningProcess(endingWith: .mcpClose).map(\.id)) == [terminal.id, command.id])
     #expect(Set(workspace.sessionsWithRunningProcess(endingWith: .appQuitEndingSessions).map(\.id)) == [terminal.id, command.id])
     #expect(workspace.persistentSessionsEnded(by: .appQuitEndingSessions).count == 2)
     #expect(workspace.sessionsWithRunningProcess(endingWith: .duplicateWindowTeardown).isEmpty)
@@ -552,14 +552,6 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     workspace.close(ended, intent: .userDetachedTab)
     #expect(await harness.fake.wait { harness.requestIDs("remove").contains(endedSession) })
     #expect(!harness.requestIDs("kill").contains(endedSession))
-
-    // Removing a worktree always ends its sessions.
-    let worktree = TerminalWorkspace(projectRoot: harness.project.path, createInitialSession: false, backendPolicy: harness.policy)
-    let removedTab = worktree.addSession()
-    #expect(await harness.waitUntilAttached(removedTab))
-    let removedSession = try #require(removedTab.persistentSession?.sessionID)
-    worktree.closeAllSessions(intent: .worktreeRemoved)
-    #expect(await harness.fake.wait { harness.requestIDs("remove").contains(removedSession) })
 
     // A window closing or the app quitting keeps them, unless its answer
     // (or Settings › Sessions) ends them; a discarded duplicate window never
@@ -740,7 +732,6 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     let restorer = harness.restorer
     let result = await restorer(WorkspaceRestoreRequest(
         repositoryRoot: harness.project.path,
-        worktreeRoot: harness.project.path,
         records: [running, ended, missing, otherHost],
         workspace: workspace
     ))
@@ -780,7 +771,6 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     harness.installationProblem.value = "The cherry session client is missing."
     let kept = await restorer(WorkspaceRestoreRequest(
         repositoryRoot: harness.project.path,
-        worktreeRoot: harness.project.path,
         records: [running],
         workspace: workspace
     ))
@@ -898,7 +888,6 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
         workspaces.append(workspace)
         let result = await restorer(WorkspaceRestoreRequest(
             repositoryRoot: harness.project.path,
-            worktreeRoot: harness.project.path,
             records: record.sessions.filter(\.isRestorable),
             workspace: workspace
         ))
@@ -1537,7 +1526,7 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
 
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     let tab = try #require(workspace.session(withID: record.id))
     #expect(tab.isPersistentLocalSession)
     #expect(await harness.fake.wait { tab.state == .exited(1) })

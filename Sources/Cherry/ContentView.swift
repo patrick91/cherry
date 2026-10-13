@@ -35,7 +35,6 @@ struct ContentView: View {
     @State private var sidebarDismissTask: Task<Void, Never>?
     @State private var trafficLightFinalSyncTask: Task<Void, Never>?
     @State private var floatingSidebarAnimationDepth = 0
-    @StateObject private var worktreeSwipeState = WorktreeSidebarSwipeState()
 
     private var projectNavigationPrototypeStyle: ProjectNavigationPrototypeStyle {
         PrototypeFeatureFlags.projectNavigationStyle
@@ -117,7 +116,6 @@ struct ContentView: View {
                     todoStore: todoStore,
                     projectRoot: projectRoot,
                     includeLeadingPadding: isSidebarHidden,
-                    usesWorktreeSurfaceTransition: worktreeSwipeState.targetRoot != nil,
                     projectNavigationTopInset: projectNavigationTopInset
                 )
                     .ignoresSafeArea(.all, edges: .top)
@@ -230,10 +228,8 @@ struct ContentView: View {
                     settings: AgentSettings.shared,
                     repository: repository,
                     chromeState: chromeState,
-                    swipeState: worktreeSwipeState,
                     projectRoot: projectRoot,
                     presentation: isSidebarRevealed ? .floating : .docked,
-                    sidebarWidth: sidebarWidth,
                     maximumWidth: titlebarProjectPickerMaximumWidth
                 )
                 .padding(.leading, titlebarProjectPickerLeadingInset)
@@ -312,38 +308,19 @@ struct ContentView: View {
                 .frame(maxHeight: .infinity)
                 .ignoresSafeArea(.all, edges: .vertical)
             }
-
-            if repository.supportsWorktrees,
-               !isSidebarHidden || isSidebarRevealed {
-                WorktreeSidebarSwipeMonitor(
-                    repository: repository,
-                    chromeState: chromeState,
-                    swipeState: worktreeSwipeState,
-                    sidebarWidth: sidebarWidth
-                )
-                .frame(width: sidebarWidth + (isSidebarRevealed ? floatingSidebarLeadingInset : 0))
-                .frame(maxHeight: .infinity)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .allowsHitTesting(false)
-            }
         }
         .ignoresSafeArea(.all, edges: .top)
         .background {
-            // Worktrees are spaces inside one project, so the window surface
-            // keeps the repository's appearance identity while checkout-local
-            // content changes.
             AppShellBackground(projectRoot: repository.repositoryRoot)
                 .ignoresSafeArea(.all)
         }
         .background(AppShortcutMonitor(
             repository: repository,
-            worktreeSwipeState: worktreeSwipeState,
             workspace: workspace,
             chromeState: chromeState,
             noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: projectRoot,
-            sidebarWidth: sidebarWidth,
             openSettings: { openSettings() }
         ))
         .background(WindowConfigurator())
@@ -365,27 +342,6 @@ struct ContentView: View {
             AddDeviceProjectSheet(deviceID: reference.id, store: .shared) { key in
                 openProject(CherryProject(root: key))
             }
-        }
-        .sheet(isPresented: $chromeState.isNewWorktreePresented) {
-            NewWorktreeSheet(
-                repository: repository,
-                chromeState: chromeState,
-                isPresented: $chromeState.isNewWorktreePresented,
-                initialBranchName: chromeState.newWorktreeBranchName ?? ""
-            )
-        }
-        .sheet(isPresented: $chromeState.isWorktreeManagerPresented) {
-            WorktreeManagerSheet(
-                repository: repository,
-                chromeState: chromeState,
-                isPresented: $chromeState.isWorktreeManagerPresented
-            )
-        }
-        .sheet(item: $chromeState.worktreeToRename) { worktree in
-            RenameWorktreeSheet(
-                repository: repository,
-                worktree: worktree
-            )
         }
         .confirmationDialog(
             "Close Agent Group?",
@@ -601,9 +557,7 @@ struct ContentView: View {
             todoStore: todoStore,
             projectRoot: projectRoot,
             presentation: .docked,
-            openProject: openProject,
-            swipeState: worktreeSwipeState,
-            sidebarWidth: sidebarWidth
+            openProject: openProject
         )
             .frame(width: sidebarWidth)
             .ignoresSafeArea(.all, edges: .top)
@@ -655,9 +609,7 @@ struct ContentView: View {
             todoStore: todoStore,
             projectRoot: projectRoot,
             presentation: .floating,
-            openProject: openProject,
-            swipeState: worktreeSwipeState,
-            sidebarWidth: sidebarWidth
+            openProject: openProject
         )
             .frame(width: sidebarWidth)
             .overlay(alignment: .trailing) {
@@ -1087,7 +1039,6 @@ private struct DetailPaneView: View {
     @ObservedObject private var agentSettings = AgentSettings.shared
     let projectRoot: String?
     let includeLeadingPadding: Bool
-    let usesWorktreeSurfaceTransition: Bool
     let projectNavigationTopInset: CGFloat
 
     var body: some View {
@@ -1106,8 +1057,7 @@ private struct DetailPaneView: View {
             } else if workspace.selectedSession != nil {
                 TerminalSplitSceneView(
                     workspace: workspace,
-                    chromeState: chromeState,
-                    usesWorktreeSurfaceTransition: usesWorktreeSurfaceTransition
+                    chromeState: chromeState
                 )
             } else {
                 ContentUnavailableView {
@@ -3188,7 +3138,7 @@ private func cherryLink(for session: TerminalSession, projectRoot: String?) -> S
 }
 
 private struct SidebarTabsView: View {
-    @ObservedObject var repository: RepositoryWorkspace
+    let repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     @ObservedObject var noteStore: ProjectNoteStore
@@ -3196,40 +3146,19 @@ private struct SidebarTabsView: View {
     let projectRoot: String?
     let presentation: SidebarPresentation
     let openProject: (CherryProject) -> Void
-    @ObservedObject var swipeState: WorktreeSidebarSwipeState
-    let sidebarWidth: CGFloat
 
     var body: some View {
         VStack(spacing: 0) {
-            ZStack {
-                if let targetRoot = swipeState.targetRoot,
-                   let targetWorkspace = repository.workspaceIfLoaded(for: targetRoot) {
-                    EquatableSidebarTabsPage(
-                        workspace: targetWorkspace,
-                        chromeState: chromeState,
-                        noteStore: noteStore,
-                        todoStore: todoStore,
-                        projectRoot: targetRoot,
-                        presentation: presentation,
-                        openProject: openProject
-                    )
-                    .equatable()
-                    .offset(x: targetPageOffset)
-                    .allowsHitTesting(false)
-                }
-
-                EquatableSidebarTabsPage(
-                    workspace: displayedSourceWorkspace,
-                    chromeState: chromeState,
-                    noteStore: noteStore,
-                    todoStore: todoStore,
-                    projectRoot: displayedSourceRoot,
-                    presentation: presentation,
-                    openProject: openProject
-                )
-                .equatable()
-                .offset(x: swipeState.offset)
-            }
+            EquatableSidebarTabsPage(
+                workspace: workspace,
+                chromeState: chromeState,
+                noteStore: noteStore,
+                todoStore: todoStore,
+                projectRoot: projectRoot,
+                presentation: presentation,
+                openProject: openProject
+            )
+            .equatable()
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
 
@@ -3243,18 +3172,6 @@ private struct SidebarTabsView: View {
                     trailing: SidebarLayout.trailingInset
                 )
             )
-
-            if repository.supportsWorktrees {
-                WorktreeSpaceRail(
-                    repository: repository,
-                    chromeState: chromeState,
-                    swipeState: swipeState,
-                    sidebarWidth: sidebarWidth
-                )
-                .padding(.leading, SidebarLayout.trafficLightLeadingInset - floatingOuterInset)
-                .padding(.trailing, SidebarLayout.trailingInset)
-                .padding(.bottom, 8 + dockedCompensation)
-            }
         }
         .background {
             if presentation == .floating {
@@ -3266,38 +3183,16 @@ private struct SidebarTabsView: View {
         }
     }
 
-    private var displayedSourceRoot: String? {
-        guard swipeState.targetRoot != nil else { return projectRoot }
-        return swipeState.sourceRoot ?? projectRoot
-    }
-
-    private var displayedSourceWorkspace: TerminalWorkspace {
-        guard let sourceRoot = displayedSourceRoot,
-              let sourceWorkspace = repository.workspaceIfLoaded(for: sourceRoot)
-        else {
-            return workspace
-        }
-        return sourceWorkspace
-    }
-
-    private var targetPageOffset: CGFloat {
-        let origin = swipeState.direction > 0 ? sidebarWidth : -sidebarWidth
-        return origin + swipeState.offset
-    }
-
     private var floatingOuterInset: CGFloat {
         presentation == .floating ? SidebarLayout.floatingOuterInset : 0
     }
-
-    private var dockedCompensation: CGFloat {
-        presentation == .docked ? SidebarLayout.floatingOuterInset : 0
-    }
 }
 
-/// Swipe progress changes on every trackpad event. Giving the heavyweight page
-/// an explicit identity boundary lets SwiftUI update its offset without walking
-/// the entire sidebar contents again; the observed models inside the page still
-/// invalidate it normally when their actual data changes.
+/// The window re-renders its sidebar for changes that leave the page as it
+/// was (its chrome, the sidebar's width). Giving the heavyweight page an
+/// explicit identity boundary lets SwiftUI skip walking the entire sidebar
+/// contents again; the observed models inside the page still invalidate it
+/// normally when their actual data changes.
 @MainActor
 private struct EquatableSidebarTabsPage: View, @preconcurrency Equatable {
     @ObservedObject var workspace: TerminalWorkspace
@@ -5021,8 +4916,6 @@ struct TitlebarProjectPicker: View {
     private static let titleSpacing: CGFloat = 6
     private static let horizontalPadding: CGFloat = 8
     private static let verticalPadding: CGFloat = 4
-    private static let worktreeIconWidth: CGFloat = 12
-    private static let worktreeLineSpacing: CGFloat = 4
 
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var terminalSettings = TerminalSettings.shared
@@ -5030,10 +4923,8 @@ struct TitlebarProjectPicker: View {
     @ObservedObject var settings: AgentSettings
     @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    @ObservedObject var swipeState: WorktreeSidebarSwipeState
     let projectRoot: String?
     let presentation: SidebarPresentation
-    let sidebarWidth: CGFloat
     let maximumWidth: CGFloat
 
     @State private var isHovering = false
@@ -5100,14 +4991,6 @@ struct TitlebarProjectPicker: View {
     }
 
     private var projectTitle: String {
-        guard let worktreeName
-        else {
-            return repositoryTitle
-        }
-        return "\(repositoryTitle) / \(worktreeName)"
-    }
-
-    private var repositoryTitle: String {
         if repository.isRemote {
             // Its Mac is the chip under it.
             return repository.repositoryName
@@ -5116,110 +4999,36 @@ struct TitlebarProjectPicker: View {
         return name.isEmpty ? "No Project" : name
     }
 
-    private var worktreeName: String? {
-        activeWorktree?.displayName
-    }
-
-    private var activeWorktree: GitWorktree? {
-        guard repository.supportsWorktrees else { return nil }
-        let root = swipeState.targetRoot == nil
-            ? repository.activeWorktreeRoot
-            : swipeState.sourceRoot ?? repository.activeWorktreeRoot
-        return repository.worktrees.first { $0.root == root }
-    }
-
-    private var swipeTargetWorktree: GitWorktree? {
-        guard let targetRoot = swipeState.targetRoot else { return nil }
-        return repository.worktrees.first { $0.root == targetRoot }
-    }
-
-    private var worktreeSwipeProgress: CGFloat {
-        guard let target = swipeTargetWorktree,
-              target.root != activeWorktree?.root
-        else { return 0 }
-        return min(1, max(0, abs(swipeState.offset) / max(sidebarWidth, 1)))
-    }
-
-    /// Two lines (the name over its worktree and, on another Mac, the
-    /// Mac chip) take the padding one line has.
+    /// A device window's two lines (the name over its Mac's chip) take the
+    /// padding one line has.
     private func titleVerticalPadding(device: RemoteDeviceBadge?) -> CGFloat {
-        activeWorktree == nil && device == nil ? Self.verticalPadding : 1
+        device == nil ? Self.verticalPadding : 1
     }
 
     @ViewBuilder
     private func titleContent(palette: SidebarPalette, device: RemoteDeviceBadge?) -> some View {
-        if activeWorktree != nil || device != nil {
+        if let device {
             VStack(alignment: .leading, spacing: 0) {
-                Text(repositoryTitle)
+                Text(projectTitle)
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.tail)
 
-                HStack(spacing: Self.deviceChipSpacing) {
-                    if let worktree = activeWorktree {
-                        ZStack(alignment: .leading) {
-                            worktreeLine(worktree, palette: palette)
-                                .opacity(1 - worktreeSwipeProgress)
-
-                            if let target = swipeTargetWorktree,
-                               target.root != worktree.root {
-                                worktreeLine(target, palette: palette)
-                                    .opacity(worktreeSwipeProgress)
-                            }
-                        }
-                        .layoutPriority(device == nil ? 1 : 0)
-                    }
-                    if let device {
-                        // Which Mac this window runs on, next to the branch.
-                        RemoteDeviceHeaderChip(badge: device)
-                            .layoutPriority(1)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                // Which Mac this window runs on.
+                RemoteDeviceHeaderChip(badge: device)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-            Text(repositoryTitle)
+            Text(projectTitle)
                 .lineLimit(1)
                 .truncationMode(.tail)
         }
     }
 
-    private static let deviceChipSpacing: CGFloat = 6
-
-    private func worktreeLine(
-        _ worktree: GitWorktree,
-        palette: SidebarPalette
-    ) -> some View {
-        HStack(spacing: Self.worktreeLineSpacing) {
-            Image(systemName: worktree.isDetached
-                ? "point.3.connected.trianglepath.dotted"
-                : "rectangle.stack")
-                .font(.system(size: 9, weight: .medium))
-                .frame(width: Self.worktreeIconWidth, height: 11)
-
-            Text(worktree.displayName)
-                .font(.system(size: 11, weight: .medium))
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
-        .foregroundStyle(palette.rowText.opacity(0.68))
-    }
-
     private func preferredWidth(showsProjectAccent: Bool, device: RemoteDeviceBadge?) -> CGFloat {
-        var secondLineWidth: CGFloat = 0
-        if let worktreeName {
-            let targetWidth = swipeTargetWorktree.map {
-                Self.measuredTitleWidth($0.displayName)
-            } ?? 0
-            secondLineWidth = Self.worktreeIconWidth
-                + Self.worktreeLineSpacing
-                + max(Self.measuredTitleWidth(worktreeName), targetWidth)
-        }
-        if let device {
-            secondLineWidth += (secondLineWidth > 0 ? Self.deviceChipSpacing : 0) + RemoteDeviceHeaderChip.width(of: device)
-        }
-        let titleWidth = max(Self.measuredTitleWidth(repositoryTitle), secondLineWidth)
+        let secondLineWidth = device.map(RemoteDeviceHeaderChip.width(of:)) ?? 0
+        let titleWidth = max(Self.measuredTitleWidth(projectTitle), secondLineWidth)
         let accentWidth = showsProjectAccent ? Self.accentDiameter + Self.titleSpacing : 0
         let paddedWidth = titleWidth + accentWidth + Self.horizontalPadding * 2
         return max(0, min(maximumWidth, paddedWidth))
@@ -9971,17 +9780,11 @@ struct TerminalSplitSceneView: View {
 
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    let usesWorktreeSurfaceTransition: Bool
     @State private var dividerDragState: DividerDragState?
 
-    init(
-        workspace: TerminalWorkspace,
-        chromeState: ProjectWindowChromeState,
-        usesWorktreeSurfaceTransition: Bool = false
-    ) {
+    init(workspace: TerminalWorkspace, chromeState: ProjectWindowChromeState) {
         self.workspace = workspace
         self.chromeState = chromeState
-        self.usesWorktreeSurfaceTransition = usesWorktreeSurfaceTransition
     }
 
     var body: some View {
@@ -9997,18 +9800,14 @@ struct TerminalSplitSceneView: View {
             )
 
             HStack(spacing: 0) {
-                // A pane is a visual slot. Keying this row by session UUID
-                // destroys its NSViewRepresentable whenever a worktree changes,
-                // so the outgoing Ghostty surface disappears before the shared
-                // container can snapshot and fade it. Keep slot identity stable;
-                // `updateNSView` will hand the replacement session to the same
-                // container and perform the guarded surface transition.
+                // A pane is a visual slot: keyed by its place, not its session,
+                // so `updateNSView` hands a replacement session to the same
+                // container instead of destroying its NSViewRepresentable.
                 ForEach(Array(panes.enumerated()), id: \.offset) { index, session in
                     TerminalSceneView(
                         session: session,
                         chromeState: chromeState,
                         isActivePane: workspace.selectedSessionID == session.id,
-                        usesWorktreeSurfaceTransition: usesWorktreeSurfaceTransition,
                         onActivate: activate,
                         // Matches the sidebar: a workspace's last tab stays open.
                         closeHostedSession: workspace.sessions.count > 1 ? { workspace.close($0) } : nil
@@ -10348,7 +10147,6 @@ private struct TerminalSceneView: View {
     @ObservedObject var session: TerminalSession
     @ObservedObject var chromeState: ProjectWindowChromeState
     let isActivePane: Bool
-    let usesWorktreeSurfaceTransition: Bool
     let onActivate: (UUID) -> Void
     let closeHostedSession: ((TerminalSession) -> Void)?
     @StateObject private var searchState = TerminalSearchState()
@@ -10462,7 +10260,6 @@ private struct TerminalSceneView: View {
             session: session,
             chromeState: chromeState,
             isActivePane: isActivePane,
-            usesWorktreeSurfaceTransition: usesWorktreeSurfaceTransition,
             onActivate: onActivate
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)

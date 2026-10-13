@@ -262,21 +262,6 @@ enum OmniBarGathering {
             }
         }
         sources.backgroundSessions = background(backgroundSessions)
-
-        let repository = window.repository
-        sources.repositoryName = repository.repositoryName
-        if repository.supportsWorktrees {
-            sources.worktrees = repository.worktrees.map { worktree in
-                OmniWorktree(
-                    root: worktree.root,
-                    name: worktree.displayName,
-                    branch: worktree.branch,
-                    isActive: worktree.root == repository.activeWorktreeRoot,
-                    canRename: repository.canRename(worktree),
-                    canRemove: repository.canRemove(worktree)
-                )
-            }
-        }
         sources.window = context(for: window, settings: settings)
 
         sources.listedLocalProjects = Set(settings.projects.map(\.root).filter { !ProjectLocation.isRemoteKey($0) })
@@ -287,12 +272,8 @@ enum OmniBarGathering {
             if let home = entry.device.homeDirectory?.nilIfEmpty { sources.homes[machine] = home }
             sources.removedProjects[machine] = Set(entry.device.hiddenProjects)
         }
-        let worktreeRoots = Set(registry.allRepositories.filter(\.supportsWorktrees).map(\.repositoryRoot))
         let installed = editorDiscovery.installedEditors
         for location in projects.locations {
-            if worktreeRoots.contains(registry.canonicalProjectRoot(for: location.key)) {
-                sources.worktreeProjectKeys.insert(location.key)
-            }
             let editors = ExternalEditorLauncher.editors(installed, forProjectRoot: location.key)
             if let editor = ExternalEditorDiscovery.resolveDefault(editors: editors, preferredID: terminalSettings.defaultEditorID) {
                 sources.editorsByProjectKey[location.key] = OmniEditor(id: editor.id, name: editor.displayName, appPath: editor.appURL.path)
@@ -415,7 +396,6 @@ enum OmniBarGathering {
         context.canDetach = chromeState.isShowingTerminalContent && selected.map(SessionCloseCoordinator.canDetach) == true
         context.canReopenClosedTab = !chromeState.closedTabs.entries.isEmpty
         context.hasProject = settings.resolvedProject(for: window.projectRoot).validProjectRoot != nil
-        context.supportsWorktrees = window.repository.supportsWorktrees
         context.isSidebarHidden = chromeState.isSidebarHidden
         context.detachTitle = inSplit ? "Detach Pane" : "Detach Tab"
         context.closeTitle = chromeState.selectedNoteID != nil ? "Close Note" : (inSplit ? "Close Pane" : "Close Tab")
@@ -452,9 +432,8 @@ struct OmniBarPerformer {
     // swiftlint:disable:next cyclomatic_complexity function_body_length
     func perform(_ command: OmniCommand) {
         switch command {
-        case .drill, .removeWorktree, .configureAgentPreset, .browseFolders, .enterFolder:
-            // The bar itself: a scope, folder completion, or its own alert
-            // and sheet.
+        case .drill, .configureAgentPreset, .browseFolders, .enterFolder:
+            // The bar itself: a scope, folder completion, or its own sheet.
             break
         case .connectDevice(let id):
             switcher.perform(.reconnectDevice(id))
@@ -479,13 +458,6 @@ struct OmniBarPerformer {
         case .copyPath(let path):
             pasteboard.clearContents()
             pasteboard.setString(path, forType: .string)
-        case .newWorktreeInProject(let key):
-            let root = registry.canonicalProjectRoot(for: key)
-            if root == repository.repositoryRoot {
-                chromeState.presentNewWorktree()
-            } else if registry.focus(projectRoot: key), let other = registry.chromeState(for: key) {
-                other.presentNewWorktree()
-            }
         case .removeProject(let key):
             guard let project = settings.projects.first(where: { $0.root == key }) else { return }
             settings.removeProject(project)
@@ -510,15 +482,13 @@ struct OmniBarPerformer {
             guard let tab = tab(id) else { return }
             let context = closeContext(tab.workspace, projectRoot: tab.projectRoot)
             SessionCloseCoordinator.detach(
-                tab.session, in: tab.workspace, chromeState: context.chromeState,
-                allowEmptyWorkspace: context.allowEmptyWorkspace, closingWindow: context.closingWindow
+                tab.session, in: tab.workspace, chromeState: context.chromeState, closingWindow: context.closingWindow
             )
         case .closeTab(let id):
             guard let tab = tab(id) else { return }
             let context = closeContext(tab.workspace, projectRoot: tab.projectRoot)
             SessionCloseCoordinator.close(
-                tab.session, in: tab.workspace, chromeState: context.chromeState,
-                allowEmptyWorkspace: context.allowEmptyWorkspace, closingWindow: context.closingWindow
+                tab.session, in: tab.workspace, chromeState: context.chromeState, closingWindow: context.closingWindow
             )
         case .openBackgroundSession(let id):
             let model = backgroundSessions.model(listing: id) ?? backgroundSessions
@@ -526,13 +496,6 @@ struct OmniBarPerformer {
             model.open(item)
         case .endBackgroundSession(let id):
             (backgroundSessions.model(listing: id) ?? backgroundSessions).end(sessionID: id)
-        case .activateWorktree(let root):
-            _ = repository.activate(worktreeRoot: root, chromeState: chromeState)
-        case .createWorktree(let name):
-            chromeState.presentNewWorktree(branchName: name)
-        case .renameWorktree(let root):
-            guard let worktree = repository.worktrees.first(where: { $0.root == root }) else { return }
-            chromeState.presentRenameWorktree(worktree)
         case .menu(let command):
             perform(command)
         case .launchAgent(let id):
@@ -584,10 +547,6 @@ struct OmniBarPerformer {
             chromeState.toggleSidebar()
         case .addProject:
             switcher.chooseProjectRoot()
-        case .newWorktree:
-            chromeState.presentNewWorktree()
-        case .manageWorktrees:
-            chromeState.presentWorktreeManager()
         case .toggleAppearance:
             toggleAppearance()
         }
@@ -700,20 +659,13 @@ struct OmniBarPerformer {
     }
 
     /// As ⌘W and ⌘D work out for the selected tab: the tab's window's
-    /// chrome, whether its workspace may empty, and the window that closes
-    /// after its last tab.
+    /// chrome, and the window that closes after its last tab.
     private func closeContext(
         _ workspace: TerminalWorkspace,
         projectRoot: String
-    ) -> (chromeState: ProjectWindowChromeState?, allowEmptyWorkspace: Bool, closingWindow: NSWindow?) {
+    ) -> (chromeState: ProjectWindowChromeState?, closingWindow: NSWindow?) {
         let chromeState = registry.chromeState(for: projectRoot)
-        let repository = chromeState.flatMap { registry.repository(for: $0) }
         let window = chromeState.flatMap { registry.window(for: $0) }
-        let closesWindow = SessionCloseCoordinator.shouldCloseWindow(for: workspace, repository: repository)
-        return (
-            chromeState,
-            SessionCloseCoordinator.hasOpenSessionsInOtherWorktrees(than: workspace, repository: repository),
-            closesWindow ? window : nil
-        )
+        return (chromeState, SessionCloseCoordinator.shouldCloseWindow(for: workspace) ? window : nil)
     }
 }

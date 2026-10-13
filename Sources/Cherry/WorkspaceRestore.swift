@@ -16,7 +16,7 @@ extension WorkspaceSessionRestorers {
     ///   host no longer lists that session, a session of This Mac that this
     ///   app created and tagged with the record's tab id (`cherry.tab`) is
     ///   taken instead (a restart or Create whose binding was never saved).
-    ///   The worktree's records without a binding may be matched by that tag
+    ///   The window's records without a binding may be matched by that tag
     ///   too (`WorkspaceRestoreRequest.unboundRecords`).
     /// - A session of This Mac that this app created, for a tab that owned it
     ///   (`restoresOwning`), comes back as that persistent tab
@@ -59,7 +59,7 @@ extension WorkspaceSessionRestorers {
     /// slow or unreachable host never holds up the other tabs.
     ///
     /// A session is owned by at most one tab: a record that would own a
-    /// session another open tab (any window or worktree) owns, or that a
+    /// session another open tab (any window) owns, or that a
     /// record before it in this restore took, is dropped, as is a record
     /// whose tab id is open already. A record that was only attached comes
     /// back attached, even when another tab shows the session.
@@ -121,7 +121,7 @@ private final class ControlPlaneRestore {
         request.cancellation.onCancel { [weak self] in self?.discardUndelivered() }
     }
 
-    /// The window closed, the app quit or the worktree was removed.
+    /// The window closed or the app quit.
     private var isStopped: Bool {
         request.cancellation.isCancelled || request.workspace.isTornDown
     }
@@ -428,7 +428,7 @@ private final class ControlPlaneRestore {
                 return result
             }
         }
-        // The window closed (or the worktree went) while the host answered.
+        // The window closed while the host answered.
         guard !isStopped else { return .keeping(records + unboundMayComeBack) }
         var result = WorkspaceRestoreResult()
         var missing: [WorkspaceSessionRecord] = []
@@ -573,7 +573,7 @@ private final class ControlPlaneRestore {
     }
 
     /// Whether this app is ending the session (Background Sessions → End,
-    /// a close that ended it, a removed worktree's tabs): a tab restored for
+    /// a close that ended it, a window close that ended sessions): a tab restored for
     /// it would outlive it, so it counts as gone.
     private func isBeingEnded(_ info: HostedSessionInfo, hostID: String) -> Bool {
         localSessions.isEnding(info.id) || localSessions.isScheduledToEnd(info, hostID: hostID)

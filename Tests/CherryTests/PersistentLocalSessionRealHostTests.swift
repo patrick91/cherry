@@ -972,7 +972,7 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         let first = makeRepository()
         first.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await first.waitForPendingRestores()
-        let workspace = first.activeWorkspace
+        let workspace = first.workspace
         let terminal = try #require(workspace.sessions.first)
         #expect(terminal.isPersistentLocalSession)
         host.show(terminal)
@@ -997,7 +997,7 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         #expect(workspace.sessions.isEmpty)
         #expect(try await host.hostSession(terminalSession)?.isRunning == true)
         #expect(try await host.hostSession(commandSession)?.isRunning == true)
-        let saved = try #require(store.load(repositoryRoot: first.repositoryRoot)?.worktree(root: first.initialWorktreeRoot))
+        let saved = try #require(store.load(repositoryRoot: first.repositoryRoot)?.worktree(root: first.workspaceRoot))
         #expect(saved.sessions.map(\.id) == [terminal.id, command.id])
 
         // Relaunch: a new window from the same saved state brings both tabs
@@ -1005,7 +1005,7 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         let second = makeRepository()
         second.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await second.waitForPendingRestores()
-        let restored = second.activeWorkspace
+        let restored = second.workspace
         #expect(restored.sessions.map(\.id) == [terminal.id, command.id])
         #expect(restored.sessions.map(\.kind) == [.terminal, .command])
         let restoredTerminal = try #require(restored.session(withID: terminal.id))
@@ -1081,7 +1081,7 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         let first = makeRepository()
         first.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await first.waitForPendingRestores()
-        let workspace = first.activeWorkspace
+        let workspace = first.workspace
         let terminal = try #require(workspace.sessions.first)
         let ended = workspace.addSession(title: "Ended")
         try await host.waitFor("both sessions") { terminal.persistentSession != nil && ended.persistentSession != nil }
@@ -1117,10 +1117,10 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         ))
         second.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
         await second.waitForPendingRestores()
-        let restored = second.activeWorkspace
+        let restored = second.workspace
         #expect(restored.sessions.map(\.id) == [terminal.id])
         #expect(restored.session(withID: ended.id) == nil)
-        #expect(store.wasEndedOnPurpose(try #require(savedState.worktree(root: first.initialWorktreeRoot)?.sessions.first { $0.id == ended.id })))
+        #expect(store.wasEndedOnPurpose(try #require(savedState.worktree(root: first.workspaceRoot)?.sessions.first { $0.id == ended.id })))
         let back = try #require(restored.session(withID: terminal.id))
         #expect(back.systemSessionEnd == .logout)
         #expect(back.persistentSessionEndedMessage == "Ended when you logged out")

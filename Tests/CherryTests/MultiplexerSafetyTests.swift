@@ -7,7 +7,8 @@ import Testing
 // The safety rules of hosted-by-default tabs (docs/specs/multiplexer-default.md):
 // one copy of the app owns this Mac's sessions and saved tabs, a state file
 // this version cannot use is never written over, the sessions of saved tabs
-// a worktree removal forgets are ended, sessions no saved tab names are
+// no open tab shows end with a window close that ends sessions, sessions no
+// saved tab names are
 // adopted, a closed window's restore leaves no stale owners, and ending a
 // session survives a host that does not answer. Against the fake `cherry
 // control` (FakeControlHelper); nothing reaches a real cherry-host or the
@@ -30,19 +31,6 @@ private final class LockedValue<Value>: @unchecked Sendable {
     var value: Value {
         get { lock.withLock { stored } }
         set { lock.withLock { stored = newValue } }
-    }
-}
-
-private func git(_ arguments: [String]) throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    process.arguments = ["git"] + arguments
-    process.standardOutput = FileHandle.nullDevice
-    process.standardError = FileHandle.nullDevice
-    try process.run()
-    process.waitUntilExit()
-    guard process.terminationStatus == 0 else {
-        throw CocoaError(.executableLoad, userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed"])
     }
 }
 
@@ -102,7 +90,6 @@ private func restore(
 ) async -> WorkspaceRestoreResult {
     await harness.restorer(WorkspaceRestoreRequest(
         repositoryRoot: harness.project.path,
-        worktreeRoot: harness.project.path,
         records: records,
         workspace: workspace,
         unboundRecords: unbound
@@ -211,7 +198,7 @@ private func restore(
         backendPolicy: SessionBackendPolicy(settings: { .defaults }, localSessions: hosting)
     )
     let result = await WorkspaceSessionRestorers.hostedByDefault(localSessions: hosting)(WorkspaceRestoreRequest(
-        repositoryRoot: "/repo", worktreeRoot: "/repo",
+        repositoryRoot: "/repo",
         records: saved.worktrees[0].sessions, workspace: workspace
     ))
     #expect(result.sessions.isEmpty)
@@ -327,7 +314,7 @@ private func restore(
         request.op == "list" && !held.isHeld ? held.hold(request, on: connection) : nil
     }
     let closing = harness.workspace()
-    var request = WorkspaceRestoreRequest(repositoryRoot: root, worktreeRoot: root, records: [editor, server], workspace: closing)
+    var request = WorkspaceRestoreRequest(repositoryRoot: root, records: [editor, server], workspace: closing)
     let cancellation = WorkspaceRestoreCancellation()
     request.cancellation = cancellation
     let restorer = harness.restorer
@@ -362,7 +349,7 @@ private func restore(
         hosted: HostedSessionBindingRecord(host: "ssh:devbox", hostID: "host-a", sessionID: "r-1", owned: false)
     )
     let closingAgain = harness.workspace()
-    var slowRequest = WorkspaceRestoreRequest(repositoryRoot: root, worktreeRoot: root, records: [editor, remote], workspace: closingAgain)
+    var slowRequest = WorkspaceRestoreRequest(repositoryRoot: root, records: [editor, remote], workspace: closingAgain)
     let slowCancellation = WorkspaceRestoreCancellation()
     slowRequest.cancellation = slowCancellation
     let slowRestorer = WorkspaceSessionRestorers.hostedByDefault(
@@ -429,142 +416,85 @@ private func restore(
     #expect(!harness.requestIDs("remove").contains(goneID))
 }
 
-// MARK: - Worktrees
+// MARK: - Saved tabs a window close ends
 
-@MainActor
-private final class WorktreeFixture {
-    let harness: PersistentHarness
-    let container: URL
-    let root: URL
-    let feature: URL
-    let other: URL
-    let store: WorkspaceStateStore
-    private let previousWorktreeSpaces: Bool
-
-    init() throws {
-        harness = try PersistentHarness()
-        container = try temporaryDirectory("cherry-forgotten")
-        root = container.appendingPathComponent("repo", isDirectory: true)
-        feature = container.appendingPathComponent("feature", isDirectory: true)
-        other = container.appendingPathComponent("other", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        try git(["-C", root.path, "init", "-b", "main"])
-        try git(["-C", root.path, "-c", "user.name=Cherry Tests", "-c", "user.email=cherry@example.invalid",
-                 "commit", "--allow-empty", "-m", "Initial"])
-        try git(["-C", root.path, "worktree", "add", "-b", "feature", feature.path])
-        try git(["-C", root.path, "worktree", "add", "-b", "other", other.path])
-        store = WorkspaceStateStore(directory: container.appendingPathComponent("store", isDirectory: true))
-        previousWorktreeSpaces = TerminalSettings.shared.worktreeSpacesEnabled
-        TerminalSettings.shared.worktreeSpacesEnabled = true
-    }
-
-    var repositoryKey: String {
-        URL(fileURLWithPath: root.path, isDirectory: true).standardizedFileURL.path
-    }
-
-    func cleanUp() {
-        TerminalSettings.shared.worktreeSpacesEnabled = previousWorktreeSpaces
+@Test @MainActor func closingAWindowEndingSessionsEndsTheSessionsOfItsSavedTabsThatAreNotTabs() async throws {
+    let harness = try PersistentHarness()
+    let container = try temporaryDirectory("cherry-forgotten")
+    let root = container.appendingPathComponent("repo", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let store = WorkspaceStateStore(directory: container.appendingPathComponent("store", isDirectory: true))
+    defer {
         harness.cleanUp()
         try? FileManager.default.removeItem(at: container)
     }
-}
-
-@Test @MainActor func removingAWorktreeEndsTheSessionsOfItsSavedTabsThatAreNotTabs() async throws {
-    let fixture = try WorktreeFixture()
-    let harness = fixture.harness
-    defer { fixture.cleanUp() }
     let launch = UUID().uuidString.lowercased()
-    let kept = record(title: "Web", sessionID: "s-web", root: fixture.feature.path)
-    let creating = record(title: "Fresh", sessionID: nil, launchRequestID: launch, root: fixture.feature.path)
-    let viewer = record(title: "Viewer", sessionID: "s-viewer", owned: false, root: fixture.feature.path)
-    let vanishing = record(title: "Other", sessionID: "s-other", root: fixture.other.path)
-    let main = record(title: "Main", sessionID: nil, root: fixture.root.path)
-    fixture.store.saveSynchronously(RepositoryStateRecord(
-        repositoryRoot: fixture.repositoryKey,
-        activeWorktreeRoot: fixture.root.path,
-        worktrees: [
-            WorktreeStateRecord(root: fixture.root.path, sessions: [main]),
-            WorktreeStateRecord(root: fixture.feature.path, sessions: [kept, creating, viewer]),
-            WorktreeStateRecord(root: fixture.other.path, sessions: [vanishing])
-        ]
+    let kept = record(title: "Web", sessionID: "s-web", root: root.path)
+    let creating = record(title: "Fresh", sessionID: nil, launchRequestID: launch, root: root.path)
+    let viewer = record(title: "Viewer", sessionID: "s-viewer", owned: false, root: root.path)
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: URL(fileURLWithPath: root.path, isDirectory: true).standardizedFileURL.path,
+        activeWorktreeRoot: root.path,
+        worktrees: [WorktreeStateRecord(root: root.path, sessions: [kept, creating, viewer])]
     ))
     // The local host is down while the window opens: every saved tab is
     // kept for when it comes back.
     harness.fake.launchFailure = "cherry-host is restarting"
     let repository = RepositoryWorkspace(
-        projectRoot: fixture.root.path,
+        projectRoot: root.path,
         backendPolicy: harness.policy,
-        stateStore: fixture.store,
+        stateStore: store,
         sessionRestorer: harness.restorer,
         autoStartCommands: { _ in [] },
         restoredTabLaunchQueue: RestoredTabLaunchQueue()
     )
     defer { repository.closeAllSessions(intent: .windowClosed) }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
-    await repository.refresh()
     await repository.waitForPendingRestores()
-    let featureWorktree = try #require(repository.worktrees.first { $0.root == fixture.feature.path })
-    #expect(repository.workspaceIfLoaded(for: fixture.feature.path)?.sessions.isEmpty == true)
 
-    // Its kept tabs that own sessions of This Mac count as running, so the
-    // removal asks first (the viewer only watched another's session).
-    #expect(await repository.removalBlockers(for: featureWorktree).runningProcessCount == 2)
-    await #expect(throws: GitWorktreeCommandError.self) {
-        try await repository.remove(featureWorktree, chromeState: nil)
-    }
-    try await repository.remove(featureWorktree, force: true, chromeState: nil)
-
-    // The other worktree disappears outside Cherry: its saved tab goes the
-    // same way at the next discovery.
-    try git(["-C", fixture.root.path, "worktree", "remove", "--force", fixture.other.path])
-    await repository.refresh()
+    // Those that own sessions of This Mac end with the window (the viewer
+    // only watched another's session).
+    #expect(repository.teardownSummary(.windowClose, pathDisplayMode: .repoFocused).savedSessionsNotOpen == 2)
+    repository.flushPersistentState()
+    repository.closeAllSessions(intent: .windowClosedEndingSessions)
 
     // They are recorded, so a run that quits before it can end them leaves
     // them to the next launch.
-    fixture.store.flush()
-    #expect(Set(fixture.store.loadSessionsToEnd().map(\.id)) == [kept.id, creating.id, vanishing.id])
+    store.flush()
+    #expect(Set(store.loadSessionsToEnd().map(\.id)) == [kept.id, creating.id])
 
-    // Once the host is back, their sessions are ended: the bound one, the
-    // one its saved Create started, and the other worktree's; never the
-    // session the viewer watched (this app's, tagged with the viewer's own
-    // id: only its record says it did not own it), nor anything their tabs
-    // did not own.
+    // Once the host is back, their sessions are ended: the bound one and
+    // the one its saved Create started; never the session the viewer
+    // watched (this app's, tagged with the viewer's own id: only its record
+    // says it did not own it), nor anything their tabs did not own.
     harness.fake.launchFailure = nil
     harness.fake.pendingHolders = 0
     harness.fake.sessions = [
-        HostedSessionInfo(id: "s-web", name: "Web", cwd: fixture.feature.path, pid: 11, owner: "CherryTests",
+        HostedSessionInfo(id: "s-web", name: "Web", cwd: root.path, pid: 11, owner: "CherryTests",
                           tags: [PersistentSessionTag.tab: kept.id.uuidString]),
-        HostedSessionInfo(id: "s-launched", name: "Fresh", cwd: fixture.feature.path, pid: 12, owner: "CherryTests",
+        HostedSessionInfo(id: "s-launched", name: "Fresh", cwd: root.path, pid: 12, owner: "CherryTests",
                           tags: [PersistentSessionTag.tab: creating.id.uuidString], requestID: launch),
-        HostedSessionInfo(id: "s-viewer", name: "Viewer", cwd: fixture.feature.path, pid: 13, owner: "CherryTests",
+        HostedSessionInfo(id: "s-viewer", name: "Viewer", cwd: root.path, pid: 13, owner: "CherryTests",
                           tags: [PersistentSessionTag.tab: viewer.id.uuidString]),
-        HostedSessionInfo(id: "s-other", name: "Other", cwd: fixture.other.path, pid: 14, owner: "CherryTests",
-                          tags: [PersistentSessionTag.tab: vanishing.id.uuidString]),
         HostedSessionInfo(id: "s-unrelated", name: "Unrelated", cwd: "/tmp", pid: 15, owner: "CherryTests")
     ]
     _ = try await harness.control.connect()
     #expect(await harness.fake.wait(timeout: 10) {
-        Set(harness.requestIDs("remove")).isSuperset(of: ["s-web", "s-launched", "s-other"])
+        Set(harness.requestIDs("remove")).isSuperset(of: ["s-web", "s-launched"])
     })
-    #expect(Set(harness.requestIDs("kill")) == ["s-web", "s-launched", "s-other"])
+    #expect(Set(harness.requestIDs("kill")) == ["s-web", "s-launched"])
     // None of them is left: nothing is recorded any more.
     #expect(await harness.fake.wait {
-        fixture.store.flush()
-        return fixture.store.loadSessionsToEnd().isEmpty
+        store.flush()
+        return store.loadSessionsToEnd().isEmpty
     })
-    #expect(!FileManager.default.fileExists(atPath: fixture.store.sessionsToEndFileURL.path))
+    #expect(!FileManager.default.fileExists(atPath: store.sessionsToEndFileURL.path))
     #expect(!harness.requestIDs("kill").contains("s-viewer"))
-    // Nothing of them is saved any more, and nothing restores them.
-    repository.flushPersistentState()
-    let saved = try #require(fixture.store.load(repositoryRoot: fixture.repositoryKey))
-    #expect(saved.worktree(root: fixture.feature.path) == nil)
-    #expect(saved.worktree(root: fixture.other.path) == nil)
-    #expect(repository.workspaceIfLoaded(for: fixture.feature.path) == nil)
 }
 
 // MARK: - Sessions no saved tab names
 
-@Test @MainActor func sessionsOfThisAppThatNoSavedTabNamesComeBackAsTabsOfTheirWorktree() async throws {
+@Test @MainActor func sessionsOfThisAppThatNoSavedTabNamesComeBackAsTabsOfTheirWindow() async throws {
     let harness = try PersistentHarness()
     let root = try temporaryDirectory("cherry-orphans")
     let storeDirectory = try temporaryDirectory("cherry-orphans-store")
@@ -613,7 +543,7 @@ private final class WorktreeFixture {
     )
     defer { repository.closeAllSessions(intent: .windowClosed) }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(await harness.fake.wait { workspace.sessions.count == 3 })
     await repository.waitForPendingRestores()
     try await Task.sleep(for: .milliseconds(200))
@@ -650,7 +580,7 @@ private final class WorktreeFixture {
     )
     defer { freshRepository.closeAllSessions(intent: .windowClosed) }
     freshRepository.beginRestoringSavedStateIfNeeded(chromeState: nil)
-    let freshWorkspace = freshRepository.activeWorkspace
+    let freshWorkspace = freshRepository.workspace
     #expect(await harness.fake.wait { freshWorkspace.session(withID: lost) != nil })
     // After its default shell, which it opened at once.
     #expect(freshWorkspace.sessions.map(\.id).last == lost)
@@ -703,7 +633,7 @@ private final class WorktreeFixture {
     )
     defer { repository.closeAllSessions(intent: .windowClosed) }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(await harness.fake.wait { workspace.sessions.count == 4 })
     await repository.waitForPendingRestores()
     try await Task.sleep(for: .milliseconds(200))
@@ -748,10 +678,10 @@ private final class WorktreeFixture {
     defer { repository.closeAllSessions(intent: .windowClosed) }
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
-    let shell = try #require(repository.activeWorkspace.sessions.first)
+    let shell = try #require(repository.workspace.sessions.first)
     #expect(await harness.waitUntilAttached(shell))
     // Its Create goes out on a later turn: named before then.
-    let tab = repository.activeWorkspace.addSession(title: "Fresh")
+    let tab = repository.workspace.addSession(title: "Fresh")
     heldTab.value = tab.id.uuidString
     #expect(tab.isPersistentLocalSession)
     #expect(await harness.fake.wait { held.isHeld })
@@ -761,7 +691,7 @@ private final class WorktreeFixture {
     store.flush()
     #expect(held.isHeld)
     #expect(tab.persistentSession == nil)
-    let saved = store.load(repositoryRoot: repository.repositoryRoot)?.worktree(root: repository.activeWorktreeRoot)?.sessions
+    let saved = store.load(repositoryRoot: repository.repositoryRoot)?.worktree(root: repository.workspaceRoot)?.sessions
     let fresh = try #require(saved?.first { $0.id == tab.id })
     #expect(fresh.launchRequestID == tab.persistentLaunchRequestID)
     #expect(fresh.launchRequestID != nil)
@@ -986,7 +916,7 @@ private final class WorktreeFixture {
         $0.hasPrefix(fileURL.lastPathComponent + ".v2-")
     })
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(await harness.fake.wait { Set(workspace.sessions.map(\.id)).isSuperset(of: [otherVersionsTab, launchedTab, crashed]) })
     try await Task.sleep(for: .milliseconds(200))
     #expect(workspace.session(withID: closedOnPurpose) == nil)
@@ -1082,10 +1012,16 @@ private final class WorktreeFixture {
     #expect(!harness.requestIDs("kill").contains(stuckID))
 }
 
-@Test @MainActor func closingAWindowOrRemovingAWorktreeWhileItsRestoreWaitsLeavesNoTabOwningItsSessions() async throws {
-    let fixture = try WorktreeFixture()
-    let harness = fixture.harness
-    defer { fixture.cleanUp() }
+@Test @MainActor func closingAWindowWhileItsRestoreWaitsLeavesNoTabOwningItsSessions() async throws {
+    let harness = try PersistentHarness()
+    let container = try temporaryDirectory("cherry-restore-waits")
+    let root = container.appendingPathComponent("repo", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let store = WorkspaceStateStore(directory: container.appendingPathComponent("store", isDirectory: true))
+    defer {
+        harness.cleanUp()
+        try? FileManager.default.removeItem(at: container)
+    }
     // An SSH host that answers only when the test says: a restore waits for
     // it before it hands back the local tabs it built.
     let ssh = FakeControlHelper()
@@ -1111,30 +1047,24 @@ private final class WorktreeFixture {
     }
     func makeRepository() -> RepositoryWorkspace {
         RepositoryWorkspace(
-            projectRoot: fixture.root.path,
+            projectRoot: root.path,
             backendPolicy: harness.policy,
-            stateStore: fixture.store,
+            stateStore: store,
             sessionRestorer: restorer,
             autoStartCommands: { _ in [] },
             restoredTabLaunchQueue: RestoredTabLaunchQueue()
         )
     }
-    let editor = record(title: "Editor", sessionID: "s-editor", root: fixture.root.path)
-    let web = record(title: "Web", sessionID: "s-web", root: fixture.feature.path)
-    fixture.store.saveSynchronously(RepositoryStateRecord(
-        repositoryRoot: fixture.repositoryKey,
-        activeWorktreeRoot: fixture.root.path,
-        worktrees: [
-            WorktreeStateRecord(root: fixture.root.path, sessions: [editor, remote("r-main")]),
-            WorktreeStateRecord(root: fixture.feature.path, sessions: [web, remote("r-feature")])
-        ]
+    let editor = record(title: "Editor", sessionID: "s-editor", root: root.path)
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: URL(fileURLWithPath: root.path, isDirectory: true).standardizedFileURL.path,
+        activeWorktreeRoot: root.path,
+        worktrees: [WorktreeStateRecord(root: root.path, sessions: [editor, remote("r-main")])]
     ))
     harness.fake.pendingHolders = 0
     harness.fake.sessions = [
-        HostedSessionInfo(id: "s-editor", name: "Editor", cwd: fixture.root.path, pid: 31, owner: "CherryTests",
-                          tags: [PersistentSessionTag.tab: editor.id.uuidString]),
-        HostedSessionInfo(id: "s-web", name: "Web", cwd: fixture.feature.path, pid: 32, owner: "CherryTests",
-                          tags: [PersistentSessionTag.tab: web.id.uuidString])
+        HostedSessionInfo(id: "s-editor", name: "Editor", cwd: root.path, pid: 31, owner: "CherryTests",
+                          tags: [PersistentSessionTag.tab: editor.id.uuidString])
     ]
 
     // The window closes while its restore waits for the SSH host, holding
@@ -1156,26 +1086,10 @@ private final class WorktreeFixture {
     #expect(await harness.fake.wait { harness.hosting.owningTab(of: "s-editor") != nil })
     sshHeld.answer(.sessions(HostedSessionList(hostID: "host-a", sessions: [])))
     await reopened.waitForPendingRestores()
-    let editorTab = try #require(reopened.activeWorkspace.session(withID: editor.id))
+    let editorTab = try #require(reopened.workspace.session(withID: editor.id))
     #expect(editorTab.isPersistentLocalSession)
     #expect(harness.hosting.owningTab(of: "s-editor") === editorTab)
     try await Task.sleep(for: .milliseconds(200))
     #expect(harness.hosting.owningTab(of: "s-editor") === editorTab)
     #expect(harness.fake.requests("kill").isEmpty)
-
-    // The feature worktree is removed while its restore waits for the SSH
-    // host: the tab it built is ended with the removal (its session too)
-    // at once.
-    ssh.respond = { request, connection in request.op == "list" ? sshHeld.hold(request, on: connection) : nil }
-    await reopened.refresh()
-    #expect(await harness.fake.wait { harness.hosting.owningTab(of: "s-web") != nil && sshHeld.isHeld })
-    let feature = try #require(reopened.worktrees.first { $0.root == fixture.feature.path })
-    try await reopened.remove(feature, force: true, chromeState: nil)
-    #expect(harness.hosting.owningTab(of: "s-web") == nil)
-    // Well before the SSH list could time out (5 s).
-    #expect(await harness.fake.wait(timeout: 2) { harness.requestIDs("kill").contains("s-web") })
-    sshHeld.answer(.sessions(HostedSessionList(hostID: "host-a", sessions: [])))
-    #expect(await harness.fake.wait { harness.requestIDs("remove").contains("s-web") })
-    #expect(!harness.requestIDs("kill").contains("s-editor"))
-    #expect(reopened.workspaceIfLoaded(for: fixture.feature.path) == nil)
 }

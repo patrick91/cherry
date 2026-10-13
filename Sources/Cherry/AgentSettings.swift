@@ -691,14 +691,14 @@ final class AgentSettings: ObservableObject {
     @Published private(set) var commandsByProject: [String: [ProjectCommandDefinition]] = [:]
     @Published private(set) var featureOverridesByProject: [String: ProjectFeatureOverrides] = [:]
     @Published private(set) var appearanceOverridesByProject: [String: ProjectAppearanceOverrides] = [:]
-    @Published private(set) var hiddenWorktreesByProject: [String: Set<String>] = [:]
-    @Published private(set) var lastActiveWorktreeByProject: [String: String] = [:]
     /// This Mac's folders the user removed from Projects: the Omni bar
     /// never offers them as "Not added yet" (adding one again forgets it).
     @Published private(set) var removedProjectRoots: Set<String> = []
 
     private let defaults: UserDefaults
-    private var repositoryRootByWorktreeRoot: [String: String] = [:]
+    /// A project's folder as its tabs name it (links resolved, see
+    /// `registerProjectFolder`), by the project it belongs to.
+    private var projectRootByFolder: [String: String] = [:]
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -713,8 +713,6 @@ final class AgentSettings: ObservableObject {
         commandsByProject = Self.loadCommandsByProject(from: defaults)
         featureOverridesByProject = Self.loadFeatureOverridesByProject(from: defaults)
         appearanceOverridesByProject = Self.loadAppearanceOverridesByProject(from: defaults)
-        hiddenWorktreesByProject = Self.loadHiddenWorktreesByProject(from: defaults)
-        lastActiveWorktreeByProject = Self.loadLastActiveWorktreesByProject(from: defaults)
         removedProjectRoots = Set(defaults.stringArray(forKey: Keys.removedProjectRoots) ?? [])
     }
 
@@ -760,7 +758,7 @@ final class AgentSettings: ObservableObject {
 
     func projectCommands(for requestedRoot: String?) -> [ProjectCommandDefinition] {
         guard let checkoutRoot = Self.validDirectory(requestedRoot ?? "") else { return [] }
-        let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
         var commands = CherryProjectFile.loadCommands(projectRoot: checkoutRoot)
         for localCommand in commandsByProject[settingsRoot] ?? [] {
             if let index = commands.firstIndex(where: { $0.normalizedName == localCommand.normalizedName }) {
@@ -781,7 +779,7 @@ final class AgentSettings: ObservableObject {
     /// name present in both is reported as `.local`.
     func commandStorage(named name: String, for requestedRoot: String?) -> ProjectCommandStorage {
         guard let checkoutRoot = Self.validDirectory(requestedRoot ?? "") else { return .local }
-        let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
         let normalizedName = AgentToolDefinition.normalizedName(name)
         if (commandsByProject[settingsRoot] ?? []).contains(where: { $0.normalizedName == normalizedName }) {
             return .local
@@ -797,7 +795,7 @@ final class AgentSettings: ObservableObject {
         guard let checkoutRoot = Self.validDirectory(requestedRoot ?? "") else {
             return .disabled
         }
-        let root = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        let root = projectRootByFolder[checkoutRoot] ?? checkoutRoot
 
         let shared = CherryProjectFile.loadFeatureSettings(projectRoot: root) ?? .disabled
         guard let local = featureOverridesByProject[root] else {
@@ -904,8 +902,6 @@ final class AgentSettings: ObservableObject {
         commandsByProject.removeValue(forKey: project.root)
         featureOverridesByProject.removeValue(forKey: project.root)
         appearanceOverridesByProject.removeValue(forKey: project.root)
-        hiddenWorktreesByProject.removeValue(forKey: project.root)
-        lastActiveWorktreeByProject.removeValue(forKey: project.root)
         if lastOpenedProjectRoot == project.root {
             lastOpenedProjectRoot = projects.first?.root
             saveLastOpenedProjectRoot()
@@ -914,8 +910,6 @@ final class AgentSettings: ObservableObject {
         saveCommands()
         saveFeatureOverrides()
         saveAppearanceOverrides()
-        saveHiddenWorktrees()
-        saveLastActiveWorktrees()
     }
 
     func markProjectOpened(_ projectRoot: String?) {
@@ -928,56 +922,21 @@ final class AgentSettings: ObservableObject {
         saveLastOpenedProjectRoot()
     }
 
-    func registerWorktreeRoots(_ roots: [String], repositoryRoot: String) {
-        guard let canonicalRoot = Self.validDirectory(repositoryRoot) else { return }
-        for requestedRoot in roots {
-            guard let root = Self.validDirectory(requestedRoot) else { continue }
-            repositoryRootByWorktreeRoot[root] = canonicalRoot
+    /// Gives `folder` (a project's folder as its tabs name it: its links
+    /// resolved) the settings of the project at `projectRoot`.
+    func registerProjectFolder(_ folder: String, projectRoot: String) {
+        guard let canonicalRoot = Self.validDirectory(projectRoot) else { return }
+        if let root = Self.validDirectory(folder) {
+            projectRootByFolder[root] = canonicalRoot
         }
-        repositoryRootByWorktreeRoot[canonicalRoot] = canonicalRoot
+        projectRootByFolder[canonicalRoot] = canonicalRoot
     }
 
+    /// The project whose settings `requestedRoot` uses: the project it is
+    /// the folder of (`registerProjectFolder`), else itself.
     func repositoryRoot(for requestedRoot: String?) -> String? {
         guard let root = Self.validDirectory(requestedRoot ?? "") else { return nil }
-        return repositoryRootByWorktreeRoot[root] ?? root
-    }
-
-    func hiddenWorktreeRoots(for repositoryRoot: String) -> Set<String> {
-        guard let root = Self.validDirectory(repositoryRoot) else { return [] }
-        return hiddenWorktreesByProject[root] ?? []
-    }
-
-    func setHiddenWorktreeRoots(_ roots: Set<String>, for repositoryRoot: String) {
-        guard let root = Self.validDirectory(repositoryRoot) else { return }
-        let normalized = Set(roots.compactMap(Self.validDirectory))
-        if normalized.isEmpty {
-            hiddenWorktreesByProject.removeValue(forKey: root)
-        } else {
-            hiddenWorktreesByProject[root] = normalized
-        }
-        saveHiddenWorktrees()
-    }
-
-    func lastActiveWorktreeRoot(for repositoryRoot: String) -> String? {
-        guard let root = Self.validDirectory(repositoryRoot),
-              let worktreeRoot = lastActiveWorktreeByProject[root]
-        else {
-            return nil
-        }
-        return Self.validDirectory(worktreeRoot)
-    }
-
-    func markWorktreeOpened(_ worktreeRoot: String, repositoryRoot: String) {
-        guard let root = Self.validDirectory(repositoryRoot),
-              let worktree = Self.validDirectory(worktreeRoot)
-        else {
-            return
-        }
-        if lastActiveWorktreeByProject[root] != worktree {
-            lastActiveWorktreeByProject[root] = worktree
-            saveLastActiveWorktrees()
-        }
-        markProjectOpened(root)
+        return projectRootByFolder[root] ?? root
     }
 
     func upsertAgent(_ agent: AgentToolDefinition, replacing originalName: String? = nil) throws {
@@ -1004,7 +963,7 @@ final class AgentSettings: ObservableObject {
         storage: ProjectCommandStorage = .local
     ) throws {
         guard let checkoutRoot = Self.validDirectory(requestedRoot) else { return }
-        let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
         let validatedCommand = try ProjectCommandConfiguration.validated([
             command.withPortableWorkingDirectory(projectRoot: ProjectLocation.launchPath(forKey: checkoutRoot))
         ]).first!
@@ -1037,7 +996,7 @@ final class AgentSettings: ObservableObject {
 
     func removeCommand(named name: String, for requestedRoot: String) {
         guard let checkoutRoot = Self.validDirectory(requestedRoot) else { return }
-        let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
         let normalizedName = AgentToolDefinition.normalizedName(name)
         let nextCommands = (commandsByProject[settingsRoot] ?? []).filter { $0.normalizedName != normalizedName }
         try? setCommands(nextCommands, for: settingsRoot)
@@ -1108,17 +1067,6 @@ final class AgentSettings: ObservableObject {
 
     private func saveAppearanceOverrides() {
         Self.saveAppearanceOverridesByProject(appearanceOverridesByProject, to: defaults)
-    }
-
-    private func saveHiddenWorktrees() {
-        let encoded = hiddenWorktreesByProject.mapValues { Array($0).sorted() }
-        guard let data = try? JSONEncoder().encode(encoded) else { return }
-        defaults.set(data, forKey: Keys.hiddenWorktreesByProject)
-    }
-
-    private func saveLastActiveWorktrees() {
-        guard let data = try? JSONEncoder().encode(lastActiveWorktreeByProject) else { return }
-        defaults.set(data, forKey: Keys.lastActiveWorktreeByProject)
     }
 
     private static func loadProjects(from defaults: UserDefaults) -> [CherryProject] {
@@ -1196,43 +1144,6 @@ final class AgentSettings: ObservableObject {
             overridesByProject[validRoot] = overrides
         }
         return overridesByProject
-    }
-
-    private static func loadHiddenWorktreesByProject(from defaults: UserDefaults) -> [String: Set<String>] {
-        guard let data = defaults.data(forKey: Keys.hiddenWorktreesByProject),
-              let decoded = try? JSONDecoder().decode([String: [String]].self, from: data)
-        else {
-            return [:]
-        }
-
-        var result: [String: Set<String>] = [:]
-        for (repositoryRoot, worktreeRoots) in decoded {
-            guard let root = validDirectory(repositoryRoot) else { continue }
-            let normalized = Set(worktreeRoots.compactMap(validDirectory))
-            if !normalized.isEmpty {
-                result[root] = normalized
-            }
-        }
-        return result
-    }
-
-    private static func loadLastActiveWorktreesByProject(from defaults: UserDefaults) -> [String: String] {
-        guard let data = defaults.data(forKey: Keys.lastActiveWorktreeByProject),
-              let decoded = try? JSONDecoder().decode([String: String].self, from: data)
-        else {
-            return [:]
-        }
-
-        var result: [String: String] = [:]
-        for (repositoryRoot, worktreeRoot) in decoded {
-            guard let root = validDirectory(repositoryRoot),
-                  let worktree = validDirectory(worktreeRoot)
-            else {
-                continue
-            }
-            result[root] = worktree
-        }
-        return result
     }
 
     private static func migratedProjectAgents(from defaults: UserDefaults) -> [AgentToolDefinition] {
@@ -1350,8 +1261,6 @@ final class AgentSettings: ObservableObject {
         static let commandsByProject = "commands.byProject"
         static let featureOverridesByProject = "features.byProject"
         static let appearanceOverridesByProject = "appearance.byProject"
-        static let hiddenWorktreesByProject = "worktrees.hiddenByProject"
-        static let lastActiveWorktreeByProject = "worktrees.lastActiveByProject"
         static let legacyLocalAgentsByProject = "agents.localByProject"
     }
 }

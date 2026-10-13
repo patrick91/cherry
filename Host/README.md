@@ -698,7 +698,8 @@ folder has none, and has no `text` (but an `error`) when it is larger than
 256 KiB or not UTF-8. It runs only the `git` that `CHERRY_GIT` names
 (Cherry's script picks one that will not ask to install the command line
 tools); without it no git runs (`git_error` is `git not found`), never one
-from `PATH`. Git runs only for `rev-parse` and `worktree list`; it reads
+from `PATH`. Git runs only for `rev-parse` and `worktree list`. The Cherry
+app no longer reads git there and runs it without `CHERRY_GIT`. It reads
 at most 64 paths, never starts or talks to a daemon and changes nothing. It
 ships with the cherry-host Cherry installs, so its answer's format follows
 the app; an older cherry-host without it makes the app say to update it.
@@ -781,8 +782,7 @@ the screen before its tabs are torn down. A log out, restart or
 shut down does not ask about sessions and ends none itself (the system then
 ends them with the user's processes), but warns about programs still running
 in them, as it does for native tabs, so the log out can be cancelled, and an update (the app on disk has
-another build number than at launch) keeps them without asking. Removing a
-worktree ends its sessions. Closing a tab whose program is at work (an
+another build number than at launch) keeps them without asking. Closing a tab whose program is at work (an
 agent, a command, or a terminal running a job) asks **Close “<name>”?**
 first: **Close** stops it, **Detach Instead** keeps it running in the
 background, **Cancel** keeps the tab. Detaching asks nothing, nor does
@@ -802,7 +802,7 @@ a terminal whose shell exited with status 0 is removed instead, as its tab
 would have closed, while **Close a tab when its shell exits** is on.
 Clicking one opens (or focuses) its project's window, whose restore brings it
 back with its sibling tabs, and shows its tab; a session no saved tab names
-becomes a tab of its worktree with its kind and name. **End** (twice, for a
+becomes a tab of that window with its kind and name. **End** (twice, for a
 running session) kills it, waits for its exit and removes it; an ended one is
 only removed. **Cherry → End Background Sessions…** and **End All…** (in that
 list and in **Settings › Sessions › Background Sessions**) end them all after
@@ -2111,8 +2111,8 @@ With a file named `masters` in its directory, the shim also runs stand-in
 SSH masters (`-M`, `-O check`, `-O exit`), and a command given the
 `ControlPath` of one is one of its sessions, at most the number in
 `max-sessions` (default 10) at once, as sshd's `MaxSessions`: one more fails
-with "Session open refused by peer". The device tests of phase 3 run git
-worktrees, `cherry-host project-info`, cherry.toml commands (auto-start,
+with "Session open refused by peer". The device tests of phase 3 run
+`cherry-host project-info`, cherry.toml commands (auto-start,
 restart on exit), the installed terminfo and zsh integration (OSC 7 reaching
 the tab), `scp -O` of dropped files and SSH master shards through it.
 Every fake Mac has an `osascript` stand-in first on its `PATH` (never the

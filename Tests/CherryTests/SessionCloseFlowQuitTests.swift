@@ -724,7 +724,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     let window = ClosingWindow()
     let delegate = closeDelegate(for: window, workspace: workspace)
     workspace.closeTabAfterCleanExit = { workspace, session in
-        SessionCloseCoordinator.closeTabAfterCleanExit(session, in: workspace, repository: nil, window: window)
+        SessionCloseCoordinator.closeTabAfterCleanExit(session, in: workspace, window: window)
     }
     let tab = workspace.addSession(title: "Only")
     #expect(await harness.waitUntilAttached(tab))
@@ -754,7 +754,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     let chromeState = ProjectWindowChromeState()
     let window = ClosingWindow()
     let delegate = ProjectWindowCloseDelegate(window: window)
-    delegate.workspace = repository.activeWorkspace
+    delegate.workspace = repository.workspace
     delegate.repository = repository
     window.delegate = delegate
     defer {
@@ -767,11 +767,11 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     // As the app's window binder does: the window claims the project, and
     // the repository learns its chrome state.
     #expect(registry.register(
-        window: window, projectRoot: root.path, workspace: repository.activeWorkspace, repository: repository,
+        window: window, projectRoot: root.path, workspace: repository.workspace, repository: repository,
         noteStore: nil, todoStore: nil, chromeState: chromeState
     ))
     repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     let shell = try #require(workspace.sessions.first)
     #expect(await harness.waitUntilAttached(shell))
     let sessionID = try #require(shell.persistentSession?.sessionID)
@@ -912,8 +912,8 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
         try? FileManager.default.removeItem(at: rootA)
         try? FileManager.default.removeItem(at: rootB)
     }
-    let shell = try #require(repository.activeWorkspace.sessions.first)
-    let command = repository.activeWorkspace.addCommandSession(
+    let shell = try #require(repository.workspace.sessions.first)
+    let command = repository.workspace.addCommandSession(
         command: ProjectCommandDefinition(name: "server", command: "serve"), projectRoot: rootA.path
     )
     let other = plain.addSession(title: "Other")
@@ -921,7 +921,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
         #expect(await harness.waitUntilAttached(tab))
     }
     #expect(registry.register(
-        window: windowA, projectRoot: rootA.path, workspace: repository.activeWorkspace, repository: repository,
+        window: windowA, projectRoot: rootA.path, workspace: repository.workspace, repository: repository,
         noteStore: nil, todoStore: nil, chromeState: nil
     ))
     #expect(registry.register(
@@ -943,7 +943,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     // End Sessions.
     let sessions = try sessionIDs([shell, command, other])
     registry.tearDownForQuit(intent: .appQuitEndingSessions)
-    #expect(repository.activeWorkspace.closeAllIntent == .appQuitEndingSessions)
+    #expect(repository.workspace.closeAllIntent == .appQuitEndingSessions)
     #expect(plain.closeAllIntent == .appQuitEndingSessions)
     #expect(await harness.hosting.waitForPendingEnds(timeout: .seconds(3)))
     #expect(Set(harness.requestIDs("kill")) == Set(sessions))
@@ -1274,12 +1274,11 @@ private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindow
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
     }
-    // A worktree the window has not restored (not discovered yet) saved a
-    // tab whose session still runs.
-    let feature = root.appendingPathComponent("feature", isDirectory: true).path
+    // A saved tab the window has not brought back (the host could not be
+    // reached as it opened) whose session still runs.
     let saved = WorkspaceSessionRecord(
-        id: UUID(), kind: .command, title: "server", commandName: "server", workingDirectory: feature,
-        projectRoot: feature,
+        id: UUID(), kind: .command, title: "server", commandName: "server", workingDirectory: root.path,
+        projectRoot: root.path,
         hosted: HostedSessionBindingRecord(host: "local", hostID: "host-a", sessionID: "s-feature", owned: true)
     )
     let store = WorkspaceStateStore(directory: storeDirectory)
@@ -1288,17 +1287,11 @@ private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindow
         let label = Comment(rawValue: "\(answer)")
         let harness = try PersistentHarness()
         defer { harness.cleanUp() }
-        harness.fake.sessions = [HostedSessionInfo(
-            id: "s-feature", name: "server", cwd: feature, pid: 31, owner: "CherryTests",
-            tags: [PersistentSessionTag.tab: saved.id.uuidString, PersistentSessionTag.kind: "command"]
-        )]
+        harness.fake.launchFailure = "cherry-host is restarting"
         store.saveSynchronously(RepositoryStateRecord(
             repositoryRoot: URL(fileURLWithPath: root.path, isDirectory: true).standardizedFileURL.path,
             activeWorktreeRoot: root.path,
-            worktrees: [
-                WorktreeStateRecord(root: root.path, sessions: []),
-                WorktreeStateRecord(root: feature, sessions: [saved])
-            ]
+            worktrees: [WorktreeStateRecord(root: root.path, sessions: [saved])]
         ))
         let repository = RepositoryWorkspace(
             projectRoot: root.path,
@@ -1315,6 +1308,14 @@ private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindow
         #expect(repository.teardownSummary(.quit, pathDisplayMode: .repoFocused).savedSessionsNotOpen == 1, label)
         repository.flushPersistentState()
         repository.closeAllSessions(intent: answer)
+        // The host comes back.
+        harness.fake.launchFailure = nil
+        harness.fake.pendingHolders = 0
+        harness.fake.sessions = [HostedSessionInfo(
+            id: "s-feature", name: "server", cwd: root.path, pid: 31, owner: "CherryTests",
+            tags: [PersistentSessionTag.tab: saved.id.uuidString, PersistentSessionTag.kind: "command"]
+        )]
+        _ = try await harness.control.connect()
 
         if ends {
             #expect(await harness.fake.wait { harness.requestIDs("remove").contains("s-feature") }, label)
@@ -1334,7 +1335,7 @@ private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindow
         // session is gone.
         store.flush()
         let state = store.load(repositoryRoot: repository.repositoryRoot)
-        #expect(state?.worktree(root: feature)?.sessions.map(\.id) == [saved.id], label)
+        #expect(state?.worktree(root: root.path)?.sessions.contains { $0.id == saved.id } == true, label)
     }
 }
 

@@ -79,8 +79,6 @@ final class ClosedTabHistory {
         let action: Action
         let tabs: [ClosedTab]
         weak var workspace: TerminalWorkspace?
-        /// The window's repository, which shows the workspace's worktree.
-        weak var repository: RepositoryWorkspace?
         fileprivate(set) var timing: ToastLifetime
         /// Its toast (Undo, or a detach's Reopen), which may be on screen.
         fileprivate(set) var toastID: UUID?
@@ -154,8 +152,7 @@ final class ClosedTabHistory {
     func record(
         _ tabs: [ClosedTab],
         action: Action,
-        workspace: TerminalWorkspace,
-        repository: RepositoryWorkspace?
+        workspace: TerminalWorkspace
     ) -> UUID? {
         guard !tabs.isEmpty else { return nil }
         let entry = Entry(
@@ -163,7 +160,6 @@ final class ClosedTabHistory {
             action: action,
             tabs: tabs,
             workspace: workspace,
-            repository: repository,
             timing: ToastLifetime(
                 lifetime: ProjectWindowToasts.lifetime(of: .standard, voiceOverEnabled: voiceOverEnabled()),
                 shownAt: now()
@@ -238,15 +234,13 @@ final class ClosedTabHistory {
     }
 
     /// Brings `entry`'s tabs back where they were
-    /// (`TerminalWorkspace.reopenClosedTab`), in their order, and shows them:
-    /// their worktree, and the one that was selected (else the first).
+    /// (`TerminalWorkspace.reopenClosedTab`), in their order, and selects
+    /// the one that was selected (else the first).
     /// Sessions whose end waited get it back first; a tab that cannot come
     /// back ends as its close asked. False when none came back.
     private func restore(_ entry: Entry) -> Bool {
         if let toastID = entry.toastID { dismissToast?(toastID) }
-        guard let workspace = entry.workspace, !workspace.isTornDown,
-              entry.repository.map({ $0.allLoadedWorkspaces().contains { $0 === workspace } }) ?? true
-        else {
+        guard let workspace = entry.workspace, !workspace.isTornDown else {
             end(entry)
             return false
         }
@@ -263,10 +257,6 @@ final class ClosedTabHistory {
         }
         guard let shown = (restored.first { $0.tab.placement.wasSelected } ?? restored.first)?.session else {
             return false
-        }
-        if let repository = entry.repository, repository.activeWorkspace !== workspace,
-           let root = repository.root(containing: shown.id) {
-            repository.activate(worktreeRoot: root, chromeState: chromeState)
         }
         workspace.select(shown)
         chromeState?.selectTerminal()

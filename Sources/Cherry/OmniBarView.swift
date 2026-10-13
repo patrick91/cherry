@@ -28,9 +28,6 @@ struct OmniBarOverlay: View {
     @State private var focusRequest = 0
     @State private var editingAgent: AgentToolDefinition?
     @State private var agentError: String?
-    @State private var removalCandidate: GitWorktree?
-    @State private var worktreeRemovalError: String?
-    @State private var isRemovingWorktree = false
 
     init(
         window: OmniBarWindow,
@@ -60,7 +57,6 @@ struct OmniBarOverlay: View {
             OmniBarPanel(
                 controller: live.controller,
                 focusRequest: focusRequest,
-                errorMessage: worktreeRemovalError,
                 panelWidth: CGFloat(panelWidth)
             )
             .modifier(CommandPaletteSurface(
@@ -122,24 +118,6 @@ struct OmniBarOverlay: View {
                 }
             )
         }
-        .alert(
-            "Remove Worktree?",
-            isPresented: Binding(
-                get: { removalCandidate != nil },
-                set: { if !$0 { removalCandidate = nil } }
-            ),
-            presenting: removalCandidate
-        ) { worktree in
-            Button("Cancel", role: .cancel) {
-                removalCandidate = nil
-                focusRequest &+= 1
-            }
-            Button(OmniWorktreeRemoval.confirmationButtonTitle(for: worktree, repository: window.repository), role: .destructive) {
-                remove(worktree)
-            }
-        } message: { worktree in
-            Text(OmniWorktreeRemoval.confirmationMessage(for: worktree, repository: window.repository))
-        }
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(.isModal)
         .accessibilityLabel("Omni bar")
@@ -168,13 +146,10 @@ struct OmniBarOverlay: View {
     }
 
     /// Runs a row: the bar closes first, then the action runs (an open
-    /// panel or a new window comes after the bar has gone). Removing a
-    /// worktree and adding an agent ask in the bar's own alert and sheet.
+    /// panel or a new window comes after the bar has gone). Adding an agent
+    /// asks in the bar's own sheet.
     private func handle(_ command: OmniCommand) {
         switch command {
-        case .removeWorktree(let root):
-            worktreeRemovalError = nil
-            removalCandidate = window.repository.worktrees.first { $0.root == root }
         case .configureAgentPreset(let id):
             agentError = nil
             editingAgent = AgentConfiguration.presets.first { $0.id == id }
@@ -189,66 +164,10 @@ struct OmniBarOverlay: View {
         }
     }
 
-    private func remove(_ worktree: GitWorktree) {
-        guard !isRemovingWorktree else { return }
-        isRemovingWorktree = true
-        worktreeRemovalError = nil
-        let repository = window.repository
-        let chromeState = window.chromeState
-        Task {
-            defer {
-                isRemovingWorktree = false
-                removalCandidate = nil
-            }
-            do {
-                try await repository.remove(worktree, force: true, chromeState: chromeState)
-                dismiss()
-            } catch {
-                worktreeRemovalError = error.localizedDescription
-                focusRequest &+= 1
-            }
-        }
-    }
-
     private func dismiss() {
         live.stop()
         window.chromeState.dismissOmniBar()
         restoreFocus()
-    }
-}
-
-/// The confirmation removing a worktree asks for (the command palette's).
-enum OmniWorktreeRemoval {
-    @MainActor
-    static func confirmationButtonTitle(for worktree: GitWorktree, repository: RepositoryWorkspace) -> String {
-        if worktree.isPrunable { return "Prune Entry" }
-        if repository.dirtyByRoot[worktree.root] == true || worktree.isLocked {
-            return "Remove Anyway"
-        }
-        return "Remove Worktree"
-    }
-
-    @MainActor
-    static func confirmationMessage(for worktree: GitWorktree, repository: RepositoryWorkspace) -> String {
-        if worktree.isPrunable {
-            return "The checkout at \(worktree.root) is already missing. Cherry will prune its stale Git entry."
-        }
-        var details: [String] = []
-        let processCount = repository.workspaceIfLoaded(for: worktree.root)?
-            .sessionsWithRunningProcess().count ?? 0
-        if processCount > 0 {
-            details.append("stop \(processCount) running process\(processCount == 1 ? "" : "es")")
-        }
-        if repository.dirtyByRoot[worktree.root] == true {
-            details.append("permanently discard modified and untracked files")
-        }
-        if worktree.isLocked {
-            details.append("override its Git lock")
-        }
-        let consequences = details.isEmpty
-            ? "remove the checkout"
-            : details.joined(separator: ", ") + ", and remove the checkout"
-        return "Cherry will \(consequences) at \(worktree.root). Its branch will be kept."
     }
 }
 
@@ -257,7 +176,6 @@ enum OmniWorktreeRemoval {
 private struct OmniBarPanel: View {
     @ObservedObject var controller: OmniBarController
     let focusRequest: Int
-    let errorMessage: String?
     let panelWidth: CGFloat
 
     @AppStorage(CommandPaletteDesign.rowHeightKey) private var rowHeight = CommandPaletteDesign.defaultRowHeight
@@ -400,16 +318,8 @@ private struct OmniBarPanel: View {
 
     private var footer: some View {
         HStack(spacing: 12) {
-            if let errorMessage {
-                Text(errorMessage)
-                    .foregroundStyle(.red)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                Text(controller.hint)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
+            Text(controller.hint)
+                .frame(maxWidth: .infinity, alignment: .leading)
             Text("↵ \(controller.primaryLabel)")
             Text("⌘K Actions")
                 .opacity(controller.selectedActions.isEmpty ? 0.45 : 1)

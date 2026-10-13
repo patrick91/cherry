@@ -113,8 +113,7 @@ enum ProjectSwitcherLive {
 
 /// What the picker menu's items and the Omni bar's project and Mac rows
 /// do: the same code path for each (a device's project opens through its
-/// key, window reuse through `openProject`). Worktree actions stay the
-/// window's.
+/// key, window reuse through `openProject`).
 @MainActor
 struct ProjectSwitcherActions {
     let settings: AgentSettings
@@ -122,13 +121,9 @@ struct ProjectSwitcherActions {
     let openProject: (CherryProject) -> Void
     let openSettings: () -> Void
 
-    /// Handles every action but the worktree ones (false for those).
-    @discardableResult
-    func perform(_ action: TitlebarProjectMenuModel.Action) -> Bool {
+    func perform(_ action: TitlebarProjectMenuModel.Action) {
         let store = RemoteDeviceStore.shared
         switch action {
-        case .activateWorktree, .newWorktree, .manageWorktrees:
-            return false
         case .openProject(let root):
             openProject(settings.projects.first(where: { $0.root == root }) ?? CherryProject(root: root))
         case .addProject:
@@ -138,10 +133,10 @@ struct ProjectSwitcherActions {
         case .openDeviceProject(let deviceID, let path):
             openProject(CherryProject(root: ProjectLocation.remote(deviceID: deviceID, path: path).key))
         case .openDeviceHome(let deviceID):
-            guard let home = store.device(id: deviceID)?.homeDirectory else { return true }
+            guard let home = store.device(id: deviceID)?.homeDirectory else { return }
             openProject(CherryProject(root: ProjectLocation.remote(deviceID: deviceID, path: home).key))
         case .openDeviceSessions(let deviceID):
-            guard let host = store.device(id: deviceID)?.host else { return true }
+            guard let host = store.device(id: deviceID)?.host else { return }
             chromeState.hostedSessionsInitialHost = host
             chromeState.isHostedSessionsPresented = true
         case .addDeviceProject(let deviceID):
@@ -149,7 +144,7 @@ struct ProjectSwitcherActions {
         case .hideDeviceProject(let deviceID, let path):
             store.hideProject(path: path, on: deviceID)
         case .reconnectDevice(let deviceID):
-            guard let host = store.device(id: deviceID)?.host else { return true }
+            guard let host = store.device(id: deviceID)?.host else { return }
             RemoteDevicePeeks.shared.retry(host)
             let control = HostControlRegistry.shared.control(for: host)
             if case .waitingToReconnect = control.state {
@@ -170,7 +165,6 @@ struct ProjectSwitcherActions {
         case .addMac:
             chromeState.isAddDevicePresented = true
         }
-        return true
     }
 
     /// Add Project…: a folder on This Mac, added to the list and opened;

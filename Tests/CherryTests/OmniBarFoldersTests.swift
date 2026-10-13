@@ -32,7 +32,7 @@ private func sources() -> OmniSources {
         locations: [location("/Users/me/code/cherry"), location("/Users/me/code/rignore", on: .device(studioID))]
     )
     sources.homes = [.thisMac: "/Users/me", .device(studioID): "/Users/me"]
-    sources.window = OmniWindowContext(hasWorkspace: true, supportsWorktrees: true)
+    sources.window = OmniWindowContext(hasWorkspace: true)
     return sources
 }
 

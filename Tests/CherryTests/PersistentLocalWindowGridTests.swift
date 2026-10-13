@@ -450,7 +450,7 @@ private func sizeFileGrid(_ call: String) -> TerminalViewportSize? {
     harness.fake.sessions = [runningSession("s-shown", shownRecord, pid: 1), runningSession("s-hidden", hiddenRecord, pid: 2)]
     queue.holdBackgroundTabs(atMost: 60)
     let result = await harness.restorer(WorkspaceRestoreRequest(
-        repositoryRoot: root, worktreeRoot: root, records: [shownRecord, hiddenRecord], workspace: workspace
+        repositoryRoot: root, records: [shownRecord, hiddenRecord], workspace: workspace
     ))
     workspace.restoreSessions(result.sessions, from: WorktreeStateRecord(
         root: root, sessions: [shownRecord, hiddenRecord], selectedSessionID: shownRecord.id
@@ -502,7 +502,7 @@ private func sizeFileGrid(_ call: String) -> TerminalViewportSize? {
     harness.fake.sessions = records.enumerated().map { runningSession("s-tab-\($0.offset + 1)", $0.element, pid: UInt32($0.offset + 1)) }
     queue.holdBackgroundTabs(atMost: 60)
     let result = await harness.restorer(WorkspaceRestoreRequest(
-        repositoryRoot: root, worktreeRoot: root, records: records, workspace: workspace
+        repositoryRoot: root, records: records, workspace: workspace
     ))
     workspace.restoreSessions(result.sessions, from: WorktreeStateRecord(
         root: root, sessions: records, selectedSessionID: records[0].id

@@ -1411,17 +1411,7 @@ private struct ProjectWindowView: View {
         }
 
         agentSettings.markProjectOpened(projectRoot)
-        let shouldActivateWorktree: Bool
-        switch deepLink.kind {
-        case .terminal:
-            shouldActivateWorktree = true
-        case .note, .todo:
-            shouldActivateWorktree = false
-        }
-        if ProjectWindowRegistry.shared.focus(
-            projectRoot: projectRoot,
-            activateWorktree: shouldActivateWorktree
-        ) {
+        if ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) {
             if !ProjectWindowRegistry.shared.select(deepLink, projectRoot: projectRoot) {
                 CherryDeepLinkOpenQueue.shared.enqueue(deepLink, projectRoot: projectRoot)
             }
@@ -1438,14 +1428,13 @@ private struct ProjectWindowView: View {
 /// selected; the parent re-passes a new `session` when the selection changes.
 private struct WindowTitleBinder: View {
     let projectName: String
-    let worktreeName: String?
     /// The Mac a device window runs on.
     let deviceName: String?
     @ObservedObject var session: TerminalSession
 
     var body: some View {
         WindowTitleWriter(title: ProjectWindowTitle.title(
-            project: projectName, worktree: worktreeName, deviceName: deviceName, tab: session.title
+            project: projectName, deviceName: deviceName, tab: session.title
         ))
     }
 }
@@ -1470,7 +1459,6 @@ private struct WindowTitleWriter: NSViewRepresentable {
 private struct ProjectWorkspaceView: View {
     @Environment(\.openWindow) private var openWindow
     @ObservedObject private var agentSettings = AgentSettings.shared
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
     @StateObject private var repository: RepositoryWorkspace
     @StateObject private var chromeState = ProjectWindowChromeState()
     @StateObject private var noteStore: ProjectNoteStore
@@ -1505,7 +1493,7 @@ private struct ProjectWorkspaceView: View {
             sessionRestorer: hosting.profile.isKnownDevice
                 ? WorkspaceSessionRestorers.hostedByDefault(localSessions: hosting)
                 : RemoteDeviceStore.keepingRestorer,
-            // A device's git worktrees and cherry.toml, read there (phase 3).
+            // A device's cherry.toml, read there (phase 3).
             remoteProject: hosting.profile.isKnownDevice ? device.map { RemoteProjectAccess.app($0) } : nil,
             // This Mac's saved tabs show before its host answers; a device's
             // wait for that Mac.
@@ -1524,12 +1512,7 @@ private struct ProjectWorkspaceView: View {
     }
 
     private var workspace: TerminalWorkspace {
-        repository.activeWorkspace
-    }
-
-    private var worktreeName: String? {
-        guard repository.supportsWorktrees else { return nil }
-        return repository.activeWorktree?.displayName
+        repository.workspace
     }
 
     var body: some View {
@@ -1568,13 +1551,9 @@ private struct ProjectWorkspaceView: View {
             // "<project> — <Mac>" for a device window.
             RemoteDeviceBadgeReader(projectKey: repository.repositoryRoot) { device in
                 if let session = workspace.selectedSession {
-                    WindowTitleBinder(
-                        projectName: projectName, worktreeName: worktreeName, deviceName: device?.name, session: session
-                    )
+                    WindowTitleBinder(projectName: projectName, deviceName: device?.name, session: session)
                 } else {
-                    WindowTitleWriter(title: ProjectWindowTitle.title(
-                        project: projectName, worktree: worktreeName, deviceName: device?.name
-                    ))
+                    WindowTitleWriter(title: ProjectWindowTitle.title(project: projectName, deviceName: device?.name))
                 }
             }
         }
@@ -1603,25 +1582,9 @@ private struct ProjectWorkspaceView: View {
         .onChange(of: storedSidebarWidth) { _, width in
             ProjectSidebarWidthStore().setWidth(width, projectRoot: sidebarWidthProjectRoot)
         }
-        .onChange(of: repository.activeWorktreeRoot) { _, _ in
-            // RepositoryWorkspace synchronously updates the window registry as
-            // part of activation. Repeating it here acknowledged sessions and
-            // persisted the same root a second time during the first render of
-            // every switch.
-            openPendingDeepLinks()
-        }
         .onChange(of: noteStore.isLoading) { _, isLoading in
             if !isLoading {
                 openPendingDeepLinks()
-            }
-        }
-        .onChange(of: terminalSettings.worktreeSpacesEnabled) { _, isEnabled in
-            if isEnabled {
-                Task {
-                    await repository.refresh()
-                }
-            } else {
-                repository.disableWorktreeSpaces(chromeState: chromeState)
             }
         }
     }

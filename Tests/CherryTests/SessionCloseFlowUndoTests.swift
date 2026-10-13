@@ -281,7 +281,7 @@ private func syntheticTab(_ name: String) -> ClosedTab {
     // shows it. A detach's time, whose session nothing ends, stays stopped.
     SessionCloseCoordinator.close(forgotten, in: workspace, chromeState: chromeState, registry: registry)
     chromeState.closedTabs.setAttended(false)
-    chromeState.closedTabs.record([syntheticTab("Detached")], action: .detach, workspace: workspace, repository: nil)
+    chromeState.closedTabs.record([syntheticTab("Detached")], action: .detach, workspace: workspace)
     #expect(chromeState.closedTabs.entries.count == 2)
     clock.advance(by: ClosedTabHistory.longestUnattendedWait - 0.1)
     #expect(harness.hosting.hasDeferredEnds)
@@ -359,11 +359,11 @@ private func syntheticTab(_ name: String) -> ClosedTab {
         #expect(!history.undoManager.canRedo)
         #expect(history.undoManager.undoMenuItemTitle == "Undo")
 
-        history.record([syntheticTab("One")], action: .close, workspace: workspace, repository: nil)
+        history.record([syntheticTab("One")], action: .close, workspace: workspace)
         #expect(history.undoManager.undoMenuItemTitle == "Undo Close Tab")
-        history.record([syntheticTab("Two"), syntheticTab("Three")], action: .close, workspace: workspace, repository: nil)
+        history.record([syntheticTab("Two"), syntheticTab("Three")], action: .close, workspace: workspace)
         #expect(history.undoManager.undoMenuItemTitle == "Undo Close Tabs")
-        history.record([syntheticTab("Four")], action: .detach, workspace: workspace, repository: nil)
+        history.record([syntheticTab("Four")], action: .detach, workspace: workspace)
         #expect(history.undoManager.undoMenuItemTitle == "Undo Detach Tab")
         #expect(history.undoManager.canUndo)
         #expect(!history.undoManager.canRedo)
@@ -789,7 +789,7 @@ private func syntheticTab(_ name: String) -> ClosedTab {
     #expect(await eventually { harness.hosting.owningTab(of: "s-orphan") != nil })
     try await Task.sleep(for: .milliseconds(200))
     #expect(harness.hosting.owningTab(of: "s-closed") == nil)
-    #expect(!repository.activeWorkspace.sessions.contains { $0.id == closedTabID })
+    #expect(!repository.workspace.sessions.contains { $0.id == closedTabID })
 
     // Nor would the next launch: the closed tab is recorded as one whose
     // session is to end.
@@ -958,7 +958,7 @@ private func quitSteps(_ harness: PersistentHarness, events: Recorder<[String]>)
     #expect(!window.validateMenuItem(undoItem))
     #expect(undoItem.title == "Undo")
     let workspace = TerminalWorkspace(createInitialSession: false)
-    chromeState.closedTabs.record([syntheticTab("Shell")], action: .close, workspace: workspace, repository: nil)
+    chromeState.closedTabs.record([syntheticTab("Shell")], action: .close, workspace: workspace)
     #expect(window.validateMenuItem(undoItem))
     #expect(undoItem.title == "Undo Close Tab")
 

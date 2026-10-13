@@ -60,8 +60,7 @@ private func safetyConfiguration() -> PersistentLocalSessions.Configuration {
 }
 
 /// Restores a Claude agent tab whose session the fake host still runs,
-/// with its attach adapter left for later (a worktree not shown, or a tab
-/// not shown yet). `owned` false restores it only attached (a viewer).
+/// with its attach adapter left for later (a tab not shown yet). `owned` false restores it only attached (a viewer).
 @MainActor
 private func restoreAgent(
     _ harness: PersistentHarness,
@@ -86,7 +85,7 @@ private func restoreAgent(
     )]
     harness.fake.screenText = screen
     let result = await harness.restorer(WorkspaceRestoreRequest(
-        repositoryRoot: harness.project.path, worktreeRoot: harness.project.path,
+        repositoryRoot: harness.project.path,
         records: [record], workspace: workspace
     ))
     workspace.restoreSessions(

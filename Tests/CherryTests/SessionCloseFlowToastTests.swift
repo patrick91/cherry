@@ -140,7 +140,7 @@ private func openRepositoryWindow(
         restoredTabLaunchQueue: RestoredTabLaunchQueue()
     )
     #expect(registry.register(
-        window: window, projectRoot: root, workspace: repository.activeWorkspace, repository: repository,
+        window: window, projectRoot: root, workspace: repository.workspace, repository: repository,
         noteStore: nil, todoStore: nil, chromeState: chromeState
     ))
     return repository
@@ -343,10 +343,10 @@ private let persistentSessionsLine = "Attach to it again from File › Persisten
         harness.cleanUp()
     }
     #expect(registry.register(
-        window: window, projectRoot: project, workspace: repository.activeWorkspace, repository: repository,
+        window: window, projectRoot: project, workspace: repository.workspace, repository: repository,
         noteStore: nil, todoStore: nil, chromeState: chromeState
     ))
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     // The window's default shell.
     #expect(await harness.fake.wait { harness.creates().count == 1 })
     let agent = workspace.addAgentSession(
@@ -991,7 +991,7 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
     #expect(both.message == "Open or end them from Background Sessions in the Cherry menu bar icon.")
     #expect(both.reopen == [.backgroundSession(id: "s-1"), .backgroundSession(id: "s-2")])
 
-    let attached = ClosedTabNotice(tabName: "CLI", reopen: .attach(local, worktreeRoot: "/work"))
+    let attached = ClosedTabNotice(tabName: "CLI", reopen: .attach(local, projectRoot: "/work"))
     let twoAttached = try #require(ClosedTabNotice.combining([attached, attached]))
     #expect(twoAttached.message == "Attach to them again from File › Persistent Sessions.")
     let mixed = try #require(ClosedTabNotice.combining(own + [attached]))
@@ -1092,7 +1092,7 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
         repository.closeAllSessions(intent: .windowClosed)
         harness.cleanUp()
     }
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(await harness.fake.wait { harness.creates().count == 1 })
     let parent = workspace.addAgentSession(agent: AgentToolDefinition(name: "Claude", command: "claude"), projectRoot: project)
     let child = workspace.addAgentSession(
@@ -1201,7 +1201,7 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
     func closeLastTabAndReopen(_ makeLastTab: (TerminalWorkspace) async throws -> TerminalSession) async throws -> RepositoryWorkspace {
         closeA()
         let repository = openA()
-        let workspace = repository.activeWorkspace
+        let workspace = repository.workspace
         let tab = try await makeLastTab(workspace)
         for shell in workspace.sessions where shell !== tab {
             workspace.close(shell, intent: .windowClosedEndingSessions)
@@ -1233,7 +1233,7 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
         return agent
     }
     let agent = try #require(agentID)
-    #expect(await harness.fake.wait { reopenedA.activeWorkspace.session(withID: agent) != nil })
+    #expect(await harness.fake.wait { reopenedA.workspace.session(withID: agent) != nil })
     #expect(other.session(withID: agent) == nil)
     #expect(opened.count == 1)
 
@@ -1244,11 +1244,11 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
         return tab
     }
     #expect(await harness.fake.wait {
-        reopenedAgain.activeWorkspace.sessions.contains { $0.hostedAttachment?.sessionID == "session-cli" }
+        reopenedAgain.workspace.sessions.contains { $0.hostedAttachment?.sessionID == "session-cli" }
     })
     #expect(!other.sessions.contains { $0.hostedAttachment?.sessionID == "session-cli" })
     #expect(opened.count == 2)
-    #expect(reopenedAgain.activeWorkspace.sessions.contains { $0.hostedAttachment?.sessionID == "session-cli" && !$0.isPersistentLocalSession })
+    #expect(reopenedAgain.workspace.sessions.contains { $0.hostedAttachment?.sessionID == "session-cli" && !$0.isPersistentLocalSession })
     // Only the default shells closed here were ended.
     let agentSession = try #require(agentSessionID)
     #expect(!harness.requestIDs("kill").contains(agentSession))

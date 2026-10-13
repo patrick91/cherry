@@ -45,14 +45,10 @@ Cherry's app data: while Cherry.app runs it is a second copy with native tabs
 and no saved tabs, and otherwise it restores and saves Cherry.app's tabs. See
 [Host/README.md](Host/README.md#use-in-the-mac-app) for running it apart.
 
-Enable worktree spaces in **Cherry > Settings > General**. Cherry then discovers
-every Git worktree for a project and keeps them
-inside one project window. Switch with the worktree rail, an interactive
-horizontal two-finger swipe over the sidebar, or `Cmd-Option-Left/Right`. The
-rail's `+` and `...` buttons create, show/hide, prune, and safely remove clean
-worktrees. The sliders button opens a temporary dogfooding panel for tuning the
-swipe trigger distance and settle duration. Quick flicks can commit below the
-distance threshold based on their velocity.
+A project window shows one folder. Cherry has no Git worktree support of its
+own: open a worktree's folder as a project (the Omni bar completes paths
+typed with `~/` or `/`). Tabs saved by a build that had worktree spaces come
+back in their project's window.
 
 ### Pasting images
 
@@ -111,7 +107,7 @@ disappear at once, and it stops those programs and ends the sessions before it
 exits (within 10 s). A log out, restart or shut down does not ask about
 sessions and ends none itself (the system then ends them), but warns about
 programs still running in them, as it does for native tabs, and an update keeps them
-without asking. Removing a worktree ends its sessions. A
+without asking. A
 terminal tab whose shell exits with status 0 closes by itself, and the window
 closes with its last tab; turn off **Close a tab when its shell exits** to
 keep such tabs. Turn off **Run local terminals as persistent sessions** to
@@ -220,8 +216,7 @@ Its terminals get Cherry's terminal type (`xterm-ghostty`) and Ghostty's
 zsh, bash or fish integration there, installed next to its `cherry-host`,
 so the directory, title and prompt marks follow the shell there, paths in
 the sidebar show that Mac's home as `~`, and a new tab starts in the
-selected tab's directory. Its git worktrees (the Worktrees section, **New
-Worktree…**, **Manage Worktrees…**) run git on that Mac, its `cherry.toml`
+selected tab's directory. Its `cherry.toml`
 commands are read there (read-only: a command you edit is saved on this Mac
 only), auto-start and restart on exit as usual, and **Open in** offers the
 editors that reach it over SSH (VS Code and Cursor through Remote - SSH,

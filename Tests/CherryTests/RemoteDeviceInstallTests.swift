@@ -584,7 +584,7 @@ private enum MachOFixture {
     #expect(state.dot == .red && state.subtitle() == "Its session host is missing")
     let device = RemoteDevice(name: "Studio", sshDestination: "studio")
     let menu = TitlebarProjectMenuModel(
-        worktrees: nil, projects: [], devices: [.init(device: device, state: state, sessions: [])], currentProjectKey: nil
+        projects: [], devices: [.init(device: device, state: state, sessions: [])], currentProjectKey: nil
     ).snapshot
     #expect(menu.contains("  Reinstall Session Host…"))
     let availability = RemoteDeviceAvailability.of(.waitingToReconnect(missing), installationProblem: nil)
@@ -666,7 +666,7 @@ private enum MachOFixture {
         installedResources: true
     )
     func menu(_ entry: TitlebarProjectMenuModel.Device) -> String {
-        TitlebarProjectMenuModel(worktrees: nil, projects: [], devices: [entry], currentProjectKey: nil).snapshot
+        TitlebarProjectMenuModel(projects: [], devices: [entry], currentProjectKey: nil).snapshot
     }
     #expect(menu(.init(device: device, state: .connected(sessionCount: 0), sessions: [], bundledBuild: "20260928120000.new"))
         .contains("  Update Session Host…\n  Persistent Sessions on Studio…"))
@@ -679,7 +679,7 @@ private enum MachOFixture {
     #expect(menu(.init(device: manual, state: .incompatible(reason: "x"), sessions: [])).contains("Update Session Host…"))
     // Only the copy that keeps the devices changes one.
     let readOnly = TitlebarProjectMenuModel(
-        worktrees: nil, projects: [],
+        projects: [],
         devices: [.init(device: device, state: .connected(sessionCount: 0), sessions: [], bundledBuild: "20260928120000.new")],
         currentProjectKey: nil, canModifyDevices: false
     )

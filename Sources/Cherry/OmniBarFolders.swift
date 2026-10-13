@@ -93,7 +93,7 @@ struct OmniPathQuery: Equatable {
 /// A folder in a listing.
 struct OmniFolderEntry: Equatable, Hashable, Sendable {
     var name: String
-    /// It has a `.git` (a repository or a worktree).
+    /// It has a `.git` (a repository, or a git worktree's file).
     var isRepository: Bool
 }
 

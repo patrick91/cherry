@@ -398,7 +398,7 @@ final class ParityControlServer {
         title: "htop", pwd: subdirectory.path, owner: "CherryTests"
     )]
     let result = await harness.restorer(WorkspaceRestoreRequest(
-        repositoryRoot: harness.project.path, worktreeRoot: harness.project.path,
+        repositoryRoot: harness.project.path,
         records: [record], workspace: workspace
     ))
     workspace.restoreSessions(result.sessions, from: WorktreeStateRecord(root: harness.project.path, sessions: [record]))

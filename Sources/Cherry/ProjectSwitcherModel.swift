@@ -173,8 +173,7 @@ struct ProjectSwitcherModel: Equatable {
     // MARK: Opening
 
     /// What opening a location does, through the picker's own actions (so
-    /// a device's project, window reuse and worktrees work as from the
-    /// menu). Nil when its Mac does not allow opening now.
+    /// a device's project and window reuse work as from the menu). Nil when its Mac does not allow opening now.
     func action(opening location: Location) -> TitlebarProjectMenuModel.Action? {
         guard canOpen(location) else { return nil }
         switch location.machine {

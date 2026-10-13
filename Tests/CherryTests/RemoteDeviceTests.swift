@@ -1379,13 +1379,15 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     defer { session.stop() }
     let local = TerminalContextBarContent(session: session)
     #expect(local.devicePrefix == nil)
-    #expect(local.breadcrumb == "~/github/farbun-dev/fizzup.club  ›  zsh")
+    #expect(local.displayPath == "~/github/farbun-dev/fizzup.club")
+    #expect(local.sessionLabel == "zsh")
 
     let deviceID = UUID()
     let badge = RemoteDeviceBadge(deviceID: deviceID, name: "patstudio", color: .teal)
     let remote = TerminalContextBarContent(session: session, device: badge)
     #expect(remote.devicePrefix == "patstudio:")
-    #expect(remote.breadcrumb == "patstudio: ~/github/farbun-dev/fizzup.club  ›  zsh")
+    #expect(remote.displayPath == "~/github/farbun-dev/fizzup.club")
+    #expect(remote.sessionLabel == "zsh")
     // A rename or a new colour re-renders the bar.
     #expect(remote != local)
     #expect(TerminalContextBarContent(session: session, device: RemoteDeviceBadge(deviceID: deviceID, name: "patstudio", color: .red)) != remote)

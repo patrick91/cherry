@@ -963,16 +963,7 @@ private struct RemoteHostStateBarContent: View {
                 }
             }
             .help(availability.detail ?? "")
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
-            .frame(maxWidth: 460)
-            .projectWindowToastObstacle()
+            .floatingBarChrome()
         }
     }
 }
@@ -996,16 +987,7 @@ struct RemoteLaunchFailureBar: View {
                 Button("Retry") { session.retryPersistentSession() }
                     .controlSize(.small)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
-            .frame(maxWidth: 520)
-            .projectWindowToastObstacle()
+            .floatingBarChrome(maxWidth: 520)
         }
     }
 }

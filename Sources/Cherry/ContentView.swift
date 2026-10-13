@@ -165,17 +165,6 @@ struct ContentView: View {
                 .zIndex(2_000)
             }
 
-            if PrototypeFeatureFlags.isIconDebugEnabled,
-               chromeState.isIconDebugOverlayPresented {
-                SidebarIconDebugOverlay(
-                    projectRoot: projectRoot,
-                    presentation: isSidebarRevealed ? .floating : .docked,
-                    leadingOffset: iconDebugOverlayLeadingOffset,
-                    isPresented: $chromeState.isIconDebugOverlayPresented
-                )
-                .zIndex(2_100)
-            }
-
             if chromeState.isSidebarPlaygroundPresented {
                 SidebarPlaygroundOverlay(
                     projectRoot: projectRoot,
@@ -374,7 +363,7 @@ struct ContentView: View {
             storedSidebarWidth = Double(sidebarWidth)
             chromeState.dockedSidebarWidth = sidebarWidth
             syncDisabledFeatureSelection(features: agentSettings.projectFeatures(for: projectRoot))
-            trafficLights.seedTarget(
+            trafficLights.update(
                 docked: isSidebarHidden ? 0 : sidebarWidth,
                 floating: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
                 sidebarWidth: sidebarWidth
@@ -2575,7 +2564,7 @@ struct ProjectOnboardingView: View {
             controller: trafficLights
         ))
         .onAppear {
-            trafficLights.seedTarget(docked: 320, floating: 0, sidebarWidth: 320)
+            trafficLights.update(docked: 320, floating: 0, sidebarWidth: 320)
         }
     }
 
@@ -2839,10 +2828,6 @@ private enum AgentTreeLayout {
 }
 
 enum PrototypeFeatureFlags {
-    static var isIconDebugEnabled: Bool {
-        truthyEnvironmentValue(for: "CHERRY_ICON_DEBUG")
-    }
-
     static var isProjectTabsPrototypeEnabled: Bool {
         truthyEnvironmentValue(for: "CHERRY_PROJECT_TABS_PROTOTYPE")
     }
@@ -3149,7 +3134,6 @@ private struct SidebarTabsPage: View {
                     workspace: workspace,
                     chromeState: chromeState,
                     projectRoot: projectRoot,
-                    presentation: presentation,
                     palette: palette,
                     agentTree: agentTree,
                     visibleAgentItems: visibleAgentItems,
@@ -3164,8 +3148,6 @@ private struct SidebarTabsPage: View {
                     displayItems: workspace.terminalDisplayItems,
                     workspace: workspace,
                     chromeState: chromeState,
-                    projectRoot: projectRoot,
-                    presentation: presentation,
                     palette: palette,
                     pathDisplayMode: terminalSettings.sidebarTerminalPathDisplayMode,
                     shortcutStartIndex: visibleAgentItems.count,
@@ -3183,7 +3165,6 @@ private struct SidebarTabsPage: View {
                     workspace: workspace,
                     chromeState: chromeState,
                     projectRoot: projectRoot,
-                    presentation: presentation,
                     palette: palette,
                     commands: commands,
                     shortcutStartIndex: visibleAgentItems.count + workspace.terminalDisplayItems.count,
@@ -3195,8 +3176,6 @@ private struct SidebarTabsPage: View {
                     SidebarTodosSection(
                         todoStore: todoStore,
                         chromeState: chromeState,
-                        projectRoot: projectRoot,
-                        presentation: presentation,
                         palette: palette,
                         shortcutNumber: visibleAgentItems.count
                             + workspace.terminalDisplayItems.count
@@ -3633,7 +3612,6 @@ private struct SidebarAgentSessionSection: View {
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
-    let presentation: SidebarPresentation
     let palette: SidebarPalette
     let agentTree: AgentSessionTreeSnapshot
     let visibleAgentItems: [AgentSessionTreeItem]
@@ -3693,7 +3671,8 @@ private struct SidebarAgentSessionSection: View {
                         SidebarAgentChildrenGroup(
                             children: children,
                             palette: palette,
-                            isActive: isActiveGroup
+                            isActive: isActiveGroup,
+                            hasDetail: { $0.sidebarDetail.nilIfEmpty != nil }
                         ) { child in
                             agentRow(
                                 session: child,
@@ -3718,7 +3697,6 @@ private struct SidebarAgentSessionSection: View {
 
     private var isIconDebugActive: Bool {
         chromeState.isSidebarPlaygroundPresented
-            || (PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented)
     }
 
     private func select(_ session: TerminalSession) {
@@ -3736,8 +3714,7 @@ private struct SidebarAgentSessionSection: View {
         SidebarTabRow(
             session: session,
             isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
-            projectRoot: projectRoot,
-            presentation: presentation,
+            palette: palette,
             pathDisplayMode: pathDisplayMode,
             shortcutNumber: shortcutNumber,
             showShortcutHint: showShortcutHints,
@@ -3797,21 +3774,25 @@ private struct AgentLaunchMenu: View {
     }
 }
 
-private struct SidebarAgentChildrenGroup<RowContent: View>: View {
-    let children: [TerminalSession]
+private struct SidebarAgentChildrenGroup<Child: Identifiable, RowContent: View>: View {
+    let children: [Child]
     let palette: SidebarPalette
     let isActive: Bool
-    let rowContent: (TerminalSession) -> RowContent
+    /// Whether a child's row shows a detail line, which makes it taller.
+    let hasDetail: (Child) -> Bool
+    let rowContent: (Child) -> RowContent
 
     init(
-        children: [TerminalSession],
+        children: [Child],
         palette: SidebarPalette,
         isActive: Bool,
-        @ViewBuilder rowContent: @escaping (TerminalSession) -> RowContent
+        hasDetail: @escaping (Child) -> Bool,
+        @ViewBuilder rowContent: @escaping (Child) -> RowContent
     ) {
         self.children = children
         self.palette = palette
         self.isActive = isActive
+        self.hasDetail = hasDetail
         self.rowContent = rowContent
     }
 
@@ -3820,7 +3801,8 @@ private struct SidebarAgentChildrenGroup<RowContent: View>: View {
             SidebarAgentChildrenGuide(
                 children: children,
                 palette: palette,
-                isActive: isActive
+                isActive: isActive,
+                hasDetail: hasDetail
             )
 
             VStack(alignment: .leading, spacing: SidebarLayout.agentTreeRowSpacing) {
@@ -3832,10 +3814,11 @@ private struct SidebarAgentChildrenGroup<RowContent: View>: View {
     }
 }
 
-private struct SidebarAgentChildrenGuide: View {
-    let children: [TerminalSession]
+private struct SidebarAgentChildrenGuide<Child: Identifiable>: View {
+    let children: [Child]
     let palette: SidebarPalette
     let isActive: Bool
+    let hasDetail: (Child) -> Bool
 
     var body: some View {
         let x = AgentTreeLayout.guideX
@@ -3883,19 +3866,19 @@ private struct SidebarAgentChildrenGuide: View {
             return rowHeight(for: children.first) / 2
         }
 
-        let precedingRowsHeight = children.prefix(index).reduce(CGFloat.zero) { partialResult, session in
-            partialResult + rowHeight(for: session)
+        let precedingRowsHeight = children.prefix(index).reduce(CGFloat.zero) { partialResult, child in
+            partialResult + rowHeight(for: child)
         }
         return precedingRowsHeight
             + SidebarLayout.agentTreeRowSpacing * CGFloat(index)
             + rowHeight(for: children[index]) / 2
     }
 
-    private func rowHeight(for session: TerminalSession?) -> CGFloat {
-        guard let session else { return AgentTreeLayout.childDetailRowHeight }
-        return session.sidebarDetail.nilIfEmpty == nil
-            ? AgentTreeLayout.childRowHeight
-            : AgentTreeLayout.childDetailRowHeight
+    private func rowHeight(for child: Child?) -> CGFloat {
+        guard let child else { return AgentTreeLayout.childDetailRowHeight }
+        return hasDetail(child)
+            ? AgentTreeLayout.childDetailRowHeight
+            : AgentTreeLayout.childRowHeight
     }
 }
 
@@ -3904,7 +3887,6 @@ private struct SidebarCommandSection: View {
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
     let projectRoot: String?
-    let presentation: SidebarPresentation
     let palette: SidebarPalette
     let commands: [ProjectCommandDefinition]
     let shortcutStartIndex: Int
@@ -3955,13 +3937,11 @@ private struct SidebarCommandSection: View {
                         projectRoot: projectRoot,
                         isSelected: chromeState.focusedIdleCommandName == command.name
                             || (chromeState.isShowingTerminalContent && (session.map { workspace.selectedSessionID == $0.id } ?? false)),
-                        presentation: presentation,
                         palette: palette,
                         shortcutNumber: shortcutStartIndex + index + 1,
                         showShortcutHint: showShortcutHints,
                         start: { start(command, existingSession: session) },
                         stop: { stop(session) },
-                        restart: { restart(command, existingSession: session) },
                         select: {
                             if let session {
                                 chromeState.selectTerminal()
@@ -4036,9 +4016,7 @@ private struct SidebarCommandSection: View {
                             with: updatedCommand,
                             projectRoot: projectRoot
                         )
-                        commandError = nil
-                        editingOriginalName = nil
-                        editingCommand = nil
+                        dismissEditor()
                     } catch {
                         commandError = error.localizedDescription
                     }
@@ -4047,17 +4025,17 @@ private struct SidebarCommandSection: View {
                     if projectRoot != nil {
                         remove(command, existingSession: workspace.commandSession(named: command.name))
                     }
-                    commandError = nil
-                    editingOriginalName = nil
-                    editingCommand = nil
+                    dismissEditor()
                 },
-                onCancel: {
-                    commandError = nil
-                    editingOriginalName = nil
-                    editingCommand = nil
-                }
+                onCancel: { dismissEditor() }
             )
         }
+    }
+
+    private func dismissEditor() {
+        commandError = nil
+        editingOriginalName = nil
+        editingCommand = nil
     }
 
     private func addCommand() {
@@ -4082,14 +4060,11 @@ private struct SidebarCommandSection: View {
             return
         }
         if let existingSession {
-            if existingSession.isRunningCommand {
-                chromeState.selectTerminal()
-                workspace.select(existingSession)
-            } else {
+            if !existingSession.isRunningCommand {
                 existingSession.restart()
-                chromeState.selectTerminal()
-                workspace.select(existingSession)
             }
+            chromeState.selectTerminal()
+            workspace.select(existingSession)
         } else {
             chromeState.selectTerminal()
             workspace.addCommandSession(command: command, projectRoot: root)
@@ -4127,7 +4102,6 @@ private struct SidebarCommandSection: View {
 
     private var isIconDebugActive: Bool {
         chromeState.isSidebarPlaygroundPresented
-            || (PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented)
     }
 }
 
@@ -4211,14 +4185,7 @@ private struct SidebarNotesSection: View, @preconcurrency Equatable {
                         .padding(.trailing, SidebarLayout.rowHorizontalInset)
                         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         .background {
-                            if isSelected(note) {
-                                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                    .fill(palette.selectedFill)
-                                    .overlay {
-                                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                            .strokeBorder(palette.selectedStroke, lineWidth: 1)
-                                    }
-                            }
+                            SidebarRowBackground(isSelected: isSelected(note), showsShadow: false, palette: palette)
                         }
                     }
                     .buttonStyle(.plain)
@@ -4256,8 +4223,6 @@ private struct SidebarNotesSection: View, @preconcurrency Equatable {
 private struct SidebarTodosSection: View {
     @ObservedObject var todoStore: ProjectTodoStore
     @ObservedObject var chromeState: ProjectWindowChromeState
-    let projectRoot: String?
-    let presentation: SidebarPresentation
     let palette: SidebarPalette
     let shortcutNumber: Int
     let showShortcutHint: Bool
@@ -4299,14 +4264,7 @@ private struct SidebarTodosSection: View {
                 .padding(.trailing, SidebarLayout.rowHorizontalInset)
                 .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .background {
-                    if isSelected {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .fill(palette.selectedFill)
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                    .strokeBorder(palette.selectedStroke, lineWidth: 1)
-                            }
-                    }
+                    SidebarRowBackground(isSelected: isSelected, showsShadow: false, palette: palette)
                 }
             }
             .buttonStyle(.plain)
@@ -4358,13 +4316,11 @@ private struct SidebarCommandRow: View {
     let session: TerminalSession?
     let projectRoot: String?
     let isSelected: Bool
-    let presentation: SidebarPresentation
     let palette: SidebarPalette
     let shortcutNumber: Int
     let showShortcutHint: Bool
     let start: () -> Void
     let stop: () -> Void
-    let restart: () -> Void
     let select: () -> Void
 
     @State private var isHovered = false
@@ -4428,7 +4384,7 @@ private struct SidebarCommandRow: View {
             .padding(.trailing, SidebarLayout.rowHorizontalInset)
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .background {
-                rowBackground(palette: palette)
+                SidebarRowBackground(isSelected: isSelected, isHovered: isHovered, palette: palette)
             }
         }
         .buttonStyle(.plain)
@@ -4437,23 +4393,38 @@ private struct SidebarCommandRow: View {
             isHovered = hovering
         }
     }
+}
 
-    @ViewBuilder
-    private func rowBackground(palette: SidebarPalette) -> some View {
+/// A sidebar row's background: the selected shape (with its shadow unless
+/// `showsShadow` is false), else the hover fill.
+private struct SidebarRowBackground: View {
+    let isSelected: Bool
+    var isHovered = false
+    var showsShadow = true
+    let palette: SidebarPalette
+
+    var body: some View {
         if isSelected {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(palette.selectedFill)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(palette.selectedStroke, lineWidth: 1)
-                }
-                .shadow(color: palette.selectedShadow, radius: 9, y: 4)
+            if showsShadow {
+                selectedShape
+                    .shadow(color: palette.selectedShadow, radius: 9, y: 4)
+            } else {
+                selectedShape
+            }
         } else if isHovered {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(palette.hoverFill)
         }
     }
 
+    private var selectedShape: some View {
+        RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(palette.selectedFill)
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(palette.selectedStroke, lineWidth: 1)
+            }
+    }
 }
 
 // Observes the session directly: run state changes (including a process
@@ -4540,8 +4511,6 @@ private struct SidebarSessionSection: View {
     let displayItems: [TerminalDisplayItem]
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    let projectRoot: String?
-    let presentation: SidebarPresentation
     let palette: SidebarPalette
     let pathDisplayMode: SidebarTerminalPathDisplayMode
     let shortcutStartIndex: Int
@@ -4618,7 +4587,6 @@ private struct SidebarSessionSection: View {
 
     private var isIconDebugActive: Bool {
         chromeState.isSidebarPlaygroundPresented
-            || (PrototypeFeatureFlags.isIconDebugEnabled && chromeState.isIconDebugOverlayPresented)
     }
 
     private func primarySelectionID(for item: TerminalDisplayItem) -> UUID {
@@ -4664,8 +4632,7 @@ private struct SidebarSessionSection: View {
                 SidebarTabRow(
                     session: session,
                     isSelected: chromeState.isShowingTerminalContent && workspace.selectedSessionID == session.id,
-                    projectRoot: projectRoot,
-                    presentation: presentation,
+                    palette: palette,
                     pathDisplayMode: pathDisplayMode,
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: showShortcutHints,
@@ -4689,8 +4656,6 @@ private struct SidebarSessionSection: View {
                     group: group,
                     workspace: workspace,
                     chromeState: chromeState,
-                    projectRoot: projectRoot,
-                    presentation: presentation,
                     pathDisplayMode: pathDisplayMode,
                     shortcutNumber: shortcutStartIndex + index + 1,
                     showShortcutHint: showShortcutHints,
@@ -4705,8 +4670,6 @@ private struct SidebarSplitTabRow: View {
     let group: TerminalSplitGroup
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    let projectRoot: String?
-    let presentation: SidebarPresentation
     let pathDisplayMode: SidebarTerminalPathDisplayMode
     let shortcutNumber: Int
     let showShortcutHint: Bool
@@ -4756,7 +4719,7 @@ private struct SidebarSplitTabRow: View {
         .padding(.trailing, SidebarLayout.rowHorizontalInset)
         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .background {
-            rowBackground
+            SidebarRowBackground(isSelected: isSelected, isHovered: isHovered, palette: palette)
         }
         .padding(.leading, -SidebarLayout.rowHorizontalInset)
         .onTapGesture {
@@ -4795,22 +4758,6 @@ private struct SidebarSplitTabRow: View {
 
     private var helpText: String {
         paneSessions.map(\.title).joined(separator: " | ")
-    }
-
-    @ViewBuilder
-    private var rowBackground: some View {
-        if isSelected {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(palette.selectedFill)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(palette.selectedStroke, lineWidth: 1)
-                }
-                .shadow(color: palette.selectedShadow, radius: 9, y: 4)
-        } else if isHovered {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(palette.hoverFill)
-        }
     }
 }
 
@@ -5195,11 +5142,11 @@ private final class SidebarInteractionOverlayView: NSView {
         }
     }
 
+    /// `rows` is kept sorted by `minY`.
     private func estimatedRowStep() -> CGFloat {
-        let sortedRows = rows.sorted { $0.rect.minY < $1.rect.minY }
-        guard sortedRows.count > 1 else { return 46 }
+        guard rows.count > 1 else { return 46 }
 
-        let deltas = zip(sortedRows, sortedRows.dropFirst()).map { next, previous in
+        let deltas = zip(rows, rows.dropFirst()).map { next, previous in
             previous.rect.minY - next.rect.minY
         }
         return deltas.first(where: { $0 > 0 }) ?? 46
@@ -5279,13 +5226,6 @@ final class TrafficLightController {
     fileprivate func detach(_ view: TrafficLightOverlayView) {
         guard self.view === view else { return }
         self.view = nil
-    }
-
-    func seedTarget(docked: CGFloat, floating: CGFloat, sidebarWidth: CGFloat) {
-        lastDocked = docked
-        lastFloating = floating
-        lastSidebarWidth = sidebarWidth
-        applyCurrentWhenSafe()
     }
 
     func update(docked: CGFloat, floating: CGFloat, sidebarWidth: CGFloat) {
@@ -5495,11 +5435,6 @@ private final class TrafficLightOverlayView: NSView {
     }
 
     @MainActor
-    func repositionButtons() {
-        applyButtonTranslation(lastTranslationX)
-    }
-
-    @MainActor
     private func scheduleButtonReposition() {
         guard !repositionScheduled else { return }
         repositionScheduled = true
@@ -5507,7 +5442,7 @@ private final class TrafficLightOverlayView: NSView {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.repositionScheduled = false
-                self.repositionButtons()
+                self.applyButtonTranslation(self.lastTranslationX)
             }
         }
     }
@@ -5827,9 +5762,6 @@ private final class SidebarAgentWorkingIndicatorView: NSView {
 }
 
 private struct SidebarAgentPermissionIndicator: View {
-    let isSelected: Bool
-    let palette: SidebarPalette
-
     var body: some View {
         Image(systemName: "hand.raised.fill")
             .font(.system(size: 12, weight: .semibold))
@@ -5868,15 +5800,10 @@ private struct SidebarAgentResultIndicator: View {
 }
 
 private struct SidebarTabRow: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-    @ObservedObject private var agentSettings = AgentSettings.shared
-
     @StateObject private var rowState: SidebarTabRowState
 
     let isSelected: Bool
-    let projectRoot: String?
-    let presentation: SidebarPresentation
+    let palette: SidebarPalette
     let pathDisplayMode: SidebarTerminalPathDisplayMode
     let shortcutNumber: Int
     let showShortcutHint: Bool
@@ -5893,8 +5820,7 @@ private struct SidebarTabRow: View {
     init(
         session: TerminalSession,
         isSelected: Bool,
-        projectRoot: String?,
-        presentation: SidebarPresentation,
+        palette: SidebarPalette,
         pathDisplayMode: SidebarTerminalPathDisplayMode,
         shortcutNumber: Int,
         showShortcutHint: Bool,
@@ -5909,8 +5835,7 @@ private struct SidebarTabRow: View {
             pathDisplayMode: pathDisplayMode
         ))
         self.isSelected = isSelected
-        self.projectRoot = projectRoot
-        self.presentation = presentation
+        self.palette = palette
         self.pathDisplayMode = pathDisplayMode
         self.shortcutNumber = shortcutNumber
         self.showShortcutHint = showShortcutHint
@@ -5922,14 +5847,6 @@ private struct SidebarTabRow: View {
     }
 
     var body: some View {
-        let palette = SidebarPalette(
-            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
-            fallbackColorScheme: colorScheme,
-            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
-            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
-            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
-            presentation: presentation
-        )
         let label = rowState.label
         let nested = nestingDepth > 0
         let nestedGuideReservationWidth = AgentTreeLayout.nestedGuideReservationWidth
@@ -5961,9 +5878,9 @@ private struct SidebarTabRow: View {
                 .padding(.trailing, -6)
             }
 
-            if let icon = rowState.agentIconDescriptor {
+            if let brand = rowState.agentBrand {
                 if !usesInlineAgentIconsForRow {
-                    AgentToolIcon(descriptor: icon, isSelected: isSelected, palette: palette)
+                    AgentToolIcon(brand: brand, isSelected: isSelected, palette: palette)
                 }
             } else if label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
                 if !usesInlineProgramIconsForRow {
@@ -5992,8 +5909,8 @@ private struct SidebarTabRow: View {
                     HStack(spacing: 4) {
                         if let resourceName = label.detailIconResourceName {
                             SidebarDetailIcon(resourceName: resourceName)
-                        } else if usesInlineAgentDetailIcons, let icon = rowState.agentIconDescriptor {
-                            AgentToolInlineIcon(descriptor: icon)
+                        } else if usesInlineAgentDetailIcons, let brand = rowState.agentBrand {
+                            AgentToolInlineIcon(brand: brand)
                         } else if usesInlineProgramDetailIcons,
                                   label.leadingIconResourceName != nil || label.leadingIconFallback != nil {
                             SidebarProgramInlineIcon(label: label)
@@ -6010,7 +5927,7 @@ private struct SidebarTabRow: View {
             Spacer(minLength: 8)
 
             if rowState.agentActivityState == .permission {
-                SidebarAgentPermissionIndicator(isSelected: isSelected, palette: palette)
+                SidebarAgentPermissionIndicator()
             } else if rowState.agentActivityState == .needsInput {
                 SidebarAgentQuestionIndicator()
             } else if rowState.hasUnseenAgentResult, !isSelected {
@@ -6055,7 +5972,7 @@ private struct SidebarTabRow: View {
         .padding(.trailing, SidebarLayout.rowHorizontalInset)
         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .background(alignment: .leading) {
-            rowBackground(palette: palette)
+            SidebarRowBackground(isSelected: isSelected, isHovered: isHovered, palette: palette)
                 .padding(.leading, nestedBackgroundLeadingInset)
         }
         .padding(.leading, -SidebarLayout.rowHorizontalInset)
@@ -6074,22 +5991,6 @@ private struct SidebarTabRow: View {
         .help(rowState.helpText)
     }
 
-    @ViewBuilder
-    private func rowBackground(palette: SidebarPalette) -> some View {
-        if isSelected {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(palette.selectedFill)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(palette.selectedStroke, lineWidth: 1)
-                }
-                .shadow(color: palette.selectedShadow, radius: 9, y: 4)
-        } else if isHovered {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(palette.hoverFill)
-        }
-    }
-
     private var usesInlineAgentIconsForRow: Bool {
         usesInlineAgentDetailIcons && rowState.label.detail != nil
     }
@@ -6103,7 +6004,7 @@ private struct SidebarTabRow: View {
 @MainActor
 private final class SidebarTabRowState: ObservableObject {
     let tint: NSColor
-    private(set) var agentIconDescriptor: AgentToolIconDescriptor?
+    private(set) var agentBrand: AgentToolBrand?
 
     @Published private(set) var label: SidebarTerminalPathLabel
     @Published private(set) var hasUnreadNotification: Bool
@@ -6128,7 +6029,7 @@ private final class SidebarTabRowState: ObservableObject {
         self.session = session
         self.pathDisplayMode = pathDisplayMode
         self.tint = session.tint
-        self.agentIconDescriptor = AgentToolIconDescriptor(
+        self.agentBrand = AgentToolBrand.forSession(
             kind: session.kind,
             agentName: session.agentName,
             title: session.title,
@@ -6174,36 +6075,27 @@ private final class SidebarTabRowState: ObservableObject {
     }
 
     private func observe(_ session: TerminalSession) {
-        session.$hostedAttachmentStatus
-            .removeDuplicates()
-            .sink { [weak self] _ in
-                Task { @MainActor [weak self] in self?.refreshLabel() }
+        // The label is read from the session on a later turn: @Published
+        // emits before the session stores its new value.
+        Publishers.Merge3(
+            session.$hostedAttachmentStatus.removeDuplicates().map { _ in () },
+            Publishers.CombineLatest3(session.$title, session.$titleSource, session.$subtitle)
+                .combineLatest(session.$workingDirectory)
+                .map { _ in () },
+            session.$resolvedCommandLine.removeDuplicates().map { _ in () }
+        )
+        .sink { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshLabel()
             }
-            .store(in: &cancellables)
-
-        Publishers.CombineLatest3(session.$title, session.$titleSource, session.$subtitle)
-            .combineLatest(session.$workingDirectory)
-            .sink { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.refreshLabel()
-                }
-            }
-            .store(in: &cancellables)
+        }
+        .store(in: &cancellables)
 
         session.$hasUnreadNotification
             .removeDuplicates()
             .sink { [weak self] hasUnreadNotification in
                 Task { @MainActor [weak self] in
                     self?.hasUnreadNotification = hasUnreadNotification
-                }
-            }
-            .store(in: &cancellables)
-
-        session.$resolvedCommandLine
-            .removeDuplicates()
-            .sink { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.refreshLabel()
                 }
             }
             .store(in: &cancellables)
@@ -6278,7 +6170,7 @@ private final class SidebarTabRowState: ObservableObject {
 
     private func refreshLabel() {
         guard let session else { return }
-        agentIconDescriptor = AgentToolIconDescriptor(
+        agentBrand = AgentToolBrand.forSession(
             kind: session.kind,
             agentName: session.agentName,
             title: session.title,
@@ -6422,50 +6314,17 @@ private struct NixShellBadge: View {
     }
 }
 
-private struct AgentToolIconDescriptor {
-    let label: String
-    let logoResourceName: String?
-    let rendersAsTemplate: Bool
-
-    private init(
-        label: String,
-        logoResourceName: String? = nil,
-        rendersAsTemplate: Bool = true
-    ) {
-        self.label = label
-        self.logoResourceName = logoResourceName
-        self.rendersAsTemplate = rendersAsTemplate
-    }
-
-    init?(agent: AgentToolDefinition) {
-        guard let brand = AgentToolBrand.detect(
-            name: agent.name,
-            commandLine: agent.commandLine
-        ) else { return nil }
-
-        self.init(
-            label: brand.fallbackLabel,
-            logoResourceName: brand.logoResourceName
-        )
-    }
-
-    init?(
+private extension AgentToolBrand {
+    /// The brand an agent tab's icon shows: nil for a terminal or an agent
+    /// Cherry does not know.
+    static func forSession(
         kind: TerminalSession.SessionKind,
         agentName: String?,
         title: String,
-        commandLine: String? = nil
-    ) {
+        commandLine: String?
+    ) -> AgentToolBrand? {
         guard kind == .agent else { return nil }
-
-        guard let brand = AgentToolBrand.detect(
-            name: agentName ?? title,
-            commandLine: commandLine
-        ) else { return nil }
-
-        self.init(
-            label: brand.fallbackLabel,
-            logoResourceName: brand.logoResourceName
-        )
+        return detect(name: agentName ?? title, commandLine: commandLine)
     }
 }
 
@@ -6502,7 +6361,7 @@ private enum SidebarIconMetrics {
 }
 
 private struct AgentToolIcon: View {
-    let descriptor: AgentToolIconDescriptor
+    let brand: AgentToolBrand
     let isSelected: Bool
     let palette: SidebarPalette
 
@@ -6519,15 +6378,15 @@ private struct AgentToolIcon: View {
                     .fill(iconColor.opacity(isSelected ? 0.18 : 0.10))
             }
 
-            if let logoResourceName = descriptor.logoResourceName {
+            if let logoResourceName = brand.logoResourceName {
                 AgentLogoImage(
                     resourceName: logoResourceName,
-                    rendersAsTemplate: descriptor.rendersAsTemplate,
-                    fallbackLabel: descriptor.label
+                    rendersAsTemplate: true,
+                    fallbackLabel: brand.fallbackLabel
                 )
                 .frame(width: glyphSize, height: glyphSize)
             } else {
-                Text(descriptor.label)
+                Text(brand.fallbackLabel)
                     .font(.system(size: 9, weight: .bold))
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
@@ -6598,7 +6457,7 @@ private struct SidebarDetailIcon: View {
 }
 
 private struct AgentToolInlineIcon: View {
-    let descriptor: AgentToolIconDescriptor
+    let brand: AgentToolBrand
 
     @AppStorage(SidebarIconMetrics.detailGlyphScaleKey) private var detailGlyphScale = SidebarIconMetrics.defaultDetailGlyphScale
     @AppStorage(SidebarIconMetrics.usesIconBackgroundCirclesKey) private var usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
@@ -6607,11 +6466,11 @@ private struct AgentToolInlineIcon: View {
         let glyphSize = SidebarIconMetrics.detailGlyphSize * CGFloat(detailGlyphScale)
 
         ZStack {
-            if let logoResourceName = descriptor.logoResourceName {
+            if let logoResourceName = brand.logoResourceName {
                 AgentLogoImage(
                     resourceName: logoResourceName,
-                    rendersAsTemplate: descriptor.rendersAsTemplate,
-                    fallbackLabel: descriptor.label
+                    rendersAsTemplate: true,
+                    fallbackLabel: brand.fallbackLabel
                 )
                 .frame(width: glyphSize, height: glyphSize)
             } else {
@@ -6620,7 +6479,7 @@ private struct AgentToolInlineIcon: View {
                         .fill(.primary.opacity(0.14))
                 }
 
-                Text(descriptor.label)
+                Text(brand.fallbackLabel)
                     .font(.system(size: 7, weight: .bold))
                     .lineLimit(1)
                     .minimumScaleFactor(0.65)
@@ -6922,168 +6781,6 @@ private struct SidebarPlaygroundOverlay: View {
 
 }
 
-private struct SidebarIconDebugOverlay: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-    @ObservedObject private var agentSettings = AgentSettings.shared
-
-    let projectRoot: String?
-    let presentation: SidebarPresentation
-    let leadingOffset: CGFloat
-    @Binding var isPresented: Bool
-
-    @AppStorage(SidebarIconMetrics.programGlyphScaleKey) private var programGlyphScale = SidebarIconMetrics.defaultProgramGlyphScale
-    @AppStorage(SidebarIconMetrics.detailGlyphScaleKey) private var detailGlyphScale = SidebarIconMetrics.defaultDetailGlyphScale
-    @AppStorage(SidebarIconMetrics.agentGlyphScaleKey) private var agentGlyphScale = SidebarIconMetrics.defaultAgentGlyphScale
-    @AppStorage(SidebarIconMetrics.usesInlineProgramDetailIconsKey) private var usesInlineProgramDetailIcons = SidebarIconMetrics.defaultUsesInlineProgramDetailIcons
-    @AppStorage(SidebarIconMetrics.usesInlineAgentDetailIconsKey) private var usesInlineAgentDetailIcons = SidebarIconMetrics.defaultUsesInlineAgentDetailIcons
-    @AppStorage(SidebarIconMetrics.usesIconBackgroundCirclesKey) private var usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
-
-    private let panelWidth: CGFloat = 430
-    private let topInset: CGFloat = 22
-    private let minimumInset: CGFloat = 8
-    private let trailingInset: CGFloat = 18
-
-    var body: some View {
-        let palette = SidebarPalette(
-            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
-            fallbackColorScheme: colorScheme,
-            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
-            projectColor: agentSettings.projectAppearance(for: projectRoot).color,
-            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
-            presentation: presentation
-        )
-
-        GeometryReader { geometry in
-            panel(palette: palette)
-                .padding(.top, topInset)
-                .padding(.leading, clampedLeadingOffset(in: geometry.size))
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        }
-        .transition(.opacity)
-    }
-
-    private func reset() {
-        SidebarIconMetrics.reset()
-        programGlyphScale = SidebarIconMetrics.defaultProgramGlyphScale
-        detailGlyphScale = SidebarIconMetrics.defaultDetailGlyphScale
-        agentGlyphScale = SidebarIconMetrics.defaultAgentGlyphScale
-        usesInlineProgramDetailIcons = SidebarIconMetrics.defaultUsesInlineProgramDetailIcons
-        usesInlineAgentDetailIcons = SidebarIconMetrics.defaultUsesInlineAgentDetailIcons
-        usesIconBackgroundCircles = SidebarIconMetrics.defaultUsesIconBackgroundCircles
-    }
-
-    private func clampedLeadingOffset(in size: CGSize) -> CGFloat {
-        max(minimumInset, min(leadingOffset, size.width - panelWidth - trailingInset))
-    }
-
-    private func panel(palette: SidebarPalette) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 8) {
-                Text("Icon Debug")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(palette.rowText)
-
-                Spacer()
-
-                Button(action: reset) {
-                    Image(systemName: "arrow.counterclockwise")
-                        .frame(width: 24, height: 24)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(palette.rowText.opacity(0.72))
-                .help("Reset icon tuning")
-
-                Button {
-                    isPresented = false
-                } label: {
-                    Image(systemName: "xmark")
-                        .frame(width: 24, height: 24)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(palette.rowText.opacity(0.72))
-                .help("Close")
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Toggle(isOn: $usesInlineProgramDetailIcons) {
-                    Text("Small terminal icons in detail line")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(palette.rowText.opacity(0.72))
-                }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-
-                Toggle(isOn: $usesInlineAgentDetailIcons) {
-                    Text("Small agent icons in detail line")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(palette.rowText.opacity(0.72))
-                }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-
-                Toggle(isOn: $usesIconBackgroundCircles) {
-                    Text("Icon background circles")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(palette.rowText.opacity(0.72))
-                }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-            }
-
-            VStack(alignment: .leading, spacing: 9) {
-                SidebarIconDebugSlider(
-                    title: "Program",
-                    value: $programGlyphScale,
-                    range: 0.70...1.30,
-                    step: 0.05,
-                    palette: palette
-                )
-
-                SidebarIconDebugSlider(
-                    title: "Detail",
-                    value: $detailGlyphScale,
-                    range: 0.70...1.45,
-                    step: 0.05,
-                    palette: palette
-                )
-
-                SidebarIconDebugSlider(
-                    title: "Agent",
-                    value: $agentGlyphScale,
-                    range: 0.70...1.35,
-                    step: 0.05,
-                    palette: palette
-                )
-            }
-
-            SidebarIconDebugLivePreview(palette: palette)
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    ForEach(SidebarIconDebugResource.Kind.allCases, id: \.self) { kind in
-                        SidebarIconDebugResourceSection(
-                            title: kind.title,
-                            resources: SidebarIconDebugResource.resources(for: kind),
-                            palette: palette
-                        )
-                    }
-                }
-                .padding(.trailing, 2)
-            }
-        }
-        .padding(14)
-        .frame(width: panelWidth)
-        .frame(maxHeight: 680)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(palette.rowText.opacity(0.12), lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.28), radius: 22, y: 14)
-    }
-}
-
 private struct SidebarIconDebugSlider: View {
     let title: String
     @Binding var value: Double
@@ -7137,12 +6834,8 @@ private struct SidebarIconDebugLivePreview: View {
             }
 
             previewItem("Agent") {
-                if let descriptor = AgentToolIconDescriptor(
-                    kind: .agent,
-                    agentName: "Codex",
-                    title: "Codex"
-                ) {
-                    AgentToolIcon(descriptor: descriptor, isSelected: false, palette: palette)
+                if let brand = AgentToolBrand.detect(name: "Codex") {
+                    AgentToolIcon(brand: brand, isSelected: false, palette: palette)
                 }
             }
         }
@@ -7217,10 +6910,11 @@ private struct SidebarIconDebugAgentPreview: View {
                 showsDisclosure: true
             )
 
-            SidebarIconDebugAgentChildrenGroup(
+            SidebarAgentChildrenGroup(
                 children: SidebarIconDebugFixtures.agentChildren,
                 palette: palette,
-                isActive: true
+                isActive: true,
+                hasDetail: { $0.detail != nil }
             ) { child in
                 SidebarIconDebugPreviewRow(
                     title: child.title,
@@ -7240,99 +6934,6 @@ private struct SidebarIconDebugAgentPreview: View {
                 palette: palette
             )
         }
-    }
-}
-
-private struct SidebarIconDebugAgentChildrenGroup<RowContent: View>: View {
-    let children: [SidebarIconDebugPreviewAgent]
-    let palette: SidebarPalette
-    let isActive: Bool
-    let rowContent: (SidebarIconDebugPreviewAgent) -> RowContent
-
-    init(
-        children: [SidebarIconDebugPreviewAgent],
-        palette: SidebarPalette,
-        isActive: Bool,
-        @ViewBuilder rowContent: @escaping (SidebarIconDebugPreviewAgent) -> RowContent
-    ) {
-        self.children = children
-        self.palette = palette
-        self.isActive = isActive
-        self.rowContent = rowContent
-    }
-
-    var body: some View {
-        ZStack(alignment: .topLeading) {
-            SidebarIconDebugAgentChildrenGuide(
-                children: children,
-                palette: palette,
-                isActive: isActive
-            )
-
-            VStack(alignment: .leading, spacing: SidebarLayout.agentTreeRowSpacing) {
-                ForEach(children) { child in
-                    rowContent(child)
-                }
-            }
-        }
-    }
-}
-
-private struct SidebarIconDebugAgentChildrenGuide: View {
-    let children: [SidebarIconDebugPreviewAgent]
-    let palette: SidebarPalette
-    let isActive: Bool
-
-    var body: some View {
-        let x = AgentTreeLayout.guideX
-        let elbowWidth = AgentTreeLayout.guideElbowWidth
-        let elbowX = x + AgentTreeLayout.guideElbowStartInset
-        let connectorLength = AgentTreeLayout.guideConnectorLength
-        let connectorDashLength = AgentTreeLayout.guideConnectorDashLength
-        let connectorDashGap = AgentTreeLayout.guideConnectorDashGap
-        let connectorX = x + AgentTreeLayout.guideConnectorOffsetX
-        let connectorY = AgentTreeLayout.guideConnectorOffsetY
-        let topOverlap = AgentTreeLayout.guideTopOverlap
-        let bottomOverlap = AgentTreeLayout.guideBottomOverlap
-        let color = palette.rowText.opacity(isActive ? 0.16 : 0.08)
-        let lastCenterY = centerY(forChildAt: max(children.count - 1, 0))
-
-        ZStack(alignment: .topLeading) {
-            Path { path in
-                path.move(to: CGPoint(x: connectorX, y: connectorY - connectorLength))
-                path.addLine(to: CGPoint(x: connectorX, y: connectorY + connectorLength))
-            }
-            .stroke(
-                color,
-                style: StrokeStyle(lineWidth: 1, lineCap: .round, dash: [connectorDashLength, connectorDashGap])
-            )
-
-            Rectangle()
-                .fill(color)
-                .frame(width: 1, height: lastCenterY + topOverlap + bottomOverlap)
-                .offset(x: x, y: -topOverlap)
-
-            ForEach(Array(children.enumerated()), id: \.element.id) { index, _ in
-                Rectangle()
-                    .fill(color)
-                    .frame(width: elbowWidth, height: 1)
-                    .offset(x: elbowX, y: centerY(forChildAt: index))
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
-
-    private func centerY(forChildAt index: Int) -> CGFloat {
-        guard index > 0 else { return rowHeight / 2 }
-        return rowHeight * CGFloat(index)
-            + SidebarLayout.agentTreeRowSpacing * CGFloat(index)
-            + rowHeight / 2
-    }
-
-    private var rowHeight: CGFloat {
-        AgentTreeLayout.childDetailRowHeight
     }
 }
 
@@ -7574,12 +7175,8 @@ private struct SidebarIconDebugPreviewRow: View {
     private var iconView: some View {
         switch icon {
         case .agent(let name):
-            if let descriptor = AgentToolIconDescriptor(
-                kind: .agent,
-                agentName: name,
-                title: name
-            ) {
-                AgentToolIcon(descriptor: descriptor, isSelected: isSelected, palette: palette)
+            if let brand = AgentToolBrand.detect(name: name) {
+                AgentToolIcon(brand: brand, isSelected: isSelected, palette: palette)
             } else {
                 Color.clear
                     .frame(width: SidebarIconMetrics.agentFrameSize, height: SidebarIconMetrics.agentFrameSize)
@@ -7614,12 +7211,8 @@ private struct SidebarIconDebugPreviewRow: View {
     private var inlineIconView: some View {
         switch icon {
         case .agent(let name):
-            if let descriptor = AgentToolIconDescriptor(
-                kind: .agent,
-                agentName: name,
-                title: name
-            ) {
-                AgentToolInlineIcon(descriptor: descriptor)
+            if let brand = AgentToolBrand.detect(name: name) {
+                AgentToolInlineIcon(brand: brand)
             }
         case .program(let resourceName, let fallback):
             SidebarProgramInlineIcon(
@@ -8412,6 +8005,15 @@ private final class TerminalSplitDividerHandleView: NSView {
     }
 }
 
+private extension View {
+    /// A status bar's place over a terminal pane: centered at its bottom,
+    /// `ProjectWindowToastOverlay.bottomInset` above the edge.
+    func bottomStatusBarPlacement() -> some View {
+        frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .padding(.bottom, 14)
+    }
+}
+
 private struct TerminalSceneView: View {
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject var session: TerminalSession
@@ -8427,38 +8029,31 @@ private struct TerminalSceneView: View {
 
             if session.kind == .command {
                 CommandExitStatusBar(session: session)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                    .padding(.bottom, 14)
+                    .bottomStatusBarPlacement()
             }
 
             PersistentSessionReconnectBar(session: session)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                .padding(.bottom, 14)
+                .bottomStatusBarPlacement()
 
             HostWaitingBar(session: session)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                .padding(.bottom, 14)
+                .bottomStatusBarPlacement()
 
             PersistentSessionFallbackBar(session: session)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                .padding(.bottom, 14)
+                .bottomStatusBarPlacement()
 
             // A device's tab: its Mac offline, or it could not start there.
             RemoteHostStateBar(session: session)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                .padding(.bottom, 14)
+                .bottomStatusBarPlacement()
 
             RemoteLaunchFailureBar(session: session)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                .padding(.bottom, 14)
+                .bottomStatusBarPlacement()
 
             SharedSessionBar(session: session)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .padding(.top, 8)
 
             PersistentSessionEndedBar(session: session, close: closeHostedSession.map { close in { close(session) } })
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                .padding(.bottom, 14)
+                .bottomStatusBarPlacement()
 
             if isActivePane, chromeState.isTerminalSearchPresented {
                 TerminalSearchOverlay(
@@ -8543,23 +8138,15 @@ private struct TerminalSceneView: View {
     }
 
     private var backgroundColors: [Color] {
-        switch colorScheme {
-        case .light:
-            [
+        colorScheme == .light
+            ? [
                 Color(nsColor: NSColor(calibratedRed: 0.96, green: 0.98, blue: 0.99, alpha: 1)),
                 Color(nsColor: NSColor(calibratedRed: 0.91, green: 0.94, blue: 0.96, alpha: 1))
             ]
-        case .dark:
-            [
+            : [
                 Color(nsColor: NSColor(calibratedRed: 0.06, green: 0.08, blue: 0.10, alpha: 1)),
                 Color(nsColor: NSColor(calibratedRed: 0.04, green: 0.05, blue: 0.07, alpha: 1))
             ]
-        @unknown default:
-            [
-                Color(nsColor: NSColor(calibratedRed: 0.06, green: 0.08, blue: 0.10, alpha: 1)),
-                Color(nsColor: NSColor(calibratedRed: 0.04, green: 0.05, blue: 0.07, alpha: 1))
-            ]
-        }
     }
 
     private func configureSearchHandlersIfActive() {
@@ -8622,12 +8209,6 @@ struct TerminalContextBarContent: Equatable {
     /// "patstudio:" before a device tab's path; nil on This Mac.
     var devicePrefix: String? {
         device.map { "\($0.name):" }
-    }
-
-    /// The whole breadcrumb as read out: "[<Mac>: ]<path>  ›  <label>".
-    var breadcrumb: String {
-        let path = "\(displayPath)  ›  \(sessionLabel)"
-        return devicePrefix.map { "\($0) \(path)" } ?? path
     }
 
     var sessionLabel: String {
@@ -8710,17 +8291,17 @@ private struct TerminalContextBar: View, Equatable {
 
     @ViewBuilder
     private var leadingIcon: some View {
-        if let descriptor = AgentToolIconDescriptor(
+        if let brand = AgentToolBrand.forSession(
             kind: content.kind,
             agentName: content.agentName,
             title: content.title,
             commandLine: content.subtitle
         ),
-           let logoResourceName = descriptor.logoResourceName {
+           let logoResourceName = brand.logoResourceName {
             AgentLogoImage(
                 resourceName: logoResourceName,
-                rendersAsTemplate: descriptor.rendersAsTemplate,
-                fallbackLabel: descriptor.label
+                rendersAsTemplate: true,
+                fallbackLabel: brand.fallbackLabel
             )
         } else {
             Image(systemName: content.kind == .agent ? "sparkles" : "terminal")
@@ -8791,16 +8372,7 @@ private struct CommandExitStatusBar: View {
                 }
                 .controlSize(.small)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
-            .frame(maxWidth: 460)
-            .projectWindowToastObstacle()
+            .floatingBarChrome()
         }
     }
 }
@@ -8830,16 +8402,7 @@ private struct PersistentSessionReconnectBar: View {
                 }
                 .controlSize(.small)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
-            .frame(maxWidth: 460)
-            .projectWindowToastObstacle()
+            .floatingBarChrome()
         }
     }
 }
@@ -8880,16 +8443,7 @@ private struct HostWaitingBarContent: View {
             }
             .controlSize(.small)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-        }
-        .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
-        .frame(maxWidth: 460)
-        .projectWindowToastObstacle()
+        .floatingBarChrome()
     }
 }
 
@@ -8920,16 +8474,7 @@ private struct PersistentSessionFallbackBar: View {
                 .controlSize(.small)
                 .help("Start this tab's program again as a persistent session. The program running now ends.")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
-            .frame(maxWidth: 460)
-            .projectWindowToastObstacle()
+            .floatingBarChrome()
         }
     }
 }
@@ -9013,16 +8558,7 @@ private struct PersistentSessionEndedBar: View {
                         ? "Close this tab"
                         : "Close this tab and remove its ended session from This Mac's session host")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
-            .frame(maxWidth: 460)
-            .projectWindowToastObstacle()
+            .floatingBarChrome()
         }
     }
 }
@@ -9079,7 +8615,7 @@ private struct TerminalSearchOverlay: View {
             .buttonStyle(.plain)
             .help("Find Next")
 
-            Button(action: close) {
+            Button(action: onClose) {
                 Image(systemName: "xmark")
                     .terminalSearchButtonLabel()
             }
@@ -9113,7 +8649,7 @@ private struct TerminalSearchOverlay: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             searchState.readQueryFromPasteboard()
         }
-        .onExitCommand(perform: close)
+        .onExitCommand(perform: onClose)
     }
 
     private func focusSearchField() {
@@ -9137,10 +8673,6 @@ private struct TerminalSearchOverlay: View {
 
     private func navigate(_ direction: TerminalSearchArrowDirection) {
         session.ghosttyBridge.navigateSearch(direction)
-    }
-
-    private func close() {
-        onClose()
     }
 }
 

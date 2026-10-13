@@ -1203,14 +1203,6 @@ struct CherryApp: App {
                 .keyboardShortcut("s")
                 .disabled(focusedChromeState == nil)
 
-                if PrototypeFeatureFlags.isIconDebugEnabled {
-                    Button(focusedChromeState?.isIconDebugOverlayPresented == true ? "Hide Icon Debug Overlay" : "Show Icon Debug Overlay") {
-                        keyWindowChromeState?.toggleIconDebugOverlay()
-                    }
-                    .keyboardShortcut("i", modifiers: [.command, .shift])
-                    .disabled(focusedChromeState == nil)
-                }
-
                 Button(focusedChromeState?.isSidebarPlaygroundPresented == true ? "Hide Sidebar Icon Playground" : "Show Sidebar Icon Playground") {
                     keyWindowChromeState?.toggleSidebarPlayground()
                 }

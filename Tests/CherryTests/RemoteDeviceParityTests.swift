@@ -905,12 +905,11 @@ private final class FakePeeks {
     let files = [URL(fileURLWithPath: "/tmp/a b.png"), URL(fileURLWithPath: "/tmp/notes.txt")]
     pasteboard.clearContents()
     pasteboard.writeObjects(files as [NSURL])
-    #expect(RemoteFileDrop.localFiles(from: pasteboard, preferringText: true) == files)
+    #expect(PastedContent(pasteboard: pasteboard) == .files(files))
     // Text is pasted as usual.
     pasteboard.clearContents()
     pasteboard.setString("echo hi", forType: .string)
-    #expect(RemoteFileDrop.localFiles(from: pasteboard, preferringText: true) == nil)
-    #expect(RemoteFileDrop.localFiles(from: pasteboard, preferringText: false) == nil)
+    #expect(PastedContent(pasteboard: pasteboard) == .text)
 
     #expect(RemoteFileDrop.insertionText(remotePaths: ["/var/t/cherry-drop.1/a b.png", "/var/t/cherry-drop.1/notes.txt"])
         == "'/var/t/cherry-drop.1/a b.png' /var/t/cherry-drop.1/notes.txt ")

@@ -10,41 +10,6 @@ import Foundation
 
 /// The files of a paste or drop, and what is inserted for them.
 enum RemoteFileDrop {
-    /// What a paste or drop on a device's tab carries that Cherry copies
-    /// there: This Mac's files, or an image with no text (a screenshot).
-    enum Content: Equatable {
-        case files([URL])
-        /// The image, as PNG.
-        case image(Data)
-    }
-
-    /// Its files or image; nil when it is text (pasted as usual) or
-    /// nothing Cherry copies. File URLs win over the text that comes with
-    /// them (Finder puts their names on the pasteboard too); an image is
-    /// copied only when there is no text.
-    static func content(from pasteboard: NSPasteboard, preferringText: Bool) -> Content? {
-        switch PastedContent(pasteboard: pasteboard) {
-        case .files(let urls): return .files(urls)
-        case .image(let png): return .image(png)
-        case .text, .nothing: return nil
-        }
-    }
-
-    /// This Mac's files a paste or drop carries: its file URLs, or its
-    /// image written to a file (`PastedImageStore`) first. Nil when it is
-    /// text or nothing Cherry copies.
-    static func localFiles(
-        from pasteboard: NSPasteboard,
-        preferringText: Bool,
-        imageDirectory: URL = TerminalPasteboardContent.defaultImageDirectory
-    ) -> [URL]? {
-        switch content(from: pasteboard, preferringText: preferringText) {
-        case .files(let urls): return urls
-        case .image(let png): return (try? PastedImageStore.save(png, in: imageDirectory)).map { [$0] }
-        case nil: return nil
-        }
-    }
-
     /// The paths inserted: each escaped for a shell (and the agents' input
     /// parsing), separated and followed by a space, as a drop inserts them.
     static func insertionText(remotePaths: [String]) -> String {
@@ -174,24 +139,22 @@ enum RemoteFileDropCoordinator {
     /// written, and how a failed copy is reported.
     static var ask: Asker = presentQuestion
     static var makeCopier: @MainActor (RemoteDevice) async -> RemoteFileCopier = { device in
-        var shell = await RemoteDeviceShell.app()
-        shell.controlPath = HostSSHMasterManager.shared.controlPathIfUp(for: device.sshDestination)
+        let shell = await RemoteDeviceShell.app(through: device.sshDestination)
         return RemoteFileCopier(shell: shell, destination: device.sshDestination, machine: device.name)
     }
-    static var device: @MainActor (HostedSessionHost) -> RemoteDevice? = { host in
-        RemoteDeviceStore.shared.devices.first { $0.host == host }
-    }
+    static var device: @MainActor (HostedSessionHost) -> RemoteDevice? = { RemoteDeviceStore.shared.device(for: $0) }
     static var imageDirectory: @MainActor () -> URL = { PastedImageStore.defaultDirectory }
     static var reportFailure: @MainActor (_ title: String, _ message: String, NSWindow?) -> Void = presentFailure
     /// The latest copy under way (tests wait for it).
     private(set) static var lastCopy: Task<Void, Never>?
 
     /// Whether `session`'s paste or drop of `pasteboard` is for this: a tab
-    /// of another Mac, with files or an image. Then it asks (not for an
-    /// image), and copies and inserts (`insert`) when confirmed; true
-    /// either way (nothing is inserted meanwhile). A pasted image's path is
-    /// inserted as a paste of This Mac's image is (the path alone); dropped
-    /// files and images as a drop inserts paths (each followed by a space).
+    /// of another Mac, with files or an image (`PastedContent`; text is
+    /// pasted as usual). Then it asks (not for an image), and copies and
+    /// inserts (`insert`) when confirmed; true either way (nothing is
+    /// inserted meanwhile). A pasted image's path is inserted as a paste of
+    /// This Mac's image is (the path alone); dropped files and images as a
+    /// drop inserts paths (each followed by a space).
     @discardableResult
     static func handle(
         _ pasteboard: NSPasteboard,
@@ -200,12 +163,10 @@ enum RemoteFileDropCoordinator {
         window: NSWindow?,
         insert: @escaping @MainActor (String) -> Void
     ) -> Bool {
-        guard let hosting = session.persistentHosting, !hosting.profile.isThisMac,
-              let content = RemoteFileDrop.content(from: pasteboard, preferringText: isPaste)
-        else { return false }
+        guard let hosting = session.persistentHosting, !hosting.profile.isThisMac else { return false }
         let machine = hosting.profile.displayName
         let host = hosting.profile.host
-        switch content {
+        switch PastedContent(pasteboard: pasteboard) {
         case .files(let files):
             ask(RemoteFileDrop.Question(files: files, machine: machine), window) { confirmed in
                 guard confirmed else { return }
@@ -218,6 +179,8 @@ enum RemoteFileDropCoordinator {
             copy([file], to: host, machine: machine, window: window, what: "The image was") { paths in
                 insert(isPaste ? PastedImage.quoted(paths[0]) : RemoteFileDrop.insertionText(remotePaths: paths))
             }
+        case .text, .nothing:
+            return false
         }
         return true
     }
@@ -349,8 +312,7 @@ struct RemoteClipboardSetter: Sendable {
 @MainActor
 enum RemoteClipboardImagePaste {
     static var makeSetter: @MainActor (RemoteDevice) async -> RemoteClipboardSetter = { device in
-        var shell = await RemoteDeviceShell.app()
-        shell.controlPath = HostSSHMasterManager.shared.controlPathIfUp(for: device.sshDestination)
+        let shell = await RemoteDeviceShell.app(through: device.sshDestination)
         return RemoteClipboardSetter(shell: shell, destination: device.sshDestination, machine: device.name)
     }
     static var showToast: @MainActor (ProjectWindowToast, NSWindow?) -> Void = { toast, window in

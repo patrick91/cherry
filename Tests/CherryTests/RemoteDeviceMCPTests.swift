@@ -957,7 +957,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     let claudeLog = try String(contentsOf: root.appendingPathComponent("claude.log"), encoding: .utf8)
     #expect(claudeLog.components(separatedBy: "\n").filter { $0.hasPrefix("mcp add") }.count == 2)
     // The sheet shows exactly these commands.
-    #expect(RemoteMCPSetup.commands(mode: .install, name: "cherry").contains(
+    #expect(RemoteMCPSetup.installCommands(name: "cherry").contains(
         "claude mcp remove --scope user cherry; claude mcp add --scope user --transport stdio cherry -- \"$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp\""
     ))
 }

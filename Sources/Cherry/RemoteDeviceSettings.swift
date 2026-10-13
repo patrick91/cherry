@@ -149,13 +149,7 @@ final class RemoteDeviceSettingsModel: ObservableObject {
     /// Reconnect: connects its control again (now, when it waits to).
     func reconnect(_ id: UUID) {
         guard let host = store.device(id: id)?.host else { return }
-        RemoteDevicePeeks.shared.retry(host)
-        let control = control(host)
-        if case .waitingToReconnect = control.state {
-            control.reconnectNow()
-        } else {
-            Task { _ = try? await control.connect(retryingLoginEnvironment: true) }
-        }
+        control(host).reconnectAsked()
     }
 }
 

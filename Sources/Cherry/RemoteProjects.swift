@@ -36,21 +36,6 @@ struct RemoteProjectInfo: Decodable, Equatable, Sendable {
         case cherryToml = "cherry_toml"
     }
 
-    init(path: String, exists: Bool, isDirectory: Bool, cherryToml: CherryToml? = nil) {
-        self.path = path
-        self.exists = exists
-        self.isDirectory = isDirectory
-        self.cherryToml = cherryToml
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        path = try container.decode(String.self, forKey: .path)
-        exists = try container.decode(Bool.self, forKey: .exists)
-        isDirectory = try container.decode(Bool.self, forKey: .isDirectory)
-        cherryToml = try container.decodeIfPresent(CherryToml.self, forKey: .cherryToml)
-    }
-
     /// Its cherry.toml text when it has one Cherry can use: at most
     /// `RemoteProjectAccess.cherryTomlLimit` bytes (the host sends no more,
     /// and a larger text is refused here too).
@@ -128,12 +113,7 @@ struct RemoteProjectAccess: Sendable {
             deviceName: device.name,
             destination: destination,
             remoteHostPath: device.remoteHostPath,
-            shell: {
-                var shell = await RemoteDeviceShell.app()
-                shell.controlPath = masters.controlPathIfUp(for: destination)
-                shell.timeout = 120
-                return shell
-            }
+            shell: { await RemoteDeviceShell.app(through: destination, masters: masters, timeout: 120) }
         )
     }
 
@@ -155,15 +135,13 @@ struct RemoteProjectAccess: Sendable {
     /// `CHERRY_GIT` is unset, so project-info runs no git (Cherry reads no
     /// git state of a device's project).
     static func projectInfoScript(paths: [String], remoteHostPath: String?) -> String {
-        var lines = ["unset CHERRY_GIT"]
-        if let path = remoteHostPath?.nilIfEmpty {
-            lines.append("host=\(RemoteDeviceProbe.shellWord(path))")
-        } else {
-            lines.append("host=cherry-host")
-        }
-        lines.append("printf '%s\\n' '\(projectInfoBegin)'")
-        lines.append("exec \"$host\" project-info --json " + paths.map(RemoteDeviceProbe.singleQuoted).joined(separator: " "))
-        return lines.joined(separator: "\n") + "\n"
+        RemoteDeviceProbe.hostCommandScript(
+            remoteHostPath: remoteHostPath,
+            begin: projectInfoBegin,
+            command: "project-info",
+            arguments: paths.map(RemoteDeviceProbe.singleQuoted),
+            prelude: ["unset CHERRY_GIT"]
+        )
     }
 
     /// Parses what the script printed.
@@ -200,12 +178,8 @@ struct RemoteProjectAccess: Sendable {
 
     /// Asks the device about `paths` (its folders).
     func projectInfo(paths: [String]) async throws -> RemoteProjectInfoReport {
-        let shell = await shell()
         let script = Self.projectInfoScript(paths: paths, remoteHostPath: remoteHostPath)
-        let destination = destination
-        let output = await Task.detached(priority: .userInitiated) {
-            shell.runSynchronously(script, on: destination)
-        }.value
+        let output = await shell().runData(script, on: destination)
         return try Self.parseProjectInfo(output, machine: deviceName)
     }
 }
@@ -218,35 +192,23 @@ struct RemoteProjectAccess: Sendable {
 final class RemoteProjectFiles: ObservableObject {
     static let shared = RemoteProjectFiles()
 
-    struct Entry: Equatable {
-        /// Its text; nil when the project has none (or it cannot be used).
-        var text: String?
-        /// Why it cannot be used (too large, not UTF-8).
-        var problem: String?
-    }
-
-    @Published private(set) var entries: [String: Entry] = [:]
-    /// Bumped on each change: `CherryProjectFile`'s parse cache follows it.
-    private(set) var generation = 0
-
-    func entry(for key: String) -> Entry? {
-        entries[ProjectLocation(key: key).key]
-    }
+    /// Each project's cherry.toml text; none when the project has none (or
+    /// it cannot be used: too large, not UTF-8).
+    @Published private(set) var texts: [String: String] = [:]
 
     func text(for key: String) -> String? {
-        entry(for: key)?.text
+        texts[ProjectLocation(key: key).key]
     }
 
     /// What `info` said of the project at `key`.
     func record(_ info: RemoteProjectInfo, for key: String) {
-        set(Entry(text: info.cherryTomlText, problem: info.cherryTomlProblem), for: key)
+        set(info.cherryTomlText, for: key)
     }
 
-    func set(_ entry: Entry?, for key: String) {
+    func set(_ text: String?, for key: String) {
         let key = ProjectLocation(key: key).key
-        guard entries[key] != entry else { return }
-        entries[key] = entry
-        generation += 1
+        guard texts[key] != text else { return }
+        texts[key] = text
         CherryProjectFile.invalidate(projectRoot: key)
     }
 }

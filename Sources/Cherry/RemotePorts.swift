@@ -63,25 +63,14 @@ struct RemotePortScanner: Sendable {
             deviceName: device.name,
             destination: destination,
             remoteHostPath: device.remoteHostPath,
-            shell: {
-                var shell = await RemoteDeviceShell.app()
-                shell.controlPath = masters.controlPathIfUp(for: destination)
-                shell.timeout = 20
-                return shell
-            }
+            shell: { await RemoteDeviceShell.app(through: destination, masters: masters, timeout: 20) }
         )
     }
 
     static func script(pids: [Int32], remoteHostPath: String?) -> String {
-        var lines: [String] = []
-        if let path = remoteHostPath?.nilIfEmpty {
-            lines.append("host=\(RemoteDeviceProbe.shellWord(path))")
-        } else {
-            lines.append("host=cherry-host")
-        }
-        lines.append("printf '%s\\n' '\(begin)'")
-        lines.append("exec \"$host\" ports --json " + pids.map { String($0) }.joined(separator: " "))
-        return lines.joined(separator: "\n") + "\n"
+        RemoteDeviceProbe.hostCommandScript(
+            remoteHostPath: remoteHostPath, begin: begin, command: "ports", arguments: pids.map { String($0) }
+        )
     }
 
     /// Parses what the script printed (`RemoteProjectError` as
@@ -113,12 +102,8 @@ struct RemotePortScanner: Sendable {
     }
 
     func ports(of pids: [Int32]) async throws -> RemotePortReport {
-        let shell = await shell()
         let script = Self.script(pids: pids, remoteHostPath: remoteHostPath)
-        let destination = destination
-        let output = await Task.detached(priority: .userInitiated) {
-            shell.runSynchronously(script, on: destination)
-        }.value
+        let output = await shell().runData(script, on: destination)
         return try Self.parse(output, machine: deviceName)
     }
 }
@@ -405,36 +390,16 @@ final class RemotePortForwards {
     }
 
     /// A TCP port no one listens on at This Mac's IPv4 loopback (where
-    /// forwards listen): the kernel's choice for port 0.
+    /// forwards listen): the kernel's choice for port 0, from a socket bound
+    /// there (and closed).
     static func unusedLocalPort() -> Int? {
-        bindLoopback(port: 0, ipv6: false)
-    }
-
-    /// Binds (and closes) a socket on the loopback; the port it had.
-    private static func bindLoopback(port: Int, ipv6: Bool) -> Int? {
-        let descriptor = socket(ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0)
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
         guard descriptor >= 0 else { return nil }
         defer { close(descriptor) }
-        if ipv6 {
-            var address = sockaddr_in6()
-            address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-            address.sin6_family = sa_family_t(AF_INET6)
-            address.sin6_port = in_port_t(UInt16(port).bigEndian)
-            address.sin6_addr = in6addr_loopback
-            let bound = withUnsafePointer(to: &address) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) }
-            }
-            guard bound == 0 else { return nil }
-            var length = socklen_t(MemoryLayout<sockaddr_in6>.size)
-            guard withUnsafeMutablePointer(to: &address, {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &length) }
-            }) == 0 else { return nil }
-            return Int(UInt16(bigEndian: address.sin6_port))
-        }
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = in_port_t(UInt16(port).bigEndian)
+        address.sin_port = 0
         address.sin_addr = in_addr(s_addr: in_addr_t(UInt32(0x7F00_0001).bigEndian))
         let bound = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
@@ -460,9 +425,7 @@ enum RemoteURLOpening {
     /// Test seams.
     static var opener: @MainActor (URL) -> Void = { NSWorkspace.shared.open($0) }
     static var forwards: @MainActor () -> RemotePortForwards = { .shared }
-    static var device: @MainActor (HostedSessionHost) -> RemoteDevice? = { host in
-        RemoteDeviceStore.shared.devices.first { $0.host == host }
-    }
+    static var device: @MainActor (HostedSessionHost) -> RemoteDevice? = { RemoteDeviceStore.shared.device(for: $0) }
     static var showToast: @MainActor (ProjectWindowToast, NSWindow?) -> Void = { toast, window in
         guard let window, let chromeState = ProjectWindowRegistry.shared.chromeState(for: window) else { return }
         chromeState.toasts.show(toast)
@@ -598,9 +561,7 @@ struct RemoteInspectableProcess {
 /// URL there. A port that could not be forwarded says why (`forwardError`).
 @MainActor
 struct DeviceServiceDetector {
-    var device: @MainActor (HostedSessionHost) -> RemoteDevice? = { host in
-        RemoteDeviceStore.shared.devices.first { $0.host == host }
-    }
+    var device: @MainActor (HostedSessionHost) -> RemoteDevice? = { RemoteDeviceStore.shared.device(for: $0) }
     var scanner: @MainActor (RemoteDevice) -> RemotePortScanner = { RemotePortScanner.app($0) }
     /// The forwards to make new ones with (`forwarding`).
     var forwards: @MainActor () -> RemotePortForwards = { .shared }

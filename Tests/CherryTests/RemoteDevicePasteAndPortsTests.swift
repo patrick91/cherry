@@ -96,6 +96,7 @@ private final class PrivatePasteboard {
     board.pasteboard.setString("echo hi", forType: .string)
     board.pasteboard.setData(onePixelPNG, forType: .png)
 
+    // Text, also in a device tab (`RemoteFileDropCoordinator`): nothing to copy.
     #expect(PastedContent(pasteboard: board.pasteboard) == .text)
     let savedDirectory = LocalImagePaste.directory
     defer { LocalImagePaste.directory = savedDirectory }
@@ -106,8 +107,6 @@ private final class PrivatePasteboard {
     ))
     #expect(String(decoding: data, as: UTF8.self) == "echo hi")
     #expect(board.saved.isEmpty)
-    // A device tab's paste of it is text too: nothing to copy.
-    #expect(RemoteFileDrop.content(from: board.pasteboard, preferringText: true) == nil)
 }
 
 @Test @MainActor func RemoteDevicePasteOfFileURLsKeepsTheFileBehaviour() throws {
@@ -122,6 +121,7 @@ private final class PrivatePasteboard {
     board.pasteboard.setString("shot.png", forType: .string)
     board.pasteboard.setData(try tiffImage(), forType: .tiff)
 
+    // A device tab asks about the file, as before (not an image copy).
     #expect(PastedContent(pasteboard: board.pasteboard) == .files([file]))
     let savedDirectory = LocalImagePaste.directory
     defer { LocalImagePaste.directory = savedDirectory }
@@ -130,9 +130,6 @@ private final class PrivatePasteboard {
     // This Mac's host-routed paste pastes the text, as before.
     #expect(TerminalPasteboardContent.pasteText(from: board.pasteboard, imageDirectory: board.directory) == "shot.png")
     #expect(board.saved.isEmpty)
-    // A device tab asks about the file, as before (not an image copy).
-    #expect(RemoteFileDrop.content(from: board.pasteboard, preferringText: true) == .files([file]))
-    #expect(RemoteFileDrop.content(from: board.pasteboard, preferringText: false) == .files([file]))
 }
 
 @Test @MainActor func RemoteDevicePastedImagesOlderThanAWeekArePruned() throws {

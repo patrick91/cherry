@@ -938,7 +938,6 @@ struct RemoteHostInstaller: Sendable {
             "  for tree in Ghostty terminfo; do [ -d \"$src/$tree\" ] && \(Tool.xattr) -cr \"$src/$tree\" 2>/dev/null; done",
             "  [ -f \"$src/CherryMCP\" ] && \(Tool.xattr) -c \"$src/CherryMCP\" 2>/dev/null",
             "  printf 'resources_hash=%s\\n' \"$(resources_hash \"$src\")\"",
-            "  printf 'xattrs=%s\\n' \"$(\(Tool.xattr) \"$src/cherry\" \"$src/cherry-host\" 2>/dev/null | tr '\\n' ' ')\"",
             "  if signature=$(\(Tool.codesign) --verify --strict \"$src/cherry-host\" 2>&1) && signature=$(\(Tool.codesign) --verify --strict \"$src/cherry\" 2>&1); then",
             "    echo codesign=ok",
             "  else",
@@ -1144,8 +1143,6 @@ struct RemoteHostInstaller: Sendable {
         var version: RemoteHostVersionReport?
         var hashes: [String] = []
         var missing = false
-        /// Extended attributes still on the files after `xattr -c`.
-        var remainingAttributes: String?
         /// The copy's Ghostty resources digest (`-`: none).
         var resourcesHash: String?
 
@@ -1159,7 +1156,6 @@ struct RemoteHostInstaller: Sendable {
                 case "verify": version = try? JSONDecoder().decode(RemoteHostVersionReport.self, from: Data(value.utf8))
                 case "hashes": hashes = value.split(separator: " ").map(String.init)
                 case "missing": missing = true
-                case "xattrs": remainingAttributes = value.trimmingCharacters(in: .whitespaces).nilIfEmpty
                 default: break
                 }
             }

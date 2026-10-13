@@ -145,13 +145,7 @@ struct ProjectSwitcherActions {
             store.hideProject(path: path, on: deviceID)
         case .reconnectDevice(let deviceID):
             guard let host = store.device(id: deviceID)?.host else { return }
-            RemoteDevicePeeks.shared.retry(host)
-            let control = HostControlRegistry.shared.control(for: host)
-            if case .waitingToReconnect = control.state {
-                control.reconnectNow()
-            } else {
-                Task { _ = try? await control.connect(retryingLoginEnvironment: true) }
-            }
+            HostControlRegistry.shared.control(for: host).reconnectAsked()
         case .trustDeviceIdentity(let deviceID):
             RemoteDeviceAlerts.confirmTrustNewIdentity(of: deviceID, store: store)
         case .updateDeviceHost(let deviceID):

@@ -49,6 +49,17 @@ struct RemoteDeviceShell: Sendable {
         }.value
     }
 
+    /// The app's, through `destination`'s SSH master while it is up (else
+    /// its own BatchMode ssh).
+    static func app(
+        through destination: String, masters: HostSSHMasterManager = .shared, timeout: TimeInterval? = nil
+    ) async -> RemoteDeviceShell {
+        var shell = await app()
+        shell.controlPath = masters.controlPathIfUp(for: destination)
+        if let timeout { shell.timeout = timeout }
+        return shell
+    }
+
     /// The ssh arguments for running `sh -s` on `destination`.
     func arguments(destination: String) -> [String] {
         [
@@ -71,10 +82,13 @@ struct RemoteDeviceShell: Sendable {
     /// Runs `script` on `destination`. Never on the main actor's time: the
     /// process is waited for on a thread of its own.
     func run(_ script: String, on destination: String) async -> Output {
+        await runData(script, on: destination).text
+    }
+
+    /// `run`, with what the script printed as bytes.
+    func runData(_ script: String, on destination: String) async -> DataOutput {
         let shell = self
-        return await Self.onOwnThread {
-            shell.runSynchronously(script, on: destination).text
-        }
+        return await Self.onOwnThread { shell.runSynchronously(script, on: destination) }
     }
 
     /// Runs `ssh <arguments>`, a command to a master
@@ -419,6 +433,24 @@ enum RemoteDeviceProbe {
             "if security show-keychain-info >/dev/null 2>&1; then echo keychain=unlocked; else echo keychain=locked; fi",
             "printf '%s\\n' '\(endMarker)'",
         ]
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// The script that runs the device's cherry-host (`remoteHostPath`,
+    /// else the one on its PATH) as `<command> --json <arguments>` (words
+    /// for sh) after `prelude`, `begin` printed on its own line first: what
+    /// `project-info` and `ports` run.
+    static func hostCommandScript(
+        remoteHostPath: String?, begin: String, command: String, arguments: [String], prelude: [String] = []
+    ) -> String {
+        var lines = prelude
+        if let path = remoteHostPath?.nilIfEmpty {
+            lines.append("host=\(shellWord(path))")
+        } else {
+            lines.append("host=cherry-host")
+        }
+        lines.append("printf '%s\\n' '\(begin)'")
+        lines.append("exec \"$host\" \(command) --json " + arguments.joined(separator: " "))
         return lines.joined(separator: "\n") + "\n"
     }
 

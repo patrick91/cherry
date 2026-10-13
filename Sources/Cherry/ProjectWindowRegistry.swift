@@ -1306,7 +1306,6 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var terminalSearchFocusRequest = 0
     @Published var isSidebarPlaygroundPresented = false
     @Published var isCommandPalettePlaygroundPresented = false
-    @Published var isProjectTabsPrototypePresented = PrototypeFeatureFlags.isProjectTabsPrototypeEnabled
     @Published var isCommandKeyPressed = false
     @Published var selectedNoteID: UUID?
     @Published var selectedTodoID: UUID?
@@ -1471,10 +1470,6 @@ final class ProjectWindowChromeState: ObservableObject {
         if isCommandPalettePlaygroundPresented, omniBar == nil {
             presentOmniBar(at: nil)
         }
-    }
-
-    func toggleProjectTabsPrototype() {
-        isProjectTabsPrototypePresented.toggle()
     }
 
     func selectNote(id: UUID?) {

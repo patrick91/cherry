@@ -1190,12 +1190,6 @@ struct CherryApp: App {
                 }
                 .disabled(focusedChromeState == nil)
 
-                Button(focusedChromeState?.isProjectTabsPrototypePresented == true ? "Hide Project Tabs Prototype" : "Show Project Tabs Prototype") {
-                    keyWindowChromeState?.toggleProjectTabsPrototype()
-                }
-                .disabled(focusedChromeState == nil)
-
-
                 Divider()
 
                 Button("New Tab") {

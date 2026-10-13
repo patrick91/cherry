@@ -36,14 +36,6 @@ struct ContentView: View {
     @State private var trafficLightFinalSyncTask: Task<Void, Never>?
     @State private var floatingSidebarAnimationDepth = 0
 
-    private var showsProjectNavigationPrototype: Bool {
-        chromeState.isProjectTabsPrototypePresented
-    }
-
-    private var projectNavigationTopInset: CGFloat {
-        showsProjectNavigationPrototype ? ProjectTabsPrototypeLayout.barHeight : 0
-    }
-
     private var sidebarWidth: CGFloat {
         clampedSidebarWidth(CGFloat(storedSidebarWidth))
     }
@@ -79,8 +71,7 @@ struct ContentView: View {
                     noteStore: noteStore,
                     todoStore: todoStore,
                     projectRoot: projectRoot,
-                    includeLeadingPadding: isSidebarHidden,
-                    projectNavigationTopInset: projectNavigationTopInset
+                    includeLeadingPadding: isSidebarHidden
                 )
                     .ignoresSafeArea(.all, edges: .top)
             }
@@ -104,50 +95,38 @@ struct ContentView: View {
                 .allowsHitTesting(isSidebarRevealed)
             }
 
-            if showsProjectNavigationPrototype {
-                ProjectTabsPrototypeBar(
-                    settings: agentSettings,
-                    projectRoot: projectRoot,
-                    presentation: isSidebarRevealed ? .floating : .docked,
-                    leadingInset: projectTabsLeadingInset,
-                    openProject: openProject
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .zIndex(900)
-            } else {
-                // Project picker, anchored to the window's top-leading corner so
-                // it shares coordinate space with the traffic-light overlay
-                // (which positions correctly at this level). It rides the same
-                // chrome translation as the traffic lights so it slides off
-                // with the sidebar, and is hidden via offset when the sidebar
-                // is fully gone.
-                TitlebarProjectPicker(
-                    settings: AgentSettings.shared,
-                    repository: repository,
-                    chromeState: chromeState,
-                    projectRoot: projectRoot,
-                    presentation: isSidebarRevealed ? .floating : .docked,
-                    maximumWidth: titlebarProjectPickerMaximumWidth
-                )
-                .padding(.leading, titlebarProjectPickerLeadingInset)
-                .padding(.top, 12)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                // Drive the picker's offset off the same animated
-                // (dockedWidth, floatingWidth) pair the traffic lights use,
-                // so it goes through the same `min(0, max(...) - sidebarWidth)`
-                // clamping each tick. With a plain `.offset(x:)` bound to a
-                // computed CGFloat, SwiftUI springs the offset directly and lets
-                // the value overshoot past `-sidebarWidth` — but the traffic
-                // lights are clamped by `max(docked, 0)`, so they pin at
-                // `-sidebarWidth` while the picker bounces. Same modifier,
-                // identical math: they slide in lockstep.
-                .modifier(ChromeOffsetModifier(
-                    dockedWidth: isSidebarHidden ? 0 : sidebarWidth,
-                    floatingWidth: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
-                    sidebarWidth: sidebarWidth
-                ))
-                .allowsHitTesting(!isSidebarHidden || isSidebarRevealed)
-            }
+            // Project picker, anchored to the window's top-leading corner so
+            // it shares coordinate space with the traffic-light overlay
+            // (which positions correctly at this level). It rides the same
+            // chrome translation as the traffic lights so it slides off
+            // with the sidebar, and is hidden via offset when the sidebar
+            // is fully gone.
+            TitlebarProjectPicker(
+                settings: AgentSettings.shared,
+                repository: repository,
+                chromeState: chromeState,
+                projectRoot: projectRoot,
+                presentation: isSidebarRevealed ? .floating : .docked,
+                maximumWidth: titlebarProjectPickerMaximumWidth
+            )
+            .padding(.leading, titlebarProjectPickerLeadingInset)
+            .padding(.top, 12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            // Drive the picker's offset off the same animated
+            // (dockedWidth, floatingWidth) pair the traffic lights use,
+            // so it goes through the same `min(0, max(...) - sidebarWidth)`
+            // clamping each tick. With a plain `.offset(x:)` bound to a
+            // computed CGFloat, SwiftUI springs the offset directly and lets
+            // the value overshoot past `-sidebarWidth` — but the traffic
+            // lights are clamped by `max(docked, 0)`, so they pin at
+            // `-sidebarWidth` while the picker bounces. Same modifier,
+            // identical math: they slide in lockstep.
+            .modifier(ChromeOffsetModifier(
+                dockedWidth: isSidebarHidden ? 0 : sidebarWidth,
+                floatingWidth: isSidebarRevealed ? sidebarWidth + floatingSidebarLeadingInset : 0,
+                sidebarWidth: sidebarWidth
+            ))
+            .allowsHitTesting(!isSidebarHidden || isSidebarRevealed)
 
             if let omniBar = chromeState.omniBar {
                 OmniBarOverlay(
@@ -414,12 +393,6 @@ struct ContentView: View {
             0,
             sidebarWidth - titlebarProjectPickerLeadingInset - SidebarLayout.trailingInset
         )
-    }
-
-    private var projectTabsLeadingInset: CGFloat {
-        isSidebarHidden && !isSidebarRevealed
-            ? SidebarLayout.trailingInset
-            : TitlebarProjectPickerLayout.leadingInset
     }
 
     private var sidebarRevealTrackingWidth: CGFloat {
@@ -925,7 +898,6 @@ private struct DetailPaneView: View {
     @ObservedObject private var agentSettings = AgentSettings.shared
     let projectRoot: String?
     let includeLeadingPadding: Bool
-    let projectNavigationTopInset: CGFloat
 
     var body: some View {
         let features = agentSettings.projectFeatures(for: projectRoot)
@@ -966,7 +938,7 @@ private struct DetailPaneView: View {
             // the pane's bottom bars.
             ProjectWindowToastOverlay(toasts: chromeState.toasts, closedTabs: chromeState.closedTabs, obstacles: bottomBars)
         }
-        .padding(.top, projectNavigationTopInset + 5)
+        .padding(.top, 5)
         .padding(.leading, includeLeadingPadding ? 5 : 0)
         .padding(.trailing, 5)
         .padding(.bottom, 5)
@@ -2802,14 +2774,6 @@ private enum TitlebarProjectPickerLayout {
     }
 }
 
-private enum ProjectTabsPrototypeLayout {
-    static let barHeight: CGFloat = 43
-    static let tabHeight: CGFloat = 29
-    static let tabCornerRadius: CGFloat = 8
-    static let tabSpacing: CGFloat = 4
-    static let horizontalPadding: CGFloat = 10
-}
-
 private enum AgentTreeLayout {
     static let guideX: CGFloat = 0
     static let guideElbowWidth: CGFloat = 5.5
@@ -2825,19 +2789,6 @@ private enum AgentTreeLayout {
     static let childRowHeight: CGFloat = 32
     static let childDetailRowHeight: CGFloat = 38
     static let nestedGuideReservationWidth = guideX + guideElbowStartInset + guideElbowWidth + 2
-}
-
-enum PrototypeFeatureFlags {
-    static var isProjectTabsPrototypeEnabled: Bool {
-        truthyEnvironmentValue(for: "CHERRY_PROJECT_TABS_PROTOTYPE")
-    }
-
-    private static func truthyEnvironmentValue(for key: String) -> Bool {
-        let value = ProcessInfo.processInfo.environment[key]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        return value == "1" || value == "true" || value == "yes" || value == "on"
-    }
 }
 
 @MainActor
@@ -3221,211 +3172,6 @@ private struct SidebarTabsPage: View {
         presentation == .docked ? SidebarLayout.floatingOuterInset : 0
     }
 
-}
-
-/// Visual prototype for treating saved projects as peers in one titlebar.
-/// Selection intentionally routes through Cherry's existing project-opening
-/// path: this keeps the mockup safe to try without changing project/window
-/// ownership or the lifetime of any terminal session.
-private struct ProjectTabsPrototypeBar: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-
-    @ObservedObject var settings: AgentSettings
-    let projectRoot: String?
-    let presentation: SidebarPresentation
-    let leadingInset: CGFloat
-    let openProject: (CherryProject) -> Void
-
-    var body: some View {
-        let currentPalette = palette(for: projectRoot)
-
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: ProjectTabsPrototypeLayout.tabSpacing) {
-                ForEach(displayedProjects) { project in
-                    ProjectTabsPrototypeButton(
-                        project: project,
-                        palette: palette(for: project.root),
-                        isSelected: project.id == selectedProjectID,
-                        isOpen: ProjectWindowRegistry.shared.hasWindow(for: project.root),
-                        action: { openProject(project) }
-                    )
-                }
-
-                ProjectTabsPrototypeAddButton(
-                    palette: currentPalette,
-                    action: chooseProjectRoot
-                )
-            }
-            .padding(.leading, leadingInset)
-            .padding(.trailing, ProjectTabsPrototypeLayout.horizontalPadding)
-            .frame(height: ProjectTabsPrototypeLayout.barHeight)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: ProjectTabsPrototypeLayout.barHeight)
-        .background {
-            SidebarBackground(projectRoot: projectRoot, presentation: presentation)
-        }
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(currentPalette.rowText.opacity(0.09))
-                .frame(height: 1)
-        }
-        .accessibilityLabel("Projects")
-    }
-
-    private var displayedProjects: [CherryProject] {
-        var projects = settings.projects
-        guard let selectedProject,
-              !projects.contains(where: { $0.id == selectedProject.id })
-        else {
-            return projects
-        }
-        projects.insert(selectedProject, at: 0)
-        return projects
-    }
-
-    private var selectedProject: CherryProject? {
-        settings.selectedProject(for: projectRoot)
-    }
-
-    private var selectedProjectID: CherryProject.ID? {
-        selectedProject?.id
-    }
-
-    private func palette(for root: String?) -> SidebarPalette {
-        SidebarPalette(
-            themeColors: terminalSettings.ghosttyThemeColors(for: colorScheme),
-            fallbackColorScheme: colorScheme,
-            sidebarBackgroundDepth: terminalSettings.sidebarBackgroundDepth,
-            projectColor: settings.projectAppearance(for: root).color,
-            projectColorDisplayMode: terminalSettings.projectColorDisplayMode,
-            presentation: presentation
-        )
-    }
-
-    private func chooseProjectRoot() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Add"
-
-        guard panel.runModal() == .OK,
-              let url = panel.url,
-              let project = settings.addProject(path: url.path)
-        else {
-            return
-        }
-        openProject(project)
-    }
-}
-
-private struct ProjectTabsPrototypeButton: View {
-    let project: CherryProject
-    let palette: SidebarPalette
-    let isSelected: Bool
-    let isOpen: Bool
-    let action: () -> Void
-
-    @State private var isHovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 7) {
-                if palette.showsProjectAccent {
-                    Circle()
-                        .fill(palette.projectAccent)
-                        .frame(width: 7, height: 7)
-                }
-
-                Text(project.name)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(isSelected ? palette.selectedText : palette.rowText)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-
-                if isOpen, !isSelected {
-                    Circle()
-                        .fill(palette.rowText.opacity(0.34))
-                        .frame(width: 5, height: 5)
-                        .accessibilityLabel("Open in another window")
-                }
-            }
-            .padding(.leading, palette.showsProjectAccent ? 9 : 10)
-            .padding(.trailing, isOpen && !isSelected ? 9 : 10)
-            .frame(maxWidth: 188)
-            .frame(height: ProjectTabsPrototypeLayout.tabHeight)
-            .background {
-                RoundedRectangle(
-                    cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
-                    style: .continuous
-                )
-                .fill(tabFill)
-            }
-            .overlay {
-                if isSelected {
-                    RoundedRectangle(
-                        cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
-                        style: .continuous
-                    )
-                    .strokeBorder(palette.selectedStroke, lineWidth: 1)
-                }
-            }
-            .contentShape(RoundedRectangle(
-                cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
-                style: .continuous
-            ))
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
-        .help(project.root)
-        .accessibilityLabel(project.name)
-        .accessibilityValue(isSelected ? "Current project" : "Project")
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
-    }
-
-    private var tabFill: Color {
-        if isSelected {
-            return palette.selectedFill
-        }
-        return isHovering ? palette.hoverFill : .clear
-    }
-}
-
-private struct ProjectTabsPrototypeAddButton: View {
-    let palette: SidebarPalette
-    let action: () -> Void
-
-    @State private var isHovering = false
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: "plus")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(palette.rowText.opacity(0.72))
-                .frame(
-                    width: ProjectTabsPrototypeLayout.tabHeight,
-                    height: ProjectTabsPrototypeLayout.tabHeight
-                )
-                .background {
-                    RoundedRectangle(
-                        cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
-                        style: .continuous
-                    )
-                    .fill(isHovering ? palette.hoverFill : .clear)
-                }
-                .contentShape(RoundedRectangle(
-                    cornerRadius: ProjectTabsPrototypeLayout.tabCornerRadius,
-                    style: .continuous
-                ))
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
-        .help("Add project")
-        .accessibilityLabel("Add project")
-    }
 }
 
 struct TitlebarProjectPicker: View {

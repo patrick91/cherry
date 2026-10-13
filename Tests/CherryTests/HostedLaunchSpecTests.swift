@@ -123,17 +123,6 @@ private func nativeLaunch(
     )
 }
 
-private func makeTemporaryDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    guard let resolved = url.path.withCString({ realpath($0, nil) }) else {
-        throw CocoaError(.fileNoSuchFile)
-    }
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-}
-
 private struct ProcessResult {
     let status: Int32
     let output: String
@@ -717,7 +706,7 @@ private struct Integration: Equatable {
     "  printf   '%s|' 'tab\there' '\\\\back' '*' \"`echo tick`\" > \"$CHERRY_TEST_OUTPUT\""
 ])
 func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: String) throws {
-    let directory = try makeTemporaryDirectory("cherry-hosted-quoting")
+    let directory = try canonicalTemporaryDirectory("cherry-hosted-quoting")
     defer { try? FileManager.default.removeItem(at: directory) }
     let argumentsFile = directory.appendingPathComponent("arguments")
     let outputFile = directory.appendingPathComponent("output")
@@ -766,7 +755,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func hostedZshLaunchRunsTheStartupCommandThroughCherrysBootstrap() throws {
-    let home = try makeTemporaryDirectory("cherry-hosted-zsh")
+    let home = try canonicalTemporaryDirectory("cherry-hosted-zsh")
     defer { try? FileManager.default.removeItem(at: home) }
     let bootstrap = try #require(try ShellIntegrationBootstrap.prepare(shellPath: "/bin/zsh", homeDirectory: home))
     let outputFile = home.appendingPathComponent("output")
@@ -823,7 +812,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 // MARK: - Resource staging
 
 @Test func stagingCopiesResourcesOnceIntoAContentAddressedDirectory() throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-stage")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-stage")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try makeResourceSource(in: directory.appendingPathComponent("bundle", isDirectory: true))
     let base = directory.appendingPathComponent("GhosttyResources", isDirectory: true)
@@ -878,7 +867,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func stagingRepairsADamagedCopyInPlaceAndKeepsWhatItDoesNotOwn() throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-repair")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-repair")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try makeResourceSource(in: directory.appendingPathComponent("bundle", isDirectory: true))
     let base = directory.appendingPathComponent("GhosttyResources", isDirectory: true)
@@ -930,7 +919,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func concurrentStagingConvergesOnOneCompleteCopy() throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-race")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-race")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try makeResourceSource(in: directory.appendingPathComponent("bundle", isDirectory: true))
     let base = directory.appendingPathComponent("GhosttyResources", isDirectory: true)
@@ -947,7 +936,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func stagingRemovesOldLeftoversOfInterruptedStages() throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-leftovers")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-leftovers")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try makeResourceSource(in: directory.appendingPathComponent("bundle", isDirectory: true))
     let base = directory.appendingPathComponent("GhosttyResources", isDirectory: true)
@@ -976,7 +965,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func stagingFailsWhenTheBundleHasNoResources() throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-missing")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-missing")
     defer { try? FileManager.default.removeItem(at: directory) }
     let missing = GhosttyResourceStaging.Source(
         resourcesDirectory: directory.appendingPathComponent("Ghostty"),
@@ -988,7 +977,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func stagerStagesOnceOffTheCallersThreadAndRetriesFailures() async throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-stager")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-stager")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try makeResourceSource(in: directory.appendingPathComponent("bundle", isDirectory: true))
     let base = directory.appendingPathComponent("GhosttyResources", isDirectory: true)
@@ -1020,7 +1009,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func bundledGhosttyResourcesStageWithAUsableTerminfo() async throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-bundled")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-bundled")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try #require(GhosttyResourceStaging.bundledSource())
     let staged = try GhosttyResourceStaging.stage(source, into: directory)
@@ -1061,7 +1050,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func preparingAZshTabWritesTheBootstrapItsLaunchUses() async throws {
-    let directory = try makeTemporaryDirectory("cherry-hosted-prepare")
+    let directory = try canonicalTemporaryDirectory("cherry-hosted-prepare")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try makeResourceSource(in: directory.appendingPathComponent("bundle", isDirectory: true))
     let stager = GhosttyResourceStager(

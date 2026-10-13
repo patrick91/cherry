@@ -133,19 +133,6 @@ private struct FakeSSH {
     }
 }
 
-private func eventually(
-    isolation: isolated (any Actor)? = #isolation,
-    _ timeout: TimeInterval = 5,
-    _ condition: () -> Bool
-) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return condition()
-}
-
 @Test func HostSSHMasterCommandsAreExactAndPathsFitASocket() throws {
     #expect(HostSSHMasterManager.masterArguments(destination: "me@devbox", controlPath: "/t/cherry-ssh-1/abc") == [
         "-M", "-N", "-T",
@@ -824,7 +811,7 @@ private func shardManager(
         kill(master, SIGKILL)
         #expect(await eventually { manager.status(of: "devbox")?.phase == .waitingToRestart })
         #expect(manager.status(of: "devbox")?.failures == round)
-        #expect(await eventually(10) { ssh.masterCalls.count == round + 1 && manager.status(of: "devbox")?.phase == .up })
+        #expect(await eventually(timeout: 10) { ssh.masterCalls.count == round + 1 && manager.status(of: "devbox")?.phase == .up })
         restartedAfter.append(Date().timeIntervalSince(killedAt))
     }
     #expect(restartedAfter[2] >= 0.4)

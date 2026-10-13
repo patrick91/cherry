@@ -9,45 +9,12 @@ import Testing
 @testable import Cherry
 @testable import CherryMCP
 
-private func runProcessOutput(executable: String, arguments: [String]) throws -> String {
-    let outputPipe = Pipe()
-    let errorPipe = Pipe()
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: executable)
-    process.arguments = arguments
-    process.standardOutput = outputPipe
-    process.standardError = errorPipe
-
-    try process.run()
-    process.waitUntilExit()
-
-    let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-    let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
-    return String(decoding: output + errorOutput, as: UTF8.self)
-}
-
 private func canonicalPathForTest(_ url: URL) throws -> String {
     guard let resolved = url.path.withCString({ realpath($0, nil) }) else {
         throw CocoaError(.fileNoSuchFile)
     }
     defer { free(resolved) }
     return String(cString: resolved)
-}
-
-@MainActor
-private func waitForCondition(
-    timeout: TimeInterval = 1,
-    interval: UInt64 = 10_000_000,
-    _ condition: @MainActor () -> Bool
-) async -> Bool {
-    let deadline = Date(timeIntervalSinceNow: timeout)
-    while Date() < deadline {
-        if condition() {
-            return true
-        }
-        try? await Task.sleep(nanoseconds: interval)
-    }
-    return condition()
 }
 
 private final class DataWriteRecorder: @unchecked Sendable {
@@ -1800,7 +1767,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
     #expect(store.isLoading)
     #expect(store.notes.isEmpty)
-    #expect(await waitForCondition(timeout: 5) { !store.isLoading })
+    #expect(await eventually(timeout: 5) { !store.isLoading })
     #expect(store.notes.count == notes.count)
     #expect(store.notes.first?.id == notes.first?.id)
 }
@@ -3394,7 +3361,7 @@ private struct MCPWhoamiPayload: Decodable {
     }
 
     let parentSession = try #require(harness.workspace.session(id: parent.terminalID))
-    #expect(await waitForCondition { parentSession.childProcessID != nil })
+    #expect(await eventually(timeout: 1) { parentSession.childProcessID != nil })
     let parentPID = try #require(parentSession.childProcessID)
     let inferredCallerID = await CherryMCPTools.inferredCallerProcessID(parentPIDs: [parentPID])
 
@@ -3448,7 +3415,7 @@ private struct MCPWhoamiPayload: Decodable {
     }
 
     let parentSession = try #require(harness.workspace.session(id: parent.terminalID))
-    #expect(await waitForCondition { parentSession.childProcessID != nil })
+    #expect(await eventually(timeout: 1) { parentSession.childProcessID != nil })
     let parentPID = try #require(parentSession.childProcessID)
     let unrelatedIntermediatePID = Int32.max
     let inferredCallerID = await CherryMCPTools.inferredCallerProcessID(
@@ -4819,7 +4786,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
 
     processor.enqueueOutput(Data("visible\r\n".utf8), launchID: nil, responseWriter: { _ in })
-    #expect(await waitForCondition { processor.snapshot(range: 0..<processor.lineCount).contains("visible") })
+    #expect(await eventually(timeout: 1) { processor.snapshot(range: 0..<processor.lineCount).contains("visible") })
 
     processor.setOutputProcessingSuspended(true)
     processor.enqueueOutput(Data("hidden\r\n".utf8), launchID: nil, responseWriter: { _ in })
@@ -4829,7 +4796,7 @@ private struct MCPWhoamiPayload: Decodable {
     processor.setOutputProcessingSuspended(false)
     processor.clear()
     processor.enqueueOutput(Data("replayed\r\n".utf8), launchID: nil, responseWriter: { _ in })
-    #expect(await waitForCondition { processor.snapshot(range: 0..<processor.lineCount).contains("replayed") })
+    #expect(await eventually(timeout: 1) { processor.snapshot(range: 0..<processor.lineCount).contains("replayed") })
 }
 
 /// A program's last output comes just before its exit: what was read while
@@ -4848,7 +4815,7 @@ private struct MCPWhoamiPayload: Decodable {
     }
     processor.enqueueOutput(Data("last words\r\n".utf8), launchID: first, responseWriter: { _ in })
     processor.endLaunch(first)
-    #expect(await waitForCondition { processor.snapshot(range: 0..<processor.lineCount).contains("last words") })
+    #expect(await eventually(timeout: 1) { processor.snapshot(range: 0..<processor.lineCount).contains("last words") })
 
     // After the launch ended, its output is dropped.
     processor.enqueueOutput(Data("too late\r\n".utf8), launchID: first, responseWriter: { _ in })
@@ -4856,7 +4823,7 @@ private struct MCPWhoamiPayload: Decodable {
     let second = UUID()
     processor.beginLaunch(second)
     processor.enqueueOutput(Data("second\r\n".utf8), launchID: second, responseWriter: { _ in })
-    #expect(await waitForCondition { processor.snapshot(range: 0..<processor.lineCount).contains("second") })
+    #expect(await eventually(timeout: 1) { processor.snapshot(range: 0..<processor.lineCount).contains("second") })
     #expect(!processor.snapshot(range: 0..<processor.lineCount).contains("too late"))
 }
 
@@ -5548,20 +5515,20 @@ private func ghosttyFeedOutput(_ data: Data) -> Data {
     }
 
     let command = "sleep 0.5"
-    let didLaunch = await waitForCondition(timeout: 2) {
+    let didLaunch = await eventually(timeout: 2) {
         session.acceptsInput
     }
     #expect(didLaunch)
 
     session.send(text: command + "\n")
-    let didShowCommandTitle = await waitForCondition(timeout: 2) {
+    let didShowCommandTitle = await eventually(timeout: 2) {
         session.title == command
     }
     #expect(didShowCommandTitle)
 
     session.setAuxiliaryProcessingActive(false)
 
-    let didRestorePromptTitle = await waitForCondition(timeout: 2) {
+    let didRestorePromptTitle = await eventually(timeout: 2) {
         session.title != command
     }
     #expect(didRestorePromptTitle)
@@ -5759,7 +5726,7 @@ private func ghosttyFeedOutput(_ data: Data) -> Data {
 
     closingWindow.endSheet(sheet)
 
-    #expect(await waitForCondition {
+    #expect(await eventually(timeout: 1) {
         !closingWindow.isVisible
     })
     #expect(otherWindow.isVisible)
@@ -5805,13 +5772,13 @@ private func ghosttyFeedOutput(_ data: Data) -> Data {
         }
     }
 
-    #expect(await waitForCondition {
+    #expect(await eventually(timeout: 1) {
         closingWindow.attachedSheet != nil
     })
 
     alert.buttons[0].performClick(nil)
 
-    #expect(await waitForCondition(timeout: 2) {
+    #expect(await eventually(timeout: 2) {
         !closingWindow.isVisible
     })
     #expect(otherWindow.isVisible)
@@ -5872,14 +5839,14 @@ private struct QuitCountWindowTestHost: View {
         view.freeSurface()
         window.close()
     }
-    #expect(await waitForCondition { view.needsConfirmQuit })
+    #expect(await eventually(timeout: 1) { view.needsConfirmQuit })
     let prompt = "\u{1b}]133;A\u{7}$ \u{1b}]133;B\u{7}"
     input.receive(prompt)
-    #expect(await waitForCondition { !view.needsConfirmQuit })
+    #expect(await eventually(timeout: 1) { !view.needsConfirmQuit })
     input.receive("cat\r\n\u{1b}]133;C\u{7}running\r\n")
-    #expect(await waitForCondition { view.needsConfirmQuit })
+    #expect(await eventually(timeout: 1) { view.needsConfirmQuit })
     input.receive("\u{1b}]133;D;0\u{7}" + prompt)
-    #expect(await waitForCondition { !view.needsConfirmQuit })
+    #expect(await eventually(timeout: 1) { !view.needsConfirmQuit })
 }
 
 @MainActor
@@ -5903,23 +5870,23 @@ private struct QuitCountWindowTestHost: View {
         session.releaseGhosttyBridge()
         try? FileManager.default.removeItem(at: directory)
     }
-    #expect(await waitForCondition(timeout: 5) { session.childProcessID != nil })
-    #expect(await waitForCondition { !session.hasRunningProcess() })
+    #expect(await eventually(timeout: 5) { session.childProcessID != nil })
+    #expect(await eventually(timeout: 1) { !session.hasRunningProcess() })
     // A background helper (like a prompt's git-status daemon) is a child of
     // an otherwise idle shell. It must not count as a foreground program.
     session.send(text: "/bin/sleep 30 & printf '%s\\n' $! > helper.pid\n")
-    #expect(await waitForCondition(timeout: 5) { FileManager.default.fileExists(atPath: helperPIDFile.path) })
+    #expect(await eventually(timeout: 5) { FileManager.default.fileExists(atPath: helperPIDFile.path) })
     let shellPID = try #require(session.childProcessID)
     let helperPID = try #require(Int32(String(contentsOf: helperPIDFile, encoding: .utf8)
         .trimmingCharacters(in: .whitespacesAndNewlines)))
     #expect(kill(helperPID, 0) == 0)
     #expect(getpgid(helperPID) != getpgid(shellPID))
-    #expect(await waitForCondition { !session.hasRunningProcess() })
+    #expect(await eventually(timeout: 1) { !session.hasRunningProcess() })
 
     session.send(text: "/bin/cat\n")
-    #expect(await waitForCondition { session.hasRunningProcess() })
+    #expect(await eventually(timeout: 1) { session.hasRunningProcess() })
     session.sendRaw(data: Data([0x03]))
-    #expect(await waitForCondition { !session.hasRunningProcess() })
+    #expect(await eventually(timeout: 1) { !session.hasRunningProcess() })
     #expect(kill(helperPID, 0) == 0)
 }
 
@@ -5977,17 +5944,17 @@ private struct QuitCountWindowTestHost: View {
     }
     closingWindow.orderFrontRegardless()
     remainingWindow.orderFrontRegardless()
-    #expect(await waitForCondition(timeout: 5) {
+    #expect(await eventually(timeout: 5) {
         registry.runningProcessCount() == initialCount + 7
     })
     closingWindow.performClose(nil)
-    #expect(await waitForCondition { closingWindow.attachedSheet != nil })
+    #expect(await eventually(timeout: 1) { closingWindow.attachedSheet != nil })
     let alert = try #require(closingWindow.attachedSheet)
     let stopButton = try #require(findSubview(in: alert.contentView!) {
         ($0 as? NSButton)?.title == "Stop and close"
     } as? NSButton)
     stopButton.performClick(nil)
-    #expect(await waitForCondition { !closingWindow.isVisible })
+    #expect(await eventually(timeout: 1) { !closingWindow.isVisible })
     #expect(closingSessions.allSatisfy { !$0.isRunning })
     #expect(closingWorkspace.sessions.isEmpty)
     #expect(remainingSessions.allSatisfy { $0.isRunning })
@@ -6745,7 +6712,7 @@ private struct QuitCountWindowTestHost: View {
     ))
     session.ghosttyBridge.activateOutputFeedWhenSurfaceIsReady()
 
-    let observerInstalled = await waitForCondition {
+    let observerInstalled = await eventually(timeout: 1) {
         session.rawOutputObserverCount == 1
     }
     #expect(observerInstalled)
@@ -6807,7 +6774,7 @@ private struct QuitCountWindowTestHost: View {
         cellHeightPixels: cellHeightPixels
     ))
 
-    let observerInstalled = await waitForCondition {
+    let observerInstalled = await eventually(timeout: 1) {
         session.rawOutputObserverCount == 1
     }
     let mountedMetrics = session.ghosttyBridge.gridMetrics
@@ -6857,12 +6824,12 @@ private struct QuitCountWindowTestHost: View {
 
     container.frame = NSRect(x: 0, y: 0, width: 900, height: 520)
     NotificationCenter.default.post(name: NSWindow.didResizeNotification, object: window)
-    let frameUpdated = await waitForCondition {
+    let frameUpdated = await eventually(timeout: 1) {
         session.ghosttyBridge.terminalView.frame.size.width == 900 &&
             session.ghosttyBridge.terminalView.frame.size.height == 520
     }
     let refitCompleted = if hasHeadlessGridMetrics {
-        await waitForCondition {
+        await eventually(timeout: 1) {
             session.revision > revisionAfterInitialFit
         }
     } else {
@@ -6906,7 +6873,7 @@ private struct QuitCountWindowTestHost: View {
     }
 
     container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
-    _ = await waitForCondition {
+    _ = await eventually(timeout: 1) {
         session.ghosttyBridge.terminalView.window != nil
     }
     #expect(session.rawOutput(maxBytes: 1_024).data.isEmpty == false)

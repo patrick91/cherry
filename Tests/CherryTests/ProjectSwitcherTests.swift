@@ -17,13 +17,6 @@ private func minutesAgo(_ minutes: Double) -> Date {
     now.addingTimeInterval(-minutes * 60)
 }
 
-private func privateDefaults() -> UserDefaults {
-    let name = "cherry-project-switcher-tests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: name)!
-    defaults.removePersistentDomain(forName: name)
-    return defaults
-}
-
 private let thisMac = ProjectSwitcherModel.MachineInfo(machine: .thisMac, name: "This Mac", dot: .green, sessionCount: 3)
 
 private func device(
@@ -70,7 +63,7 @@ private func remote(
 // MARK: - Recency
 
 @Test @MainActor func recencyStoreKeepsTheLastOpeningPerKeyAcrossInstances() {
-    let defaults = privateDefaults()
+    let defaults = privateDefaults("cherry-project-switcher-tests")
     let store = ProjectRecencyStore(defaults: defaults)
     store.markOpened("/a", at: minutesAgo(30))
     store.markOpened("/b", at: minutesAgo(20))
@@ -87,7 +80,7 @@ private func remote(
 }
 
 @Test @MainActor func recencyStoreKeepsOnlyTheMostRecentKeys() {
-    let store = ProjectRecencyStore(defaults: privateDefaults())
+    let store = ProjectRecencyStore(defaults: privateDefaults("cherry-project-switcher-tests"))
     for index in 0 ..< (ProjectRecencyStore.capacity + 10) {
         store.markOpened("/p\(index)", at: now.addingTimeInterval(Double(index) * 60))
     }
@@ -99,7 +92,7 @@ private func remote(
 @Test @MainActor func aProjectWindowMarksItsProjectOpenedWhenItBecomesActive() throws {
     let registry = ProjectWindowRegistry()
     registry.bringWindowForward = { _ in }
-    let recency = ProjectRecencyStore(defaults: privateDefaults())
+    let recency = ProjectRecencyStore(defaults: privateDefaults("cherry-project-switcher-tests"))
     registry.projectRecency = recency
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("cherry-switcher-\(UUID().uuidString)", isDirectory: true)

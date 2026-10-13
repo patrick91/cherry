@@ -316,13 +316,8 @@ final class FakeRemoteMac {
             .split(separator: "\n").map(String.init)
     }
 
-    func waitFor(_ description: String, timeout: TimeInterval = 20, _ predicate: () async throws -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if try await predicate() { return }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        throw HostedSessionError.message("Timed out waiting for \(description)")
+    func waitFor(_ description: String, timeout: TimeInterval = 20, _ predicate: @MainActor () async throws -> Bool) async throws {
+        try await poll(description, timeout: timeout, predicate)
     }
 
     /// Every session, as the device's own Cherry lists it (not through ssh).

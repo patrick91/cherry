@@ -742,7 +742,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     let harness = try PersistentHarness()
     harness.cleanExitMinimumRunTime = 0
     let dialogs = CloseDialogs()
-    let root = try canonicalDirectory("cherry-clean-exit-window")
+    let root = try canonicalTemporaryDirectory("cherry-clean-exit-window")
     let repository = RepositoryWorkspace(
         projectRoot: root.path,
         backendPolicy: harness.policy,
@@ -890,8 +890,8 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
 
 @Test @MainActor func theQuitSummaryCountsEveryWindowsRunningSessionsAndEndingThemTerminatesThem() async throws {
     let harness = try PersistentHarness()
-    let rootA = try canonicalDirectory("cherry-quit-a")
-    let rootB = try canonicalDirectory("cherry-quit-b")
+    let rootA = try canonicalTemporaryDirectory("cherry-quit-a")
+    let rootB = try canonicalTemporaryDirectory("cherry-quit-b")
     let repository = RepositoryWorkspace(
         projectRoot: rootA.path,
         backendPolicy: harness.policy,
@@ -1268,8 +1268,8 @@ private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindow
 }
 
 @Test @MainActor func endingAWindowsSessionsAlsoEndsThoseOfItsSavedTabsNoOpenTabShows() async throws {
-    let root = try canonicalDirectory("cherry-end-saved")
-    let storeDirectory = try canonicalDirectory("cherry-end-saved-store")
+    let root = try canonicalTemporaryDirectory("cherry-end-saved")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-end-saved-store")
     defer {
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
@@ -1337,15 +1337,6 @@ private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindow
         let state = store.load(repositoryRoot: repository.repositoryRoot)
         #expect(state?.worktree(root: root.path)?.sessions.contains { $0.id == saved.id } == true, label)
     }
-}
-
-private func canonicalDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    let resolved = try #require(url.path.withCString { realpath($0, nil) })
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
 }
 
 // MARK: - Quits the system ends sessions after

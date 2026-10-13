@@ -1485,16 +1485,8 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
 
 @Test @MainActor func autoStartStartsARestoredCommandWhoseSessionEndedWhileCherryWasClosed() async throws {
     let harness = try PersistentHarness()
-    func canonicalDirectory(_ prefix: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        let resolved = try #require(url.path.withCString { realpath($0, nil) })
-        defer { free(resolved) }
-        return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-    }
-    let root = try canonicalDirectory("cherry-persistent-autostart")
-    let storeDirectory = try canonicalDirectory("cherry-persistent-autostart-store")
+    let root = try canonicalTemporaryDirectory("cherry-persistent-autostart")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-persistent-autostart-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let command = ProjectCommandDefinition(name: "server", command: "serve", autoStart: true)
     let record = WorkspaceSessionRecord(

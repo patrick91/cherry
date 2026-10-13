@@ -33,70 +33,6 @@ private final class ClosingWindow: NSWindow {
     }
 }
 
-/// A project window that never comes on screen.
-@MainActor
-private func testWindow() -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
-        styleMask: [.titled, .closable], backing: .buffered, defer: true
-    )
-    window.isReleasedWhenClosed = false
-    return window
-}
-
-private func temporaryDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    let resolved = try #require(url.path.withCString { realpath($0, nil) })
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-}
-
-/// A clock the test moves, and the checks toasts scheduled on it.
-@MainActor
-private final class ManualClock {
-    let start = Date(timeIntervalSince1970: 1_000)
-    private(set) var now: Date
-    private var scheduled: [(at: Date, work: @MainActor () -> Void)] = []
-
-    init() { now = start }
-
-    var schedule: ProjectWindowToasts.Scheduler {
-        { [unowned self] delay, work in scheduled.append((now.addingTimeInterval(delay), work)) }
-    }
-
-    /// Moves the clock on by `seconds`, running what falls due, in order.
-    func advance(by seconds: TimeInterval) {
-        now = now.addingTimeInterval(seconds)
-        while let next = scheduled.enumerated().filter({ $0.element.at <= now }).min(by: { $0.element.at < $1.element.at }) {
-            scheduled.remove(at: next.offset)
-            next.element.work()
-        }
-    }
-}
-
-/// A window's chrome whose toasts keep time on `clock` (never dismissing by
-/// themselves without one) and announce into `announced`.
-@MainActor
-private func quietChromeState(
-    clock: ManualClock? = nil,
-    announced: Recorder<[String]> = Recorder([])
-) -> ProjectWindowChromeState {
-    let schedule: ProjectWindowToasts.Scheduler
-    if let clock {
-        schedule = clock.schedule
-    } else {
-        schedule = { _, _ in }
-    }
-    return ProjectWindowChromeState(toasts: ProjectWindowToasts(
-        now: { clock?.now ?? Date() },
-        schedule: schedule,
-        announce: { announced.value.append($0) },
-        voiceOverEnabled: { false }
-    ))
-}
-
 /// Toasts on `clock`, whatever VoiceOver does on this Mac.
 @MainActor
 private func manualToasts(
@@ -144,11 +80,6 @@ private func openRepositoryWindow(
         noteStore: nil, todoStore: nil, chromeState: chromeState
     ))
     return repository
-}
-
-@MainActor
-private func sidebarName(of session: TerminalSession) -> String {
-    SidebarSessionLabel.label(for: session, pathDisplayMode: TerminalSettings.shared.sidebarTerminalPathDisplayMode).title
 }
 
 private let backgroundSessionsLine = "Open or end it from Background Sessions in the Cherry menu bar icon."
@@ -467,7 +398,7 @@ private let persistentSessionsLine = "Attach to it again from File › Persisten
     let closing = harness.workspace()
     let window = ClosingWindow()
     let chromeState = quietChromeState()
-    let otherRoots = [try temporaryDirectory("cherry-toast-other"), try temporaryDirectory("cherry-toast-other")]
+    let otherRoots = [try canonicalTemporaryDirectory("cherry-toast-other"), try canonicalTemporaryDirectory("cherry-toast-other")]
     let others = otherRoots.map {
         TerminalWorkspace(projectRoot: $0.path, createInitialSession: false, backendPolicy: harness.policy)
     }
@@ -1148,7 +1079,7 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
     registry.bringWindowForward = { _ in }
     registry.windowIsOnScreen = { _ in true }
     // Window B, another project, stays open.
-    let otherRoot = try temporaryDirectory("cherry-toast-reopen-other")
+    let otherRoot = try canonicalTemporaryDirectory("cherry-toast-reopen-other")
     let other = TerminalWorkspace(projectRoot: otherRoot.path, createInitialSession: false, backendPolicy: harness.policy)
     let otherWindow = testWindow()
     let otherChromeState = quietChromeState()

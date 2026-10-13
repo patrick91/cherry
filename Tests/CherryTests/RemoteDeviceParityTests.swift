@@ -95,16 +95,6 @@ private final class DeviceHarness {
     }
 }
 
-@MainActor
-private func eventually(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return condition()
-}
-
 // MARK: - project-info
 
 private func output(_ text: String, status: Int32 = 0, errors: String = "") -> RemoteDeviceShell.DataOutput {

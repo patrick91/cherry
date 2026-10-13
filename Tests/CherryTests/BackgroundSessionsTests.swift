@@ -13,38 +13,6 @@ import Testing
 
 // MARK: - Helpers
 
-private func temporaryDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    let resolved = try #require(url.path.withCString { realpath($0, nil) })
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-}
-
-/// A project window that never comes on screen.
-@MainActor
-private func testWindow() -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
-        styleMask: [.titled, .closable], backing: .buffered, defer: true
-    )
-    window.isReleasedWhenClosed = false
-    return window
-}
-
-/// Waits (polling the main loop) until `condition` holds; false after
-/// `timeout`.
-@MainActor
-private func eventually(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return condition()
-}
-
 /// A session this app (CherryTests) started for a tab. `createdAt` nil: the
 /// host did not say when, so no orphan scan adopts it. `foreground`: the job
 /// its shell runs in its foreground (a busy terminal).
@@ -104,11 +72,6 @@ private func session(of record: WorkspaceSessionRecord, root: String) -> HostedS
         record.hosted!.sessionID, tab: record.id, project: root, name: record.title,
         kind: record.kind.rawValue, command: record.commandName
     )
-}
-
-/// The key a repository's saved tabs are stored under.
-private func repositoryKey(_ root: URL) -> String {
-    URL(fileURLWithPath: root.path, isDirectory: true).standardizedFileURL.path
 }
 
 /// The same directory, however it is spelled (`/var` or `/private/var`).
@@ -174,27 +137,6 @@ private func makeModel(
         isAppActive: isAppActive,
         removeStaleResources: removeStaleResources
     )
-}
-
-/// Suspends restores until the test opens it.
-@MainActor
-private final class RestoreGate {
-    private var continuations: [CheckedContinuation<Void, Never>] = []
-    private var isOpen = false
-    private(set) var waiting = 0
-
-    func wait() async {
-        guard !isOpen else { return }
-        waiting += 1
-        await withCheckedContinuation { continuations.append($0) }
-    }
-
-    func open() {
-        isOpen = true
-        let waiting = continuations
-        continuations.removeAll()
-        waiting.forEach { $0.resume() }
-    }
 }
 
 /// A project window for `root` whose restore uses the harness's host
@@ -409,8 +351,8 @@ private func openProject(
 
 @Test @MainActor func sessionsAwaitingARestoreAreNotBackgroundButSetAsideOnesAre() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-background-restore")
-    let storeDirectory = try temporaryDirectory("cherry-background-restore-store")
+    let root = try canonicalTemporaryDirectory("cherry-background-restore")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-restore-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let editor = savedTab(title: "Editor", sessionID: "s-editor", root: root.path)
     let server = savedTab(kind: .command, title: "server", sessionID: "s-server", commandName: "server", root: root.path)
@@ -624,7 +566,7 @@ private func openProject(
 }
 
 @Test @MainActor func aCopyWithoutTheInstanceLockListsAndEndsNothing() async throws {
-    let directory = try temporaryDirectory("cherry-background-lock")
+    let directory = try canonicalTemporaryDirectory("cherry-background-lock")
     defer { try? FileManager.default.removeItem(at: directory) }
     let lockURL = directory.appendingPathComponent("instance.lock")
     let holder = AppInstanceLock(fileURL: lockURL, applicationSupportName: "CherryTests")
@@ -864,7 +806,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
 /// what it reported before it was looked at is not news.
 @Test @MainActor func aBackgroundProgramThatFinishesIsUnreadAndOneThatWaitsForTheUserIsPosted() async throws {
     let harness = try PersistentHarness()
-    let store = WorkspaceStateStore(directory: try temporaryDirectory("cherry-background-program-status"))
+    let store = WorkspaceStateStore(directory: try canonicalTemporaryDirectory("cherry-background-program-status"))
     harness.hosting.endedSessionsStore = store
     let clock = Recorder(Date())
     let posted = Recorder<[BackgroundSessionNotificationContent]>([])
@@ -1183,8 +1125,8 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
 
 @Test @MainActor func openingASessionOfAClosedWindowReopensItsProjectAndRevealsTheRestoredTab() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-background-open")
-    let storeDirectory = try temporaryDirectory("cherry-background-open-store")
+    let root = try canonicalTemporaryDirectory("cherry-background-open")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-open-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let editor = savedTab(title: "Editor", sessionID: "s-editor", root: root.path)
     let logs = savedTab(title: "Logs", sessionID: "s-logs", root: root.path)
@@ -1238,8 +1180,8 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
 
 @Test @MainActor func endingASessionOfAClosedWindowDropsItsTabWhenTheWindowReopens() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-background-end")
-    let storeDirectory = try temporaryDirectory("cherry-background-end-store")
+    let root = try canonicalTemporaryDirectory("cherry-background-end")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-end-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let editor = savedTab(title: "Editor", sessionID: "s-editor", root: root.path)
     let logs = savedTab(title: "Logs", sessionID: "s-logs", root: root.path)
@@ -1279,8 +1221,8 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     var configuration = PersistentHarness.fastConfiguration
     configuration.terminationTimeout = .milliseconds(200)
     let harness = try PersistentHarness(configuration: configuration)
-    let root = try temporaryDirectory("cherry-background-reopen-ending")
-    let storeDirectory = try temporaryDirectory("cherry-background-reopen-ending-store")
+    let root = try canonicalTemporaryDirectory("cherry-background-reopen-ending")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-reopen-ending-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let editor = savedTab(title: "Editor", sessionID: "s-editor", root: root.path)
     let logs = savedTab(title: "Logs", sessionID: "s-logs", root: root.path)
@@ -1435,15 +1377,6 @@ private final class NoticeDefaults {
     }
 }
 
-/// A project window's chrome whose toasts never go by themselves and reach
-/// no VoiceOver.
-@MainActor
-private func quietChromeState() -> ProjectWindowChromeState {
-    ProjectWindowChromeState(toasts: ProjectWindowToasts(
-        schedule: { _, _ in }, announce: { _ in }, voiceOverEnabled: { false }
-    ))
-}
-
 /// Registers `window` with `registry` as the project window of `root`, with
 /// `chromeState` and a workspace that runs nothing, which the caller keeps
 /// (the registry holds it weakly).
@@ -1496,8 +1429,8 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
 
 @Test @MainActor func theLaunchNoticeWaitsForRestoresAndShowsItsToastOnce() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-background-notice")
-    let storeDirectory = try temporaryDirectory("cherry-background-notice-store")
+    let root = try canonicalTemporaryDirectory("cherry-background-notice")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-notice-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let noticeDefaults = try NoticeDefaults()
     let editor = savedTab(title: "Editor", sessionID: "s-editor", root: root.path)
@@ -1736,9 +1669,9 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
 
 @Test @MainActor func theLaunchNoticesReopenBringsEachSessionBackInItsOwnProjectWindow() async throws {
     let harness = try PersistentHarness()
-    let rootA = try temporaryDirectory("cherry-background-notice-a")
-    let rootB = try temporaryDirectory("cherry-background-notice-b")
-    let storeDirectory = try temporaryDirectory("cherry-background-notice-reopen-store")
+    let rootA = try canonicalTemporaryDirectory("cherry-background-notice-a")
+    let rootB = try canonicalTemporaryDirectory("cherry-background-notice-b")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-notice-reopen-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let noticeDefaults = try NoticeDefaults()
     let registry = ProjectWindowRegistry()
@@ -1892,7 +1825,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     let pendingAnswer = Recorder<(@MainActor (SessionTeardownAnswer, LocalSessionsOnQuit?) -> Void)?>(nil)
     ProjectWindowCloseDelegate.sessionsKeptInBackground = { notice.noteTold($0) }
     ProjectWindowCloseDelegate.askAboutSessions = { _, _, answer in pendingAnswer.value = answer }
-    let elsewhere = try temporaryDirectory("cherry-background-notice-window")
+    let elsewhere = try canonicalTemporaryDirectory("cherry-background-notice-window")
     let noticeWindow = testWindow()
     let chromeState = quietChromeState()
     let windowWorkspace = registerWindow(noticeWindow, root: elsewhere.path, chromeState: chromeState, in: registry)
@@ -1992,7 +1925,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     #expect(harness.fake.requests("list").count == lists)
 
     // Another copy holds the instance lock.
-    let directory = try temporaryDirectory("cherry-background-notice-lock")
+    let directory = try canonicalTemporaryDirectory("cherry-background-notice-lock")
     defer { try? FileManager.default.removeItem(at: directory) }
     let lockURL = directory.appendingPathComponent("instance.lock")
     let holder = AppInstanceLock(fileURL: lockURL, applicationSupportName: "CherryTests")
@@ -2088,7 +2021,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
 @Test @MainActor func aBackgroundSessionsBellsAndNotificationsArePostedNamingItAndMarkedUnread() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()
-    let store = WorkspaceStateStore(directory: try temporaryDirectory("cherry-background-unread"))
+    let store = WorkspaceStateStore(directory: try canonicalTemporaryDirectory("cherry-background-unread"))
     harness.hosting.endedSessionsStore = store
     let clock = Recorder(Date())
     let posted = Recorder<[BackgroundSessionNotificationContent]>([])
@@ -2196,8 +2129,8 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
 
 @Test @MainActor func clickingABackgroundSessionsNotificationOpensItAsOpenDoes() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-background-click")
-    let storeDirectory = try temporaryDirectory("cherry-background-click-store")
+    let root = try canonicalTemporaryDirectory("cherry-background-click")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-click-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     harness.fake.pendingHolders = 0
     let registry = ProjectWindowRegistry()
@@ -2234,7 +2167,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
 
 @Test @MainActor func endedBackgroundSessionsNoSavedTabNamesAreRemovedAfterTheGracePeriod() async throws {
     let harness = try PersistentHarness()
-    let directory = try temporaryDirectory("cherry-background-gc")
+    let directory = try canonicalTemporaryDirectory("cherry-background-gc")
     let store = WorkspaceStateStore(directory: directory)
     harness.hosting.endedSessionsStore = store
     let clock = Recorder(Date())
@@ -2401,7 +2334,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
         defaults.removePersistentDomain(forName: suite)
     }
     let project = try #require(settings.addProject(path: harness.project.path))
-    let other = try temporaryDirectory("cherry-other-project")
+    let other = try canonicalTemporaryDirectory("cherry-other-project")
     defer { try? FileManager.default.removeItem(at: other) }
     harness.fake.sessions = [
         ownSession("s-mine", project: project.root, name: "Server"),
@@ -2524,7 +2457,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
 
 @Test @MainActor func unreadMarksOfAnEarlierRunComeBackInTheList() async throws {
     let harness = try PersistentHarness()
-    let directory = try temporaryDirectory("cherry-background-unread-launch")
+    let directory = try canonicalTemporaryDirectory("cherry-background-unread-launch")
     let store = WorkspaceStateStore(directory: directory)
     harness.hosting.endedSessionsStore = store
     let model = makeModel(harness)

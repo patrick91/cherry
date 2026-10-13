@@ -224,16 +224,6 @@ enum KeyLogger {
     }
 }
 
-@MainActor
-func poll(_ description: String, timeout: TimeInterval = 15, _ predicate: @MainActor () async throws -> Bool) async throws {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if try await predicate() { return }
-        try await Task.sleep(for: .milliseconds(25))
-    }
-    throw HostedSessionError.message("Timed out waiting for \(description)")
-}
-
 private func hex(_ text: String) -> String {
     Data(text.utf8).map { String(format: "%02x", $0) }.joined()
 }

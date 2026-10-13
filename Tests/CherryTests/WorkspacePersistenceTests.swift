@@ -8,17 +8,6 @@ import Testing
 
 // MARK: - Helpers
 
-private func makeCanonicalTemporaryDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    guard let resolved = url.path.withCString({ realpath($0, nil) }) else {
-        throw CocoaError(.fileNoSuchFile)
-    }
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-}
-
 private func hostedRecord(
     id: UUID = UUID(),
     title: String,
@@ -86,23 +75,6 @@ private final class Box<Value> {
 
     init(_ value: Value) {
         self.value = value
-    }
-}
-
-/// Suspends a restore until the test opens it.
-@MainActor
-private final class RestoreGate {
-    private var continuation: CheckedContinuation<Void, Never>?
-    private(set) var isWaiting = false
-
-    func wait() async {
-        isWaiting = true
-        await withCheckedContinuation { continuation = $0 }
-    }
-
-    func open() {
-        continuation?.resume()
-        continuation = nil
     }
 }
 
@@ -195,13 +167,6 @@ private func makeRestoringRepository(
     )
 }
 
-/// `RepositoryWorkspace.repositoryRoot` for a directory: standardized, so a
-/// temporary directory loses its /private prefix. Its tabs' folder
-/// (`workspaceRoot`) stays a real path.
-private func repositoryKey(_ url: URL) -> String {
-    URL(fileURLWithPath: url.path, isDirectory: true).standardizedFileURL.path
-}
-
 @MainActor
 private func waitForSavedState(
     in store: WorkspaceStateStore,
@@ -227,7 +192,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 // MARK: - Store
 
 @Test func workspaceStateStoreRoundTripsRepositoryState() throws {
-    let directory = try makeCanonicalTemporaryDirectory("cherry-workspace-store")
+    let directory = try canonicalTemporaryDirectory("cherry-workspace-store")
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = WorkspaceStateStore(directory: directory)
     let splitID = UUID()
@@ -287,7 +252,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test func workspaceStateStoreReplacesFilesAtomicallyAndPrivately() throws {
-    let directory = try makeCanonicalTemporaryDirectory("cherry-workspace-atomic")
+    let directory = try canonicalTemporaryDirectory("cherry-workspace-atomic")
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
     let old = RepositoryStateRecord(
@@ -323,7 +288,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test func theStoreRecordsSystemQuitsAndSessionsEndedOnPurposeAndTabsTheSystemEnded() throws {
-    let directory = try makeCanonicalTemporaryDirectory("cherry-system-ends")
+    let directory = try canonicalTemporaryDirectory("cherry-system-ends")
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
 
@@ -432,7 +397,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test func openProjectWindowListRoundTripsAndReopensOnlyWindowsWithTabs() throws {
-    let directory = try makeCanonicalTemporaryDirectory("cherry-open-windows")
+    let directory = try canonicalTemporaryDirectory("cherry-open-windows")
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
     let withTabs = directory.appendingPathComponent("with-tabs", isDirectory: true)
@@ -813,8 +778,8 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 // MARK: - Restore
 
 @Test @MainActor func repositoryRestoresHostedRecordsWithTheirIDsAndLayout() async throws {
-    let root = try makeCanonicalTemporaryDirectory("cherry-restore")
-    let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-restore-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-store")
     defer {
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
@@ -917,8 +882,8 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test @MainActor func repositoryOpensTheDefaultShellWhenNothingIsRestored() async throws {
-    let root = try makeCanonicalTemporaryDirectory("cherry-restore-empty")
-    let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-restore-empty-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-empty")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-empty-store")
     defer {
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
@@ -953,7 +918,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 
     // Only native tabs saved: nothing can come back, so the window opens its
     // default shell at once and the restorer is never asked.
-    let nativeOnlyRoot = try makeCanonicalTemporaryDirectory("cherry-restore-native")
+    let nativeOnlyRoot = try canonicalTemporaryDirectory("cherry-restore-native")
     defer { try? FileManager.default.removeItem(at: nativeOnlyRoot) }
     store.saveSynchronously(RepositoryStateRecord(
         repositoryRoot: repositoryKey(nativeOnlyRoot),
@@ -976,8 +941,8 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test @MainActor func autoStartWaitsForTheRestoreAndSkipsRestoredCommands() async throws {
-    let root = try makeCanonicalTemporaryDirectory("cherry-restore-autostart")
-    let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-restore-autostart-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-autostart")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-autostart-store")
     defer {
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
@@ -1015,10 +980,10 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     #expect(autoStartRequests.isEmpty)
 
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
-    for _ in 0..<100 where !gate.isWaiting {
+    for _ in 0..<100 where gate.waiting == 0 {
         await Task.yield()
     }
-    #expect(gate.isWaiting)
+    #expect(gate.waiting > 0)
     repository.autoStartInitialCommandsIfNeeded()
     #expect(autoStartRequests.isEmpty)
     #expect(workspace.sessions.isEmpty)
@@ -1036,8 +1001,8 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test @MainActor func repositoryKeepsSavedTabsItCannotRestoreYet() async throws {
-    let root = try makeCanonicalTemporaryDirectory("cherry-restore-kept")
-    let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-restore-kept-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-kept")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-kept-store")
     defer {
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
@@ -1110,8 +1075,8 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     // Sessions), and is kept, as its saved record, when it keeps them.
     for (intent, ends) in [(SessionCloseIntent.appQuitEndingSessions, true), (.appQuit, false)] {
         let label = Comment(rawValue: "\(intent)")
-        let root = try makeCanonicalTemporaryDirectory("cherry-restore-abandoned")
-        let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-restore-abandoned-store")
+        let root = try canonicalTemporaryDirectory("cherry-restore-abandoned")
+        let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-abandoned-store")
         defer {
             try? FileManager.default.removeItem(at: root)
             try? FileManager.default.removeItem(at: storeDirectory)
@@ -1131,10 +1096,10 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
         )
         defer { gate.open() }
         repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
-        for _ in 0..<100 where !gate.isWaiting {
+        for _ in 0..<100 where gate.waiting == 0 {
             await Task.yield()
         }
-        #expect(gate.isWaiting, label)
+        #expect(gate.waiting > 0, label)
 
         repository.closeAllSessions(intent: intent)
         gate.open()
@@ -1153,7 +1118,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 /// window in one restore, the project's own first, nothing is ended, and
 /// they are saved again as the window's one record.
 @Test @MainActor func aFileSavedWithWorktreeSpacesRestoresEveryWorktreesTabsInTheWindow() async throws {
-    let container = try makeCanonicalTemporaryDirectory("cherry-restore-worktrees")
+    let container = try canonicalTemporaryDirectory("cherry-restore-worktrees")
     defer { try? FileManager.default.removeItem(at: container) }
     let root = container.appendingPathComponent("repo", isDirectory: true)
     let feature = container.appendingPathComponent("feature", isDirectory: true)
@@ -1201,8 +1166,8 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 // MARK: - Saving
 
 @Test @MainActor func repositoryNeverSavesBeforeClaimingItsWindowOrDuringTeardown() async throws {
-    let root = try makeCanonicalTemporaryDirectory("cherry-save-teardown")
-    let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-save-teardown-store")
+    let root = try canonicalTemporaryDirectory("cherry-save-teardown")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-save-teardown-store")
     defer {
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
@@ -1264,7 +1229,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 @MainActor
 struct WorkspaceRegistryPersistenceTests {
     @Test func confirmedQuitSavesWhatChangedWhileTheAlertWasUp() async throws {
-        let container = try makeCanonicalTemporaryDirectory("cherry-quit-flush")
+        let container = try canonicalTemporaryDirectory("cherry-quit-flush")
         defer { try? FileManager.default.removeItem(at: container) }
         let rootA = container.appendingPathComponent("a", isDirectory: true)
         let rootB = container.appendingPathComponent("b", isDirectory: true)
@@ -1352,7 +1317,7 @@ struct WorkspaceRegistryPersistenceTests {
     }
 
     @Test func savedWindowsReopenOnceAndSkipOpenOnes() throws {
-        let directory = try makeCanonicalTemporaryDirectory("cherry-reopen")
+        let directory = try canonicalTemporaryDirectory("cherry-reopen")
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
         let projects = ["open", "closed", "empty"].map { directory.appendingPathComponent($0, isDirectory: true) }
@@ -1399,7 +1364,7 @@ struct WorkspaceRegistryPersistenceTests {
     /// back from the app's own list alone: a new run reads what the last one
     /// saved as its windows closed at quit.
     @Test func windowsOpenAtQuitReopenAtTheNextLaunchWithoutAppKit() throws {
-        let directory = try makeCanonicalTemporaryDirectory("cherry-relaunch-windows")
+        let directory = try canonicalTemporaryDirectory("cherry-relaunch-windows")
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
         let projects = ["a", "b"].map { directory.appendingPathComponent($0, isDirectory: true) }
@@ -1452,7 +1417,7 @@ struct WorkspaceRegistryPersistenceTests {
     /// Saved windows open at once at launch (`savedWindowsLaunchPlan`);
     /// only the default project's window waits a moment for a deep link's.
     @Test func savedWindowsOpenWithoutWaitingForTheDefaultWindowDecision() throws {
-        let directory = try makeCanonicalTemporaryDirectory("cherry-saved-windows-now")
+        let directory = try canonicalTemporaryDirectory("cherry-saved-windows-now")
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
 
@@ -1482,7 +1447,7 @@ struct WorkspaceRegistryPersistenceTests {
     }
 
     @Test func launchOpensTheDefaultWindowOnlyWhenNothingElseOpens() throws {
-        let directory = try makeCanonicalTemporaryDirectory("cherry-default-window")
+        let directory = try canonicalTemporaryDirectory("cherry-default-window")
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
 
@@ -1514,7 +1479,7 @@ struct WorkspaceRegistryPersistenceTests {
     /// A second copy of the app (another holds the instance lock) reopens
     /// none of the first copy's windows: it opens the default one.
     @Test func aSecondCopyOpensOnlyTheDefaultWindow() throws {
-        let directory = try makeCanonicalTemporaryDirectory("cherry-second-copy-windows")
+        let directory = try canonicalTemporaryDirectory("cherry-second-copy-windows")
         defer { try? FileManager.default.removeItem(at: directory) }
         let lockURL = directory.appendingPathComponent("instance.lock")
         let owner = AppInstanceLock(fileURL: lockURL, applicationSupportName: "CherryTests")
@@ -1561,7 +1526,7 @@ struct WorkspaceRegistryPersistenceTests {
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let frames = ProjectWindowFrameStore(defaults: defaults)
-        let directory = try makeCanonicalTemporaryDirectory("cherry-window-frames")
+        let directory = try canonicalTemporaryDirectory("cherry-window-frames")
         defer { try? FileManager.default.removeItem(at: directory) }
         let roots = try ["a", "b", "c"].map { name in
             let project = directory.appendingPathComponent(name, isDirectory: true)
@@ -1641,7 +1606,7 @@ struct WorkspaceRegistryPersistenceTests {
         let defaultsName = "CherryTests.OwningWindow.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: defaultsName))
         let settings = AgentSettings(defaults: defaults)
-        let container = try makeCanonicalTemporaryDirectory("cherry-mcp-owning-window")
+        let container = try canonicalTemporaryDirectory("cherry-mcp-owning-window")
         let rootA = container.appendingPathComponent("a", isDirectory: true)
         let rootB = container.appendingPathComponent("b", isDirectory: true)
         try FileManager.default.createDirectory(at: rootA, withIntermediateDirectories: true)

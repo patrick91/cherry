@@ -26,18 +26,6 @@ private func window() -> NSWindow {
     return window
 }
 
-/// Waits (polling the main loop) until `condition` holds; false after
-/// `timeout`.
-@MainActor
-private func eventually(timeout: TimeInterval = 30, _ condition: () -> Bool) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return condition()
-}
-
 @Test func theInstanceLockNoticeExplainsWhyPersistentSessionsAreOffOnlyWhenTheyAre() throws {
     #expect(InstanceLockNotice.content(reason: nil) == nil)
     #expect(InstanceLockNotice.content(reason: "  \n") == nil)
@@ -83,7 +71,7 @@ private func eventually(timeout: TimeInterval = 30, _ condition: () -> Bool) asy
     notice.projectWindowDidRegister(first)
     // Windows registering while it is being found out change nothing.
     notice.projectWindowDidRegister(second)
-    #expect(await eventually { !shown.shown.isEmpty })
+    #expect(await eventually(timeout: 30) { !shown.shown.isEmpty })
     #expect(notice.phase == .shown)
     notice.projectWindowDidRegister(second)
     notice.projectWindowDidRegister(first)
@@ -102,7 +90,7 @@ private func eventually(timeout: TimeInterval = 30, _ condition: () -> Bool) asy
         present: { content, window in shown.shown.append((content, window)) }
     )
     notice.projectWindowDidRegister(window())
-    #expect(await eventually { notice.phase == .notNeeded })
+    #expect(await eventually(timeout: 30) { notice.phase == .notNeeded })
     notice.projectWindowDidRegister(window())
     try await Task.sleep(for: .milliseconds(100))
     #expect(shown.shown.isEmpty)
@@ -127,7 +115,7 @@ private func eventually(timeout: TimeInterval = 30, _ condition: () -> Bool) asy
     // The window that registered is not on screen, and no other project
     // window is: after a few tries, it waits for the next one.
     notice.projectWindowDidRegister(offScreen)
-    #expect(await eventually {
+    #expect(await eventually(timeout: 30) {
         if case .waitingForWindow = notice.phase { return true }
         return false
     })
@@ -151,12 +139,12 @@ private func eventually(timeout: TimeInterval = 30, _ condition: () -> Bool) asy
         retries: 100
     )
     retrying.projectWindowDidRegister(offScreen)
-    #expect(await eventually {
+    #expect(await eventually(timeout: 30) {
         if case .waitingForWindow = retrying.phase { return true }
         return false
     })
     fallbackWindow.value = fallback
-    #expect(await eventually { retrying.phase == .shown })
+    #expect(await eventually(timeout: 30) { retrying.phase == .shown })
     #expect(shown.shown.last?.window === fallback)
 }
 
@@ -202,7 +190,7 @@ private func eventually(timeout: TimeInterval = 30, _ condition: () -> Bool) asy
     // The background sessions notice waits for the launch's windows.
     #expect(registry.backgroundSessionsNotice === backgroundNotice)
     #expect(backgroundNotice.phase == .idle)
-    #expect(await eventually { shown.shown.count == 1 })
+    #expect(await eventually(timeout: 30) { shown.shown.count == 1 })
     #expect(shown.shown.first?.window === projectWindow)
 
     // Installed once: a second call (there is none in the app) keeps it.

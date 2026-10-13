@@ -13,13 +13,6 @@ import Testing
 private let studioID = UUID(uuidString: "00000000-0000-0000-0000-00000000D00D")!
 private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
-private func privateDefaults() -> UserDefaults {
-    let name = "cherry-omni-bar-tests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: name)!
-    defaults.removePersistentDomain(forName: name)
-    return defaults
-}
-
 private func local(
     _ name: String,
     open: ProjectSwitcherModel.OpenStatus? = nil,
@@ -187,7 +180,7 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
 // MARK: - Frecency
 
 @Test @MainActor func omniFrecencyTakesOverThePalettesUsageAndCountsProjectWindows() throws {
-    let defaults = privateDefaults()
+    let defaults = privateDefaults("cherry-omni-bar-tests")
     let legacy: [String: OmniFrecencyStore.Entry] = [
         "command:toggleAppearance": .init(selectionCount: 3, lastSelectedAt: now.addingTimeInterval(-7_200)),
     ]

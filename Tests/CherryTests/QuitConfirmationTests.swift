@@ -21,17 +21,6 @@ private func makeWindow() -> NSWindow {
     return window
 }
 
-/// Waits (briefly) for `condition`: the window-close observer runs on the
-/// main queue.
-@MainActor
-private func eventually(_ condition: () -> Bool) async -> Bool {
-    for _ in 0..<50 {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return condition()
-}
-
 @Test @MainActor func theQuitConfirmationGoesOnAProjectWindowNeverTheMenuBarPanel() {
     let keyProject = makeWindow()
     let activeProject = makeWindow()
@@ -75,7 +64,7 @@ private func eventually(_ condition: () -> Bool) async -> Bool {
     // The sheet's window closes before the sheet was answered: the quit is
     // cancelled (AppKit gets its reply) ...
     parent.close()
-    #expect(await eventually { answers.value == [false] })
+    #expect(await eventually(timeout: 0.5) { answers.value == [false] })
     #expect(answer.isResolved)
     // ... and the sheet ending with its window answers nothing more.
     answer.resolve(true)
@@ -106,7 +95,7 @@ private func eventually(_ condition: () -> Bool) async -> Bool {
     }
 
     parent.close()
-    #expect(await eventually { answers.value == [.cancel] })
+    #expect(await eventually(timeout: 0.5) { answers.value == [.cancel] })
     #expect(answer.isResolved)
     // End Sessions answered as the sheet ends with its window: ignored.
     answer.resolve(.end)

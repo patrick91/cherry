@@ -331,12 +331,7 @@ final class FakeControlHelper: @unchecked Sendable {
     /// Waits (polling) until `condition` holds; false after `timeout`.
     @MainActor
     func wait(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return true }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        return condition()
+        await eventually(timeout: timeout, condition)
     }
 }
 

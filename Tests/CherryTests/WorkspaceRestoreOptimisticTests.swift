@@ -47,35 +47,6 @@ private func exited(_ id: String, _ record: WorkspaceSessionRecord, code: UInt32
                       owner: "CherryTests", tags: [PersistentSessionTag.tab: record.id.uuidString])
 }
 
-private func temporaryDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    let resolved = try #require(url.path.withCString { realpath($0, nil) })
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-}
-
-/// Holds a restore until opened: the host "has not answered" meanwhile.
-@MainActor
-private final class HostAnswerGate {
-    private var continuations: [CheckedContinuation<Void, Never>] = []
-    private var isOpen = false
-    private(set) var waiting = 0
-
-    func wait() async {
-        guard !isOpen else { return }
-        waiting += 1
-        await withCheckedContinuation { continuations.append($0) }
-    }
-
-    func open() {
-        isOpen = true
-        continuations.forEach { $0.resume() }
-        continuations.removeAll()
-    }
-}
-
 /// A project window whose saved tabs come back through `harness`'s fake
 /// host, showing them before it answers (as the app's windows do).
 @MainActor
@@ -84,7 +55,8 @@ private struct OptimisticWindow {
     let root: URL
     let storeDirectory: URL
     let store: WorkspaceStateStore
-    let gate = HostAnswerGate()
+    /// Holds the restore until opened: the host "has not answered" meanwhile.
+    let gate = RestoreGate()
     let queue = RestoredTabLaunchQueue()
     let repository: RepositoryWorkspace
 
@@ -98,7 +70,7 @@ private struct OptimisticWindow {
     ) throws {
         self.harness = harness
         self.root = root
-        storeDirectory = try temporaryDirectory("cherry-optimistic-store")
+        storeDirectory = try canonicalTemporaryDirectory("cherry-optimistic-store")
         store = WorkspaceStateStore(directory: storeDirectory)
         store.saveSynchronously(RepositoryStateRecord(
             repositoryRoot: URL(fileURLWithPath: root.path, isDirectory: true).standardizedFileURL.path,
@@ -154,7 +126,7 @@ private struct OptimisticWindow {
 @Test @MainActor func savedTabsShowBeforeTheHostAnswersAndStayTheSameTabsOnceItConfirmsThem() async throws {
     let harness2 = try PersistentHarness()
     harness2.fake.pendingHolders = 0
-    let rootURL = try temporaryDirectory("cherry-optimistic-shown")
+    let rootURL = try canonicalTemporaryDirectory("cherry-optimistic-shown")
     let root = rootURL.path
     let editorID = UUID()
     let serverID = UUID()
@@ -223,7 +195,7 @@ private struct OptimisticWindow {
 @Test @MainActor func theHostsAnswerConfirmsReplacesEndsOrDropsEachTabShownBeforeIt() async throws {
     let harness = try PersistentHarness()
     harness.fake.pendingHolders = 0
-    let rootURL = try temporaryDirectory("cherry-optimistic-matrix")
+    let rootURL = try canonicalTemporaryDirectory("cherry-optimistic-matrix")
     let root = rootURL.path
     let live = savedTab(title: "Live", sessionID: "s-live", workingDirectory: root)
     let failed = savedTab(kind: .command, title: "build", sessionID: "s-build", commandName: "build", restartOnExit: true,
@@ -293,7 +265,7 @@ private struct OptimisticWindow {
 @Test @MainActor func aTabShownForASessionMissingFromTheFirstListStaysUntilTheSecondLook() async throws {
     let harness = try PersistentHarness()
     harness.fake.pendingHolders = nil
-    let rootURL = try temporaryDirectory("cherry-optimistic-second-look")
+    let rootURL = try canonicalTemporaryDirectory("cherry-optimistic-second-look")
     let root = rootURL.path
     let live = savedTab(title: "Live", sessionID: "s-live", workingDirectory: root)
     let late = savedTab(title: "Late", sessionID: "s-late", workingDirectory: root)
@@ -319,7 +291,7 @@ private struct OptimisticWindow {
 @Test @MainActor func tabsSavedBeforeARestartWaitForTheHostAndComeBackEnded() async throws {
     let harness = try PersistentHarness()
     harness.fake.pendingHolders = 0
-    let rootURL = try temporaryDirectory("cherry-optimistic-reboot")
+    let rootURL = try canonicalTemporaryDirectory("cherry-optimistic-reboot")
     let root = rootURL.path
     let shell = savedTab(title: "Shell", sessionID: "s-shell", workingDirectory: root)
     let boot = try #require(SystemEndedSessions.currentBootTime())
@@ -341,7 +313,7 @@ private struct OptimisticWindow {
 @Test @MainActor func tabsShownBeforeAnUnreachableHostAnswersGoAndComeBackWhenItIsUp() async throws {
     let harness = try PersistentHarness()
     harness.fake.pendingHolders = 0
-    let rootURL = try temporaryDirectory("cherry-optimistic-unreachable")
+    let rootURL = try canonicalTemporaryDirectory("cherry-optimistic-unreachable")
     let root = rootURL.path
     let editor = savedTab(title: "Editor", sessionID: "s-editor", workingDirectory: root)
     harness.fake.launchFailure = "cherry-host did not start"
@@ -374,7 +346,7 @@ private struct OptimisticWindow {
 @Test @MainActor func aTabClosedBeforeTheHostAnswersDoesNotComeBack() async throws {
     let harness = try PersistentHarness()
     harness.fake.pendingHolders = 0
-    let rootURL = try temporaryDirectory("cherry-optimistic-closed")
+    let rootURL = try canonicalTemporaryDirectory("cherry-optimistic-closed")
     let root = rootURL.path
     let keep = savedTab(title: "Keep", sessionID: "s-keep", workingDirectory: root)
     let close = savedTab(title: "Close", sessionID: "s-close", workingDirectory: root)
@@ -398,7 +370,7 @@ private struct OptimisticWindow {
 @Test @MainActor func windowsThatDoNotOptInWaitForTheHostAsBefore() async throws {
     let harness = try PersistentHarness()
     harness.fake.pendingHolders = 0
-    let rootURL = try temporaryDirectory("cherry-optimistic-off")
+    let rootURL = try canonicalTemporaryDirectory("cherry-optimistic-off")
     let root = rootURL.path
     let editor = savedTab(title: "Editor", sessionID: "s-editor", workingDirectory: root)
     harness.fake.sessions = [running("s-editor", editor, pid: 91)]
@@ -529,7 +501,7 @@ private struct OptimisticWindow {
 @Test @MainActor func theLaunchOpensItsFirstWindowAloneAndTheOthersOnceItShows() async throws {
     let registry = ProjectWindowRegistry()
     registry.windowRevealMaximumWait = .seconds(60)
-    let storeDirectory = try temporaryDirectory("cherry-launch-windows-store")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-launch-windows-store")
     defer { try? FileManager.default.removeItem(at: storeDirectory) }
     let store = WorkspaceStateStore(directory: storeDirectory)
     registry.setWorkspaceStateStoreForTesting(store)
@@ -538,7 +510,7 @@ private struct OptimisticWindow {
     var opened: [String] = []
     var gateAsked = 0
     var proceed: (@MainActor () -> Void)?
-    let roots = try (0..<3).map { try temporaryDirectory("cherry-launch-window-\($0)").path }
+    let roots = try (0..<3).map { try canonicalTemporaryDirectory("cherry-launch-window-\($0)").path }
     defer { roots.forEach { try? FileManager.default.removeItem(atPath: $0) } }
     var windows: [NSWindow] = []
     defer {
@@ -578,16 +550,6 @@ private struct OptimisticWindow {
     #expect(await eventually { allOpened })
 }
 
-@MainActor
-private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool) async -> Bool {
-    let deadline = ContinuousClock.now + timeout
-    while !condition() {
-        guard ContinuousClock.now < deadline else { return false }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return true
-}
-
 // MARK: - Restored adapters during the launch
 
 @Test @MainActor func tabsNoWindowShowsWaitWhileTheLaunchHoldsThem() async throws {
@@ -622,7 +584,7 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
 // MARK: - The last run's login environment
 
 @Test func theLastRunsLoginEnvironmentIsKeptForThisUserAndThisBootOnly() throws {
-    let directory = try temporaryDirectory("cherry-login-environment")
+    let directory = try canonicalTemporaryDirectory("cherry-login-environment")
     defer { try? FileManager.default.removeItem(at: directory) }
     let file = directory.appendingPathComponent(LoginEnvironmentCache.fileName)
     let boot = Date(timeIntervalSince1970: 1_800_000_000)
@@ -658,7 +620,7 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
 /// answers that capture while the shell runs in the background, then this
 /// run's (saved for the next launch, and handed to whoever got the old one).
 @Test func theLoginEnvironmentAnswersTheLastRunsCaptureWhileItCapturesAgain() async throws {
-    let directory = try temporaryDirectory("cherry-login-environment-resolve")
+    let directory = try canonicalTemporaryDirectory("cherry-login-environment-resolve")
     defer { try? FileManager.default.removeItem(at: directory) }
     let cache = LoginEnvironmentCache(
         fileURL: directory.appendingPathComponent(LoginEnvironmentCache.fileName),
@@ -706,7 +668,7 @@ private func quietChrome() -> ProjectWindowChromeState {
     let harness = try PersistentHarness()
     harness.fake.pendingHolders = 0
     harness.fake.killEndsSession = false
-    let rootURL = try temporaryDirectory("cherry-optimistic-restart")
+    let rootURL = try canonicalTemporaryDirectory("cherry-optimistic-restart")
     let root = rootURL.path
     let keep = savedTab(title: "Keep", sessionID: "s-keep", workingDirectory: root)
     let redo = savedTab(title: "Redo", sessionID: "s-redo", workingDirectory: root)
@@ -771,7 +733,7 @@ private final class HeldHostLists: @unchecked Sendable {
     // back confirmed, as the next test does).
     let lists = HeldHostLists()
     lists.install(on: harness.fake)
-    let rootURL = try temporaryDirectory("cherry-optimistic-undo")
+    let rootURL = try canonicalTemporaryDirectory("cherry-optimistic-undo")
     let root = rootURL.path
     let keep = savedTab(title: "Keep", sessionID: "s-keep", workingDirectory: root)
     let close = savedTab(title: "Close", sessionID: "s-close", workingDirectory: root)
@@ -810,7 +772,7 @@ private final class HeldHostLists: @unchecked Sendable {
 @Test @MainActor func undoingTheCloseOfAProvisionalTabAfterTheHostListedButBeforeTheRestoreAnsweredKeepsIt() async throws {
     let harness = try PersistentHarness()
     harness.fake.pendingHolders = 0
-    let rootURL = try temporaryDirectory("cherry-optimistic-undo-listed")
+    let rootURL = try canonicalTemporaryDirectory("cherry-optimistic-undo-listed")
     let root = rootURL.path
     let keep = savedTab(title: "Keep", sessionID: "s-keep", workingDirectory: root)
     let close = savedTab(title: "Close", sessionID: "s-close", workingDirectory: root)
@@ -846,7 +808,7 @@ private final class HeldHostLists: @unchecked Sendable {
 @Test(arguments: [true, false]) @MainActor func mixedTabsKeepTheirSavedOrderAndSplits(optimistic: Bool) async throws {
     let harness = try PersistentHarness()
     harness.fake.pendingHolders = 0
-    let rootURL = try temporaryDirectory("cherry-optimistic-layout")
+    let rootURL = try canonicalTemporaryDirectory("cherry-optimistic-layout")
     let root = rootURL.path
     let a = savedTab(title: "A", sessionID: "s-a", workingDirectory: root)
     let b = savedTab(title: "B", sessionID: "s-b", exitStatus: 1, workingDirectory: root)
@@ -855,7 +817,7 @@ private final class HeldHostLists: @unchecked Sendable {
     harness.fake.sessions = [running("s-a", a, pid: 1), exited("s-b", b, code: 1), running("s-c", c, pid: 3),
                              running("s-d", d, pid: 4)]
     let group = UUID()
-    let storeDirectory = try temporaryDirectory("cherry-optimistic-layout-store")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-optimistic-layout-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     store.saveSynchronously(RepositoryStateRecord(
         repositoryRoot: URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL.path,
@@ -899,14 +861,14 @@ private final class HeldHostLists: @unchecked Sendable {
     defer { harness.cleanUp() }
     let registry = ProjectWindowRegistry()
     registry.windowRevealMaximumWait = .seconds(60)
-    let storeDirectory = try temporaryDirectory("cherry-launch-quit-store")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-launch-quit-store")
     defer { try? FileManager.default.removeItem(at: storeDirectory) }
     let store = WorkspaceStateStore(directory: storeDirectory)
     registry.setWorkspaceStateStoreForTesting(store)
     registry.launchWindowHosting = harness.hosting
     var turns: [@MainActor () -> Void] = []
     registry.scheduleLaunchWindowTurn = { turns.append($0) }
-    let roots = try (0..<2).map { try temporaryDirectory("cherry-launch-quit-\($0)").path }
+    let roots = try (0..<2).map { try canonicalTemporaryDirectory("cherry-launch-quit-\($0)").path }
     defer { roots.forEach { try? FileManager.default.removeItem(atPath: $0) } }
     let later = savedTab(title: "Later", sessionID: "s-later", workingDirectory: roots[1])
     let native = savedTab(title: "Native", sessionID: nil, workingDirectory: roots[1])
@@ -947,7 +909,7 @@ private final class HeldHostLists: @unchecked Sendable {
 /// Only the variables Cherry uses are kept, out of backups, and a file that
 /// is not this user's own private file is not read.
 @Test func theCachedLoginEnvironmentKeepsOnlyWhatCherryUsesPrivately() throws {
-    let directory = try temporaryDirectory("cherry-login-environment-private")
+    let directory = try canonicalTemporaryDirectory("cherry-login-environment-private")
     defer { try? FileManager.default.removeItem(at: directory) }
     var file = directory.appendingPathComponent(LoginEnvironmentCache.fileName)
     let cache = LoginEnvironmentCache(
@@ -981,7 +943,7 @@ private final class HeldHostLists: @unchecked Sendable {
 /// Another login session (launchd's agent socket changed), or a log out
 /// since the save: the cache is not used. SSH masters never get its agent.
 @Test func theCachedLoginEnvironmentIsForThisLoginSessionOnly() throws {
-    let directory = try temporaryDirectory("cherry-login-environment-session")
+    let directory = try canonicalTemporaryDirectory("cherry-login-environment-session")
     defer { try? FileManager.default.removeItem(at: directory) }
     let file = directory.appendingPathComponent(LoginEnvironmentCache.fileName)
     let launchdAgent = Recorder<String?>("/private/tmp/launchd-1/Listeners")

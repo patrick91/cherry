@@ -7,8 +7,9 @@ import Testing
 @testable import Cherry
 
 /// A control server on a private socket with one host-managed workspace,
-/// for the agent wait tests: agents run `/bin/cat` (screens are injected
-/// with `ingestTestingData`) or a fake agent script.
+/// for the agent wait tests (and ControlActivityTests): agents run
+/// `/bin/cat` (screens are injected with `ingestTestingData`) or a fake
+/// agent script.
 @MainActor
 final class ControlAgentWaitHarness {
     let defaultsName: String

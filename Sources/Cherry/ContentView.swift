@@ -21,7 +21,6 @@ struct ContentView: View {
     @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var todoStore: ProjectTodoStore
     let projectRoot: String?
     let openProject: (CherryProject) -> Void
@@ -68,7 +67,6 @@ struct ContentView: View {
                 DetailPaneView(
                     workspace: workspace,
                     chromeState: chromeState,
-                    noteStore: noteStore,
                     todoStore: todoStore,
                     projectRoot: projectRoot,
                     includeLeadingPadding: isSidebarHidden
@@ -77,7 +75,7 @@ struct ContentView: View {
             }
 
             // Keep only the sidebar presentation that can currently be seen.
-            // Each sidebar contains the complete sessions/agents/commands/notes
+            // Each sidebar contains the complete sessions/agents/commands/todos
             // tree; retaining both at steady state doubled the SwiftUI work of a
             // workspace switch. Transition flags keep both alive only for the
             // brief handoff where they genuinely overlap.
@@ -183,7 +181,6 @@ struct ContentView: View {
             repository: repository,
             workspace: workspace,
             chromeState: chromeState,
-            noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: projectRoot,
             openSettings: { openSettings() }
@@ -412,7 +409,6 @@ struct ContentView: View {
             repository: repository,
             workspace: workspace,
             chromeState: chromeState,
-            noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: projectRoot,
             presentation: .docked,
@@ -464,7 +460,6 @@ struct ContentView: View {
             repository: repository,
             workspace: workspace,
             chromeState: chromeState,
-            noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: projectRoot,
             presentation: .floating,
@@ -526,9 +521,6 @@ struct ContentView: View {
     }
 
     private func syncDisabledFeatureSelection(features: ProjectFeatureSettings) {
-        if !features.notesEnabled, chromeState.selectedNoteID != nil {
-            chromeState.selectTerminal()
-        }
         if !features.todosEnabled, chromeState.isTodoPanePresented {
             chromeState.selectTerminal()
         }
@@ -893,7 +885,6 @@ final class TabCloseAlertPresenterView: NSView {
 private struct DetailPaneView: View {
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var todoStore: ProjectTodoStore
     @ObservedObject private var agentSettings = AgentSettings.shared
     let projectRoot: String?
@@ -902,9 +893,7 @@ private struct DetailPaneView: View {
     var body: some View {
         let features = agentSettings.projectFeatures(for: projectRoot)
         Group {
-            if features.notesEnabled, let note = selectedNote {
-                NoteDetailView(note: note, noteStore: noteStore)
-            } else if features.todosEnabled, chromeState.isTodoPanePresented {
+            if features.todosEnabled, chromeState.isTodoPanePresented {
                 TodoPaneView(todoStore: todoStore, chromeState: chromeState)
             } else if let idleCommand = focusedIdleCommand {
                 IdleCommandView(
@@ -942,12 +931,6 @@ private struct DetailPaneView: View {
         .padding(.leading, includeLeadingPadding ? 5 : 0)
         .padding(.trailing, 5)
         .padding(.bottom, 5)
-        .onChange(of: noteStore.notes) { _, notes in
-            guard let selectedID = chromeState.selectedNoteID,
-                  !notes.contains(where: { $0.id == selectedID })
-            else { return }
-            chromeState.selectNote(id: nil)
-        }
         .onChange(of: todoStore.todos) { _, todos in
             guard let selectedID = chromeState.selectedTodoID,
                   !todos.contains(where: { $0.id == selectedID })
@@ -962,11 +945,6 @@ private struct DetailPaneView: View {
                 }
             }
         }
-    }
-
-    private var selectedNote: ProjectNote? {
-        guard let selectedID = chromeState.selectedNoteID else { return nil }
-        return noteStore.notes.first { $0.id == selectedID }
     }
 
     private var focusedIdleCommand: ProjectCommandDefinition? {
@@ -1063,109 +1041,6 @@ private struct IdleCommandView: View {
             themeColors.backgroundColor
             dimOverlay
         }
-    }
-}
-
-private struct NoteDetailView: View {
-    let note: ProjectNote
-    @ObservedObject var noteStore: ProjectNoteStore
-    @ObservedObject private var terminalSettings = TerminalSettings.shared
-    @Environment(\.colorScheme) private var colorScheme
-
-    @State private var draftTitle: String
-    @State private var draftMarkdown: String
-    @State private var pendingSave: Task<Void, Never>?
-
-    init(note: ProjectNote, noteStore: ProjectNoteStore) {
-        self.note = note
-        self.noteStore = noteStore
-        _draftTitle = State(initialValue: note.title)
-        _draftMarkdown = State(initialValue: note.markdown)
-    }
-
-    private var themeColors: TerminalThemeColors {
-        terminalSettings.ghosttyThemeColors(for: colorScheme)
-    }
-
-    private var themeForeground: Color {
-        let foreground = NSColor(hexRGB: themeColors.foreground) ?? .labelColor
-        return Color(nsColor: foreground.boostedForReading(against: NSColor(hexRGB: themeColors.background)))
-    }
-
-    private var titleHeader: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            TextField("Untitled", text: $draftTitle, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...)
-                .font(.system(size: 28, weight: .bold))
-                .foregroundStyle(themeForeground)
-                .onSubmit { saveNow() }
-
-            Text("Edited \(note.updatedAt.formatted(.relative(presentation: .named)))")
-                .font(.system(size: 11))
-                .foregroundStyle(themeForeground.opacity(0.5))
-        }
-        .padding(.leading, NoteEditorStyle.document.textGutter)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    var body: some View {
-        MarkdownSourceEditor(
-            text: $draftMarkdown,
-            themeColors: themeColors,
-            header: AnyView(titleHeader)
-        )
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .background(themeColors.backgroundColor)
-        .contextMenu {
-            Button("Copy Link") {
-                copyCherryLink(cherryLink(for: note))
-            }
-        }
-        .onChange(of: draftTitle) { _, title in
-            // The title wraps for display but stays a single line of text.
-            if title.contains(where: \.isNewline) {
-                draftTitle = title.replacingOccurrences(of: "\n", with: " ")
-                    .replacingOccurrences(of: "\r", with: " ")
-                return
-            }
-            scheduleSave()
-        }
-        .onChange(of: draftMarkdown) { _, _ in scheduleSave() }
-        .onChange(of: note.id) { _, _ in
-            pendingSave?.cancel()
-            draftTitle = note.title
-            draftMarkdown = note.markdown
-        }
-        .onChange(of: note.updatedAt) { _, _ in
-            guard draftTitle != note.title || draftMarkdown != note.markdown else { return }
-            pendingSave?.cancel()
-            draftTitle = note.title
-            draftMarkdown = note.markdown
-        }
-        .onDisappear {
-            saveNow()
-        }
-    }
-
-    private func scheduleSave() {
-        pendingSave?.cancel()
-        pendingSave = Task { @MainActor in
-            do {
-                try await Task.sleep(for: .milliseconds(400))
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            saveNow()
-        }
-    }
-
-    private func saveNow() {
-        pendingSave?.cancel()
-        pendingSave = nil
-        guard draftTitle != note.title || draftMarkdown != note.markdown else { return }
-        _ = try? noteStore.updateFromEditor(id: note.id, title: draftTitle, markdown: draftMarkdown)
     }
 }
 
@@ -2204,8 +2079,6 @@ private struct TodoInspectorPane: View {
                     maxContentWidth: .greatestFiniteMagnitude,
                     minHorizontalInset: 0,
                     verticalInset: 4,
-                    headerSpacing: 0,
-                    style: .terminal,
                     onContentHeightChange: { detailsContentHeight = $0 }
                 )
                 .frame(height: max(120, detailsContentHeight))
@@ -2871,10 +2744,6 @@ private func copyNixCommand(_ environment: NixShellEnvironment) {
     NSPasteboard.general.setString(environment.command, forType: .string)
 }
 
-private func cherryLink(for note: ProjectNote) -> String {
-    CherryDeepLink.noteURL(projectRoot: note.projectRoot, noteID: note.id)
-}
-
 private func cherryLink(for todo: ProjectTodo) -> String {
     CherryDeepLink.todoURL(projectRoot: todo.projectRoot, todoID: todo.id)
 }
@@ -2965,7 +2834,6 @@ private struct SidebarTabsView: View {
     let repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var todoStore: ProjectTodoStore
     let projectRoot: String?
     let presentation: SidebarPresentation
@@ -2976,7 +2844,6 @@ private struct SidebarTabsView: View {
             EquatableSidebarTabsPage(
                 workspace: workspace,
                 chromeState: chromeState,
-                noteStore: noteStore,
                 todoStore: todoStore,
                 projectRoot: projectRoot,
                 presentation: presentation,
@@ -3021,7 +2888,6 @@ private struct SidebarTabsView: View {
 private struct EquatableSidebarTabsPage: View, @preconcurrency Equatable {
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var todoStore: ProjectTodoStore
     let projectRoot: String?
     let presentation: SidebarPresentation
@@ -3030,7 +2896,6 @@ private struct EquatableSidebarTabsPage: View, @preconcurrency Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.workspace === rhs.workspace
             && lhs.chromeState === rhs.chromeState
-            && lhs.noteStore === rhs.noteStore
             && lhs.todoStore === rhs.todoStore
             && lhs.projectRoot == rhs.projectRoot
             && lhs.presentation == rhs.presentation
@@ -3040,7 +2905,6 @@ private struct EquatableSidebarTabsPage: View, @preconcurrency Equatable {
         SidebarTabsPage(
             workspace: workspace,
             chromeState: chromeState,
-            noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: projectRoot,
             presentation: presentation,
@@ -3058,7 +2922,6 @@ private struct SidebarTabsPage: View {
     @ObservedObject private var terminalSettings = TerminalSettings.shared
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var todoStore: ProjectTodoStore
     let projectRoot: String?
     let presentation: SidebarPresentation
@@ -3134,21 +2997,6 @@ private struct SidebarTabsPage: View {
                             + 1,
                         showShortcutHint: chromeState.isCommandKeyPressed
                     )
-                }
-
-                if features.notesEnabled {
-                    SidebarNotesSection(
-                        noteStore: noteStore,
-                        chromeState: chromeState,
-                        selectedNoteID: chromeState.selectedNoteID,
-                        palette: palette,
-                        shortcutStartIndex: visibleAgentItems.count
-                            + workspace.terminalDisplayItems.count
-                            + commands.count
-                            + (features.todosEnabled ? 1 : 0),
-                        showShortcutHints: chromeState.isCommandKeyPressed
-                    )
-                    .equatable()
                 }
             }
             // Keep the sidebar's text column aligned with the native
@@ -3851,121 +3699,6 @@ private struct SidebarCommandSection: View {
     }
 }
 
-private struct SidebarNotesSection: View, @preconcurrency Equatable {
-    @ObservedObject var noteStore: ProjectNoteStore
-    let chromeState: ProjectWindowChromeState
-    let selectedNoteID: UUID?
-    let palette: SidebarPalette
-    let shortcutStartIndex: Int
-    let showShortcutHints: Bool
-
-    static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.noteStore === rhs.noteStore
-            && lhs.chromeState === rhs.chromeState
-            && lhs.selectedNoteID == rhs.selectedNoteID
-            && lhs.palette == rhs.palette
-            && lhs.shortcutStartIndex == rhs.shortcutStartIndex
-            && lhs.showShortcutHints == rhs.showShortcutHints
-    }
-
-    var body: some View {
-        let shortcutNumbersByNoteID = Dictionary(uniqueKeysWithValues: noteStore.notes
-            .prefix(max(0, 9 - shortcutStartIndex))
-            .enumerated()
-            .map { index, note in (note.id, shortcutStartIndex + index + 1) })
-
-        LazyVStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                SidebarSectionHeader(title: "Notes", count: noteStore.notes.count, palette: palette)
-
-                Button(action: createNote) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(palette.headerText)
-                        .frame(width: 22, height: 22)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(noteStore.isLoading)
-                .help("New note")
-            }
-
-            if noteStore.notes.isEmpty {
-                SidebarEmptyRow(
-                    title: noteStore.isLoading ? "Loading notes…" : "No notes",
-                    palette: palette
-                )
-            } else {
-                ForEach(noteStore.notes) { note in
-                    let shortcutNumber = shortcutNumbersByNoteID[note.id]
-                    Button {
-                        chromeState.selectNote(id: note.id)
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "note.text")
-                                .font(.system(size: 13, weight: .regular))
-                                .foregroundStyle(isSelected(note) ? palette.selectedText : palette.rowText)
-                                .frame(width: 18)
-
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(note.title.isEmpty ? "Untitled Note" : note.title)
-                                    .font(.system(size: 15, weight: .regular))
-                                    .foregroundStyle(isSelected(note) ? palette.selectedText : palette.rowText)
-                                    .lineLimit(1)
-
-                                Text(note.updatedAt, style: .relative)
-                                    .font(.system(size: 11, weight: .regular))
-                                    .foregroundStyle((isSelected(note) ? palette.selectedText : palette.rowText).opacity(0.56))
-                                    .lineLimit(1)
-                            }
-
-                            Spacer(minLength: 8)
-
-                            if showShortcutHints, let shortcutNumber {
-                                SidebarShortcutHint(number: shortcutNumber, isSelected: isSelected(note), palette: palette)
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .frame(height: 46)
-                        .padding(.leading, SidebarLayout.rowHorizontalInset)
-                        .padding(.trailing, SidebarLayout.rowHorizontalInset)
-                        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        .background {
-                            SidebarRowBackground(isSelected: isSelected(note), showsShadow: false, palette: palette)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.leading, -SidebarLayout.rowHorizontalInset)
-                    .contextMenu {
-                        Button("Copy Link") {
-                            copyCherryLink(cherryLink(for: note))
-                        }
-
-                        Divider()
-
-                        Button("Delete", role: .destructive) {
-                            try? noteStore.delete(id: note.id)
-                            if chromeState.selectedNoteID == note.id {
-                                chromeState.selectNote(id: nil)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func createNote() {
-        if let note = try? noteStore.create(title: "Untitled Note", markdown: "# Untitled Note\n") {
-            chromeState.selectNote(id: note.id)
-        }
-    }
-
-    private func isSelected(_ note: ProjectNote) -> Bool {
-        selectedNoteID == note.id
-    }
-}
-
 private struct SidebarTodosSection: View {
     @ObservedObject var todoStore: ProjectTodoStore
     @ObservedObject var chromeState: ProjectWindowChromeState
@@ -4305,7 +4038,6 @@ private struct SidebarSessionSection: View {
                     },
                     onSelect: { sessionID in
                         guard let session = workspace.session(withID: sessionID) else { return }
-                        chromeState.selectNote(id: nil)
                         chromeState.selectTerminal()
                         workspace.select(session)
                     },

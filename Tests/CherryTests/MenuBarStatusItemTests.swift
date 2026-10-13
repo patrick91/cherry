@@ -32,7 +32,7 @@ import Testing
                               backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         windows.append((window, root))
-        _ = registry.register(window: window, projectRoot: root, workspace: workspace, noteStore: nil,
+        _ = registry.register(window: window, projectRoot: root, workspace: workspace,
                               todoStore: nil, chromeState: nil)
     }
     var installed = 0

@@ -63,7 +63,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "get_project_status",
-            "Return active project root, process counts, note/todo counts, selected process, and health without changing the Cherry UI.",
+            "Return active project root, process counts, todo counts, selected process, and health without changing the Cherry UI.",
             properties: [:]
         ),
         tool(
@@ -73,7 +73,7 @@ public enum CherryMCPTools {
         ),
         tool(
             "resolve_link",
-            "Resolve a \(CherryDeepLink.scheme)://project/... link for a note, todo, or live terminal without changing the Cherry UI.",
+            "Resolve a \(CherryDeepLink.scheme)://project/... link for a todo or live terminal without changing the Cherry UI.",
             properties: [
                 "link": string("Cherry deep link to resolve."),
                 "include_output": boolean("For terminal links, include rendered output. Defaults to false."),
@@ -353,79 +353,9 @@ public enum CherryMCPTools {
             properties: [:]
         ),
         tool(
-            "list_notes",
-            "List Cherry notes for the current or specified project. Requires Notes to be enabled for the project.",
-            properties: projectScopedProperties()
-        ),
-        tool(
             "list_todos",
             "List Cherry todos for the current or specified project. Requires Todos to be enabled for the project.",
             properties: projectScopedProperties()
-        ),
-        tool(
-            "create_note",
-            "Create a project-scoped Markdown note in Cherry without opening or selecting it. Requires Notes to be enabled for the project.",
-            properties: projectScopedProperties([
-                "title": string("Note title."),
-                "markdown": string("Markdown content.")
-            ]),
-            required: ["title", "markdown"]
-        ),
-        tool(
-            "get_note",
-            "Read a Cherry Markdown note. Requires Notes to be enabled for the project.",
-            properties: projectScopedProperties(["note_id": string("Cherry note UUID.")]),
-            required: ["note_id"]
-        ),
-        tool(
-            "update_note",
-            "Update a Cherry Markdown note title and/or content without opening or selecting it. Requires Notes to be enabled for the project.",
-            properties: projectScopedProperties([
-                "note_id": string("Cherry note UUID."),
-                "title": string("Optional replacement title."),
-                "markdown": string("Optional replacement Markdown content.")
-            ]),
-            required: ["note_id"]
-        ),
-        tool(
-            "append_note",
-            "Append Markdown to a Cherry note without opening or selecting it. Requires Notes to be enabled for the project.",
-            properties: projectScopedProperties([
-                "note_id": string("Cherry note UUID."),
-                "markdown": string("Markdown content to append.")
-            ]),
-            required: ["note_id", "markdown"]
-        ),
-        tool(
-            "rename_note",
-            "Rename a Cherry note without opening or selecting it. Requires Notes to be enabled for the project.",
-            properties: projectScopedProperties([
-                "note_id": string("Cherry note UUID."),
-                "title": string("Replacement note title.")
-            ]),
-            required: ["note_id", "title"]
-        ),
-        tool(
-            "search_notes",
-            "Search Cherry note titles and Markdown for the current or specified project without changing the Cherry UI. Requires Notes to be enabled for the project.",
-            properties: projectScopedProperties([
-                "query": string("Text to search for."),
-                "case_sensitive": boolean("Whether matching is case-sensitive."),
-                "max_matches": integer("Maximum matches. Max 500.")
-            ]),
-            required: ["query"]
-        ),
-        tool(
-            "delete_note",
-            "Delete a Cherry Markdown note. Requires Notes to be enabled for the project.",
-            properties: projectScopedProperties(["note_id": string("Cherry note UUID.")]),
-            required: ["note_id"]
-        ),
-        tool(
-            "select_note",
-            "Explicitly open an existing Cherry Markdown note for review/editing. Requires Notes to be enabled for the project. Use only when the user asks to switch the Cherry UI.",
-            properties: projectScopedProperties(["note_id": string("Cherry note UUID.")]),
-            required: ["note_id"]
         ),
         tool(
             "create_todo",
@@ -1001,43 +931,8 @@ public enum CherryMCPTools {
             return .restartAllCommands(processBulkCommand(in: arguments))
         case "list_agents":
             return .listAgents
-        case "list_notes":
-            return .listNotes
         case "list_todos":
             return .listTodos
-        case "create_note":
-            return .createNote(.init(
-                title: try requiredString("title", in: arguments),
-                markdown: try requiredString("markdown", in: arguments)
-            ))
-        case "get_note":
-            return .getNote(.init(noteID: try requiredString("note_id", in: arguments)))
-        case "update_note":
-            return .updateNote(.init(
-                noteID: try requiredString("note_id", in: arguments),
-                title: stringArgument("title", in: arguments),
-                markdown: stringArgument("markdown", in: arguments)
-            ))
-        case "append_note":
-            return .appendNote(.init(
-                noteID: try requiredString("note_id", in: arguments),
-                markdown: try requiredString("markdown", in: arguments)
-            ))
-        case "rename_note":
-            return .renameNote(.init(
-                noteID: try requiredString("note_id", in: arguments),
-                title: try requiredString("title", in: arguments)
-            ))
-        case "search_notes":
-            return .searchNotes(.init(
-                query: try requiredString("query", in: arguments),
-                caseSensitive: boolArgument("case_sensitive", in: arguments),
-                maxMatches: intArgument("max_matches", in: arguments)
-            ))
-        case "delete_note":
-            return .deleteNote(.init(noteID: try requiredString("note_id", in: arguments)))
-        case "select_note":
-            return .selectNote(.init(noteID: try requiredString("note_id", in: arguments)))
         case "create_todo":
             return .createTodo(.init(
                 title: try requiredString("title", in: arguments),
@@ -1168,25 +1063,7 @@ public enum CherryMCPTools {
             return try encodedResult(payload)
         case .listAgents(let payload):
             return try encodedResult(payload)
-        case .listNotes(let payload):
-            return try encodedResult(payload)
         case .listTodos(let payload):
-            return try encodedResult(payload)
-        case .createNote(let payload):
-            return try encodedResult(payload)
-        case .getNote(let payload):
-            return try encodedResult(payload)
-        case .updateNote(let payload):
-            return try encodedResult(payload)
-        case .appendNote(let payload):
-            return try encodedResult(payload)
-        case .renameNote(let payload):
-            return try encodedResult(payload)
-        case .searchNotes(let payload):
-            return try encodedResult(payload)
-        case .deleteNote(let payload):
-            return try encodedResult(payload)
-        case .selectNote(let payload):
             return try encodedResult(payload)
         case .createTodo(let payload):
             return try encodedResult(payload)
@@ -1217,7 +1094,7 @@ public enum CherryMCPTools {
         let json = try jsonString(payload)
         return CallTool.Result(
             content: [.text(text: json, annotations: nil, _meta: nil)],
-            structuredContent: Optional.some(try Value(payload)),
+            structuredContent: Optional.some(try structuredValue(payload)),
             isError: false
         )
     }
@@ -1227,17 +1104,33 @@ public enum CherryMCPTools {
         let json = try jsonString(payload)
         return CallTool.Result(
             content: [.text(text: json, annotations: nil, _meta: nil)],
-            structuredContent: Optional.some(try Value(payload)),
+            structuredContent: Optional.some(try structuredValue(payload)),
             isError: true
         )
     }
 
+    /// `Value(payload)`, encoded as agents read it (`agentFacingEncoder`).
+    private static func structuredValue<Payload: Encodable>(_ payload: Payload) throws -> Value {
+        if let value = payload as? Value {
+            return value
+        }
+        return try JSONDecoder().decode(Value.self, from: agentFacingEncoder().encode(payload))
+    }
+
     private static func jsonString<Payload: Encodable>(_ payload: Payload) throws -> String {
-        let encoder = JSONEncoder()
+        let encoder = agentFacingEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(payload)
         return String(decoding: data, as: UTF8.self)
+    }
+
+    /// What agents read leaves out the fields the control wire keeps only
+    /// for older helpers (`cherryAgentFacingOutput`).
+    private static func agentFacingEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.userInfo[.cherryAgentFacingOutput] = true
+        return encoder
     }
 
     private static func requiredString(_ key: String, in arguments: [String: Value]) throws -> String {

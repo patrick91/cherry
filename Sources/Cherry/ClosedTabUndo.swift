@@ -364,7 +364,7 @@ final class ClosedTabUndoManager: UndoManager {
 enum ClosedTabUndoRouting {
     /// Whether they act on the window's closed tabs (`ClosedTabHistory`)
     /// while `firstResponder` has the keyboard: the terminal, the sidebar,
-    /// or any view but a text view. A text view (an `NSText`: the notes
+    /// or any view but a text view. A text view (an `NSText`: a to-do's
     /// editor, or the editor of a search or name field) keeps its own text
     /// undo, as ever; closed tabs never join its undo.
     static func actsOnClosedTabs(firstResponder: NSResponder?) -> Bool {

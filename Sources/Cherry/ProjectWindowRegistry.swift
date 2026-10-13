@@ -13,7 +13,6 @@ final class ProjectWindowRegistry {
         weak var window: NSWindow?
         weak var workspace: TerminalWorkspace?
         weak var repository: RepositoryWorkspace?
-        weak var noteStore: ProjectNoteStore?
         weak var todoStore: ProjectTodoStore?
         weak var chromeState: ProjectWindowChromeState?
     }
@@ -25,7 +24,6 @@ final class ProjectWindowRegistry {
     private var activationOrder: [String] = []
     private var activeProjectRoot: String?
     weak var activeWorkspace: TerminalWorkspace?
-    weak var activeNoteStore: ProjectNoteStore?
     weak var activeTodoStore: ProjectTodoStore?
     weak var activeChromeState: ProjectWindowChromeState?
     /// Where the open project windows are saved for the next launch. The app
@@ -758,11 +756,6 @@ final class ProjectWindowRegistry {
         return nil
     }
 
-    func noteStore(for projectRoot: String) -> ProjectNoteStore? {
-        pruneStaleWindows()
-        return entries[repositoryRoot(for: projectRoot)]?.noteStore
-    }
-
     func todoStore(for projectRoot: String) -> ProjectTodoStore? {
         pruneStaleWindows()
         return entries[repositoryRoot(for: projectRoot)]?.todoStore
@@ -786,7 +779,6 @@ final class ProjectWindowRegistry {
         projectRoot: String?,
         workspace: TerminalWorkspace,
         repository: RepositoryWorkspace? = nil,
-        noteStore: ProjectNoteStore?,
         todoStore: ProjectTodoStore?,
         chromeState: ProjectWindowChromeState?
     ) -> Bool {
@@ -851,7 +843,6 @@ final class ProjectWindowRegistry {
         entry.window = window
         entry.workspace = workspace
         entry.repository = repository ?? entry.repository
-        entry.noteStore = noteStore ?? entry.noteStore
         entry.todoStore = todoStore ?? entry.todoStore
         entry.chromeState = chromeState ?? entry.chromeState
         entries[projectRoot] = entry
@@ -863,7 +854,6 @@ final class ProjectWindowRegistry {
             activate(
                 projectRoot: projectRoot,
                 workspace: workspace,
-                noteStore: noteStore,
                 todoStore: todoStore,
                 chromeState: chromeState
             )
@@ -879,8 +869,8 @@ final class ProjectWindowRegistry {
     /// shows, before the reveal's layout pass and the keys typed while it
     /// was off screen (`HiddenWindowKeyHold`), rather than on a turn after
     /// them (its container's own request, which then finds it done). Only
-    /// a key window showing its terminal (not a note, a to-do or the Omni
-    /// bar), and only the terminal of that window.
+    /// a key window showing its terminal (not a to-do or the Omni bar), and
+    /// only the terminal of that window.
     private func focusSelectedTerminal(in window: NSWindow, projectRoot: String) {
         guard window.isKeyWindow,
               let entry = entries[projectRoot],
@@ -936,7 +926,6 @@ final class ProjectWindowRegistry {
             activate(
                 projectRoot: workspace.projectRoot ?? repositoryRoot,
                 workspace: workspace,
-                noteStore: entry.noteStore,
                 todoStore: entry.todoStore,
                 chromeState: entry.chromeState
             )
@@ -944,7 +933,6 @@ final class ProjectWindowRegistry {
             activate(
                 projectRoot: projectRoot,
                 workspace: workspace,
-                noteStore: entry.noteStore,
                 todoStore: entry.todoStore,
                 chromeState: entry.chromeState
             )
@@ -965,17 +953,6 @@ final class ProjectWindowRegistry {
         }
 
         switch deepLink.kind {
-        case .note:
-            guard AgentSettings.shared.projectFeatures(for: projectRoot).notesEnabled else {
-                return false
-            }
-            guard let noteID = UUID(uuidString: deepLink.targetID),
-                  entries[repositoryRoot]?.noteStore?.notes.contains(where: { $0.id == noteID }) == true
-            else {
-                return false
-            }
-            chromeState.selectNote(id: noteID)
-            return true
         case .todo:
             guard AgentSettings.shared.projectFeatures(for: projectRoot).todosEnabled else {
                 return false
@@ -1010,7 +987,6 @@ final class ProjectWindowRegistry {
     func activateWindow(
         projectRoot: String?,
         workspace: TerminalWorkspace,
-        noteStore: ProjectNoteStore?,
         todoStore: ProjectTodoStore?,
         chromeState: ProjectWindowChromeState?
     ) {
@@ -1018,7 +994,6 @@ final class ProjectWindowRegistry {
         activate(
             projectRoot: projectRoot,
             workspace: workspace,
-            noteStore: noteStore,
             todoStore: todoStore,
             chromeState: chromeState
         )
@@ -1102,7 +1077,6 @@ final class ProjectWindowRegistry {
     private func activate(
         projectRoot: String,
         workspace: TerminalWorkspace,
-        noteStore: ProjectNoteStore?,
         todoStore: ProjectTodoStore?,
         chromeState: ProjectWindowChromeState?,
         recordsOpening: Bool = true
@@ -1114,7 +1088,6 @@ final class ProjectWindowRegistry {
         projectRecency?.markOpened(windowRoot)
         activeProjectRoot = effectiveRoot
         activeWorkspace = workspace
-        activeNoteStore = noteStore
         activeTodoStore = todoStore
         activeChromeState = chromeState
         if recordsOpening {
@@ -1162,7 +1135,6 @@ final class ProjectWindowRegistry {
         activate(
             projectRoot: projectRoot,
             workspace: workspace,
-            noteStore: entry.noteStore,
             todoStore: entry.todoStore,
             chromeState: entry.chromeState
         )
@@ -1201,7 +1173,6 @@ final class ProjectWindowRegistry {
         guard activeProjectRoot.map(repositoryRoot(for:)) == projectRoot else { return false }
         activeProjectRoot = nil
         activeWorkspace = nil
-        activeNoteStore = nil
         activeTodoStore = nil
         activeChromeState = nil
         return true
@@ -1307,7 +1278,6 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var isSidebarPlaygroundPresented = false
     @Published var isCommandPalettePlaygroundPresented = false
     @Published var isCommandKeyPressed = false
-    @Published var selectedNoteID: UUID?
     @Published var selectedTodoID: UUID?
     @Published var isTodoPanePresented = false
     @Published var selectedTodoTagFilterIDs: Set<String> = []
@@ -1472,32 +1442,16 @@ final class ProjectWindowChromeState: ObservableObject {
         }
     }
 
-    func selectNote(id: UUID?) {
-        selectedNoteID = id
-        selectedTodoID = nil
-        isTodoPanePresented = false
-        focusedIdleCommandName = nil
-    }
-
     func selectTodo(id: UUID?) {
-        selectedNoteID = nil
         selectedTodoID = id
         isTodoPanePresented = true
         focusedIdleCommandName = nil
     }
 
     func selectTerminal() {
-        selectedNoteID = nil
         selectedTodoID = nil
         isTodoPanePresented = false
         focusedIdleCommandName = nil
-    }
-
-    @discardableResult
-    func closeSelectedNoteIfNeeded() -> Bool {
-        guard selectedNoteID != nil else { return false }
-        selectNote(id: nil)
-        return true
     }
 
     func toggleAgentGroupCollapsed(_ id: UUID) {
@@ -1528,14 +1482,13 @@ final class ProjectWindowChromeState: ObservableObject {
     }
 
     func focusIdleCommand(name: String) {
-        selectedNoteID = nil
         selectedTodoID = nil
         isTodoPanePresented = false
         focusedIdleCommandName = name
     }
 
     var isShowingTerminalContent: Bool {
-        selectedNoteID == nil && !isTodoPanePresented && focusedIdleCommandName == nil
+        !isTodoPanePresented && focusedIdleCommandName == nil
     }
 
     // Wraps the docked-sidebar resize animation with a start/end signal so the
@@ -1584,7 +1537,6 @@ struct ProjectWindowBinder: NSViewRepresentable {
     let projectRoot: String?
     let workspace: TerminalWorkspace
     let repository: RepositoryWorkspace?
-    let noteStore: ProjectNoteStore?
     let todoStore: ProjectTodoStore?
     let chromeState: ProjectWindowChromeState?
 
@@ -1593,7 +1545,6 @@ struct ProjectWindowBinder: NSViewRepresentable {
         view.projectRoot = projectRoot
         view.workspace = workspace
         view.repository = repository
-        view.noteStore = noteStore
         view.todoStore = todoStore
         view.chromeState = chromeState
         return view
@@ -1604,7 +1555,6 @@ struct ProjectWindowBinder: NSViewRepresentable {
         view.projectRoot = projectRoot
         view.workspace = workspace
         view.repository = repository
-        view.noteStore = noteStore
         view.todoStore = todoStore
         view.chromeState = chromeState
         view.registerIfPossible()
@@ -1615,7 +1565,6 @@ struct ProjectWindowBinder: NSViewRepresentable {
 private final class ProjectWindowBinderView: NSView {
     weak var workspace: TerminalWorkspace?
     weak var repository: RepositoryWorkspace?
-    weak var noteStore: ProjectNoteStore?
     weak var todoStore: ProjectTodoStore?
     weak var chromeState: ProjectWindowChromeState?
     weak var boundWindow: NSWindow?
@@ -1635,7 +1584,6 @@ private final class ProjectWindowBinderView: NSView {
             projectRoot: projectRoot,
             workspace: workspace,
             repository: repository,
-            noteStore: noteStore,
             todoStore: todoStore,
             chromeState: chromeState
         )
@@ -1700,7 +1648,6 @@ private final class ProjectWindowBinderView: NSView {
                 ProjectWindowRegistry.shared.activateWindow(
                     projectRoot: self.projectRoot,
                     workspace: self.repository?.workspace ?? workspace,
-                    noteStore: self.noteStore,
                     todoStore: self.todoStore,
                     chromeState: self.chromeState
                 )

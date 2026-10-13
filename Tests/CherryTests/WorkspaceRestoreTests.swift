@@ -2261,7 +2261,6 @@ private func makeRevealTestWindow() -> NSWindow {
         projectRoot: root.path,
         workspace: repository.workspace,
         repository: repository,
-        noteStore: nil,
         todoStore: nil,
         chromeState: nil
     ))
@@ -2335,7 +2334,6 @@ private func makeRevealTestWindow() -> NSWindow {
         projectRoot: root.path,
         workspace: repository.workspace,
         repository: repository,
-        noteStore: nil,
         todoStore: nil,
         chromeState: nil
     ))
@@ -2389,7 +2387,6 @@ private func makeRevealTestWindow() -> NSWindow {
         projectRoot: root.path,
         workspace: repository.workspace,
         repository: repository,
-        noteStore: nil,
         todoStore: nil,
         chromeState: nil
     ))

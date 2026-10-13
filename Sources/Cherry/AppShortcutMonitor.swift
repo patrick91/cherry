@@ -7,7 +7,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
     @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var todoStore: ProjectTodoStore
     let projectRoot: String?
     let openSettings: () -> Void
@@ -42,7 +41,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
     /// surface). `charactersIgnoringModifiers` keeps Shift: ⌘⇧D arrives as
     /// "D". ⌘Z brings back the window's latest closed or detached tab
     /// (`ClosedTabHistory`) unless a text view has the keyboard
-    /// (`textHasKeyboard`: the notes editor, a search or name field), whose
+    /// (`textHasKeyboard`: a to-do's editor, a search or name field), whose
     /// own undo it is then; the terminal program never gets it. Caps Lock,
     /// and the keypad and function flags AppKit adds to some keys, are not
     /// held modifiers: with Caps Lock on, ⌘D is still Detach Tab. ⌘P opens
@@ -104,7 +103,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
             repository: repository,
             workspace: workspace,
             chromeState: chromeState,
-            noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: projectRoot,
             visibleCommands: visibleCommands,
@@ -123,7 +121,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
         context.coordinator.workspace = workspace
         context.coordinator.repository = repository
         context.coordinator.chromeState = chromeState
-        context.coordinator.noteStore = noteStore
         context.coordinator.todoStore = todoStore
         context.coordinator.projectRoot = projectRoot
         context.coordinator.visibleCommands = visibleCommands
@@ -145,7 +142,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
         case session(TerminalSession)
         case command(ProjectCommandDefinition)
         case todoBoard
-        case note(UUID)
     }
 
     @MainActor
@@ -153,7 +149,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
         weak var repository: RepositoryWorkspace?
         weak var workspace: TerminalWorkspace?
         weak var chromeState: ProjectWindowChromeState?
-        weak var noteStore: ProjectNoteStore?
         weak var todoStore: ProjectTodoStore?
         var projectRoot: String?
         var visibleCommands: [ProjectCommandDefinition]
@@ -166,7 +161,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
             repository: RepositoryWorkspace? = nil,
             workspace: TerminalWorkspace,
             chromeState: ProjectWindowChromeState,
-            noteStore: ProjectNoteStore,
             todoStore: ProjectTodoStore,
             projectRoot: String?,
             visibleCommands: [ProjectCommandDefinition],
@@ -176,7 +170,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
             self.repository = repository
             self.workspace = workspace
             self.chromeState = chromeState
-            self.noteStore = noteStore
             self.todoStore = todoStore
             self.projectRoot = projectRoot
             self.visibleCommands = visibleCommands
@@ -319,20 +312,11 @@ struct AppShortcutMonitor: NSViewRepresentable {
             if projectFeatures.todosEnabled {
                 items.append(.todoBoard)
             }
-            if projectFeatures.notesEnabled, let noteStore {
-                items += noteStore.notes.map { .note($0.id) }
-            }
             return items
         }
 
         private func currentSidebarIndex(in items: [SidebarItem]) -> Int? {
             if let chromeState {
-                if let selectedNoteID = chromeState.selectedNoteID {
-                    return items.firstIndex {
-                        if case .note(let id) = $0 { return id == selectedNoteID }
-                        return false
-                    }
-                }
                 if chromeState.isTodoPanePresented {
                     return items.firstIndex {
                         if case .todoBoard = $0 { return true }
@@ -353,7 +337,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
                         return s.id == selectedID
                     case .command(let def):
                         return workspace?.commandSession(named: def.name)?.id == selectedID
-                    case .todoBoard, .note:
+                    case .todoBoard:
                         return false
                     }
                 }
@@ -376,8 +360,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
                 }
             case .todoBoard:
                 chromeState.selectTodo(id: chromeState.selectedTodoID ?? todoStore?.firstSelectableTodo?.id)
-            case .note(let id):
-                chromeState.selectNote(id: id)
             }
         }
     }

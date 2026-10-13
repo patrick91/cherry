@@ -201,7 +201,7 @@ private func readFile(_ url: URL) -> String {
         )
         hereWindow.isReleasedWhenClosed = false
         #expect(ProjectWindowRegistry.shared.register(
-            window: hereWindow, projectRoot: localRoot.path, workspace: here, noteStore: nil, todoStore: nil, chromeState: nil
+            window: hereWindow, projectRoot: localRoot.path, workspace: here, todoStore: nil, chromeState: nil
         ))
         defer {
             ProjectWindowRegistry.shared.unregister(window: hereWindow, projectRoot: localRoot.path)

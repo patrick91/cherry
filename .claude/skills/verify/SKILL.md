@@ -12,7 +12,7 @@ description: Build, launch, and observe Cherry changes end-to-end on this machin
 ```
 
 CherryDev.app has its own bundle ID (`app.cherry.CherryDev`), UserDefaults domain, Application
-Support folder (`~/Library/Application Support/CherryDev`: saved tabs, notes, shell integration)
+Support folder (`~/Library/Application Support/CherryDev`: saved tabs, to-dos, shell integration)
 and URL scheme (`cherry-dev`), so it coexists with the user's production Cherry.app. Its
 persistent sessions are owned by `CherryDev`. The script pkills only prior CherryDev instances.
 `./script/build_and_run.sh build` builds and packages `dist/CherryDev.app` without launching it

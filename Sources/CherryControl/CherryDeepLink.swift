@@ -2,7 +2,6 @@ import Foundation
 
 public struct CherryDeepLink: Codable, Equatable, Sendable {
     public enum TargetKind: String, Codable, Equatable, Sendable {
-        case note
         case todo
         case terminal
     }
@@ -34,10 +33,6 @@ public struct CherryDeepLink: Codable, Equatable, Sendable {
 
     public var absoluteString: String {
         url.absoluteString
-    }
-
-    public static func noteURL(projectRoot: String, noteID: UUID) -> String {
-        CherryDeepLink(projectRoot: projectRoot, kind: .note, targetID: noteID.uuidString).absoluteString
     }
 
     public static func todoURL(projectRoot: String, todoID: UUID) -> String {
@@ -83,7 +78,11 @@ public struct CherryDeepLink: Codable, Equatable, Sendable {
         }
 
         guard let kind = TargetKind(rawValue: pathComponents[1].lowercased()) else {
-            throw CherryControlError(code: "invalid_deep_link_kind", message: "Cherry link kind must be note, todo, or terminal.")
+            // A note's link, from before notes were removed.
+            if pathComponents[1].lowercased() == "note" {
+                throw CherryControlError(code: "notes_removed", message: "Cherry no longer has notes; this is a link to a note.")
+            }
+            throw CherryControlError(code: "invalid_deep_link_kind", message: "Cherry link kind must be todo or terminal.")
         }
 
         let targetID = pathComponents[2]

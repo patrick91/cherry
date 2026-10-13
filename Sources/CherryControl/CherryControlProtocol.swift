@@ -161,16 +161,7 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case restartAllCommands(ProcessBulkCommandRequest)
     case listTerminals
     case listAgents
-    case listNotes
     case listTodos
-    case createNote(CreateNoteRequest)
-    case getNote(NoteIDRequest)
-    case updateNote(UpdateNoteRequest)
-    case appendNote(AppendNoteRequest)
-    case renameNote(RenameNoteRequest)
-    case searchNotes(SearchNotesRequest)
-    case deleteNote(NoteIDRequest)
-    case selectNote(NoteIDRequest)
     case createTodo(CreateTodoRequest)
     case getTodo(TodoIDRequest)
     case updateTodo(UpdateTodoRequest)
@@ -504,14 +495,6 @@ public struct TerminalIDRequest: Codable, Equatable, Sendable {
     }
 }
 
-public struct NoteIDRequest: Codable, Equatable, Sendable {
-    public let noteID: String
-
-    public init(noteID: String) {
-        self.noteID = noteID
-    }
-}
-
 public struct TodoIDRequest: Codable, Equatable, Sendable {
     public let todoID: String
 
@@ -531,60 +514,6 @@ public struct ResolveDeepLinkRequest: Codable, Equatable, Sendable {
         self.includeOutput = includeOutput
         self.startLine = startLine
         self.lineLimit = lineLimit
-    }
-}
-
-public struct CreateNoteRequest: Codable, Equatable, Sendable {
-    public let title: String
-    public let markdown: String
-
-    public init(title: String, markdown: String) {
-        self.title = title
-        self.markdown = markdown
-    }
-}
-
-public struct UpdateNoteRequest: Codable, Equatable, Sendable {
-    public let noteID: String
-    public let title: String?
-    public let markdown: String?
-
-    public init(noteID: String, title: String? = nil, markdown: String? = nil) {
-        self.noteID = noteID
-        self.title = title
-        self.markdown = markdown
-    }
-}
-
-public struct AppendNoteRequest: Codable, Equatable, Sendable {
-    public let noteID: String
-    public let markdown: String
-
-    public init(noteID: String, markdown: String) {
-        self.noteID = noteID
-        self.markdown = markdown
-    }
-}
-
-public struct RenameNoteRequest: Codable, Equatable, Sendable {
-    public let noteID: String
-    public let title: String
-
-    public init(noteID: String, title: String) {
-        self.noteID = noteID
-        self.title = title
-    }
-}
-
-public struct SearchNotesRequest: Codable, Equatable, Sendable {
-    public let query: String
-    public let caseSensitive: Bool?
-    public let maxMatches: Int?
-
-    public init(query: String, caseSensitive: Bool? = nil, maxMatches: Int? = nil) {
-        self.query = query
-        self.caseSensitive = caseSensitive
-        self.maxMatches = maxMatches
     }
 }
 
@@ -731,16 +660,7 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case restartAllCommands(ListProcessesResult)
     case listTerminals(ListTerminalsResult)
     case listAgents(ListAgentsResult)
-    case listNotes(ListNotesResult)
     case listTodos(ListTodosResult)
-    case createNote(NoteDetailResult)
-    case getNote(NoteDetailResult)
-    case updateNote(NoteDetailResult)
-    case appendNote(NoteDetailResult)
-    case renameNote(NoteDetailResult)
-    case searchNotes(SearchNotesResult)
-    case deleteNote(DeleteNoteResult)
-    case selectNote(SelectNoteResult)
     case createTodo(TodoDetailResult)
     case getTodo(TodoDetailResult)
     case updateTodo(TodoDetailResult)
@@ -840,7 +760,7 @@ public struct ProjectInfo: Codable, Equatable, Sendable {
         name: String,
         active: Bool,
         open: Bool,
-        features: ProjectFeatureAvailability = .init(notesEnabled: false, todosEnabled: false)
+        features: ProjectFeatureAvailability = .init(todosEnabled: false)
     ) {
         self.root = root
         self.name = name
@@ -850,13 +770,42 @@ public struct ProjectInfo: Codable, Equatable, Sendable {
     }
 }
 
+extension CodingUserInfoKey {
+    /// True on an encoder that writes what agents read (CherryMCP's tool
+    /// results), not the control wire: fields the wire keeps only for older
+    /// helpers stay out of it.
+    public static let cherryAgentFacingOutput = CodingUserInfoKey(rawValue: "cherry.agentFacingOutput")!
+}
+
+/// A project's optional features. The wire still carries `notesEnabled`,
+/// always false: CherryMCP helpers from before notes were removed (an agent's
+/// helper in a persistent session an update kept, a build installed on another
+/// Mac) decode it as required, and without it their `list_projects` and
+/// `get_project_status` answers would not decode. Agents never see it
+/// (`cherryAgentFacingOutput`).
 public struct ProjectFeatureAvailability: Codable, Equatable, Sendable {
-    public let notesEnabled: Bool
     public let todosEnabled: Bool
 
-    public init(notesEnabled: Bool, todosEnabled: Bool) {
-        self.notesEnabled = notesEnabled
+    public init(todosEnabled: Bool) {
         self.todosEnabled = todosEnabled
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case notesEnabled
+        case todosEnabled
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        todosEnabled = try container.decode(Bool.self, forKey: .todosEnabled)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if encoder.userInfo[.cherryAgentFacingOutput] as? Bool != true {
+            try container.encode(false, forKey: .notesEnabled)
+        }
+        try container.encode(todosEnabled, forKey: .todosEnabled)
     }
 }
 
@@ -897,7 +846,6 @@ public struct ProcessCounts: Codable, Equatable, Sendable {
 public struct ProjectStatusResult: Codable, Equatable, Sendable {
     public let projectRoot: String?
     public let processCounts: ProcessCounts
-    public let noteCount: Int?
     public let todoCount: Int?
     public let features: ProjectFeatureAvailability
     public let selectedProcessID: String?
@@ -907,16 +855,14 @@ public struct ProjectStatusResult: Codable, Equatable, Sendable {
     public init(
         projectRoot: String?,
         processCounts: ProcessCounts,
-        noteCount: Int?,
         todoCount: Int?,
-        features: ProjectFeatureAvailability = .init(notesEnabled: false, todosEnabled: false),
+        features: ProjectFeatureAvailability = .init(todosEnabled: false),
         selectedProcessID: String?,
         selectedProcessName: String?,
         health: String
     ) {
         self.projectRoot = projectRoot
         self.processCounts = processCounts
-        self.noteCount = noteCount
         self.todoCount = todoCount
         self.features = features
         self.selectedProcessID = selectedProcessID
@@ -1438,117 +1384,6 @@ public struct ListAgentsResult: Codable, Equatable, Sendable {
     }
 }
 
-public struct ProjectNote: Codable, Equatable, Identifiable, Sendable {
-    public let id: UUID
-    public let projectRoot: String
-    public var title: String
-    public var markdown: String
-    public let createdAt: Date
-    public var updatedAt: Date
-
-    public init(
-        id: UUID,
-        projectRoot: String,
-        title: String,
-        markdown: String,
-        createdAt: Date,
-        updatedAt: Date
-    ) {
-        self.id = id
-        self.projectRoot = projectRoot
-        self.title = title
-        self.markdown = markdown
-        self.createdAt = createdAt
-        self.updatedAt = updatedAt
-    }
-}
-
-public struct NoteInfo: Codable, Equatable, Sendable {
-    public let id: String
-    public let link: String?
-    public let projectRoot: String
-    public let title: String
-    public let createdAt: Date
-    public let updatedAt: Date
-
-    public init(id: String, link: String? = nil, projectRoot: String, title: String, createdAt: Date, updatedAt: Date) {
-        self.id = id
-        self.link = link
-        self.projectRoot = projectRoot
-        self.title = title
-        self.createdAt = createdAt
-        self.updatedAt = updatedAt
-    }
-}
-
-public struct ListNotesResult: Codable, Equatable, Sendable {
-    public let activeProjectRoot: String
-    public let notes: [NoteInfo]
-    public let selectedNoteID: String?
-
-    public init(activeProjectRoot: String, notes: [NoteInfo], selectedNoteID: String?) {
-        self.activeProjectRoot = activeProjectRoot
-        self.notes = notes
-        self.selectedNoteID = selectedNoteID
-    }
-}
-
-public struct NoteDetailResult: Codable, Equatable, Sendable {
-    public let note: ProjectNote
-    public let link: String?
-    public let selected: Bool
-
-    public init(note: ProjectNote, link: String? = nil, selected: Bool) {
-        self.note = note
-        self.link = link
-        self.selected = selected
-    }
-}
-
-public struct NoteSearchMatch: Codable, Equatable, Sendable {
-    public let noteID: String
-    public let title: String
-    public let lineNumber: Int?
-    public let text: String
-
-    public init(noteID: String, title: String, lineNumber: Int?, text: String) {
-        self.noteID = noteID
-        self.title = title
-        self.lineNumber = lineNumber
-        self.text = text
-    }
-}
-
-public struct SearchNotesResult: Codable, Equatable, Sendable {
-    public let activeProjectRoot: String
-    public let matches: [NoteSearchMatch]
-
-    public init(activeProjectRoot: String, matches: [NoteSearchMatch]) {
-        self.activeProjectRoot = activeProjectRoot
-        self.matches = matches
-    }
-}
-
-public struct SelectNoteResult: Codable, Equatable, Sendable {
-    public let noteID: String
-    public let selected: Bool
-
-    public init(noteID: String, selected: Bool) {
-        self.noteID = noteID
-        self.selected = selected
-    }
-}
-
-public struct DeleteNoteResult: Codable, Equatable, Sendable {
-    public let noteID: String
-    public let deleted: Bool
-
-    public init(noteID: String, deleted: Bool) {
-        self.noteID = noteID
-        self.deleted = deleted
-    }
-}
-
 public enum TodoStatus: String, Codable, CaseIterable, Equatable, Identifiable, Sendable {
     case backlog
     case ready
@@ -1789,8 +1624,6 @@ public struct ResolveDeepLinkResult: Codable, Equatable, Sendable {
     public let targetID: String
     public let found: Bool
     public let projectRoot: String?
-    public let note: ProjectNote?
-    public let noteLink: String?
     public let todo: ProjectTodo?
     public let todoLink: String?
     public let process: ProcessSummary?
@@ -1803,8 +1636,6 @@ public struct ResolveDeepLinkResult: Codable, Equatable, Sendable {
         targetID: String,
         found: Bool,
         projectRoot: String?,
-        note: ProjectNote? = nil,
-        noteLink: String? = nil,
         todo: ProjectTodo? = nil,
         todoLink: String? = nil,
         process: ProcessSummary? = nil,
@@ -1816,8 +1647,6 @@ public struct ResolveDeepLinkResult: Codable, Equatable, Sendable {
         self.targetID = targetID
         self.found = found
         self.projectRoot = projectRoot
-        self.note = note
-        self.noteLink = noteLink
         self.todo = todo
         self.todoLink = todoLink
         self.process = process

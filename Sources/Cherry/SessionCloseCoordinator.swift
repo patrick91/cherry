@@ -230,7 +230,7 @@ enum SessionCloseCoordinator {
     /// (`SessionTeardownQuestion`) to bring it back next time. A program the
     /// close leaves running asks nothing: the window's toast says where it
     /// went, or, when the window closes with its last tab, another project
-    /// window's (`ClosedTabNotice`). A shown note closes instead.
+    /// window's (`ClosedTabNotice`).
     /// `registry`: the windows' registry (the repository's, else the app's).
     static func closeSelectedTabOrWindow(
         workspace: TerminalWorkspace,
@@ -239,9 +239,6 @@ enum SessionCloseCoordinator {
         window: NSWindow?,
         registry: ProjectWindowRegistry? = nil
     ) {
-        if chromeState?.closeSelectedNoteIfNeeded() == true {
-            return
-        }
         let registry = registry ?? repository?.windowRegistry ?? .shared
         let closesWindow = shouldCloseWindow(for: workspace)
         guard let session = workspace.selectedSession ?? (closesWindow ? workspace.sessions.first : nil) else {
@@ -260,8 +257,8 @@ enum SessionCloseCoordinator {
     /// ⌘D and Detach Tab: detaches the selected tab (`detach`), the focused
     /// pane in a split. On the window's last tab the window closes after
     /// it, as with ⌘W. Nothing for a tab that cannot detach (`canDetach`),
-    /// or while the window shows a note, the todo board or an idle command
-    /// instead of the tab.
+    /// or while the window shows the todo board or an idle command instead
+    /// of the tab.
     static func detachSelectedTabOrWindow(
         workspace: TerminalWorkspace,
         repository: RepositoryWorkspace?,
@@ -285,13 +282,11 @@ enum SessionCloseCoordinator {
     /// A terminal tab whose shell exited with status 0 closes
     /// (`programExited`), as ⌘W closes it but without asking, since nothing
     /// runs: on the window's last tab the window closes after it. Without a
-    /// window, while a sheet is on it, or while it shows a note (⌘W would
-    /// close the note, not the window), that last tab stays and shows its
+    /// window, or while a sheet is on it, that last tab stays and shows its
     /// exit.
     static func closeTabAfterCleanExit(
         _ session: TerminalSession,
         in workspace: TerminalWorkspace,
-        chromeState: ProjectWindowChromeState? = nil,
         window: NSWindow?
     ) {
         guard workspace.sessions.contains(where: { $0 === session }) else { return }
@@ -299,7 +294,7 @@ enum SessionCloseCoordinator {
             workspace.close(session, intent: .programExited)
             return
         }
-        guard let window, window.attachedSheet == nil, chromeState?.selectedNoteID == nil else { return }
+        guard let window, window.attachedSheet == nil else { return }
         workspace.close(session, allowEmptyWorkspace: true, intent: .programExited)
         guard workspace.sessions.isEmpty else { return }
         window.performClose(nil)

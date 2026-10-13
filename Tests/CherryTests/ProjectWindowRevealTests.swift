@@ -215,7 +215,6 @@ private func makeCover(_ schedule: ManualSchedule, center: NotificationCenter) -
         window: window,
         projectRoot: root.path,
         workspace: workspace,
-        noteStore: nil,
         todoStore: nil,
         chromeState: nil
     ))
@@ -376,7 +375,7 @@ private func makeFullScreenTestWindow() -> NSWindow {
     }
     #expect(registry.register(
         window: window, projectRoot: root.path, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        todoStore: nil, chromeState: nil
     ))
     #expect(entering.count == 1)
     #expect(entering.first?.window === window)
@@ -397,13 +396,13 @@ private func makeFullScreenTestWindow() -> NSWindow {
     // Registering again (every view update does) does not go again.
     #expect(registry.register(
         window: window, projectRoot: root.path, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        todoStore: nil, chromeState: nil
     ))
     #expect(entering.count == 1)
 
     #expect(registry.register(
         window: windowed, projectRoot: other.path, workspace: otherWorkspace,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        todoStore: nil, chromeState: nil
     ))
     #expect(entering.count == 1)
     #expect(windowed.alphaValue == 1)

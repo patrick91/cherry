@@ -475,10 +475,9 @@ enum ProjectIdentityColor: String, CaseIterable, Codable, Equatable, Identifiabl
 }
 
 struct ProjectFeatureSettings: Codable, Equatable {
-    var notesEnabled: Bool
     var todosEnabled: Bool
 
-    static let disabled = ProjectFeatureSettings(notesEnabled: false, todosEnabled: false)
+    static let disabled = ProjectFeatureSettings(todosEnabled: false)
 }
 
 struct ProjectAppearanceSettings: Codable, Equatable {
@@ -487,12 +486,17 @@ struct ProjectAppearanceSettings: Codable, Equatable {
     static let none = ProjectAppearanceSettings(color: nil)
 }
 
+/// A project's local feature settings (`features.byProject`). The ones
+/// saved before notes were removed may also name `notesEnabled`: decoding
+/// ignores it and the next save drops it, on purpose (the setting went with
+/// notes, and only this Mac's Cherry reads these). cherry.toml keeps its
+/// `notes = …` line instead (`renderFeatureSection`): teammates' older
+/// builds read that file.
 struct ProjectFeatureOverrides: Codable, Equatable {
-    var notesEnabled: Bool?
     var todosEnabled: Bool?
 
     var isEmpty: Bool {
-        notesEnabled == nil && todosEnabled == nil
+        todosEnabled == nil
     }
 }
 
@@ -765,10 +769,7 @@ final class AgentSettings: ObservableObject {
             return shared
         }
 
-        return ProjectFeatureSettings(
-            notesEnabled: local.notesEnabled ?? shared.notesEnabled,
-            todosEnabled: local.todosEnabled ?? shared.todosEnabled
-        )
+        return ProjectFeatureSettings(todosEnabled: local.todosEnabled ?? shared.todosEnabled)
     }
 
     func projectFeatureOverrides(for requestedRoot: String?) -> ProjectFeatureOverrides {
@@ -815,7 +816,6 @@ final class AgentSettings: ObservableObject {
         switch storage {
         case .local:
             var overrides = featureOverridesByProject[root] ?? ProjectFeatureOverrides()
-            overrides.notesEnabled = features.notesEnabled
             overrides.todosEnabled = features.todosEnabled
             try setFeatureOverrides(overrides, for: root)
         case .projectFile:
@@ -1266,10 +1266,7 @@ enum CherryProjectFile {
         parsed.commands = (try? ProjectCommandConfiguration.validated(parseCommands(from: commandSource))) ?? []
         if let featureSource = tableSection(named: "features", in: contents) {
             let fields = parseKeyValues(from: featureSource)
-            parsed.features = ProjectFeatureSettings(
-                notesEnabled: boolValue(fields["notes"]) ?? false,
-                todosEnabled: boolValue(fields["todos"]) ?? false
-            )
+            parsed.features = ProjectFeatureSettings(todosEnabled: boolValue(fields["todos"]) ?? false)
         }
         if let appearanceSource = tableSection(named: "appearance", in: contents) {
             let fields = parseKeyValues(from: appearanceSource)
@@ -1297,22 +1294,32 @@ enum CherryProjectFile {
 
     @MainActor
     static func writeFeatureSettings(_ features: ProjectFeatureSettings, projectRoot: String) throws {
-        try writeTableSection(named: "features", renderFeatureSection(features), projectRoot: projectRoot)
+        try writeTableSection(named: "features", projectRoot: projectRoot) { existing in
+            renderFeatureSection(features, replacing: existing)
+        }
     }
 
     @MainActor
     static func writeAppearanceSettings(_ appearance: ProjectAppearanceSettings, projectRoot: String) throws {
-        try writeTableSection(named: "appearance", renderAppearanceSection(appearance), projectRoot: projectRoot)
+        try writeTableSection(named: "appearance", projectRoot: projectRoot) { _ in
+            renderAppearanceSection(appearance)
+        }
     }
 
-    /// Replaces the `[table]` section of the project's cherry.toml with
-    /// `section`, or appends it.
+    /// Replaces the `[table]` section of the project's cherry.toml with the
+    /// section `render` makes of the current one (nil when there is none),
+    /// or appends it.
     @MainActor
-    private static func writeTableSection(named table: String, _ section: String, projectRoot: String) throws {
+    private static func writeTableSection(
+        named table: String,
+        projectRoot: String,
+        _ render: (_ existing: String?) -> String
+    ) throws {
         try requireLocal(projectRoot)
         defer { invalidate(projectRoot: projectRoot) }
         let url = fileURL(projectRoot: projectRoot)
         let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let section = render(tableSection(named: table, in: existing))
         let nextContents: String
 
         if let range = tableSectionRange(named: table, in: existing) {
@@ -1396,12 +1403,28 @@ enum CherryProjectFile {
         return lines.joined(separator: "\n")
     }
 
-    private static func renderFeatureSection(_ features: ProjectFeatureSettings) -> String {
-        [
-            "[features]",
-            "notes = \(features.notesEnabled ? "true" : "false")",
-            "todos = \(features.todosEnabled ? "true" : "false")"
-        ].joined(separator: "\n")
+    /// The `[features]` section with `todos` set. An existing section keeps
+    /// its other lines: a `notes = …` that builds from before notes were
+    /// removed still read stays as it is for teammates on those builds.
+    private static func renderFeatureSection(_ features: ProjectFeatureSettings, replacing existing: String?) -> String {
+        let todosLine = "todos = \(features.todosEnabled ? "true" : "false")"
+        guard let existing else {
+            return ["[features]", todosLine].joined(separator: "\n")
+        }
+        var lines = existing.components(separatedBy: "\n")
+        while let last = lines.last, last.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.removeLast()
+        }
+        var replaced = false
+        lines = lines.compactMap { line -> String? in
+            guard parseKeyValues(from: line).keys.contains("todos") else { return line }
+            defer { replaced = true }
+            return replaced ? nil : todosLine
+        }
+        if !replaced {
+            lines.append(todosLine)
+        }
+        return lines.joined(separator: "\n")
     }
 
     private static func renderAppearanceSection(_ appearance: ProjectAppearanceSettings) -> String {

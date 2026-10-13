@@ -1259,7 +1259,6 @@ struct WorkspaceRegistryPersistenceTests {
                 projectRoot: root.path,
                 workspace: repository.workspace,
                 repository: repository,
-                noteStore: nil,
                 todoStore: nil,
                 chromeState: nil
             ))
@@ -1307,7 +1306,6 @@ struct WorkspaceRegistryPersistenceTests {
             projectRoot: rootA.path,
             workspace: repositoryA.workspace,
             repository: repositoryA,
-            noteStore: nil,
             todoStore: nil,
             chromeState: nil
         ))
@@ -1347,7 +1345,6 @@ struct WorkspaceRegistryPersistenceTests {
             window: window,
             projectRoot: projects[0].path,
             workspace: workspace,
-            noteStore: nil,
             todoStore: nil,
             chromeState: nil
         ))
@@ -1393,7 +1390,6 @@ struct WorkspaceRegistryPersistenceTests {
                 window: window,
                 projectRoot: project.path,
                 workspace: workspace,
-                noteStore: nil,
                 todoStore: nil,
                 chromeState: nil
             ))
@@ -1469,7 +1465,6 @@ struct WorkspaceRegistryPersistenceTests {
             window: window,
             projectRoot: project.path,
             workspace: workspace,
-            noteStore: nil,
             todoStore: nil,
             chromeState: nil
         ))
@@ -1549,7 +1544,6 @@ struct WorkspaceRegistryPersistenceTests {
                 window: window,
                 projectRoot: root,
                 workspace: workspace,
-                noteStore: nil,
                 todoStore: nil,
                 chromeState: nil
             )
@@ -1655,7 +1649,6 @@ struct WorkspaceRegistryPersistenceTests {
             window: windowB,
             projectRoot: rootB.path,
             workspace: workspaceB,
-            noteStore: nil,
             todoStore: nil,
             chromeState: nil
         ))

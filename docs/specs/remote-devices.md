@@ -62,10 +62,10 @@ choosing a project folder, remote previews without SSH port forwarding.
 
 1. **Keys, not paths.** A remote project's root is its key everywhere a
    project is identified: `ProjectWindowRegistry`, `WorkspaceStateStore`
-   (`sha256(key).json`), notes and todos (`ProjectNoteStore`,
-   `ProjectTodoStore`: `sha256(key).json`), `CherryDeepLink.projectKey`
-   (the SHA-256 of the key, never of a path resolved against the current
-   directory), `AgentSettings` (projects, commands, overrides). No code treats a remote key as a local path: no
+   (`sha256(key).json`), todos (`ProjectTodoStore`: `sha256(key).json`),
+   `CherryDeepLink.projectKey` (the SHA-256 of the key, never of a path
+   resolved against the current directory), `AgentSettings` (projects,
+   commands, overrides). No code treats a remote key as a local path: no
    `FileManager` check, no `URL(fileURLWithPath:)` standardisation, no
    `cherry.toml` read or write, no `NSWorkspace` open.
 2. **Never run a remote tab locally.** A remote hosting has
@@ -986,7 +986,7 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
     windows, so another window's id is `terminal_not_found`; links resolve
     only to its Mac's projects (`found: false` otherwise, no output);
   - `list_projects` lists only its Mac's projects; the other listings
-    (processes, terminals, agents' counts, services, notes, todos, status)
+    (processes, terminals, agents' counts, services, todos, status)
     are of its window, which the choke point checks;
   - (second review) a session must itself be on its Mac, not only its
     window: Persistent Sessions could attach a This Mac session, or a saved
@@ -1276,8 +1276,8 @@ the device.
    remote tab's signals through, its directory still comes from the host's
    `changed` events (`hostReportedWorkingDirectory`); restoring and
    system-ended tabs (`makeSystemEndedSession`) must not check directories
-   on this Mac either. Notes and todos
-   work unchanged (keyed by the key). Open in editor is hidden (phase 3).
+   on this Mac either. Todos work unchanged (keyed by the key). Open in
+   editor is hidden (phase 3).
 4. **Failure UI.** A failed remote tab shows a bar like
    `PersistentSessionFallbackBar`: "Couldn't start on <Mac>: <reason>" with
    **Retry** (`retryPersistentSession`), never "Not a persistent session".

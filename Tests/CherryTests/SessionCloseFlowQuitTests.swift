@@ -768,7 +768,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     // the repository learns its chrome state.
     #expect(registry.register(
         window: window, projectRoot: root.path, workspace: repository.workspace, repository: repository,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        todoStore: nil, chromeState: chromeState
     ))
     repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
     let workspace = repository.workspace
@@ -922,11 +922,11 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     }
     #expect(registry.register(
         window: windowA, projectRoot: rootA.path, workspace: repository.workspace, repository: repository,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        todoStore: nil, chromeState: nil
     ))
     #expect(registry.register(
         window: windowB, projectRoot: rootB.path, workspace: plain,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        todoStore: nil, chromeState: nil
     ))
 
     let summary = registry.teardownSummary(pathDisplayMode: .repoFocused)
@@ -986,7 +986,7 @@ private final class RecordedQuitSteps {
 private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindowRegistry, window: NSWindow) -> Bool {
     registry.register(
         window: window, projectRoot: workspace.projectRoot, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        todoStore: nil, chromeState: nil
     )
 }
 

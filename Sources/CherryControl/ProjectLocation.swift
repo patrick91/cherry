@@ -4,7 +4,7 @@ import Foundation
 /// one of the user's other Macs (a device) that runs its tabs over SSH.
 ///
 /// Its `key` identifies the project everywhere a project is keyed (window
-/// registry, saved workspace state, notes, todos, deep links, settings):
+/// registry, saved workspace state, todos, deep links, settings):
 /// a local project's key is its path, unchanged, and a remote one's is
 /// `device:<lowercased device UUID>:<absolute path>`. A remote key is never
 /// a local path: only launch and remote-command code uses its `path`.

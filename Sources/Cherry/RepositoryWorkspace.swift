@@ -491,12 +491,10 @@ final class RepositoryWorkspace: ObservableObject {
     private func closeTabsAfterCleanExit() {
         workspace.closeTabAfterCleanExit = { [weak self] workspace, session in
             guard let self, !self.isTearingDown else { return }
-            let chromeState = self.chromeState
             SessionCloseCoordinator.closeTabAfterCleanExit(
                 session,
                 in: workspace,
-                chromeState: chromeState,
-                window: chromeState.flatMap { self.windowRegistry?.window(for: $0) }
+                window: self.chromeState.flatMap { self.windowRegistry?.window(for: $0) }
             )
         }
     }

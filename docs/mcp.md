@@ -124,7 +124,7 @@ checks without an MCP client.
 ## Project Tools
 
 - `list_projects` lists the saved and open projects: each one's root, name,
-  whether it is active or open, and its notes and to-dos features.
+  whether it is active or open, and its to-dos feature.
 - `open_project` focuses a project's window by absolute `project_root`,
   opening it when the project is saved in Cherry but its window is closed.
 
@@ -741,9 +741,9 @@ For local services, use `services_list` or `get_process_ports` for discovery and
 }
 ```
 
-## Notes And Todos
+## Todos
 
-Cherry also exposes project notes and todos through MCP. These tools are
+Cherry also exposes project todos through MCP. These tools are
 project-scoped and do not change visible UI selection unless the tool name starts
 with `select_`.
 

@@ -34,8 +34,8 @@ import Testing
     }
 
     // Everything keyed on a project tells them apart.
-    #expect(ProjectNoteStore.projectStorageName(projectRoot: remote.key)
-        != ProjectNoteStore.projectStorageName(projectRoot: local.key))
+    #expect(ProjectTodoStore.projectStorageName(projectRoot: remote.key)
+        != ProjectTodoStore.projectStorageName(projectRoot: local.key))
     #expect(CherryDeepLink.projectKey(forProjectRoot: remote.key)
         != CherryDeepLink.projectKey(forProjectRoot: local.key))
     // Another device's project at the same path is another project too.
@@ -52,7 +52,7 @@ import Testing
     FileManager.default.changeCurrentDirectoryPath(NSTemporaryDirectory())
     #expect(CherryDeepLink.projectKey(forProjectRoot: key) == before)
     // A link to it resolves back to the same key.
-    let link = try CherryDeepLink.parse(CherryDeepLink.noteURL(projectRoot: key, noteID: UUID()))
+    let link = try CherryDeepLink.parse(CherryDeepLink.todoURL(projectRoot: key, todoID: UUID()))
     #expect(link.projectKey == before)
 }
 
@@ -70,7 +70,7 @@ import Testing
         try CherryProjectFile.upsertCommand(ProjectCommandDefinition(name: "dev", command: "make"), projectRoot: key)
     }
     #expect(throws: CherryProjectFile.RemoteProjectFileError.self) {
-        try CherryProjectFile.writeFeatureSettings(ProjectFeatureSettings(notesEnabled: true, todosEnabled: false), projectRoot: key)
+        try CherryProjectFile.writeFeatureSettings(ProjectFeatureSettings(todosEnabled: true), projectRoot: key)
     }
     // A command's directory is resolved against the project's path there.
     #expect(ProjectCommandDefinition(name: "dev", command: "make", workingDirectory: "web")

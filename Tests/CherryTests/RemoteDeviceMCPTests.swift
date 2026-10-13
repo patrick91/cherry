@@ -114,7 +114,7 @@ private final class DeviceMCPHarness {
             window.isReleasedWhenClosed = false
             #expect(ProjectWindowRegistry.shared.register(
                 window: window, projectRoot: root, workspace: workspace,
-                noteStore: nil, todoStore: nil, chromeState: nil
+                todoStore: nil, chromeState: nil
             ))
             windows.append((window, root))
         }

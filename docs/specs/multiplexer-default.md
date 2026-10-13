@@ -161,7 +161,7 @@ Undoing a close or detach (`ClosedTabHistory`):
   runs in one tab per workspace): a closed one's session then ends, and a
   detached one's stays in the background.
 - ⌘Z goes to the closed tabs only while no text view has the keyboard: the
-  terminal, the sidebar or any other view. In a text view (the notes
+  terminal, the sidebar or any other view. In a text view (a to-do's
   editor, a search, name or palette field) ⌘Z and Edit › Undo are its own
   text undo, as before; closed tabs never join it. ⌘Z never reaches the
   terminal program, and with nothing to bring back it beeps.
@@ -230,8 +230,7 @@ from its restore), closes as `programExited` on
 the next main-loop turn, as most terminals close it. `exit` ends a shell
 with its last command's status, so after a failed command the tab stays. On
 the window's last tab the window closes too, as with ⌘W, without asking
-(nothing runs); with no window, while a sheet is on it, or while it shows a
-note (⌘W would close the note), the tab stays.
+(nothing runs); with no window, or while a sheet is on it, the tab stays.
 Non-zero exits and signals, command and agent tabs, attached tabs, a stop or
 restart (MCP `stop_process` included), and a shell that ended within its
 first second keep the tab, showing how it ended. Native tabs follow the same

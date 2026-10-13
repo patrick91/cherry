@@ -3688,11 +3688,11 @@ private struct SidebarAgentSessionSection: View {
         }
     }
 
-    private func launch(_ agent: ResolvedAgentTool) {
+    private func launch(_ agent: AgentToolDefinition) {
         let project = settings.resolvedProject(for: projectRoot)
         guard agent.isLaunchable, let root = project.validProjectRoot else { return }
         chromeState.selectTerminal()
-        workspace.addAgentSession(agent: agent.definition, projectRoot: root)
+        workspace.addAgentSession(agent: agent, projectRoot: root)
     }
 
     private var isIconDebugActive: Bool {
@@ -3741,7 +3741,7 @@ private struct AgentLaunchMenu: View {
     let project: ResolvedAgentProject
     let palette: SidebarPalette
     let openSettings: () -> Void
-    let launch: (ResolvedAgentTool) -> Void
+    let launch: (AgentToolDefinition) -> Void
 
     var body: some View {
         Menu {

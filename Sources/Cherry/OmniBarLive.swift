@@ -352,11 +352,9 @@ enum OmniBarGathering {
     }
 
     /// An agent tab's tool, as the menu-bar agent list names it
-    /// (`MenuBarAgentsModel.refresh`); nil for other tabs.
+    /// (`TerminalSession.agentToolKey`); nil for other tabs.
     static func agentKey(of session: TerminalSession) -> String? {
-        guard session.kind == .agent else { return nil }
-        let brand = AgentToolBrand.detect(name: session.agentName ?? session.title, commandLine: session.subtitle)
-        return brand?.rawValue ?? AgentToolDefinition.normalizedName(session.agentName ?? session.title)
+        session.kind == .agent ? session.agentToolKey : nil
     }
 
     /// This Mac's background sessions, then each device's.
@@ -508,7 +506,7 @@ struct OmniBarPerformer {
                   let agent = project.launchableAgents.first(where: { $0.id == id })
             else { return NSSound.beep() }
             chromeState.selectTerminal()
-            workspace.addAgentSession(agent: agent.definition, projectRoot: root)
+            workspace.addAgentSession(agent: agent, projectRoot: root)
         case .openInEditor(let editorID):
             guard let root = settings.resolvedProject(for: window.projectRoot).validProjectRoot else { return }
             let editors = ExternalEditorLauncher.editors(editorDiscovery.installedEditors, forProjectRoot: root)

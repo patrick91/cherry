@@ -59,21 +59,13 @@ enum AgentTaskSessionStatus: Equatable, Sendable {
 struct AgentTasksFileRecord: Codable, Equatable, Sendable {
     static let currentVersion = 1
 
-    var version: Int
+    var version: Int = AgentTasksFileRecord.currentVersion
     var savedAt: Date
     /// The next seq the registry gives out.
     var nextSeq: Int
     var runs: [AgentRunRecord]
     /// In creation order.
     var tasks: [AgentTaskRecord]
-
-    init(version: Int = AgentTasksFileRecord.currentVersion, savedAt: Date, nextSeq: Int, runs: [AgentRunRecord], tasks: [AgentTaskRecord]) {
-        self.version = version
-        self.savedAt = savedAt
-        self.nextSeq = nextSeq
-        self.runs = runs
-        self.tasks = tasks
-    }
 }
 
 struct AgentRunRecord: Codable, Equatable, Sendable {

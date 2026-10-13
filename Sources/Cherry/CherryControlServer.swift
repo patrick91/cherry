@@ -916,7 +916,7 @@ final class CherryControlServer: @unchecked Sendable {
             guard resolvedAgent.isLaunchable else {
                 throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(resolvedAgent.name)' is not launchable.")
             }
-            let agent = try agentDefinition(resolvedAgent.definition, overridingModel: request.model)
+            let agent = try agentDefinition(resolvedAgent, overridingModel: request.model)
             let session = workspace.addAgentSession(
                 agent: agent,
                 projectRoot: projectRoot,
@@ -1305,8 +1305,8 @@ final class CherryControlServer: @unchecked Sendable {
     private func listAgents(workspace: TerminalWorkspace) -> ListAgentsResult {
         ListAgentsResult(
             activeProjectRoot: workspace.projectRoot,
-            agents: agentSettings.resolvedAgents.map { agent in
-                let normalizedName = agent.definition.normalizedName
+            agents: agentSettings.agents.map { agent in
+                let normalizedName = agent.normalizedName
                 let activeSessionCount = workspace.agentSessions.filter { callerReaches($0, in: workspace) }.filter {
                     $0.agentName.map { AgentToolDefinition.normalizedName($0) } == normalizedName
                 }.count
@@ -1314,8 +1314,8 @@ final class CherryControlServer: @unchecked Sendable {
                 return AgentInfo(
                     id: agent.id,
                     name: agent.name,
-                    command: agent.definition.command,
-                    arguments: agent.definition.arguments,
+                    command: agent.command,
+                    arguments: agent.arguments,
                     commandLine: agent.commandLine,
                     enabled: agent.enabled,
                     launchable: agent.isLaunchable,
@@ -1622,7 +1622,7 @@ final class CherryControlServer: @unchecked Sendable {
             guard resolvedAgent.isLaunchable else {
                 throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(resolvedAgent.name)' is not launchable.")
             }
-            let agentDefinition = try agentDefinition(resolvedAgent.definition, overridingModel: request.model, effort: request.effort)
+            let agentDefinition = try agentDefinition(resolvedAgent, overridingModel: request.model, effort: request.effort)
             let parentID = try parentAgentID(from: request.parentAgentID, workspace: workspace)
             // Checked (its schema too) before anything is spawned.
             let taskPlan = try prepareTaskSpawn(request, parentAgentID: parentID, workspace: workspace)
@@ -1796,7 +1796,7 @@ final class CherryControlServer: @unchecked Sendable {
             guard agent.isLaunchable else {
                 throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(agent.name)' is not launchable.")
             }
-            return workspace.addAgentSession(agent: agent.definition, projectRoot: projectRoot, select: false)
+            return workspace.addAgentSession(agent: agent, projectRoot: projectRoot, select: false)
         case .command, nil:
             let command = try findProjectCommand(named: request.processName ?? "", projectRoot: projectRoot)
             return workspace.addCommandSession(command: command, projectRoot: projectRoot, select: false)
@@ -2368,9 +2368,9 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func findAgent(named requestedName: String) throws -> ResolvedAgentTool {
+    private func findAgent(named requestedName: String) throws -> AgentToolDefinition {
         let normalizedName = AgentToolDefinition.normalizedName(requestedName)
-        guard let agent = agentSettings.resolvedAgents.first(where: { $0.definition.normalizedName == normalizedName }) else {
+        guard let agent = agentSettings.agents.first(where: { $0.normalizedName == normalizedName }) else {
             throw CherryControlError(code: "agent_not_found", message: "No Cherry agent is configured with name \(requestedName).")
         }
         return agent

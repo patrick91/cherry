@@ -30,8 +30,7 @@ enum AgentScreenActivity {
         case none
     }
 
-    /// Classifies a whole screen (oldest line first), the way the session's
-    /// state machine reads it when no human-input floor applies.
+    /// Classifies a whole screen (oldest line first).
     /// `includesAnswerMenus` false reads it as before the tab's first turn,
     /// when a menu is a startup dialog, not a paused turn.
     static func verdict(for screen: [String], agent: String, includesAnswerMenus: Bool = true) -> Verdict {
@@ -41,10 +40,12 @@ enum AgentScreenActivity {
         }
         guard end > 0 else { return .none }
         let markerLines = Array(screen[max(0, end - markerTailLineLimit)..<end])
-        switch includesAnswerMenus ? answerMenu(in: markerLines) : nil {
-        case .permission?: return .permission
-        case .question?: return .question
-        case nil: break
+        // A menu the screen ends with outranks working markers: the turn is
+        // paused on the user's answer even while a footer still says "esc to
+        // interrupt" or a background task row shows work.
+        if includesAnswerMenus {
+            if AgentPermissionPrompt.isShowing(in: markerLines) { return .permission }
+            if AgentQuestionPrompt.isShowing(in: markerLines) { return .question }
         }
         if showsWorkingMarker(markerLines, agent: agent) {
             return .working
@@ -55,28 +56,6 @@ enum AgentScreenActivity {
             return .prompt
         }
         return .none
-    }
-
-    // MARK: - Menus waiting on the user's answer
-
-    /// A menu at the bottom of an agent's screen that its turn waits on.
-    enum AnswerMenu: String, Equatable, Sendable {
-        /// A tool-permission (approval) menu: `AgentPermissionPrompt`.
-        case permission
-        /// A question with a choice menu (Claude's AskUserQuestion,
-        /// Codex's request_user_input): `AgentQuestionPrompt`.
-        case question
-    }
-
-    /// The menu `lines` (a screen's tail, oldest first) end with, if any.
-    /// It outranks working markers: the turn is paused on the user's
-    /// answer even while a footer still says "esc to interrupt" or a
-    /// background task row shows work. The recognizers are the ones MCP
-    /// uses, so the sidebar and MCP agree.
-    static func answerMenu(in lines: [String]) -> AnswerMenu? {
-        if AgentPermissionPrompt.isShowing(in: lines) { return .permission }
-        if AgentQuestionPrompt.isShowing(in: lines) { return .question }
-        return nil
     }
 
     // MARK: - Composer prompts
@@ -113,7 +92,7 @@ enum AgentScreenActivity {
         if showsKeyHintMenu(lines) {
             return true
         }
-        if agent == "amp", ampComposerBox(in: lines) != nil {
+        if agent == "amp", ampComposerBoxIndex(in: lines) != nil {
             return true
         }
 
@@ -162,37 +141,23 @@ enum AgentScreenActivity {
     // its session to "working" forever, so there is no bare "working (" match.
     private static let claudeSpinnerGlyphs: Set<Character> = ["·", "✢", "✳", "✶", "✻", "✽", "∗", "*"]
 
+    /// Whether `lines` (a screen's tail, oldest first) show a turn in flight.
     static func showsWorkingMarker(_ lines: [String], agent: String) -> Bool {
-        !workingLines(lines, agent: agent).isEmpty
-    }
-
-    /// The lines of `lines` (a screen's tail, oldest first) that show a turn
-    /// in flight, trimmed, oldest first: the evidence `showsWorkingMarker`
-    /// finds. While the agent works their text advances (a spinner glyph,
-    /// an elapsed counter, a token meter) where they stand; a repaint of a
-    /// finished screen leaves them frozen (`AgentResumedWorkDetector`).
-    static func workingLines(_ lines: [String], agent: String) -> [String] {
-        workingLineIndices(lines, agent: agent).map { lines[$0].trimmingCharacters(in: .whitespacesAndNewlines) }
-    }
-
-    /// The indices in `lines` of its `workingLines`, ascending.
-    static func workingLineIndices(_ lines: [String], agent: String) -> [Int] {
         let trimmedLines = lines.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        var live = IndexSet(trimmedLines.indices.filter { showsInterruptHint(trimmedLines[$0]) })
+        if trimmedLines.contains(where: showsInterruptHint) {
+            return true
+        }
 
         switch agent {
         case "pi":
-            live.formUnion(IndexSet(trimmedLines.indices.filter { isPiSpinnerStatus(trimmedLines[$0]) }))
+            return trimmedLines.contains(where: isPiSpinnerStatus)
         case "amp":
-            if let border = ampComposerBoxIndex(in: lines), ampStatusIsLive(trimmedLines[border]) {
-                live.insert(border)
-            }
+            return ampComposerBoxIndex(in: lines).map { ampStatusIsLive(trimmedLines[$0]) } ?? false
         case "claude":
-            live.formUnion(claudeLiveWorkLineIndices(trimmedLines))
+            return claudeShowsLiveWork(trimmedLines)
         default:
-            break
+            return false
         }
-        return Array(live)
     }
 
     /// "esc to interrupt", also when a narrow footer truncates it
@@ -219,14 +184,11 @@ enum AgentScreenActivity {
     /// A background *shell* is not work: "✻ Worked for 3m · 1 shell still
     /// running" ends a turn whose result is ready (dev servers and watchers
     /// outlive turns), so only agents and workflows keep the session working.
-    /// Returns the indices of those lines: the newest status line when it
-    /// is live, and each live task row.
-    private static func claudeLiveWorkLineIndices(_ lines: [String]) -> IndexSet {
-        var live = IndexSet(lines.indices.filter { isLiveClaudeTaskRow(lines[$0]) })
-        if let status = lines.lastIndex(where: isClaudeStatusLine), claudeStatusIsLive(lines[status]) {
-            live.insert(status)
+    private static func claudeShowsLiveWork(_ lines: [String]) -> Bool {
+        if lines.contains(where: isLiveClaudeTaskRow) {
+            return true
         }
-        return live
+        return lines.last(where: isClaudeStatusLine).map(claudeStatusIsLive) ?? false
     }
 
     private static func isClaudeStatusLine(_ line: String) -> Bool {
@@ -296,12 +258,8 @@ enum AgentScreenActivity {
     // MARK: Amp
 
     /// Amp keeps a framed composer at the bottom of its screen (`╭─…─╮`,
-    /// `│ … │` rows, `╰ <status> ─…─╯`); returns its bottom border.
-    private static func ampComposerBox(in lines: [String]) -> String? {
-        ampComposerBoxIndex(in: lines).map { lines[$0].trimmingCharacters(in: .whitespaces) }
-    }
-
-    /// The index in `lines` of Amp's composer's bottom border (above).
+    /// `│ … │` rows, `╰ <status> ─…─╯`); returns the index in `lines` of its
+    /// bottom border.
     private static func ampComposerBoxIndex(in lines: [String]) -> Int? {
         let nonBlank = lines.indices.filter { !lines[$0].trimmingCharacters(in: .whitespaces).isEmpty }
         func starts(_ index: Int, with prefix: String) -> Bool {
@@ -352,5 +310,13 @@ enum AgentScreenActivity {
             return normalized
         }
         return AgentToolBrand.detect(name: name, commandLine: commandLine)?.rawValue ?? normalized
+    }
+}
+
+extension TerminalSession {
+    /// The agent tool this tab runs, by its name (or title) and command
+    /// line (`AgentScreenActivity.agentKey`).
+    var agentToolKey: String {
+        AgentScreenActivity.agentKey(name: agentName ?? title, commandLine: subtitle)
     }
 }

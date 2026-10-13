@@ -53,17 +53,17 @@ struct ProjectCommandEditor: View {
     let projectRoot: String
     let canDelete: Bool
     let errorMessage: String?
-    let onSave: (ProjectCommandDefinition, ProjectCommandStorage) -> Void
+    let onSave: (ProjectCommandDefinition, ProjectSettingStorage) -> Void
     let onDelete: () -> Void
     let onCancel: () -> Void
 
     init(
         command: ProjectCommandDefinition,
         projectRoot: String,
-        storage: ProjectCommandStorage = .local,
+        storage: ProjectSettingStorage = .local,
         canDelete: Bool,
         errorMessage: String?,
-        onSave: @escaping (ProjectCommandDefinition, ProjectCommandStorage) -> Void,
+        onSave: @escaping (ProjectCommandDefinition, ProjectSettingStorage) -> Void,
         onDelete: @escaping () -> Void,
         onCancel: @escaping () -> Void
     ) {
@@ -322,10 +322,10 @@ private struct ProjectCommandDraft {
     var autoStart: Bool
     var autoRestart: Bool
     var enabled: Bool
-    var storage: ProjectCommandStorage
+    var storage: ProjectSettingStorage
     let projectRoot: String
 
-    init(command: ProjectCommandDefinition, projectRoot: String, storage: ProjectCommandStorage) {
+    init(command: ProjectCommandDefinition, projectRoot: String, storage: ProjectSettingStorage) {
         name = command.name
         commandLine = command.commandLine
         workingDirectory = ProjectCommandDefinition.portableWorkingDirectory(

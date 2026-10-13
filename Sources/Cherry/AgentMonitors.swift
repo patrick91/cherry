@@ -515,11 +515,7 @@ extension CherryControlServer {
             }
             for watched in subscription.watched where !watched.finished {
                 if let session = watched.session, refreshed.insert(ObjectIdentifier(session)).inserted {
-                    let key = ObjectIdentifier(session)
-                    if monitors.lastRefreshAt[key].map({ now.timeIntervalSince($0) >= monitors.refreshInterval }) ?? true {
-                        monitors.lastRefreshAt[key] = now
-                        await refreshForMonitor(session)
-                    }
+                    await refreshForMonitorIfDue(session, now: now)
                 }
                 evaluate(watched, in: subscription, now: Date())
             }
@@ -533,6 +529,18 @@ extension CherryControlServer {
     func refreshForMonitor(_ session: TerminalSession) async {
         await session.refreshContentFromHostIfNeeded(maximumAge: session.hostContentPollInterval, recentOnly: true)
         _ = session.lineCount
+    }
+
+    /// `refreshForMonitor`, at most once per `monitors.refreshInterval` for
+    /// a session (monitors and tasks share the stamp).
+    @MainActor
+    func refreshForMonitorIfDue(_ session: TerminalSession, now: Date) async {
+        let key = ObjectIdentifier(session)
+        guard monitors.lastRefreshAt[key].map({ now.timeIntervalSince($0) >= monitors.refreshInterval }) ?? true else {
+            return
+        }
+        monitors.lastRefreshAt[key] = now
+        await refreshForMonitor(session)
     }
 
     /// The watched process's status now (`MonitorProcessStatus.status`).
@@ -558,7 +566,7 @@ extension CherryControlServer {
             break
         }
         guard session.kind == .agent else { return "running" }
-        let reported = reportedAgentActivityState(of: session) ?? "unknown"
+        let reported = session.agentActivityState.rawValue
         switch reported {
         case "idle":
             let quietSince = session.lastContentChangeAt ?? session.startedAt ?? now

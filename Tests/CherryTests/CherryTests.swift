@@ -8964,14 +8964,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     #expect(reloadedSettings.lastOpenedProjectRoot == secondDirectory.path)
     #expect(reloadedSettings.projectRoot(for: nil) == secondDirectory.path)
     #expect(defaults.string(forKey: "projects.lastOpenedRoot") == secondDirectory.path)
-    #expect(reloadedSettings.projectRootForWindow(
-        requestedRoot: firstDirectory.path,
-        onboardedRoot: nil
-    ) == firstDirectory.path)
-    #expect(reloadedSettings.projectRootForWindow(
-        requestedRoot: nil,
-        onboardedRoot: nil
-    ) == secondDirectory.path)
+    #expect(reloadedSettings.projectRoot(for: firstDirectory.path) == firstDirectory.path)
 
     reloadedSettings.removeProject(firstProject)
     #expect(reloadedSettings.projectRoot(for: nil) == secondDirectory.path)

@@ -1306,7 +1306,7 @@ struct CherryApp: App {
                                   let projectRoot = agentSettings.resolvedProject(for: workspace.projectRoot).validProjectRoot
                             else { return }
                             keyWindowChromeState?.selectTerminal()
-                            workspace.addAgentSession(agent: agent.definition, projectRoot: projectRoot)
+                            workspace.addAgentSession(agent: agent, projectRoot: projectRoot)
                         }
                     }
                 }
@@ -1350,7 +1350,6 @@ struct CherryApp: App {
 private struct ProjectWindowView: View {
     @Environment(\.openWindow) private var openWindow
     @ObservedObject private var agentSettings = AgentSettings.shared
-    @State private var onboardedProjectRoot: String?
     @State private var lockedProjectRoot: String?
 
     let requestedProjectRoot: String?
@@ -1366,7 +1365,6 @@ private struct ProjectWindowView: View {
                     .id(projectRoot)
             } else {
                 ProjectOnboardingView { project in
-                    onboardedProjectRoot = project.root
                     lockedProjectRoot = project.root
                 }
             }
@@ -1378,16 +1376,7 @@ private struct ProjectWindowView: View {
     }
 
     private var projectRoot: String? {
-        if let onboardedProjectRoot {
-            return onboardedProjectRoot
-        }
-        if let lockedProjectRoot {
-            return lockedProjectRoot
-        }
-        return agentSettings.projectRootForWindow(
-            requestedRoot: requestedProjectRoot,
-            onboardedRoot: onboardedProjectRoot
-        )
+        lockedProjectRoot ?? agentSettings.projectRoot(for: requestedProjectRoot)
     }
 
     private func lockProjectRootIfNeeded() {

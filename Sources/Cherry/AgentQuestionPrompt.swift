@@ -49,10 +49,10 @@ enum AgentQuestionPrompt {
         for (index, trimmed) in tail.enumerated() {
             var isOption = false
             if let first = trimmed.first, cursors.contains(first),
-               isNumberedOption(trimmed.dropFirst().drop { $0.isWhitespace }) {
+               AgentPermissionPrompt.optionText(trimmed.dropFirst().drop { $0.isWhitespace }) != nil {
                 isOption = true
                 hasSelectedOption = true
-            } else if isNumberedOption(Substring(trimmed)) {
+            } else if AgentPermissionPrompt.optionText(Substring(trimmed)) != nil {
                 isOption = true
             }
             if isOption {
@@ -70,18 +70,5 @@ enum AgentQuestionPrompt {
             }
         }
         return optionCount >= 2 && hasSelectedOption && hasPickerPhrase
-    }
-
-    /// "1. Text" or "2) Text".
-    private static func isNumberedOption(_ text: Substring) -> Bool {
-        var index = text.startIndex
-        var digits = 0
-        while index < text.endIndex, text[index].isASCII, text[index].isNumber, digits < 2 {
-            index = text.index(after: index)
-            digits += 1
-        }
-        guard digits > 0, index < text.endIndex, text[index] == "." || text[index] == ")" else { return false }
-        let next = text.index(after: index)
-        return next < text.endIndex && text[next] == " "
     }
 }

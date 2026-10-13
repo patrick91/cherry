@@ -247,6 +247,6 @@ final class RemoteProjectFiles: ObservableObject {
         guard entries[key] != entry else { return }
         entries[key] = entry
         generation += 1
-        CherryProjectFile.invalidateRemote(projectRoot: key)
+        CherryProjectFile.invalidate(projectRoot: key)
     }
 }

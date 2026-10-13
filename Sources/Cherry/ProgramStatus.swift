@@ -60,37 +60,6 @@ struct ProgramStatus: Codable, Equatable, Sendable {
         case id, state, kind, progress, app, title, message
     }
 
-    init(
-        id: String = "",
-        state: State,
-        kind: Kind? = nil,
-        progress: Int? = nil,
-        app: String = "",
-        title: String = "",
-        message: String = ""
-    ) {
-        self.id = id
-        self.state = state
-        self.kind = kind
-        self.progress = progress
-        self.app = app
-        self.title = title
-        self.message = message
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(
-            id: try container.decodeIfPresent(String.self, forKey: .id) ?? "",
-            state: try container.decode(State.self, forKey: .state),
-            kind: try container.decodeIfPresent(Kind.self, forKey: .kind),
-            progress: try container.decodeIfPresent(Int.self, forKey: .progress),
-            app: try container.decodeIfPresent(String.self, forKey: .app) ?? "",
-            title: try container.decodeIfPresent(String.self, forKey: .title) ?? "",
-            message: try container.decodeIfPresent(String.self, forKey: .message) ?? ""
-        )
-    }
-
     /// As the host writes it: empty and absent values left out.
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
@@ -104,6 +73,22 @@ struct ProgramStatus: Codable, Equatable, Sendable {
     }
 
     var isRoot: Bool { id.isEmpty }
+}
+
+// In an extension, so the memberwise initializer stays.
+extension ProgramStatus {
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try container.decodeIfPresent(String.self, forKey: .id) ?? "",
+            state: try container.decode(State.self, forKey: .state),
+            kind: try container.decodeIfPresent(Kind.self, forKey: .kind),
+            progress: try container.decodeIfPresent(Int.self, forKey: .progress),
+            app: try container.decodeIfPresent(String.self, forKey: .app) ?? "",
+            title: try container.decodeIfPresent(String.self, forKey: .title) ?? "",
+            message: try container.decodeIfPresent(String.self, forKey: .message) ?? ""
+        )
+    }
 }
 
 extension Array where Element == ProgramStatus {

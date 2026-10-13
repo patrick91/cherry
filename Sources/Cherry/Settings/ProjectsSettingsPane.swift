@@ -59,14 +59,7 @@ struct ProjectSettingsPane: View {
     }
 
     private func chooseProjectRoot() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Add"
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let url = NSOpenPanel.chooseFolder(prompt: "Add", canCreateDirectories: true) else { return }
         if let project = settings.addProject(path: url.path) {
             openProject(project)
         }

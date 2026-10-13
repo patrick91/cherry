@@ -7,6 +7,11 @@ final class ProjectTodoStore: ObservableObject {
     @Published private(set) var todos: [ProjectTodo] = []
     @Published private(set) var tagCatalog: [TodoTag] = []
 
+    /// The todo to select when none is: the first one not done, else the first.
+    var firstSelectableTodo: ProjectTodo? {
+        todos.first { $0.status != .done } ?? todos.first
+    }
+
     let projectRoot: String
     private let fileURL: URL
     private let encoder = JSONEncoder()
@@ -345,8 +350,8 @@ final class ProjectTodoStore: ObservableObject {
         var seen = Set<String>()
 
         for rawName in names {
-            guard let name = normalizedTagName(rawName) else { continue }
-            let id = tagID(forNormalizedName: name)
+            guard let name = Self.normalizedTagName(rawName) else { continue }
+            let id = Self.tagID(forNormalizedName: name)
             guard seen.insert(id).inserted else { continue }
 
             if let existing = tagCatalog.first(where: { $0.id == id }) {
@@ -365,8 +370,8 @@ final class ProjectTodoStore: ObservableObject {
     private func reconcileTagsAfterLoad() {
         var catalogByID: [String: TodoTag] = [:]
         for tag in tagCatalog {
-            guard let name = normalizedTagName(tag.name) else { continue }
-            let id = tagID(forNormalizedName: name)
+            guard let name = Self.normalizedTagName(tag.name) else { continue }
+            let id = Self.tagID(forNormalizedName: name)
             if catalogByID[id] == nil {
                 catalogByID[id] = TodoTag(
                     id: id,
@@ -380,8 +385,8 @@ final class ProjectTodoStore: ObservableObject {
             var resolved: [TodoTag] = []
             var seen = Set<String>()
             for tag in todos[todoIndex].tags {
-                guard let name = normalizedTagName(tag.name) else { continue }
-                let id = tagID(forNormalizedName: name)
+                guard let name = Self.normalizedTagName(tag.name) else { continue }
+                let id = Self.tagID(forNormalizedName: name)
                 guard seen.insert(id).inserted else { continue }
 
                 if let catalogTag = catalogByID[id] {
@@ -410,13 +415,16 @@ final class ProjectTodoStore: ObservableObject {
         }
     }
 
-    private func normalizedTagName(_ name: String) -> String? {
+    /// A tag name with its words joined by single spaces; nil when it has none.
+    static func normalizedTagName(_ name: String) -> String? {
         let parts = name.split(whereSeparator: \.isWhitespace)
         let normalized = parts.joined(separator: " ")
         return normalized.isEmpty ? nil : normalized
     }
 
-    private func tagID(forNormalizedName name: String) -> String {
+    /// The id of the tag with this normalized name, the same for any case or
+    /// diacritics.
+    static func tagID(forNormalizedName name: String) -> String {
         name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
             .lowercased()
     }

@@ -200,7 +200,6 @@ private struct OmniBarPanel: View {
                     text: Binding(get: { controller.query }, set: { controller.setQuery($0) }),
                     placeholder: controller.placeholder,
                     focusRequest: focusRequest,
-                    onSubmit: {},
                     accessibilityLabel: controller.scope.map { "Search \($0.label)" } ?? "Search everything",
                     onCommand: handleCommand
                 )

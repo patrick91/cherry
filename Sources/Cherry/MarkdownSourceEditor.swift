@@ -3,34 +3,12 @@ import CherryControl
 import SwiftUI
 
 enum NoteEditorStyle {
-    /// Raw monospace source with terminal-palette colors (used by the todo inspector).
+    /// Source with terminal-palette colors in a centered column (used by the
+    /// todo inspector).
     case terminal
     /// Document look for notes: proportional type, left-anchored column, syntax
     /// markers hanging in a leading gutter so text sits flush.
     case document
-
-    var contentWidth: CGFloat {
-        self == .document ? 880 : 740
-    }
-
-    /// Minimum inset from the pane edge to the marker gutter. The text edge sits at
-    /// `horizontalInset + textGutter`, which is what the eye reads as the left margin.
-    var horizontalInset: CGFloat {
-        self == .document ? 6 : 32
-    }
-
-    /// Right margin on narrow panes; matches the visible left text margin.
-    var trailingInset: CGFloat {
-        self == .document ? horizontalInset + textGutter : 32
-    }
-
-    var verticalInset: CGFloat {
-        self == .document ? 26 : 24
-    }
-
-    var headerSpacing: CGFloat {
-        self == .document ? 16 : 24
-    }
 
     /// Left gutter that syntax markers hang into so text sits flush.
     var textGutter: CGFloat {
@@ -45,26 +23,22 @@ enum NoteEditorStyle {
 struct MarkdownSourceEditor: NSViewRepresentable {
     @Binding var text: String
     var themeColors: TerminalThemeColors?
-    var maxContentWidth: CGFloat = 740
-    var minHorizontalInset: CGFloat = 32
+    var maxContentWidth: CGFloat = 880
+    /// Minimum inset from the pane edge to the marker gutter. The text edge sits at
+    /// `minHorizontalInset + style.textGutter`, which is what the eye reads as the left margin.
+    var minHorizontalInset: CGFloat = 6
     /// Right-edge inset when the pane is narrower than the content width; nil mirrors the left.
-    var trailingInset: CGFloat? = nil
-    var verticalInset: CGFloat = 24
-    var headerSpacing: CGFloat = 24
+    /// The default is `minHorizontalInset + NoteEditorStyle.document.textGutter`, so
+    /// a note's right margin matches its visible left text margin.
+    var trailingInset: CGFloat? = 42
+    var verticalInset: CGFloat = 26
+    var headerSpacing: CGFloat = 16
     var header: AnyView? = nil
-    var bodyFontSize: CGFloat = 13.5
-    var useMonospacedFont: Bool = true
-    var style: NoteEditorStyle = .terminal
+    var style: NoteEditorStyle = .document
     var onContentHeightChange: ((CGFloat) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(
-            text: $text,
-            themeColors: themeColors,
-            bodyFontSize: bodyFontSize,
-            useMonospacedFont: useMonospacedFont,
-            style: style
-        )
+        Coordinator(text: $text, themeColors: themeColors, style: style)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -118,12 +92,7 @@ struct MarkdownSourceEditor: NSViewRepresentable {
 
         context.coordinator.textView = textView
         context.coordinator.documentView = documentView
-        context.coordinator.appliedAppearance = Coordinator.Appearance(
-            themeColors: themeColors,
-            bodyFontSize: bodyFontSize,
-            useMonospacedFont: useMonospacedFont,
-            style: style
-        )
+        context.coordinator.appliedAppearance = Coordinator.Appearance(themeColors: themeColors, style: style)
         context.coordinator.applyInsertionPoint(to: textView)
         context.coordinator.applySelectionColors(to: textView)
         context.coordinator.setText(text, in: textView)
@@ -146,16 +115,9 @@ struct MarkdownSourceEditor: NSViewRepresentable {
 
         let textView = documentView.textView
         let coordinator = context.coordinator
-        let appearance = Coordinator.Appearance(
-            themeColors: themeColors,
-            bodyFontSize: bodyFontSize,
-            useMonospacedFont: useMonospacedFont,
-            style: style
-        )
+        let appearance = Coordinator.Appearance(themeColors: themeColors, style: style)
         let appearanceChanged = coordinator.appliedAppearance != appearance
         coordinator.themeColors = themeColors
-        coordinator.bodyFontSize = bodyFontSize
-        coordinator.useMonospacedFont = useMonospacedFont
         coordinator.style = style
         if appearanceChanged {
             coordinator.appliedAppearance = appearance
@@ -179,31 +141,20 @@ struct MarkdownSourceEditor: NSViewRepresentable {
         weak var textView: NSTextView?
         weak var documentView: MarkdownDocumentView?
         var themeColors: TerminalThemeColors?
-        var bodyFontSize: CGFloat
-        var useMonospacedFont: Bool
         var style: NoteEditorStyle
         private var isApplyingText = false
+        private let bodyFontSize: CGFloat = 15
 
         /// Everything that feeds into highlighting; re-highlight only when it changes.
         struct Appearance: Equatable {
             var themeColors: TerminalThemeColors?
-            var bodyFontSize: CGFloat
-            var useMonospacedFont: Bool
             var style: NoteEditorStyle
         }
         var appliedAppearance: Appearance?
 
-        init(
-            text: Binding<String>,
-            themeColors: TerminalThemeColors?,
-            bodyFontSize: CGFloat,
-            useMonospacedFont: Bool,
-            style: NoteEditorStyle
-        ) {
+        init(text: Binding<String>, themeColors: TerminalThemeColors?, style: NoteEditorStyle) {
             _text = text
             self.themeColors = themeColors
-            self.bodyFontSize = bodyFontSize
-            self.useMonospacedFont = useMonospacedFont
             self.style = style
         }
 
@@ -375,23 +326,12 @@ struct MarkdownSourceEditor: NSViewRepresentable {
             ]
         }
 
-        private var effectiveBodyFontSize: CGFloat {
-            style == .terminal ? bodyFontSize : 15
-        }
-
         private func bodyFont(weight: NSFont.Weight) -> NSFont {
-            let size = effectiveBodyFontSize
-            if style == .terminal, useMonospacedFont {
-                return NSFont.monospacedSystemFont(ofSize: size, weight: weight)
-            }
-            return NSFont.systemFont(ofSize: size, weight: weight)
+            NSFont.systemFont(ofSize: bodyFontSize, weight: weight)
         }
 
         private func headingFont(size: CGFloat) -> NSFont {
             if style == .terminal {
-                if useMonospacedFont {
-                    return NSFont.monospacedSystemFont(ofSize: size, weight: .semibold)
-                }
                 return NSFont.systemFont(ofSize: size, weight: .semibold)
             }
             return NSFont.systemFont(ofSize: size, weight: .bold)
@@ -399,15 +339,15 @@ struct MarkdownSourceEditor: NSViewRepresentable {
 
         private func headingSize(forLevel level: Int) -> CGFloat {
             switch level {
-            case 1: return effectiveBodyFontSize * 1.55
-            case 2: return effectiveBodyFontSize * 1.3
-            case 3: return effectiveBodyFontSize * 1.12
-            default: return effectiveBodyFontSize
+            case 1: return bodyFontSize * 1.55
+            case 2: return bodyFontSize * 1.3
+            case 3: return bodyFontSize * 1.12
+            default: return bodyFontSize
             }
         }
 
         private func codeFont(weight: NSFont.Weight = .regular) -> NSFont {
-            let size = style == .terminal ? effectiveBodyFontSize : (effectiveBodyFontSize * 0.88).rounded()
+            let size = style == .terminal ? bodyFontSize : (bodyFontSize * 0.88).rounded()
             return NSFont.monospacedSystemFont(ofSize: size, weight: weight)
         }
 

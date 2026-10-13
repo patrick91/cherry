@@ -375,9 +375,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
                     chromeState.focusIdleCommand(name: command.name)
                 }
             case .todoBoard:
-                let firstSelectableTodoID = todoStore?.todos.first { $0.status != .done }?.id
-                    ?? todoStore?.todos.first?.id
-                chromeState.selectTodo(id: chromeState.selectedTodoID ?? firstSelectableTodoID)
+                chromeState.selectTodo(id: chromeState.selectedTodoID ?? todoStore?.firstSelectableTodo?.id)
             case .note(let id):
                 chromeState.selectNote(id: id)
             }

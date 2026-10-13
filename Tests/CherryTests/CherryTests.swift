@@ -9151,39 +9151,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 }
 
 @MainActor
-@Test func workspaceInstallsPreviewAgentTreeWithoutLaunchingAgents() async throws {
-    let directory = FileManager.default.temporaryDirectory
-        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(at: directory)
-    }
-
-    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
-    defer {
-        workspace.sessions.forEach { $0.stop() }
-    }
-
-    let previewSessions = workspace.installPreviewAgentTree()
-    let parent = try #require(previewSessions.first)
-
-    #expect(previewSessions.count == 20)
-    #expect(workspace.agentSessions.map(\.id) == previewSessions.map(\.id))
-    #expect(workspace.rootAgentSessions.map(\.id) == [parent.id, previewSessions[13].id, previewSessions[19].id])
-    #expect(workspace.childAgentSessions(of: parent).map(\.id) == previewSessions[1...12].map(\.id))
-    #expect(workspace.childAgentSessions(of: previewSessions[13]).map(\.id) == previewSessions[14...18].map(\.id))
-    #expect(workspace.descendantAgentSessions(of: parent).map(\.id) == previewSessions[1...12].map(\.id))
-    #expect(workspace.visibleAgentTreeItems().allSatisfy { $0.depth <= 1 })
-    #expect(previewSessions.contains { $0.sidebarDetail.isEmpty })
-    #expect(previewSessions.allSatisfy { session in
-        session.kind == .agent &&
-        session.childProcessID == nil &&
-        session.state == .exited(0)
-    })
-    #expect(workspace.installPreviewAgentTree().isEmpty)
-}
-
-@MainActor
 @Test func workspaceCanCreateCommandSession() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -10289,8 +10256,6 @@ private func serviceRecord(
     let coordinator = MarkdownSourceEditor.Coordinator(
         text: .constant(""),
         themeColors: nil,
-        bodyFontSize: 15,
-        useMonospacedFont: false,
         style: .document
     )
     textView.string = markdown
@@ -10336,8 +10301,6 @@ private func serviceRecord(
     let coordinator = MarkdownSourceEditor.Coordinator(
         text: .constant(""),
         themeColors: nil,
-        bodyFontSize: 15,
-        useMonospacedFont: false,
         style: .document
     )
     textView.string = markdown
@@ -10395,8 +10358,6 @@ private func serviceRecord(
     let coordinator = MarkdownSourceEditor.Coordinator(
         text: .constant(""),
         themeColors: nil,
-        bodyFontSize: 15,
-        useMonospacedFont: false,
         style: .document
     )
     textView.string = markdown

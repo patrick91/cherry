@@ -210,21 +210,18 @@ struct ProjectCommandEditor: View {
     }
 
     private func chooseWorkingDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
-        if !draft.workingDirectory.isEmpty {
-            panel.directoryURL = URL(
+        let directoryURL: URL? = if !draft.workingDirectory.isEmpty {
+            URL(
                 fileURLWithPath: draft.definition.resolvedWorkingDirectory(projectRoot: projectRoot),
                 isDirectory: true
             )
         } else if !projectRoot.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: projectRoot, isDirectory: true)
+            URL(fileURLWithPath: projectRoot, isDirectory: true)
+        } else {
+            nil
         }
 
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let url = NSOpenPanel.chooseFolder(prompt: "Choose", directoryURL: directoryURL) else { return }
         draft.workingDirectory = ProjectCommandDefinition.portableWorkingDirectory(url.path, projectRoot: projectRoot)
     }
 

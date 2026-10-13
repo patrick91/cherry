@@ -2151,90 +2151,6 @@ final class TerminalWorkspace: ObservableObject {
         return session
     }
 
-    @discardableResult
-    func installPreviewAgentTree() -> [TerminalSession] {
-        guard agentSessions.isEmpty else { return [] }
-
-        let workingDirectory = launchRoot ?? NSHomeDirectory()
-        var previewSessions: [TerminalSession] = []
-
-        func appendPreviewAgent(
-            title: String,
-            subtitle: String,
-            agentName: String,
-            parentAgentID: UUID? = nil
-        ) -> TerminalSession {
-            let session = Self.makePreviewAgentSession(
-                index: previewSessions.count + 1,
-                title: title,
-                subtitle: subtitle,
-                agentName: agentName,
-                workingDirectory: workingDirectory,
-                projectRoot: projectRoot,
-                parentAgentID: parentAgentID,
-                launchBackend: launchBackend
-            )
-            previewSessions.append(session)
-            return session
-        }
-
-        let parent = appendPreviewAgent(
-            title: "Claude",
-            subtitle: "Investigate Profile Cache Loading",
-            agentName: "Claude"
-        )
-        [
-            ("Codex", "tuning sidebar UI", "Codex"),
-            ("Gemini", "no agent process running", "Gemini"),
-            ("Amp", "previewed empty agent tree", "Amp"),
-            ("Codex Review", "check close confirmation", "Codex"),
-            ("Claude Notes", "inspect sidebar spacing", "Claude"),
-            ("Gemini Audit", "", "Gemini"),
-            ("Amp Layout", "", "Amp"),
-            ("Codex MCP", "validate parent_agent_id", "Codex"),
-            ("Claude Cache", "read cached profile data", "Claude"),
-            ("Gemini Trace", "measure row rhythm", "Gemini"),
-            ("Amp Snapshot", "compare guide alignment", "Amp"),
-            ("Codex Docs", "", "Codex")
-        ].forEach { title, subtitle, agentName in
-            _ = appendPreviewAgent(
-                title: title,
-                subtitle: subtitle,
-                agentName: agentName,
-                parentAgentID: parent.id
-            )
-        }
-
-        let designParent = appendPreviewAgent(
-            title: "Codex Design",
-            subtitle: "agent tree preview visible",
-            agentName: "Codex"
-        )
-        [
-            ("Claude Close", "group close prompt", "Claude"),
-            ("Gemini Commands", "shortcut numbering", "Gemini"),
-            ("Amp Icons", "mixed provider logos", "Amp"),
-            ("Codex Empty", "", "Codex"),
-            ("Claude Labels", "longer sidebar details", "Claude")
-        ].forEach { title, subtitle, agentName in
-            _ = appendPreviewAgent(
-                title: title,
-                subtitle: subtitle,
-                agentName: agentName,
-                parentAgentID: designParent.id
-            )
-        }
-
-        _ = appendPreviewAgent(
-            title: "Claude Scratch",
-            subtitle: "",
-            agentName: "Claude"
-        )
-        sessions.append(contentsOf: previewSessions)
-        selectedSessionID = parent.id
-        return previewSessions
-    }
-
     func commandSession(named name: String) -> TerminalSession? {
         let normalizedName = AgentToolDefinition.normalizedName(name)
         return commandSessions.first {
@@ -3236,31 +3152,6 @@ final class TerminalWorkspace: ObservableObject {
             launchBackend: launchBackend,
             persistentHosting: persistentHosting
         )
-    }
-
-    private static func makePreviewAgentSession(
-        index: Int,
-        title: String,
-        subtitle: String,
-        agentName: String,
-        workingDirectory: String,
-        projectRoot: String?,
-        parentAgentID: UUID? = nil,
-        launchBackend: TerminalSessionLaunchBackend
-    ) -> TerminalSession {
-        let session = TerminalSession(
-            title: title,
-            subtitle: subtitle,
-            tint: palette[(index - 1) % palette.count],
-            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
-            projectRoot: projectRoot,
-            launchShell: false,
-            kind: .agent,
-            agentName: agentName,
-            parentAgentID: parentAgentID,
-            launchBackend: launchBackend
-        )
-        return session
     }
 
     private static func resolvedWorkingDirectory(_ requestedWorkingDirectory: String?) -> String {

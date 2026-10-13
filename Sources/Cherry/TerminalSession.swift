@@ -7529,16 +7529,15 @@ final class TerminalSession: ObservableObject, Identifiable {
         return replaceNativeContent(with: text)
     }
 
-    /// Takes `text` as the tab's lines; when it changed, advances the output
-    /// and content counters.
+    /// Takes `text` as the tab's lines (`lines`: the caller's split of it,
+    /// if it has one); when it changed, advances the output and content
+    /// counters. An unchanged text costs only its hash.
     @discardableResult
-    private func replaceNativeContent(with text: String) -> Bool {
-        var hasher = Hasher()
-        hasher.combine(text)
-        let hash = hasher.finalize()
+    private func replaceNativeContent(with text: String, lines: [String]? = nil) -> Bool {
+        let hash = TerminalScreenText.contentHash(of: text)
         guard hash != nativeContentHash else { return false }
         nativeContentHash = hash
-        nativeContentLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        nativeContentLines = lines ?? TerminalScreenText.lines(of: text)
 
         lastOutputAt = Date()
         if case .launching = state { state = .live }
@@ -7633,7 +7632,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if hostContentUsesAlternateScreen != screen.alternateScreen {
             hostContentUsesAlternateScreen = screen.alternateScreen
         }
-        let lines = screen.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let lines = TerminalScreenText.lines(of: screen.text)
         let hasHistory = recentLines.map { lines.count < $0 } ?? true
         let tailKey = Self.hostContentChangeKey(
             lines, recentLines: persistentHosting?.configuration.hostScreenRecentLines ?? recentLines ?? lines.count
@@ -7644,13 +7643,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard changed || hasHistory else { return }
         hostContentHasHistory = hasHistory
         if changed {
-            replaceNativeContent(with: screen.text)
+            replaceNativeContent(with: screen.text, lines: lines)
         } else {
             // The same last lines, now with the history above them.
             nativeContentLines = lines
-            var hasher = Hasher()
-            hasher.combine(screen.text)
-            nativeContentHash = hasher.finalize()
+            nativeContentHash = TerminalScreenText.contentHash(of: screen.text)
         }
     }
 

@@ -820,9 +820,7 @@ pub enum ServerMessage {
     /// line when blank rows after the text hold it. When the cursor is above
     /// the lines returned (fewer asked for than lie below it), and for
     /// `max_lines` 0 (an empty text), it is 0. `cursor_col` is the cursor's
-    /// column on the screen either way. (For a session whose process
-    /// predates `max_lines`, the host limits the whole text itself and
-    /// estimates the cursor's line from its row.)
+    /// column on the screen either way.
     ScreenText {
         id: String,
         text: String,

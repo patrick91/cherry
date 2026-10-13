@@ -569,13 +569,14 @@ differs from the design above.
   implemented as designed. The holder link is at `LINK_VERSION` 11 (11 adds
   `program_status`, OSC 7501 program status records, to `Info` and the
   hello's session), and a
-  daemon speaks every version from 1. Beyond the frames listed above it has
+  daemon speaks every version from 4 (`MIN_LINK_VERSION`: no holder was
+  ever built with an older one). Beyond the frames listed above it has
   `Launch` and `Failed` (Create goes through the holder), `Update` (rename /
   retag kept by the holder), `Info` (title/pwd/foreground, from version 3
   `alternate_screen` and `kitty_keyboard_flags`, from version 4
-  `application_cursor_keys`), `ScreenReply` (from version 3,
-  `SCREEN_LINES_VERSION`, `Screen` carries `max_lines`) and `Refused` (a
-  daemon that will never serve a holder, with `retry`). All of them are
+  `application_cursor_keys`), `ScreenReply` (from version 3 `Screen`
+  carries `max_lines`) and `Refused` (a daemon that will never serve a
+  holder, with `retry`). All of them are
   additive; version 4 adds only `application_cursor_keys` (in `Info` and
   the hello's session), and version 7 adds `bracketed_paste` there (left
   out by older holders, which the daemon then reports as unknown), the

@@ -932,7 +932,6 @@ impl Holder {
         // The child may not have run its program yet: look again soon.
         holder.sample_foreground();
         holder.activity();
-        holder.info = link::Info::default();
         holder.connect(stream);
         Ok(holder)
     }
@@ -1668,31 +1667,29 @@ impl Holder {
                 let Ok(request) = frame.meta::<link::ScreenRequest>() else {
                     return false;
                 };
-                let frame = match self.screen(&request) {
-                    Ok(screen) => link::encode(
-                        kind::SCREEN_REPLY,
-                        &link::ScreenReply {
+                let (reply, text) = match self.screen(&request) {
+                    Ok(screen) => (
+                        link::ScreenReply {
                             req: request.req,
                             cursor_row: screen.cursor_row,
                             cursor_col: screen.cursor_col,
                             alternate_screen: screen.alternate_screen,
                             error: None,
                         },
-                        screen.text.as_bytes(),
+                        screen.text.into_bytes(),
                     ),
-                    Err(error) => link::encode(
-                        kind::SCREEN_REPLY,
-                        &link::ScreenReply {
+                    Err(error) => (
+                        link::ScreenReply {
                             req: request.req,
                             cursor_row: 0,
                             cursor_col: 0,
                             alternate_screen: false,
                             error: Some(format!("{error:#}")),
                         },
-                        &[],
+                        Vec::new(),
                     ),
                 };
-                self.send(frame);
+                self.send(link::encode(kind::SCREEN_REPLY, &reply, &text));
                 return true;
             }
             kind::UPDATE => {
@@ -1777,10 +1774,7 @@ impl Holder {
     }
 
     fn flush_link(&mut self) {
-        if !self.info.is_empty() && self.link.is_some() {
-            let info = std::mem::take(&mut self.info);
-            self.send(link::encode(kind::INFO, &info, &[]));
-        }
+        self.send_info();
         // Output goes as soon as the link has room; until then it gathers.
         // It also gathers, up to `GATHER_BYTES`, while the program's output
         // keeps coming (the pass read as much as it may, so more is ready

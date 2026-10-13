@@ -11,7 +11,7 @@ use crate::{
     environment,
     holder::LINK_FD,
     link::{self, kind, Frame},
-    outbox::{Outbox, Output, Pacing, Push, PACE_STEP},
+    outbox::{Outbox, Output, Pacing, Push, MERGED_OUTPUT, PACE_STEP},
     paths, processes, screen,
     signals::{self, Wake},
 };
@@ -55,9 +55,6 @@ const LINK_READ: usize = 4 * 1024 * 1024;
 /// looked at this often: their writers do not wake the worker for all they
 /// take (see `Worker::next_wait`).
 const IDLE_RECHECK: Duration = Duration::from_millis(50);
-/// Output frames from the holder merge into client frames of at most this
-/// much output (see `Worker::pump_link`).
-const MERGED_OUTPUT: usize = 256 * 1024;
 /// How long a removed session's holder gets to take its last frame.
 const REMOVE_FLUSH: Duration = Duration::from_secs(1);
 /// Callers sharing one screen request, at most: beyond them the holder is
@@ -109,28 +106,7 @@ pub struct Session {
 }
 
 pub enum Command {
-    Attach {
-        lease: u64,
-        cols: u16,
-        rows: u16,
-        takeover: bool,
-        /// The client's terminal answers queries (see `Worker::send_query`).
-        answers_queries: bool,
-        /// Names the client: an attachment with the same ID is dropped
-        /// (see `Worker::drop_stale`).
-        client_id: Option<String>,
-        /// The client's cell size in pixels, when it gave one (see
-        /// `Worker::cell_source`).
-        cell: Option<(u32, u32)>,
-        /// It paints a viewport whatever the grid's size (see
-        /// `ClientMessage::Attach::viewport`).
-        viewport: bool,
-        outbox: Arc<Outbox>,
-        abort: UnixStream,
-        cancelled: Arc<AtomicBool>,
-        /// Whether the attachment was established.
-        ack: SyncSender<bool>,
-    },
+    Attach(AttachRequest),
     Input {
         lease: u64,
         data: Vec<u8>,
@@ -184,6 +160,30 @@ pub enum Command {
     Remove {
         ack: SyncSender<()>,
     },
+}
+
+/// A client's attach (`ClientMessage::Attach`).
+pub struct AttachRequest {
+    pub lease: u64,
+    pub cols: u16,
+    pub rows: u16,
+    pub takeover: bool,
+    /// The client's terminal answers queries (see `Worker::send_query`).
+    pub answers_queries: bool,
+    /// Names the client: an attachment with the same ID is dropped (see
+    /// `Worker::drop_stale`).
+    pub client_id: Option<String>,
+    /// The client's cell size in pixels, when it gave one (see
+    /// `Worker::cell_source`).
+    pub cell: Option<(u32, u32)>,
+    /// It paints a viewport whatever the grid's size (see
+    /// `ClientMessage::Attach::viewport`).
+    pub viewport: bool,
+    pub outbox: Arc<Outbox>,
+    pub abort: UnixStream,
+    pub cancelled: Arc<AtomicBool>,
+    /// Whether the attachment was established.
+    pub ack: SyncSender<bool>,
 }
 
 /// How a `Command::ClearHistory` went.
@@ -272,7 +272,7 @@ struct Attachment {
     resync_after: Option<Instant>,
     /// Its terminal answers queries (see `Worker::send_query`).
     answers_queries: bool,
-    /// See `Command::Attach`.
+    /// See `AttachRequest::client_id`.
     client_id: Option<String>,
     /// Its cell size in pixels, when it gave one.
     cell: Option<(u32, u32)>,
@@ -765,8 +765,6 @@ impl Session {
             created_at: session.created_at,
             alternate_screen: session.alternate_screen,
             kitty_keyboard_flags: session.kitty_keyboard_flags,
-            // Off from a holder older than link version 4, which never
-            // reports it.
             application_cursor_keys: session.application_cursor_keys,
             // Unknown from a holder older than link version 7.
             bracketed_paste: session.bracketed_paste,
@@ -915,13 +913,11 @@ fn frame(message: &ServerMessage) -> Option<Arc<Vec<u8>>> {
     encode_frame(message).ok().map(Arc::new)
 }
 
-fn attached_frame(
-    session: SessionInfo,
-    offset: u64,
-    snapshot: Vec<u8>,
-    reason: AttachReason,
-) -> Result<Arc<Vec<u8>>> {
-    Ok(Replacement::new(session, offset, snapshot, reason)?.frame)
+/// Queue an `Error` for one client.
+fn push_error(outbox: &Outbox, code: &str, message: impl Into<String>) {
+    if let Some(frame) = frame(&ServerMessage::error(code, message)) {
+        outbox.push_control(frame);
+    }
 }
 
 fn output_frame(offset: u64, data: &[u8]) -> Result<Output> {
@@ -1002,43 +998,12 @@ type CellCandidate = (Option<(u32, u32)>, u16, u16);
 
 /// An attach waiting for its snapshot.
 struct PendingAttach {
-    lease: u64,
-    cols: u16,
-    rows: u16,
-    takeover: bool,
-    answers_queries: bool,
-    client_id: Option<String>,
-    cell: Option<(u32, u32)>,
-    viewport: bool,
-    outbox: Arc<Outbox>,
-    abort: UnixStream,
-    cancelled: Arc<AtomicBool>,
-    ack: SyncSender<bool>,
+    request: AttachRequest,
     /// Whether its size changed the grid.
     resized: bool,
     /// Other attachments whose replacement for the new grid is full: they
     /// get the same snapshot.
     full_others: Vec<u64>,
-}
-
-impl PendingAttach {
-    /// The command it came from, to handle again later.
-    fn into_command(self) -> Command {
-        Command::Attach {
-            lease: self.lease,
-            cols: self.cols,
-            rows: self.rows,
-            takeover: self.takeover,
-            answers_queries: self.answers_queries,
-            client_id: self.client_id,
-            cell: self.cell,
-            viewport: self.viewport,
-            outbox: self.outbox,
-            abort: self.abort,
-            cancelled: self.cancelled,
-            ack: self.ack,
-        }
-    }
 }
 
 /// What a request to the holder is for.
@@ -1070,17 +1035,40 @@ enum Request {
     },
     /// The screen with or without its history, limited to `max_lines` or
     /// not, for every caller that asked the same while it was pending.
-    /// `whole`: the holder is too old to limit the text itself.
     Screen {
         scrollback: bool,
         max_lines: Option<u32>,
-        whole: bool,
         replies: Vec<SyncSender<ServerMessage>>,
     },
     /// A `ClearHistory` waiting for the holder's `HistoryCleared`.
     ClearHistory {
         ack: SyncSender<ClearOutcome>,
     },
+}
+
+/// Answer a request the holder will not serve: a detach is done, a screen
+/// read gets `screen` (an error) and a history clear `clear`. Any other
+/// request is returned.
+fn answer_unserved(
+    request: Request,
+    screen: &ServerMessage,
+    clear: ClearOutcome,
+) -> Option<Request> {
+    match request {
+        Request::Detach { ack } => {
+            let _ = ack.send(());
+        }
+        Request::Screen { replies, .. } => {
+            for reply in replies {
+                let _ = reply.send(screen.clone());
+            }
+        }
+        Request::ClearHistory { ack } => {
+            let _ = ack.send(clear);
+        }
+        request => return Some(request),
+    }
+    None
 }
 
 struct HolderLink {
@@ -1120,7 +1108,7 @@ struct Worker {
     requests: BTreeMap<u64, Request>,
     /// Attaches waiting for the one in progress: one at a time, so each
     /// sees the grid the previous one left.
-    waiting: VecDeque<Command>,
+    waiting: VecDeque<AttachRequest>,
     /// A resync snapshot has been asked for.
     resyncing: bool,
     /// How the session ended, once it has.
@@ -1181,37 +1169,49 @@ impl Worker {
         }
     }
 
-    /// Ask the holder for a snapshot; returns the request's ID.
-    fn request_snapshot(&mut self, kind: &str, request: Request) -> Option<u64> {
-        self.request_snapshot_with(kind, false, request)
+    /// Ask the holder something (`encode`: the frame, for the request's
+    /// ID), as `tell` sends it; `request` waits for the answer. Returns the
+    /// request's ID.
+    fn ask(&mut self, encode: impl FnOnce(u64) -> Vec<u8>, request: Request) -> Option<u64> {
+        let req = self.next_req;
+        if !self.tell(encode(req)) {
+            return None;
+        }
+        self.next_req += 1;
+        self.requests.insert(req, request);
+        Some(req)
     }
 
-    /// `request_snapshot`, for windows that paint a viewport (`graphics`:
-    /// the screens re-send the kitty images on screen, link version 9).
+    /// Ask the holder for a snapshot (`limited`); returns the request's ID.
+    fn request_snapshot(&mut self, request: Request) -> Option<u64> {
+        self.request_snapshot_with("limited", false, request)
+    }
+
+    /// `request_snapshot`, of another kind (see `request_screens`), and for
+    /// windows that paint a viewport (`graphics`: the screens re-send the
+    /// kitty images on screen, link version 9).
     fn request_snapshot_with(
         &mut self,
         kind: &str,
         graphics: bool,
         request: Request,
     ) -> Option<u64> {
-        let req = self.next_req;
         let max = (kind == "limited").then_some(MAX_SNAPSHOT_BYTES);
-        let sent = self.tell(link::encode(
-            kind::SNAPSHOT,
-            &link::SnapshotRequest {
-                req,
-                kind: kind.into(),
-                max,
-                graphics,
+        self.ask(
+            |req| {
+                link::encode(
+                    kind::SNAPSHOT,
+                    &link::SnapshotRequest {
+                        req,
+                        kind: kind.into(),
+                        max,
+                        graphics,
+                    },
+                    &[],
+                )
             },
-            &[],
-        ));
-        if !sent {
-            return None;
-        }
-        self.next_req += 1;
-        self.requests.insert(req, request);
-        Some(req)
+            request,
+        )
     }
 
     /// The shared grid: the smallest size any attachment asked for.
@@ -1415,15 +1415,12 @@ impl Worker {
         // The screens first: right behind the resize (see `request_screens`).
         self.request_screens(refresh, just_resized);
         if !full.is_empty() {
-            self.request_snapshot(
-                "limited",
-                Request::Replace {
-                    full: true,
-                    leases: full,
-                    resized: false,
-                    refreshes: Vec::new(),
-                },
-            );
+            self.request_snapshot(Request::Replace {
+                full: true,
+                leases: full,
+                resized: false,
+                refreshes: Vec::new(),
+            });
         }
     }
 
@@ -1541,12 +1538,11 @@ impl Worker {
                     attachment.direct = attachment.matches(size);
                 }
                 Err(error) => {
-                    if let Some(frame) = frame(&ServerMessage::error(
+                    push_error(
+                        &attachment.outbox,
                         error_code::SNAPSHOT_FAILED,
                         error.clone(),
-                    )) {
-                        attachment.outbox.push_control(frame);
-                    }
+                    );
                     // It keeps the grid it had, which its window no longer
                     // matches.
                     attachment.direct = false;
@@ -1670,11 +1666,7 @@ impl Worker {
             })
             .map(|attachment| attachment.lease)
             .collect();
-        if !leases.is_empty()
-            && self
-                .request_snapshot("limited", Request::Resync { leases })
-                .is_some()
-        {
+        if !leases.is_empty() && self.request_snapshot(Request::Resync { leases }).is_some() {
             self.resyncing = true;
         }
     }
@@ -1694,12 +1686,11 @@ impl Worker {
                     attachment.direct = attachment.matches(size);
                 }
                 Err(error) => {
-                    if let Some(frame) = self::frame(&ServerMessage::error(
+                    push_error(
+                        &attachment.outbox,
                         error_code::SNAPSHOT_FAILED,
                         error.clone(),
-                    )) {
-                        attachment.outbox.push_control(frame);
-                    }
+                    );
                     attachment.resync_after = Some(now + RESYNC_RETRY);
                 }
             }
@@ -1755,37 +1746,21 @@ impl Worker {
         }
     }
 
+    /// Give the holder input (an attachment's, by `lease`, or
+    /// `SendInput`'s); what it cannot take now is released at once.
+    fn send_input(&mut self, lease: Option<u64>, data: Vec<u8>) {
+        let len = data.len();
+        if self.running() && self.tell(link::encode(kind::INPUT, &link::InputMeta { lease }, &data))
+        {
+            self.unacknowledged += len;
+        } else {
+            self.input.release(len);
+        }
+    }
+
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Attach {
-                lease,
-                cols,
-                rows,
-                takeover,
-                answers_queries,
-                client_id,
-                cell,
-                viewport,
-                outbox,
-                abort,
-                cancelled,
-                ack,
-            } => self.attach(PendingAttach {
-                lease,
-                cols,
-                rows,
-                takeover,
-                answers_queries,
-                client_id,
-                cell,
-                viewport,
-                outbox,
-                abort,
-                cancelled,
-                ack,
-                resized: false,
-                full_others: Vec::new(),
-            }),
+            Command::Attach(request) => self.attach(request),
             Command::Input { lease, data } => {
                 let attachment = self
                     .attached
@@ -1795,34 +1770,13 @@ impl Worker {
                 if attachment.is_some_and(|a| a.answers_queries) {
                     self.typist = Some(lease);
                 }
-                let len = data.len();
-                if attached
-                    && self.running()
-                    && self.tell(link::encode(
-                        kind::INPUT,
-                        &link::InputMeta { lease: Some(lease) },
-                        &data,
-                    ))
-                {
-                    self.unacknowledged += len;
+                if attached {
+                    self.send_input(Some(lease), data);
                 } else {
-                    self.input.release(len);
+                    self.input.release(data.len());
                 }
             }
-            Command::Send { data } => {
-                let len = data.len();
-                if self.running()
-                    && self.tell(link::encode(
-                        kind::INPUT,
-                        &link::InputMeta { lease: None },
-                        &data,
-                    ))
-                {
-                    self.unacknowledged += len;
-                } else {
-                    self.input.release(len);
-                }
-            }
+            Command::Send { data } => self.send_input(None, data),
             Command::Screen {
                 scrollback,
                 max_lines,
@@ -1835,16 +1789,13 @@ impl Worker {
                     Some(link) if link.version < link::CLEAR_HISTORY_VERSION => {
                         Some(ClearOutcome::Unsupported)
                     }
+                    // A holder of this version takes it (see `kind::since`).
                     Some(_) => {
-                        let req = self.next_req;
-                        if self.tell(link::encode(kind::CLEAR_HISTORY, &link::Req { req }, &[])) {
-                            self.next_req += 1;
-                            self.requests
-                                .insert(req, Request::ClearHistory { ack: ack.clone() });
-                            None
-                        } else {
-                            Some(ClearOutcome::NotLinked)
-                        }
+                        self.ask(
+                            |req| link::encode(kind::CLEAR_HISTORY, &link::Req { req }, &[]),
+                            Request::ClearHistory { ack: ack.clone() },
+                        );
+                        None
                     }
                 };
                 if let Some(outcome) = outcome {
@@ -1967,16 +1918,20 @@ impl Worker {
                     self.schedule_grid();
                     // The holder keeps the lease's input for delivery, and
                     // says so in order with it.
-                    let req = self.next_req;
                     if self.running()
-                        && self.tell(link::encode(
-                            kind::DETACH,
-                            &link::DetachMeta { req, lease },
-                            &[],
-                        ))
+                        && self
+                            .ask(
+                                |req| {
+                                    link::encode(
+                                        kind::DETACH,
+                                        &link::DetachMeta { req, lease },
+                                        &[],
+                                    )
+                                },
+                                Request::Detach { ack: ack.clone() },
+                            )
+                            .is_some()
                     {
-                        self.next_req += 1;
-                        self.requests.insert(req, Request::Detach { ack });
                         return;
                     }
                 }
@@ -2006,10 +1961,6 @@ impl Worker {
                 error_code::REQUEST_FAILED,
                 "the session's holder is gone, and its screen with it",
             )),
-            Some(link) if link.version < kind::since(kind::SCREEN) => Some((
-                error_code::UNSUPPORTED_OPERATION,
-                "this session's holder is too old to read its screen",
-            )),
             Some(_) => None,
         };
         if let Some((code, message)) = refusal {
@@ -2029,7 +1980,6 @@ impl Worker {
                 scrollback: of,
                 max_lines: limit,
                 replies,
-                ..
             } = request
             {
                 screens += 1;
@@ -2050,41 +2000,32 @@ impl Worker {
             not_answering(reply);
             return;
         }
-        // An older holder would ignore the limit: it is sent the request
-        // without one, and its whole text is limited here.
-        let whole = self
-            .link
-            .as_ref()
-            .is_some_and(|link| link.version < link::SCREEN_LINES_VERSION);
-        let req = self.next_req;
-        self.next_req += 1;
-        self.tell(link::encode(
-            kind::SCREEN,
-            &link::ScreenRequest {
-                req,
-                scrollback,
-                max_lines: max_lines.filter(|_| !whole),
+        self.ask(
+            |req| {
+                link::encode(
+                    kind::SCREEN,
+                    &link::ScreenRequest {
+                        req,
+                        scrollback,
+                        max_lines,
+                    },
+                    &[],
+                )
             },
-            &[],
-        ));
-        self.requests.insert(
-            req,
             Request::Screen {
                 scrollback,
                 max_lines,
-                whole,
                 replies: vec![reply],
             },
         );
     }
 
-    /// The answer to `Screen` (with `scrollback` and `max_lines`), from the
-    /// holder's; `whole` when the holder did not limit its text.
+    /// The answer to `Screen` (with `max_lines`), from the holder's.
     fn screen_text(
         &self,
         reply: link::ScreenReply,
         text: Vec<u8>,
-        (scrollback, max_lines, whole): (bool, Option<u32>, bool),
+        max_lines: Option<u32>,
     ) -> ServerMessage {
         if let Some(error) = reply.error {
             return ServerMessage::error(error_code::REQUEST_FAILED, error);
@@ -2092,13 +2033,6 @@ impl Worker {
         let mut text = String::from_utf8(text)
             .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
         let cursor_row = match max_lines {
-            Some(max_lines) if whole => screen::limit_whole(
-                &mut text,
-                reply.cursor_row,
-                self.size().1,
-                scrollback && !reply.alternate_screen,
-                max_lines,
-            ),
             // Counted from the first line: the lines dropped here (none
             // from a holder that keeps to the limit) move it up.
             Some(_) => {
@@ -2142,34 +2076,33 @@ impl Worker {
         }
     }
 
-    fn attach(&mut self, mut pending: PendingAttach) {
-        if pending.cancelled.load(Ordering::SeqCst) {
-            let _ = pending.ack.send(false);
+    fn attach(&mut self, request: AttachRequest) {
+        if request.cancelled.load(Ordering::SeqCst) {
+            let _ = request.ack.send(false);
             return;
         }
         if self
             .requests
             .values()
-            .any(|request| matches!(request, Request::Attach(_)))
+            .any(|pending| matches!(pending, Request::Attach(_)))
         {
-            self.waiting.push_back(pending.into_command());
+            self.waiting.push_back(request);
             return;
         }
         if self.removed {
-            if let Some(frame) = frame(&ServerMessage::error(
+            push_error(
+                &request.outbox,
                 error_code::REQUEST_FAILED,
                 "the session was removed",
-            )) {
-                pending.outbox.push_control(frame);
-            }
-            let _ = pending.ack.send(false);
+            );
+            let _ = request.ack.send(false);
             return;
         }
         if !self.running() {
             // The final screen and the exit; the grid stays as it was.
             if self.link.is_none() {
                 self.attach_exited(
-                    pending,
+                    request,
                     Ok(Snapshot {
                         bytes: Vec::new(),
                         offset: self.offset,
@@ -2177,91 +2110,87 @@ impl Worker {
                     }),
                 );
             } else {
-                self.request_snapshot("limited", Request::Attach(pending));
+                self.request_snapshot(Request::Attach(PendingAttach {
+                    request,
+                    resized: false,
+                    full_others: Vec::new(),
+                }));
             }
             return;
         }
-        if let Some(client) = pending.client_id.clone() {
+        if let Some(client) = request.client_id.clone() {
             self.drop_stale(&client);
         }
         self.release_gone();
-        let (cols, rows) = (pending.cols, pending.rows);
-        let dimensions = match (pending.takeover, self.desired_size()) {
+        let (cols, rows) = (request.cols, request.rows);
+        let dimensions = match (request.takeover, self.desired_size()) {
             (false, Some((c, r))) => (cols.min(c), rows.min(r)),
             _ => (cols, rows),
         };
         let resized = dimensions != self.size();
-        pending.resized = resized;
-        let attaching = Some((pending.cell, pending.cols, pending.rows));
+        let mut full_others = Vec::new();
+        let attaching = Some((request.cell, cols, rows));
         if resized {
             self.resize(dimensions.0, dimensions.1, attaching);
-            if !pending.takeover {
+            if !request.takeover {
                 // The other windows get replacements for the new size;
                 // those that need a full snapshot get this one's. The
                 // screens right behind the resize (see `request_screens`).
                 let (full, screens) = self.replacements_for(dimensions, |_| true);
-                pending.full_others = full;
+                full_others = full;
                 self.request_screens(screens, true);
             }
         } else {
             // Its snapshot already sees the cell size it brings.
             self.sync_cell(attaching);
         }
-        self.request_snapshot("limited", Request::Attach(pending));
+        self.request_snapshot(Request::Attach(PendingAttach {
+            request,
+            resized,
+            full_others,
+        }));
     }
 
     /// Answer an attach to an exited session: its final screen, then the
     /// exit.
-    fn attach_exited(&mut self, pending: PendingAttach, snapshot: Result<Snapshot, String>) {
-        let mut session = self.info().clone();
+    fn attach_exited(&mut self, request: AttachRequest, snapshot: Result<Snapshot, String>) {
         let (exit_code, signal) = self.exit.unwrap_or((1, None));
         let exit = ServerMessage::Exit {
-            id: session.id.clone(),
+            id: self.id.clone(),
             exit_code,
             signal,
         };
-        let attached = snapshot.and_then(
-            |Snapshot {
-                 bytes,
-                 offset,
-                 size: (cols, rows),
-             }| {
-                session.cols = cols;
-                session.rows = rows;
-                attached_frame(session, offset, bytes, AttachReason::Attach)
-                    .map_err(|error| error.to_string())
-            },
-        );
-        match attached {
+        match self.replacement(snapshot, AttachReason::Attach) {
             Ok(attached) => {
-                pending.outbox.push_control(attached);
+                request.outbox.push_control(attached.frame);
                 if let Some(exit) = frame(&exit) {
-                    pending.outbox.push_control(exit);
+                    request.outbox.push_control(exit);
                 }
-                let _ = pending.ack.send(true);
+                let _ = request.ack.send(true);
             }
             Err(error) => {
-                if let Some(frame) =
-                    frame(&ServerMessage::error(error_code::SNAPSHOT_FAILED, error))
-                {
-                    pending.outbox.push_control(frame);
-                }
-                let _ = pending.ack.send(false);
+                push_error(&request.outbox, error_code::SNAPSHOT_FAILED, error);
+                let _ = request.ack.send(false);
             }
         }
     }
 
     /// The snapshot for an attach has arrived.
     fn attached(&mut self, pending: PendingAttach, snapshot: Result<Snapshot, String>) {
+        let PendingAttach {
+            request,
+            resized,
+            full_others,
+        } = pending;
         if !self.running() {
-            return self.attach_exited(pending, snapshot);
+            return self.attach_exited(request, snapshot);
         }
         // The grid the snapshot shows: the grid may have changed since it
         // was asked for.
         let shown = snapshot
             .as_ref()
             .map_or(self.size(), |snapshot| snapshot.size);
-        let PendingAttach {
+        let AttachRequest {
             lease,
             cols,
             rows,
@@ -2274,50 +2203,22 @@ impl Worker {
             abort,
             cancelled,
             ack,
-            resized,
-            full_others,
-        } = pending;
-        let mut session = self.info().clone();
-        let frames = snapshot.and_then(
-            |Snapshot {
-                 bytes,
-                 offset,
-                 size: (grid_cols, grid_rows),
-             }| {
-                session.cols = grid_cols;
-                session.rows = grid_rows;
-                let frames = || -> Result<_> {
-                    let others = (!full_others.is_empty())
-                        .then(|| {
-                            attached_frame(
-                                session.clone(),
-                                offset,
-                                bytes.clone(),
-                                AttachReason::Resize,
-                            )
-                        })
-                        .transpose()?;
-                    Ok((
-                        attached_frame(
-                            session.clone(),
-                            offset,
-                            bytes.clone(),
-                            AttachReason::Attach,
-                        )?,
-                        others,
-                    ))
-                };
-                frames().map_err(|error| error.to_string())
-            },
-        );
+        } = request;
+        let frames = self
+            .replacement(snapshot, AttachReason::Attach)
+            .and_then(|own| {
+                if full_others.is_empty() {
+                    return Ok((own.frame, None));
+                }
+                let others =
+                    Replacement::new(own.session, own.offset, own.snapshot, AttachReason::Resize)
+                        .map_err(|error| error.to_string())?;
+                Ok((own.frame, Some(others.frame)))
+            });
         let (own, others) = match frames {
             Ok(frames) => frames,
             Err(error) => {
-                if let Some(frame) =
-                    frame(&ServerMessage::error(error_code::SNAPSHOT_FAILED, error))
-                {
-                    outbox.push_control(frame);
-                }
+                push_error(&outbox, error_code::SNAPSHOT_FAILED, error);
                 if resized {
                     // Return to the size the remaining clients asked for.
                     self.schedule_grid();
@@ -2404,8 +2305,8 @@ impl Worker {
             Request::Attach(pending) => {
                 self.attached(pending, snapshot);
                 // The next attach, now that this one's grid is known.
-                while let Some(command) = self.waiting.pop_front() {
-                    self.handle(command);
+                while let Some(request) = self.waiting.pop_front() {
+                    self.attach(request);
                     if self
                         .requests
                         .values()
@@ -2425,18 +2326,14 @@ impl Worker {
                 }
             }
             Request::Replace { full, leases, .. } => {
-                let mut session = self.info().clone();
-                session.cols = size.0;
-                session.rows = size.1;
-                let frame = snapshot.and_then(|Snapshot { bytes, offset, .. }| {
-                    attached_frame(session, offset, bytes, AttachReason::Resize)
-                        .map_err(|error| error.to_string())
-                });
+                let frame = self
+                    .replacement(snapshot, AttachReason::Resize)
+                    .map(|replacement| replacement.frame);
                 self.replace(full, &leases, frame, size);
             }
             Request::Resync { leases } => {
                 self.resyncing = false;
-                let replacement = self.replacement(snapshot, size);
+                let replacement = self.replacement(snapshot, AttachReason::Resync);
                 let caught_up = replacement.is_ok();
                 self.resync(&leases, replacement, size);
                 // The grid changed while the resync was pending, and its
@@ -2447,43 +2344,39 @@ impl Worker {
                 }
             }
             Request::Final { leases } => {
-                let replacement = self.replacement(snapshot, size);
+                let replacement = self.replacement(snapshot, AttachReason::Resync);
                 self.resync(&leases, replacement, size);
                 self.announce_exit();
             }
-            Request::Detach { ack } => {
-                let _ = ack.send(());
-            }
-            Request::ClearHistory { ack } => {
-                let _ = ack.send(ClearOutcome::Failed(
-                    "the session's holder answered with a snapshot".into(),
-                ));
-            }
-            // Not a snapshot's: answered on its own (`screen_text`).
-            Request::Screen { replies, .. } => {
-                let error = ServerMessage::error(
-                    error_code::REQUEST_FAILED,
-                    "the session's holder answered with a snapshot",
+            // Not a snapshot's: a detach, a screen (answered on its own,
+            // `screen_text`) or a history clear.
+            request => {
+                let error = "the session's holder answered with a snapshot";
+                answer_unserved(
+                    request,
+                    &ServerMessage::error(error_code::REQUEST_FAILED, error),
+                    ClearOutcome::Failed(error.into()),
                 );
-                for reply in replies {
-                    let _ = reply.send(error.clone());
-                }
             }
         }
     }
 
+    /// The `Attached` frame (for `reason`) that shows a snapshot from the
+    /// holder, at the grid size it was taken at, or why there is none.
     fn replacement(
         &self,
         snapshot: Result<Snapshot, String>,
-        size: (u16, u16),
+        reason: AttachReason,
     ) -> Result<Replacement, String> {
+        let Snapshot {
+            bytes,
+            offset,
+            size: (cols, rows),
+        } = snapshot?;
         let mut session = self.info().clone();
-        session.cols = size.0;
-        session.rows = size.1;
-        snapshot.and_then(|Snapshot { bytes, offset, .. }| {
-            Replacement::new(session, offset, bytes, AttachReason::Resync)
-                .map_err(|error| error.to_string())
-        })
+        session.cols = cols;
+        session.rows = rows;
+        Replacement::new(session, offset, bytes, reason).map_err(|error| error.to_string())
     }
 
     /// The session has exited (or its holder is gone: `ended_by`).
@@ -2527,7 +2420,7 @@ impl Worker {
             .collect();
         if lagging.is_empty()
             || self
-                .request_snapshot("limited", Request::Final { leases: lagging })
+                .request_snapshot(Request::Final { leases: lagging })
                 .is_none()
         {
             self.announce_exit();
@@ -2656,14 +2549,10 @@ impl Worker {
             kind::SCREEN_REPLY => {
                 if let Ok(reply) = frame.meta::<link::ScreenReply>() {
                     if let Some(Request::Screen {
-                        scrollback,
-                        max_lines,
-                        whole,
-                        replies,
+                        max_lines, replies, ..
                     }) = self.requests.remove(&reply.req)
                     {
-                        let text =
-                            self.screen_text(reply, frame.data, (scrollback, max_lines, whole));
+                        let text = self.screen_text(reply, frame.data, max_lines);
                         for to in replies {
                             let _ = to.send(text.clone());
                         }
@@ -2845,26 +2734,15 @@ impl Worker {
         let requests = std::mem::take(&mut self.requests);
         self.resyncing = false;
         let mut final_screen = false;
+        let gone = ServerMessage::error(
+            error_code::REQUEST_FAILED,
+            "the session's holder is gone, and its screen with it",
+        );
         for request in requests.into_values() {
-            match request {
-                Request::Attach(pending) => self.waiting.push_front(pending.into_command()),
-                Request::Detach { ack } => {
-                    let _ = ack.send(());
-                }
-                Request::Screen { replies, .. } => {
-                    let error = ServerMessage::error(
-                        error_code::REQUEST_FAILED,
-                        "the session's holder is gone, and its screen with it",
-                    );
-                    for reply in replies {
-                        let _ = reply.send(error.clone());
-                    }
-                }
-                Request::ClearHistory { ack } => {
-                    let _ = ack.send(ClearOutcome::NotLinked);
-                }
-                Request::Final { .. } => final_screen = true,
-                Request::Replace { .. } | Request::Resync { .. } => {}
+            match answer_unserved(request, &gone, ClearOutcome::NotLinked) {
+                Some(Request::Attach(pending)) => self.waiting.push_front(pending.request),
+                Some(Request::Final { .. }) => final_screen = true,
+                _ => {}
             }
         }
         if self.running() {
@@ -2877,8 +2755,8 @@ impl Worker {
             self.announce_exit();
         }
         // Attaches get what is left: an empty screen and the exit.
-        while let Some(command) = self.waiting.pop_front() {
-            self.handle(command);
+        while let Some(request) = self.waiting.pop_front() {
+            self.attach(request);
         }
     }
 
@@ -2932,25 +2810,10 @@ impl Worker {
         }
         self.linked.store(false, Ordering::SeqCst);
         self.input.release(std::mem::take(&mut self.unacknowledged));
+        let removed = ServerMessage::error(error_code::UNKNOWN_SESSION, "the session was removed");
         for request in std::mem::take(&mut self.requests).into_values() {
-            match request {
-                Request::Detach { ack } => {
-                    let _ = ack.send(());
-                }
-                Request::Screen { replies, .. } => {
-                    let error = ServerMessage::error(
-                        error_code::UNKNOWN_SESSION,
-                        "the session was removed",
-                    );
-                    for reply in replies {
-                        let _ = reply.send(error.clone());
-                    }
-                }
-                Request::ClearHistory { ack } => {
-                    let _ = ack.send(ClearOutcome::Removed);
-                }
-                _ => {}
-            }
+            // The others (attaches, replacements) are dropped.
+            answer_unserved(request, &removed, ClearOutcome::Removed);
         }
         self.attached.clear();
         self.update_attached_flag();

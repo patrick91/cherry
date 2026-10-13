@@ -463,11 +463,16 @@ fn open_at(dir: &File, name: &CString, looked: &libc::stat) -> Result<File, Refu
             "cannot open the file",
         ));
     }
-    let file = unsafe { File::from_raw_fd(fd) };
+    still_the_file(unsafe { File::from_raw_fd(fd) }, identity(looked))
+}
+
+/// `file`, opened once a look at it found a regular file of identity
+/// `looked` (see `identity`), unless it is no longer that file.
+fn still_the_file(file: File, looked: (u64, u64)) -> Result<File, Refusal> {
     let opened = file
         .metadata()
         .map_err(|error| Refusal::io(&error, "cannot read the file"))?;
-    if !opened.file_type().is_file() || (opened.dev(), opened.ino()) != identity(looked) {
+    if !opened.file_type().is_file() || (opened.dev(), opened.ino()) != looked {
         return Err(Refusal::new(
             "EBADF",
             "the file changed while it was opened",
@@ -506,17 +511,7 @@ fn open_regular(path: &Path) -> Result<File, Refusal> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)
         .map_err(|error| Refusal::io(&error, "cannot open the file"))?;
-    let opened = file
-        .metadata()
-        .map_err(|error| Refusal::io(&error, "cannot read the file"))?;
-    if !opened.file_type().is_file() || (opened.dev(), opened.ino()) != (looked.dev(), looked.ino())
-    {
-        return Err(Refusal::new(
-            "EBADF",
-            "the file changed while it was opened",
-        ));
-    }
-    Ok(file)
+    still_the_file(file, (looked.dev(), looked.ino()))
 }
 
 /// The bytes to read of data `len` bytes long: where they start and how
@@ -909,13 +904,7 @@ impl Media {
                 return;
             }
             let left = job.deadline.min(until) - now;
-            let mut poll = libc::pollfd {
-                fd: self.wakeup_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let millis = left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
-            unsafe { libc::poll(&mut poll, 1, millis) };
+            signals::wait_for(self.wakeup_fd(), libc::POLLIN, Some(left));
             self.drain_wakeups();
         }
     }

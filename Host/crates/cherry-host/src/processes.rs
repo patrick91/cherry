@@ -33,20 +33,29 @@ fn session_members(leader: libc::pid_t) -> Vec<libc::pid_t> {
         .collect()
 }
 
-/// Exited processes keep their PID until reaped but can no longer run.
-pub fn is_zombie(pid: libc::pid_t) -> bool {
-    #[cfg(target_os = "macos")]
+/// What the kernel keeps of a process (`PROC_PIDTBSDINFO`); None when it
+/// cannot be read.
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
     unsafe {
         let mut info: libc::proc_bsdinfo = std::mem::zeroed();
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        libc::proc_pidinfo(
+        (libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
             0,
             (&mut info as *mut libc::proc_bsdinfo).cast(),
             size,
-        ) != size
-            || info.pbi_status == libc::SZOMB
+        ) == size)
+            .then_some(info)
+    }
+}
+
+/// Exited processes keep their PID until reaped but can no longer run.
+pub fn is_zombie(pid: libc::pid_t) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        bsd_info(pid).is_none_or(|info| info.pbi_status == libc::SZOMB)
     }
     #[cfg(target_os = "linux")]
     {
@@ -81,19 +90,9 @@ pub fn signal_session(leader: libc::pid_t, signal: libc::c_int) {
 /// when the listing is incomplete (an unreadable /proc, no descriptors
 /// left): it is unreaped, so its PID cannot belong to anyone else.
 fn signal_members(leader: libc::pid_t, members: Vec<libc::pid_t>, signal: libc::c_int) {
-    let others = members.into_iter().filter(|pid| *pid != leader);
-    for pid in others.chain([leader]) {
-        // Re-check right before signalling: a member that exited since the
-        // listing may already have a new, unrelated owner of its PID.
-        if pid == leader || unsafe { libc::getsid(pid) } == leader {
-            unsafe {
-                libc::kill(pid, signal);
-                if !matches!(signal, libc::SIGKILL | libc::SIGSTOP) {
-                    libc::kill(pid, libc::SIGCONT);
-                }
-            }
-        }
-    }
+    let others: Vec<libc::pid_t> = members.into_iter().filter(|pid| *pid != leader).collect();
+    signal_listed(leader, &others, signal);
+    send(leader, signal);
 }
 
 /// The last resort: stop every member first, so none can fork a replacement
@@ -207,12 +206,18 @@ pub fn end_abandoned_session(
 fn signal_listed(leader: libc::pid_t, members: &[libc::pid_t], signal: libc::c_int) {
     for &pid in members {
         if unsafe { libc::getsid(pid) } == leader {
-            unsafe {
-                libc::kill(pid, signal);
-                if !matches!(signal, libc::SIGKILL | libc::SIGSTOP) {
-                    libc::kill(pid, libc::SIGCONT);
-                }
-            }
+            send(pid, signal);
+        }
+    }
+}
+
+/// Send `signal` to `pid`, followed by SIGCONT (except for SIGKILL and
+/// SIGSTOP) so that a stopped process acts on it.
+fn send(pid: libc::pid_t, signal: libc::c_int) {
+    unsafe {
+        libc::kill(pid, signal);
+        if !matches!(signal, libc::SIGKILL | libc::SIGSTOP) {
+            libc::kill(pid, libc::SIGCONT);
         }
     }
 }
@@ -245,19 +250,10 @@ pub fn exited(pid: libc::pid_t) -> bool {
 /// it cannot be read.
 pub fn process_name(pid: libc::pid_t) -> String {
     #[cfg(target_os = "macos")]
-    unsafe {
-        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        if libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&mut info as *mut libc::proc_bsdinfo).cast(),
-            size,
-        ) != size
-        {
+    {
+        let Some(info) = bsd_info(pid) else {
             return String::new();
-        }
+        };
         let name = |chars: &[libc::c_char]| {
             let bytes: Vec<u8> = chars
                 .iter()

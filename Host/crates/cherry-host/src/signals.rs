@@ -1,14 +1,19 @@
 //! Event-driven wakeups. A daemon session worker sleeps until a connection
 //! or its holder has something for it (`Wake`). A holder turns SIGCHLD into
 //! a readable byte (`child_exits`), so it can sleep until its child exits
-//! instead of polling for it.
+//! instead of polling for it. Waiting for one descriptor, for a while at
+//! most, is `wait_for`.
 use std::{
     io::{self, Read, Write},
-    os::unix::{io::IntoRawFd, net::UnixStream},
+    os::unix::{
+        io::{IntoRawFd, RawFd},
+        net::UnixStream,
+    },
     sync::{
         atomic::{AtomicI32, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 /// The sending half of a worker's wake socket.
@@ -33,6 +38,23 @@ impl Wake {
 pub fn drain(receiver: &UnixStream) {
     let mut buffer = [0u8; 256];
     while (&*receiver).read(&mut buffer).is_ok_and(|n| n > 0) {}
+}
+
+/// Wait until `fd` is ready for `events` (`POLLIN`, `POLLOUT`), for at most
+/// `timeout` (a millisecond at least; None: without limit), or until a
+/// signal interrupts the wait. The caller looks again either way.
+pub fn wait_for(fd: RawFd, events: libc::c_short, timeout: Option<Duration>) {
+    let millis = timeout.map_or(-1, |timeout| {
+        timeout.as_millis().clamp(1, i32::MAX as u128) as libc::c_int
+    });
+    let mut poll = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    unsafe {
+        libc::poll(&mut poll, 1, millis);
+    }
 }
 
 static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);

@@ -1194,14 +1194,7 @@ fn refuse_over_limit(mut stream: UnixStream, limit: usize, over_limit: &mut Diag
 fn stderr_log(state: &Path) -> Option<PathBuf> {
     let path = state.join("host.log");
     let file = fs::metadata(&path).ok()?;
-    let mut stderr: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(libc::STDERR_FILENO, &mut stderr) } != 0 {
-        return None;
-    }
-    // `st_dev` is an i32 on macOS and a u64 on Linux.
-    #[allow(clippy::unnecessary_cast)]
-    let same = stderr.st_dev as u64 == file.dev() && stderr.st_ino as u64 == file.ino();
-    same.then_some(path)
+    (fd_identity(libc::STDERR_FILENO) == Some((file.dev(), file.ino()))).then_some(path)
 }
 
 /// Rate-limited diagnostics for the host log.

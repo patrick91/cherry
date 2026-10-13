@@ -5944,7 +5944,7 @@ private struct QuitCountWindowTestHost: View {
 
     session.send(text: "/bin/cat\n")
     #expect(await waitForCondition { session.hasRunningProcess() })
-    session.sendInterrupt()
+    session.sendRaw(data: Data([0x03]))
     #expect(await waitForCondition { !session.hasRunningProcess() })
     #expect(kill(helperPID, 0) == 0)
 }
@@ -9079,7 +9079,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         "\(parent.id.uuidString):0"
     ])
 
-    workspace.closeAgentPromotingChildren(parent)
+    workspace.close(parent)
 
     #expect(!workspace.sessions.contains { $0.id == parent.id })
     #expect(child.parentAgentID == nil)

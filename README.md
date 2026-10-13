@@ -458,20 +458,6 @@ Scripts/terminal-hell-test
 
 The most useful panels for background rendering bugs are `256-color and truecolor full-row backgrounds`, `Reset boundaries and inverse video`, and `Codex-style prompt paint`.
 
-To capture the actual PTY stream while reproducing a rendering bug:
-
-```bash
-CHERRY_TRACE_PTY_DIR=/tmp/cherry-traces swift run
-```
-
-Then inspect the latest trace for palette queries and background SGR:
-
-```bash
-Scripts/analyze-terminal-trace /tmp/cherry-traces/*.pty --show-erase
-```
-
-Raw traces can include terminal output and prompt text, so treat them like logs.
-
 ## Performance Stress
 
 Run the opt-in terminal stress suite:

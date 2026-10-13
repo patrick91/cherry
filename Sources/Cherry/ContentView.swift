@@ -366,7 +366,7 @@ struct ContentView: View {
 
                 Button("Close Parent Only") {
                     SessionCloseCoordinator.closeTabs([session], in: workspace, chromeState: chromeState) {
-                        workspace.closeAgentPromotingChildren(session)
+                        workspace.close(session)
                     }
                     chromeState.pendingAgentGroupCloseSessionID = nil
                     chromeState.pendingAgentGroupCloseAllowsEmptyWorkspace = false

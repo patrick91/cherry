@@ -693,7 +693,6 @@ final class ShellProcessController: @unchecked Sendable {
     private let onExit: (Int32) -> Void
     private let ioQueueIdentity = IOQueueIdentity()
     private let ioQueue = DispatchQueue(label: "Cherry.ShellProcess", qos: .userInitiated)
-    private let urgentWriteQueue = DispatchQueue(label: "Cherry.ShellProcess.UrgentWrite", qos: .userInteractive)
     private let masterFDLock = NSLock()
     private let readBufferBytes = 16 * 1024
     private let maximumReadBatchBytes = 256 * 1024
@@ -776,78 +775,6 @@ final class ShellProcessController: @unchecked Sendable {
             self.appendPendingWrite(data)
             self.flushPendingWrites()
         }
-    }
-
-    func writeUrgent(_ data: Data) {
-        guard !data.isEmpty else { return }
-
-        urgentWriteQueue.async { [self] in
-            var remaining = data
-            while !remaining.isEmpty {
-                switch directWriteToMaster(remaining, label: "urgent write") {
-                case .wrote(let byteCount):
-                    remaining.removeSubrange(0..<byteCount)
-                case .interrupted:
-                    continue
-                case .wouldBlock:
-                    write(remaining)
-                    return
-                case .closed, .failed:
-                    return
-                }
-            }
-        }
-    }
-
-    private enum DirectWriteResult {
-        case wrote(Int)
-        case interrupted
-        case wouldBlock
-        case closed
-        case failed(Int32)
-    }
-
-    private func directWriteToMaster(_ data: Data, label: String) -> DirectWriteResult {
-        masterFDLock.lock()
-        defer { masterFDLock.unlock() }
-
-        guard masterFD >= 0 else {
-            if shellTransportDebugEnabled {
-                fputs("[pty \(label) skipped] closed fd child=\(childPID)\n", stderr)
-            }
-            return .closed
-        }
-
-        let written = data.withUnsafeBytes { rawBuffer -> Int in
-            guard let baseAddress = rawBuffer.baseAddress else { return 0 }
-            return Darwin.write(masterFD, baseAddress, rawBuffer.count)
-        }
-
-        if written > 0 {
-            if shellTransportDebugEnabled {
-                let chunk = data.prefix(written)
-                let rendered = chunk.map { String(format: "%02x", $0) }.joined(separator: " ")
-                fputs("[pty \(label)] fd=\(masterFD) bytes=\(written) data=\(rendered)\n", stderr)
-            }
-            return .wrote(written)
-        }
-
-        if written == 0 {
-            return .wouldBlock
-        }
-
-        let writeError = errno
-        if writeError == EINTR {
-            return .interrupted
-        }
-        if writeError == EAGAIN || writeError == EWOULDBLOCK {
-            return .wouldBlock
-        }
-
-        if shellTransportDebugEnabled {
-            fputs("[pty \(label) error] fd=\(masterFD) errno=\(writeError)\n", stderr)
-        }
-        return .failed(writeError)
     }
 
     func resize(columns: Int, rows: Int) {

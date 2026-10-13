@@ -1155,7 +1155,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
         replayCurrentFrameForMountedGrid(force: true)
 
-        outputObserverID = session.observeRawOutput(replayExistingOutput: false) { [outputSink] data in
+        outputObserverID = session.observeRawOutput { [outputSink] data in
             outputSink.receive(data)
         }
         Self.installedOutputObserverCount += 1
@@ -3770,14 +3770,6 @@ private extension TerminalPointerStyle {
         case .operationNotAllowed:
             .operationNotAllowed
         }
-    }
-}
-
-private extension NSLock {
-    func withLock<T>(_ body: () -> T) -> T {
-        lock()
-        defer { unlock() }
-        return body()
     }
 }
 

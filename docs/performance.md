@@ -59,7 +59,6 @@ Cherry with performance counters enabled:
 ```bash
 CHERRY_TERMINAL_PERF=1 \
 CHERRY_PERF_PROJECT_ROOTS="$PWD" \
-CHERRY_TRACE_PTY_DIR=/tmp/cherry-traces \
 swift run Cherry
 ```
 

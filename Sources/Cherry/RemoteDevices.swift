@@ -612,33 +612,7 @@ final class RemoteDeviceStore: ObservableObject {
             return
         }
         guard let read = refreshLoginEnvironment(of: id) else { return }
-        await Self.wait(for: read, upTo: loginEnvironmentLaunchWait)
-    }
-
-    /// Waits for `task` to finish, at most `timeout` (the task goes on).
-    private static func wait(for task: Task<Void, Never>, upTo timeout: Duration) async {
-        let waiter = FirstResume()
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            waiter.continuation = continuation
-            Task { @MainActor in
-                await task.value
-                waiter.resume()
-            }
-            Task { @MainActor in
-                try? await Task.sleep(for: timeout)
-                waiter.resume()
-            }
-        }
-    }
-
-    @MainActor
-    private final class FirstResume {
-        var continuation: CheckedContinuation<Void, Never>?
-
-        func resume() {
-            continuation?.resume()
-            continuation = nil
-        }
+        await waitForTask(read, upTo: loginEnvironmentLaunchWait)
     }
 
     /// Reads the device's login environment over its ssh (its master when

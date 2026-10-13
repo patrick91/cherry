@@ -2307,7 +2307,7 @@ final class CherryControlServer: @unchecked Sendable {
             }
             workspace.closeAgentGroup(session, intent: .mcpClose)
         case .promoteSubAgents:
-            workspace.closeAgentPromotingChildren(session, intent: .mcpClose)
+            workspace.close(session, intent: .mcpClose)
         }
     }
 

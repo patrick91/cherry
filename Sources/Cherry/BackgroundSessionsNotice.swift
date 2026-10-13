@@ -194,21 +194,9 @@ final class BackgroundSessionsNotice {
             return HostedSessionList(hostID: hostID, sessions: control.sessions, pendingHolders: control.expectsHolders ? 1 : 0)
         }
         let peeks = peeks
-        let peek = await Self.within(deviceListTimeout) { await peeks.refresh(control) }
+        let peek = await withinTimeout(deviceListTimeout) { await peeks.refresh(control) }
         if case .listed(let list)?? = peek { return list }
         return nil
-    }
-
-    /// `work`'s answer, or nil when it takes longer than `timeout`.
-    private static func within<T: Sendable>(_ timeout: Duration, _ work: @escaping @MainActor () async -> T) async -> T? {
-        let once = ResumeOnceBox<T>()
-        return await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
-            Task { @MainActor in once.resume(continuation, with: await work()) }
-            Task { @MainActor in
-                try? await Task.sleep(for: timeout)
-                once.resume(continuation, with: nil)
-            }
-        }
     }
 
     private func checked(_ content: Content?) {
@@ -336,17 +324,5 @@ final class BackgroundSessionsNotice {
             message: from + (named.map { " (\($0))" } ?? "") + ". " + whereTo,
             sessionIDs: sessions.map(\.id)
         )
-    }
-}
-
-/// Resumes a continuation once, whichever answer comes first.
-@MainActor
-private final class ResumeOnceBox<T: Sendable> {
-    private var resumed = false
-
-    func resume(_ continuation: CheckedContinuation<T?, Never>, with value: T?) {
-        guard !resumed else { return }
-        resumed = true
-        continuation.resume(returning: value)
     }
 }

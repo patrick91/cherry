@@ -173,10 +173,92 @@ pub fn resolve_cwd(cwd: &str) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-/// Mark every descriptor above stderr close-on-exec. Async-signal-safe, for
-/// use between fork and exec.
-pub fn cloexec_from_3() {
-    cloexec_from_3_below(None);
+/// What `cloexec_from_3` needs in a forked child, where nothing may
+/// allocate: on macOS, room for the kernel's list of the open descriptors.
+/// Make it before the fork.
+pub struct FdList {
+    #[cfg(target_os = "macos")]
+    entries: Vec<libc::proc_fdinfo>,
+}
+
+impl FdList {
+    pub fn before_fork() -> FdList {
+        #[cfg(target_os = "macos")]
+        {
+            // Room for this process's descriptor table and as much again:
+            // other threads can open descriptors until the fork, and the
+            // table grows by doubling.
+            let entry = std::mem::size_of::<libc::proc_fdinfo>();
+            let needed = unsafe {
+                libc::proc_pidinfo(
+                    libc::getpid(),
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            let count = (needed.max(0) as usize / entry * 2).clamp(256, 1 << 17);
+            let empty = libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0,
+            };
+            FdList {
+                entries: vec![empty; count],
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        FdList {}
+    }
+
+    /// Mark every descriptor above stderr close-on-exec. Async-signal-safe,
+    /// for use between fork and exec.
+    pub fn cloexec_from_3(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.cloexec_listed() {
+                return;
+            }
+        }
+        cloexec_from_3_below(None);
+    }
+
+    /// `cloexec_from_3` for the descriptors the kernel lists as open
+    /// (`proc_pidinfo`, which only copies into the room made before the
+    /// fork): a few calls rather than one per descriptor the limit allows,
+    /// which can be a million. False when the list may not have fit.
+    #[cfg(target_os = "macos")]
+    fn cloexec_listed(&mut self) -> bool {
+        let entry = std::mem::size_of::<libc::proc_fdinfo>();
+        let room = (self.entries.len() * entry) as libc::c_int;
+        let pid = unsafe { libc::getpid() };
+        // A listing may stop where the room ends without saying so (older
+        // kernels list by index), so the room must hold what the kernel
+        // says the whole table needs. With one thread left, it cannot grow.
+        let needed =
+            unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        if needed <= 0 || needed > room {
+            return false;
+        }
+        let used = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                self.entries.as_mut_ptr().cast(),
+                room,
+            )
+        };
+        if used <= 0 || used >= room {
+            return false;
+        }
+        for info in &self.entries[..used as usize / entry] {
+            if info.proc_fd > 2 {
+                mark_cloexec(info.proc_fd);
+            }
+        }
+        true
+    }
 }
 
 /// One past the highest open descriptor, from `/dev/fd`. Only a process
@@ -197,9 +279,9 @@ pub fn open_fd_end() -> Option<libc::c_int> {
         .map(|fd| fd + 1)
 }
 
-/// `cloexec_from_3`, looking no further than `end` (see `open_fd_end`)
-/// where there is no faster way than a descriptor at a time: macOS, whose
-/// descriptor limit can be a million.
+/// `FdList::cloexec_from_3` without a list, looking no further than `end`
+/// (see `open_fd_end`) where there is no faster way than a descriptor at a
+/// time: macOS, whose descriptor limit can be a million.
 pub fn cloexec_from_3_below(end: Option<libc::c_int>) {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -221,11 +303,16 @@ pub fn cloexec_from_3_below(end: Option<libc::c_int>) {
     };
     let max = end.map_or(max, |end| end.min(max));
     for fd in 3..max {
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
-                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-            }
+        mark_cloexec(fd);
+    }
+}
+
+/// Set close-on-exec on `fd` if it is open. Async-signal-safe.
+fn mark_cloexec(fd: libc::c_int) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
         }
     }
 }
@@ -256,6 +343,85 @@ mod tests {
         let file = std::fs::File::open("/dev/null").unwrap();
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
         assert!(open_fd_end().unwrap() > fd);
+    }
+
+    /// A copy of /dev/null at a high descriptor, close-on-exec here so that
+    /// no other test's child inherits it.
+    fn high_descriptor() -> libc::c_int {
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let at = (limit.rlim_cur.min(5000) - 1) as libc::c_int;
+        let fd = unsafe {
+            libc::fcntl(
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                libc::F_DUPFD_CLOEXEC,
+                at,
+            )
+        };
+        assert!(fd >= at, "{}", std::io::Error::last_os_error());
+        fd
+    }
+
+    /// Whether a forked child, where `fd` is not close-on-exec, has `mark`
+    /// make it close-on-exec, leaving stdin, stdout and stderr as they were.
+    fn marked_in_child(fd: libc::c_int, mut mark: impl FnMut() -> bool) -> bool {
+        unsafe {
+            match libc::fork() {
+                -1 => panic!("fork: {}", std::io::Error::last_os_error()),
+                0 => {
+                    let before = [0, 1, 2].map(|fd| libc::fcntl(fd, libc::F_GETFD));
+                    libc::fcntl(fd, libc::F_SETFD, 0);
+                    let ran = mark();
+                    let marked = libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0;
+                    let kept = [0, 1, 2].map(|fd| libc::fcntl(fd, libc::F_GETFD)) == before;
+                    libc::_exit(if ran && marked && kept { 0 } else { 1 });
+                }
+                child => {
+                    let mut status = 0;
+                    assert_eq!(libc::waitpid(child, &mut status, 0), child);
+                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_forked_child_marks_the_open_descriptors_close_on_exec() {
+        let fd = high_descriptor();
+        let mut fds = FdList::before_fork();
+        #[cfg(target_os = "macos")]
+        assert!(marked_in_child(fd, || fds.cloexec_listed()));
+        assert!(marked_in_child(fd, || {
+            fds.cloexec_from_3();
+            true
+        }));
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn descriptors_opened_after_the_list_was_made_are_marked_too() {
+        // Another thread can open one between `before_fork` and the fork.
+        let mut fds = FdList::before_fork();
+        let fd = high_descriptor();
+        assert!(marked_in_child(fd, || {
+            fds.cloexec_from_3();
+            true
+        }));
+        // A list the table may not fit in is not trusted: the scan marks it.
+        #[cfg(target_os = "macos")]
+        {
+            fds.entries.truncate(1);
+            assert!(marked_in_child(fd, || {
+                let listed = fds.cloexec_listed();
+                fds.cloexec_from_3();
+                !listed
+            }));
+        }
+        unsafe { libc::close(fd) };
     }
 
     #[test]

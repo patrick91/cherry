@@ -257,12 +257,13 @@ pub fn start(path: &Path) -> Result<()> {
     if let Some(build) = std::env::var_os("CHERRY_HOST_TEST_SERVE_BUILD") {
         command.env("CHERRY_HOST_TEST_BUILD", build);
     }
+    let mut fds = environment::FdList::before_fork();
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
-            environment::cloexec_from_3();
+            fds.cloexec_from_3();
             Ok(())
         });
     }

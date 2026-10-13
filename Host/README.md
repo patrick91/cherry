@@ -23,9 +23,10 @@ install -d "$HOME/.local/bin"
 install -m 755 Host/target/release/cherry Host/target/release/cherry-host "$HOME/.local/bin/"
 ```
 
-The build requires Rust/Cargo, a C/C++ toolchain, Git, curl, tar, and network
-access for dependencies. On macOS, install the Xcode command-line tools; on
-Debian/Ubuntu, install `build-essential git curl xz-utils`. The VT build script
+The build requires Rust/Cargo 1.85 or later (the workspace's `rust-version`), a
+C/C++ toolchain, Git, curl, tar, and network access for dependencies. On macOS,
+install the Xcode command-line tools; on Debian/Ubuntu, install
+`build-essential git curl xz-utils`. The VT build script
 downloads checksum-pinned Zig 0.16.0 and builds a pinned Ghostty revision as a
 ReleaseSafe library. See [the VT dependency notes](vendor/ghostty-vt/README.md)
 for revision, stamp, and toolchain overrides. `Scripts/build-host-vt` accepts a
@@ -68,7 +69,7 @@ interactive shell's PATH may differ. Verify it with
 
 The supported build targets are macOS arm64/x86_64 and GNU Linux arm64/x86_64.
 Linux tests run natively in a Debian 12 container (`Scripts/test-host-linux`),
-and CI is configured for Ubuntu 22.04 x86_64 and 24.04 arm64. The Ghostty
+and CI is configured for Ubuntu 24.04 x86_64 and arm64. The Ghostty
 archive is built with a glibc 2.31 target, but this is
 **not a verified glibc floor for the complete Rust binaries**. Build on your
 deployment distribution or validate an archive there. Musl Linux and Windows
@@ -2056,7 +2057,9 @@ progress, and after `Detach` it sends no `Resize` or `Ping`.
 ```sh
 Scripts/build-host-vt
 cargo fmt --manifest-path Host/Cargo.toml --all -- --check
+Scripts/host-notices --check
 cargo clippy --manifest-path Host/Cargo.toml --locked --workspace --all-targets -- -D warnings
+cargo +1.85.0 check --manifest-path Host/Cargo.toml --locked --workspace --all-targets
 cargo test --manifest-path Host/Cargo.toml --locked --workspace -- --test-threads=1
 cargo build --manifest-path Host/Cargo.toml --locked --bins
 cargo test --manifest-path Host/Cargo.toml --locked -p cherry-cli --test real_host -- --ignored --test-threads=1
@@ -2215,7 +2218,8 @@ then shuts its daemon down and kills any `cherry-host serve` or `hold` still
 using its socket.
 
 Two GitHub workflows are configured. `host.yml` runs the Rust commands above on
-macOS 15 arm64, Ubuntu 22.04 x86_64, and Ubuntu 24.04 arm64, plus a job that
+macOS 15 arm64, Ubuntu 24.04 x86_64, and Ubuntu 24.04 arm64 (the Rust 1.85
+check, the workspace's `rust-version`, on Ubuntu x86_64 only), plus a job that
 runs `Scripts/test-host-ssh`. `app.yml`, on macOS 26, builds the Rust helpers
 (`Scripts/build-host debug`), runs `python3 Scripts/test_cherry_private_host.py`
 (the teardown the GUI test scripts use), builds the Swift tests, and then
@@ -2224,4 +2228,7 @@ runs `Scripts/test-session-suites --skip-build unit` and
 library keyed on `Scripts/build-host-vt`. Configuring a workflow does not
 establish that it has passed. Dependency notices are in
 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) and
-[vendor/ghostty-vt](vendor/ghostty-vt/README.md).
+[vendor/ghostty-vt](vendor/ghostty-vt/README.md). After a `Cargo.lock` change,
+`Scripts/host-notices --write` regenerates the first from the crates the
+workspace builds on macOS and Linux; `--check`, which `host.yml` runs, fails
+while it is stale.

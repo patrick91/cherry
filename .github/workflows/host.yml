@@ -29,27 +29,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-22.04, ubuntu-24.04-arm]
+        # The ssh job's Debian 12 container (Scripts/test-host-linux) covers
+        # an older Linux userland than these runners.
+        os: [macos-15, ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust and the pinned Ghostty VT library
         uses: ./.github/actions/host-toolchain
-      # apt's Neovim (0.6 on 22.04, 0.9 on 24.04) predates the terminal
-      # queries current Neovim sends at startup. Keep the version and digests
-      # in sync with Host/tests/Dockerfile.
+      # apt's Neovim (0.9 on 24.04) predates the terminal queries current
+      # Neovim sends at startup. Keep the version and digests in sync with
+      # Host/tests/Dockerfile.
       - name: Install Neovim on Linux
         if: runner.os == 'Linux'
         run: |
           case "$(uname -m)" in
-            x86_64) arch=x86_64; digest=bce0f56eda1f1b1db6eee8f4133d7a38813ea07933837dd1777411ca384c6875 ;;
-            aarch64) arch=arm64; digest=1aa5ca085249580ae0f91eb14f27ec0919773ff2d99a163d03f3d6c21ac29725 ;;
+            x86_64) arch=x86_64; digest=474430d53e6264f6d6dd18db42d6dc9df3a1b56ca9e88a325bbf860e1a811d87 ;;
+            aarch64) arch=arm64; digest=8f1f64a0bdb97247034038c3823c6cbad5bdf9ecd5751b85494b71c3ee04c815 ;;
             *) echo "No pinned Neovim build for $(uname -m)" >&2; exit 1 ;;
           esac
           archive="$RUNNER_TEMP/nvim.tar.gz"
           curl -fsSL --retry 3 -o "$archive" \
-            "https://github.com/neovim/neovim/releases/download/v0.12.5/nvim-linux-$arch.tar.gz"
+            "https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-linux-$arch.tar.gz"
           echo "$digest  $archive" | sha256sum -c -
           sudo mkdir -p /opt/nvim
           sudo tar -xzf "$archive" -C /opt/nvim --strip-components=1
@@ -59,8 +61,19 @@ jobs:
         run: brew list --versions neovim || brew install neovim
       - name: Check formatting
         run: cargo fmt --manifest-path Host/Cargo.toml --all -- --check
+      # Host/THIRD_PARTY_NOTICES.txt ships with the helpers: it must name
+      # every crate Cargo.lock builds (Scripts/host-notices --write).
+      - name: Check the dependency notices
+        run: Scripts/host-notices --check
       - name: Lint
         run: cargo clippy --manifest-path Host/Cargo.toml --locked --workspace --all-targets -- -D warnings
+      # Host/Cargo.toml's rust-version, which resolver 3 makes `cargo update`
+      # respect, must still build the workspace. Keep the two in step.
+      - name: Check the minimum supported Rust version
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          cargo +1.85.0 check --manifest-path Host/Cargo.toml --locked --workspace --all-targets
       - name: Test
         run: cargo test --manifest-path Host/Cargo.toml --locked --workspace -- --test-threads=1
       - name: Build host and client
@@ -81,7 +94,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust and the pinned Ghostty VT library
         uses: ./.github/actions/host-toolchain
       - name: Test through SSH

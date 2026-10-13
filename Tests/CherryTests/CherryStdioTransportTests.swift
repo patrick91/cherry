@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import MCP
 import Testing
 
 @testable import CherryMCP
@@ -56,6 +57,79 @@ struct CherryStdioTransportTests {
         #expect(sent == #"{"id":1}"#.data(using: .utf8)! + Data([0x0A]))
         await transport.disconnect()
     }
+
+    @Test func toolListResponseIsTheServersResponse() async throws {
+        let inputPipe = try TestPipe()
+        let outputPipe = try TestPipe()
+        defer {
+            inputPipe.close()
+            outputPipe.close()
+        }
+
+        let server = Server(name: "cherry", version: "test", capabilities: .init(tools: .init(listChanged: false)))
+        await server.withMethodHandler(ListTools.self) { _ in
+            ListTools.Result(tools: CherryMCPTools.all)
+        }
+        try await server.start(transport: CherryStdioTransport(
+            inputFileDescriptor: inputPipe.read,
+            outputFileDescriptor: outputPipe.write
+        ))
+
+        for request in [
+            #"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#,
+            #"{"jsonrpc":"2.0","id":"list/1","method":"tools/list","params":{"cursor":"next"}}"#,
+        ] {
+            try inputPipe.write(Data(request.utf8) + Data([0x0A]))
+            let fromServer = try outputPipe.readLine(timeoutMilliseconds: 5_000)
+            let cached = try #require(CherryMCPTools.listResponse(answering: Data(request.utf8)))
+            #expect(try JSONDecoder().decode(Value.self, from: cached) == JSONDecoder().decode(Value.self, from: fromServer))
+        }
+        await server.stop()
+    }
+
+    @Test func toolListTransportAnswersToolsListAndPassesOtherMessagesOn() async throws {
+        let inputPipe = try TestPipe()
+        let outputPipe = try TestPipe()
+        defer {
+            inputPipe.close()
+            outputPipe.close()
+        }
+
+        let transport = CherryMCPToolListTransport(base: CherryStdioTransport(
+            inputFileDescriptor: inputPipe.read,
+            outputFileDescriptor: outputPipe.write
+        ))
+        try await transport.connect()
+
+        let stream = await transport.receive()
+        let receiveTask = Task { () throws -> [Data] in
+            var received: [Data] = []
+            for try await message in stream {
+                received.append(message)
+                if received.count == 4 { break }
+            }
+            return received
+        }
+
+        let passedOn = [
+            #"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            #"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_process_input","arguments":{"text":"tools/list"}}}"#,
+            #"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":"not parameters"}"#,
+            #"[{"jsonrpc":"2.0","id":4,"method":"tools/list"}]"#,
+        ]
+        let messages = [passedOn[0], passedOn[1], #"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#, passedOn[2], passedOn[3]]
+        try inputPipe.write(Data(messages.joined(separator: "\n").utf8) + Data([0x0A]))
+
+        let response = try JSONDecoder().decode(Value.self, from: outputPipe.readLine(timeoutMilliseconds: 5_000))
+        #expect(response.objectValue?["id"] == .string("a"))
+        #expect(response.objectValue?["result"]?.objectValue?["tools"]?.arrayValue?.count == CherryMCPTools.all.count)
+
+        let received = try await withTimeout(.seconds(5)) {
+            try await receiveTask.value
+        }
+        #expect(received == passedOn.map { Data($0.utf8) })
+        await transport.disconnect()
+    }
 }
 
 private struct TestPipe {
@@ -104,6 +178,21 @@ private struct TestPipe {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         return Data(buffer.prefix(count))
+    }
+
+    /// Reads until a newline and returns the line without it.
+    func readLine(timeoutMilliseconds: Int32) throws -> Data {
+        var line = Data()
+        while true {
+            let chunk = try readAvailable(timeoutMilliseconds: timeoutMilliseconds)
+            guard !chunk.isEmpty else {
+                throw POSIXError(.EPIPE)
+            }
+            line.append(chunk)
+            if let newline = line.firstIndex(of: 0x0A) {
+                return line[..<newline]
+            }
+        }
     }
 
     func close() {

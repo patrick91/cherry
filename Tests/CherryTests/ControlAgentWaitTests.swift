@@ -6,10 +6,10 @@ import MCP
 import Testing
 @testable import Cherry
 
-/// A control server on a private socket with one host-managed workspace,
-/// for the agent wait tests (and ControlActivityTests): agents run
-/// `/bin/cat` (screens are injected with `ingestTestingData`) or a fake
-/// agent script.
+/// A control server on a private socket with one workspace, host-managed
+/// unless a test asks for native tabs, for the agent wait tests (and
+/// ControlActivityTests): agents run `/bin/cat` (screens are injected with
+/// `ingestTestingData`) or a fake agent script.
 @MainActor
 final class ControlAgentWaitHarness {
     let defaultsName: String
@@ -20,7 +20,7 @@ final class ControlAgentWaitHarness {
     let socketURL: URL
     let server: CherryControlServer
 
-    init() throws {
+    init(launchBackend: TerminalSessionLaunchBackend = .hostManaged) throws {
         defaultsName = "CherryTests.ControlAgentWait.\(UUID().uuidString)"
         defaults = try #require(UserDefaults(suiteName: defaultsName))
         projectRoot = FileManager.default.temporaryDirectory
@@ -33,7 +33,7 @@ final class ControlAgentWaitHarness {
         socketURL = socketDirectory.appendingPathComponent("control.sock")
         settings = AgentSettings(defaults: defaults)
         _ = settings.addProject(path: projectRoot.path)
-        workspace = TerminalWorkspace(projectRoot: projectRoot.path, launchBackend: .hostManaged)
+        workspace = TerminalWorkspace(projectRoot: projectRoot.path, launchBackend: launchBackend)
         server = CherryControlServer(
             workspace: workspace,
             socketURL: socketURL,
@@ -50,6 +50,19 @@ final class ControlAgentWaitHarness {
             throw CherryControlError(code: "spawn_failed", message: "Expected spawnProcess result, got \(String(describing: response))")
         }
         return try #require(workspace.session(id: spawned.process.id))
+    }
+
+    /// Starts `script` as the project command `name`; returns its process id.
+    func startScript(named name: String, _ script: String) async throws -> String {
+        let scriptURL = projectRoot.appendingPathComponent("\(name).sh")
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        chmod(scriptURL.path, 0o755)
+        try settings.upsertCommand(ProjectCommandDefinition(name: name, command: scriptURL.path), for: projectRoot.path)
+        let response = try await send(.startProcess(.init(processName: name, kind: "command")))
+        guard case .startProcess(let started)? = response.result else {
+            throw CherryControlError(code: "start_failed", message: "Expected startProcess result, got \(String(describing: response))")
+        }
+        return started.process.id
     }
 
     /// A fake agent CLI that reports its status as Claude Code does

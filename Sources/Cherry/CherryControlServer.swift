@@ -1191,7 +1191,8 @@ final class CherryControlServer: @unchecked Sendable {
                     state: session.state.label,
                     selected: workspace.selectedSessionID == session.id,
                     workingDirectory: session.workingDirectory,
-                    lineCount: session.lineCount,
+                    // Cheap, non-refreshing line count, as process listings.
+                    lineCount: session.listingLineCount,
                     link: link(for: session, workspace: workspace),
                     kind: session.kind.rawValue,
                     agentName: session.agentName,
@@ -1872,6 +1873,11 @@ final class CherryControlServer: @unchecked Sendable {
             // line numbers) comes from the whole history.
             await session.refreshContentFromHostIfNeeded()
             let output = terminalOutput(for: session, startLine: nil, lineLimit: request.lineLimit)
+            // Reading the output can note output the loop had not read yet.
+            observedNewOutput = observedNewOutput || ProcessIdleDetector.observedNewOutput(
+                currentOutputVersion: session.outputVersion,
+                sinceOutputVersion: sinceOutputVersion
+            )
             return WaitForProcessIdleResult(
                 process: processInfo(for: session, workspace: sessionWorkspace),
                 reason: reason,
@@ -1894,9 +1900,15 @@ final class CherryControlServer: @unchecked Sendable {
                 return await result(reason: .closed)
             }
             // Polls every 50 ms; the host's screen (its last lines only) is
-            // read at most once per `hostContentPollInterval`.
+            // read at most once per `hostContentPollInterval`, a surface's
+            // whole text when its visible screen changed (and every 0.5 s).
+            // A reported `working` never ends the wait, so its screen is then
+            // read only every 0.5 s.
             await session.refreshContentFromHostIfNeeded(maximumAge: session.hostContentPollInterval, recentOnly: true)
-            _ = session.lineCount
+            session.watchContentForChanges(
+                periodicallyOnly: session.kind == .agent && session.reportsProgramStatus
+                    && session.agentActivityState == .working
+            )
             observedNewOutput = observedNewOutput || ProcessIdleDetector.observedNewOutput(
                 currentOutputVersion: session.outputVersion,
                 sinceOutputVersion: sinceOutputVersion
@@ -1934,7 +1946,8 @@ final class CherryControlServer: @unchecked Sendable {
                     // Reported a moment after the message, `working` starts
                     // the turn: idle counts once it did, or after the start
                     // grace, and once its last output was drawn.
-                    if contentIsQuiet, Self.agentTurnMayHaveEnded(session, now: now) {
+                    if contentIsQuiet, Self.agentTurnMayHaveEnded(session, now: now),
+                       session.contentStayedUnchanged() {
                         return await result(reason: .idle)
                     }
                 case .working, .unknown:
@@ -1953,7 +1966,9 @@ final class CherryControlServer: @unchecked Sendable {
                 quietMilliseconds: quietMilliseconds,
                 requireNewOutput: requireNewOutput,
                 observedNewOutput: observedNewOutput
-            ) {
+            ), session.contentStayedUnchanged() {
+                // Quiet as far as the loop read: output its reads could not
+                // see (`watchContentForChanges`) keeps the wait going.
                 return await result(reason: .idle)
             }
 

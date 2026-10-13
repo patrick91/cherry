@@ -3727,6 +3727,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     // from `ghostty_surface_read_text` on a debounced render signal.
     private static let nativeContentDebounceInterval: TimeInterval = 0.12
     private static let nativeContentReadThrottle: TimeInterval = 0.05
+    /// How often `watchContentForChanges` reads the whole text when the
+    /// visible screen shows no change.
+    private static let nativeContentWatchReadInterval: TimeInterval = 0.5
     private var nativeContentLines: [String] = []
     /// The lines a tab closed because its shell exited showed last
     /// (`keepContentAfterClosing`): what a caller still holding it (MCP
@@ -3736,6 +3739,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var nativeContentHash = 0
     private var nativeContentRefreshScheduled = false
     private var lastNativeContentReadAt: Date?
+    /// The visible screen's hash when `watchContentForChanges` last read
+    /// the whole text.
+    private var watchedViewportHash: Int?
     /// Unit/integration fixtures can inject a deterministic VT stream even when
     /// the session owns a live native surface. Once injected, data-layer reads use
     /// the processor snapshot and ignore unrelated shell redraws for that fixture.
@@ -7504,6 +7510,50 @@ final class TerminalSession: ObservableObject, Identifiable {
             return
         }
         refreshNativeContentNow()
+    }
+
+    /// For a loop that watches the tab for new output every 50 ms (MCP
+    /// `wait_for_process_idle`): advances the output and content counters
+    /// as `lineCount` does, without reading a native surface's whole text
+    /// (about a millisecond for a long history) on every pass. A tab no
+    /// window shows gets no render signal, so a change shows only in what
+    /// is read: its visible screen (the surface's `readViewportText`,
+    /// microseconds) is read first, and the whole text only when that
+    /// changed since the loop's last read, or once that read is older than
+    /// `nativeContentWatchReadInterval` (output the visible screen does not
+    /// show: the tab is scrolled back, or a program repeats the same lines).
+    /// `periodicallyOnly`: the loop does not wait on the screen now (an
+    /// agent that reports working): the whole text is read only that often.
+    /// A loop calls `contentStayedUnchanged` before it calls the tab quiet.
+    func watchContentForChanges(periodicallyOnly: Bool = false) {
+        guard let bridge = ghosttyBridgeStorage, bridge.isNativePTYBacked, !usesInjectedTestingContent,
+              !readsContentFromHost, closedTabContentLines == nil
+        else {
+            _ = contentLineCount()
+            return
+        }
+        let now = Date()
+        let readAge = lastNativeContentReadAt.map { now.timeIntervalSince($0) }
+        if let readAge, readAge < Self.nativeContentReadThrottle { return }
+        let readIsDue = readAge.map { $0 >= Self.nativeContentWatchReadInterval } ?? true
+        if periodicallyOnly {
+            if readIsDue { refreshNativeContentNow() }
+            return
+        }
+        let viewportHash = bridge.terminalView.readViewportText().map { TerminalScreenText.contentHash(of: $0) }
+        if let viewportHash, viewportHash == watchedViewportHash, !readIsDue { return }
+        watchedViewportHash = viewportHash
+        refreshNativeContentNow()
+    }
+
+    /// Reads a native surface's whole text unless it was read moments ago
+    /// (`nativeContentReadThrottle`): what a loop that watched the tab with
+    /// `watchContentForChanges` does before it calls the tab quiet. False
+    /// when the text changed (new output, noted now).
+    func contentStayedUnchanged() -> Bool {
+        let version = outputVersion
+        _ = contentLineCount()
+        return outputVersion == version
     }
 
     /// Pulls the surface scrollback and, if it changed, rebuilds the native line

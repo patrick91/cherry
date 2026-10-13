@@ -1165,8 +1165,8 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func cherryControlRequestRoundTrips() async throws {
-    let request = CherryControlRequest.sendInput(.init(
-        terminalID: UUID().uuidString,
+    let request = CherryControlRequest.sendProcessInput(.init(
+        processID: UUID().uuidString,
         text: "pwd\n",
         rawBase64: nil,
         waitMilliseconds: 100,
@@ -1246,39 +1246,6 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(throws: CherryControlError(code: "invalid_deep_link_kind", message: "Cherry link kind must be note, todo, or terminal.")) {
         try CherryDeepLink.parse("cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/project/\(noteID.uuidString)")
     }
-}
-
-@Test func cherryControlRunAgentRequestRoundTrips() async throws {
-    let parentAgentID = UUID().uuidString
-    let request = CherryControlRequest.runAgent(.init(
-        agentName: "Codex",
-        model: "gpt-5.4-mini",
-        title: "Review workflow",
-        text: "status\n",
-        rawBase64: nil,
-        waitMilliseconds: 100,
-        lineLimit: 20,
-        submit: true,
-        parentAgentID: parentAgentID,
-        select: true
-    ))
-
-    let data = try JSONEncoder().encode(request)
-    let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
-
-    #expect(decoded == request)
-}
-
-@Test func cherryControlRenameTerminalRequestRoundTrips() async throws {
-    let request = CherryControlRequest.renameTerminal(.init(
-        terminalID: UUID().uuidString,
-        title: "API migration"
-    ))
-
-    let data = try JSONEncoder().encode(request)
-    let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
-
-    #expect(decoded == request)
 }
 
 @Test func cherryControlNoteRequestsRoundTrip() async throws {
@@ -1918,28 +1885,28 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let response = try await harness.send(.runAgent(.init(
-        agentName: " echo ",
+    let response = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: " echo ",
         text: "agent-input\n",
         waitMilliseconds: 250,
-        lineLimit: 20,
-        select: false
+        lineLimit: 20
     )))
 
-    guard case .runAgent(let result)? = response.result else {
-        Issue.record("Expected runAgent result, got \(String(describing: response))")
+    guard case .spawnProcess(let result)? = response.result else {
+        Issue.record("Expected spawnProcess result, got \(String(describing: response))")
         return
     }
 
     #expect(response.error == nil)
-    #expect(result.projectRoot == harness.projectRoot.path)
-    #expect(result.kind == "agent")
-    #expect(result.agentName == "Echo")
-    #expect(result.title == "Echo")
+    #expect(harness.workspace.session(id: result.process.id)?.projectRoot == harness.projectRoot.path)
+    #expect(result.process.kind == "agent")
+    #expect(result.process.agentName == "Echo")
+    #expect(harness.workspace.session(id: result.process.id)?.title == "Echo")
     #expect(result.sentBytes == Data("agent-input\n".utf8).count)
     #expect(result.output?.lines.joined(separator: "\n").contains("agent-input") == true)
     #expect(harness.workspace.agentSessions.count == 1)
-    #expect(harness.workspace.selectedSessionID != UUID(uuidString: result.terminalID))
+    #expect(harness.workspace.selectedSessionID != UUID(uuidString: result.process.id))
 }
 
 @MainActor
@@ -2034,15 +2001,16 @@ private struct MCPWhoamiPayload: Decodable {
     )))
     #expect(terminalResponse.error?.code == "invalid_process_request")
 
-    let emptyResponse = try await harness.send(.runAgent(.init(
-        agentName: "Custom",
+    let emptyResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Custom",
         model: "  "
     )))
     #expect(emptyResponse.error?.code == "invalid_model")
 }
 
 @MainActor
-@Test func controlServerRunAgentSubmitsPlainTextPromptByDefault() async throws {
+@Test func controlServerSpawnedAgentSubmitsPlainTextPromptByDefault() async throws {
     let harness = try ControlServerHarness()
     defer {
         harness.stop()
@@ -2051,15 +2019,16 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let response = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
+    let response = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
         text: "agent-input",
         waitMilliseconds: 250,
         lineLimit: 20
     )))
 
-    guard case .runAgent(let result)? = response.result else {
-        Issue.record("Expected runAgent result, got \(String(describing: response))")
+    guard case .spawnProcess(let result)? = response.result else {
+        Issue.record("Expected spawnProcess result, got \(String(describing: response))")
         return
     }
 
@@ -2094,15 +2063,16 @@ private struct MCPWhoamiPayload: Decodable {
     ))
     harness.server.start()
 
-    let response = try await harness.send(.runAgent(.init(
-        agentName: "Codex",
+    let response = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Codex",
         text: "delayed prompt",
         waitMilliseconds: 2_500,
         lineLimit: 20
     )))
 
-    guard case .runAgent(let result)? = response.result else {
-        Issue.record("Expected runAgent result, got \(String(describing: response))")
+    guard case .spawnProcess(let result)? = response.result else {
+        Issue.record("Expected spawnProcess result, got \(String(describing: response))")
         return
     }
 
@@ -2123,62 +2093,65 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let parentResponse = try await harness.send(.runAgent(.init(agentName: "Echo")))
-    guard case .runAgent(let parent)? = parentResponse.result,
-          let parentID = UUID(uuidString: parent.terminalID)
+    let parentResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
+    guard case .spawnProcess(let parent)? = parentResponse.result,
+          let parentID = UUID(uuidString: parent.process.id)
     else {
-        Issue.record("Expected parent runAgent result, got \(String(describing: parentResponse))")
+        Issue.record("Expected parent spawnProcess result, got \(String(describing: parentResponse))")
         return
     }
 
-    let childResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        parentAgentID: parent.terminalID
+    let childResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
+        parentAgentID: parent.process.id
     )))
-    guard case .runAgent(let child)? = childResponse.result,
-          let childID = UUID(uuidString: child.terminalID)
+    guard case .spawnProcess(let child)? = childResponse.result,
+          let childID = UUID(uuidString: child.process.id)
     else {
-        Issue.record("Expected child runAgent result, got \(String(describing: childResponse))")
+        Issue.record("Expected child spawnProcess result, got \(String(describing: childResponse))")
         return
     }
 
-    #expect(child.parentAgentID == parent.terminalID)
-    #expect(child.childAgentCount == 0)
-    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == parentID)
+    #expect(child.process.parentAgentID == parent.process.id)
+    #expect(child.process.childAgentCount == 0)
+    #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == parentID)
 
-    let nestedChildResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        parentAgentID: child.terminalID
+    let nestedChildResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
+        parentAgentID: child.process.id
     )))
-    guard case .runAgent(let nestedChild)? = nestedChildResponse.result,
-          let nestedChildID = UUID(uuidString: nestedChild.terminalID)
+    guard case .spawnProcess(let nestedChild)? = nestedChildResponse.result,
+          let nestedChildID = UUID(uuidString: nestedChild.process.id)
     else {
-        Issue.record("Expected nested child runAgent result, got \(String(describing: nestedChildResponse))")
+        Issue.record("Expected nested child spawnProcess result, got \(String(describing: nestedChildResponse))")
         return
     }
 
-    #expect(nestedChild.parentAgentID == parent.terminalID)
-    #expect(harness.workspace.session(id: nestedChild.terminalID)?.parentAgentID == parentID)
+    #expect(nestedChild.process.parentAgentID == parent.process.id)
+    #expect(harness.workspace.session(id: nestedChild.process.id)?.parentAgentID == parentID)
 
-    let parentStatusResponse = try await harness.send(.getProcessStatus(.init(processID: parent.terminalID)))
+    let parentStatusResponse = try await harness.send(.getProcessStatus(.init(processID: parent.process.id)))
     guard case .getProcessStatus(let parentStatus)? = parentStatusResponse.result else {
         Issue.record("Expected parent process status, got \(String(describing: parentStatusResponse))")
         return
     }
     #expect(parentStatus.process.childAgentCount == 2)
 
-    let rejectCloseResponse = try await harness.send(.closeProcess(.init(processID: parent.terminalID)))
+    let rejectCloseResponse = try await harness.send(.closeProcess(.init(processID: parent.process.id)))
     #expect(rejectCloseResponse.error?.code == "agent_has_sub_agents")
 
     let terminalID = try #require(harness.workspace.terminalSessions.first?.id.uuidString)
-    let invalidParentResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
+    let invalidParentResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
         parentAgentID: terminalID
     )))
     #expect(invalidParentResponse.error?.code == "parent_agent_not_agent")
 
     let promoteResponse = try await harness.send(.closeProcess(.init(
-        processID: parent.terminalID,
+        processID: parent.process.id,
         agentClosePolicy: .promoteSubAgents
     )))
     guard case .closeProcess(_)? = promoteResponse.result else {
@@ -2186,9 +2159,9 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
     #expect(!harness.workspace.sessions.contains { $0.id == parentID })
-    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == nil)
+    #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == nil)
     #expect(harness.workspace.sessions.contains { $0.id == childID })
-    #expect(harness.workspace.session(id: nestedChild.terminalID)?.parentAgentID == nil)
+    #expect(harness.workspace.session(id: nestedChild.process.id)?.parentAgentID == nil)
     #expect(harness.workspace.sessions.contains { $0.id == nestedChildID })
 }
 
@@ -2202,58 +2175,59 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let parentResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        select: true
-    )))
-    guard case .runAgent(let parent)? = parentResponse.result,
-          let parentID = UUID(uuidString: parent.terminalID)
+    let parentResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
+    guard case .spawnProcess(let parent)? = parentResponse.result,
+          let parentID = UUID(uuidString: parent.process.id)
     else {
-        Issue.record("Expected parent runAgent result, got \(String(describing: parentResponse))")
+        Issue.record("Expected parent spawnProcess result, got \(String(describing: parentResponse))")
         return
     }
+    #expect(try await harness.send(.selectProcess(.init(processID: parent.process.id))).error == nil)
     #expect(harness.workspace.selectedSessionID == parentID)
 
-    let childResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
+    let childResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
         parentAgentID: CherryControl.selectedAgentParentID
     )))
-    guard case .runAgent(let child)? = childResponse.result else {
-        Issue.record("Expected child runAgent result, got \(String(describing: childResponse))")
+    guard case .spawnProcess(let child)? = childResponse.result else {
+        Issue.record("Expected child spawnProcess result, got \(String(describing: childResponse))")
         return
     }
 
-    #expect(child.parentAgentID == parent.terminalID)
-    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == parentID)
+    #expect(child.process.parentAgentID == parent.process.id)
+    #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == parentID)
     #expect(harness.workspace.selectedSessionID == parentID)
 
     let terminal = harness.workspace.addSession(select: false)
     harness.workspace.select(terminal)
     harness.chromeState.selectTerminal()
 
-    let fallbackChildResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
+    let fallbackChildResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
         parentAgentID: CherryControl.selectedAgentParentID
     )))
-    guard case .runAgent(let fallbackChild)? = fallbackChildResponse.result else {
-        Issue.record("Expected fallback child runAgent result, got \(String(describing: fallbackChildResponse))")
+    guard case .spawnProcess(let fallbackChild)? = fallbackChildResponse.result else {
+        Issue.record("Expected fallback child spawnProcess result, got \(String(describing: fallbackChildResponse))")
         return
     }
 
-    #expect(fallbackChild.parentAgentID == parent.terminalID)
-    #expect(harness.workspace.session(id: fallbackChild.terminalID)?.parentAgentID == parentID)
+    #expect(fallbackChild.process.parentAgentID == parent.process.id)
+    #expect(harness.workspace.session(id: fallbackChild.process.id)?.parentAgentID == parentID)
 
-    let topLevelResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
+    let topLevelResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
         parentAgentID: CherryControl.topLevelAgentParentID
     )))
-    guard case .runAgent(let topLevel)? = topLevelResponse.result else {
-        Issue.record("Expected top-level runAgent result, got \(String(describing: topLevelResponse))")
+    guard case .spawnProcess(let topLevel)? = topLevelResponse.result else {
+        Issue.record("Expected top-level spawnProcess result, got \(String(describing: topLevelResponse))")
         return
     }
 
-    #expect(topLevel.parentAgentID == nil)
-    #expect(harness.workspace.session(id: topLevel.terminalID)?.parentAgentID == nil)
+    #expect(topLevel.process.parentAgentID == nil)
+    #expect(harness.workspace.session(id: topLevel.process.id)?.parentAgentID == nil)
 }
 
 @MainActor
@@ -2278,14 +2252,12 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let selectedParentResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        select: true
-    )))
-    guard case .runAgent(let selectedParent)? = selectedParentResponse.result else {
-        Issue.record("Expected selected parent runAgent result, got \(String(describing: selectedParentResponse))")
+    let selectedParentResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
+    guard case .spawnProcess(let selectedParent)? = selectedParentResponse.result else {
+        Issue.record("Expected selected parent spawnProcess result, got \(String(describing: selectedParentResponse))")
         return
     }
+    #expect(try await harness.send(.selectProcess(.init(processID: selectedParent.process.id))).error == nil)
 
     let childResult = await CherryMCPTools.call(
         name: "spawn_process",
@@ -2297,7 +2269,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(selectedParent.parentAgentID == nil)
+    #expect(selectedParent.process.parentAgentID == nil)
     #expect(child.process.parentAgentID == nil)
     #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == nil)
 
@@ -2352,36 +2324,38 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let firstResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        title: "First",
-        select: true
+    let firstResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
+        title: "First"
     )))
-    guard case .runAgent(let first)? = firstResponse.result,
-          let firstID = UUID(uuidString: first.terminalID)
+    guard case .spawnProcess(let first)? = firstResponse.result,
+          let firstID = UUID(uuidString: first.process.id)
     else {
-        Issue.record("Expected first runAgent result, got \(String(describing: firstResponse))")
+        Issue.record("Expected first spawnProcess result, got \(String(describing: firstResponse))")
         return
     }
+    #expect(try await harness.send(.selectProcess(.init(processID: first.process.id))).error == nil)
 
-    let secondResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        title: "Second",
-        select: true
+    let secondResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
+        title: "Second"
     )))
-    guard case .runAgent(let second)? = secondResponse.result,
-          let secondID = UUID(uuidString: second.terminalID)
+    guard case .spawnProcess(let second)? = secondResponse.result,
+          let secondID = UUID(uuidString: second.process.id)
     else {
-        Issue.record("Expected second runAgent result, got \(String(describing: secondResponse))")
+        Issue.record("Expected second spawnProcess result, got \(String(describing: secondResponse))")
         return
     }
+    #expect(try await harness.send(.selectProcess(.init(processID: second.process.id))).error == nil)
     #expect(harness.workspace.selectedSessionID == secondID)
 
-    let sessionContext = CherryMCPToolContext.bound(callerProcessID: second.terminalID)
-    #expect(sessionContext.callerProcessID == second.terminalID)
-    #expect(sessionContext.boundProcessID == second.terminalID)
+    let sessionContext = CherryMCPToolContext.bound(callerProcessID: second.process.id)
+    #expect(sessionContext.callerProcessID == second.process.id)
+    #expect(sessionContext.boundProcessID == second.process.id)
 
-    if let firstSession = harness.workspace.session(id: first.terminalID) {
+    if let firstSession = harness.workspace.session(id: first.process.id) {
         harness.workspace.select(firstSession)
     }
     harness.chromeState.selectTerminal()
@@ -2398,7 +2372,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(child.process.parentAgentID == second.terminalID)
+    #expect(child.process.parentAgentID == second.process.id)
     #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == secondID)
 
     let secondChildResult = await CherryMCPTools.call(
@@ -2412,7 +2386,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let secondChild = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: secondChildResult)
 
-    #expect(secondChild.process.parentAgentID == second.terminalID)
+    #expect(secondChild.process.parentAgentID == second.process.id)
     #expect(harness.workspace.session(id: secondChild.process.id)?.parentAgentID == secondID)
 }
 
@@ -2491,30 +2465,35 @@ private struct MCPWhoamiPayload: Decodable {
         }
     }
 
-    let parentAResponse = try await send(.runAgent(.init(
-        agentName: "Echo",
-        title: "Project A parent",
-        select: true
+    let parentAResponse = try await send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
+        title: "Project A parent"
     )))
-    guard case .runAgent(let parentA)? = parentAResponse.result else {
+    guard case .spawnProcess(let parentA)? = parentAResponse.result else {
         Issue.record("Expected project A parent, got \(String(describing: parentAResponse))")
         return
     }
+    #expect(try await send(.selectProcess(.init(processID: parentA.process.id))).error == nil)
 
     let parentBResponse = try await send(.scoped(.init(
         projectRoot: projectRootB.path,
-        request: .runAgent(.init(
-            agentName: "Echo",
-            title: "Project B parent",
-            select: true
+        request: .spawnProcess(.init(
+            kind: "agent",
+            name: "Echo",
+            title: "Project B parent"
         ))
     )))
-    guard case .runAgent(let parentB)? = parentBResponse.result else {
+    guard case .spawnProcess(let parentB)? = parentBResponse.result else {
         Issue.record("Expected project B parent, got \(String(describing: parentBResponse))")
         return
     }
+    #expect(try await send(.scoped(.init(
+        projectRoot: projectRootB.path,
+        request: .selectProcess(.init(processID: parentB.process.id))
+    ))).error == nil)
 
-    let sessionContext = CherryMCPToolContext.bound(callerProcessID: parentA.terminalID)
+    let sessionContext = CherryMCPToolContext.bound(callerProcessID: parentA.process.id)
     let childResult = await CherryMCPTools.call(
         name: "spawn_process",
         arguments: [
@@ -2526,7 +2505,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(parentB.parentAgentID == nil)
+    #expect(parentB.process.parentAgentID == nil)
     #expect(child.process.parentAgentID == nil)
     #expect(workspaceB.session(id: child.process.id)?.parentAgentID == nil)
 }
@@ -2663,22 +2642,22 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let firstResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "First root")))
-    guard case .runAgent(let first)? = firstResponse.result else {
-        Issue.record("Expected first runAgent result, got \(String(describing: firstResponse))")
+    let firstResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo", title: "First root")))
+    guard case .spawnProcess(let first)? = firstResponse.result else {
+        Issue.record("Expected first spawnProcess result, got \(String(describing: firstResponse))")
         return
     }
 
-    let secondResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "Second root")))
-    guard case .runAgent(let second)? = secondResponse.result,
-          UUID(uuidString: second.terminalID) != nil
+    let secondResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo", title: "Second root")))
+    guard case .spawnProcess(let second)? = secondResponse.result,
+          UUID(uuidString: second.process.id) != nil
     else {
-        Issue.record("Expected second runAgent result, got \(String(describing: secondResponse))")
+        Issue.record("Expected second spawnProcess result, got \(String(describing: secondResponse))")
         return
     }
 
-    #expect(first.parentAgentID == nil)
-    #expect(second.parentAgentID == nil)
+    #expect(first.process.parentAgentID == nil)
+    #expect(second.process.parentAgentID == nil)
 
     let sessionContext = CherryMCPToolContext.bound()
     let childResult = await CherryMCPTools.call(
@@ -3295,22 +3274,22 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let firstResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "First root")))
-    guard case .runAgent(let first)? = firstResponse.result,
-          let firstID = UUID(uuidString: first.terminalID)
+    let firstResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo", title: "First root")))
+    guard case .spawnProcess(let first)? = firstResponse.result,
+          let firstID = UUID(uuidString: first.process.id)
     else {
-        Issue.record("Expected first runAgent result, got \(String(describing: firstResponse))")
+        Issue.record("Expected first spawnProcess result, got \(String(describing: firstResponse))")
         return
     }
 
-    let secondResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "Second root")))
-    guard case .runAgent(let second)? = secondResponse.result else {
-        Issue.record("Expected second runAgent result, got \(String(describing: secondResponse))")
+    let secondResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo", title: "Second root")))
+    guard case .spawnProcess(let second)? = secondResponse.result else {
+        Issue.record("Expected second spawnProcess result, got \(String(describing: secondResponse))")
         return
     }
 
-    setEnvironmentValue(second.terminalID, for: CherryControl.agentIDEnvironmentKey)
-    setEnvironmentValue(first.terminalID, for: CherryControl.processIDEnvironmentKey)
+    setEnvironmentValue(second.process.id, for: CherryControl.agentIDEnvironmentKey)
+    setEnvironmentValue(first.process.id, for: CherryControl.processIDEnvironmentKey)
 
     let childResult = await CherryMCPTools.call(
         name: "spawn_process",
@@ -3322,8 +3301,8 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(second.parentAgentID == nil)
-    #expect(child.process.parentAgentID == first.terminalID)
+    #expect(second.process.parentAgentID == nil)
+    #expect(child.process.parentAgentID == first.process.id)
     #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == firstID)
 }
 
@@ -3352,20 +3331,20 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let parentResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "Parent")))
-    guard case .runAgent(let parent)? = parentResponse.result,
-          let parentID = UUID(uuidString: parent.terminalID)
+    let parentResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo", title: "Parent")))
+    guard case .spawnProcess(let parent)? = parentResponse.result,
+          let parentID = UUID(uuidString: parent.process.id)
     else {
-        Issue.record("Expected parent runAgent result, got \(String(describing: parentResponse))")
+        Issue.record("Expected parent spawnProcess result, got \(String(describing: parentResponse))")
         return
     }
 
-    let parentSession = try #require(harness.workspace.session(id: parent.terminalID))
+    let parentSession = try #require(harness.workspace.session(id: parent.process.id))
     #expect(await eventually(timeout: 1) { parentSession.childProcessID != nil })
     let parentPID = try #require(parentSession.childProcessID)
     let inferredCallerID = await CherryMCPTools.inferredCallerProcessID(parentPIDs: [parentPID])
 
-    #expect(inferredCallerID == parent.terminalID)
+    #expect(inferredCallerID == parent.process.id)
 
     let sessionContext = CherryMCPToolContext.bound(callerProcessID: inferredCallerID)
     let childResult = await CherryMCPTools.call(
@@ -3379,7 +3358,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(child.process.parentAgentID == parent.terminalID)
+    #expect(child.process.parentAgentID == parent.process.id)
     #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == parentID)
 }
 
@@ -3408,13 +3387,13 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let parentResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "Parent")))
-    guard case .runAgent(let parent)? = parentResponse.result else {
-        Issue.record("Expected parent runAgent result, got \(String(describing: parentResponse))")
+    let parentResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo", title: "Parent")))
+    guard case .spawnProcess(let parent)? = parentResponse.result else {
+        Issue.record("Expected parent spawnProcess result, got \(String(describing: parentResponse))")
         return
     }
 
-    let parentSession = try #require(harness.workspace.session(id: parent.terminalID))
+    let parentSession = try #require(harness.workspace.session(id: parent.process.id))
     #expect(await eventually(timeout: 1) { parentSession.childProcessID != nil })
     let parentPID = try #require(parentSession.childProcessID)
     let unrelatedIntermediatePID = Int32.max
@@ -3422,7 +3401,7 @@ private struct MCPWhoamiPayload: Decodable {
         parentPIDs: [unrelatedIntermediatePID, parentPID]
     )
 
-    #expect(inferredCallerID == parent.terminalID)
+    #expect(inferredCallerID == parent.process.id)
 }
 
 @MainActor
@@ -3480,7 +3459,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func controlServerRunAgentSelectionFocusesTerminalPane() async throws {
+@Test func controlServerSelectingSpawnedAgentFocusesTerminalPane() async throws {
     let harness = try ControlServerHarness()
     defer {
         harness.stop()
@@ -3502,16 +3481,14 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(harness.chromeState.selectedTodoID == createdTodo.todo.id)
     #expect(harness.chromeState.isTodoPanePresented == true)
 
-    let response = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        select: true
-    )))
-    guard case .runAgent(let result)? = response.result,
-          let terminalID = UUID(uuidString: result.terminalID)
+    let response = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
+    guard case .spawnProcess(let result)? = response.result,
+          let terminalID = UUID(uuidString: result.process.id)
     else {
-        Issue.record("Expected runAgent result, got \(String(describing: response))")
+        Issue.record("Expected spawnProcess result, got \(String(describing: response))")
         return
     }
+    #expect(try await harness.send(.selectProcess(.init(processID: result.process.id))).error == nil)
 
     #expect(harness.workspace.selectedSessionID == terminalID)
     #expect(harness.chromeState.isShowingTerminalContent == true)
@@ -3529,18 +3506,19 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let firstResponse = try await harness.send(.runAgent(.init(agentName: "Echo")))
-    let secondResponse = try await harness.send(.runAgent(.init(agentName: "Echo")))
+    let firstResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
+    let secondResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
 
-    guard case .runAgent(let firstResult)? = firstResponse.result,
-          case .runAgent(let secondResult)? = secondResponse.result
+    guard case .spawnProcess(let firstResult)? = firstResponse.result,
+          case .spawnProcess(let secondResult)? = secondResponse.result
     else {
-        Issue.record("Expected runAgent results")
+        Issue.record("Expected spawnProcess results")
         return
     }
 
-    #expect(firstResult.title == "Echo")
-    #expect(secondResult.title == "Echo")
+    #expect(firstResult.process.id != secondResult.process.id)
+    #expect(harness.workspace.session(id: firstResult.process.id)?.title == "Echo")
+    #expect(harness.workspace.session(id: secondResult.process.id)?.title == "Echo")
     #expect(harness.workspace.agentSessions.map(\.title) == ["Echo", "Echo"])
 }
 
@@ -4615,22 +4593,22 @@ private struct MCPWhoamiPayload: Decodable {
     harness.server.start()
     let terminalID = try #require(harness.workspace.selectedSession?.id.uuidString)
 
-    let response = try await harness.send(.renameTerminal(.init(
-        terminalID: terminalID,
+    let response = try await harness.send(.renameProcess(.init(
+        processID: terminalID,
         title: "Build log"
     )))
 
-    guard case .renameTerminal(let result)? = response.result else {
-        Issue.record("Expected renameTerminal result, got \(String(describing: response))")
+    guard case .renameProcess(let result)? = response.result else {
+        Issue.record("Expected renameProcess result, got \(String(describing: response))")
         return
     }
 
-    #expect(result.title == "Build log")
+    #expect(result.process.name == "Build log")
     #expect(harness.workspace.selectedSession?.title == "Build log")
 }
 
 @MainActor
-@Test func controlServerSelectTerminalActivatesGroupedPane() async throws {
+@Test func controlServerSelectProcessActivatesGroupedPane() async throws {
     let harness = try ControlServerHarness()
     defer {
         harness.stop()
@@ -4651,13 +4629,13 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(initialList.selectedTerminalID == secondSession.id.uuidString)
     #expect(initialList.terminals.filter(\.selected).map(\.id) == [secondSession.id.uuidString])
 
-    let selectResponse = try await harness.send(.selectTerminal(.init(terminalID: firstSession.id.uuidString)))
-    guard case .selectTerminal(let selected)? = selectResponse.result else {
-        Issue.record("Expected selectTerminal result, got \(String(describing: selectResponse))")
+    let selectResponse = try await harness.send(.selectProcess(.init(processID: firstSession.id.uuidString)))
+    guard case .selectProcess(let selected)? = selectResponse.result else {
+        Issue.record("Expected selectProcess result, got \(String(describing: selectResponse))")
         return
     }
-    #expect(selected.selected)
-    #expect(selected.terminalID == firstSession.id.uuidString)
+    #expect(selected.process.selected)
+    #expect(selected.process.id == firstSession.id.uuidString)
     #expect(harness.workspace.selectedSessionID == firstSession.id)
     #expect(harness.workspace.splitGroup(id: groupID)?.activeSessionID == firstSession.id)
 
@@ -4671,12 +4649,12 @@ private struct MCPWhoamiPayload: Decodable {
     harness.workspace.closeActivePane()
     #expect(harness.workspace.splitGroup(id: groupID) == nil)
     #expect(harness.workspace.selectedSessionID == secondSession.id)
-    let dissolvedSelectResponse = try await harness.send(.selectTerminal(.init(terminalID: secondSession.id.uuidString)))
-    guard case .selectTerminal(let dissolvedSelected)? = dissolvedSelectResponse.result else {
-        Issue.record("Expected selectTerminal result, got \(String(describing: dissolvedSelectResponse))")
+    let dissolvedSelectResponse = try await harness.send(.selectProcess(.init(processID: secondSession.id.uuidString)))
+    guard case .selectProcess(let dissolvedSelected)? = dissolvedSelectResponse.result else {
+        Issue.record("Expected selectProcess result, got \(String(describing: dissolvedSelectResponse))")
         return
     }
-    #expect(dissolvedSelected.selected)
+    #expect(dissolvedSelected.process.selected)
     #expect(harness.workspace.selectedSessionID == secondSession.id)
 }
 
@@ -4690,10 +4668,10 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "claude", enabled: false))
     harness.server.start()
 
-    let missingResponse = try await harness.send(.runAgent(.init(agentName: "Codex")))
+    let missingResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Codex")))
     #expect(missingResponse.error?.code == "agent_not_found")
 
-    let disabledResponse = try await harness.send(.runAgent(.init(agentName: "Claude")))
+    let disabledResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Claude")))
     #expect(disabledResponse.error?.code == "agent_not_launchable")
 }
 

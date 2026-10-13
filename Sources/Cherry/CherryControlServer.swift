@@ -900,68 +900,6 @@ final class CherryControlServer: @unchecked Sendable {
         case .listTodos:
             let todoStore = try activeTodoStore(for: workspace)
             return .init(result: .listTodos(listTodos(todoStore: todoStore)))
-        case .createTerminal(let request):
-            let session = workspace.addSession(
-                title: request.title,
-                workingDirectory: request.workingDirectory,
-                command: request.command,
-                select: false
-            )
-            return .init(result: .createTerminal(summary(for: session, workspace: workspace)))
-        case .runAgent(let request):
-            guard let projectRoot = workspace.projectRoot else {
-                throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
-            }
-            let resolvedAgent = try findAgent(named: request.agentName)
-            guard resolvedAgent.isLaunchable else {
-                throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(resolvedAgent.name)' is not launchable.")
-            }
-            let agent = try agentDefinition(resolvedAgent, overridingModel: request.model)
-            let session = workspace.addAgentSession(
-                agent: agent,
-                projectRoot: projectRoot,
-                title: request.title,
-                parentAgentID: try parentAgentID(from: request.parentAgentID, workspace: workspace),
-                select: request.select ?? false
-            )
-            if request.select ?? false {
-                chromeState(for: workspace)?.selectTerminal()
-            }
-            let initialInput = try agentInputPayload(
-                text: request.text,
-                rawBase64: request.rawBase64,
-                submit: request.submit
-            )
-            let sentBytes: Int
-            if let initialInput, !initialInput.isEmpty {
-                await waitForAgentInitialInputReadiness(session: session, agent: agent)
-                // The agent exists either way: sentBytes says whether its
-                // first input reached it.
-                sentBytes = (try? await sendInitialAgentInput(initialInput, to: session, agent: agent)) ?? 0
-            } else {
-                sentBytes = 0
-            }
-            let waitMilliseconds = min(max(request.waitMilliseconds ?? 0, 0), 5_000)
-            let lineLimit = min(max(request.lineLimit ?? 200, 1), 2_000)
-            if waitMilliseconds > 0 {
-                try? await Task.sleep(for: .milliseconds(waitMilliseconds))
-                await session.refreshContentFromHostIfNeeded()
-            }
-            let output = waitMilliseconds > 0 ? terminalOutput(for: session, startLine: nil, lineLimit: lineLimit) : nil
-            return .init(result: .runAgent(.init(
-                terminalID: session.id.uuidString,
-                link: link(for: session, workspace: workspace),
-                title: session.title,
-                state: session.state.label,
-                kind: session.kind.rawValue,
-                agentName: session.agentName,
-                summary: nil,
-                parentAgentID: session.parentAgentID?.uuidString,
-                childAgentCount: callerChildAgentCount(of: session, in: workspace),
-                projectRoot: projectRoot,
-                sentBytes: sentBytes,
-                output: output
-            )))
         case .createNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
             let note = try noteStore.create(title: request.title, markdown: request.markdown)
@@ -1079,34 +1017,6 @@ final class CherryControlServer: @unchecked Sendable {
                 commentID: try commentID(from: request.commentID)
             )
             return .init(result: .deleteTodoComment(todoDetail(todo, in: workspace)))
-        case .renameTerminal(let request):
-            let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
-            session.rename(to: request.title)
-            return .init(result: .renameTerminal(summary(for: session, workspace: sessionWorkspace)))
-        case .selectTerminal(let request):
-            let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
-            sessionWorkspace.select(session)
-            chromeState(for: sessionWorkspace)?.selectTerminal()
-            return .init(result: .selectTerminal(.init(terminalID: session.id.uuidString, selected: true)))
-        case .sendInput(let request):
-            let session = try findSession(workspace: workspace, terminalID: request.terminalID)
-            let input = try terminalInputPayload(text: request.text, rawBase64: request.rawBase64)
-            if session.kind == .agent {
-                try await refuseInputIntoPermissionPrompt(of: session, keysOnly: input.isRaw)
-            }
-            try await sendTerminalInput(input, to: session)
-            let waitMilliseconds = min(max(request.waitMilliseconds ?? 0, 0), 5_000)
-            let lineLimit = min(max(request.lineLimit ?? 200, 1), 2_000)
-            if waitMilliseconds > 0 {
-                try? await Task.sleep(for: .milliseconds(waitMilliseconds))
-                await session.refreshContentFromHostIfNeeded()
-            }
-            let output = waitMilliseconds > 0 ? terminalOutput(for: session, startLine: nil, lineLimit: lineLimit) : nil
-            return .init(result: .sendInput(.init(terminalID: session.id.uuidString, sentBytes: input.payload.count, output: output)))
-        case .getTerminalOutput(let request):
-            let session = try findSession(workspace: workspace, terminalID: request.terminalID)
-            await session.refreshContentFromHostIfNeeded()
-            return .init(result: .getTerminalOutput(terminalOutput(for: session, startLine: request.startLine, lineLimit: request.lineLimit)))
         case .clearOutput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             // A persistent tab's host clears its copy before this answers,
@@ -1115,14 +1025,6 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .clearOutput(.init(
                 terminalID: session.id.uuidString, cleared: kept == nil, hostKeptHistory: kept
             )))
-        case .restartTerminal(let request):
-            let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
-            try restartProcess(session, in: sessionWorkspace)
-            return .init(result: .restartTerminal(summary(for: session, workspace: sessionWorkspace)))
-        case .closeTerminal(let request):
-            let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
-            try closeFromControl(session, workspace: sessionWorkspace, agentClosePolicy: request.agentClosePolicy)
-            return .init(result: .closeTerminal(.init(terminalID: session.id.uuidString, closed: true)))
         }
     }
 
@@ -2594,21 +2496,6 @@ final class CherryControlServer: @unchecked Sendable {
     private func link(for session: TerminalSession, workspace: TerminalWorkspace) -> String? {
         guard let projectRoot = workspace.projectRoot else { return nil }
         return CherryDeepLink.terminalURL(projectRoot: projectRoot, terminalID: session.id)
-    }
-
-    @MainActor
-    private func summary(for session: TerminalSession, workspace: TerminalWorkspace) -> TerminalSummaryResult {
-        TerminalSummaryResult(
-            terminalID: session.id.uuidString,
-            link: link(for: session, workspace: workspace),
-            title: session.title,
-            state: session.state.label,
-            kind: session.kind.rawValue,
-            agentName: session.agentName,
-            summary: nil,
-            parentAgentID: session.parentAgentID?.uuidString,
-            childAgentCount: callerChildAgentCount(of: session, in: workspace)
-        )
     }
 
     private struct TerminalControlInput {

@@ -406,12 +406,10 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         .getProcessStatus(.init(processID: id, processName: nil)),
         .getProcessOutput(.init(processID: id)),
         .sendProcessInput(.init(processID: id, text: "remote-input\n")),
-        .sendInput(.init(terminalID: id, text: "remote-send-input\n", rawBase64: nil, waitMilliseconds: nil, lineLimit: nil)),
         .restartProcess(.init(processID: id)),
         .closeProcess(.init(processID: id)),
         .stopProcess(.init(processID: id)),
         .getProcessPorts(.init(processID: id)),
-        .getTerminalOutput(.init(terminalID: id, startLine: nil, lineLimit: nil)),
         .getProcessStatus(.init(processID: otherDeviceTab, processName: nil)),
     ]
     for request in requests {
@@ -429,7 +427,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     try await Task.sleep(for: .milliseconds(300))
     #expect(echo.isRunning)
     let echoed = try await harness.output(of: echo)
-    #expect(!echoed.contains("remote-input") && !echoed.contains("remote-send-input"))
+    #expect(!echoed.contains("remote-input"))
 }
 
 /// (d) Another device's key, or a This Mac root, as a project: refused.
@@ -1032,12 +1030,8 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
             .getProcessOutput(.init(processID: id)),
             .sendProcessInput(.init(processID: id, text: "remote-input\n")),
             .sendProcessInput(.init(processName: foreign.title, text: "remote-input\n")),
-            .sendInput(.init(terminalID: id, text: "x\n", rawBase64: nil, waitMilliseconds: nil, lineLimit: nil)),
-            .getTerminalOutput(.init(terminalID: id, startLine: nil, lineLimit: nil)),
             .restartProcess(.init(processID: id)),
-            .restartTerminal(.init(terminalID: id)),
             .closeProcess(.init(processID: id)),
-            .closeTerminal(.init(terminalID: id)),
             .stopProcess(.init(processID: id)),
             .selectProcess(.init(processID: id)),
             .waitForProcessIdle(.init(processID: id, timeoutMilliseconds: 50)),

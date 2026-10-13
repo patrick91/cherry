@@ -1441,7 +1441,6 @@ private func fixtureSession() throws -> HostedSessionInfo {
     for request in [
         CherryControlRequest.startProcess(.init(processID: processID)),
         .restartProcess(.init(processID: processID)),
-        .restartTerminal(.init(terminalID: processID)),
     ] {
         let response = try await harness.send(request)
         #expect(response.error?.code == "hosted_session_ended")

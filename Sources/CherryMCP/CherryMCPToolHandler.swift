@@ -1172,10 +1172,6 @@ public enum CherryMCPTools {
             return try encodedResult(payload)
         case .listTodos(let payload):
             return try encodedResult(payload)
-        case .createTerminal(let payload):
-            return try encodedResult(payload)
-        case .runAgent(let payload):
-            return try encodedResult(payload)
         case .createNote(let payload):
             return try encodedResult(payload)
         case .getNote(let payload):
@@ -1212,19 +1208,7 @@ public enum CherryMCPTools {
             return try encodedResult(payload)
         case .deleteTodoComment(let payload):
             return try encodedResult(payload)
-        case .renameTerminal(let payload):
-            return try encodedResult(payload)
-        case .selectTerminal(let payload):
-            return try encodedResult(payload)
-        case .sendInput(let payload):
-            return try encodedResult(payload)
-        case .getTerminalOutput(let payload):
-            return try encodedResult(payload)
         case .clearOutput(let payload):
-            return try encodedResult(payload)
-        case .restartTerminal(let payload):
-            return try encodedResult(payload)
-        case .closeTerminal(let payload):
             return try encodedResult(payload)
         }
     }

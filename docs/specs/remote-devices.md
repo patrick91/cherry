@@ -1066,8 +1066,8 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
   refused, with no spawn in and no input to the This Mac window (whose
   command a local caller shows live); a nested scoped JSON line refused;
   a This Mac tab's and another device's tab's ids `terminal_not_found`
-  for status, output, input, send_input, restart, stop, close, ports and
-  terminal output, and a link to it not found; another device's key and
+  for status, output, input, restart, stop, close and ports, and a link
+  to it not found; another device's key and
   This Mac's root refused, its own path, key and a folder inside resolving;
   list_projects, list_processes, list_terminals and status of its Mac only;
   the envelope; the unreachable message; the launch environment in the

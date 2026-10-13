@@ -163,8 +163,6 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case listAgents
     case listNotes
     case listTodos
-    case createTerminal(CreateTerminalRequest)
-    case runAgent(RunAgentRequest)
     case createNote(CreateNoteRequest)
     case getNote(NoteIDRequest)
     case updateNote(UpdateNoteRequest)
@@ -183,13 +181,7 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case listTodoComments(TodoIDRequest)
     case updateTodoComment(UpdateTodoCommentRequest)
     case deleteTodoComment(DeleteTodoCommentRequest)
-    case renameTerminal(RenameTerminalRequest)
-    case selectTerminal(TerminalIDRequest)
-    case sendInput(SendInputRequest)
-    case getTerminalOutput(GetTerminalOutputRequest)
     case clearOutput(TerminalIDRequest)
-    case restartTerminal(TerminalIDRequest)
-    case closeTerminal(CloseTerminalRequest)
 }
 
 public struct ScopedControlRequest: Codable, Equatable, Sendable {
@@ -685,109 +677,6 @@ public struct DeleteTodoCommentRequest: Codable, Equatable, Sendable {
     }
 }
 
-public struct CreateTerminalRequest: Codable, Equatable, Sendable {
-    public let title: String?
-    public let workingDirectory: String?
-    public let command: String?
-
-    public init(title: String?, workingDirectory: String?, command: String?) {
-        self.title = title
-        self.workingDirectory = workingDirectory
-        self.command = command
-    }
-}
-
-public struct RunAgentRequest: Codable, Equatable, Sendable {
-    public let agentName: String
-    public let model: String?
-    public let title: String?
-    public let text: String?
-    public let rawBase64: String?
-    public let waitMilliseconds: Int?
-    public let lineLimit: Int?
-    public let submit: Bool?
-    public let parentAgentID: String?
-    public let select: Bool?
-
-    public init(
-        agentName: String,
-        model: String? = nil,
-        title: String? = nil,
-        text: String? = nil,
-        rawBase64: String? = nil,
-        waitMilliseconds: Int? = nil,
-        lineLimit: Int? = nil,
-        submit: Bool? = nil,
-        parentAgentID: String? = nil,
-        select: Bool? = nil
-    ) {
-        self.agentName = agentName
-        self.model = model
-        self.title = title
-        self.text = text
-        self.rawBase64 = rawBase64
-        self.waitMilliseconds = waitMilliseconds
-        self.lineLimit = lineLimit
-        self.submit = submit
-        self.parentAgentID = parentAgentID
-        self.select = select
-    }
-}
-
-public struct CloseTerminalRequest: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let agentClosePolicy: AgentClosePolicy?
-
-    public init(terminalID: String, agentClosePolicy: AgentClosePolicy? = nil) {
-        self.terminalID = terminalID
-        self.agentClosePolicy = agentClosePolicy
-    }
-}
-
-public struct RenameTerminalRequest: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let title: String?
-
-    public init(terminalID: String, title: String?) {
-        self.terminalID = terminalID
-        self.title = title
-    }
-}
-
-public struct SendInputRequest: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let text: String?
-    public let rawBase64: String?
-    public let waitMilliseconds: Int?
-    public let lineLimit: Int?
-
-    public init(
-        terminalID: String,
-        text: String?,
-        rawBase64: String?,
-        waitMilliseconds: Int?,
-        lineLimit: Int?
-    ) {
-        self.terminalID = terminalID
-        self.text = text
-        self.rawBase64 = rawBase64
-        self.waitMilliseconds = waitMilliseconds
-        self.lineLimit = lineLimit
-    }
-}
-
-public struct GetTerminalOutputRequest: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let startLine: Int?
-    public let lineLimit: Int?
-
-    public init(terminalID: String, startLine: Int?, lineLimit: Int?) {
-        self.terminalID = terminalID
-        self.startLine = startLine
-        self.lineLimit = lineLimit
-    }
-}
-
 public struct CherryControlResponse: Codable, Equatable, Sendable {
     public let result: CherryControlResult?
     public let error: CherryControlError?
@@ -844,8 +733,6 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case listAgents(ListAgentsResult)
     case listNotes(ListNotesResult)
     case listTodos(ListTodosResult)
-    case createTerminal(TerminalSummaryResult)
-    case runAgent(RunAgentResult)
     case createNote(NoteDetailResult)
     case getNote(NoteDetailResult)
     case updateNote(NoteDetailResult)
@@ -864,13 +751,7 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case listTodoComments(ListTodoCommentsResult)
     case updateTodoComment(TodoDetailResult)
     case deleteTodoComment(TodoDetailResult)
-    case renameTerminal(TerminalSummaryResult)
-    case selectTerminal(SelectTerminalResult)
-    case sendInput(SendInputResult)
-    case getTerminalOutput(TerminalOutputResult)
     case clearOutput(ClearOutputResult)
-    case restartTerminal(TerminalSummaryResult)
-    case closeTerminal(CloseTerminalResult)
 }
 
 public struct CherryControlError: Codable, Equatable, Error, Sendable {
@@ -1870,105 +1751,6 @@ public struct DeleteTodoResult: Codable, Equatable, Sendable {
     }
 }
 
-public struct TerminalSummaryResult: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let link: String?
-    public let title: String
-    public let state: String
-    public let kind: String?
-    public let agentName: String?
-    public let summary: String?
-    public let parentAgentID: String?
-    public let childAgentCount: Int?
-
-    public init(
-        terminalID: String,
-        link: String? = nil,
-        title: String,
-        state: String,
-        kind: String? = nil,
-        agentName: String? = nil,
-        summary: String? = nil,
-        parentAgentID: String? = nil,
-        childAgentCount: Int? = nil
-    ) {
-        self.terminalID = terminalID
-        self.link = link
-        self.title = title
-        self.state = state
-        self.kind = kind
-        self.agentName = agentName
-        self.summary = summary
-        self.parentAgentID = parentAgentID
-        self.childAgentCount = childAgentCount
-    }
-}
-
-public struct RunAgentResult: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let link: String?
-    public let title: String
-    public let state: String
-    public let kind: String?
-    public let agentName: String?
-    public let summary: String?
-    public let parentAgentID: String?
-    public let childAgentCount: Int?
-    public let projectRoot: String
-    public let sentBytes: Int
-    public let output: TerminalOutputResult?
-
-    public init(
-        terminalID: String,
-        link: String? = nil,
-        title: String,
-        state: String,
-        kind: String?,
-        agentName: String?,
-        summary: String?,
-        parentAgentID: String? = nil,
-        childAgentCount: Int? = nil,
-        projectRoot: String,
-        sentBytes: Int,
-        output: TerminalOutputResult?
-    ) {
-        self.terminalID = terminalID
-        self.link = link
-        self.title = title
-        self.state = state
-        self.kind = kind
-        self.agentName = agentName
-        self.summary = summary
-        self.parentAgentID = parentAgentID
-        self.childAgentCount = childAgentCount
-        self.projectRoot = projectRoot
-        self.sentBytes = sentBytes
-        self.output = output
-    }
-}
-
-public struct SelectTerminalResult: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let selected: Bool
-
-    public init(terminalID: String, selected: Bool) {
-        self.terminalID = terminalID
-        self.selected = selected
-    }
-}
-
-public struct SendInputResult: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let sentBytes: Int
-    public let output: TerminalOutputResult?
-
-    public init(terminalID: String, sentBytes: Int, output: TerminalOutputResult?) {
-        self.terminalID = terminalID
-        self.sentBytes = sentBytes
-        self.output = output
-    }
-}
-
 public struct TerminalOutputResult: Codable, Equatable, Sendable {
     public let terminalID: String
     public let startLine: Int
@@ -2091,16 +1873,6 @@ public struct ClearOutputResult: Codable, Equatable, Sendable {
         self.terminalID = terminalID
         self.cleared = cleared
         self.hostKeptHistory = hostKeptHistory
-    }
-}
-
-public struct CloseTerminalResult: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let closed: Bool
-
-    public init(terminalID: String, closed: Bool) {
-        self.terminalID = terminalID
-        self.closed = closed
     }
 }
 

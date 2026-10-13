@@ -1651,8 +1651,8 @@ final class PersistentHostSessions {
     }
 
     /// Clears the history above the session's screen on its host (Clear
-    /// Scrollback, MCP `clear_output`): reads of its screen (`screen(of:)`)
-    /// and an adapter that attaches no longer bring it back.
+    /// Scrollback, the control request `clearOutput`): reads of its screen
+    /// (`screen(of:)`) and an adapter that attaches no longer bring it back.
     func clearHistory(of binding: HostedSessionAttachment) async throws {
         try await control.clearHistory(binding.sessionID, expectedHostID: binding.hostID)
     }

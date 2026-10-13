@@ -4743,10 +4743,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.discardPendingOutput()
     }
 
-    /// Clear Scrollback (⌘K) and MCP `clear_output`: the tab's screen and
-    /// history, and for a persistent tab its host's copy of the history too
-    /// (`clearHostHistory`), which reads through the host (MCP output and
-    /// search) and the next attach adapter would otherwise bring back.
+    /// Clear Scrollback (⌘K) and the control request `clearOutput`: the
+    /// tab's screen and history, and for a persistent tab its host's copy
+    /// of the history too (`clearHostHistory`), which reads through the host
+    /// (MCP output and search) and the next attach adapter would otherwise
+    /// bring back.
     /// Returns the host's clear, for a caller that waits for it: nil when
     /// the host cleared it, else why it kept it.
     @discardableResult

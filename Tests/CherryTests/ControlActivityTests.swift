@@ -287,10 +287,12 @@ struct ControlActivityTests {
         #expect(waited.process.programStatus == nil)
     }
 
+#if DEBUG
     /// A turn as Claude Code reports it: `working` at the submit, `done`
     /// at its end. A result that comes while the tab is not seen stays
     /// unseen until it is; an `idle` straight after `working` is a turn the
-    /// user cancelled.
+    /// user cancelled. (`noteTestingInput` is DEBUG only: release builds,
+    /// such as Scripts/perf-terminal-stress's, compile without this test.)
     @Test func reportedTurnsAreCountedAndTheirResultsAreUnseenUntilViewed() async throws {
         TerminalNotificationCenter.shared.isDeliveryEnabled = false
         defer {
@@ -343,6 +345,7 @@ struct ControlActivityTests {
         #expect(session.agentActivityState == .unknown)
         #expect(session.programStatus.isEmpty)
     }
+#endif
 
     @Test func trimmedRawOutputSuffixSkipsPartialUTF8AndEscapeTails() async throws {
         let continuationTail = Data([0x9F, 0x92, 0x96]) + Data("hello\n".utf8)

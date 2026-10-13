@@ -7,6 +7,10 @@ import Testing
 // A keystroke that changes nothing a view shows publishes nothing: every
 // view observing the tab (the pane, its context bar, the sidebar row) would
 // otherwise re-render once per key (about 1.75 ms of main thread a key).
+//
+// These tests type with `noteTestingInput`, which is DEBUG only: release
+// builds, such as Scripts/perf-terminal-stress's, compile without them.
+#if DEBUG
 
 @MainActor
 private final class PublishCounter {
@@ -154,3 +158,4 @@ private func ingestOutput(_ text: String, into session: TerminalSession) async t
     #expect(moved != before)
     #expect(moved.displayPath == "~/project")
 }
+#endif

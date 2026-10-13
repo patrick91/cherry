@@ -1028,12 +1028,12 @@ differs from the design above.
   with `ESC [ 201 ~`. (Holding the paste for the adapter was rejected: it
   would arrive later, after whatever the user typed meanwhile, and the
   surface learns the mode only from the adapter's repaint.)
-- Clear Scrollback (⌘K) and MCP `clear_output` on a persistent tab also send
-  `ClearHistory`, and forget the screen read from the host; `clear_output`
-  answers once the host did, so MCP output and search read after it no
-  longer have the history, and neither does the next attach adapter. The
-  holder answers how it went (`HistoryCleared`): `clear_output` says
-  `cleared: false` with the host's reason (`hostKeptHistory`) when the
+- Clear Scrollback (⌘K) and the control request `clearOutput` on a persistent
+  tab also send `ClearHistory`, and forget the screen read from the host;
+  `clearOutput` answers once the host did, so MCP output and search read
+  after it no longer have the history, and neither does the next attach
+  adapter. The holder answers how it went (`HistoryCleared`): `clearOutput`
+  says `cleared: false` with the host's reason (`hostKeptHistory`) when the
   alternate screen shows, the holder predates link 7, is not connected, or
   failed. A UTF-8 character the output left half written is never broken:
   the holder's erase then waits for the output that completes it.

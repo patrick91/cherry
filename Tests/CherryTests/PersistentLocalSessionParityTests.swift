@@ -702,7 +702,7 @@ final class ParityControlServer {
         return nil
     }
 
-    // MCP clear_output asks the host before it answers.
+    // The control request clearOutput asks the host before it answers.
     let cleared = try await control.send(.clearOutput(.init(terminalID: tab.id.uuidString)))
     #expect(cleared.error == nil)
     guard case .clearOutput(let clearedResult)? = cleared.result else {

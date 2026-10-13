@@ -1,58 +1,31 @@
 #!/usr/bin/env python3
 import argparse
-import errno
 import glob
 import json
 import os
 from pathlib import Path
-import shlex
-import socket
+import re
 import subprocess
 import sys
 import time
 
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cherry_private_host  # noqa: E402
+import perf_common  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
-WORKLOAD_SCRIPT = REPO_ROOT / "Scripts" / "perf-terminal-workload"
 
-
+# The shared workload values, and how many tabs and windows Cherry runs them
+# in and how often it switches tabs.
 SCALES = {
-    "smoke": {
-        "duration": 20,
-        "tabs": 4,
-        "windows": 1,
-        "lines": 8_000,
-        "frames": 150,
-        "progress_frames": 300,
-        "sleep_ms": 0,
-        "rate_mib_per_second": 4.0,
-        "select_interval": 0.25,
-        "sample_interval": 2.0,
-    },
-    "standard": {
-        "duration": 180,
-        "tabs": 12,
-        "windows": 1,
-        "lines": 50_000,
-        "frames": 1_000,
-        "progress_frames": 2_000,
-        "sleep_ms": 0,
-        "rate_mib_per_second": 2.0,
-        "select_interval": 0.5,
-        "sample_interval": 5.0,
-    },
-    "soak": {
-        "duration": 7_200,
-        "tabs": 24,
-        "windows": 3,
-        "lines": 120_000,
-        "frames": 6_000,
-        "progress_frames": 10_000,
-        "sleep_ms": 0,
-        "rate_mib_per_second": 1.0,
-        "select_interval": 1.0,
-        "sample_interval": 30.0,
-    },
+    scale: {**perf_common.WORKLOAD_SCALES[scale], **app}
+    for scale, app in {
+        "smoke": {"tabs": 4, "windows": 1, "select_interval": 0.25},
+        "standard": {"tabs": 12, "windows": 1, "select_interval": 0.5},
+        "soak": {"tabs": 24, "windows": 3, "select_interval": 1.0},
+    }.items()
 }
 
 
@@ -60,7 +33,17 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Drive a running Cherry app through app-level terminal perf workloads."
     )
-    parser.add_argument("--socket", help="Cherry control socket path. Defaults to CHERRY_CONTROL_SOCKET or newest /tmp/cherry-$UID socket.")
+    parser.add_argument(
+        "--socket",
+        help="Cherry control socket path. Defaults to CHERRY_CONTROL_SOCKET or newest /tmp/cherry-$UID socket. "
+        "It must be in a private run directory (see --force).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Drive a Cherry whose control socket is not in a private run directory (0700, yours, with home/ in "
+        "it, as Scripts/cherry_private_host.py makes): your own Cherry, whose windows and tabs it then opens.",
+    )
     parser.add_argument("--scale", choices=sorted(SCALES), default="smoke")
     parser.add_argument("--mode", choices=("scrollback", "tui", "mixed"), default="mixed")
     parser.add_argument("--duration", type=float, help="Seconds to cycle tab selection and keep workloads running.")
@@ -76,7 +59,12 @@ def parse_args():
         help="Maximum average output rate for each terminal. Zero runs an unbounded overload test.",
     )
     parser.add_argument("--select-interval", type=float, help="Seconds between select_process calls.")
-    parser.add_argument("--sample-interval", type=float, help="Seconds between Cherry process RSS/CPU samples.")
+    parser.add_argument(
+        "--sample-interval",
+        type=float,
+        help="Seconds between RSS/CPU samples of Cherry's processes (the app, its cherry helpers, its session "
+        "host's daemon and holders).",
+    )
     parser.add_argument(
         "--spawn-interval",
         type=float,
@@ -93,11 +81,6 @@ def parse_args():
     parser.add_argument("--keep-open", action="store_true", help="Leave spawned Cherry processes open at the end.")
     parser.add_argument("--log-dir", default=str(REPO_ROOT / ".build" / "perf"), help="Directory for JSON report.")
     return parser.parse_args()
-
-
-def setting(args, key):
-    value = getattr(args, key)
-    return value if value is not None else SCALES[args.scale][key]
 
 
 def find_socket(explicit):
@@ -118,8 +101,20 @@ def find_socket(explicit):
     return candidates[0]
 
 
-def enum_case(name, payload=None):
-    return {name: {"_0": payload} if payload is not None else {}}
+def require_private_run(socket_path, force):
+    """Refuse a Cherry that is not a private run's, such as the user's own
+    (a Cherry tab's CHERRY_CONTROL_SOCKET names it), unless forced."""
+    if force or cherry_private_host.is_private_run_directory(socket_path.parent):
+        return
+    raise SystemExit(
+        f"{socket_path} is not in a private Cherry run directory (0700, yours, with home/ in it), so it may be "
+        "your own Cherry, which the soak would fill with project windows and tabs. Run Cherry from a private "
+        "directory (Scripts/perf-run-emulator-comparison --cherry-only does, or see docs/performance.md), "
+        "or pass --force."
+    )
+
+
+enum_case = cherry_private_host.enum_case
 
 
 def scoped(project_root, request):
@@ -127,37 +122,12 @@ def scoped(project_root, request):
 
 
 def send(socket_path, request, timeout=15):
-    payload = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        try:
-            sock.connect(str(socket_path))
-        except OSError as error:
-            raise RuntimeError(
-                f"Could not connect to Cherry at {socket_path}. Start Cherry first or pass --socket. ({error})"
-            ) from error
-        sock.sendall(payload)
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except OSError as error:
-            if error.errno != errno.ENOTCONN:
-                raise
-        data = bytearray()
-        while True:
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            data.extend(chunk)
-            if data.endswith(b"\n"):
-                break
-
-    if not data:
-        raise RuntimeError("Cherry returned an empty control response.")
-    response = json.loads(data.decode("utf-8"))
-    if response.get("error"):
-        error = response["error"]
-        raise RuntimeError(f"{error.get('code')}: {error.get('message')}")
-    return response["result"]
+    try:
+        return cherry_private_host.control_request(socket_path, request, timeout)
+    except (FileNotFoundError, ConnectionRefusedError) as error:
+        raise RuntimeError(
+            f"Could not connect to Cherry at {socket_path}. Start Cherry first or pass --socket. ({error})"
+        ) from error
 
 
 def result_payload(result, case_name):
@@ -165,26 +135,6 @@ def result_payload(result, case_name):
     if payload is None:
         raise RuntimeError(f"Expected result case {case_name}, got {result}")
     return payload.get("_0", payload)
-
-
-def shell_command(mode, duration, lines, frames, progress_frames, sleep_ms, rate_mib_per_second):
-    command = [
-        str(WORKLOAD_SCRIPT),
-        mode,
-        "--duration",
-        str(max(1, int(duration))),
-        "--lines",
-        str(lines),
-        "--frames",
-        str(frames),
-        "--progress-frames",
-        str(progress_frames),
-        "--sleep-ms",
-        str(max(0, sleep_ms)),
-        "--rate-mib-per-second",
-        str(max(0, rate_mib_per_second)),
-    ]
-    return " ".join(shlex.quote(part) for part in command)
 
 
 def process_snapshot(socket_path, project_root):
@@ -269,54 +219,51 @@ def cherry_pid_for_socket(socket_path):
         return []
 
 
-def sample_processes(pids):
-    if not pids:
-        return {"processes": [], "total_rss_bytes": 0, "total_cpu_percent": 0.0}
+def host_socket_for(socket_path):
+    """The session-host socket of the Cherry at `socket_path`:
+    CHERRY_HOST_SOCKET (as Scripts/perf-run-emulator-comparison sets it),
+    else the one beside it in a private run directory. A forced run of
+    another Cherry samples its daemon and holders only when that names
+    them."""
+    return os.environ.get("CHERRY_HOST_SOCKET") or str(cherry_private_host.layout(socket_path.parent)[2])
 
-    try:
-        output = subprocess.check_output(
-            [
-                "/bin/ps",
-                "-o",
-                "pid=,rss=,pcpu=,etime=",
-                "-p",
-                ",".join(str(pid) for pid in pids),
-            ],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=2,
-        )
-    except Exception as error:
-        return {
-            "processes": [],
-            "total_rss_bytes": 0,
-            "total_cpu_percent": 0.0,
-            "error": str(error),
-        }
 
-    processes = []
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        try:
-            pid = int(parts[0])
-            rss_bytes = int(parts[1]) * 1024
-            cpu_percent = float(parts[2])
-        except ValueError:
-            continue
-        processes.append({
-            "pid": pid,
-            "rss_bytes": rss_bytes,
-            "cpu_percent": cpu_percent,
-            "elapsed": parts[3],
-        })
+def executables():
+    """Each process's executable, by pid."""
+    listing = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,comm="],
+                             capture_output=True, text=True, check=False).stdout
+    found = {}
+    for line in listing.splitlines():
+        pid, _, path = line.strip().partition(" ")
+        if pid.isdigit():
+            found[int(pid)] = path.strip()
+    return found
 
-    return {
-        "processes": processes,
-        "total_rss_bytes": sum(process["rss_bytes"] for process in processes),
-        "total_cpu_percent": sum(process["cpu_percent"] for process in processes),
-    }
+
+def cherry_processes(app_pids, host_socket):
+    """Cherry's processes by pid, with their role: the app, the cherry
+    helpers it runs (persistent tabs' attach adapters, its control
+    connection), and its session host's daemon and holders, which run apart
+    from it. Not the shells and programs in its tabs (nor the login(1) they
+    run under): the Ghostty control run samples only Ghostty."""
+    table = cherry_private_host.process_table()
+    names = {pid: Path(path).name for pid, path in executables().items()}
+    children = {}
+    for pid, parent, _ in table:
+        children.setdefault(parent, []).append(pid)
+    commands = {pid: command for pid, _, command in table}
+    roles = {pid: "app" for pid in app_pids if pid in commands}
+    pending = list(roles)
+    while pending:
+        for child in children.get(pending.pop(), []):
+            pending.append(child)
+            if names.get(child) == "cherry":
+                roles[child] = "adapter" if " attach " in commands[child] else "helper"
+    host = re.compile(rf" (serve|hold) --socket {re.escape(host_socket)}(?: |$)")
+    for pid, command in commands.items():
+        if names.get(pid) == "cherry-host" and (match := host.search(command)):
+            roles[pid] = "daemon" if match.group(1) == "serve" else "holder"
+    return roles
 
 
 def wait_for_workload_start(socket_path, project_root, process_id, mode, timeout=5):
@@ -359,193 +306,26 @@ def wait_for_workload_start(socket_path, project_root, process_id, mode, timeout
     )
 
 
-def performance_totals(sample):
-    statuses = [
-        entry["status"]
-        for entry in sample.get("performance", [])
-        if isinstance(entry, dict) and isinstance(entry.get("status"), dict)
-    ]
-    if not statuses:
-        return None
-
-    def value(status, key, default=0):
-        return status.get(key, default) or default
-
-    def counter(status, key, default=0):
-        return (status.get("terminalPerfCounters") or {}).get(key, default) or default
-
-    return {
-        "process_count": sum((status.get("processCounts") or {}).get("total", 0) for status in statuses),
-        "ghostty_live_bridge_count": max(value(status, "ghosttyLiveBridgeCount") for status in statuses),
-        "ghostty_output_observer_count": max(value(status, "ghosttyInstalledOutputObserverCount") for status in statuses),
-        "raw_output_observer_count": sum(value(status, "rawOutputObserverCount") for status in statuses),
-        "raw_output_retained_bytes": sum(value(status, "rawOutputRetainedBytes") for status in statuses),
-        "raw_output_retained_chunk_count": sum(value(status, "rawOutputRetainedChunkCount") for status in statuses),
-        "terminal_perf_enabled": any(bool(status.get("terminalPerfEnabled")) for status in statuses),
-        "pty_chunks": max(counter(status, "ptyChunks") for status in statuses),
-        "pty_bytes": max(counter(status, "ptyBytes") for status in statuses),
-        "ghostty_feed_chunks": max(counter(status, "ghosttyFeedChunks") for status in statuses),
-        "ghostty_feed_bytes": max(counter(status, "ghosttyFeedBytes") for status in statuses),
-        "processor_backlog_drop_count": max(counter(status, "processorBacklogDropCount") for status in statuses),
-        "processor_backlog_dropped_bytes": max(counter(status, "processorBacklogDroppedBytes") for status in statuses),
-        "background_output_throttle_count": max(counter(status, "backgroundOutputThrottleCount") for status in statuses),
-        "bridge_attaches": max(counter(status, "bridgeAttaches") for status in statuses),
-        "render_ticks": max(counter(status, "renderTicks") for status in statuses),
-    }
-
-
-def rss_drift(prefix, start, end):
-    elapsed = max(0.0, float(end.get("elapsed_seconds", 0.0)) - float(start.get("elapsed_seconds", 0.0)))
-    start_rss = int(start.get("total_rss_bytes", 0))
-    end_rss = int(end.get("total_rss_bytes", 0))
-    delta = end_rss - start_rss
-    growth = (delta / elapsed) if elapsed > 0 else 0.0
-    return {
-        f"{prefix}_start_label": start.get("label", ""),
-        f"{prefix}_end_label": end.get("label", ""),
-        f"{prefix}_elapsed_seconds": elapsed,
-        f"{prefix}_start_total_rss_bytes": start_rss,
-        f"{prefix}_end_total_rss_bytes": end_rss,
-        f"{prefix}_rss_delta_bytes": delta,
-        f"{prefix}_rss_growth_mib_per_hour": (growth * 3600) / 1_048_576,
-    }
-
-
-def steady_state_drift(ordered_samples):
-    empty = {
-        "steady_state_start_label": "",
-        "steady_state_end_label": "",
-        "steady_state_elapsed_seconds": 0.0,
-        "steady_state_start_total_rss_bytes": 0,
-        "steady_state_end_total_rss_bytes": 0,
-        "steady_state_rss_delta_bytes": 0,
-        "steady_state_rss_growth_mib_per_hour": 0.0,
-    }
-    start = next((sample for sample in ordered_samples if sample.get("label") == "after_spawn"), None)
-    if start is None:
-        return empty
-
-    start_elapsed = float(start.get("elapsed_seconds", 0.0))
-    end_labels = {"during_selection", "before_close", "failure"}
-    candidates = [
-        sample for sample in ordered_samples
-        if sample is not start
-        and float(sample.get("elapsed_seconds", 0.0)) >= start_elapsed
-        and sample.get("label") in end_labels
-    ]
-    end = candidates[-1] if candidates else start
-    return rss_drift("steady_state", start, end)
-
-
-def summarize_samples(samples):
-    if not samples:
-        return {
-            "sample_count": 0,
-            "first_total_rss_bytes": 0,
-            "last_total_rss_bytes": 0,
-            "min_total_rss_bytes": 0,
-            "max_total_rss_bytes": 0,
-            "rss_delta_bytes": 0,
-            "rss_growth_bytes_per_second": 0.0,
-            "rss_growth_mib_per_hour": 0.0,
-            "max_total_cpu_percent": 0.0,
-            "max_process_rss_bytes": 0,
-            "performance_sample_count": 0,
-            "max_ghostty_live_bridge_count": 0,
-            "last_ghostty_live_bridge_count": 0,
-            "max_ghostty_output_observer_count": 0,
-            "last_ghostty_output_observer_count": 0,
-            "max_raw_output_observer_count": 0,
-            "last_raw_output_observer_count": 0,
-            "max_raw_output_retained_bytes": 0,
-            "last_raw_output_retained_bytes": 0,
-            "max_raw_output_retained_chunk_count": 0,
-            "last_raw_output_retained_chunk_count": 0,
-            "last_terminal_perf_background_output_throttle_count": 0,
-            "steady_state_start_label": "",
-            "steady_state_end_label": "",
-            "steady_state_elapsed_seconds": 0.0,
-            "steady_state_start_total_rss_bytes": 0,
-            "steady_state_end_total_rss_bytes": 0,
-            "steady_state_rss_delta_bytes": 0,
-            "steady_state_rss_growth_mib_per_hour": 0.0,
-        }
-
-    ordered = sorted(samples, key=lambda sample: sample.get("elapsed_seconds", 0.0))
-    first = ordered[0]
-    last = ordered[-1]
-    elapsed = max(0.0, float(last.get("elapsed_seconds", 0.0)) - float(first.get("elapsed_seconds", 0.0)))
-    first_rss = int(first.get("total_rss_bytes", 0))
-    last_rss = int(last.get("total_rss_bytes", 0))
-    rss_delta = last_rss - first_rss
-    rss_growth = (rss_delta / elapsed) if elapsed > 0 else 0.0
-
-    max_process_rss = 0
-    for sample in ordered:
-        for process in sample.get("processes", []):
-            max_process_rss = max(max_process_rss, process.get("rss_bytes", 0))
-
-    performance_samples = [
-        totals for sample in ordered
-        if (totals := performance_totals(sample)) is not None
-    ]
-    last_performance = performance_samples[-1] if performance_samples else {}
-    steady_state = steady_state_drift(ordered)
-
-    return {
-        "sample_count": len(ordered),
-        "first_total_rss_bytes": first_rss,
-        "last_total_rss_bytes": last_rss,
-        "min_total_rss_bytes": min(sample.get("total_rss_bytes", 0) for sample in ordered),
-        "max_total_rss_bytes": max(sample.get("total_rss_bytes", 0) for sample in ordered),
-        "rss_delta_bytes": rss_delta,
-        "rss_growth_bytes_per_second": rss_growth,
-        "rss_growth_mib_per_hour": (rss_growth * 3600) / 1_048_576,
-        **steady_state,
-        "max_total_cpu_percent": max(sample.get("total_cpu_percent", 0.0) for sample in ordered),
-        "max_process_rss_bytes": max_process_rss,
-        "performance_sample_count": len(performance_samples),
-        "max_ghostty_live_bridge_count": max((sample["ghostty_live_bridge_count"] for sample in performance_samples), default=0),
-        "last_ghostty_live_bridge_count": last_performance.get("ghostty_live_bridge_count", 0),
-        "max_ghostty_output_observer_count": max((sample["ghostty_output_observer_count"] for sample in performance_samples), default=0),
-        "last_ghostty_output_observer_count": last_performance.get("ghostty_output_observer_count", 0),
-        "max_raw_output_observer_count": max((sample["raw_output_observer_count"] for sample in performance_samples), default=0),
-        "last_raw_output_observer_count": last_performance.get("raw_output_observer_count", 0),
-        "max_raw_output_retained_bytes": max((sample["raw_output_retained_bytes"] for sample in performance_samples), default=0),
-        "last_raw_output_retained_bytes": last_performance.get("raw_output_retained_bytes", 0),
-        "max_raw_output_retained_chunk_count": max((sample["raw_output_retained_chunk_count"] for sample in performance_samples), default=0),
-        "last_raw_output_retained_chunk_count": last_performance.get("raw_output_retained_chunk_count", 0),
-        "last_terminal_perf_pty_chunks": last_performance.get("pty_chunks", 0),
-        "last_terminal_perf_pty_bytes": last_performance.get("pty_bytes", 0),
-        "last_terminal_perf_ghostty_feed_chunks": last_performance.get("ghostty_feed_chunks", 0),
-        "last_terminal_perf_ghostty_feed_bytes": last_performance.get("ghostty_feed_bytes", 0),
-        "last_terminal_perf_processor_backlog_drop_count": last_performance.get("processor_backlog_drop_count", 0),
-        "last_terminal_perf_processor_backlog_dropped_bytes": last_performance.get("processor_backlog_dropped_bytes", 0),
-        "last_terminal_perf_background_output_throttle_count": last_performance.get("background_output_throttle_count", 0),
-        "last_terminal_perf_bridge_attaches": last_performance.get("bridge_attaches", 0),
-        "last_terminal_perf_render_ticks": last_performance.get("render_ticks", 0),
-    }
-
-
 def main():
     args = parse_args()
-    duration = setting(args, "duration")
-    tabs = setting(args, "tabs")
-    windows = setting(args, "windows")
-    lines = setting(args, "lines")
-    frames = setting(args, "frames")
-    progress_frames = setting(args, "progress_frames")
-    sleep_ms = setting(args, "sleep_ms")
-    rate_mib_per_second = setting(args, "rate_mib_per_second")
-    select_interval = setting(args, "select_interval")
-    sample_interval = setting(args, "sample_interval")
+    duration = perf_common.setting(args, SCALES, "duration")
+    tabs = perf_common.setting(args, SCALES, "tabs")
+    windows = perf_common.setting(args, SCALES, "windows")
+    lines = perf_common.setting(args, SCALES, "lines")
+    frames = perf_common.setting(args, SCALES, "frames")
+    progress_frames = perf_common.setting(args, SCALES, "progress_frames")
+    sleep_ms = perf_common.setting(args, SCALES, "sleep_ms")
+    rate_mib_per_second = perf_common.setting(args, SCALES, "rate_mib_per_second")
+    select_interval = perf_common.setting(args, SCALES, "select_interval")
+    sample_interval = perf_common.setting(args, SCALES, "sample_interval")
     socket_path = find_socket(args.socket)
+    require_private_run(socket_path, args.force)
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     project_roots = choose_project_roots(socket_path, args, windows)
 
-    command = shell_command(
+    command = perf_common.shell_command(
         args.mode,
         duration,
         lines,
@@ -555,10 +335,12 @@ def main():
         rate_mib_per_second,
     )
     cherry_pids = cherry_pid_for_socket(socket_path)
+    host_socket = host_socket_for(socket_path)
     start_time = time.monotonic()
     report = {
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "socket": str(socket_path),
+        "host_socket": host_socket,
         "cherry_pids": cherry_pids,
         "scale": args.scale,
         "mode": args.mode,
@@ -577,7 +359,10 @@ def main():
     spawned = []
 
     def add_sample(label):
-        sample = sample_processes(cherry_pids)
+        roles = cherry_processes(cherry_pids, host_socket)
+        sample = perf_common.sample_processes(sorted(roles))
+        for process in sample["processes"]:
+            process["role"] = roles.get(process["pid"], "")
         sample["label"] = label
         sample["elapsed_seconds"] = round(time.monotonic() - start_time, 3)
         sample["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -587,6 +372,7 @@ def main():
     print(f"[soak] socket={socket_path}")
     print(f"[soak] command={command}")
     print(f"[soak] cherry_pids={','.join(str(pid) for pid in cherry_pids) or '<none>'}")
+    print(f"[soak] host_socket={host_socket}")
     add_sample("start")
 
     failure = None
@@ -682,7 +468,7 @@ def main():
     if not args.keep_open and args.settle_after_close > 0:
         time.sleep(args.settle_after_close)
     add_sample("after_close" if not args.keep_open else "kept_open")
-    report["sample_summary"] = summarize_samples(report["samples"])
+    report["sample_summary"] = perf_common.summarize_app_samples(report["samples"])
     report_path = log_dir / f"app-soak-{args.scale}-{time.strftime('%Y%m%d-%H%M%S')}.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     print(f"[soak] wrote {report_path}")
@@ -700,9 +486,6 @@ def main():
         f"last_bridges={summary['last_ghostty_live_bridge_count']} "
         f"last_observers={summary['last_ghostty_output_observer_count']} "
         f"last_raw_observers={summary['last_raw_output_observer_count']} "
-        f"last_raw_mib={summary['last_raw_output_retained_bytes'] / 1_048_576:.1f} "
-        f"processor_backlog_dropped_mib={summary['last_terminal_perf_processor_backlog_dropped_bytes'] / 1_048_576:.1f} "
-        f"background_throttles={summary['last_terminal_perf_background_output_throttle_count']} "
         f"max_cpu_percent={summary['max_total_cpu_percent']:.1f}"
     )
     if failure is not None:

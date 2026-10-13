@@ -30,6 +30,9 @@
 # Without --skip-build, the Swift tests are built first, and for real-host
 # the Rust helpers too (Scripts/build-host debug). CI builds them in earlier
 # steps and passes --skip-build.
+#
+# The tests run without any CHERRY_* or GHOSTTY_* variable (see
+# without_tab_environment), so a run from a Cherry tab runs as CI does.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -82,19 +85,30 @@ else
   fold_start='==> ' fold_end='' error='error: '
 fi
 
+# A Cherry tab's own variables (its control socket, tab and agent ids, MCP
+# token and helper, Ghostty's shell integration) would make the tests of a
+# run from that tab see the user's app: ControlAgentTask*'s workers, for one,
+# are then refused as unauthorized. Every test runs without them; each mode
+# sets what it needs (CHERRY_TEST_HOST_INTEGRATION) after this.
+without_tab_environment=(env)
+while IFS= read -r name; do
+  without_tab_environment+=(-u "$name")
+done < <(compgen -e | grep -E '^(CHERRY|GHOSTTY)_' || true)
+
 # How many tests whose name matches $2 reached outcome $3 in log $1.
 count() {
   grep -E "Test $2 $3" "$1" | grep -cv 'Test run with' || true
 }
 
-# Run the tests `filter` selects, logging to $logs/<label>.log. Swift Testing
-# exits non-zero when any selected test fails.
+# Run the tests `filter` selects, without the tab environment and with the
+# variables the arguments after it set, logging to $logs/<label>.log. Swift
+# Testing exits non-zero when any selected test fails.
 run_filter() {
   local label=$1 filter=$2
   shift 2
   local log="$logs/$label.log"
   echo "${fold_start}swift test --filter '$filter'"
-  if ! "$@" swift test --skip-build --no-parallel --filter "$filter" 2>&1 | tee "$log"; then
+  if ! "${without_tab_environment[@]}" "$@" swift test --skip-build --no-parallel --filter "$filter" 2>&1 | tee "$log"; then
     failures+=("$label: a selected test failed (see $log)")
   fi
   [ -z "$fold_end" ] || echo "$fold_end"
@@ -170,8 +184,9 @@ case "$mode" in
     fi
     for group in "${groups[@]}"; do
       label=${group//[^A-Za-z]/}
-      # Real-host tests are gated on this variable; they run in real-host mode.
-      run_filter "$label" "$group" env -u CHERRY_TEST_HOST_INTEGRATION
+      # Real-host tests are gated on CHERRY_TEST_HOST_INTEGRATION, which the
+      # tab environment's removal drops; they run in real-host mode.
+      run_filter "$label" "$group"
       passed=$(count "$logs/$label.log" '.+' 'passed after')
       if [ "$passed" -eq 0 ]; then
         failures+=("$group: no test passed; the filter no longer selects its tests")
@@ -186,7 +201,7 @@ case "$mode" in
     fi
     ;;
   real-host)
-    run_filter RealHost RealHost env CHERRY_TEST_HOST_INTEGRATION=1
+    run_filter RealHost RealHost CHERRY_TEST_HOST_INTEGRATION=1
     log="$logs/RealHost.log"
     skipped=$(count "$log" '.+' 'skipped')
     if [ "$skipped" -ne 0 ]; then

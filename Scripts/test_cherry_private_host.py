@@ -9,9 +9,11 @@ Run: python3 Scripts/test_cherry_private_host.py
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -121,6 +123,20 @@ class PrivateDirectoryTests(unittest.TestCase):
         self.assertLess(len(os.fsencode(str(host_socket))), 104)
         self.assertLess(len(os.fsencode(str(control_socket))), 104)
 
+    def test_tells_a_private_run_directory_apart(self):
+        directory = host.make_private_directory("chp-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        self.assertTrue(host.is_private_run_directory(directory))
+        self.assertFalse(host.is_private_run_directory(directory / "missing"))
+        for mode, with_home in ((0o755, True), (0o700, False)):
+            other = Path(tempfile.mkdtemp(prefix="chp-"))
+            self.addCleanup(shutil.rmtree, other, True)
+            other.chmod(mode)
+            if with_home:
+                (other / "home").mkdir()
+            with self.subTest(mode=oct(mode), with_home=with_home):
+                self.assertFalse(host.is_private_run_directory(other))
+
     def test_stop_refuses_a_directory_it_did_not_make(self):
         for mode, with_home in ((0o755, True), (0o700, False)):
             directory = Path(tempfile.mkdtemp(prefix="chp-"))
@@ -177,6 +193,71 @@ class DevelopmentCliTests(unittest.TestCase):
         self.assertEqual(self.cli(PATH=f"{self.root / 'gui'}:{self.root / 'bin'}"), on_path)
         workspace_release = executable(self.repository / "Host/target/release/cherry")
         self.assertEqual(self.cli(PATH=str(self.root / "bin")), workspace_release)
+
+
+class ControlRequestTests(unittest.TestCase):
+    """control_request against a stand-in for Cherry's control socket."""
+
+    def serve(self, answer):
+        """A socket that answers one request with `answer`; returns its path
+        and a list that gets the request it read."""
+        directory = Path(tempfile.mkdtemp(prefix="chp-", dir="/private/tmp" if os.path.isdir("/private/tmp") else None))
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "control.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(str(path))
+        listener.listen(1)
+        received = []
+
+        def respond():
+            connection, _ = listener.accept()
+            with connection:
+                request = bytearray()
+                while chunk := connection.recv(65536):
+                    request.extend(chunk)
+                received.append(bytes(request))
+                connection.sendall(answer)
+
+        thread = threading.Thread(target=respond, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        return path, received
+
+    def test_sends_one_line_and_returns_the_result(self):
+        path, received = self.serve(b'{"result":{"listProcesses":{"_0":{"processes":[]}}}}\n')
+        request = host.enum_case("scoped", {"projectRoot": "/p", "request": host.enum_case("listProcesses", {})})
+        result = host.control_request(path, request, timeout=5)
+        self.assertEqual(result, {"listProcesses": {"_0": {"processes": []}}})
+        self.assertEqual(received, [b'{"scoped":{"_0":{"projectRoot":"/p","request":{"listProcesses":{"_0":{}}}}}}\n'])
+        self.assertEqual(host.enum_case("listProjects"), {"listProjects": {}})
+
+    def test_an_error_or_no_answer_raises(self):
+        for answer, message in ((b'{"error":{"code":"not_found","message":"no such process"}}\n',
+                                 "not_found: no such process"),
+                                (b"", "empty control response")):
+            with self.subTest(answer=answer):
+                path, _ = self.serve(answer)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    host.control_request(path, host.enum_case("listProjects"), timeout=5)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the process listing is macOS'")
+class ProcessesTests(unittest.TestCase):
+    def test_spares_this_process_and_the_ones_it_descends_from(self):
+        marker = f"chp-ancestors-{os.getpid()}-{time.monotonic_ns()}"
+        other = orphan(marker)
+        self.addCleanup(lambda: alive(other) and os.kill(other, 9))
+        # A shell whose command line names the marker runs a Python that
+        # names it too and lists the processes that do, as a shell that runs
+        # `stop` can name the run's directory. (The command after the Python
+        # keeps the shell from replacing itself with it.)
+        lister = ("import sys; sys.path.insert(0, sys.argv[1]); import cherry_private_host as host; "
+                  "print(sorted(pid for pid, _ in host.processes(lambda command: sys.argv[2] in command)))")
+        listed = subprocess.run(["/bin/sh", "-c", f'"$0" -B -c "$1" "$2" "$3"; : {marker}',
+                                 sys.executable, lister, str(REPOSITORY / "Scripts"), marker],
+                                capture_output=True, text=True, timeout=30, check=True).stdout
+        self.assertEqual(json.loads(listed), [other])
 
 
 @unittest.skipUnless(sys.platform == "darwin", "the state directory and process listing are macOS'")

@@ -459,11 +459,13 @@ Scripts/perf-terminal-stress --standard
 ```
 
 Use `--smoke` for a quick check and `--soak` before perf-sensitive changes. For
-real app UI soak runs, start Cherry and run `Scripts/perf-app-soak --scale
-standard`. `Scripts/perf-app-report` summarizes peak RSS, end-to-start RSS
-drift, MiB/hour growth, Ghostty bridge/observer counts, and raw replay
-retention, with hard gates for CPU, memory drift, retained output, and PTY
-callback density so long-session leaks are visible. Use paced TUI soaks such as
+real app UI soak runs, run `Scripts/perf-run-emulator-comparison --cherry-only`,
+which runs Cherry from a private directory and drives it with
+`Scripts/perf-app-soak` (which refuses to drive your own Cherry unless forced).
+`Scripts/perf-app-report` summarizes peak RSS, end-to-start RSS drift, MiB/hour
+growth and Ghostty bridge/observer counts of Cherry's processes (the app, its
+helpers and its session host), with hard gates for CPU and memory drift so
+long-session leaks are visible. Use paced TUI soaks such as
 `--mode tui --sleep-ms 4` for long-session stability, and keep unpaced `mixed`
 runs as overload/flood stress. `Scripts/perf-ghostty-workload` and
 `Scripts/perf-ghostty-report` capture the same workload in Ghostty as a control

@@ -290,8 +290,13 @@ import Testing
         )
     }
 
+    /// Switching through many sessions keeps each detached surface warm, fed
+    /// by its output observer, up to `GhosttySessionBridge.liveSurfaceLimit`
+    /// (64 by default); the least recently used past it are released with
+    /// their observers. With keep-warm off (`CHERRY_LIVE_SURFACE_LIMIT=0`)
+    /// every detached surface is released after the release delay.
     @MainActor
-    @Test func detachedGhosttySurfacesReleaseAfterManySessionSwitches() async throws {
+    @Test func detachedGhosttySurfacesStayWarmUpToTheLiveSurfaceLimit() async throws {
         guard TerminalPerfHarness.isEnabled else { return }
         let scale = TerminalPerfHarness.scale
         let startingObserverCount = GhosttySessionBridge.installedOutputObserverCount
@@ -313,7 +318,7 @@ import Testing
         }
 
         let result = TerminalPerfHarness.measure(
-            name: "ghostty-detached-surface-release",
+            name: "ghostty-detached-surface-switches",
             bytes: 0,
             metadata: scale.description
         ) {
@@ -333,15 +338,16 @@ import Testing
 
         try await Task.sleep(for: .milliseconds(20))
 
-        let observerCountAfterRelease = GhosttySessionBridge.installedOutputObserverCount
-        let retainedDetachedObservers = sessions.dropLast().reduce(0) { $0 + $1.rawOutputObserverCount }
+        let observerCountAfterSwitches = GhosttySessionBridge.installedOutputObserverCount
+        let warmDetachedObservers = sessions.dropLast().reduce(0) { $0 + $1.rawOutputObserverCount }
         let activeObserverCount = sessions.last?.rawOutputObserverCount ?? 0
+        let warmLimit = GhosttySessionBridge.liveSurfaceLimit ?? 0
 
-        #expect(retainedDetachedObservers == 0)
+        #expect(warmDetachedObservers == min(sessions.count - 1, warmLimit))
         #expect(activeObserverCount == 1)
         TerminalPerfHarness.printResult(
             result,
-            extra: "sessions=\(scale.sessionCount) observersAfterRelease=\(observerCountAfterRelease - startingObserverCount) retainedDetachedObservers=\(retainedDetachedObservers)"
+            extra: "sessions=\(scale.sessionCount) observersAfterSwitches=\(observerCountAfterSwitches - startingObserverCount) warmDetachedObservers=\(warmDetachedObservers)"
         )
     }
 

@@ -4,12 +4,30 @@ Cherry should stay responsive and memory-stable during long-lived agent workspac
 
 ## What We Measure
 
-- Long scrollback replay through Cherry's live terminal state tracking.
-- TUI-style alternate-screen redraws that repaint the viewport many times.
-- Raw PTY output retention, including the 1 MiB replay buffer used when Ghostty surfaces attach.
-- Many long-lived sessions receiving small output bursts, which stresses per-session raw replay retention and object churn.
-- Ghostty bridge/session churn and detached-surface release across many terminal sessions.
-- Runtime counters from `CHERRY_TERMINAL_PERF=1`: PTY chunks, Ghostty feed chunks, render ticks, SwiftUI representable updates, container configures, bridge attaches, `fitToSize`, and settings reconfigures.
+In the app a tab's PTY belongs to its Ghostty surface (a native tab) or to its
+session's `cherry-host hold` holder (a persistent tab, the default), not to
+Cherry. Cherry's own host-managed path (`LiveTerminalOutputBuffer`, the raw
+output it keeps for replay, PTY coalescing) runs only in tests, so only the
+synthetic suite measures it.
+
+- Synthetic suite (`Scripts/perf-terminal-stress`):
+  - Long scrollback and TUI-style alternate-screen redraws through the
+    host-managed buffer.
+  - Raw output retention of host-managed sessions, also with many long-lived
+    sessions receiving small output bursts.
+  - Rebuilding an evicted surface from a styled replay (`renderedReplayOutput`).
+  - Ghostty bridge/session churn across many sessions, and detached surfaces
+    kept warm up to the live-surface cap (see below).
+  - The sidebar switching workspaces with a large note collection.
+- App soak (`Scripts/perf-app-soak`): RSS and CPU of Cherry's processes (the
+  app, its attach adapters and control helper, its session host's daemon and
+  holders) under real workloads, and the runtime counters from
+  `CHERRY_TERMINAL_PERF=1`: Ghostty bridges and output observers, Ghostty feed
+  chunks, render ticks, SwiftUI representable updates, container configures,
+  bridge attaches, `fitToSize`, and settings reconfigures. Its PTY chunk,
+  processor backlog, background throttle and raw retention counters count
+  only the host-managed path, so they stay at 0 in the app and the soak
+  reports leave them out.
 
 ## Commands
 
@@ -32,10 +50,12 @@ Scripts/perf-terminal-stress --soak
 ```
 
 The script writes logs under `.build/perf/` and runs `swift test -c release --no-parallel --filter TerminalPerformanceStressTests` with `CHERRY_PERF_STRESS=1`.
-It also writes a parsed JSON report beside the log.
+It also writes a parsed JSON report beside the log, also when a test fails (the
+script then exits with the suite's status).
 
-The synthetic suite is intentionally headless. It catches parser/state-tracking,
-raw-output-retention, and bridge-lifetime regressions without opening the app.
+The synthetic suite is intentionally headless. It catches parser/state-tracking
+and raw-output-retention regressions of the host-managed path, and
+bridge-lifetime regressions, without opening the app.
 
 To create a local machine baseline and fail future runs that regress beyond the
 default 25% tolerance, keep one baseline per scale/configuration:
@@ -53,41 +73,67 @@ local machine or CI runner.
 
 ## App-Level Soak
 
-Use the real app for UI/rendering work that synthetic tests cannot cover. Start
-Cherry with performance counters enabled:
+Use the real app for UI/rendering work that synthetic tests cannot cover. The
+simplest run is `Scripts/perf-run-emulator-comparison --cherry-only` (see the
+shapes below): it builds Cherry, runs it from a private directory and drives it
+with `Scripts/perf-app-soak`.
+
+To drive a Cherry you start yourself, run CherryDev, not `swift run Cherry`
+(which has the installed Cherry's identity: it restores, saves and ends your
+own tabs and sessions on the shared session host), with a private `HOME` and
+private sockets in a private (0700) directory, and performance counters
+enabled:
 
 ```bash
-CHERRY_TERMINAL_PERF=1 \
-CHERRY_PERF_PROJECT_ROOTS="$PWD" \
-swift run Cherry
+./script/build_and_run.sh build
+dir=$(mktemp -d /private/tmp/cherry-perf-XXXXXX); mkdir -m 700 "$dir/home"
+HOME="$dir/home" CFFIXED_USER_HOME="$dir/home" \
+CHERRY_HOST_SOCKET="$dir/host.sock" CHERRY_CONTROL_SOCKET="$dir/control.sock" \
+CHERRY_TERMINAL_PERF=1 CHERRY_PERF_PROJECT_ROOTS="$PWD" \
+  dist/CherryDev.app/Contents/MacOS/CherryDev -sessions.onQuit keep &
 ```
 
 `CHERRY_PERF_PROJECT_ROOTS` is a colon- or newline-separated list of valid
 directories. It is only honored when `CHERRY_TERMINAL_PERF=1` and does not save
 those projects to app preferences.
 
-Then drive the running app from another terminal:
+Then drive it, with the same `$dir`:
 
 ```bash
-Scripts/perf-app-soak --scale smoke
-Scripts/perf-app-soak --scale standard
-Scripts/perf-app-soak --scale soak --windows 3 --tabs 24
+Scripts/perf-app-soak --socket "$dir/control.sock" --scale smoke
+Scripts/perf-app-soak --socket "$dir/control.sock" --scale standard
+Scripts/perf-app-soak --socket "$dir/control.sock" --scale soak --windows 3 --tabs 24
+```
+
+When you are done, quit CherryDev, wait for its process to exit, and end the
+run's sessions and session host and delete the directory:
+
+```bash
+python3 Scripts/cherry_private_host.py stop "$dir" --cli dist/CherryDev.app/Contents/MacOS/cherry
 ```
 
 `Scripts/perf-app-soak` talks to Cherry's local control socket, opens project
 windows from Cherry's configured/open project list, creates terminal tabs, sends
 deterministic workloads, cycles selection through the spawned tabs so Ghostty
 surfaces attach/detach, and writes a JSON report under `.build/perf/`. It
-verifies each spawned workload starts producing real terminal output before the
-soak window begins, so a command-submission regression fails loudly instead of
-measuring idle shells. It closes only the processes it created unless
-`--keep-open` is passed, then waits `--settle-after-close` seconds before the
-final sample so delayed detached Ghostty surface release is not mistaken for a
-leak. For multi-window runs, open or configure the target projects in Cherry
-first, or pass explicit repeated `--project-root` values. Large many-session
-runs can use `--spawn-interval` to pace setup while keeping the steady-state
-workload unchanged. Use `--sleep-ms` with TUI workloads when you want a
-frame-paced long-session soak instead of a flat-out PTY flood.
+refuses a control socket outside a private run directory (0700, yours, with
+`home/` in it), such as your own Cherry's, which a Cherry tab's
+`CHERRY_CONTROL_SOCKET` names, unless you pass `--force`. It samples the RSS
+and CPU of Cherry's processes: the app, the `cherry` helpers it runs
+(persistent tabs' attach adapters, its control connection) and its session
+host's daemon and holders (found by `CHERRY_HOST_SOCKET`, else the `host.sock`
+beside the control socket); not the shells and programs in its tabs, since the
+Ghostty control run samples only Ghostty. It verifies each spawned workload
+starts producing real terminal output before the soak window begins, so a
+command-submission regression fails loudly instead of measuring idle shells. It
+closes only the processes it created unless `--keep-open` is passed, then waits
+`--settle-after-close` seconds before the final sample so delayed detached
+Ghostty surface release is not mistaken for a leak. For multi-window runs, open
+or configure the target projects in Cherry first, or pass explicit repeated
+`--project-root` values. Large many-session runs can use `--spawn-interval` to
+pace setup while keeping the steady-state workload unchanged. Use `--sleep-ms`
+with TUI workloads when you want a frame-paced long-session soak instead of a
+flat-out PTY flood.
 
 Recommended app-level shapes:
 
@@ -116,14 +162,15 @@ Scripts/perf-run-emulator-comparison \
   --cherry-command 'swift run -c release Cherry'
 ```
 
-The app-soak JSON includes periodic Cherry process samples:
+The app-soak JSON includes periodic samples of Cherry's processes:
 
 - `samples[].total_rss_bytes`
 - `samples[].total_cpu_percent`
+- `samples[].processes[]` (`pid`, `rss_bytes`, `cpu_percent`, and `role`:
+  `app`, `adapter`, `helper`, `daemon` or `holder`)
 - `samples[].performance[].status.ghosttyLiveBridgeCount`
 - `samples[].performance[].status.ghosttyInstalledOutputObserverCount`
 - `samples[].performance[].status.rawOutputObserverCount`
-- `samples[].performance[].status.rawOutputRetainedBytes`
 - `samples[].performance[].status.terminalPerfCounters`
 - `sample_summary.max_total_rss_bytes`
 - `sample_summary.last_total_rss_bytes`
@@ -134,12 +181,8 @@ The app-soak JSON includes periodic Cherry process samples:
 - `sample_summary.last_ghostty_live_bridge_count`
 - `sample_summary.last_ghostty_output_observer_count`
 - `sample_summary.last_raw_output_observer_count`
-- `sample_summary.last_raw_output_retained_bytes`
-- `sample_summary.last_terminal_perf_pty_chunks`
-- `sample_summary.last_terminal_perf_pty_bytes`
-- `sample_summary.last_terminal_perf_processor_backlog_drop_count`
-- `sample_summary.last_terminal_perf_processor_backlog_dropped_bytes`
-- `sample_summary.last_terminal_perf_background_output_throttle_count`
+- `sample_summary.last_terminal_perf_bridge_attaches`
+- `sample_summary.last_terminal_perf_render_ticks`
 - `sample_summary.max_total_cpu_percent`
 
 For long-session leak hunting, prefer the drift fields over peak RSS alone:
@@ -148,8 +191,9 @@ For long-session leak hunting, prefer the drift fields over peak RSS alone:
 `steady_state_*` fields measure from after all workloads have started to the
 last active pre-close sample, which separates leak-like growth from the expected
 memory cost of opening many sessions. The Cherry-specific fields explain what
-grew: Ghostty surfaces/observers, raw replay retention, or terminal feed/render
-counters. Use `--sample-interval 10` to increase or decrease sampling frequency.
+grew: which of Cherry's processes (`role`), Ghostty surfaces/observers, or
+terminal feed/render counters. Use `--sample-interval 10` to increase or
+decrease sampling frequency.
 
 To summarize an app-soak run or compare it to a local app baseline:
 
@@ -168,34 +212,16 @@ comparison slack or a hard growth-rate limit:
 Scripts/perf-app-report .build/perf/app-soak-soak-NEW.json \
   --baseline .build/perf/baselines/app-soak-soak.json \
   --rss-growth-slack-mib 128 \
-  --cherry-count-slack 2 \
-  --raw-retention-slack-mib 128
+  --cherry-count-slack 2
 
 Scripts/perf-app-report .build/perf/app-soak-soak-NEW.json \
   --max-total-cpu-percent 150 \
-  --max-steady-state-rss-growth-mib-per-hour 1024 \
-  --max-raw-output-retained-mib 1 \
-  --max-pty-chunks-per-mib 160
+  --max-steady-state-rss-growth-mib-per-hour 1024
 ```
 
-`--max-total-cpu-percent` puts a hard ceiling on the summed Cherry process CPU
-seen during the run. Use a tighter value for paced TUI soaks and a higher
-mode-specific value for deliberate flood/overload tests.
-`--max-raw-output-retained-mib` is strict for the default close-and-settle
-workflow; increase it only when using `--keep-open` or intentionally sampling
-while workload tabs remain alive.
-`--max-pty-chunks-per-mib` protects the PTY coalescing path. A sudden jump in
-chunks per MiB usually means Cherry is back to processing tiny PTY reads one at
-a time, which shows up as CPU burn during redraw storms. Use a stricter limit
-for flat-out flood runs, and a looser mode-specific limit for paced TUI runs
-where the workload intentionally sleeps between frames.
-The processor backlog drop counters indicate that plain terminal sessions
-started shedding stale Cherry-side parser backlog to preserve app responsiveness;
-visible bytes are still retained for Ghostty replay through the raw output store.
-The background output throttle counter indicates that hidden plain terminals
-emitted enough data for Cherry to briefly pause their PTY readers. This
-backpressures runaway hidden output while selected terminals, agents, and
-managed commands continue reading normally.
+`--max-total-cpu-percent` puts a hard ceiling on the summed CPU of Cherry's
+processes seen during the run. Use a tighter value for paced TUI soaks and a
+higher mode-specific value for deliberate flood/overload tests.
 
 To watch Cherry's built-in performance counters while the soak runs:
 
@@ -244,10 +270,11 @@ Scripts/perf-ghostty-report .build/perf/ghostty-workload-standard-NEW.json \
 ```
 
 To compare Cherry directly against a Ghostty control run, match workload count
-and duration, then compare the reports:
+and duration, then compare the reports (here with a Cherry run from a private
+`$dir`, see App-Level Soak):
 
 ```bash
-Scripts/perf-app-soak --scale smoke --windows 3 --tabs 2 --duration 60
+Scripts/perf-app-soak --socket "$dir/control.sock" --scale smoke --windows 3 --tabs 2 --duration 60
 Scripts/perf-ghostty-workload --smoke --windows 6 --duration 60
 
 Scripts/perf-compare-emulators \
@@ -287,9 +314,9 @@ setting, and recorded in the manifest. At the end every session there is
 killed and removed, the daemon is shut down and the directory is deleted;
 `--keep-cherry-open` instead prints
 `python3 Scripts/cherry_private_host.py stop <dir>` for later teardown.
-`Scripts/perf-app-soak` driving a Cherry you started yourself measures that
-Cherry's own tabs, which are persistent sessions unless Settings › Sessions
-turns them off.
+`Scripts/perf-app-soak` driving a Cherry you started yourself (see App-Level
+Soak) measures that Cherry's own tabs, which are persistent sessions unless
+Settings › Sessions turns them off.
 
 For long leak-focused soaks where a Ghostty control would double the wall time,
 use the same launcher in Cherry-only mode:
@@ -316,11 +343,16 @@ Then gate the resulting app report with `--max-steady-state-rss-growth-mib-per-h
 
 Cherry-specific overhead to watch:
 
-- `TerminalSession` still stores raw PTY output and tracks session state while Ghostty renders.
-- Plain terminal sessions keep only a bounded auxiliary `LiveTerminalOutputBuffer`
-  scrollback for Cherry-side state; Ghostty owns the visible terminal scrollback.
-- `LiveTerminalOutputBuffer` parsing may duplicate work Ghostty already performs.
-- `GhosttyOutputSink` coalescing helps progress-frame storms, but should not add input latency after host input.
+- Ghostty (a native tab) or the session's holder (a persistent tab) owns the
+  PTY; Cherry reads each tab's screen text from its surface, or from the host
+  while a persistent tab's adapter is away, for its content model (MCP output
+  and search, the sidebar).
+- A persistent tab's output is parsed twice, by its holder's headless terminal
+  and by its Ghostty surface, and each persistent tab has two processes of its
+  own: its attach adapter (`cherry attach`) and its holder.
+- The host-managed `LiveTerminalOutputBuffer`, raw output store and
+  `GhosttyOutputSink` coalescing are what the synthetic suite measures; the
+  app's tabs do not feed them.
 - Surface detach/reattach should not leak `GhosttySessionBridge` objects or raw output observers.
 
 ### Keep background surfaces warm (`CHERRY_LIVE_SURFACE_LIMIT`)

@@ -65,6 +65,21 @@ enum OmniLocalFolders {
         ))
     }
 
+    /// Makes the folder at `path` (absolute), not its parents. A folder
+    /// already there is fine (made since the listing). Blocking.
+    static func create(_ path: String, fileManager: FileManager = .default) -> OmniFolderCreation {
+        do {
+            try fileManager.createDirectory(atPath: path, withIntermediateDirectories: false)
+            return .created
+        } catch {
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: path, isDirectory: &isDirectory) {
+                return isDirectory.boolValue ? .created : .notAFolder(path)
+            }
+            return .failed(error.localizedDescription)
+        }
+    }
+
     /// Where repositories are looked for, under the home folder: each
     /// pattern's `*` is one level.
     static let scanPatterns = ["github/*/*", "github/*", "code/*", "src/*", "Developer/*", "projects/*"]
@@ -98,8 +113,9 @@ enum OmniLocalFolders {
 
 // MARK: - Another Mac
 
-/// The scripts that list a folder and find repositories on another Mac,
-/// run with `sh -s` over its SSH master. The folder asked for is never in
+/// The scripts that list a folder, make one and find repositories on
+/// another Mac, run with `sh -s` over its SSH master. The folder asked for
+/// (or made) is never in
 /// the script as text a shell reads: it goes in as octal escapes that only
 /// `printf` turns back into bytes (`octalBytes`), so no name, quote,
 /// `$(…)`, backquote or newline in it runs anything. What the Mac prints is
@@ -107,6 +123,7 @@ enum OmniLocalFolders {
 enum OmniRemoteFolders {
     static let listMarker = "CHERRY-FOLDERS 1"
     static let scanMarker = "CHERRY-REPOS 1"
+    static let createMarker = "CHERRY-MKDIR 1"
     /// How long a listing may take there.
     static let timeout: TimeInterval = 3
 
@@ -183,6 +200,49 @@ enum OmniRemoteFolders {
         return .listed(OmniFolderContents(path: path, isRepository: isRepository, entries: entries, truncated: truncated))
     }
 
+    /// Makes the folder `path` (absolute) there, not its parents: `K` when
+    /// a folder is there now (made, or one already was), `F` when something
+    /// else has its name, `X<mkdir's error>` when it could not be made.
+    static func createScript(path: String) -> String {
+        """
+        dir=$(printf \(octalBytes(path)); printf x)
+        dir=${dir%x}
+        printf '%s\\n' '\(createMarker)'
+        if [ -d "$dir" ]; then printf 'K\\0'
+        elif [ -e "$dir" ] || [ -L "$dir" ]; then printf 'F\\0'
+        elif err=$(mkdir -- "$dir" 2>&1); then printf 'K\\0'
+        else printf 'X%s\\0' "$err"; fi
+
+        """
+    }
+
+    /// Reads what `createScript` printed.
+    static func parseCreation(_ output: RemoteDeviceShell.DataOutput, path: String) -> OmniFolderCreation {
+        guard let records = records(output.standardOutput, after: createMarker) else {
+            if output.status == 255 || output.timedOut {
+                return .failed(RemoteDeviceSSHFailure.classify(output.standardError, timedOut: output.timedOut).message)
+            }
+            return .failed("mkdir did not run (exit \(output.status))")
+        }
+        guard let record = records.first, let tag = record.first else {
+            return .failed(output.timedOut ? "it did not answer in time" : "mkdir was cut short")
+        }
+        switch tag {
+        case "K":
+            return .created
+        case "F":
+            return .notAFolder(path)
+        default:
+            // "mkdir: <the path, or its missing parent>: Permission denied":
+            // the reason.
+            var message = record.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+            if message.hasPrefix("mkdir: "), let colon = message.range(of: ": ", options: .backwards) {
+                message = String(message[colon.upperBound...])
+            }
+            return .failed(message.isEmpty ? "mkdir failed" : message)
+        }
+    }
+
     /// Finds the repositories under the home folder there at
     /// `OmniLocalFolders.scanPatterns`: their absolute paths, NUL-separated.
     static func scanScript(limit: Int = OmniFolderListingLimits.repositories) -> String {
@@ -238,6 +298,12 @@ enum OmniRemoteFolders {
         let script = listScript(directory: directory)
         let output = await RemoteDeviceShell.onOwnThread { shell.runSynchronously(script, on: destination) }
         return parseListing(output)
+    }
+
+    static func create(_ path: String, on destination: String, shell: RemoteDeviceShell) async -> OmniFolderCreation {
+        let script = createScript(path: path)
+        let output = await RemoteDeviceShell.onOwnThread { shell.runSynchronously(script, on: destination) }
+        return parseCreation(output, path: path)
     }
 
     static func scan(on destination: String, shell: RemoteDeviceShell) async -> [String]? {
@@ -351,6 +417,15 @@ final class OmniFolderBrowser {
             guard case .device(let id) = request.machine, isConnected(id) else { continue }
             listedAt[request] = nil
             self.request(request)
+        }
+    }
+
+    /// Forgets the listings kept of `machine`'s folders (a folder was made
+    /// there): the next request of each lists it again.
+    func forgetListings(on machine: ProjectSwitcherModel.Machine) {
+        for request in Array(listings.keys) where request.machine == machine && !inFlight.contains(request) {
+            listings[request] = nil
+            listedAt[request] = nil
         }
     }
 

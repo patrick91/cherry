@@ -43,6 +43,15 @@ struct OmniPathQuery: Equatable {
     /// Hidden folders are listed only for a segment that starts with ".".
     var showsHidden: Bool { segment.hasPrefix(".") }
 
+    /// The folder a New folder row would make in `directory`: the segment
+    /// without spaces around it; nil when that names no folder ("", ".",
+    /// "..").
+    var newFolderName: String? {
+        let name = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("\0") else { return nil }
+        return name
+    }
+
     /// The absolute path a typed path names on a Mac whose home is `home`
     /// (nil: `~` cannot be expanded), with repeated `/` and `.` removed and
     /// `..` applied; no trailing `/` but for `/` itself.
@@ -127,6 +136,20 @@ enum OmniFolderListing: Equatable, Sendable {
     case failed(String)
 }
 
+/// What making a new folder came to (`OmniLocalFolders.create`,
+/// `OmniRemoteFolders.create`).
+enum OmniFolderCreation: Equatable, Sendable {
+    /// A folder is there now: made, or one already was.
+    case created
+    /// Why it could not be made.
+    case failed(String)
+
+    /// Something that is not a folder has its name.
+    static func notAFolder(_ path: String) -> OmniFolderCreation {
+        .failed("“\((path as NSString).lastPathComponent)” is already there, and is not a folder.")
+    }
+}
+
 /// A folder listing asked of a Mac: by the folder as typed ("~/github/").
 struct OmniFolderRequest: Hashable, Sendable {
     var machine: ProjectSwitcherModel.Machine
@@ -156,7 +179,8 @@ extension ProjectSwitcherModel.Machine {
 
 // MARK: - Rows
 
-/// The rows of folder completion, and the Add Project and Open Folder rows.
+/// The rows of folder completion (with New folder “…” for a name no folder
+/// has), and the Add Project and Open Folder rows.
 enum OmniFolderRows {
     /// The Mac a path query lists in `scope`: This Mac at the root and in
     /// Projects, the Mac in a Mac's scope; nil elsewhere.
@@ -331,6 +355,22 @@ enum OmniFolderRows {
                 recordsUse: false,
                 completion: typed + "/"
             ), matched: matched))
+        }
+        // A name no folder there has: New folder “…”, which makes it, then
+        // adds and opens it (Add Project…) or opens it once (Open Folder…).
+        if let name = path.newFolderName,
+           !contents.entries.contains(where: { $0.name.compare(name, options: .caseInsensitive) == .orderedSame }) {
+            let absolute = base + "/" + name
+            rows.append(OmniRow(item: OmniItem(
+                id: "folder-new:\(machine.idComponent):\(absolute)",
+                kind: .folder,
+                title: "New folder “\(path.directory + name)”",
+                symbol: "folder.badge.plus",
+                primaryLabel: "Create & Open",
+                primary: .createFolder(path: absolute, on: machine, intent: intent),
+                machine: machine,
+                recordsUse: false
+            )))
         }
         return rows
     }

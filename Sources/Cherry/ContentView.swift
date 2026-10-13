@@ -2732,6 +2732,7 @@ struct ProjectOnboardingView: View {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "Create"
 
@@ -3445,6 +3446,7 @@ private struct ProjectTabsPrototypeBar: View {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "Add"
 
@@ -3551,6 +3553,7 @@ private struct ProjectSegmentedPrototypeBar: View {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "Add"
 
@@ -4150,6 +4153,7 @@ private struct ProjectRailPrototype: View {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "Add"
 
@@ -4415,6 +4419,7 @@ private struct ProjectStackPrototypeSidebar: View {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "Add"
 
@@ -4616,6 +4621,7 @@ private struct WorkspaceFoldersPrototypeSidebar: View {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = "Add"
 

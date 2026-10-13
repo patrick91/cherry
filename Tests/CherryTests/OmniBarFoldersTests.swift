@@ -124,7 +124,7 @@ private func select(_ title: String, in controller: OmniBarController) throws {
 
     // The segment filters: prefix first, then contains, the match in bold.
     controller.setQuery("~/code/cher")
-    #expect(controller.rows.map(\.item.title) == ["~/code/cherry", "~/code/my-cherry-fork"])
+    #expect(controller.rows.map(\.item.title) == ["~/code/cherry", "~/code/my-cherry-fork", "New folder “~/code/cher”"])
     #expect(controller.rows[0].matched == [7, 8, 9, 10])
     #expect(controller.rows[1].matched == [10, 11, 12, 13])
     // ↵ on an added repository opens it.
@@ -243,6 +243,67 @@ private func select(_ title: String, in controller: OmniBarController) throws {
     #expect(other.rows.isEmpty)
     #expect(other.emptyState.text == "No folder ~/nope on patstudio")
     #expect(!other.emptyState.isLoading)
+}
+
+@Test @MainActor func omniANameNoFolderHasOffersNewFolderLastThatMakesIt() throws {
+    let recorder = FolderRecorder()
+    var listed = sources()
+    listed.folderListings[OmniFolderRequest(machine: .thisMac, directory: "~/code/")] = .listed(codeListing)
+    listed.folderListings[OmniFolderRequest(machine: .device(studioID), directory: "~/")] = .listed(
+        OmniFolderContents(path: "/Users/me", isRepository: false, entries: [.init(name: "code", isRepository: false)])
+    )
+    let controller = recorder.controller(listed)
+    controller.open(at: .projects)
+
+    // Nothing there has the name: New folder is the one row, and ↵ makes it.
+    controller.setQuery("~/code/brand new")
+    #expect(controller.rows.map(\.item.title) == ["New folder “~/code/brand new”"])
+    #expect(controller.primaryLabel == "Create & Open")
+    #expect(controller.selectedItem?.symbol == "folder.badge.plus")
+    controller.activate()
+    #expect(recorder.run == [.createFolder(path: "/Users/me/code/brand new", on: .thisMac, intent: .add)])
+
+    // After the folders that match, and never for a name a folder has
+    // (case aside, hidden ones too), nor for none.
+    controller.setQuery("~/code/cher")
+    #expect(controller.rows.map(\.item.title) == ["~/code/cherry", "~/code/my-cherry-fork", "New folder “~/code/cher”"])
+    #expect(controller.selectedItem?.title == "~/code/cherry")
+    for query in ["~/code/cherry", "~/code/CHERRY", "~/code/.hidden", "~/code/", "~/code/.", "~/code/..", "~/code/   "] {
+        controller.setQuery(query)
+        #expect(!controller.rows.contains { $0.item.primary.isCreateFolder }, "\(query)")
+    }
+    // Spaces around the name are not part of it.
+    controller.setQuery("~/code/ spaced  ")
+    #expect(controller.rows.last?.item.primary == .createFolder(path: "/Users/me/code/spaced", on: .thisMac, intent: .add))
+
+    // Open Folder… makes it and opens it once.
+    controller.browseFolders(on: .thisMac, intent: .openOnce)
+    controller.setQuery("~/code/scratch")
+    #expect(controller.rows.last?.item.primary == .createFolder(path: "/Users/me/code/scratch", on: .thisMac, intent: .openOnce))
+
+    // Another Mac's folder: at the path its listing names there.
+    controller.browseFolders(on: .device(studioID), intent: .add)
+    controller.setQuery("~/side-project")
+    #expect(controller.rows.map(\.item.title) == ["New folder “~/side-project”"])
+    #expect(controller.rows.last?.item.primary == .createFolder(path: "/Users/me/side-project", on: .device(studioID), intent: .add))
+
+    // Not listed (yet, or a Mac not connected): nothing to make it in.
+    controller.open(at: .projects)
+    controller.setQuery("~/elsewhere/new")
+    #expect(controller.rows.isEmpty)
+    var offline = sources()
+    offline.folderListings[OmniFolderRequest(machine: .device(studioID), directory: "~/")] = .notConnected
+    let other = recorder.controller(offline)
+    other.open(at: .mac(.device(studioID), name: "patstudio"))
+    other.setQuery("~/new")
+    #expect(other.rows.map(\.item.title) == ["patstudio isn't connected"])
+}
+
+private extension OmniCommand {
+    var isCreateFolder: Bool {
+        if case .createFolder = self { return true }
+        return false
+    }
 }
 
 // MARK: - Not added yet
@@ -387,6 +448,63 @@ private func pwnedFiles(under root: URL) -> [String] {
     if case .failed = OmniRemoteFolders.parseListing(.init(status: 0, standardOutput: cut, standardError: "")) {} else {
         Issue.record("a listing without its end was taken")
     }
+}
+
+@Test func omniRemoteCreateScriptMakesOnlyThatFolderAndRunsNothingFromItsName() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("omni-mkdir-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let home = root.appendingPathComponent("home", isDirectory: true)
+    let parent = home.appendingPathComponent("code $(touch pwned-parent)", isDirectory: true)
+    try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+    func create(_ url: URL) throws -> OmniFolderCreation {
+        let script = OmniRemoteFolders.createScript(path: url.path)
+        // The folder never appears in the script as text.
+        #expect(!script.contains("pwned") && !script.contains("it's"))
+        return OmniRemoteFolders.parseCreation(try runLocally(script, home: home, in: root), path: url.path)
+    }
+
+    for name in hostileNames + ["it's $(touch pwned-new) `touch pwned-tick2`"] {
+        let folder = parent.appendingPathComponent(name, isDirectory: true)
+        #expect(try create(folder) == .created, "\(name)")
+        var isDirectory: ObjCBool = false
+        #expect(FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory) && isDirectory.boolValue, "\(name)")
+    }
+    // A folder already there is fine; a file of that name is not.
+    #expect(try create(parent.appendingPathComponent("-n")) == .created)
+    FileManager.default.createFile(atPath: parent.appendingPathComponent("a-file").path, contents: Data())
+    #expect(try create(parent.appendingPathComponent("a-file")) == .failed("“a-file” is already there, and is not a folder."))
+    // Never its parents: mkdir's reason, without its path.
+    let orphan = parent.appendingPathComponent("missing/new")
+    #expect(try create(orphan) == .failed("No such file or directory"))
+    #expect(!FileManager.default.fileExists(atPath: parent.appendingPathComponent("missing").path))
+    #expect(pwnedFiles(under: root).isEmpty)
+
+    // No marker (ssh failed), or cut short: a failure.
+    let failed = OmniRemoteFolders.parseCreation(
+        .init(status: 255, standardOutput: Data(), standardError: "ssh: connect to host x port 22: Connection refused"), path: "/x"
+    )
+    if case .failed = failed {} else { Issue.record("expected a failure, got \(failed)") }
+    let cut = OmniRemoteFolders.parseCreation(
+        .init(status: 0, standardOutput: Data((OmniRemoteFolders.createMarker + "\n").utf8), standardError: ""), path: "/x"
+    )
+    #expect(cut == .failed("mkdir was cut short"))
+}
+
+@Test func omniLocalCreateMakesOnlyThatFolder() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("omni-create-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let folder = root.appendingPathComponent("new project").path
+    #expect(OmniLocalFolders.create(folder) == .created)
+    #expect(OmniLocalFolders.list(folder) != .missing)
+    #expect(OmniLocalFolders.create(folder) == .created)
+    FileManager.default.createFile(atPath: root.appendingPathComponent("file").path, contents: Data())
+    #expect(OmniLocalFolders.create(root.appendingPathComponent("file").path) == .failed("“file” is already there, and is not a folder."))
+    guard case .failed = OmniLocalFolders.create(root.appendingPathComponent("missing/new").path) else {
+        Issue.record("made a folder's parents")
+        return
+    }
+    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("missing").path))
 }
 
 @Test func omniRemoteScanScriptFindsRepositoriesUnderTheUsualPlaces() throws {
@@ -644,4 +762,57 @@ private func waitUntil(_ condition: @MainActor () -> Bool) async {
     performer.perform(.addFolder(path: root.appendingPathComponent("gone").path, on: .thisMac, open: true))
     #expect(settings.projects.count == 1)
     #expect(chrome.toasts.current?.title.hasPrefix("There is no folder at") == true)
+}
+
+@Test @MainActor func omniNewFolderOnThisMacMakesItThenAddsAndOpensItOrOpensItOnce() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("omni-new-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let suite = "cherry-omni-new-folder-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let settings = AgentSettings(defaults: defaults)
+    let chrome = ProjectWindowChromeState()
+    var opened: [String] = []
+    let listing = OmniFolderListing.listed(OmniFolderContents(path: root.path, isRepository: false, entries: []))
+    let browser = OmniFolderBrowser(listLocal: { _ in listing }, listRemote: { _, _ in .missing }, isConnected: { _ in false })
+    var performer = OmniBarPerformer(
+        window: OmniBarWindow(
+            projectRoot: root.path, repository: RepositoryWorkspace(projectRoot: root.path),
+            workspace: TerminalWorkspace(projectRoot: root.path, createInitialSession: false), chromeState: chrome
+        ),
+        settings: settings,
+        registry: ProjectWindowRegistry(),
+        backgroundSessionsModel: { preconditionFailure("not asked in this test") },
+        switcher: ProjectSwitcherActions(settings: settings, chromeState: chrome, openProject: { opened.append($0.root) }, openSettings: {}),
+        editorDiscovery: ExternalEditorDiscovery(appURLResolver: { _ in nil }, iconProvider: { _ in NSImage() }),
+        projects: { ProjectSwitcherModel(machines: [], locations: []) },
+        openSettings: {},
+        toggleAppearance: {}
+    )
+    performer.folderBrowser = browser
+    let listed = OmniFolderRequest(machine: .thisMac, directory: root.path + "/")
+    browser.request(listed)
+    await waitUntil { browser.listings[listed] == listing }
+
+    // Add Project…: made, added and opened; the listing kept is forgotten.
+    let made = root.appendingPathComponent("made").path
+    performer.perform(.createFolder(path: made, on: .thisMac, intent: .add))
+    var isDirectory: ObjCBool = false
+    #expect(FileManager.default.fileExists(atPath: made, isDirectory: &isDirectory) && isDirectory.boolValue)
+    let project = try #require(settings.projects.first)
+    #expect(settings.projects.count == 1 && opened == [project.root])
+    #expect(browser.listings[listed] == nil)
+
+    // Open Folder…: made and opened once, not added.
+    let once = root.appendingPathComponent("once").path
+    performer.perform(.createFolder(path: once, on: .thisMac, intent: .openOnce))
+    #expect(FileManager.default.fileExists(atPath: once))
+    #expect(settings.projects.count == 1 && opened.count == 2 && opened.last?.hasSuffix("/once") == true)
+
+    // A file of that name: said so, nothing added or opened.
+    FileManager.default.createFile(atPath: root.appendingPathComponent("taken").path, contents: Data())
+    performer.perform(.createFolder(path: root.appendingPathComponent("taken").path, on: .thisMac, intent: .add))
+    #expect(settings.projects.count == 1 && opened.count == 2)
+    #expect(chrome.toasts.current?.title == "taken could not be created")
 }

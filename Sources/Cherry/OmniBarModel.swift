@@ -138,6 +138,10 @@ enum OmniCommand: Equatable {
     /// Adds the folder at this path (absolute, or `~/…` on a device) to
     /// the projects of its Mac, and opens it when `open`.
     case addFolder(path: String, on: ProjectSwitcherModel.Machine, open: Bool)
+    /// New folder “…”: makes the folder at this absolute path (not its
+    /// parents) on that Mac, then adds and opens it (`.add`) or opens it
+    /// once (`.openOnce`).
+    case createFolder(path: String, on: ProjectSwitcherModel.Machine, intent: OmniFolderIntent)
     /// A new terminal in this folder of that Mac.
     case newTerminalAt(path: String, on: ProjectSwitcherModel.Machine)
     /// Connects a device that is not connected (Reconnect), keeping the bar

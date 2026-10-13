@@ -317,14 +317,15 @@ fn mark_cloexec(fd: libc::c_int) {
     }
 }
 
-/// Close descriptors above stderr inherited from whoever started the daemon.
-/// A long-lived daemon must not keep, say, a script's lock file open.
-pub fn close_inherited_fds() {
+/// Close descriptors above stderr inherited from whoever started the daemon,
+/// but `keep`. A long-lived daemon must not keep, say, a script's lock file
+/// open.
+pub fn close_inherited_fds(keep: Option<libc::c_int>) {
     let fds: Vec<libc::c_int> = std::fs::read_dir("/dev/fd")
         .into_iter()
         .flatten()
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
-        .filter(|fd| *fd > 2)
+        .filter(|fd| *fd > 2 && Some(*fd) != keep)
         .collect();
     // The listing's own descriptor is already closed and simply fails here.
     for fd in fds {

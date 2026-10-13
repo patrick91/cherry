@@ -320,6 +320,58 @@ fn concurrent_first_starts_share_one_daemon() {
     );
 }
 
+/// `serve` given a readiness descriptor, as `start` runs it: its end of a
+/// socket pair, and ours to read with a timeout.
+fn serve_telling(sandbox: &Sandbox, stderr: Stdio) -> (std::process::Child, UnixStream) {
+    let (ready, end) = UnixStream::pair().unwrap();
+    let fd = end.as_raw_fd();
+    let mut command = sandbox.command("serve");
+    command
+        .env("CHERRY_HOST_READY_FD", fd.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().unwrap();
+    drop(end);
+    ready
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    (child, ready)
+}
+
+#[test]
+fn a_daemon_says_when_it_listens_and_one_that_gives_up_says_nothing() {
+    use std::io::Read;
+    let sandbox = Sandbox::new();
+    let (mut first, mut ready) = serve_telling(&sandbox, Stdio::null());
+    let mut bytes = [0u8; 8];
+    assert_eq!(ready.read(&mut bytes).unwrap(), 1);
+    // It answers then, and keeps nothing of the starter's open.
+    assert!(quiet_connect(&sandbox.socket).is_some());
+    assert_eq!(ready.read(&mut bytes).unwrap(), 0);
+    // A second daemon for the socket cannot take the lock: its descriptor
+    // ends without a byte.
+    let (second, mut ready) = serve_telling(&sandbox, Stdio::piped());
+    assert_eq!(ready.read(&mut bytes).unwrap(), 0);
+    let output = second.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("another cherry-host is already running"),
+        "{}",
+        stderr(&output)
+    );
+    stop_daemon(&sandbox.socket);
+    assert!(wait_child(&mut first, Duration::from_secs(5)).success());
+}
+
 #[test]
 fn auto_started_daemons_give_sessions_a_clean_environment() {
     let sandbox = Sandbox::new();

@@ -650,6 +650,13 @@ only, and neither `cherry start` nor `cherry-host start` replaces a daemon.
 (see [Sockets, state, and access](#sockets-state-and-access)), or the systemd
 user service when it is enabled (see
 [Lifetime](#lifetime-service-setup-and-updates)), and returns once it answers.
+A detached daemon says when it listens, through a descriptor it inherits
+(named in `CHERRY_HOST_READY_FD`), so `start` returns then without polling
+the socket; a daemon that gives up first (another one won the socket, or it
+failed) closes it, and `start` then looks for a daemon that answers until the
+one it started has been gone for 2 seconds, at most 10 seconds in all. A
+client waits for `cherry-host start` to exit, which the end of its stdout
+tells it at once.
 `cherry-host serve` runs the daemon in the foreground with stderr on the
 terminal; the systemd unit uses it. Both take `--socket PATH`.
 

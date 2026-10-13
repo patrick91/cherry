@@ -443,6 +443,8 @@ struct OmniBarPerformer {
     let openSettings: () -> Void
     let toggleAppearance: () -> Void
     var pasteboard: NSPasteboard = .general
+    /// Forgets a Mac's folder listings once a folder is made there.
+    var folderBrowser: OmniFolderBrowser = .shared
 
     private var chromeState: ProjectWindowChromeState { window.chromeState }
     private var backgroundSessions: BackgroundSessionsModel { backgroundSessionsModel() }
@@ -460,6 +462,8 @@ struct OmniBarPerformer {
             switcher.perform(.reconnectDevice(id))
         case .addFolder(let path, let machine, let open):
             addFolder(path, on: machine, open: open)
+        case .createFolder(let path, let machine, let intent):
+            createFolder(path, on: machine, intent: intent)
         case .newTerminalAt(let path, let machine):
             newTerminal(on: machine, at: path)
         case .openProject(let key):
@@ -628,6 +632,48 @@ struct OmniBarPerformer {
                         name: name, predicate: " could not be added", message: failure.message,
                         symbolName: "exclamationmark.triangle.fill"
                     ))
+                }
+            }
+        }
+    }
+
+    /// New folder “…”: makes the folder at `path` (absolute; never its
+    /// parents) on `machine`, This Mac's with FileManager and another Mac's
+    /// over its SSH master (`OmniRemoteFolders.create`), forgets that Mac's
+    /// folder listings, then adds and opens it (Add Project…) or opens it
+    /// once (Open Folder…); says why not in a toast when it cannot be made.
+    private func createFolder(_ path: String, on machine: ProjectSwitcherModel.Machine, intent: OmniFolderIntent) {
+        let toasts = chromeState.toasts
+        let name = (path as NSString).lastPathComponent
+        let failed = { (message: String) in
+            toasts.show(ProjectWindowToast(
+                name: name, predicate: " could not be created", message: message,
+                symbolName: "exclamationmark.triangle.fill"
+            ))
+        }
+        let created = { [self] in
+            folderBrowser.forgetListings(on: machine)
+            switch intent {
+            case .add: addFolder(path, on: machine, open: true)
+            case .openOnce: if !switcher.openPath(path, on: machine) { NSSound.beep() }
+            }
+        }
+        switch machine {
+        case .thisMac:
+            switch OmniLocalFolders.create(path) {
+            case .created: created()
+            case .failed(let message): failed(message)
+            }
+        case .device(let id):
+            let store = RemoteDeviceStore.shared
+            guard let device = store.device(id: id) else { return failed("That Mac is no longer one of your Macs.") }
+            // Not made when it could not be added.
+            if intent == .add, !store.canModify { return failed(RemoteDeviceStore.readOnlyReason) }
+            Task { @MainActor in
+                let shell = await OmniRemoteFolders.shell(for: device)
+                switch await OmniRemoteFolders.create(path, on: device.sshDestination, shell: shell) {
+                case .created: created()
+                case .failed(let message): failed(message)
                 }
             }
         }

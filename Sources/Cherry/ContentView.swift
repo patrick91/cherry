@@ -4945,13 +4945,20 @@ struct TitlebarProjectPicker: View {
             presentation: presentation
         )
 
-        // A device window's Mac (nil for This Mac's: no store is asked).
+        // A device window's Mac (nil for This Mac's: no store is asked),
+        // and whether it answers.
         RemoteDeviceBadgeReader(projectKey: repository.repositoryRoot) { device in
-            pickerButton(palette: palette, device: device)
+            RemoteDeviceStatusReader(hosting: device == nil ? nil : repository.deviceHosting) { status in
+                pickerButton(palette: palette, device: device, status: status)
+            }
         }
     }
 
-    private func pickerButton(palette: SidebarPalette, device: RemoteDeviceBadge?) -> some View {
+    private func pickerButton(
+        palette: SidebarPalette,
+        device: RemoteDeviceBadge?,
+        status: RemoteDeviceHeaderStatus
+    ) -> some View {
         // A plain Button (SwiftUI Menu's NSPopUpButton would own the
         // label's mouse tracking, so `.onHover` would never fire): it opens
         // the Omni bar on Projects, as ⌘O does.
@@ -4963,14 +4970,14 @@ struct TitlebarProjectPicker: View {
                         .frame(width: Self.accentDiameter, height: Self.accentDiameter)
                 }
 
-                titleContent(palette: palette, device: device)
+                titleContent(palette: palette, device: device, status: status)
             }
             .font(.system(size: Self.fontSize, weight: .semibold))
             .foregroundStyle(palette.rowText)
             .padding(.horizontal, Self.horizontalPadding)
-            .padding(.vertical, titleVerticalPadding(device: device))
+            .padding(.vertical, Self.verticalPadding)
             .frame(
-                width: preferredWidth(showsProjectAccent: palette.showsProjectAccent, device: device),
+                width: preferredWidth(showsProjectAccent: palette.showsProjectAccent, device: device, status: status),
                 alignment: .leading
             )
             .clipped()
@@ -4982,8 +4989,8 @@ struct TitlebarProjectPicker: View {
         }
         .buttonStyle(.plain)
         .background(TitlebarProjectMenuAnchor())
-        .help(device.map { "\(projectTitle) on \($0.name)" } ?? projectTitle)
-        .accessibilityLabel(device.map { "Project: \(projectTitle), on \($0.name)" } ?? "Project: \(projectTitle)")
+        .help(help(device: device, status: status))
+        .accessibilityLabel(accessibilityLabel(device: device, status: status))
         .accessibilityHint("Opens the Omni bar on Projects (⌘O)")
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.12)) {
@@ -4998,33 +5005,44 @@ struct TitlebarProjectPicker: View {
 
     private var projectTitle: String {
         if repository.isRemote {
-            // Its Mac is the chip under it.
+            // Its Mac follows it ("@ <Mac>").
             return repository.repositoryName
         }
         let name = selectedProject?.name ?? repository.repositoryName
         return name.isEmpty ? "No Project" : name
     }
 
-    /// A device window's two lines (the name over its Mac's chip) take the
-    /// padding one line has.
-    private func titleVerticalPadding(device: RemoteDeviceBadge?) -> CGFloat {
-        device == nil ? Self.verticalPadding : 1
+    private func help(device: RemoteDeviceBadge?, status: RemoteDeviceHeaderStatus) -> String {
+        guard let device else { return projectTitle }
+        return status.detail(machine: device.name) ?? "\(projectTitle) on \(device.name)"
+    }
+
+    private func accessibilityLabel(device: RemoteDeviceBadge?, status: RemoteDeviceHeaderStatus) -> String {
+        guard let device else { return "Project: \(projectTitle)" }
+        let label = "Project: \(projectTitle), on \(device.name)"
+        return status.detail(machine: device.name).map { "\(label). \($0)" } ?? label
     }
 
     @ViewBuilder
-    private func titleContent(palette: SidebarPalette, device: RemoteDeviceBadge?) -> some View {
+    private func titleContent(
+        palette: SidebarPalette,
+        device: RemoteDeviceBadge?,
+        status: RemoteDeviceHeaderStatus
+    ) -> some View {
         if let device {
-            VStack(alignment: .leading, spacing: 0) {
+            // "cherry @ patmini": which Mac this window runs on.
+            HStack(spacing: RemoteDeviceHeaderAddress.spacing) {
                 Text(projectTitle)
-                    .font(.system(size: 13, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.tail)
-
-                // Which Mac this window runs on.
-                RemoteDeviceHeaderChip(badge: device)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .layoutPriority(1)
+                RemoteDeviceHeaderAddress(
+                    badge: device,
+                    status: status,
+                    fontSize: Self.fontSize,
+                    textColor: palette.rowText
+                )
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             Text(projectTitle)
                 .lineLimit(1)
@@ -5032,9 +5050,16 @@ struct TitlebarProjectPicker: View {
         }
     }
 
-    private func preferredWidth(showsProjectAccent: Bool, device: RemoteDeviceBadge?) -> CGFloat {
-        let secondLineWidth = device.map(RemoteDeviceHeaderChip.width(of:)) ?? 0
-        let titleWidth = max(Self.measuredTitleWidth(projectTitle), secondLineWidth)
+    private func preferredWidth(
+        showsProjectAccent: Bool,
+        device: RemoteDeviceBadge?,
+        status: RemoteDeviceHeaderStatus
+    ) -> CGFloat {
+        let addressWidth = device.map {
+            RemoteDeviceHeaderAddress.spacing
+                + RemoteDeviceHeaderAddress.width(of: $0, status: status, fontSize: Self.fontSize)
+        } ?? 0
+        let titleWidth = Self.measuredTitleWidth(projectTitle) + addressWidth
         let accentWidth = showsProjectAccent ? Self.accentDiameter + Self.titleSpacing : 0
         let paddedWidth = titleWidth + accentWidth + Self.horizontalPadding * 2
         return max(0, min(maximumWidth, paddedWidth))
@@ -7746,10 +7771,6 @@ private struct SidebarTabRow: View {
                 SidebarTaskStateGlyph(state: badge.state, isSelected: isSelected, palette: palette)
             }
 
-            if let machine = rowState.remoteMachineName {
-                RemoteDeviceChip(name: machine, isSelected: isSelected)
-            }
-
             if rowState.isShared {
                 Image(systemName: "person.2.fill")
                     .font(.system(size: 9, weight: .medium))
@@ -7833,8 +7854,6 @@ private final class SidebarTabRowState: ObservableObject {
     @Published private(set) var nixShellEnvironment: NixShellEnvironment?
     /// Its session is shared with other clients (`TerminalSession.sharedSessionBar`).
     @Published private(set) var isShared = false
-    /// The device its program runs on (docs/specs/remote-devices.md).
-    let remoteMachineName: String?
     /// Its task, when it is a Cherry task's worker (`AgentTaskBoard`).
     @Published private(set) var taskBadge: AgentTaskBadge?
     /// Its open runs' progress, when it handed out tasks.
@@ -7860,7 +7879,6 @@ private final class SidebarTabRowState: ObservableObject {
         self.hasUnseenAgentResult = session.hasUnseenAgentResult
         self.programStatusMessage = session.programStatus.root?.message.nilIfEmpty
         self.nixShellEnvironment = session.nixShellEnvironment
-        self.remoteMachineName = session.remoteMachineName
 
         observe(session)
     }

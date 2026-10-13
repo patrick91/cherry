@@ -1548,7 +1548,7 @@ private struct ProjectWorkspaceView: View {
             chromeState: chromeState
         ))
         .background {
-            // "<project> — <Mac>" for a device window.
+            // "<project> @ <Mac>" for a device window.
             RemoteDeviceBadgeReader(projectKey: repository.repositoryRoot) { device in
                 if let session = workspace.selectedSession {
                     WindowTitleBinder(projectName: projectName, deviceName: device?.name, session: session)
@@ -1557,7 +1557,7 @@ private struct ProjectWorkspaceView: View {
                 }
             }
         }
-        // A device window's views read its Mac (chip, path prefix, colour)
+        // A device window's views read its Mac (header, path prefix, colour)
         // from the device store; This Mac's never ask it.
         .environment(\.remoteDeviceStore, repository.isRemote ? RemoteDeviceStore.shared : nil)
         .focusedValue(\.terminalWorkspace, workspace)

@@ -275,8 +275,11 @@ What exists (`Sources/Cherry/RemoteDevices.swift`, `RemoteDeviceCheck.swift`,
   hides project commands; Open in an editor is hidden), marks the hosting
   in use while open, holds a lease on the device's control connection
   while the window has tabs, and starts `HostedReconnects` wake/network
-  monitoring. Title "<project> — <Mac>" with a computer glyph in the picker
-  (and the window title); each tab row has a device chip. The restore
+  monitoring. The sidebar header reads "<project> @ <Mac>" on one line,
+  the Mac's name in its colour (`RemoteDeviceHeaderAddress`), dimmed while
+  its control reconnects and grey with a warning when the user has to act
+  (`RemoteDeviceHeaderStatus`); the window title is the same. Tab rows do
+  not repeat the Mac (every tab of the window runs there). The restore
   routes records of the window's own host (`localSessions.profile.host`,
   not only `.local`) to the owning restore, so a device's tabs come back as
   its own; unbound records are looked for only on the host their `hostKey`

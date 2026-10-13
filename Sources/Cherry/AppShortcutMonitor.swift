@@ -12,10 +12,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
     let projectRoot: String?
     let openSettings: () -> Void
 
-    private var visibleCommandNames: [String] {
-        visibleCommands.map(\.name)
-    }
-
     private var visibleCommands: [ProjectCommandDefinition] {
         agentSettings.launchableProjectCommands(for: projectRoot)
     }
@@ -111,7 +107,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
             noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: projectRoot,
-            visibleCommandNames: visibleCommandNames,
             visibleCommands: visibleCommands,
             projectFeatures: projectFeatures,
             openSettings: openSettings
@@ -131,7 +126,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
         context.coordinator.noteStore = noteStore
         context.coordinator.todoStore = todoStore
         context.coordinator.projectRoot = projectRoot
-        context.coordinator.visibleCommandNames = visibleCommandNames
         context.coordinator.visibleCommands = visibleCommands
         context.coordinator.projectFeatures = projectFeatures
         context.coordinator.openSettings = openSettings
@@ -162,7 +156,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
         weak var noteStore: ProjectNoteStore?
         weak var todoStore: ProjectTodoStore?
         var projectRoot: String?
-        var visibleCommandNames: [String]
         var visibleCommands: [ProjectCommandDefinition]
         var projectFeatures: ProjectFeatureSettings
         var openSettings: () -> Void
@@ -176,7 +169,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
             noteStore: ProjectNoteStore,
             todoStore: ProjectTodoStore,
             projectRoot: String?,
-            visibleCommandNames: [String],
             visibleCommands: [ProjectCommandDefinition],
             projectFeatures: ProjectFeatureSettings,
             openSettings: @escaping () -> Void
@@ -187,7 +179,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
             self.noteStore = noteStore
             self.todoStore = todoStore
             self.projectRoot = projectRoot
-            self.visibleCommandNames = visibleCommandNames
             self.visibleCommands = visibleCommands
             self.projectFeatures = projectFeatures
             self.openSettings = openSettings

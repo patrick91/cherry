@@ -985,11 +985,10 @@ final class CherryControlServer: @unchecked Sendable {
             if request.select ?? false {
                 chromeState(for: workspace)?.selectTerminal()
             }
-            let initialInput = try runAgentInitialInput(
+            let initialInput = try agentInputPayload(
                 text: request.text,
                 rawBase64: request.rawBase64,
-                submit: request.submit,
-                keyboardProtocolFlags: session.keyboardProtocolFlags
+                submit: request.submit
             )
             let sentBytes: Int
             if let initialInput, !initialInput.isEmpty {
@@ -1209,7 +1208,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .selectTerminal(.init(terminalID: session.id.uuidString, selected: true)))
         case .sendInput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
-            let input = try terminalInputPayload(from: request, for: session)
+            let input = try terminalInputPayload(from: request)
             if session.kind == .agent {
                 try await refuseInputIntoPermissionPrompt(of: session, keysOnly: input.isRaw)
             }
@@ -1826,8 +1825,7 @@ final class CherryControlServer: @unchecked Sendable {
             let input = try agentInputPayload(
                 text: text,
                 rawBase64: request.rawBase64,
-                submit: submit,
-                keyboardProtocolFlags: session.keyboardProtocolFlags
+                submit: submit
             )
             var inputError: CherryControlError?
             let typedSince = Date()
@@ -1854,7 +1852,7 @@ final class CherryControlServer: @unchecked Sendable {
                 noteKickoff(task, delivered: sentBytes > 0, error: inputError, typedSince: typedSince)
             }
         } else {
-            let input = try optionalTerminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
+            let input = try optionalTerminalInputPayload(text: request.text, rawBase64: request.rawBase64)
             if let input, !input.payload.isEmpty || request.submit == true {
                 do {
                     sentBytes = try await sendTerminalInput(input, submit: request.submit == true, to: session)
@@ -2790,21 +2788,15 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func terminalInputPayload(from request: SendInputRequest, for session: TerminalSession) throws -> TerminalControlInput {
-        try terminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
+    private func terminalInputPayload(from request: SendInputRequest) throws -> TerminalControlInput {
+        try terminalInputPayload(text: request.text, rawBase64: request.rawBase64)
     }
 
     @MainActor
-    private func terminalInputPayload(text: String?, rawBase64: String?, for session: TerminalSession) throws -> TerminalControlInput {
+    private func terminalInputPayload(text: String?, rawBase64: String?) throws -> TerminalControlInput {
         switch (text, rawBase64) {
         case let (text?, nil):
-            return .init(
-                payload: TerminalInputEncoder.terminalTextData(
-                    text,
-                    keyboardProtocolFlags: session.keyboardProtocolFlags
-                ),
-                isRaw: false
-            )
+            return .init(payload: TerminalInputEncoder.terminalTextData(text), isRaw: false)
         case let (nil, rawBase64?):
             guard let data = Data(base64Encoded: rawBase64) else {
                 throw CherryControlError(code: "invalid_base64", message: "raw_base64 is not valid base64.")
@@ -2816,16 +2808,10 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func optionalTerminalInputPayload(text: String?, rawBase64: String?, for session: TerminalSession) throws -> TerminalControlInput? {
+    private func optionalTerminalInputPayload(text: String?, rawBase64: String?) throws -> TerminalControlInput? {
         switch (text, rawBase64) {
         case let (text?, nil):
-            return .init(
-                payload: TerminalInputEncoder.terminalTextData(
-                    text,
-                    keyboardProtocolFlags: session.keyboardProtocolFlags
-                ),
-                isRaw: false
-            )
+            return .init(payload: TerminalInputEncoder.terminalTextData(text), isRaw: false)
         case let (nil, rawBase64?):
             guard let data = Data(base64Encoded: rawBase64) else {
                 throw CherryControlError(code: "invalid_base64", message: "raw_base64 is not valid base64.")
@@ -2864,7 +2850,7 @@ final class CherryControlServer: @unchecked Sendable {
             try await sendTerminalInput(input, to: session)
             try? await Task.sleep(for: Self.terminalSubmitPause)
         }
-        let enter = TerminalInputEncoder.enterSequence(keyboardProtocolFlags: session.keyboardProtocolFlags)
+        let enter = TerminalInputEncoder.enterData
         try await deliver(enter, raw: false, to: session, alreadySent: input.payload.count)
         return input.payload.count + enter.count
     }
@@ -2973,8 +2959,7 @@ final class CherryControlServer: @unchecked Sendable {
             let input = try agentInputPayload(
                 text: text,
                 rawBase64: rawBase64,
-                submit: submit,
-                keyboardProtocolFlags: session.keyboardProtocolFlags
+                submit: submit
             )
             guard let input, !input.isEmpty else { return 0 }
             return try await sendAgentInput(
@@ -2985,7 +2970,7 @@ final class CherryControlServer: @unchecked Sendable {
             )
         }
 
-        let input = try terminalInputPayload(text: text, rawBase64: rawBase64, for: session)
+        let input = try terminalInputPayload(text: text, rawBase64: rawBase64)
         return try await sendTerminalInput(input, submit: submit == true, to: session)
     }
 
@@ -3039,9 +3024,7 @@ final class CherryControlServer: @unchecked Sendable {
                 try await deliver(input.payload, raw: false, to: session)
                 try? await Task.sleep(for: .milliseconds(150))
             }
-            let enterSequence = TerminalInputEncoder.enterSequence(
-                keyboardProtocolFlags: session.keyboardProtocolFlags
-            )
+            let enterSequence = TerminalInputEncoder.enterData
             mcpControlDebugLog("agent \(source) input submit session=\(session.id.uuidString) bytes=\(enterSequence.count)")
             try await deliver(enterSequence, raw: false, to: session, alreadySent: input.payload.count)
             return input.payload.count + enterSequence.count
@@ -3049,9 +3032,7 @@ final class CherryControlServer: @unchecked Sendable {
 
         var payload = input.payload
         if input.submit {
-            payload.append(TerminalInputEncoder.enterSequence(
-                keyboardProtocolFlags: session.keyboardProtocolFlags
-            ))
+            payload.append(TerminalInputEncoder.enterData)
         }
         guard !payload.isEmpty else { return 0 }
         mcpControlDebugLog("agent \(source) input combined session=\(session.id.uuidString) bytes=\(payload.count) submit=\(input.submit)")
@@ -3237,9 +3218,7 @@ final class CherryControlServer: @unchecked Sendable {
                         acknowledgedStartupPromptCount += 1
                         awaitingOutputAfterAcknowledgementVersion = session.outputVersion
                         startupPromptSearchStartLine = session.lineCount
-                        let enterSequence = TerminalInputEncoder.enterSequence(
-                            keyboardProtocolFlags: session.keyboardProtocolFlags
-                        )
+                        let enterSequence = TerminalInputEncoder.enterData
                         mcpControlDebugLog("agent startup prompt acknowledged session=\(session.id.uuidString) bytes=\(enterSequence.count)")
                         // As MCP's other input: through the host while the
                         // attach adapter is not known to be attached.
@@ -3357,17 +3336,13 @@ final class CherryControlServer: @unchecked Sendable {
     private func agentInputPayload(
         text: String?,
         rawBase64: String?,
-        submit: Bool?,
-        keyboardProtocolFlags: Int
+        submit: Bool?
     ) throws -> AgentInitialInput? {
         let payload: Data
         let isTextInput: Bool
         switch (text, rawBase64) {
         case let (text?, nil):
-            payload = TerminalInputEncoder.terminalTextData(
-                text,
-                keyboardProtocolFlags: keyboardProtocolFlags
-            )
+            payload = TerminalInputEncoder.terminalTextData(text)
             isTextInput = true
         case let (nil, rawBase64?):
             guard let data = Data(base64Encoded: rawBase64) else {
@@ -3384,20 +3359,6 @@ final class CherryControlServer: @unchecked Sendable {
         let wantsSubmit = submit ?? isTextInput
         let shouldSubmit = wantsSubmit && payload.last != 0x0d && payload.last != 0x0a
         return AgentInitialInput(payload: payload, submit: shouldSubmit)
-    }
-
-    private func runAgentInitialInput(
-        text: String?,
-        rawBase64: String?,
-        submit: Bool?,
-        keyboardProtocolFlags: Int
-    ) throws -> AgentInitialInput? {
-        try agentInputPayload(
-            text: text,
-            rawBase64: rawBase64,
-            submit: submit,
-            keyboardProtocolFlags: keyboardProtocolFlags
-        )
     }
 
     @MainActor

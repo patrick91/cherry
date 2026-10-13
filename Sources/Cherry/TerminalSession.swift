@@ -23,7 +23,7 @@ final class TerminalProcessor: @unchecked Sendable {
     private let notificationLock = NSLock()
     private let backpressurePolicy: BackpressurePolicy
 
-    private var buffer: any TerminalBuffering
+    private var buffer: LiveTerminalOutputBuffer
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
     private var activeLaunchID: UUID?
     private var outputEpoch = 0
@@ -36,7 +36,7 @@ final class TerminalProcessor: @unchecked Sendable {
 
     init(
         maxScrollback: Int?,
-        buffer: (any TerminalBuffering)? = nil,
+        buffer: LiveTerminalOutputBuffer? = nil,
         backpressurePolicy: BackpressurePolicy = .preserveAll
     ) {
         self.buffer = buffer ?? LiveTerminalOutputBuffer(maxScrollback: maxScrollback)
@@ -88,18 +88,6 @@ final class TerminalProcessor: @unchecked Sendable {
 
     func snapshot(range: Range<Int>) -> [String] {
         locked { buffer.snapshot(range: range) }
-    }
-
-    func lineLength(at row: Int) -> Int {
-        locked { buffer.lineLength(at: row) }
-    }
-
-    func gridPoint(row: Int, column: Int) -> TerminalGridPoint {
-        locked { buffer.gridPoint(row: row, column: column) }
-    }
-
-    func selectedText(in selection: TerminalSelectionRange) -> String {
-        locked { buffer.selectedText(in: selection) }
     }
 
     func clear() {
@@ -3972,7 +3960,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         workingDirectory: String = NSHomeDirectory(),
         projectRoot: String? = nil,
         maxScrollback: Int? = TerminalSession.defaultMaxScrollback,
-        buffer: (any TerminalBuffering)? = nil,
+        buffer: LiveTerminalOutputBuffer? = nil,
         launchShell: Bool = true,
         kind: SessionKind = .terminal,
         agentName: String? = nil,
@@ -4459,18 +4447,6 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     var replayViewportSize: TerminalViewportSize {
         viewportSize
-    }
-
-    func lineLength(at row: Int) -> Int {
-        processor.lineLength(at: row)
-    }
-
-    func gridPoint(row: Int, column: Int) -> TerminalGridPoint {
-        processor.gridPoint(row: row, column: column)
-    }
-
-    func selectedText(in selection: TerminalSelectionRange) -> String {
-        processor.selectedText(in: selection)
     }
 
     func setParentAgentID(_ parentAgentID: UUID?) {

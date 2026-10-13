@@ -28,9 +28,10 @@ struct MacOSServiceDetector: ServiceDetecting {
     }
 
     func detectServices(processes: [InspectableProcess], includeUnattributed: Bool) async throws -> [ServiceRecord] {
-        // `ps`/`lsof` are blocking subprocesses; run them off the @MainActor control
-        // server so they can't pin it and starve every other MCP request — the
-        // cause of nested-agent "Transport closed" hangs.
+        // `lsof` is a blocking subprocess (and the process table a sysctl); run
+        // them off the @MainActor control server so they can't pin it and starve
+        // every other MCP request — the cause of nested-agent "Transport closed"
+        // hangs.
         let processTreeProvider = self.processTreeProvider
         let lsofOutputProvider = self.lsofOutputProvider
         let (processTree, lsofOutput) = try await Task.detached(priority: .utility) {
@@ -84,11 +85,15 @@ struct MacOSServiceDetector: ServiceDetecting {
         processes: [InspectableProcess],
         processTree: [Int32: Int32]
     ) -> [Int32: InspectableProcess] {
+        var childrenByParent: [Int32: [Int32]] = [:]
+        for (pid, parentPID) in processTree {
+            childrenByParent[parentPID, default: []].append(pid)
+        }
         var lookup: [Int32: InspectableProcess] = [:]
         for process in processes {
             guard let rootPID = process.rootPID, rootPID > 0 else { continue }
             lookup[rootPID] = process
-            for descendant in Self.descendants(of: rootPID, processTree: processTree) {
+            for descendant in Self.descendants(of: rootPID, childrenByParent: childrenByParent) {
                 lookup[descendant] = process
             }
         }
@@ -170,35 +175,24 @@ struct MacOSServiceDetector: ServiceDetecting {
         return (host.isEmpty ? "*" : host, port)
     }
 
-    private static func descendants(of rootPID: Int32, processTree: [Int32: Int32]) -> Set<Int32> {
+    private static func descendants(of rootPID: Int32, childrenByParent: [Int32: [Int32]]) -> Set<Int32> {
         var descendants = Set<Int32>()
         var frontier = [rootPID]
         while let parent = frontier.popLast() {
-            for (pid, ppid) in processTree where ppid == parent && !descendants.contains(pid) {
-                descendants.insert(pid)
+            for pid in childrenByParent[parent] ?? [] where descendants.insert(pid).inserted {
                 frontier.append(pid)
             }
         }
         return descendants
     }
 
+    /// Every process's parent, from the process table read in-process
+    /// (`ShellProcessController.enumerateProcesses`, the table `ps` reads).
     private static func currentProcessTree() -> [Int32: Int32] {
-        guard let output = try? runTool(path: "/bin/ps", arguments: ["-axo", "pid=,ppid="]) else {
-            return [:]
-        }
-
-        var tree: [Int32: Int32] = [:]
-        for line in output.split(whereSeparator: \.isNewline) {
-            let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
-            guard parts.count >= 2,
-                  let pid = Int32(parts[0]),
-                  let ppid = Int32(parts[1])
-            else {
-                continue
-            }
-            tree[pid] = ppid
-        }
-        return tree
+        Dictionary(
+            ShellProcessController.enumerateProcesses().map { ($0.pid, $0.parentPID) },
+            uniquingKeysWith: { first, _ in first }
+        )
     }
 
     private static func currentLsofOutput() throws -> String {

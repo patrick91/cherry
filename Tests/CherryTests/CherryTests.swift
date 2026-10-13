@@ -105,10 +105,6 @@ private final class LockedBool: @unchecked Sendable {
     }
 }
 
-private final class MockTerminalFindPasteboard: TerminalFindPasteboard {
-    var string: String?
-}
-
 private func environmentValue(_ key: String) -> String? {
     getenv(key).map { String(cString: $0) }
 }
@@ -595,8 +591,9 @@ private struct MCPWhoamiPayload: Decodable {
 
 @MainActor
 @Test func terminalSearchStateSyncsWithFindPasteboard() {
-    let pasteboard = MockTerminalFindPasteboard()
-    pasteboard.string = "initial needle"
+    let pasteboard = NSPasteboard(name: .init("CherryTests.Find.\(UUID().uuidString)"))
+    pasteboard.clearContents()
+    pasteboard.setString("initial needle", forType: .string)
 
     let state = TerminalSearchState(pasteboard: pasteboard)
 
@@ -606,9 +603,10 @@ private struct MCPWhoamiPayload: Decodable {
     state.query = "new query"
     state.writeQueryToPasteboard()
 
-    #expect(pasteboard.string == "new query")
+    #expect(pasteboard.string(forType: .string) == "new query")
 
-    pasteboard.string = "external query"
+    pasteboard.clearContents()
+    pasteboard.setString("external query", forType: .string)
     state.readQueryFromPasteboard()
 
     #expect(state.query == "external query")
@@ -617,7 +615,7 @@ private struct MCPWhoamiPayload: Decodable {
 
 @MainActor
 @Test func terminalSearchStateFormatsSearchResultCounts() {
-    let state = TerminalSearchState(pasteboard: MockTerminalFindPasteboard())
+    let state = TerminalSearchState(pasteboard: NSPasteboard(name: .init("CherryTests.Find.\(UUID().uuidString)")))
 
     #expect(state.resultCountDescription == nil)
 
@@ -4409,10 +4407,7 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
 
-    let expectedPayload = TerminalInputEncoder.terminalTextData(
-        prompt,
-        keyboardProtocolFlags: 7
-    )
+    let expectedPayload = TerminalInputEncoder.terminalTextData(prompt)
     #expect(sent.sentBytes == expectedPayload.count)
     // The response's own 500 ms wait can end before a busy machine runs the
     // script's reply, so wait for the reply itself.
@@ -4490,10 +4485,7 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
 
-    let expectedPayload = TerminalInputEncoder.terminalTextData(
-        prompt,
-        keyboardProtocolFlags: 8
-    )
+    let expectedPayload = TerminalInputEncoder.terminalTextData(prompt)
     #expect(sent.sentBytes == expectedPayload.count)
     // The response's own 500 ms wait can end before a busy machine runs the
     // script's reply, so wait for the reply itself.
@@ -5165,28 +5157,17 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(!text.contains("\u{1B}[K"))
 }
 
-@Test func ghosttyReplayOutputDropsTerminalQueriesThatCanWriteHostInput() async throws {
-    let replay = Data([
-        "before",
-        "\u{1B}]11;?\u{07}",
-        "\u{1B}]10;?\u{1B}\\",
-        "\u{1B}[6n",
-        "\u{1B}[c",
-        "\u{1B}[>c",
-        "\u{1B}[?2027$p",
-        "\u{1B}[?u",
-        "\u{1B}P+q4D73\u{1B}\\",
-        "\u{1B}]2;kept title\u{07}",
-        "\u{1B}[31m",
-        "after"
-    ].joined().utf8)
-
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
-
-    #expect(String(decoding: sanitized, as: UTF8.self) == "before\u{1B}]2;kept title\u{07}\u{1B}[31mafter")
+/// What the live feed (`GhosttyOutputSink`) hands Ghostty for `data`
+/// received in one chunk.
+private func ghosttyFeedOutput(_ data: Data) -> Data {
+    let observedData = DataWriteRecorder()
+    let sink = GhosttyOutputSink(receiveForTesting: { observedData.append($0) })
+    sink.receive(data)
+    sink.flushForTesting()
+    return observedData.values.reduce(into: Data()) { $0.append($1) }
 }
 
-@Test func ghosttyReplayOutputCollapsesOverwrittenProgressFrames() async throws {
+@Test func ghosttyFeedCollapsesOverwrittenProgressFrames() async throws {
     let replay = Data([
         "Building for debugging...\r\n",
         "\u{1B}[2K\r[0/3] Write swift-version--58304C5D6DBC2206.txt",
@@ -5196,7 +5177,7 @@ private struct MCPWhoamiPayload: Decodable {
         "\r\nBuild complete\r\n"
     ].joined().utf8)
 
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let sanitized = ghosttyFeedOutput(replay)
     let output = String(decoding: sanitized, as: UTF8.self)
 
     #expect(output == (
@@ -5206,7 +5187,7 @@ private struct MCPWhoamiPayload: Decodable {
     ))
 }
 
-@Test func ghosttyReplayOutputDropsZshPromptEndOfLineMarks() async throws {
+@Test func ghosttyFeedDropsZshPromptEndOfLineMarks() async throws {
     let promptEndMark = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
         String(repeating: " ", count: 120) +
         "\r \r"
@@ -5221,7 +5202,7 @@ private struct MCPWhoamiPayload: Decodable {
         "\u{1B}[1;32m❯\u{1B}[0m "
     ].joined().utf8)
 
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let sanitized = ghosttyFeedOutput(replay)
     let output = String(decoding: sanitized, as: UTF8.self)
 
     #expect(!output.contains("\u{1B}[7m%\u{1B}[27m"))
@@ -5230,29 +5211,29 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(output.contains("\u{1B}[1;32m❯\u{1B}[0m "))
 }
 
-@Test func ghosttyReplayOutputDropsCompactZshPromptEndOfLineMarks() async throws {
+@Test func ghosttyFeedDropsCompactZshPromptEndOfLineMarks() async throws {
     let replay = Data((
         "before\r\n" +
         "\u{1B}[7m%\u{1B}[27m\r" +
         "\u{1B}[1;36m~/github/patrick91/cherry\u{1B}[0m\r\n"
     ).utf8)
 
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let sanitized = ghosttyFeedOutput(replay)
     let output = String(decoding: sanitized, as: UTF8.self)
 
     #expect(!output.contains("\u{1B}[7m%\u{1B}[27m"))
     #expect(output == "before\r\n\r\u{1B}[K\u{1B}[1;36m~/github/patrick91/cherry\u{1B}[0m\r\n")
 }
 
-@Test func ghosttyReplayOutputKeepsPaletteColoredPercentLines() async throws {
+@Test func ghosttyFeedKeepsPaletteColoredPercentLines() async throws {
     let replay = Data("progress \u{1B}[38;5;7m%\u{1B}[0m\r\n".utf8)
 
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let sanitized = ghosttyFeedOutput(replay)
 
     #expect(sanitized == replay)
 }
 
-@Test func ghosttyReplayOutputKeepsPromptRepaintReturnAfterDroppingZshMark() async throws {
+@Test func ghosttyFeedKeepsPromptRepaintReturnAfterDroppingZshMark() async throws {
     let promptEndMark = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
         String(repeating: " ", count: 20) +
         "\r \r"
@@ -5264,7 +5245,7 @@ private struct MCPWhoamiPayload: Decodable {
         "a\u{08}as"
     ].joined().utf8)
 
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let sanitized = ghosttyFeedOutput(replay)
 
     #expect(!String(decoding: sanitized, as: UTF8.self).contains("\u{1B}[7m%\u{1B}[27m"))
     var replayedBuffer = LiveTerminalOutputBuffer(maxScrollback: nil)
@@ -5275,7 +5256,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(!promptLine.contains("ls"))
 }
 
-@Test func ghosttyReplayOutputPreservesContentSharingRowWithZshMark() async throws {
+@Test func ghosttyFeedPreservesContentSharingRowWithZshMark() async throws {
     // Regression: a zsh PROMPT_EOL_MARK that follows real content on the SAME row must NOT
     // be collapsed into `\r\x1b[K`. That carriage-return + erase-to-end-of-line rewinds to
     // column 0 and wipes the content sharing the row — the reported ghost/missing-character
@@ -5292,7 +5273,7 @@ private struct MCPWhoamiPayload: Decodable {
         "\u{1B}[0m❯ "
     ).utf8)
 
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let sanitized = ghosttyFeedOutput(replay)
 
     var replayedBuffer = LiveTerminalOutputBuffer(maxScrollback: nil)
     replayedBuffer.ingest(sanitized)
@@ -8357,7 +8338,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         noteStore: noteStore,
         todoStore: todoStore,
         projectRoot: projectDirectory.path,
-        visibleCommandNames: [],
         visibleCommands: [],
         projectFeatures: ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
         openSettings: {}
@@ -8433,7 +8413,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         noteStore: noteStore,
         todoStore: todoStore,
         projectRoot: projectDirectory.path,
-        visibleCommandNames: [],
         visibleCommands: [],
         projectFeatures: ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
         openSettings: {}
@@ -9914,151 +9893,22 @@ private func serviceRecord(
     #expect(visibleLines.dropFirst(promptIndex + 2).allSatisfy { $0.isEmpty })
 }
 
-@Test func nerdFontFamiliesPreferMonoFonts() async throws {
-    let families = [
-        "Example Nerd Font",
-        "JetBrainsMono Nerd Font Mono",
-        "Apple Symbols",
-        "CaskaydiaCove Nerd Font Mono"
-    ]
-
-    #expect(TerminalFontPalette.preferredNerdFontFamilies(from: families) == [
-        "JetBrainsMono Nerd Font Mono",
-        "CaskaydiaCove Nerd Font Mono",
-        "Example Nerd Font"
-    ])
-}
-
-@Test func alternateScreenScrollWheelProducesCursorKeys() async throws {
-    var remainder: CGFloat = 0
-
-    let sequence = TerminalInputEncoder.alternateScreenScrollSequence(
-        deltaY: 20,
-        hasPreciseScrollingDeltas: true,
-        lineHeight: 20,
-        remainder: &remainder
-    )
-
-    #expect(sequence == Data("\u{1B}[A\u{1B}[A\u{1B}[A".utf8))
-}
-
-@Test func preciseScrollAccumulatesByPartialTerminalCells() async throws {
-    var remainder: CGFloat = 0
-
-    let firstSequence = TerminalInputEncoder.alternateScreenScrollSequence(
-        deltaY: 10,
-        hasPreciseScrollingDeltas: true,
-        lineHeight: 20,
-        remainder: &remainder
-    )
-    let secondSequence = TerminalInputEncoder.alternateScreenScrollSequence(
-        deltaY: 10,
-        hasPreciseScrollingDeltas: true,
-        lineHeight: 20,
-        remainder: &remainder
-    )
-
-    #expect(firstSequence == Data("\u{1B}[A".utf8))
-    #expect(secondSequence == Data("\u{1B}[A\u{1B}[A".utf8))
-}
-
-@Test func sgrMouseWheelProducesTerminalMouseEvents() async throws {
-    var remainder: CGFloat = 0
-
-    let sequence = TerminalInputEncoder.mouseWheelSequence(
-        deltaY: -20,
-        hasPreciseScrollingDeltas: true,
-        lineHeight: 20,
-        column: 5,
-        row: 3,
-        mouseState: TerminalMouseState(trackingMode: .normal, usesSGREncoding: true),
-        remainder: &remainder
-    )
-
-    #expect(sequence == Data("\u{1B}[<65;5;3M\u{1B}[<65;5;3M\u{1B}[<65;5;3M".utf8))
-}
-
-@Test func terminalMousePositionUsesVisibleViewportCoordinates() async throws {
-    let position = TerminalInputEncoder.mousePosition(
-        documentLocation: NSPoint(x: 22 + 4.5 * 8, y: 900 + 24 + 2.5 * 20),
-        visibleOrigin: NSPoint(x: 0, y: 900),
-        viewportSize: TerminalViewportSize(columns: 80, rows: 24),
-        sideInset: 22,
-        topInset: 24,
-        cellWidth: 8,
-        lineHeight: 20
-    )
-
-    #expect(position.column == 5)
-    #expect(position.row == 3)
-}
-
-@Test func viewportScrollOffsetClampsAtDocumentEdges() async throws {
-    let contentHeight: CGFloat = 1_000
-    let viewportHeight: CGFloat = 400
-
-    #expect(TerminalInputEncoder.clampedViewportOffset(
-        currentOffset: 4,
-        deltaY: 20,
-        hasPreciseScrollingDeltas: true,
-        lineHeight: 20,
-        documentHeight: contentHeight,
-        viewportHeight: viewportHeight
-    ) == 0)
-    #expect(TerminalInputEncoder.clampedViewportOffset(
-        currentOffset: 590,
-        deltaY: -20,
-        hasPreciseScrollingDeltas: true,
-        lineHeight: 20,
-        documentHeight: contentHeight,
-        viewportHeight: viewportHeight
-    ) == 600)
-}
-
 @Test func terminalEnterSendsCarriageReturn() async throws {
-    let enter = TerminalInputEncoder.commandSequence(for: #selector(NSResponder.insertNewline(_:)))
-
-    #expect(enter == Data("\r".utf8))
-    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 0) == Data("\r".utf8))
-    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 7) == Data("\r".utf8))
-    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 8) == Data("\r".utf8))
-    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 9) == Data("\r".utf8))
+    #expect(TerminalInputEncoder.enterData == Data("\r".utf8))
 }
 
 @Test func terminalTextDataEncodesLineEndingsAsEnter() async throws {
-    #expect(TerminalInputEncoder.terminalTextData(
-        "one\ntwo\r\nthree\rfour",
-        keyboardProtocolFlags: 0
-    ) == Data("one\rtwo\rthree\rfour".utf8))
-
-    #expect(TerminalInputEncoder.terminalTextData(
-        "disambiguate\n",
-        keyboardProtocolFlags: 7
-    ) == Data("disambiguate\r".utf8))
-
-    #expect(TerminalInputEncoder.terminalTextData(
-        "all-keys\n",
-        keyboardProtocolFlags: 8
-    ) == Data("all-keys\r".utf8))
+    #expect(TerminalInputEncoder.terminalTextData("one\ntwo\r\nthree\rfour") == Data("one\rtwo\rthree\rfour".utf8))
+    #expect(TerminalInputEncoder.terminalTextData("line\n") == Data("line\r".utf8))
+    #expect(TerminalInputEncoder.terminalTextData("no line ending") == Data("no line ending".utf8))
 }
 
 @Test func terminalArrowKeysFollowApplicationCursorMode() async throws {
-    let normalUp = TerminalInputEncoder.commandSequence(for: #selector(NSResponder.moveUp(_:)))
-    let applicationUp = TerminalInputEncoder.commandSequence(
-        for: #selector(NSResponder.moveUp(_:)),
-        usesApplicationCursorKeys: true
-    )
-
-    #expect(normalUp == Data("\u{1B}[A".utf8))
-    #expect(applicationUp == Data("\u{1B}OA".utf8))
+    #expect(TerminalInputEncoder.cursorKeySequence(.up, usesApplicationCursorKeys: false) == "\u{1B}[A")
+    #expect(TerminalInputEncoder.cursorKeySequence(.up, usesApplicationCursorKeys: true) == "\u{1B}OA")
     #expect(TerminalInputEncoder.cursorKeySequence(.down, usesApplicationCursorKeys: true) == "\u{1B}OB")
     #expect(TerminalInputEncoder.cursorKeySequence(.right, usesApplicationCursorKeys: true) == "\u{1B}OC")
     #expect(TerminalInputEncoder.cursorKeySequence(.left, usesApplicationCursorKeys: true) == "\u{1B}OD")
-}
-
-@Test func terminalInsertedTextIgnoresAppKitFunctionKeyCharacters() async throws {
-    #expect(TerminalInputEncoder.insertedTextData(String(UnicodeScalar(NSUpArrowFunctionKey)!)) == nil)
-    #expect(TerminalInputEncoder.insertedTextData("a") == Data("a".utf8))
 }
 
 @Test func appKitArrowFastPathUsesApplicationCursorMode() async throws {
@@ -10144,9 +9994,6 @@ private func serviceRecord(
         keyCode: 51,
         modifiers: [.option, .shift]
     ) == nil)
-    #expect(TerminalInputEncoder.commandSequence(
-        for: #selector(NSResponder.deleteWordBackward(_:))
-    ) == Data([0x1B, 0x7F]))
 }
 
 @Test func appKitOptionDigitTextUsesAppKitCharacters() async throws {
@@ -10154,24 +10001,21 @@ private func serviceRecord(
         keyCode: 20,
         characters: "#",
         charactersIgnoringModifiers: "3",
-        modifiers: .option,
-        keyboardProtocolFlags: 0
+        modifiers: .option
     ) == Data("#".utf8))
 
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
         keyCode: 19,
         characters: "€",
         charactersIgnoringModifiers: "2",
-        modifiers: [.option, .shift],
-        keyboardProtocolFlags: 0
+        modifiers: [.option, .shift]
     ) == Data("€".utf8))
 
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
         keyCode: 20,
         characters: "#",
         charactersIgnoringModifiers: "£",
-        modifiers: .option,
-        keyboardProtocolFlags: 0
+        modifiers: .option
     ) == Data("#".utf8))
 }
 
@@ -10180,15 +10024,13 @@ private func serviceRecord(
         keyCode: 18,
         characters: nil,
         charactersIgnoringModifiers: nil,
-        modifiers: .option,
-        keyboardProtocolFlags: 0
+        modifiers: .option
     ))
     let optionTwo = try #require(TerminalInputEncoder.appKitOptionDigitTextData(
         keyCode: 19,
         characters: "",
         charactersIgnoringModifiers: nil,
-        modifiers: .option,
-        keyboardProtocolFlags: 0
+        modifiers: .option
     ))
 
     #expect(!optionOne.isEmpty)
@@ -10200,24 +10042,21 @@ private func serviceRecord(
         keyCode: 0,
         characters: "å",
         charactersIgnoringModifiers: "a",
-        modifiers: .option,
-        keyboardProtocolFlags: 0
+        modifiers: .option
     ) == nil)
 
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
         keyCode: 20,
         characters: "#",
         charactersIgnoringModifiers: "3",
-        modifiers: [.option, .command],
-        keyboardProtocolFlags: 0
+        modifiers: [.option, .command]
     ) == nil)
 
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
         keyCode: 20,
         characters: String(UnicodeScalar(NSUpArrowFunctionKey)!),
         charactersIgnoringModifiers: "3",
-        modifiers: .option,
-        keyboardProtocolFlags: 0
+        modifiers: .option
     ) == nil)
 }
 
@@ -10326,10 +10165,7 @@ private func serviceRecord(
     pasteboard.clearContents()
     pasteboard.setString("alpha\nbeta", forType: .string)
 
-    let data = try #require(TerminalPasteboardContent.pasteData(
-        from: pasteboard,
-        bracketedPasteMode: true
-    ))
+    let data = try #require(TerminalPasteboardContent.pasteData(from: pasteboard, bracketing: { _ in true }))
 
     #expect(String(decoding: data, as: UTF8.self) == "\u{1B}[200~alpha\nbeta\u{1B}[201~")
 }
@@ -10343,7 +10179,7 @@ private func serviceRecord(
     #expect(TerminalPasteboardContent.urlPasteText(from: pasteboard) == "/tmp/cherry\\ paste/image\\'s\\ test.png")
 }
 
-@Test func pasteboardImageContentsAreSavedAndPastedAsPath() async throws {
+@Test func pasteboardImageContentsAreSavedNamedAfterTheirTimeAndID() async throws {
     let pasteboard = NSPasteboard(name: .init("CherryTests.ImagePaste.\(UUID().uuidString)"))
     pasteboard.clearContents()
     let pngData = try #require(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="))
@@ -10356,7 +10192,7 @@ private func serviceRecord(
     }
     let imageID = try #require(UUID(uuidString: "ABCDEF12-0000-0000-0000-000000000123"))
     let now = Date()
-    let data = try #require(TerminalPasteboardContent.nonTextPasteData(
+    let url = try #require(TerminalPasteboardContent.pastedImageFileURL(
         from: pasteboard,
         imageDirectory: directory,
         imageID: imageID,
@@ -10366,30 +10202,8 @@ private func serviceRecord(
     let path = directory.appendingPathComponent(PastedImageStore.fileName(at: now, id: imageID)).path
     #expect(path.hasSuffix("-abcdef12.png"))
 
-    #expect(String(decoding: data, as: UTF8.self) == PastedImage.quoted(path))
+    #expect(url.path == path)
     #expect(FileManager.default.fileExists(atPath: path))
-}
-
-@Test func selectedTextSpansRows() async throws {
-    var buffer = LiveTerminalOutputBuffer(maxScrollback: nil)
-    buffer.ingest(Data("alpha\r\nbravo\r\ncharlie".utf8))
-    let selection = TerminalSelectionRange(
-        anchor: TerminalGridPoint(row: 0, column: 2),
-        extent: TerminalGridPoint(row: 2, column: 4)
-    )
-
-    #expect(buffer.selectedText(in: selection) == "pha\nbravo\nchar")
-}
-
-@Test func selectedTextHandlesReverseSelection() async throws {
-    var buffer = LiveTerminalOutputBuffer(maxScrollback: nil)
-    buffer.ingest(Data("alpha\r\nbravo".utf8))
-    let selection = TerminalSelectionRange(
-        anchor: TerminalGridPoint(row: 1, column: 3),
-        extent: TerminalGridPoint(row: 0, column: 1)
-    )
-
-    #expect(buffer.selectedText(in: selection) == "lpha\nbra")
 }
 
 @Test func ghosttyBridgeSkipsUnchangedMountedGridResize() async throws {

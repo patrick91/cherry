@@ -3,11 +3,7 @@ import Combine
 import Carbon.HIToolbox
 import SwiftUI
 
-private let terminalInputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
-
 enum TerminalInputEncoder {
-    private static let maximumScrollStepsPerEvent = 36
-    private static let terminalScrollRowsPerLine: CGFloat = 3
     private static let returnKeyCode: UInt16 = 36
     private static let keypadEnterKeyCode: UInt16 = 76
     private static let tabKeyCode: UInt16 = 48
@@ -29,62 +25,16 @@ enum TerminalInputEncoder {
     private static let appKitDownArrowKeyCode: UInt16 = 0x7D
     private static let appKitUpArrowKeyCode: UInt16 = 0x7E
 
-    static func commandSequence(
-        for selector: Selector,
-        usesApplicationCursorKeys: Bool = false
-    ) -> Data? {
-        switch selector {
-        case #selector(NSResponder.insertNewline(_:)):
-            return Data("\r".utf8)
-        case #selector(NSResponder.insertTab(_:)):
-            return Data("\t".utf8)
-        case #selector(NSResponder.cancelOperation(_:)):
-            return Data([0x03])
-        case #selector(NSResponder.deleteBackward(_:)):
-            return Data([0x7F])
-        case #selector(NSResponder.deleteForward(_:)):
-            return Data("\u{1B}[3~".utf8)
-        case #selector(NSResponder.moveLeft(_:)):
-            return Data(cursorKeySequence(.left, usesApplicationCursorKeys: usesApplicationCursorKeys).utf8)
-        case #selector(NSResponder.moveRight(_:)):
-            return Data(cursorKeySequence(.right, usesApplicationCursorKeys: usesApplicationCursorKeys).utf8)
-        case #selector(NSResponder.moveUp(_:)):
-            return Data(cursorKeySequence(.up, usesApplicationCursorKeys: usesApplicationCursorKeys).utf8)
-        case #selector(NSResponder.moveDown(_:)):
-            return Data(cursorKeySequence(.down, usesApplicationCursorKeys: usesApplicationCursorKeys).utf8)
-        case #selector(NSResponder.moveToBeginningOfLine(_:)):
-            return Data([0x01])
-        case #selector(NSResponder.moveToEndOfLine(_:)):
-            return Data([0x05])
-        case #selector(NSResponder.moveWordLeft(_:)):
-            return Data("\u{1B}b".utf8)
-        case #selector(NSResponder.moveWordRight(_:)):
-            return Data("\u{1B}f".utf8)
-        case #selector(NSResponder.deleteWordBackward(_:)):
-            return Data([0x1B, 0x7F])
-        case #selector(NSResponder.pageUp(_:)):
-            return Data("\u{1B}[5~".utf8)
-        case #selector(NSResponder.pageDown(_:)):
-            return Data("\u{1B}[6~".utf8)
-        default:
-            return nil
-        }
-    }
+    /// Enter is CR under every keyboard protocol Cherry types for: the
+    /// kitty report-all-keys encoding (`CSI 13 u`) is not sent.
+    static let enterData = Data("\r".utf8)
 
-    static func enterSequence(keyboardProtocolFlags: Int) -> Data {
-        return Data("\r".utf8)
-    }
-
-    static func terminalTextData(
-        _ text: String,
-        keyboardProtocolFlags: Int
-    ) -> Data {
+    static func terminalTextData(_ text: String) -> Data {
         let utf8 = text.utf8
         if !utf8.contains(0x0A), !utf8.contains(0x0D) {
             return Data(utf8)
         }
 
-        let enter = enterSequence(keyboardProtocolFlags: keyboardProtocolFlags)
         var data = Data()
         data.reserveCapacity(utf8.count)
         var previousWasCarriageReturn = false
@@ -92,11 +42,11 @@ enum TerminalInputEncoder {
         for byte in utf8 {
             switch byte {
             case 0x0D:
-                data.append(enter)
+                data.append(enterData)
                 previousWasCarriageReturn = true
             case 0x0A:
                 if !previousWasCarriageReturn {
-                    data.append(enter)
+                    data.append(enterData)
                 }
                 previousWasCarriageReturn = false
             default:
@@ -231,8 +181,7 @@ enum TerminalInputEncoder {
         keyCode: UInt16,
         characters: String?,
         charactersIgnoringModifiers: String?,
-        modifiers: NSEvent.ModifierFlags,
-        keyboardProtocolFlags: Int
+        modifiers: NSEvent.ModifierFlags
     ) -> Data? {
         let modifiers = modifiers.intersection(.deviceIndependentFlagsMask)
         guard modifiers.contains(.option),
@@ -245,14 +194,14 @@ enum TerminalInputEncoder {
 
         if let characters, !characters.isEmpty {
             guard let text = printableTerminalText(characters) else { return nil }
-            return terminalTextData(text, keyboardProtocolFlags: keyboardProtocolFlags)
+            return terminalTextData(text)
         }
 
         guard let text = translatedAppKitText(keyCode: keyCode, modifiers: modifiers) else {
             return nil
         }
 
-        return terminalTextData(text, keyboardProtocolFlags: keyboardProtocolFlags)
+        return terminalTextData(text)
     }
 
     private static func isAppKitTopRowDigitKey(
@@ -400,136 +349,11 @@ enum TerminalInputEncoder {
         return data
     }
 
-    static func insertedTextData(_ text: String) -> Data? {
-        guard !isAppKitFunctionKeyText(text) else { return nil }
-        return Data(text.utf8)
-    }
-
     static func isAppKitFunctionKeyText(_ text: String) -> Bool {
         guard !text.isEmpty else { return false }
         return text.unicodeScalars.allSatisfy { scalar in
             scalar.value >= 0xF700 && scalar.value <= 0xF8FF
         }
-    }
-
-    static func alternateScreenScrollSequence(
-        deltaY: CGFloat,
-        hasPreciseScrollingDeltas: Bool,
-        lineHeight: CGFloat,
-        remainder: inout CGFloat
-    ) -> Data? {
-        let steps = scrollStepCount(
-            deltaY: deltaY,
-            hasPreciseScrollingDeltas: hasPreciseScrollingDeltas,
-            lineHeight: lineHeight,
-            remainder: &remainder
-        )
-        guard steps != 0 else { return nil }
-
-        let sequence = steps > 0 ? "\u{1B}[A" : "\u{1B}[B"
-        return Data(String(repeating: sequence, count: abs(steps)).utf8)
-    }
-
-    static func mouseWheelSequence(
-        deltaY: CGFloat,
-        hasPreciseScrollingDeltas: Bool,
-        lineHeight: CGFloat,
-        column: Int,
-        row: Int,
-        mouseState: TerminalMouseState,
-        remainder: inout CGFloat
-    ) -> Data? {
-        let steps = scrollStepCount(
-            deltaY: deltaY,
-            hasPreciseScrollingDeltas: hasPreciseScrollingDeltas,
-            lineHeight: lineHeight,
-            remainder: &remainder
-        )
-        guard steps != 0 else { return nil }
-
-        let button = steps > 0 ? 64 : 65
-        var data = Data()
-        for _ in 0..<abs(steps) {
-            if mouseState.usesSGREncoding {
-                data.append(Data("\u{1B}[<\(button);\(column);\(row)M".utf8))
-            } else if let legacySequence = legacyMouseWheelSequence(button: button, column: column, row: row) {
-                data.append(legacySequence)
-            }
-        }
-
-        return data.isEmpty ? nil : data
-    }
-
-    static func mousePosition(
-        documentLocation: NSPoint,
-        visibleOrigin: NSPoint,
-        viewportSize: TerminalViewportSize,
-        sideInset: CGFloat,
-        topInset: CGFloat,
-        cellWidth: CGFloat,
-        lineHeight: CGFloat
-    ) -> (column: Int, row: Int) {
-        let visibleLocation = NSPoint(
-            x: documentLocation.x - visibleOrigin.x,
-            y: documentLocation.y - visibleOrigin.y
-        )
-        let rawColumn = Int(floor((visibleLocation.x - sideInset) / cellWidth)) + 1
-        let rawRow = Int(floor((visibleLocation.y - topInset) / lineHeight)) + 1
-
-        return (
-            column: min(max(rawColumn, 1), viewportSize.columns),
-            row: min(max(rawRow, 1), viewportSize.rows)
-        )
-    }
-
-    static func clampedViewportOffset(
-        currentOffset: CGFloat,
-        deltaY: CGFloat,
-        hasPreciseScrollingDeltas: Bool,
-        lineHeight: CGFloat,
-        documentHeight: CGFloat,
-        viewportHeight: CGFloat
-    ) -> CGFloat {
-        let maximumOffset = max(0, documentHeight - viewportHeight)
-        let scrollDelta = hasPreciseScrollingDeltas
-            ? deltaY
-            : deltaY * lineHeight
-        let proposedOffset = currentOffset - scrollDelta
-        return min(max(proposedOffset, 0), maximumOffset)
-    }
-
-    private static func scrollStepCount(
-        deltaY: CGFloat,
-        hasPreciseScrollingDeltas: Bool,
-        lineHeight: CGFloat,
-        remainder: inout CGFloat
-    ) -> Int {
-        guard deltaY != 0 else { return 0 }
-
-        let rawSteps: Int
-        if hasPreciseScrollingDeltas {
-            let scrollUnit = max(1, lineHeight / terminalScrollRowsPerLine)
-            remainder += deltaY / scrollUnit
-            rawSteps = Int(remainder.rounded(.towardZero))
-            remainder -= CGFloat(rawSteps)
-        } else {
-            rawSteps = Int((deltaY * terminalScrollRowsPerLine).rounded(.awayFromZero))
-        }
-
-        return min(max(rawSteps, -maximumScrollStepsPerEvent), maximumScrollStepsPerEvent)
-    }
-
-    private static func legacyMouseWheelSequence(button: Int, column: Int, row: Int) -> Data? {
-        guard (1...223).contains(column), (1...223).contains(row) else { return nil }
-
-        return Data([
-            0x1B,
-            UInt8(ascii: "["),
-            UInt8(ascii: "M"),
-            UInt8(button + 32),
-            UInt8(column + 32),
-            UInt8(row + 32)
-        ])
     }
 }
 
@@ -566,52 +390,6 @@ enum TerminalPasteboardContent {
             return PastedImage.quoted(imageURL.path)
         }
         return nil
-    }
-
-    static func pasteData(
-        from pasteboard: NSPasteboard,
-        bracketedPasteMode: Bool = false
-    ) -> Data? {
-        if let text = pasteboard.string(forType: .string), !text.isEmpty {
-            return TerminalInputEncoder.pastedTextData(
-                text,
-                bracketedPasteMode: bracketedPasteMode
-            )
-        }
-
-        return nonTextPasteData(
-            from: pasteboard,
-            bracketedPasteMode: bracketedPasteMode
-        )
-    }
-
-    static func nonTextPasteData(
-        from pasteboard: NSPasteboard,
-        imageDirectory: URL = defaultImageDirectory,
-        imageID: UUID = UUID(),
-        now: Date = Date(),
-        bracketedPasteMode: Bool = false
-    ) -> Data? {
-        if let urlText = urlPasteText(from: pasteboard) {
-            return TerminalInputEncoder.pastedTextData(
-                urlText,
-                bracketedPasteMode: bracketedPasteMode
-            )
-        }
-
-        guard let imageURL = pastedImageFileURL(
-            from: pasteboard,
-            imageDirectory: imageDirectory,
-            imageID: imageID,
-            now: now
-        ) else {
-            return nil
-        }
-
-        return TerminalInputEncoder.pastedTextData(
-            PastedImage.quoted(imageURL.path),
-            bracketedPasteMode: bracketedPasteMode
-        )
     }
 
     static func urlPasteText(from pasteboard: NSPasteboard) -> String? {
@@ -653,19 +431,8 @@ struct TerminalSurfaceView: NSViewRepresentable {
     let onActivate: (UUID) -> Void
 
     func makeNSView(context: Context) -> GhosttyTerminalContainerView {
-        TerminalPerformanceMonitor.recordRepresentableUpdate()
         let containerView = GhosttyTerminalContainerView()
-        containerView.configure(
-            with: session,
-            colorScheme: context.environment.colorScheme,
-            allowsAutoFocus: isActivePane && !chromeState.isOmniBarPresented,
-            isActivePane: isActivePane,
-            onActivate: { onActivate(session.id) }
-        )
-        containerView.applySidebarAnimationState(
-            isAnimating: chromeState.isSidebarAnimating,
-            postAnimationDeltaWidth: chromeState.pendingPostAnimationDelta
-        )
+        updateNSView(containerView, context: context)
         return containerView
     }
 

@@ -385,14 +385,6 @@ from `Cherry` only by case. `CHERRY_ICON_PATH` sets an `.icns` icon; a relative
 path is relative to your current directory. A build whose Info.plist holds an
 invalid folder name or scheme logs a warning and uses Cherry's.
 
-Installed builds keep recently-used Ghostty terminal surfaces alive across tab
-switches (no per-switch replay). To build the older replay-on-switch behavior
-instead, opt out:
-
-```bash
-CHERRY_KEEP_SURFACES_WARM=0 Scripts/install-local-app
-```
-
 The installer signs with the first Developer ID Application certificate of
 Cherry's team (`TEAM_ID` in `Packaging/release.conf`) in your keychain, else
 the first Apple Development one, else ad hoc, and says which it chose; a

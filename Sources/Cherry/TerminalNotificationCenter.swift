@@ -36,6 +36,17 @@ final class TerminalNotificationCenter {
         }
     }
 
+    /// Posts `content` now, asking for permission first if this run has not.
+    private func add(_ content: UNMutableNotificationContent, identifier: String) {
+        requestAuthorizationIfNeeded()
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                fputs("[notification post] \(error.localizedDescription)\n", stderr)
+            }
+        }
+    }
+
     func post(_ notification: TerminalNotificationRequest, for session: TerminalSession) {
         deliver(
             title: notification.title?.nilIfEmpty ?? session.title,
@@ -87,23 +98,13 @@ final class TerminalNotificationCenter {
             reportUnavailableDeliveryIfNeeded()
             return
         }
-        requestAuthorizationIfNeeded()
         let notification = UNMutableNotificationContent()
         notification.title = content.title
         notification.subtitle = content.subtitle
         notification.body = content.body
         notification.sound = .default
         notification.userInfo = content.userInfo
-        let request = UNNotificationRequest(
-            identifier: "cherry-background-\(content.sessionID)-\(UUID().uuidString)",
-            content: notification,
-            trigger: nil
-        )
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error {
-                fputs("[notification post] \(error.localizedDescription)\n", stderr)
-            }
-        }
+        add(notification, identifier: "cherry-background-\(content.sessionID)-\(UUID().uuidString)")
     }
 
     private func deliver(
@@ -119,8 +120,6 @@ final class TerminalNotificationCenter {
             return
         }
 
-        requestAuthorizationIfNeeded()
-
         let projectRoot = ProjectWindowRegistry.shared.projectRoot(containing: session.id)
         let content = UNMutableNotificationContent()
         content.title = title
@@ -130,18 +129,7 @@ final class TerminalNotificationCenter {
             "sessionID": session.id.uuidString,
             "projectRoot": projectRoot ?? ""
         ]
-
-        let request = UNNotificationRequest(
-            identifier: "\(identifierPrefix)-\(session.id.uuidString)-\(UUID().uuidString)",
-            content: content,
-            trigger: nil
-        )
-
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error {
-                fputs("[notification post] \(error.localizedDescription)\n", stderr)
-            }
-        }
+        add(content, identifier: "\(identifierPrefix)-\(session.id.uuidString)-\(UUID().uuidString)")
     }
 
     func handleResponse(userInfo: [AnyHashable: Any]) {

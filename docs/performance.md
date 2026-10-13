@@ -341,8 +341,7 @@ Override the cap at runtime with `CHERRY_LIVE_SURFACE_LIMIT=N`. Use
 every surface alive forever, the pure-Ghostty model where memory grows with tab
 count (Ghostty itself has no eviction and can balloon at high surface counts).
 Disable keep-warm (old replay-on-every-switch behavior) with
-`CHERRY_LIVE_SURFACE_LIMIT=0` or a `-DCHERRY_REPLAY_ON_SWITCH` build
-(`CHERRY_KEEP_SURFACES_WARM=0 Scripts/install-local-app`). Use the app-soak harness to measure the per-surface
+`CHERRY_LIVE_SURFACE_LIMIT=0`. Use the app-soak harness to measure the per-surface
 RSS/CPU cost at your real tab count; `last_ghostty_live_bridge_count` and
 `last_ghostty_output_observer_count` in the report show how many stay resident.
 

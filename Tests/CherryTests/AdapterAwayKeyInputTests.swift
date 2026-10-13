@@ -195,7 +195,6 @@ private func keyDown(
             charactersIgnoringModifiers: ignoring ?? characters,
             usesApplicationCursorKeys: applicationCursorKeys,
             isEnhancedKeyboardProtocolActive: false,
-            keyboardProtocolFlags: 0,
             sendsModifiedArrowKeys: false
         ).map { String(decoding: $0, as: UTF8.self) }
     }
@@ -242,7 +241,6 @@ private func encoded(
         charactersIgnoringModifiers: ignoring ?? characters,
         usesApplicationCursorKeys: applicationCursorKeys,
         isEnhancedKeyboardProtocolActive: kittyFlags > 0,
-        keyboardProtocolFlags: kittyFlags,
         sendsModifiedArrowKeys: false,
         modifyOtherKeys: modifyOtherKeys,
         optionAsAlt: optionAsAlt
@@ -409,7 +407,7 @@ private func encoded(
     let controlShift2 = HostRoutedKeyEncoder.data(
         keyCode: 19, modifiers: [.control, .shift], characters: "\u{00}", charactersIgnoringModifiers: "@",
         unshiftedCharacters: "2", usesApplicationCursorKeys: false, isEnhancedKeyboardProtocolActive: true,
-        keyboardProtocolFlags: 1, sendsModifiedArrowKeys: false
+        sendsModifiedArrowKeys: false
     ).map { String(decoding: $0, as: UTF8.self) }
     #expect(controlShift2 == "\u{1B}[50;6u")
     // A non-Latin layout: its own character, as Ghostty's surface sends it.

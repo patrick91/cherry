@@ -63,7 +63,6 @@ if [[ "$RELEASE" == 1 ]]; then
   refuse_override CHERRY_BUNDLE_ID "$RELEASE_BUNDLE_ID"
   refuse_override CHERRY_APPLICATION_SUPPORT_NAME Cherry
   refuse_override CHERRY_URL_SCHEME cherry
-  [[ "${CHERRY_KEEP_SURFACES_WARM:-1}" != 0 ]] || fail "CHERRY_RELEASE=1 refuses CHERRY_KEEP_SURFACES_WARM=0"
   [[ "${CHERRY_SKIP_HOST:-0}" != 1 ]] || fail "CHERRY_RELEASE=1 refuses CHERRY_SKIP_HOST=1: a release carries the Persistent Sessions helpers"
   [[ -z "${CHERRY_ICON_PATH:-}" ]] || fail "CHERRY_RELEASE=1 refuses CHERRY_ICON_PATH"
   [[ -z "${CHERRY_GET_TASK_ALLOW:-}" || "${CHERRY_GET_TASK_ALLOW}" == 0 ]] \
@@ -219,22 +218,6 @@ if [[ "$RELEASE" == 1 ]]; then
     || fail "Packaging/THIRD_PARTY_NOTICES.txt does not match Package.resolved or GhosttyKit: run Scripts/app-notices --write and commit it."
 fi
 
-# Live-surface keep-warm is ON by default (the in-code default keeps
-# recently-used Ghostty surfaces alive across tab switches instead of freeing +
-# replaying them). Opt out (old replay-on-switch behavior) with
-# CHERRY_KEEP_SURFACES_WARM=0 Scripts/install-local-app.
-# (EXTRA_BUILD_ARGS is a plain string, not a bash array, so empty expansion is
-# safe under `set -u` on macOS's stock bash 3.2; these flags contain no spaces.)
-KEEP_WARM="${CHERRY_KEEP_SURFACES_WARM:-1}"
-EXTRA_BUILD_ARGS=""
-if [[ "$KEEP_WARM" == "0" ]]; then
-  EXTRA_BUILD_ARGS="-Xswiftc -DCHERRY_REPLAY_ON_SWITCH"
-  echo "Building STOCK (replay-on-switch; the old behavior)"
-else
-  echo "Building WARM (live surfaces kept warm; the default)"
-fi
-
-echo "Building with native PTY (Ghostty owns the PTY)"
 echo "Signing with $IDENTITY_DESCRIPTION"
 
 # CFBundleShortVersionString and CFBundleVersion. A release is given both;
@@ -268,17 +251,19 @@ fi
 # the app, since each triple's build may share SwiftPM's products directory.
 MCP_HELPER_PATH="$("$ROOT/Scripts/build-mcp-helper" "$CONFIGURATION" | tail -n 1)"
 # CHERRY_SWIFT_BUILD_ARGS (release mode: --force-resolved-versions) goes to
-# every Swift build, split like EXTRA_BUILD_ARGS.
-# shellcheck disable=SC2086 # EXTRA_BUILD_ARGS and CHERRY_SWIFT_BUILD_ARGS are split on purpose (see above).
+# every Swift build. It is a plain string, not a bash array, so an empty
+# expansion is safe under `set -u` on macOS's stock bash 3.2; its flags contain
+# no spaces.
+# shellcheck disable=SC2086 # CHERRY_SWIFT_BUILD_ARGS is split on purpose (see above).
 if [[ "$APP_ARCHS" == universal ]]; then
-  BINARY_PATH="$("$ROOT/Scripts/build-universal" Cherry "$CONFIGURATION" --archs universal -- $EXTRA_BUILD_ARGS ${CHERRY_SWIFT_BUILD_ARGS:-} | tail -n 1)"
+  BINARY_PATH="$("$ROOT/Scripts/build-universal" Cherry "$CONFIGURATION" --archs universal -- ${CHERRY_SWIFT_BUILD_ARGS:-} | tail -n 1)"
   # This Mac's triple was built last; its products directory holds the
   # resource bundles and Sparkle.framework.
   MINIMUM_MACOS="$(sed -n 's/.*\.macOS(\.v\([0-9][0-9]*\)).*/\1/p' Package.swift | sed -n 1p)"
   [[ -n "$MINIMUM_MACOS" ]] || fail "Could not read the macOS version from Package.swift"
   BIN_DIR="$(swift build -c "$CONFIGURATION" --product Cherry --triple "$(uname -m)-apple-macosx$MINIMUM_MACOS.0" ${CHERRY_SWIFT_BUILD_ARGS:-} --show-bin-path)"
 else
-  swift build -c "$CONFIGURATION" --product Cherry $EXTRA_BUILD_ARGS ${CHERRY_SWIFT_BUILD_ARGS:-}
+  swift build -c "$CONFIGURATION" --product Cherry ${CHERRY_SWIFT_BUILD_ARGS:-}
   BIN_DIR="$(swift build -c "$CONFIGURATION" ${CHERRY_SWIFT_BUILD_ARGS:-} --show-bin-path)"
   BINARY_PATH="$BIN_DIR/Cherry"
 fi

@@ -396,9 +396,9 @@ private func session(
     #expect(RemoteNotOpenSection.ownerLabel(sessions[5], ownOwner: ours) == "Another client's")
 }
 
-// MARK: - The picker
+// MARK: - Devices in the Omni bar
 
-@Test func thePickerModelListsDevicesWithTheirStateProjectsAndActions() throws {
+@Test @MainActor func theOmniBarListsDevicesWithTheirStateProjectsAndActions() throws {
     let now = Date(timeIntervalSince1970: 1_800_000_000)
     let studioID = try #require(UUID(uuidString: "00000000-0000-0000-0000-00000000A001"))
     let miniID = try #require(UUID(uuidString: "00000000-0000-0000-0000-00000000A002"))
@@ -416,95 +416,60 @@ private func session(
         session("c", owner: "Cherry", project: "/Users/me/secret"),
         session("d", owner: nil, project: nil),
     ]
-    let model = TitlebarProjectMenuModel(
-        projects: [
-            .init(root: "/Users/local/site", name: "site", isSelected: false),
-        ],
-        devices: [
-            .init(device: studio, state: .connected(sessionCount: 4), sessions: studioSessions),
-            .init(device: mini, state: RemoteDeviceConnectionState(
-                control: .waitingToReconnect(.unavailable("ssh: connect to host mini port 22: Connection timed out")),
-                sessionCount: 0, lastSeen: mini.lastSeen
-            ), sessions: []),
-            .init(device: laptop, state: .identityChanged(reason: "Expected host identity a, received b."), sessions: []),
-        ],
+    let devices: [TitlebarProjectMenuModel.Device] = [
+        .init(device: studio, state: .connected(sessionCount: 4), sessions: studioSessions),
+        .init(device: mini, state: RemoteDeviceConnectionState(
+            control: .waitingToReconnect(.unavailable("ssh: connect to host mini port 22: Connection timed out")),
+            sessionCount: 0, lastSeen: mini.lastSeen
+        ), sessions: []),
+        .init(device: laptop, state: .identityChanged(reason: "Expected host identity a, received b."), sessions: []),
+    ]
+    var sources = OmniSources()
+    sources.devices = devices
+    sources.projects = ProjectSwitcherModel.make(
+        localProjects: [.init(root: "/Users/local/site", name: "site")],
+        devices: devices,
+        openWindows: [:],
+        recency: [:],
         currentProjectKey: studio.projectKey(path: "/Users/me/app"),
-        now: now
+        thisMac: ProjectSwitcherModel.thisMacInfo(sessionCount: nil, symbol: "laptopcomputer"),
+        localHome: "/Users/local"
     )
-    #expect(model.snapshot == """
-    ## Projects
-    site
-    ---
-    Add Project...
-    Edit Projects...
-    ---
-    ## Devices
-    [x] ●green Studio — Connected · 4 sessions
-      [x] app — 2 sessions · /Users/me/app
-      ⌥ Hide app — /Users/me/app
-      notes — /Users/me/notes
-      ⌥ Hide notes — /Users/me/notes
-      Other sessions — 1 session
-      ---
-      Open Home Folder — /Users/me
-      Add Project on Studio…
-      ---
-      ●green Connected (off)
-      Persistent Sessions on Studio…
-      Set Up Cherry MCP on Studio…
-      ---
-      Rename…
-      Remove…
-    ●gray Mini — Offline
-      No Projects (off)
-      ---
-      Open Home Folder (off)
-      Add Project on Mini…
-      ---
-      ●gray Offline: ssh: connect to host mini port 22: Connection timed out (off)
-      Reconnect
-      Persistent Sessions on Mini…
-      Set Up Cherry MCP on Mini…
-      ---
-      Rename…
-      Remove…
-    ●red Laptop — Its identity changed
-      No Projects (off)
-      ---
-      Open Home Folder (off)
-      Add Project on Laptop… (off)
-      ---
-      ●red Identity changed: Expected host identity a, received b. (off)
-      Trust New Identity…
-      Persistent Sessions on Laptop…
-      Set Up Cherry MCP on Laptop… (off)
-      ---
-      Rename…
-      Remove…
-    Add Mac…
-    """)
-    // Each item says what it does.
-    let studioItem = try #require(model.deviceItems[studioID])
-    let actions = (studioItem.children ?? []).compactMap { entry -> TitlebarProjectMenuModel.Action? in
-        if case .item(let item) = entry { return item.action }
-        return nil
-    }
-    #expect(actions == [
-        .openDeviceProject(deviceID: studioID, path: "/Users/me/app"),
-        .hideDeviceProject(deviceID: studioID, path: "/Users/me/app"),
-        .openDeviceProject(deviceID: studioID, path: "/Users/me/notes"),
-        .hideDeviceProject(deviceID: studioID, path: "/Users/me/notes"),
-        .openDeviceSessions(studioID),
-        .openDeviceHome(studioID),
-        .addDeviceProject(studioID),
-        .openDeviceSessions(studioID),
-        .setUpDeviceMCP(studioID),
-        .renameDevice(studioID),
-        .removeDevice(studioID),
+    let macs = OmniProviders.macs(sources)
+    try #require(macs.count == 4)
+    #expect(macs.map(\.title) == ["This Mac", "Studio", "Mini", "Laptop"])
+    #expect(macs.map(\.detail) == ["", "4 sessions", "Offline", "Offline"])
+    #expect(macs[1].status == .idle && macs[2].status == .offline && macs[3].status == .offline)
+    // Its projects: its sessions' (every owner's), the added ones, not the
+    // hidden one.
+    #expect(OmniProviders.projects(sources, on: .device(studioID)).map(\.title) == ["app", "notes"])
+    #expect(sources.projects.locations.first { $0.isCurrent }?.key == studio.projectKey(path: "/Users/me/app"))
+
+    // Each Mac's actions, as it answers now.
+    #expect(macs[1].actions.map(\.title) == [
+        "Open Home Folder", "Add Project on Studio…", "New Terminal on Studio",
+        "Persistent Sessions on Studio…", "Set Up Cherry MCP on Studio…", "Rename…", "Remove…",
     ])
+    #expect(macs[1].actions.map(\.command) == [
+        .switcher(.openDeviceHome(studioID)),
+        .browseFolders(on: .device(studioID), intent: .add),
+        .newTerminal(on: .device(studioID)),
+        .switcher(.openDeviceSessions(studioID)),
+        .switcher(.setUpDeviceMCP(studioID)),
+        .switcher(.renameDevice(studioID)),
+        .switcher(.removeDevice(studioID)),
+    ])
+    // Its home is not known yet: no Open Home Folder.
+    #expect(macs[2].actions.map(\.title) == [
+        "Add Project on Mini…", "New Terminal on Mini", "Reconnect",
+        "Persistent Sessions on Mini…", "Set Up Cherry MCP on Mini…", "Rename…", "Remove…",
+    ])
+    // Another identity answers: nothing to open there.
+    #expect(macs[3].actions.map(\.title) == ["Trust New Identity…", "Persistent Sessions on Laptop…", "Rename…", "Remove…"])
+    #expect(macs[3].actions.first?.command == .switcher(.trustDeviceIdentity(laptopID)))
 }
 
-@Test func thePickerModelSaysHowEachDeviceStands() {
+@Test func eachDeviceSaysHowItStands() {
     let now = Date(timeIntervalSince1970: 1_800_000_000)
     let states: [(RemoteDeviceConnectionState, String, RemoteDeviceConnectionState.Dot)] = [
         (.unknown(lastSeen: nil), "Not checked yet", .gray),
@@ -525,21 +490,6 @@ private func session(
     #expect(RemoteDeviceConnectionState.failure(.identityMismatch("x")) == .identityChanged(reason: "x"))
     #expect(RemoteDeviceConnectionState.failure(.unavailable("The session host speaks protocol 6, but this Cherry speaks 7.")).offersReconnect)
     #expect(!RemoteDeviceConnectionState.connected(sessionCount: 0).offersReconnect)
-    // This Mac's projects are listed as before.
-    let model = TitlebarProjectMenuModel(
-        projects: [],
-        devices: [],
-        currentProjectKey: "/p"
-    )
-    #expect(model.snapshot == """
-    No Projects (off)
-    ---
-    Add Project...
-    Edit Projects...
-    ---
-    ## Devices
-    Add Mac…
-    """)
 }
 
 // MARK: - Saved records and restore wording
@@ -833,7 +783,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
             openWindows: [:],
             recency: [:],
             currentProjectKey: nil,
-            thisMac: ProjectSwitcherModel.thisMacInfo(computerName: nil, sessionCount: 3, projectCount: 0, symbol: "laptopcomputer"),
+            thisMac: ProjectSwitcherModel.thisMacInfo(sessionCount: 3, symbol: "laptopcomputer"),
             localHome: "/Users/me"
         )
         return sources
@@ -971,16 +921,23 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     writable = true
     store.remove(mini.id)
     #expect(!hostStore.hosts.contains(try HostedSessionHost.ssh("mini")))
-    // The picker offers no change to a copy that cannot make it.
+    // The Omni bar offers no change to a copy that cannot make it.
     let device = RemoteDevice(id: UUID(), name: "Studio", sshDestination: "studio", homeDirectory: "/Users/me")
-    let menu = TitlebarProjectMenuModel(
-        projects: [],
-        devices: [.init(device: device, state: .identityChanged(reason: "x"), sessions: [session("a", owner: "Cherry", project: "/Users/me/app")])],
-        currentProjectKey: nil, canModifyDevices: false
+    let entry = TitlebarProjectMenuModel.Device(
+        device: device, state: .identityChanged(reason: "x"), sessions: [session("a", owner: "Cherry", project: "/Users/me/app")]
     )
-    for line in ["⌥ Hide app — /Users/me/app (off)", "Trust New Identity… (off)", "Rename… (off)", "Remove… (off)", "Add Mac… (off)"] {
-        #expect(menu.snapshot.contains(line), "\(line)")
-    }
+    var sources = OmniSources()
+    sources.devices = [entry]
+    sources.canModifyDevices = false
+    sources.projects = ProjectSwitcherModel.make(
+        localProjects: [], devices: [entry], openWindows: [:], recency: [:], currentProjectKey: nil,
+        thisMac: ProjectSwitcherModel.thisMacInfo(sessionCount: nil, symbol: "desktopcomputer"), localHome: "/Users/me"
+    )
+    let project = try #require(OmniProviders.projects(sources, on: .device(device.id)).first)
+    #expect(project.title == "app")
+    #expect(!project.actions.contains { $0.title == "Remove from Projects" })
+    #expect(OmniProviders.macActions(.device(device.id), sources: sources).map(\.title) == ["Persistent Sessions on Studio…"])
+    #expect(!OmniProviders.commands(sources).contains { $0.id == "command:addMac" })
 }
 
 @Test @MainActor func aMacsHostingStaysTheSameAcrossRenamesRemovalsInUseAndAddingItAgain() throws {

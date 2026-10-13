@@ -13,8 +13,7 @@ struct TerminalSettingsPane: View {
                     title: "Light",
                     selection: $settings.lightTerminalThemeName
                 )
-                .padding(.horizontal, 18)
-                .padding(.vertical, 13)
+                .settingsRowPadding()
 
                 SettingsDivider()
 
@@ -22,8 +21,7 @@ struct TerminalSettingsPane: View {
                     title: "Dark",
                     selection: $settings.darkTerminalThemeName
                 )
-                .padding(.horizontal, 18)
-                .padding(.vertical, 13)
+                .settingsRowPadding()
             }
 
             SettingsCard("Text") {
@@ -34,8 +32,7 @@ struct TerminalSettingsPane: View {
                     step: 1,
                     suffix: "pt"
                 )
-                .padding(.horizontal, 18)
-                .padding(.vertical, 13)
+                .settingsRowPadding()
 
                 SettingsDivider()
 
@@ -54,8 +51,7 @@ struct TerminalSettingsPane: View {
                     step: 0.05,
                     suffix: "x"
                 )
-                .padding(.horizontal, 18)
-                .padding(.vertical, 13)
+                .settingsRowPadding()
 
                 SettingsDivider()
 
@@ -67,15 +63,13 @@ struct TerminalSettingsPane: View {
                     suffix: "%",
                     displayScale: 100
                 )
-                .padding(.horizontal, 18)
-                .padding(.vertical, 13)
+                .settingsRowPadding()
 
                 if optionKey.isOptionDown {
                     SettingsDivider()
 
                     SidebarThemeDebugPanel(settings: settings)
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 13)
+                        .settingsRowPadding()
                 }
             }
 

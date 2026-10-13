@@ -59,6 +59,11 @@ let package = Package(
                 .product(name: "GhosttyTheme", package: "libghostty-spm"),
                 .product(name: "Sparkle", package: "Sparkle"),
             ],
+            // The Icon Composer source: Scripts/install-local-app compiles it
+            // with actool from here, and the app bundle never reads it.
+            exclude: [
+                "Resources/AppIcon.icon"
+            ],
             resources: [
                 .process("Resources")
             ],

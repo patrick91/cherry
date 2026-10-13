@@ -39,8 +39,7 @@ struct ProjectCommandRow: View {
             Button("Edit", action: onEdit)
                 .settingsGlassButtonStyle()
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 13)
+        .settingsRowPadding()
         .contextMenu {
             Button("Delete", role: .destructive, action: onDelete)
         }
@@ -345,9 +344,6 @@ private struct ProjectCommandDraft {
         enabled = command.enabled
         self.storage = storage
         self.projectRoot = projectRoot
-        if name.isEmpty, commandLine.isEmpty, workingDirectory.isEmpty {
-            self.workingDirectory = ""
-        }
     }
 
     var definition: ProjectCommandDefinition {

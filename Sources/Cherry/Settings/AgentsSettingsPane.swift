@@ -129,8 +129,7 @@ private struct AgentToolRow: View {
                 .settingsGlassButtonStyle()
             Button("Delete", role: .destructive, action: onReset)
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 13)
+        .settingsRowPadding()
     }
 }
 

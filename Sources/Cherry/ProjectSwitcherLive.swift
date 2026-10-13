@@ -3,7 +3,6 @@ import CherryControl
 import Combine
 import Foundation
 import IOKit.ps
-import SystemConfiguration
 
 extension TitlebarProjectMenuModel {
     /// Each device and what is known of it now, from cached state: its
@@ -33,7 +32,7 @@ extension TitlebarProjectMenuModel {
                 bundledBuild: RemoteHostHelpers.cachedAppBuild
             )
         }
-        // Read once in the background: the next menu offers Update Session
+        // Read once in the background: the next look offers Update Session
         // Host… for a device whose install is older.
         if !store.devices.isEmpty { RemoteHostHelpers.preloadApp() }
         return devices
@@ -47,10 +46,7 @@ extension TitlebarProjectMenuModel {
 @MainActor
 enum ProjectSwitcherLive {
     /// The model from the app's state now.
-    static func build(
-        currentProjectKey: String?,
-        devices: [TitlebarProjectMenuModel.Device] = TitlebarProjectMenuModel.liveDevices()
-    ) -> ProjectSwitcherModel {
+    static func build(currentProjectKey: String?, devices: [TitlebarProjectMenuModel.Device]) -> ProjectSwitcherModel {
         let registry = ProjectWindowRegistry.shared
         let settings = AgentSettings.shared
         let recency = ProjectRecencyStore.shared
@@ -73,12 +69,7 @@ enum ProjectSwitcherLive {
 
         let localControl = HostControlRegistry.shared.all.first { $0.host.id == HostedSessionHost.local.id }
         let localSessions = localControl?.state == .connected ? localControl?.sessions.count : nil
-        let thisMac = ProjectSwitcherModel.thisMacInfo(
-            computerName: Self.computerName,
-            sessionCount: localSessions,
-            projectCount: localProjects.count,
-            symbol: Self.thisMacSymbol
-        )
+        let thisMac = ProjectSwitcherModel.thisMacInfo(sessionCount: localSessions, symbol: Self.thisMacSymbol)
         var canonical: [String: String] = [:]
         return ProjectSwitcherModel.make(
             localProjects: localProjects,
@@ -96,8 +87,6 @@ enum ProjectSwitcherLive {
         )
     }
 
-    private static let computerName: String? = SCDynamicStoreCopyComputerName(nil, nil) as String?
-
     /// A laptop's glyph for a Mac with a built-in battery, else a desktop's.
     private static let thisMacSymbol: String = {
         guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
@@ -111,25 +100,20 @@ enum ProjectSwitcherLive {
     }()
 }
 
-/// What the picker menu's items and the Omni bar's project and Mac rows
-/// do: the same code path for each (a device's project opens through its
-/// key, window reuse through `openProject`).
+/// What the Omni bar's project and Mac rows do: the same code path for
+/// each (a device's project opens through its key, window reuse through
+/// `openProject`).
 @MainActor
 struct ProjectSwitcherActions {
     let settings: AgentSettings
     let chromeState: ProjectWindowChromeState
     let openProject: (CherryProject) -> Void
-    let openSettings: () -> Void
 
     func perform(_ action: TitlebarProjectMenuModel.Action) {
         let store = RemoteDeviceStore.shared
         switch action {
         case .openProject(let root):
             openProject(settings.projects.first(where: { $0.root == root }) ?? CherryProject(root: root))
-        case .addProject:
-            chooseProjectRoot()
-        case .editProjects:
-            openSettings()
         case .openDeviceProject(let deviceID, let path):
             openProject(CherryProject(root: ProjectLocation.remote(deviceID: deviceID, path: path).key))
         case .openDeviceHome(let deviceID):
@@ -161,33 +145,6 @@ struct ProjectSwitcherActions {
         }
     }
 
-    /// Add Project…: a folder on This Mac, added to the list and opened;
-    /// on a device, Add Project on <Mac>… (a path checked there).
-    func addProject(on machine: ProjectSwitcherModel.Machine) {
-        switch machine {
-        case .thisMac: chooseProjectRoot()
-        case .device(let id): perform(.addDeviceProject(id))
-        }
-    }
-
-    /// Open Folder…: a folder on This Mac, opened without adding it; on a
-    /// device, Add Project on <Mac>… (there is no remote folder browser).
-    func openFolder(on machine: ProjectSwitcherModel.Machine) {
-        switch machine {
-        case .thisMac:
-            let panel = NSOpenPanel()
-            panel.canChooseFiles = false
-            panel.canChooseDirectories = true
-            panel.canCreateDirectories = true
-            panel.allowsMultipleSelection = false
-            panel.prompt = "Open"
-            guard panel.runModal() == .OK, let url = panel.url else { return }
-            openProject(CherryProject(root: url.path))
-        case .device(let id):
-            perform(.addDeviceProject(id))
-        }
-    }
-
     /// "Open “<query>” as a folder…": false when the query names no folder
     /// that can be opened (a missing one on This Mac, `~` on a device whose
     /// home is unknown).
@@ -205,20 +162,5 @@ struct ProjectSwitcherActions {
             perform(.openDeviceProject(deviceID: id, path: path))
         }
         return true
-    }
-
-    func chooseProjectRoot() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Add"
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        settings.addProject(path: url.path)
-        if let project = settings.selectedProject(for: url.path) {
-            openProject(project)
-        }
     }
 }

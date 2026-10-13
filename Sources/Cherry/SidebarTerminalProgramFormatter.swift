@@ -81,7 +81,8 @@ enum SidebarTerminalProgramFormatter {
         guard let runnerTarget = runnerTarget(from: tokens) else { return nil }
 
         let descriptor = ProgramCatalog.descriptor(forPackageOrExecutable: runnerTarget.target)
-        let title = descriptor?.displayName ?? displayName(forPackage: runnerTarget.target)
+        let title = descriptor?.displayName
+            ?? (ProgramCatalog.cleanedPackageOrExecutable(runnerTarget.target).nilIfEmpty ?? runnerTarget.target)
         return label(
             title: title,
             detail: rawCommand,
@@ -99,7 +100,7 @@ enum SidebarTerminalProgramFormatter {
             detail: detail,
             leadingIconResourceName: descriptor.logoResourceName,
             leadingIconFallback: descriptor.fallbackLabel,
-            leadingIconRendersAsTemplate: descriptor.logoResourceName != nil && descriptor.rendersAsTemplate
+            leadingIconRendersAsTemplate: descriptor.logoResourceName != nil
         )
     }
 
@@ -158,21 +159,11 @@ enum SidebarTerminalProgramFormatter {
         let executable = ProgramCatalog.normalizedExecutableName(first)
 
         switch executable {
-        case "bunx":
-            guard let runner = ProgramCatalog.descriptor(forExecutable: "bunx"),
-                  let target = firstRunnableToken(from: Array(tokens.dropFirst()))
-            else { return nil }
-            return (runner, target)
-        case "npx":
-            guard let runner = ProgramCatalog.descriptor(forExecutable: "npx"),
-                  let target = firstRunnableToken(from: Array(tokens.dropFirst()))
-            else { return nil }
-            return (runner, target)
-        case "uvx":
-            guard let runner = ProgramCatalog.descriptor(forExecutable: "uvx"),
+        case "bunx", "npx", "uvx":
+            guard let runner = ProgramCatalog.descriptor(forExecutable: executable),
                   let target = firstRunnableToken(
                     from: Array(tokens.dropFirst()),
-                    additionalOptionsTakingValue: uvxOptionsTakingValue
+                    additionalOptionsTakingValue: executable == "uvx" ? uvxOptionsTakingValue : []
                   )
             else { return nil }
             return (runner, target)
@@ -260,21 +251,6 @@ enum SidebarTerminalProgramFormatter {
             return token
         }
         return nil
-    }
-
-    private static func displayName(forPackage token: String) -> String {
-        cleanedPackageName(token)
-    }
-
-    private static func cleanedPackageName(_ token: String) -> String {
-        var package = SidebarTerminalPathString.lastPathComponent(token)
-        if package.hasPrefix("@"), let slash = package.firstIndex(of: "/") {
-            package = String(package[package.index(after: slash)...])
-        }
-        if let version = package.dropFirst().lastIndex(of: "@") {
-            package = String(package[..<version])
-        }
-        return package.nilIfEmpty ?? token
     }
 
     private static func splitTrailingParenthetical(_ value: String) -> (title: String, parenthetical: String?) {
@@ -420,7 +396,6 @@ private struct ProgramDescriptor {
     let displayName: String
     let logoResourceName: String?
     let fallbackLabel: String
-    let rendersAsTemplate: Bool
     let prefersArgumentTitle: Bool
     let prefersSubcommandTitle: Bool
 
@@ -428,14 +403,12 @@ private struct ProgramDescriptor {
         displayName: String,
         logoResourceName: String? = nil,
         fallbackLabel: String,
-        rendersAsTemplate: Bool = true,
         prefersArgumentTitle: Bool = false,
         prefersSubcommandTitle: Bool = false
     ) {
         self.displayName = displayName
         self.logoResourceName = logoResourceName
         self.fallbackLabel = fallbackLabel
-        self.rendersAsTemplate = rendersAsTemplate
         self.prefersArgumentTitle = prefersArgumentTitle
         self.prefersSubcommandTitle = prefersSubcommandTitle
     }
@@ -466,7 +439,7 @@ private enum ProgramCatalog {
         return name
     }
 
-    private static func cleanedPackageOrExecutable(_ value: String) -> String {
+    static func cleanedPackageOrExecutable(_ value: String) -> String {
         var package = SidebarTerminalPathString.lastPathComponent(value)
         if package.hasPrefix("@"), let slash = package.firstIndex(of: "/") {
             package = String(package[package.index(after: slash)...])
@@ -496,14 +469,12 @@ private enum ProgramCatalog {
         "cargo": "rust",
         "rustc": "rust",
         "sc": "shortcake",
-        "ruff": "ruff",
         "ruff-lsp": "ruff",
         "uvicorn": "fastapi",
         "py.test": "pytest",
         "pytest3": "pytest",
         "nextjs": "next",
-        "create-vite": "vite",
-        "create-next-app": "create-next-app"
+        "create-vite": "vite"
     ]
 
     private static let descriptors: [String: ProgramDescriptor] = [

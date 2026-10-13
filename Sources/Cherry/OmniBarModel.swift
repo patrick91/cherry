@@ -98,7 +98,6 @@ enum OmniMenuCommand: String, CaseIterable {
     case toggleSidebar
     // Ids of the command palette's commands, kept so their usage carries
     // over (`OmniFrecencyStore`).
-    case addProject
     case toggleAppearance
 }
 
@@ -113,10 +112,8 @@ enum OmniCommand: Equatable {
     case revealInFinder(path: String)
     case copyPath(String)
     case removeProject(key: String)
-    /// One of the picker menu's actions (`ProjectSwitcherActions.perform`).
+    /// Opens a project or acts on a Mac (`ProjectSwitcherActions.perform`).
     case switcher(TitlebarProjectMenuModel.Action)
-    case openFolder(on: ProjectSwitcherModel.Machine)
-    case addProject(on: ProjectSwitcherModel.Machine)
     case newTerminal(on: ProjectSwitcherModel.Machine)
     case endBackgroundSessions(on: ProjectSwitcherModel.Machine)
     case goToTab(UUID)
@@ -495,7 +492,6 @@ struct OmniAgent: Equatable {
 
 /// What the window the bar is open in can do now (the commands offered).
 struct OmniWindowContext: Equatable {
-    var hasWorkspace = true
     var hasSelectedTab = false
     var canSplit = false
     var canDetach = false
@@ -511,7 +507,7 @@ struct OmniWindowContext: Equatable {
 struct OmniSources: Equatable {
     /// Projects and Macs (`ProjectSwitcherModel.make`).
     var projects = ProjectSwitcherModel(machines: [], locations: [])
-    /// Each device as the picker menu knows it, for its actions.
+    /// Each device and what is known of it now, for its actions.
     var devices: [TitlebarProjectMenuModel.Device] = []
     var tabs: [OmniTab] = []
     var backgroundSessions: [OmniBackgroundSession] = []
@@ -525,7 +521,6 @@ struct OmniSources: Equatable {
     var agents: [OmniAgent] = []
     var agentPresets: [OmniAgent] = []
     var canModifyDevices = true
-    var now = Date(timeIntervalSince1970: 0)
     /// Folder listings by the folder typed (`OmniFolderBrowser`).
     var folderListings: [OmniFolderRequest: OmniFolderListing] = [:]
     /// The git repositories found under the usual places on each Mac
@@ -542,10 +537,6 @@ struct OmniSources: Equatable {
 
 /// Turns the sources into rows, one function per kind.
 enum OmniProviders {
-    static func macName(_ machine: ProjectSwitcherModel.Machine, in sources: OmniSources) -> String {
-        sources.projects.name(of: machine)
-    }
-
     // MARK: Projects
 
     static func projects(_ sources: OmniSources, on machine: ProjectSwitcherModel.Machine? = nil) -> [OmniItem] {
@@ -689,11 +680,14 @@ enum OmniProviders {
     }
 
     /// A Mac's ⌘K actions: its folders, a terminal on it, and, for a
-    /// device, what the picker menu offers for it now (Reconnect, Trust New
+    /// device, what can be done with it now (Reconnect, Trust New
     /// Identity…, Update Session Host…, Set Up Cherry MCP…, Rename…,
-    /// Remove…; `TitlebarProjectMenuModel.deviceItem`).
+    /// Remove…).
     static func macActions(_ machine: ProjectSwitcherModel.Machine, sources: OmniSources) -> [OmniAction] {
         let hasBackground = sources.backgroundSessions.contains { $0.machine == machine }
+        let endBackgroundSessions = OmniAction(
+            title: "End Background Sessions…", command: .endBackgroundSessions(on: machine), isDestructive: true
+        )
         switch machine {
         case .thisMac:
             var actions: [OmniAction] = [
@@ -702,57 +696,43 @@ enum OmniProviders {
                 .init(title: "New Terminal on This Mac", command: .newTerminal(on: .thisMac)),
                 .init(title: "Persistent Sessions…", command: .menu(.persistentSessions)),
             ]
-            if hasBackground {
-                actions.append(.init(title: "End Background Sessions…", command: .endBackgroundSessions(on: .thisMac), isDestructive: true))
-            }
+            if hasBackground { actions.append(endBackgroundSessions) }
             return actions
         case .device(let id):
             guard let entry = sources.devices.first(where: { $0.device.id == id }) else { return [] }
-            let item = TitlebarProjectMenuModel.deviceItem(
-                entry, currentProjectKey: nil, canModify: sources.canModifyDevices, now: sources.now
-            )
-            let offered: [TitlebarProjectMenuModel.Item] = (item.children ?? []).compactMap { child in
-                guard case .item(let menuItem) = child, menuItem.isEnabled, !menuItem.isAlternate,
-                      let action = menuItem.action
-                else { return nil }
-                switch action {
-                case .openDeviceHome, .addDeviceProject, .reconnectDevice, .trustDeviceIdentity,
-                     .updateDeviceHost, .setUpDeviceMCP, .renameDevice, .removeDevice:
-                    return menuItem
-                case .openDeviceSessions:
-                    // "Other sessions" and "Persistent Sessions on …" are one.
-                    return menuItem.title.hasPrefix("Persistent Sessions") ? menuItem : nil
-                default:
-                    return nil
-                }
-            }
+            let device = entry.device
+            let state = entry.state
+            // Its projects open only while it answers as itself; only the
+            // copy of the app that keeps the devices changes them.
+            let canOpen = state.allowsOpening
+            let canModify = sources.canModifyDevices
             var actions: [OmniAction] = []
-            for menuItem in offered {
-                guard let action = menuItem.action else { continue }
-                if case .renameDevice = action {
-                    // The machine's own actions go before its management.
-                    if hasBackground {
-                        actions.append(.init(
-                            title: "End Background Sessions…",
-                            command: .endBackgroundSessions(on: machine),
-                            isDestructive: true
-                        ))
-                    }
-                }
-                var isDestructive = false
-                if case .removeDevice = action { isDestructive = true }
-                if case .addDeviceProject = action {
-                    // Its folders, in the bar.
-                    actions.append(.init(title: menuItem.title, command: .browseFolders(on: machine, intent: .add)))
-                } else {
-                    actions.append(.init(title: menuItem.title, command: .switcher(action), isDestructive: isDestructive))
-                }
-                if case .addDeviceProject = action {
-                    actions.append(.init(title: "New Terminal on \(entry.device.name)", command: .newTerminal(on: machine)))
-                }
+            if canOpen, device.homeDirectory != nil {
+                actions.append(.init(title: "Open Home Folder", command: .switcher(.openDeviceHome(id))))
             }
-            if hasBackground, !actions.contains(where: { $0.title == "End Background Sessions…" }) {
-                actions.append(.init(title: "End Background Sessions…", command: .endBackgroundSessions(on: machine), isDestructive: true))
+            if canOpen, canModify {
+                // Its folders, in the bar.
+                actions.append(.init(title: "Add Project on \(device.name)…", command: .browseFolders(on: machine, intent: .add)))
+                actions.append(.init(title: "New Terminal on \(device.name)", command: .newTerminal(on: machine)))
+            }
+            if state.offersReconnect {
+                actions.append(.init(title: "Reconnect", command: .switcher(.reconnectDevice(id))))
+            }
+            if canModify, state.offersTrustNewIdentity {
+                actions.append(.init(title: "Trust New Identity…", command: .switcher(.trustDeviceIdentity(id))))
+            }
+            if canModify, entry.offersHostUpdate {
+                actions.append(.init(title: entry.hostUpdateTitle, command: .switcher(.updateDeviceHost(id))))
+            }
+            actions.append(.init(title: "Persistent Sessions on \(device.name)…", command: .switcher(.openDeviceSessions(id))))
+            if canOpen {
+                actions.append(.init(title: "Set Up Cherry MCP on \(device.name)…", command: .switcher(.setUpDeviceMCP(id))))
+            }
+            // The machine's own actions go before its management.
+            if hasBackground { actions.append(endBackgroundSessions) }
+            if canModify {
+                actions.append(.init(title: "Rename…", command: .switcher(.renameDevice(id))))
+                actions.append(.init(title: "Remove…", command: .switcher(.removeDevice(id)), isDestructive: true))
             }
             return actions
         }
@@ -842,10 +822,7 @@ enum OmniProviders {
     /// run now, then an agent row for each launchable agent.
     static func commands(_ sources: OmniSources) -> [OmniItem] {
         let window = sources.window
-        var items: [OmniItem] = []
-        if window.hasWorkspace {
-            items.append(command(.newTab, title: "New Tab", shortcut: "⌘T", symbol: "plus.rectangle"))
-        }
+        var items: [OmniItem] = [command(.newTab, title: "New Tab", shortcut: "⌘T", symbol: "plus.rectangle")]
         if window.hasProject, !sources.agents.isEmpty {
             items.append(OmniItem(
                 id: "command:agents",
@@ -1395,13 +1372,6 @@ final class OmniBarController: ObservableObject {
     func hover(id: String) {
         guard !isActionListOpen, selectedID != id, rows.contains(where: { $0.id == id }) else { return }
         selectedID = id
-    }
-
-    func select(_ index: Int) {
-        let rows = rows
-        guard rows.indices.contains(index) else { return }
-        selectedID = rows[index].id
-        isActionListOpen = false
     }
 
     func select(id: String) {

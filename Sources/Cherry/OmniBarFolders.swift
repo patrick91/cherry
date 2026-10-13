@@ -40,9 +40,6 @@ struct OmniPathQuery: Equatable {
         directory == "/" ? "/" : String(directory.dropLast())
     }
 
-    /// Hidden folders are listed only for a segment that starts with ".".
-    var showsHidden: Bool { segment.hasPrefix(".") }
-
     /// The folder a New folder row would make in `directory`: the segment
     /// without spaces around it; nil when that names no folder ("", ".",
     /// "..").
@@ -113,8 +110,6 @@ struct OmniFolderContents: Equatable, Sendable {
     /// It is itself a git repository.
     var isRepository: Bool
     var entries: [OmniFolderEntry]
-    /// More folders than `OmniFolderListingLimits.entries` were there.
-    var truncated = false
 }
 
 enum OmniFolderListingLimits {
@@ -411,7 +406,6 @@ enum OmniUnaddedRows {
     /// The repositories on `machine` (every Mac when nil) that are not
     /// projects, removed or hidden, by name.
     static func repositories(_ sources: OmniSources, on machine: ProjectSwitcherModel.Machine? = nil) -> [OmniUnaddedRepository] {
-        let known = Set(sources.projects.machines.map(\.machine))
         var seen = Set<OmniUnaddedRepository>()
         return sources.unaddedRepositories
             .filter { repository in
@@ -419,9 +413,7 @@ enum OmniUnaddedRows {
                 // A device this Cherry no longer knows (or one whose
                 // projects cannot be opened now) lists none.
                 if case .device = repository.machine {
-                    guard known.contains(repository.machine),
-                          sources.projects.machine(repository.machine)?.allowsOpening == true
-                    else { return false }
+                    guard sources.projects.machine(repository.machine)?.allowsOpening == true else { return false }
                 }
                 if OmniFolderRows.project(at: repository.path, on: repository.machine, in: sources) != nil { return false }
                 if sources.removedProjects[repository.machine]?.contains(repository.path) == true { return false }

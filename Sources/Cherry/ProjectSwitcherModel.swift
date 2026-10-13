@@ -2,7 +2,7 @@ import CherryControl
 import Foundation
 
 // The projects on every Mac, the Macs and the open windows, as the Omni
-// bar lists them (`OmniProviders`) and the picker menu opens them
+// bar lists them (`OmniProviders`) and opens them
 // (`ProjectSwitcherActions`). `ProjectSwitcherModel` is pure: tests give it
 // projects, devices, open windows and recency.
 
@@ -23,12 +23,10 @@ final class ProjectRecencyStore: ObservableObject {
 
     @Published private(set) var dates: [String: Date]
     private let defaults: UserDefaults
-    private let key: String
 
-    init(defaults: UserDefaults, key: String = ProjectRecencyStore.defaultsKey) {
+    init(defaults: UserDefaults) {
         self.defaults = defaults
-        self.key = key
-        let stored = defaults.dictionary(forKey: key) as? [String: Double] ?? [:]
+        let stored = defaults.dictionary(forKey: Self.defaultsKey) as? [String: Double] ?? [:]
         dates = stored.mapValues { Date(timeIntervalSince1970: $0) }
     }
 
@@ -52,7 +50,7 @@ final class ProjectRecencyStore: ObservableObject {
             next = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
         }
         dates = next
-        defaults.set(next.mapValues(\.timeIntervalSince1970), forKey: key)
+        defaults.set(next.mapValues(\.timeIntervalSince1970), forKey: Self.defaultsKey)
     }
 
     /// Keys, most recent first.
@@ -68,6 +66,12 @@ struct ProjectSwitcherModel: Equatable {
         case thisMac
         case device(UUID)
 
+        /// The Mac of a project location key (This Mac for a local path, or
+        /// for none).
+        init(projectKey: String?) {
+            self = projectKey.flatMap { ProjectLocation(key: $0).deviceID }.map { Self.device($0) } ?? .thisMac
+        }
+
         var deviceID: UUID? {
             if case .device(let id) = self { return id }
             return nil
@@ -78,22 +82,15 @@ struct ProjectSwitcherModel: Equatable {
     struct MachineInfo: Equatable, Identifiable {
         var machine: Machine
         var name: String
-        /// "Connected · 2 sessions", "Offline", "14 sessions".
-        var status: String
         var dot: RemoteDeviceConnectionState.Dot
         /// Its host's sessions, when known.
         var sessionCount: Int?
-        /// "<destination> over SSH · session host <build> · N projects".
-        var detail: String
         /// Answers now (or is This Mac): an unreachable Mac's row is
         /// Offline.
         var isReachable: Bool = true
         /// Its projects can be opened (never while another identity or
         /// protocol answers there).
         var allowsOpening: Bool = true
-        /// Why a Mac does not answer.
-        var unreachableMessage: String?
-        var offersTrustNewIdentity: Bool = false
         /// An SF Symbol for its row.
         var symbol: String = "desktopcomputer"
 
@@ -102,15 +99,7 @@ struct ProjectSwitcherModel: Equatable {
 
     /// What an open project window holds.
     struct OpenStatus: Equatable {
-        var tabs: Int
         var workingAgents: Int
-
-        var text: String {
-            let tabsText = tabs == 1 ? "1 tab" : "\(tabs) tabs"
-            guard workingAgents > 0 else { return tabsText }
-            let agents = workingAgents == 1 ? "1 agent working" : "\(workingAgents) agents working"
-            return "\(agents) · \(tabsText)"
-        }
     }
 
     /// A project on one Mac.
@@ -128,8 +117,6 @@ struct ProjectSwitcherModel: Equatable {
         /// The window the bar was opened from shows it.
         var isCurrent = false
         var lastOpened: Date?
-        /// Sessions whose project it is (a device's, as its host listed).
-        var sessionCount = 0
 
         var id: String { key }
         var isOpen: Bool { openStatus != nil }
@@ -141,14 +128,6 @@ struct ProjectSwitcherModel: Equatable {
     /// This Mac first, then each device.
     var machines: [MachineInfo]
     var locations: [Location]
-    /// The Mac of the window the bar opened from.
-    var currentMachine: Machine = .thisMac
-
-    init(machines: [MachineInfo], locations: [Location], currentMachine: Machine = .thisMac) {
-        self.machines = machines
-        self.locations = locations
-        self.currentMachine = currentMachine
-    }
 
     func machine(_ machine: Machine) -> MachineInfo? {
         machines.first { $0.machine == machine }
@@ -166,14 +145,11 @@ struct ProjectSwitcherModel: Equatable {
         self.machine(machine)?.isReachable ?? false
     }
 
-    func projectCount(on machine: Machine) -> Int {
-        locations.filter { $0.machine == machine }.count
-    }
-
     // MARK: Opening
 
-    /// What opening a location does, through the picker's own actions (so
-    /// a device's project and window reuse work as from the menu). Nil when its Mac does not allow opening now.
+    /// What opening a location does, through `ProjectSwitcherActions` (so
+    /// a device's project and window reuse work as from any other row).
+    /// Nil when its Mac does not allow opening now.
     func action(opening location: Location) -> TitlebarProjectMenuModel.Action? {
         guard canOpen(location) else { return nil }
         switch location.machine {
@@ -218,7 +194,7 @@ extension ProjectSwitcherModel {
         var name: String
     }
 
-    /// Builds the model from what the picker's menu already gathers.
+    /// Builds the model from cached state.
     /// - `localProjects`: This Mac's projects (the settings' list, then any
     ///   other open or recently opened local folder).
     /// - `devices`: each device, its state and its host's sessions as last
@@ -234,8 +210,7 @@ extension ProjectSwitcherModel {
         currentProjectKey: String?,
         thisMac: MachineInfo,
         canonicalKey: (String) -> String = { $0 },
-        localHome: String? = NSHomeDirectory(),
-        now: Date = Date()
+        localHome: String? = NSHomeDirectory()
     ) -> ProjectSwitcherModel {
         let currentKey = currentProjectKey.map(canonicalKey)
         var machines = [thisMac]
@@ -255,13 +230,9 @@ extension ProjectSwitcherModel {
                 lastOpened: recency[project.root] ?? recency[key]
             ))
         }
-        var currentMachine: Machine = .thisMac
         for entry in devices {
             let device = entry.device
             let machine = Machine.device(device.id)
-            if let currentKey, ProjectLocation(key: currentKey).deviceID == device.id {
-                currentMachine = machine
-            }
             let (projects, _) = RemoteDeviceDiscovery.projects(
                 sessions: entry.sessions, added: device.addedProjects, hidden: device.hiddenProjects
             )
@@ -277,8 +248,7 @@ extension ProjectSwitcherModel {
                     displayPath: displayPath(project.path, home: device.homeDirectory),
                     openStatus: openWindows[canonicalKey(key)],
                     isCurrent: canonicalKey(key) == currentKey,
-                    lastOpened: recency[key],
-                    sessionCount: project.sessionCount
+                    lastOpened: recency[key]
                 ))
             }
             // A window of a folder its host does not list (its home, a
@@ -298,12 +268,12 @@ extension ProjectSwitcherModel {
                     lastOpened: recency[key]
                 ))
             }
-            machines.append(machineInfo(for: entry, projectCount: paths.count, now: now))
+            machines.append(machineInfo(for: entry))
         }
-        return ProjectSwitcherModel(machines: machines, locations: locations, currentMachine: currentMachine)
+        return ProjectSwitcherModel(machines: machines, locations: locations)
     }
 
-    static func machineInfo(for entry: TitlebarProjectMenuModel.Device, projectCount: Int, now: Date) -> MachineInfo {
+    static func machineInfo(for entry: TitlebarProjectMenuModel.Device) -> MachineInfo {
         let device = entry.device
         let state = entry.state
         let sessionCount: Int? = switch state {
@@ -314,49 +284,19 @@ extension ProjectSwitcherModel {
         case .connected, .reachable, .connecting, .notRunning, .unknown: true
         case .offline, .identityChanged, .loginRefused, .incompatible, .hostMissing: false
         }
-        var detailParts = ["\(device.sshDestination) over SSH"]
-        if let build = device.installedBuild { detailParts.append("session host \(build)") }
-        detailParts.append(projectCount == 1 ? "1 project" : "\(projectCount) projects")
-        var message: String?
-        if !isReachable {
-            let lastSeen = device.lastSeen.map { " (last seen \(RemoteDeviceConnectionState.relative($0, now: now)))" } ?? ""
-            switch state {
-            case .offline:
-                message = "\(device.name) isn't reachable\(lastSeen). Its projects open once it's back; its tabs wait for it."
-            default:
-                message = state.detail
-            }
-        }
         return MachineInfo(
             machine: .device(device.id),
             name: device.name,
-            status: state.subtitle(now: now),
             dot: state.dot,
             sessionCount: sessionCount,
-            detail: detailParts.joined(separator: " · "),
             isReachable: isReachable,
             allowsOpening: state.allowsOpening,
-            unreachableMessage: message,
-            offersTrustNewIdentity: state.offersTrustNewIdentity,
             symbol: "desktopcomputer"
         )
     }
 
     /// This Mac's row.
-    static func thisMacInfo(computerName: String?, sessionCount: Int?, projectCount: Int, symbol: String) -> MachineInfo {
-        let sessions = sessionCount.map { $0 == 1 ? "1 session" : "\($0) sessions" }
-        var detail: [String] = []
-        if let computerName, !computerName.isEmpty { detail.append(computerName) }
-        detail.append(projectCount == 1 ? "1 project" : "\(projectCount) projects")
-        if let sessionCount { detail.append(sessionCount == 1 ? "1 session running" : "\(sessionCount) sessions running") }
-        return MachineInfo(
-            machine: .thisMac,
-            name: "This Mac",
-            status: sessions ?? "Local",
-            dot: .green,
-            sessionCount: sessionCount,
-            detail: detail.joined(separator: " · "),
-            symbol: symbol
-        )
+    static func thisMacInfo(sessionCount: Int?, symbol: String) -> MachineInfo {
+        MachineInfo(machine: .thisMac, name: "This Mac", dot: .green, sessionCount: sessionCount, symbol: symbol)
     }
 }

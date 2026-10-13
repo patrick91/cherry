@@ -964,17 +964,13 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
 
 @Test @MainActor func RemoteDeviceMCPSetupIsInTheDeviceMenu() throws {
     let device = RemoteDevice(name: "Studio", sshDestination: "studio")
-    let item = TitlebarProjectMenuModel.deviceItem(
+    var sources = OmniSources()
+    sources.devices = [
         .init(device: device, state: RemoteDeviceConnectionState(control: .connected, sessionCount: 0, lastSeen: nil), sessions: []),
-        currentProjectKey: nil, now: Date()
-    )
-    let actions = (item.children ?? []).compactMap { entry -> TitlebarProjectMenuModel.Item? in
-        if case .item(let item) = entry { return item }
-        return nil
-    }
-    let setUp = try #require(actions.first { $0.action == .setUpDeviceMCP(device.id) })
+    ]
+    let actions = OmniProviders.macActions(.device(device.id), sources: sources)
+    let setUp = try #require(actions.first { $0.command == .switcher(.setUpDeviceMCP(device.id)) })
     #expect(setUp.title == "Set Up Cherry MCP on Studio…")
-    #expect(setUp.isEnabled)
 }
 
 // MARK: - Second review: sessions of other hosts, local scans, the directory there, request limits

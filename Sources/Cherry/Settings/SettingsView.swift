@@ -26,9 +26,8 @@ struct SettingsView: View {
 
     private func keepSelectionVisible() {
         let visible = visibleSelections()
-        guard !visible.isEmpty else { return }
         guard !visible.contains(selection) else { return }
-        selection = visible.first ?? .page(.general)
+        selection = visible[0]
     }
 
     private func visibleSelections() -> [SettingsSelection] {
@@ -61,45 +60,9 @@ private struct SettingsNativeTabView: View {
             } else {
                 if !pages.isEmpty {
                     TabSection("Settings") {
-                        if pages.contains(.general) {
-                            Tab("General", systemImage: SettingsPage.general.systemImage, value: SettingsSelection.page(.general)) {
-                                GeneralSettingsPane(settings: terminalSettings)
-                            }
-                        }
-
-                        if pages.contains(.terminal) {
-                            Tab("Terminal", systemImage: SettingsPage.terminal.systemImage, value: SettingsSelection.page(.terminal)) {
-                                TerminalSettingsPane(settings: terminalSettings)
-                            }
-                        }
-
-                        if pages.contains(.sessions) {
-                            Tab("Sessions", systemImage: SettingsPage.sessions.systemImage, value: SettingsSelection.page(.sessions)) {
-                                SessionsSettingsPane(settings: terminalSettings)
-                            }
-                        }
-
-                        if pages.contains(.projects) {
-                            Tab("Projects", systemImage: SettingsPage.projects.systemImage, value: SettingsSelection.page(.projects)) {
-                                ProjectSettingsPane(settings: agentSettings)
-                            }
-                        }
-
-                        if pages.contains(.agents) {
-                            Tab("Agents", systemImage: SettingsPage.agents.systemImage, value: SettingsSelection.page(.agents)) {
-                                AgentSettingsPane(settings: agentSettings)
-                            }
-                        }
-
-                        if pages.contains(.mcp) {
-                            Tab("MCP", systemImage: SettingsPage.mcp.systemImage, value: SettingsSelection.page(.mcp)) {
-                                MCPSettingsPane()
-                            }
-                        }
-
-                        if pages.contains(.updates) {
-                            Tab("Updates", systemImage: SettingsPage.updates.systemImage, value: SettingsSelection.page(.updates)) {
-                                UpdatesSettingsPane(status: AppUpdater.shared.status)
+                        ForEach(pages) { page in
+                            Tab(page.title, systemImage: page.systemImage, value: SettingsSelection.page(page)) {
+                                pane(for: page)
                             }
                         }
                     }
@@ -124,6 +87,19 @@ private struct SettingsNativeTabView: View {
         .background(SettingsNativeWindowConfigurator())
         .frame(width: 980, height: 680)
     }
+
+    @ViewBuilder
+    private func pane(for page: SettingsPage) -> some View {
+        switch page {
+        case .general: GeneralSettingsPane(settings: terminalSettings)
+        case .terminal: TerminalSettingsPane(settings: terminalSettings)
+        case .sessions: SessionsSettingsPane(settings: terminalSettings)
+        case .projects: ProjectSettingsPane(settings: agentSettings)
+        case .agents: AgentSettingsPane(settings: agentSettings)
+        case .mcp: MCPSettingsPane()
+        case .updates: UpdatesSettingsPane(status: AppUpdater.shared.status)
+        }
+    }
 }
 
 private struct SettingsEmptySearchPane: View {
@@ -134,8 +110,7 @@ private struct SettingsEmptySearchPane: View {
             title: "No Results",
             subtitle: query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "No settings are available."
-                : "No settings match \"\(query)\".",
-            systemImage: "magnifyingglass"
+                : "No settings match \"\(query)\"."
         ) {
             SettingsCard {
                 SettingsEmptyState(

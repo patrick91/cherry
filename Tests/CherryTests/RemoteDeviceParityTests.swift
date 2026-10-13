@@ -431,25 +431,22 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     let zed = editor("zed", "dev.zed.Zed", app: "Zed")
     let sublime = editor("sublime-text", "com.sublimetext.4", app: "Sublime Text")
 
-    #expect(RemoteEditorLink.make(editor: vscode, destination: "me@studio", path: "/Users/me/my app")
-        == .url(URL(string: "vscode://vscode-remote/ssh-remote+me@studio/Users/me/my%20app")!))
-    #expect(RemoteEditorLink.make(editor: insiders, destination: "studio", path: "/p")
-        == .url(URL(string: "vscode-insiders://vscode-remote/ssh-remote+studio/p")!))
-    #expect(RemoteEditorLink.make(editor: cursor, destination: "studio", path: "/p")
-        == .url(URL(string: "cursor://vscode-remote/ssh-remote+studio/p")!))
-    #expect(RemoteEditorLink.make(editor: zed, destination: "studio", path: "/Users/me/app")
-        == .url(URL(string: "zed://ssh/studio/Users/me/app")!))
+    #expect(RemoteEditorLink.url(editor: vscode, destination: "me@studio", path: "/Users/me/my app")
+        == URL(string: "vscode://vscode-remote/ssh-remote+me@studio/Users/me/my%20app")!)
+    #expect(RemoteEditorLink.url(editor: insiders, destination: "studio", path: "/p")
+        == URL(string: "vscode-insiders://vscode-remote/ssh-remote+studio/p")!)
+    #expect(RemoteEditorLink.url(editor: cursor, destination: "studio", path: "/p")
+        == URL(string: "cursor://vscode-remote/ssh-remote+studio/p")!)
+    #expect(RemoteEditorLink.url(editor: zed, destination: "studio", path: "/Users/me/app")
+        == URL(string: "zed://ssh/studio/Users/me/app")!)
     // A path with spaces: percent-encoded, and it decodes (as Zed decodes
     // its hotlink's path) to the path itself; the host stays as typed.
-    guard case .url(let spaced)? = RemoteEditorLink.make(editor: zed, destination: "me@studio.local", path: "/Users/me/my app/ü") else {
-        Issue.record("no Zed link")
-        return
-    }
+    let spaced = try #require(RemoteEditorLink.url(editor: zed, destination: "me@studio.local", path: "/Users/me/my app/ü"))
     #expect(spaced.absoluteString == "zed://ssh/me@studio.local/Users/me/my%20app/%C3%BC")
     #expect(spaced.path(percentEncoded: false) == "/me@studio.local/Users/me/my app/ü")
     #expect(!spaced.absoluteString.contains(" "))
-    #expect(RemoteEditorLink.make(editor: sublime, destination: "studio", path: "/p") == nil)
-    #expect(RemoteEditorLink.make(editor: zed, destination: "studio", path: "relative") == nil)
+    #expect(RemoteEditorLink.url(editor: sublime, destination: "studio", path: "/p") == nil)
+    #expect(RemoteEditorLink.url(editor: zed, destination: "studio", path: "relative") == nil)
 
     // A device's project offers only the editors that can reach it.
     let key = ProjectLocation.remote(deviceID: UUID(), path: "/Users/me/app").key
@@ -457,23 +454,24 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     #expect(ExternalEditorLauncher.editors(installed, forProjectRoot: key).map(\.id) == ["zed", "vscode"])
     #expect(ExternalEditorLauncher.editors(installed, forProjectRoot: "/Users/me/local").map(\.id) == ["zed", "vscode", "sublime-text"])
 
-    // Opening goes through the injected opener, never NSWorkspace here.
-    var opened: [(RemoteEditorLink, String)] = []
-    var localOpens: [URL] = []
+    // Opening goes through the injected opener, never NSWorkspace here: a
+    // device's project as its link, with the editor's app.
+    var opened: [(url: URL, app: URL)] = []
     let launcher = ExternalEditorLauncher(
-        openHandler: { folder, _ in localOpens.append(folder) },
-        remoteOpener: { link, editor in opened.append((link, editor.id)) },
+        openHandler: { url, app in opened.append((url, app)) },
         destination: { $0 == key ? "studio" : nil }
     )
     launcher.open(projectRoot: key, with: vscode)
     launcher.open(projectRoot: key, with: sublime)
     launcher.open(projectRoot: ProjectLocation.remote(deviceID: UUID(), path: "/x").key, with: zed)
     launcher.open(projectRoot: key, with: zed)
-    #expect(opened.map(\.1) == ["vscode", "zed"])
-    #expect(opened.first?.0 == .url(URL(string: "vscode://vscode-remote/ssh-remote+studio/Users/me/app")!))
-    #expect(localOpens.isEmpty)
+    #expect(opened.map(\.app) == [vscode.appURL, zed.appURL])
+    #expect(opened.first?.url == URL(string: "vscode://vscode-remote/ssh-remote+studio/Users/me/app")!)
+    #expect(!opened.contains { $0.url.isFileURL })
     launcher.open(projectRoot: "/Users/me/local", with: sublime)
-    #expect(localOpens == [URL(fileURLWithPath: "/Users/me/local", isDirectory: true)])
+    #expect(opened.last?.url == URL(fileURLWithPath: "/Users/me/local", isDirectory: true))
+    #expect(opened.last?.app == sublime.appURL)
+    #expect(opened.count == 3)
 }
 
 // MARK: - `~` labels

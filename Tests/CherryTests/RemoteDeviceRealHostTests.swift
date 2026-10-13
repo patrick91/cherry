@@ -574,13 +574,6 @@ private func remoteRepository(
         #expect(projects.first?.sessionCount == 2)
         #expect(other == 1)
         #expect(RemoteDeviceDiscovery.projects(sessions: listed, added: [], hidden: [mac.projectPath]).projects.isEmpty)
-        let device = RemoteDevice(id: mac.deviceID, name: "Studio", sshDestination: "studio", homeDirectory: mac.home.path)
-        let menu = TitlebarProjectMenuModel(
-            projects: [], devices: [.init(device: device, state: .connected(sessionCount: listed.count), sessions: listed)],
-            currentProjectKey: mac.projectKey
-        )
-        #expect(menu.snapshot.contains("[x] app — 2 sessions · \(mac.projectPath)"))
-        #expect(menu.snapshot.contains("Other sessions — 1 session"))
 
         // Neither adopts the other's: the device's own Cherry never takes
         // this installation's session, and this one never takes theirs.

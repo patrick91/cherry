@@ -79,20 +79,23 @@ enum SidebarTerminalPathFormatter {
         for path: String,
         homeDirectory: String = NSHomeDirectory()
     ) -> String? {
-        let components = relativeComponents(for: path, homeDirectory: homeDirectory)
-        guard components.count >= 3,
-              components[0].caseInsensitiveCompare("github") == .orderedSame
-        else {
-            return nil
-        }
-
-        return components.dropFirst().joined(separator: "/")
+        githubComponents(for: path, homeDirectory: homeDirectory)?.joined(separator: "/")
     }
 
     private static func githubRepositoryLabel(
         for path: String,
         homeDirectory: String
     ) -> SidebarTerminalPathLabel? {
+        guard let components = githubComponents(for: path, homeDirectory: homeDirectory) else { return nil }
+        let owner = components[components.startIndex]
+        let repo = components[components.startIndex + 1]
+        let title = components.dropFirst().joined(separator: "/")
+        return .init(title: title, detail: "\(owner)/\(repo)", detailIconResourceName: "github")
+    }
+
+    /// A path in `~/github/<owner>/<repo>`: its owner, its repository and
+    /// the rest of its components; nil for any other path.
+    private static func githubComponents(for path: String, homeDirectory: String) -> ArraySlice<String>? {
         let components = relativeComponents(for: path, homeDirectory: homeDirectory)
         guard components.count >= 3,
               components[0].caseInsensitiveCompare("github") == .orderedSame
@@ -100,11 +103,7 @@ enum SidebarTerminalPathFormatter {
             return nil
         }
 
-        let owner = components[1]
-        let repo = components[2]
-        let remaining = Array(components.dropFirst(3))
-        let title = ([repo] + remaining).joined(separator: "/")
-        return .init(title: title, detail: "\(owner)/\(repo)", detailIconResourceName: "github")
+        return components.dropFirst()
     }
 
     private static func smartInitialsLabel(

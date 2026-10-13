@@ -100,8 +100,7 @@ struct ProjectDetailSettingsPane: View {
     var body: some View {
         SettingsPaneScroll(
             title: project.name,
-            subtitle: project.root,
-            systemImage: "folder.fill"
+            subtitle: project.root
         ) {
             SettingsCard("Project") {
                 SettingsRow("Location", subtitle: project.root) {
@@ -121,14 +120,12 @@ struct ProjectDetailSettingsPane: View {
 
             SettingsCard("Features") {
                 ProjectFeatureControls(settings: settings, project: project)
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 13)
+                    .settingsRowPadding()
             }
 
             SettingsCard("Appearance") {
                 ProjectAppearanceControls(settings: settings, project: project)
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 13)
+                    .settingsRowPadding()
             }
 
             SettingsCard("Commands") {

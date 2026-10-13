@@ -132,12 +132,7 @@ struct OmniBarOverlay: View {
             settings: .shared,
             registry: .shared,
             backgroundSessionsModel: { .shared },
-            switcher: ProjectSwitcherActions(
-                settings: .shared,
-                chromeState: chromeState,
-                openProject: openProject,
-                openSettings: openSettings
-            ),
+            switcher: ProjectSwitcherActions(settings: .shared, chromeState: chromeState, openProject: openProject),
             editorDiscovery: .shared,
             projects: { live.controller.sources.projects },
             openSettings: openSettings,

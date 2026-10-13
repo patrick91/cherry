@@ -26,13 +26,12 @@ private func sources() -> OmniSources {
     var sources = OmniSources()
     sources.projects = ProjectSwitcherModel(
         machines: [
-            .init(machine: .thisMac, name: "This Mac", status: "", dot: .green, detail: ""),
-            .init(machine: .device(studioID), name: "patstudio", status: "", dot: .green, detail: ""),
+            .init(machine: .thisMac, name: "This Mac", dot: .green),
+            .init(machine: .device(studioID), name: "patstudio", dot: .green),
         ],
         locations: [location("/Users/me/code/cherry"), location("/Users/me/code/rignore", on: .device(studioID))]
     )
     sources.homes = [.thisMac: "/Users/me", .device(studioID): "/Users/me"]
-    sources.window = OmniWindowContext(hasWorkspace: true)
     return sources
 }
 
@@ -62,7 +61,7 @@ private final class FolderRecorder {
 
 @MainActor
 private func select(_ title: String, in controller: OmniBarController) throws {
-    controller.select(try #require(controller.rows.firstIndex { $0.item.title == title }))
+    controller.select(id: try #require(controller.rows.first { $0.item.title == title }).id)
 }
 
 // MARK: - Path queries
@@ -312,7 +311,7 @@ private extension OmniCommand {
     var found = sources()
     let offlineID = UUID()
     found.projects.machines.append(.init(
-        machine: .device(offlineID), name: "offline", status: "", dot: .gray, detail: "", isReachable: false, allowsOpening: false
+        machine: .device(offlineID), name: "offline", dot: .gray, isReachable: false, allowsOpening: false
     ))
     found.unaddedRepositories = [
         OmniUnaddedRepository(machine: .thisMac, path: "/Users/me/code/cherry"), // a project
@@ -431,13 +430,13 @@ private func pwnedFiles(under root: URL) -> [String] {
     #expect(missing == .missing)
     #expect(pwnedFiles(under: root).isEmpty)
 
-    // Capped, and said so.
+    // Capped.
     let capped = OmniRemoteFolders.parseListing(try runLocally(OmniRemoteFolders.listScript(directory: asked.path, limit: 3), home: home, in: cwd))
     guard case .listed(let few) = capped else {
         Issue.record("not listed: \(capped)")
         return
     }
-    #expect(few.entries.count == 3 && few.truncated)
+    #expect(few.entries.count == 3)
 
     // No marker (ssh failed): a failure, not an empty folder.
     let failed = OmniRemoteFolders.parseListing(.init(status: 255, standardOutput: Data(), standardError: "ssh: connect to host x port 22: Connection refused"))
@@ -739,8 +738,8 @@ private func waitUntil(_ condition: @MainActor () -> Bool) async {
         settings: settings,
         registry: ProjectWindowRegistry(),
         backgroundSessionsModel: { preconditionFailure("not asked in this test") },
-        switcher: ProjectSwitcherActions(settings: settings, chromeState: chrome, openProject: { opened.append($0.root) }, openSettings: {}),
-        editorDiscovery: ExternalEditorDiscovery(appURLResolver: { _ in nil }, iconProvider: { _ in NSImage() }),
+        switcher: ProjectSwitcherActions(settings: settings, chromeState: chrome, openProject: { opened.append($0.root) }),
+        editorDiscovery: ExternalEditorDiscovery(appURLResolver: { _ in nil }),
         projects: { ProjectSwitcherModel(machines: [], locations: []) },
         openSettings: {},
         toggleAppearance: {}
@@ -784,8 +783,8 @@ private func waitUntil(_ condition: @MainActor () -> Bool) async {
         settings: settings,
         registry: ProjectWindowRegistry(),
         backgroundSessionsModel: { preconditionFailure("not asked in this test") },
-        switcher: ProjectSwitcherActions(settings: settings, chromeState: chrome, openProject: { opened.append($0.root) }, openSettings: {}),
-        editorDiscovery: ExternalEditorDiscovery(appURLResolver: { _ in nil }, iconProvider: { _ in NSImage() }),
+        switcher: ProjectSwitcherActions(settings: settings, chromeState: chrome, openProject: { opened.append($0.root) }),
+        editorDiscovery: ExternalEditorDiscovery(appURLResolver: { _ in nil }),
         projects: { ProjectSwitcherModel(machines: [], locations: []) },
         openSettings: {},
         toggleAppearance: {}

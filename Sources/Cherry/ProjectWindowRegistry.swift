@@ -631,15 +631,13 @@ final class ProjectWindowRegistry {
     }
 
     /// Each open project window, by its key (`canonicalProjectRoot`), with
-    /// how many tabs it holds and how many of its agents are working (the
-    /// project switcher's status line).
+    /// how many of its agents are working (the Omni bar's project status).
     func openProjectWindowStatuses() -> [String: ProjectSwitcherModel.OpenStatus] {
         pruneStaleWindows()
         var statuses: [String: ProjectSwitcherModel.OpenStatus] = [:]
         for (root, entry) in entries where entry.window != nil {
-            var status = ProjectSwitcherModel.OpenStatus(tabs: 0, workingAgents: 0)
+            var status = ProjectSwitcherModel.OpenStatus(workingAgents: 0)
             if let workspace = entry.repository?.workspace ?? entry.workspace {
-                status.tabs = workspace.sessions.count
                 status.workingAgents = workspace.agentSessions.filter { $0.agentActivityState == .working }.count
             }
             statuses[root] = status

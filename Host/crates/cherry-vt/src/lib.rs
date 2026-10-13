@@ -12,7 +12,8 @@ pub use events::{
     parse_osc99, Osc99, ProgressState, VtEvent, MAX_PENDING_EVENTS, MAX_PENDING_EVENT_BYTES,
 };
 pub use graphics::{
-    base64, decode_rgba, GraphicsReplay, Placement, IMAGE_RESET, MAX_DECODED_BYTES, MAX_IMAGE_SIDE,
+    base64, decode_base64, decode_rgba, GraphicsReplay, Placement, IMAGE_RESET, MAX_DECODED_BYTES,
+    MAX_IMAGE_SIDE,
 };
 pub use program_status::{
     ProgramState, ProgramStatusKind, ProgramStatusRecord, MAX_PROGRAM_STATUS_RECORDS,

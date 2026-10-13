@@ -23,8 +23,7 @@ use crate::{diagnose, transport::Transport, transport::RPC_TIMEOUT};
 use cherry_protocol::{build_is_newer, ClientMessage, HostStatus, ServerMessage};
 use std::{
     fs,
-    io::Write,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -166,27 +165,13 @@ fn note_outcome_in(state: &Path, attempt: &Attempt, now_build: Option<&str>, now
         attempt.to,
         now_build.unwrap_or("(unknown)")
     );
-    let path = state.join(RECORD);
     let Ok(bytes) = serde_json::to_vec(&Record {
         attempt: attempt.clone(),
         at: seconds(now),
     }) else {
         return;
     };
-    let dir = state;
-    let temporary = dir.join(format!(".{RECORD}.{}.tmp", std::process::id()));
-    let written = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temporary)
-        .and_then(|mut file| file.write_all(&bytes))
-        .and_then(|()| fs::rename(&temporary, &path));
-    if written.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
+    let _ = cherry_protocol::write_private_atomic(&state.join(RECORD), &bytes, false);
 }
 
 #[cfg(test)]

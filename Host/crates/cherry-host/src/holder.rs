@@ -842,7 +842,7 @@ impl Holder {
             holder_pid: std::process::id(),
             created_at,
             link_version: link::LINK_VERSION,
-            holder_started: processes::start_identity(unsafe { libc::getpid() }),
+            holder_started: cherry_protocol::start_identity(unsafe { libc::getpid() }),
             build: Some(daemon::build().to_owned()),
         };
         let manifest = match paths::write_manifest(Path::new(&state_dir), &manifest) {

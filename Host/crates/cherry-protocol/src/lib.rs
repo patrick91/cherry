@@ -1063,21 +1063,19 @@ pub fn valid_cell_size(width: Option<u32>, height: Option<u32>) -> Option<(u32, 
 }
 
 pub fn default_socket_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("CHERRY_HOST_SOCKET") {
-        return path.into();
-    }
-    // A short path also fits sockaddr_un on macOS. This directory must be 0700;
-    // clients verify ownership before trusting it (see `verify_socket_path`).
-    PathBuf::from(format!("/tmp/cherry-host-{}/host.sock", unsafe {
-        libc::geteuid()
-    }))
+    std::env::var_os("CHERRY_HOST_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(builtin_socket_path)
 }
 
-fn euid() -> u32 {
+/// This process's effective user ID.
+pub fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
 /// The socket path used when neither --socket nor CHERRY_HOST_SOCKET is set.
+/// A short path also fits sockaddr_un on macOS. This directory must be 0700;
+/// clients verify ownership before trusting it (see `verify_socket_path`).
 pub fn builtin_socket_path() -> PathBuf {
     PathBuf::from(format!("/tmp/cherry-host-{}/host.sock", euid()))
 }
@@ -1275,6 +1273,98 @@ pub fn connect_verified(path: &Path) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// When the process `pid` started, as a token that another process with the
+/// same PID (after the PID was reused, or after a reboot) never has: on
+/// macOS `seconds.microseconds` (`proc_bsdinfo`, the same value `sysctl`'s
+/// `kinfo_proc.kp_proc.p_starttime` gives); on Linux the boot id and the
+/// start time in clock ticks since it. None when it cannot be read.
+/// Holders' manifests, the daemon's PID file and `attach --status-file`
+/// record it, and `cherry doctor` and the app compare it, so its format
+/// never changes.
+pub fn start_identity(pid: libc::pid_t) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        (libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        ) == size)
+            .then(|| format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        // After the parenthesised command name: the state (field 3) comes
+        // first, and the start time is field 22.
+        let end = stat.iter().rposition(|&b| b == b')')?;
+        let fields = std::str::from_utf8(&stat[end + 1..]).ok()?;
+        let started = fields.split_ascii_whitespace().nth(22 - 3)?;
+        Some(format!("{}/{started}", boot.trim()))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether the process a PID file or manifest names (`pid`, which started
+/// at `started`, a `start_identity`) still exists, a zombie included, and
+/// was not given to another process since (unless that cannot be told).
+pub fn process_runs(pid: u32, started: Option<&str>) -> bool {
+    // 0 and values beyond pid_t would address process groups.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 || unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    match (started, start_identity(pid)) {
+        (Some(recorded), Some(current)) => recorded == current,
+        _ => true,
+    }
+}
+
+/// Replace the file at `path` with `bytes`, private to this user (mode
+/// 0600): readers see the old file or the new one, never a partial one. The
+/// new one is written beside it (`.<name>.<pid>.tmp`, never through a
+/// symlink) and renamed over it. A `durable` file is on disk before it gets
+/// its name; its directory is not synced.
+pub fn write_private_atomic(path: &Path, bytes: &[u8], durable: bool) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let mut temporary_name = std::ffi::OsString::from(".");
+    temporary_name.push(name);
+    temporary_name.push(format!(".{}.tmp", std::process::id()));
+    let temporary = path.with_file_name(temporary_name);
+    let _ = std::fs::remove_file(&temporary);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            if durable {
+                file.sync_all()?;
+            }
+            Ok(())
+        })
+        .and_then(|()| std::fs::rename(&temporary, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
+}
+
 /// Name of the stable agent-socket link in the directory that holds the
 /// host's socket (the `state_dir` of `update_agent_link`). Sessions receive
 /// `SSH_AUTH_SOCK=<that directory>/agent.sock`. Like tmux's
@@ -1382,7 +1472,7 @@ pub fn release_agent_link(state_dir: &Path, lends: impl Fn(u32) -> bool) -> io::
 }
 
 /// An existing socket (after following links) owned by this user.
-fn is_own_socket(path: &Path) -> bool {
+pub fn is_own_socket(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_socket() && meta.uid() == euid())
 }
 
@@ -3622,5 +3712,36 @@ mod tests {
         update_agent_link(&state, None).unwrap();
         assert!(std::fs::symlink_metadata(state.join(AGENT_LINK_NAME)).is_err());
         assert!(std::fs::symlink_metadata(state.join(AGENT_CLIENTS_DIR)).is_err());
+    }
+
+    #[test]
+    fn the_start_identity_is_the_kernels_and_tells_processes_apart() {
+        let own = start_identity(std::process::id() as libc::pid_t).unwrap();
+        assert_eq!(
+            start_identity(std::process::id() as libc::pid_t).unwrap(),
+            own
+        );
+        // Started later than this process: another identity.
+        std::thread::sleep(Duration::from_millis(20));
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let other = start_identity(child.id() as libc::pid_t).unwrap();
+        assert!(process_runs(child.id(), Some(other.as_str())));
+        assert!(process_runs(child.id(), None));
+        assert!(!process_runs(child.id(), Some(own.as_str())));
+        let _ = child.kill();
+        let _ = child.wait();
+        // Compared as numbers: Linux's clock ticks after the boot id gain
+        // digits (9897, then 10544), macOS's seconds and microseconds don't.
+        let started =
+            |identity: &str| -> f64 { identity.rsplit('/').next().unwrap().parse().unwrap() };
+        assert!(started(&other) >= started(&own), "{other} < {own}");
+        assert_ne!(other, own);
+        assert_eq!(start_identity(i32::MAX), None);
+        // 0 and values beyond pid_t name no process.
+        assert!(!process_runs(0, None));
+        assert!(!process_runs(u32::MAX, None));
     }
 }

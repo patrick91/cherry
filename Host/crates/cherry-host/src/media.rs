@@ -58,7 +58,10 @@
 //! Everything but a media command passes through byte for byte, in order,
 //! and a command split across reads is found whole.
 use crate::signals::{self, Wake};
-use cherry_vt::kitty::{self, Control};
+use cherry_vt::{
+    decode_base64,
+    kitty::{self, Control},
+};
 use std::{
     ffi::{CString, OsStr},
     fs::{File, OpenOptions},
@@ -621,37 +624,6 @@ fn read_memory(memory: &File, source: &Source) -> Result<Vec<u8>, Refusal> {
     let data = unsafe { std::slice::from_raw_parts(map.cast::<u8>().add(skip), size) }.to_vec();
     unsafe { libc::munmap(map, length) };
     Ok(data)
-}
-
-/// Base64 (standard alphabet, padding optional); None for anything else.
-fn decode_base64(text: &[u8]) -> Option<Vec<u8>> {
-    let text = text
-        .strip_suffix(b"==")
-        .or_else(|| text.strip_suffix(b"="))
-        .unwrap_or(text);
-    if text.len() % 4 == 1 {
-        return None;
-    }
-    let value = |byte: u8| -> Option<u32> {
-        Some(match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        } as u32)
-    };
-    let mut out = Vec::with_capacity(text.len() / 4 * 3 + 2);
-    for group in text.chunks(4) {
-        let mut n = 0;
-        for (index, &byte) in group.iter().enumerate() {
-            n |= value(byte)? << (18 - 6 * index);
-        }
-        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
-        out.extend_from_slice(&bytes[..group.len() - 1]);
-    }
-    Some(out)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {

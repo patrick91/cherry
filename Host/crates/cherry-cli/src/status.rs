@@ -5,19 +5,15 @@
 //! While attached the file holds `{"outcome":"attached","viewport":…,
 //! "reconnecting":…,"exit_code":null,"signal":null,"message":null}`, rewritten
 //! whenever the viewport or reconnecting state changes, with `pid` and
-//! `started` (this process's pid and kernel start time, `start_identity`),
-//! so a supervisor can signal this process itself rather than a wrapper
-//! that runs it (SIGUSR1: reconnect now) after checking the pid is still
-//! this process's. The final outcome
+//! `started` (this process's pid and kernel start time,
+//! `cherry_protocol::start_identity`), so a supervisor can signal this
+//! process itself rather than a wrapper that runs it (SIGUSR1: reconnect
+//! now) after checking the pid is still this process's. The final outcome
 //! replaces it when the command ends; a `disconnected` or `failed` one that
 //! connecting again can never resolve says `"reconnectable":false`. A reader
 //! never sees a partial file.
 use serde::Serialize;
-use std::{
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Status {
@@ -33,8 +29,9 @@ pub struct Status {
     /// While attached: this process's pid.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
-    /// While attached: when this process started, as `start_identity`
-    /// gives it (macOS: `seconds.microseconds`); left out when unknown.
+    /// While attached: when this process started, as
+    /// `cherry_protocol::start_identity` gives it (macOS:
+    /// `seconds.microseconds`); left out when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started: Option<String>,
     pub exit_code: Option<u32>,
@@ -97,43 +94,9 @@ impl Status {
             viewport: Some(live.viewport),
             reconnecting: Some(live.reconnecting),
             pid: Some(std::process::id()),
-            started: start_identity(std::process::id() as libc::pid_t),
+            started: cherry_protocol::start_identity(std::process::id() as libc::pid_t),
             ..Self::new(Outcome::Attached, None)
         }
-    }
-}
-
-/// When the process `pid` started, as the kernel keeps it: on macOS
-/// `seconds.microseconds` (`proc_bsdinfo`, the same value `sysctl`'s
-/// `kinfo_proc.kp_proc.p_starttime` gives); on Linux the boot id and the
-/// start time in clock ticks. None when it cannot be read.
-pub fn start_identity(pid: libc::pid_t) -> Option<String> {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        (libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&mut info as *mut libc::proc_bsdinfo).cast(),
-            size,
-        ) == size)
-            .then(|| format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-        let end = stat.iter().rposition(|&b| b == b')')?;
-        let fields = std::str::from_utf8(&stat[end + 1..]).ok()?;
-        let started = fields.split_ascii_whitespace().nth(22 - 3)?;
-        Some(format!("{}/{started}", boot.trim()))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = pid;
-        None
     }
 }
 
@@ -232,33 +195,9 @@ pub fn write_atomically(path: &Path, status: &Status) -> std::io::Result<()> {
 
 /// `write_atomically`, synced to disk before the rename when `durable`.
 fn write(path: &Path, status: &Status, durable: bool) -> std::io::Result<()> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| std::io::Error::other("status file path has no file name"))?;
-    let mut temporary_name = std::ffi::OsString::from(".");
-    temporary_name.push(name);
-    temporary_name.push(format!(".{}.tmp", std::process::id()));
-    let temporary = path.with_file_name(temporary_name);
-    let _ = std::fs::remove_file(&temporary);
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)?;
-        let mut json = serde_json::to_vec(status)?;
-        json.push(b'\n');
-        file.write_all(&json)?;
-        if durable {
-            file.sync_all()?;
-        }
-        std::fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
+    let mut json = serde_json::to_vec(status)?;
+    json.push(b'\n');
+    cherry_protocol::write_private_atomic(path, &json, durable)
 }
 
 /// Best effort for a command line clap rejected: report the usage error
@@ -321,32 +260,9 @@ mod tests {
             format!(
                 r#"{{"outcome":"attached","viewport":true,"reconnecting":false,"pid":{},"started":"{}","exit_code":null,"signal":null,"message":null}}"#,
                 std::process::id(),
-                start_identity(std::process::id() as libc::pid_t).unwrap()
+                cherry_protocol::start_identity(std::process::id() as libc::pid_t).unwrap()
             )
         );
-    }
-
-    #[test]
-    fn the_start_identity_is_the_kernels_and_tells_processes_apart() {
-        let own = start_identity(std::process::id() as libc::pid_t).unwrap();
-        assert_eq!(
-            start_identity(std::process::id() as libc::pid_t).unwrap(),
-            own
-        );
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("5")
-            .spawn()
-            .unwrap();
-        let other = start_identity(child.id() as libc::pid_t).unwrap();
-        let _ = child.kill();
-        let _ = child.wait();
-        // Compared as numbers: Linux's clock ticks after the boot id gain
-        // digits (9897, then 10544), macOS's seconds and microseconds don't.
-        let started =
-            |identity: &str| -> f64 { identity.rsplit('/').next().unwrap().parse().unwrap() };
-        assert!(started(&other) >= started(&own), "{other} < {own}");
-        assert_ne!(other, own);
-        assert_eq!(start_identity(i32::MAX), None);
     }
 
     #[test]

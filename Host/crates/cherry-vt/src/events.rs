@@ -1,5 +1,6 @@
 //! What programs tell their terminal besides what to draw: a title, a working
 //! directory, the bell, desktop notifications and progress reports.
+use crate::graphics::decode_base64;
 use std::collections::VecDeque;
 
 /// Something a program did that a terminal reports rather than shows.
@@ -356,34 +357,4 @@ fn is_identifier(value: &[u8]) -> bool {
         && value
             .iter()
             .all(|&byte| byte.is_ascii_alphanumeric() || b"_+-.".contains(&byte))
-}
-
-/// Standard base64, padding optional.
-fn decode_base64(text: &[u8]) -> Option<Vec<u8>> {
-    let text = text
-        .strip_suffix(b"==")
-        .or_else(|| text.strip_suffix(b"="))
-        .unwrap_or(text);
-    if text.len() % 4 == 1 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(text.len() / 4 * 3 + 2);
-    let (mut bits, mut count) = (0u32, 0);
-    for &byte in text {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        };
-        bits = (bits << 6) | u32::from(value);
-        count += 6;
-        if count >= 8 {
-            count -= 8;
-            out.push((bits >> count) as u8);
-        }
-    }
-    Some(out)
 }

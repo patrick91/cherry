@@ -693,7 +693,7 @@ differs from the design above.
   `MAX_CONNECTIONS` (1024), holders registered and still expected, lost
   sessions and its descriptor limit.
 - The daemon writes `host.pid` in its state directory (JSON: pid, its
-  start identity (`processes::start_identity`), build, start time, socket)
+  start identity (`cherry_protocol::start_identity`), build, start time, socket)
   once it holds the lock, and removes it when it exits normally. Its log lines and its holders' say when, who and which build:
   `2026-09-27T10:15:00.123Z cherry-host[1234] daemon <build>: <message>`
   (`holder` for a holder); other roles (`start`, the gateway) still write

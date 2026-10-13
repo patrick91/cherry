@@ -106,8 +106,8 @@ pub fn kill_session(leader: libc::pid_t) {
 }
 
 /// A process as it was while its session's holder was linked: its PID and
-/// when it started (`start_identity`), so that a process that got the PID
-/// later is not taken for it.
+/// when it started (`cherry_protocol::start_identity`), so that a process
+/// that got the PID later is not taken for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Recorded {
     pub pid: libc::pid_t,
@@ -118,7 +118,7 @@ impl Recorded {
     pub fn of(pid: libc::pid_t) -> Self {
         Self {
             pid,
-            started: start_identity(pid),
+            started: cherry_protocol::start_identity(pid),
         }
     }
 
@@ -130,7 +130,7 @@ impl Recorded {
     /// Whether the PID now belongs to another process (unless that cannot
     /// be told).
     fn reused(&self) -> bool {
-        match (&self.started, start_identity(self.pid)) {
+        match (&self.started, cherry_protocol::start_identity(self.pid)) {
             (Some(recorded), Some(current)) => *recorded != current,
             _ => false,
         }
@@ -282,37 +282,6 @@ pub fn process_name(pid: libc::pid_t) -> String {
     }
 }
 
-/// When a process started, as a token that another process with the same
-/// PID (after the PID was reused, or after a reboot) never has: the start
-/// time to the microsecond on macOS; on Linux the boot and the start time
-/// in clock ticks since it. None when it cannot be read.
-pub fn start_identity(pid: libc::pid_t) -> Option<String> {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        (libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&mut info as *mut libc::proc_bsdinfo).cast(),
-            size,
-        ) == size)
-            .then(|| format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-        // After the parenthesised command name: the state (field 3) comes
-        // first, and the start time is field 22.
-        let end = stat.iter().rposition(|&b| b == b')')?;
-        let fields = std::str::from_utf8(&stat[end + 1..]).ok()?;
-        let started = fields.split_ascii_whitespace().nth(22 - 3)?;
-        Some(format!("{}/{started}", boot.trim()))
-    }
-}
-
 /// Where this process's executable is now. The kernel follows it when it,
 /// or a directory above it such as an app bundle, is moved or renamed. None
 /// once it was deleted.
@@ -383,24 +352,6 @@ pub fn reap(pid: libc::pid_t) -> Option<ExitStatus> {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
-
-    #[test]
-    fn a_start_identity_tells_processes_apart() {
-        let own = start_identity(unsafe { libc::getpid() });
-        assert!(own.is_some());
-        assert_eq!(start_identity(unsafe { libc::getpid() }), own);
-        // Started later than this process: another identity.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
-        let other = start_identity(child.id() as libc::pid_t);
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(other.is_some());
-        assert_ne!(other, own);
-    }
 
     #[test]
     fn the_leader_is_signalled_even_when_listing_members_fails() {

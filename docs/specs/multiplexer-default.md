@@ -1347,7 +1347,10 @@ differs from the design above.
   running session of this app names no copy (it was created before the
   tag), nothing is removed.
 
-- `WorkspaceStateStore` keeps one JSON file per repository (version 1). It
+- `WorkspaceStateStore` keeps one JSON file per project window (version 1):
+  a project's primary window's named by the SHA-256 of its root, as before,
+  another window's by that of its root, a NUL and its id (`windowID` in the
+  record; `open-windows.json` lists `windows` beside `projectRoots`). It
   saves 500 ms after changes, except that a newly opened persistent tab is
   saved at once (its record carries the Create's request id,
   `launchRequestID`); it never saves during teardown, and quit flushes it

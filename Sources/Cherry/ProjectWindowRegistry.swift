@@ -1188,6 +1188,9 @@ final class ProjectWindowRegistry {
 final class ProjectWindowFrameSaver: NSObject {
     private weak var window: NSWindow?
     private let projectRoot: String
+    /// The window's id (`ProjectWindowValue.windowID`); nil for the
+    /// project's primary window.
+    private let windowID: UUID?
     private let store: ProjectWindowFrameStore
     private let isTerminating: @MainActor () -> Bool
     private var isClosing = false
@@ -1195,12 +1198,14 @@ final class ProjectWindowFrameSaver: NSObject {
     init(
         window: NSWindow,
         projectRoot: String,
+        windowID: UUID? = nil,
         store: ProjectWindowFrameStore,
         center: NotificationCenter = .default,
         isTerminating: @escaping @MainActor () -> Bool = { false }
     ) {
         self.window = window
         self.projectRoot = projectRoot
+        self.windowID = windowID
         self.store = store
         self.isTerminating = isTerminating
         super.init()
@@ -1220,7 +1225,7 @@ final class ProjectWindowFrameSaver: NSObject {
     @objc private func frameDidChange(_ notification: Notification) {
         guard let window else { return }
         if notification.name == NSWindow.didResizeNotification, window.inLiveResize { return }
-        store.save(window, projectRoot: projectRoot)
+        store.save(window, projectRoot: projectRoot, windowID: windowID)
     }
 
     @objc private func fullScreenDidChange(_ notification: Notification) {
@@ -1228,7 +1233,7 @@ final class ProjectWindowFrameSaver: NSObject {
         // A window that leaves full screen because it closes, or the app
         // quits, was in full screen for the next launch.
         if !entered, isClosing || isTerminating() { return }
-        store.setFullScreen(entered, projectRoot: projectRoot)
+        store.setFullScreen(entered, projectRoot: projectRoot, windowID: windowID)
     }
 
     @objc private func windowWillClose(_ notification: Notification) {
@@ -1237,7 +1242,7 @@ final class ProjectWindowFrameSaver: NSObject {
 
     func saveNow() {
         guard let window else { return }
-        store.save(window, projectRoot: projectRoot)
+        store.save(window, projectRoot: projectRoot, windowID: windowID)
     }
 }
 
@@ -2017,11 +2022,13 @@ enum LaunchWindowPlan: Equatable {
     case nothing
 }
 
-/// A project window's frame, per project, in the app's defaults. Project
+/// A project window's frame, per window, in the app's defaults. Project
 /// windows are not restorable, which also turns off SwiftUI's frame
 /// autosave: without this, every window would open at the default size.
 /// Unlike that autosave (keyed by the order windows opened in), each project
-/// gets its own window's frame back, at launch and when it opens later.
+/// window gets its own frame back, at launch and when it opens later. A
+/// project's primary window (`windowID` nil) keeps the keys a project's one
+/// window had; another window's add `#<window id>`.
 struct ProjectWindowFrameStore {
     let defaults: UserDefaults
 
@@ -2029,29 +2036,33 @@ struct ProjectWindowFrameStore {
         self.defaults = defaults
     }
 
-    static func key(projectRoot: String) -> String {
-        "window.frame.\(projectRoot)"
+    static func key(projectRoot: String, windowID: UUID? = nil) -> String {
+        "window.frame.\(projectRoot)" + windowSuffix(windowID)
     }
 
-    func frameDescriptor(projectRoot: String) -> NSWindow.PersistableFrameDescriptor? {
-        defaults.string(forKey: Self.key(projectRoot: projectRoot))
+    func frameDescriptor(projectRoot: String, windowID: UUID? = nil) -> NSWindow.PersistableFrameDescriptor? {
+        defaults.string(forKey: Self.key(projectRoot: projectRoot, windowID: windowID))
     }
 
-    static func fullScreenKey(projectRoot: String) -> String {
-        "window.fullScreen.\(projectRoot)"
+    static func fullScreenKey(projectRoot: String, windowID: UUID? = nil) -> String {
+        "window.fullScreen.\(projectRoot)" + windowSuffix(windowID)
     }
 
-    /// Whether the project's window was in full screen when it was last
-    /// saved: it comes back in full screen (`WindowFullScreenRestore`), and
-    /// its saved frame is the one it had before, which it goes back to when
-    /// it leaves full screen.
-    func isFullScreen(projectRoot: String) -> Bool {
-        defaults.bool(forKey: Self.fullScreenKey(projectRoot: projectRoot))
+    private static func windowSuffix(_ windowID: UUID?) -> String {
+        windowID.map { "#\($0.uuidString)" } ?? ""
     }
 
-    func setFullScreen(_ fullScreen: Bool, projectRoot: String) {
-        let key = Self.fullScreenKey(projectRoot: projectRoot)
-        guard isFullScreen(projectRoot: projectRoot) != fullScreen else { return }
+    /// Whether the window was in full screen when it was last saved: it
+    /// comes back in full screen (`WindowFullScreenRestore`), and its saved
+    /// frame is the one it had before, which it goes back to when it leaves
+    /// full screen.
+    func isFullScreen(projectRoot: String, windowID: UUID? = nil) -> Bool {
+        defaults.bool(forKey: Self.fullScreenKey(projectRoot: projectRoot, windowID: windowID))
+    }
+
+    func setFullScreen(_ fullScreen: Bool, projectRoot: String, windowID: UUID? = nil) {
+        let key = Self.fullScreenKey(projectRoot: projectRoot, windowID: windowID)
+        guard isFullScreen(projectRoot: projectRoot, windowID: windowID) != fullScreen else { return }
         if fullScreen {
             defaults.set(true, forKey: key)
         } else {
@@ -2062,19 +2073,20 @@ struct ProjectWindowFrameStore {
     /// Saves `window`'s frame, unless it is full screen: the frame it goes
     /// back to when it leaves full screen stays saved.
     @MainActor
-    func save(_ window: NSWindow, projectRoot: String) {
+    func save(_ window: NSWindow, projectRoot: String, windowID: UUID? = nil) {
         guard !window.styleMask.contains(.fullScreen) else { return }
         let descriptor = window.frameDescriptor
-        guard frameDescriptor(projectRoot: projectRoot) != descriptor else { return }
-        defaults.set(descriptor, forKey: Self.key(projectRoot: projectRoot))
+        guard frameDescriptor(projectRoot: projectRoot, windowID: windowID) != descriptor else { return }
+        defaults.set(descriptor, forKey: Self.key(projectRoot: projectRoot, windowID: windowID))
     }
 
-    /// Gives `window` the frame saved for `projectRoot` (AppKit fits it to
-    /// the screens there are now). False when none was saved.
+    /// Gives `window` the frame saved for that window of `projectRoot`
+    /// (AppKit fits it to the screens there are now). False when none was
+    /// saved.
     @MainActor
     @discardableResult
-    func restore(_ window: NSWindow, projectRoot: String) -> Bool {
-        guard let descriptor = frameDescriptor(projectRoot: projectRoot) else { return false }
+    func restore(_ window: NSWindow, projectRoot: String, windowID: UUID? = nil) -> Bool {
+        guard let descriptor = frameDescriptor(projectRoot: projectRoot, windowID: windowID) else { return false }
         window.setFrame(from: descriptor)
         return true
     }

@@ -10,6 +10,10 @@ import Foundation
 final class RepositoryWorkspace: ObservableObject {
     /// The project, as the window registry and the saved state name it.
     let repositoryRoot: String
+    /// Which of the project's windows this is (`ProjectWindowValue.windowID`):
+    /// nil for its primary window. Each window loads and saves only its own
+    /// file (`WorkspaceStateStore.stateFileName(repositoryRoot:windowID:)`).
+    let windowID: UUID?
     /// The project's folder as its tabs name it: `repositoryRoot` with its
     /// links resolved (a device's project: its key).
     let workspaceRoot: String
@@ -129,6 +133,7 @@ final class RepositoryWorkspace: ObservableObject {
     /// tests get native tabs and no persistence unless they opt in.
     init(
         projectRoot: String,
+        windowID: UUID? = nil,
         backendPolicy: SessionBackendPolicy = .native,
         stateStore: WorkspaceStateStore? = nil,
         sessionRestorer: @escaping WorkspaceSessionRestorer = WorkspaceSessionRestorers.none,
@@ -158,6 +163,7 @@ final class RepositoryWorkspace: ObservableObject {
         }
         isRemote = location.isRemote
         repositoryRoot = root
+        self.windowID = windowID
         workspaceRoot = folder
         self.remoteProject = location.isRemote ? remoteProject : nil
         self.remoteProjectFiles = remoteProjectFiles ?? (location.isRemote && remoteProject != nil ? .shared : nil)
@@ -174,7 +180,7 @@ final class RepositoryWorkspace: ObservableObject {
         // tabs are dropped. A file saved while Cherry had worktree spaces
         // can name several folders: their tabs all come back here.
         let mayAdoptUnbound = backendPolicy.localSessions != nil
-        let savedState = stateStore?.load(repositoryRoot: root)
+        let savedState = stateStore?.load(repositoryRoot: root, windowID: windowID)
         if var record = savedState?.workspaceRecord(root: folder),
            mayAdoptUnbound
                ? record.hasRestorableSessions
@@ -196,7 +202,7 @@ final class RepositoryWorkspace: ObservableObject {
                 savedState: savedState,
                 // A file this version moved aside still says when it was
                 // saved and which tabs it had.
-                setAside: savedState == nil ? stateStore.setAsideState(repositoryRoot: root) : nil,
+                setAside: savedState == nil ? stateStore.setAsideState(repositoryRoot: root, windowID: windowID) : nil,
                 sessionsToEnd: sessionsToEnd,
                 createdBefore: runStartedAt,
                 host: localSessions.profile.host
@@ -835,7 +841,8 @@ final class RepositoryWorkspace: ObservableObject {
             repositoryRoot: repositoryRoot,
             activeWorktreeRoot: workspaceRoot,
             worktrees: record.map { [$0] } ?? [],
-            savedAt: now
+            savedAt: now,
+            windowID: windowID
         )
     }
 

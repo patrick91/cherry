@@ -258,6 +258,33 @@ struct TerminalThemeColors: Equatable {
     let palette: [Int: String]
 }
 
+/// The keyboard lines of the user's Ghostty configuration, as native tabs
+/// read them (`TerminalSettings.ghosttyKeyboardConfig`). `files`, a line's
+/// `file` and `isApplied` are for the Keyboard Diagnostics window.
+/// Temporary keyboard diagnostics; remove once the Shift+Enter/Shift+Tab report is understood.
+struct UserGhosttyKeyboardConfig {
+    /// A `keybind` or `macos-option-as-alt` line of a file read.
+    struct Line: Equatable {
+        var file: URL
+        var key: String
+        var value: String
+        /// The embedded Ghostty's diagnostic for a line it rejects, which is
+        /// left out.
+        var rejection: String?
+        /// Whether native surfaces take it (`parseUserGhosttyKeyboardConfig`).
+        var isApplied = false
+    }
+
+    /// Every file read, keyboard lines or not, in Ghostty's order
+    /// (`ghosttyConfigFileContents`).
+    var files: [URL] = []
+    /// Their keyboard lines, in order.
+    var lines: [Line] = []
+    /// What native surfaces take: the lines applied, then the ones Cherry
+    /// adds.
+    var surfaceLines: [(String, String)] = []
+}
+
 @MainActor
 final class TerminalSettings: ObservableObject {
     static let shared = TerminalSettings()
@@ -417,79 +444,368 @@ final class TerminalSettings: ObservableObject {
         )
     }
 
-    /// Keyboard-related lines lifted from the user's own ghostty config so native
-    /// panes match standalone ghostty (their `shift+enter`, `macos-option-as-alt`,
-    /// etc.). Read once. Defaults `macos-option-as-alt = true` if unset so the
-    /// Alt/Meta family works out of the box. Only input-producing keybinds are
-    /// forwarded — app-action keybinds (tabs/splits) are Cherry's job.
-    static let nativeUserKeyboardConfig: [(String, String)] = loadUserGhosttyKeyboardConfig()
-
-    /// The file `nativeUserKeyboardConfig` was read from, chosen once with it
-    /// (`userGhosttyKeyboardConfigFile`), for the Keyboard Diagnostics window.
-    /// Temporary keyboard diagnostics; remove once the Shift+Enter/Shift+Tab report is understood.
-    static let nativeUserKeyboardConfigFile: URL? = userGhosttyKeyboardConfigFile(
-        home: FileManager.default.homeDirectoryForCurrentUser
-    ) { FileManager.default.fileExists(atPath: $0) }
-
-    private static func loadUserGhosttyKeyboardConfig() -> [(String, String)] {
-        let contents = nativeUserKeyboardConfigFile.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
-        return parseUserGhosttyKeyboardConfig(contents ?? "")
+    /// Keyboard-related lines lifted from the user's own Ghostty configuration
+    /// so native panes match standalone Ghostty (their `shift+enter`,
+    /// `macos-option-as-alt`, etc.): from every file Ghostty loads
+    /// (`ghosttyKeyboardConfig`), read once, the first time a surface needs
+    /// them after the app allowed it (`readsUserGhosttyConfiguration`);
+    /// before that, and in tests, Cherry's own lines alone. Defaults
+    /// `macos-option-as-alt = true` if unset so the Alt/Meta family works out
+    /// of the box. Only input-producing keybinds are forwarded — app-action
+    /// keybinds (tabs/splits) are Cherry's job. Tests set it before they
+    /// create a surface.
+    static var nativeUserKeyboardConfig: [(String, String)] {
+        get {
+            nativeKeyboardConfigOverride
+                ?? (readsUserGhosttyConfiguration ? userGhosttyKeyboardConfig.surfaceLines : parseUserGhosttyKeyboardConfig(""))
+        }
+        set { nativeKeyboardConfigOverride = newValue }
     }
 
-    /// The ghostty config `nativeUserKeyboardConfig` reads: the first of
-    /// these that exists.
+    /// What `nativeUserKeyboardConfig` read of the user's Ghostty files, file
+    /// by file, for the Keyboard Diagnostics window (which reads them if no
+    /// surface has yet); nil when it reads none.
     /// Temporary keyboard diagnostics; remove once the Shift+Enter/Shift+Tab report is understood.
-    nonisolated static func userGhosttyKeyboardConfigFile(home: URL, fileExists: (String) -> Bool) -> URL? {
-        [
-            home.appendingPathComponent(".config/ghostty/config"),
-            home.appendingPathComponent("Library/Application Support/com.mitchellh.ghostty/config"),
-        ].first { fileExists($0.path) }
+    static var nativeUserKeyboardConfigReading: UserGhosttyKeyboardConfig? {
+        readsUserGhosttyConfiguration ? userGhosttyKeyboardConfig : nil
     }
 
-    /// Pure parser: keep `macos-option-as-alt` and input-producing `keybind` lines,
-    /// defaulting option-as-alt to `true` when the user didn't set it.
-    nonisolated static func parseUserGhosttyKeyboardConfig(_ contents: String) -> [(String, String)] {
-        var result: [(String, String)] = []
-        var sawOptionAsAlt = false
-        var userKeybindTriggers: Set<String> = []
-        for rawLine in contents.split(separator: "\n", omittingEmptySubsequences: true) {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { continue }
-            let key = line[..<eq].trimmingCharacters(in: .whitespaces)
-            let value = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
-            guard !value.isEmpty else { continue }
-            switch key {
-            case "macos-option-as-alt":
-                result.append((key, value))
-                sawOptionAsAlt = true
-            case "keybind" where isInputProducingKeybind(value):
-                result.append((key, value))
-                if let eq = value.firstIndex(of: "=") {
-                    userKeybindTriggers.insert(value[..<eq].trimmingCharacters(in: .whitespaces).lowercased())
+    /// Whether `nativeUserKeyboardConfig` reads the user's Ghostty files:
+    /// the app sets it (`CherryApp.init`); tests never read them.
+    static var readsUserGhosttyConfiguration = false
+
+    private static var nativeKeyboardConfigOverride: [(String, String)]?
+    private static let userGhosttyKeyboardConfig = ghosttyKeyboardConfig(
+        home: FileManager.default.homeDirectoryForCurrentUser,
+        environment: ProcessInfo.processInfo.environment
+    )
+
+    /// The keys of the lines `parseUserGhosttyKeyboardConfig` keeps.
+    nonisolated private static let keyboardConfigKeys: Set<String> = ["keybind", "macos-option-as-alt"]
+
+    /// The keyboard lines of the Ghostty configuration of `home`
+    /// (`ghosttyConfigFileContents`), and those native surfaces take
+    /// (`parseUserGhosttyKeyboardConfig`). A line the embedded Ghostty
+    /// rejects would fail the configuration of every surface, which would
+    /// then run with none at all (`TerminalController.rejectedLines`): it is
+    /// left out and logged, as standalone Ghostty reports and ignores it.
+    static func ghosttyKeyboardConfig(home: URL, environment: [String: String]) -> UserGhosttyKeyboardConfig {
+        let files = ghosttyConfigFileContents(home: home, environment: environment)
+        var lines = files.flatMap { file in
+            ghosttyConfigLines(file.contents)
+                .filter { keyboardConfigKeys.contains($0.key) }
+                .map { UserGhosttyKeyboardConfig.Line(file: file.url, key: $0.key, value: $0.value) }
+        }
+        let rejected = TerminalController.rejectedLines(of: TerminalConfiguration { builder in
+            for line in lines {
+                builder.withCustom(line.key, line.value)
+            }
+        })
+        for (index, issue) in rejected.sorted(by: { $0.key < $1.key }) {
+            lines[index].rejection = issue
+            SessionLog.notice(
+                "Native tabs leave out a line of the Ghostty configuration that Ghostty rejects: "
+                    + "\(lines[index].key) = \(lines[index].value) (\(issue))"
+            )
+        }
+        let taken = lines.indices.filter { lines[$0].rejection == nil }
+        let parsed = userGhosttyKeyboardLines(taken.map { (lines[$0].key, lines[$0].value) })
+        for index in parsed.kept {
+            lines[taken[index]].isApplied = true
+        }
+        return UserGhosttyKeyboardConfig(
+            files: files.map(\.url),
+            lines: lines,
+            surfaceLines: lines.filter(\.isApplied).map { ($0.key, $0.value) } + parsed.added
+        )
+    }
+
+    /// The configuration files Ghostty loads by default, in its order
+    /// (`Config.loadDefaultFiles`, Ghostty 1.3): `config`, then
+    /// `config.ghostty`, in `$XDG_CONFIG_HOME/ghostty` (`~/.config/ghostty`
+    /// when that is unset, empty or not an absolute path), then the same two
+    /// in `~/Library/Application Support/com.mitchellh.ghostty`. Ghostty
+    /// loads every one that exists; a later line overrides an earlier one.
+    nonisolated static func ghosttyDefaultConfigPaths(home: URL, environment: [String: String]) -> [URL] {
+        let configHome = environment["XDG_CONFIG_HOME"].flatMap { $0.hasPrefix("/") ? URL(fileURLWithPath: $0) : nil }
+            ?? home.appendingPathComponent(".config")
+        return [
+            configHome.appendingPathComponent("ghostty"),
+            home.appendingPathComponent("Library/Application Support/com.mitchellh.ghostty"),
+        ].flatMap { [$0.appendingPathComponent("config"), $0.appendingPathComponent("config.ghostty")] }
+    }
+
+    /// Every configuration file Ghostty loads and its text, in its order: the
+    /// default files that exist (`ghosttyDefaultConfigPaths`), then the files
+    /// their `config-file` lines name, in the order named and each file once
+    /// (`Config.loadRecursiveFiles`; a symbolic link is its target); a file
+    /// one of those names comes after the files named so far. A path is
+    /// relative to the directory of the file that names it, `~/` is `home`,
+    /// a leading `?` only makes it optional, and an empty `config-file`
+    /// empties the list. Ghostty reads a file line by line: a line that is
+    /// not UTF-8 is left out, not the file.
+    nonisolated static func ghosttyConfigFileContents(
+        home: URL,
+        environment: [String: String]
+    ) -> [(url: URL, contents: String)] {
+        var contents: [(url: URL, contents: String)] = []
+        var includes: [URL] = []
+        func load(_ file: URL) {
+            // A regular file, or a link to one, as Ghostty reads a
+            // `config-file`: reading a FIFO would wait for a writer.
+            var info = stat()
+            guard stat(file.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+                  let data = try? Data(contentsOf: file)
+            else { return }
+            var text = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+                .map { String(bytes: $0, encoding: .utf8) ?? "" }
+                .joined(separator: "\n")
+            if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+            contents.append((file, text))
+            for (key, value) in ghosttyConfigLines(text) where key == "config-file" {
+                guard !value.isEmpty else {
+                    includes.removeAll()
+                    continue
                 }
+                var path = value.hasPrefix("?") ? String(value.dropFirst()) : value
+                if path.utf8.count >= 2, path.hasPrefix("\""), path.hasSuffix("\"") {
+                    path = String(path.dropFirst().dropLast())
+                }
+                if path.isEmpty { continue }
+                if path.hasPrefix("/") {
+                    includes.append(URL(fileURLWithPath: path))
+                } else if path.hasPrefix("~/") {
+                    includes.append(home.appendingPathComponent(String(path.dropFirst(2))))
+                } else {
+                    includes.append(file.deletingLastPathComponent().appendingPathComponent(path))
+                }
+            }
+        }
+        for file in ghosttyDefaultConfigPaths(home: home, environment: environment) {
+            load(file)
+        }
+        var loaded: Set<String> = []
+        var index = 0
+        while index < includes.count {
+            let file = includes[index]
+            index += 1
+            if loaded.insert(file.resolvingSymlinksInPath().path).inserted { load(file) }
+        }
+        return contents
+    }
+
+    /// The `key = value` lines of a Ghostty configuration file, as Ghostty
+    /// reads them (`cli.args.LineIterator`): lines end at LF and are trimmed
+    /// of spaces, tabs and CR, blank lines and `#` comments are skipped, and
+    /// a value's surrounding double quotes are removed.
+    nonisolated static func ghosttyConfigLines(_ contents: String) -> [(key: String, value: String)] {
+        let blanks = CharacterSet(charactersIn: " \t")
+        // "\r\n" is one Character.
+        return contents.split(whereSeparator: { $0 == "\n" || $0 == "\r\n" }).compactMap { rawLine in
+            let line = rawLine.trimmingCharacters(in: CharacterSet(charactersIn: " \t\r"))
+            guard !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { return nil }
+            let key = line[..<eq].trimmingCharacters(in: blanks)
+            var value = line[line.index(after: eq)...].trimmingCharacters(in: blanks)
+            if value.utf8.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+                value = String(value.dropFirst().dropLast())
+            }
+            return (key, value)
+        }
+    }
+
+    /// `parseUserGhosttyKeyboardConfig(lines:)` of a configuration file's
+    /// text.
+    nonisolated static func parseUserGhosttyKeyboardConfig(_ contents: String) -> [(String, String)] {
+        parseUserGhosttyKeyboardConfig(lines: ghosttyConfigLines(contents))
+    }
+
+    /// Pure parser: keep `macos-option-as-alt` and input-producing `keybind`
+    /// lines in order, a keybind only while Ghostty's binding set would keep
+    /// it (`Binding.Set.parseAndPutRecurse`): a later binding of its trigger,
+    /// whatever its action, replaces it, and so does one of a sequence it
+    /// starts or of the first steps of its own sequence (except `unbind`),
+    /// and `keybind = clear` or an empty `keybind =` drops every earlier
+    /// one. A `chain=` line goes with the binding before it. An empty
+    /// `macos-option-as-alt =` drops the earlier ones. Adds `shift+tab=csi:Z`
+    /// when no line binds Shift+Tab, or a sequence that starts with it, and
+    /// option-as-alt `true` when no line sets it.
+    nonisolated static func parseUserGhosttyKeyboardConfig(
+        lines: [(key: String, value: String)]
+    ) -> [(String, String)] {
+        let parsed = userGhosttyKeyboardLines(lines)
+        return parsed.kept.map { (lines[$0].key, lines[$0].value) } + parsed.added
+    }
+
+    /// The `lines` `parseUserGhosttyKeyboardConfig(lines:)` keeps, by index
+    /// in order, and the lines it adds after them.
+    nonisolated private static func userGhosttyKeyboardLines(
+        _ lines: [(key: String, value: String)]
+    ) -> (kept: [Int], added: [(String, String)]) {
+        // Each kept line, and the trigger of the keybind it is or chains to
+        // (`keybindSteps`).
+        var kept: [(index: Int, steps: [String]?)] = []
+        var sawOptionAsAlt = false
+        var bindsShiftTab = false
+        // The trigger the latest keybind line bound, and whether it is kept.
+        var latestBinding: (steps: [String], isKept: Bool)?
+        for (index, (key, value)) in lines.enumerated() {
+            switch key {
+            case "macos-option-as-alt" where value.isEmpty:
+                // Back to the default.
+                kept.removeAll { lines[$0.index].key == key }
+                sawOptionAsAlt = false
+            case "macos-option-as-alt":
+                kept.append((index, nil))
+                sawOptionAsAlt = true
+            case "keybind" where value.isEmpty || value == "clear":
+                // No binding of the user's is left: `clear` drops them all,
+                // and an empty value restores Ghostty's defaults.
+                kept.removeAll { $0.steps != nil }
+                bindsShiftTab = false
+                latestBinding = nil
+            case "keybind":
+                guard let parts = keybindParts(value) else { continue }
+                if parts.trigger == "chain" {
+                    if let latestBinding, latestBinding.isKept, isInputProducingKeybindAction(parts.action) {
+                        kept.append((index, latestBinding.steps))
+                    }
+                    continue
+                }
+                let steps = keybindSteps(parts.trigger)
+                let unbinds = parts.action == "unbind"
+                kept.removeAll { line in
+                    guard let other = line.steps else { return false }
+                    return other.starts(with: steps) || (!unbinds && steps.starts(with: other))
+                }
+                if steps.first == "shift+tab" { bindsShiftTab = true }
+                let isKept = isInputProducingKeybindAction(parts.action)
+                if isKept { kept.append((index, steps)) }
+                latestBinding = (steps, isKept)
             default:
                 continue
             }
         }
-        // Default keybinds for agent special keys the wrapper's native key handling
-        // encodes wrong (it sends modifiers as modify-other-keys). Force the standard
-        // sequence via ghostty; a user's own binding for the same trigger wins.
-        for (trigger, action) in [("shift+tab", "csi:Z")] where !userKeybindTriggers.contains(trigger) {
-            result.append(("keybind", "\(trigger)=\(action)"))
+        var added: [(String, String)] = []
+        // Shift+Tab types `CSI Z` (back tab) in every keyboard mode, where
+        // Ghostty's encoder types `CSI 27;2;9~` under modifyOtherKeys 2 and
+        // `CSI 9;2u` under the kitty keyboard protocol; a user's own binding
+        // for the same trigger, whatever its action, wins.
+        if !bindsShiftTab {
+            added.append(("keybind", "shift+tab=csi:Z"))
         }
         if !sawOptionAsAlt {
-            result.append(("macos-option-as-alt", "true"))
+            added.append(("macos-option-as-alt", "true"))
         }
-        return result
+        return (kept.map(\.index), added)
     }
 
-    /// A ghostty keybind value is `trigger=action`. Keep only actions that produce
-    /// terminal input (so we don't hijack tab/split/window actions Cherry owns).
-    nonisolated private static func isInputProducingKeybind(_ value: String) -> Bool {
-        guard let eq = value.firstIndex(of: "=") else { return false }
-        let action = value[value.index(after: eq)...].trimmingCharacters(in: .whitespaces)
-        return action.hasPrefix("text:") || action.hasPrefix("csi:")
-            || action.hasPrefix("esc:") || action == "ignore"
+    /// A keybind value's trigger and action, split at the `=` Ghostty splits
+    /// it at: an `=` followed by `+` or `=` is the trigger's `=` key.
+    nonisolated private static func keybindParts(_ value: String) -> (trigger: String, action: String)? {
+        var start = value.startIndex
+        while let eq = value[start...].firstIndex(of: "=") {
+            let next = value.index(after: eq)
+            if next < value.endIndex, value[next] == "+" || value[next] == "=" {
+                start = next
+                continue
+            }
+            return (
+                value[..<eq].trimmingCharacters(in: .whitespaces),
+                value[next...].trimmingCharacters(in: .whitespaces)
+            )
+        }
+        return nil
+    }
+
+    /// A trigger's steps (`a>b` is two) as Ghostty tells triggers apart
+    /// (`Binding.Trigger.parse` and `hash`), for a trigger Ghostty accepts:
+    /// without the `all:`, `global:`, `unconsumed:` and `performable:`
+    /// flags, each step's modifiers by their Ghostty names in one order
+    /// (`cmd+shift+a` and `shift+super+a` are one), and its key by one name
+    /// (`keybindKeyName`).
+    nonisolated private static func keybindSteps(_ trigger: String) -> [String] {
+        var rest = Substring(trigger)
+        while let colon = rest.firstIndex(of: ":"),
+              ["all", "global", "unconsumed", "performable"].contains(String(rest[..<colon])) {
+            rest = rest[rest.index(after: colon)...]
+        }
+        let modifierNames = [
+            "shift": "shift", "ctrl": "ctrl", "control": "ctrl", "alt": "alt", "opt": "alt", "option": "alt",
+            "super": "super", "cmd": "super", "command": "super", "caps_lock": "caps_lock", "num_lock": "num_lock",
+        ]
+        return rest.split(separator: ">", omittingEmptySubsequences: false).map { step in
+            var modifiers: Set<String> = []
+            var key = ""
+            // Parts end at `+`; an empty one is the `+` key (`ctrl++`).
+            var parts = step
+            while !parts.isEmpty {
+                let end = parts.firstIndex(of: "+") ?? parts.endIndex
+                let part = String(parts[..<end])
+                parts = end == parts.endIndex ? "" : parts[parts.index(after: end)...]
+                if let modifier = modifierNames[part] {
+                    modifiers.insert(modifier)
+                } else {
+                    key = keybindKeyName(part)
+                }
+            }
+            return (modifiers.sorted() + [key]).joined(separator: "+")
+        }
+    }
+
+    /// The name of a trigger's key, one for each key Ghostty tells apart: a
+    /// character in lower case (`A` is `a`), the `+` key for an empty part,
+    /// and a physical key by its snake_case name, which Ghostty 1.1's names
+    /// (`left`, `kp_enter`, `one`) and W3C codes (`ArrowLeft`, `Digit1`,
+    /// `F1`) are spelled differently (`Key.fromW3C`,
+    /// `Trigger.backwards_compatible_keys`).
+    nonisolated private static func keybindKeyName(_ part: String) -> String {
+        if part.isEmpty { return "+" }
+        if part.unicodeScalars.count == 1 { return part.lowercased() }
+        // Ghostty 1.1's names.
+        let isPhysical = part.hasPrefix("physical:")
+        let old = isPhysical ? String(part.dropFirst("physical:".count)) : part
+        let digits = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+        if let digit = digits.firstIndex(of: old) { return isPhysical ? "digit_\(digit)" : "\(digit)" }
+        if old.hasPrefix("kp_") { return "numpad_" + old.dropFirst(3) }
+        for side in ["left", "right"] where old.hasPrefix(side + "_") {
+            let modifier = old.dropFirst(side.count + 1)
+            if ["shift", "control", "alt", "super"].contains(modifier) {
+                return "\(modifier == "super" ? "meta" : modifier)_\(side)"
+            }
+        }
+        switch old {
+        case "plus": return "+"
+        case "apostrophe": return isPhysical ? "quote" : "'"
+        case "grave_accent": return "backquote"
+        case "left_bracket": return "bracket_left"
+        case "right_bracket": return "bracket_right"
+        case "up", "down", "left", "right": return "arrow_" + old
+        default: break
+        }
+        // A key's own name, or its W3C code in any case.
+        let lower = part.lowercased()
+        let oneWordNames: Set<String> = [
+            "backquote", "backslash", "comma", "equal", "minus", "period", "quote", "semicolon", "slash",
+            "backspace", "enter", "space", "tab", "convert", "delete", "end", "help", "home", "insert",
+            "escape", "fn", "pause", "eject", "power", "sleep", "copy", "cut", "paste",
+        ]
+        let isFunctionKey = lower.count > 1 && lower.first == "f" && lower.dropFirst().allSatisfy { $0.isASCII && $0.isNumber }
+        if lower.contains("_") || oneWordNames.contains(lower) || isFunctionKey {
+            return lower
+        }
+        // `ArrowLeft` is `arrow_left`, `Digit1` `digit_1`.
+        var name = ""
+        for (index, character) in part.enumerated() {
+            if index > 0, character.isUppercase || character.isNumber { name += "_" }
+            name += character.lowercased()
+        }
+        return name
+    }
+
+    /// Keep only actions that produce terminal input (so we don't hijack
+    /// tab/split/window actions Cherry owns).
+    nonisolated private static func isInputProducingKeybindAction(_ action: String) -> Bool {
+        action.hasPrefix("text:") || action.hasPrefix("csi:") || action.hasPrefix("esc:") || action == "ignore"
     }
 
     func ghosttyConfiguration() -> TerminalConfiguration {

@@ -40,6 +40,7 @@
                 return
             }
             inputMethodHandler?.syncPreedit(clearIfNeeded: markedTextBefore)
+            let composing = inputMethodHandler?.hasMarkedText == true || markedTextBefore
 
             if let collected = inputMethodHandler?.finishCollectingText() {
                 var input = event.buildKeyInput(
@@ -47,6 +48,17 @@
                     translationModifiers: translationEvent.modifierFlags
                 )
                 for text in collected {
+                    // A lone control character an input method hands over
+                    // while it composes is its own, as in Ghostty's macOS
+                    // app (`TerminalInputText.isComposingControlInput`).
+                    if TerminalInputText.isComposingControlInput(text, composing: composing) { continue }
+                    // Another goes as the key alone, as in Ghostty's macOS
+                    // app (`TerminalInputText.keyEventText`).
+                    guard let text = TerminalInputText.keyEventText(text) else {
+                        input.text = nil
+                        surface.sendKeyEvent(input)
+                        continue
+                    }
                     text.withCString { ptr in
                         input.text = ptr
                         surface.sendKeyEvent(input)
@@ -55,13 +67,16 @@
                 return
             }
 
+            // A control key (Control+H) while an input method composes is
+            // the input method's: not encoded, and no binding runs.
+            if TerminalInputText.isComposingControlInput(event.characters, composing: composing) { return }
             sendKeyEvent(
                 for: event,
                 translationEvent: translationEvent,
                 action: action,
                 to: surface,
                 includeText: true,
-                composing: inputMethodHandler?.hasMarkedText == true || markedTextBefore
+                composing: composing
             )
         }
 
@@ -271,7 +286,15 @@
             return input
         }
 
+        /// The text Ghostty gets with this key event, as Ghostty's macOS app
+        /// gives it (`NSEvent.ghosttyCharacters`, then `String.keyEventText`):
+        /// none for a function key or a control character (Return, Tab,
+        /// Escape, Backspace), which Ghostty encodes from the key itself.
         var filteredCharacters: String? {
+            TerminalInputText.keyEventText(keyCharacters)
+        }
+
+        private var keyCharacters: String? {
             guard let filtered = TerminalInputText.filteredFunctionKeyText(characters) else {
                 return nil
             }

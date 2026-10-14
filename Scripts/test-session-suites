@@ -4,8 +4,9 @@
 #   Scripts/test-session-suites [--skip-build] unit
 #   Scripts/test-session-suites [--skip-build] real-host
 #
-# unit: runs each group below on its own (the session groups, and AppUpdate:
-# Restart to Update's quit keeps sessions). Swift Testing matches --filter
+# unit: runs each group below on its own (the session groups, AppUpdate:
+# Restart to Update's quit keeps sessions, and NativeKeyboard: the bytes a
+# native tab's program reads for its keys). Swift Testing matches --filter
 # against a test's ID, which includes its source file name, so a group selects
 # every test in the files named after it (WorkspaceRestore selects all of
 # WorkspaceRestoreTests.swift) as well as the tests named after it. Each group
@@ -134,6 +135,7 @@ groups=(
   ControlAgentTaskPersistence # ControlAgentTaskPersistenceTests
   ProgramStatus         # ProgramStatusTests
   AppUpdate             # AppUpdateTests: restart to update keeps sessions
+  NativeKeyboard        # NativeKeyboard{Config,Surface}Tests: keys and the user's Ghostty keybinds
 )
 
 # What marks a test file as a session suite: the hosted and persistent session

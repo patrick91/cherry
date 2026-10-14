@@ -425,6 +425,13 @@ private func encoded(
     #expect(encoded("\t", keyCode: 48, kittyFlags: 1) == "\t")
     #expect(encoded("\u{7F}", keyCode: 51, kittyFlags: 1) == "\u{7F}")
     #expect(encoded("\r", keyCode: 36, .option, kittyFlags: 1) == "\u{1B}[13;3u")
+    #expect(encoded("\u{7F}", keyCode: 51, .option, kittyFlags: 1) == "\u{1B}[127;3u")
+    #expect(encoded("\u{7F}", keyCode: 51, .option, kittyFlags: 1, optionAsAlt: .neither) == "\u{1B}[127;3u")
+    // Keypad Enter is the protocol's own key, KP_ENTER.
+    #expect(encoded("\u{03}", keyCode: 76, .numericPad, kittyFlags: 1) == "\u{1B}[57414u")
+    #expect(encoded("\u{03}", keyCode: 76, [.numericPad, .shift], kittyFlags: 1) == "\u{1B}[57414;2u")
+    #expect(encoded("\u{03}", keyCode: 76, [.numericPad, .control], kittyFlags: 1) == "\u{1B}[57414;5u")
+    #expect(encoded("\u{03}", keyCode: 76, [.numericPad, .shift]) == "\r")
     // F1, F2 and F4 are `CSI P`…, F3 `CSI 13 ~`; F5 and above as in xterm.
     #expect(encoded("\u{F704}", keyCode: 122, .function, kittyFlags: 1) == "\u{1B}[P")
     #expect(encoded("\u{F705}", keyCode: 120, .function, kittyFlags: 1) == "\u{1B}[Q")

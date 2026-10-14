@@ -36,6 +36,7 @@ struct TypedKey: CustomStringConvertible {
     static let up = TypedKey(name: "Up", characters: "\u{F700}", charactersIgnoringModifiers: "\u{F700}", keyCode: 126, modifiers: [.numericPad, .function])
     static let escape = TypedKey(name: "Escape", characters: "\u{1B}", charactersIgnoringModifiers: "\u{1B}", keyCode: 53)
     static let controlReturn = TypedKey(name: "Ctrl+Return", characters: "\r", charactersIgnoringModifiers: "\r", keyCode: 36, modifiers: .control)
+    static let shiftReturn = TypedKey(name: "Shift+Return", characters: "\r", charactersIgnoringModifiers: "\r", keyCode: 36, modifiers: .shift)
     static let keypadOne = TypedKey(name: "Keypad 1", characters: "1", charactersIgnoringModifiers: "1", keyCode: 83, modifiers: .numericPad)
 }
 
@@ -178,7 +179,7 @@ enum KeyLogger {
         ("kitty set 0", "\u{1B}[=0;1u"),
     ]
 
-    static let keys: [TypedKey] = [.controlB, .controlSpace, .d, .up, .keypadOne, .controlReturn, .escape, .z]
+    static let keys: [TypedKey] = [.controlB, .controlSpace, .d, .up, .keypadOne, .controlReturn, .shiftReturn, .escape, .z]
 
     /// The command that runs the logger for every step in `modes`.
     static func command(script: URL, log: URL) -> String {
@@ -295,6 +296,13 @@ private func nativeKeyBytes(in directory: URL, stage: KeyPathStage) async throws
         }
         #expect(attached[1]?.contains(hex("\u{1B}OA")) == true)
         #expect(attached[0]?.contains(hex("\u{1B}[A")) == true)
+        // Shift+Return is `CSI 13;2u` under the kitty protocol (not a bare
+        // CR, which an agent's composer takes as Return), `CSI 27;2;13~`
+        // elsewhere.
+        for index in KeyLogger.modes.indices {
+            let shiftReturn = [5, 7].contains(index) ? "\u{1B}[13;2u" : "\u{1B}[27;2;13~"
+            #expect(attached[index]?.contains(hex(shiftReturn)) == true, "\(KeyLogger.modes[index].name): \(attached[index] ?? "-")")
+        }
 
         // Without an adapter the host types the keys, in the modes it
         // reports (kitty flags and DECCKM).
@@ -307,21 +315,23 @@ private func nativeKeyBytes(in directory: URL, stage: KeyPathStage) async throws
         try await host.waitFor("the first step") { host.screen(away).contains("STEP_0_READY") }
         try await loseAdapter(of: away, host: host)
         #expect(stage.focus(away))
-        let awayKeys: [TypedKey] = [.controlB, .controlSpace, .d, .up, .escape, .z]
+        let awayKeys: [TypedKey] = [.controlB, .controlSpace, .d, .up, .escape, .shiftReturn, .z]
         // The surface keeps the last screen it had: the steps show in the
         // host's.
         let binding = try #require(away.persistentSession)
         let routed = try await KeyLogger.run(away, stage: stage, log: awayLog, keys: awayKeys, steps: [0, 1, 2, 5, 6, 7, 8]) {
             try await host.hosting.screen(of: binding).text
         }
+        // Shift+Return: `CSI 13;2u` under the kitty protocol, Cherry's own
+        // CR elsewhere.
         let expected: [Int: String] = [
-            0: "0200" + hex("d\u{1B}[A\u{1B}z"),
-            1: "0200" + hex("d\u{1B}OA\u{1B}z"),
-            2: "0200" + hex("d\u{1B}[A\u{1B}z"),
-            5: hex("\u{1B}[98;5u\u{1B}[32;5ud\u{1B}[A\u{1B}[27uz"),
-            6: "0200" + hex("d\u{1B}[A\u{1B}z"),
-            7: hex("\u{1B}[98;5u\u{1B}[32;5ud\u{1B}[A\u{1B}[27uz"),
-            8: "0200" + hex("d\u{1B}[A\u{1B}z"),
+            0: "0200" + hex("d\u{1B}[A\u{1B}\rz"),
+            1: "0200" + hex("d\u{1B}OA\u{1B}\rz"),
+            2: "0200" + hex("d\u{1B}[A\u{1B}\rz"),
+            5: hex("\u{1B}[98;5u\u{1B}[32;5ud\u{1B}[A\u{1B}[27u\u{1B}[13;2uz"),
+            6: "0200" + hex("d\u{1B}[A\u{1B}\rz"),
+            7: hex("\u{1B}[98;5u\u{1B}[32;5ud\u{1B}[A\u{1B}[27u\u{1B}[13;2uz"),
+            8: "0200" + hex("d\u{1B}[A\u{1B}\rz"),
         ]
         for (index, bytes) in expected {
             #expect(routed[index] == bytes, "\(KeyLogger.modes[index].name) through the host: \(routed[index] ?? "-")")

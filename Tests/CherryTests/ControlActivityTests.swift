@@ -276,6 +276,75 @@ struct ControlActivityTests {
     }
 #endif
 
+    /// An idle wait on a native tab reads its surface (a tab no window
+    /// shows gets no render signal), its whole text only when the visible
+    /// screen changed: output that screen does not show, such as a program
+    /// repeating the same line, still keeps the wait from calling it quiet.
+    @Test func aNativeTabsWaitSeesOutputItsVisibleScreenDoesNotShow() async throws {
+        let harness = try ControlAgentWaitHarness(launchBackend: .nativePTY)
+        defer {
+            harness.stop()
+        }
+        harness.server.start()
+        let processID = try await harness.startScript(named: "Repeater", """
+            #!/bin/sh
+            while :; do echo same; sleep 0.02; done
+            """)
+        // The visible screen fills with the line, and then stays the same.
+        try await Task.sleep(for: .milliseconds(1_500))
+
+        let waitResponse = try await harness.send(.waitForProcessIdle(.init(
+            processID: processID,
+            requireNewOutput: false,
+            quietMilliseconds: 300,
+            timeoutMilliseconds: 1_500,
+            lineLimit: 5
+        )))
+        guard case .waitForProcessIdle(let waited)? = waitResponse.result else {
+            Issue.record("Expected waitForProcessIdle result, got \(String(describing: waitResponse))")
+            return
+        }
+        #expect(waited.reason == .timedOut)
+        #expect(waited.observedNewOutput)
+        #expect(waited.outputVersion > waited.sinceOutputVersion)
+        #expect(waited.output.lines.contains("same"))
+    }
+
+    /// The output a wait on a native tab waits for ends it once quiet.
+    @Test func aNativeTabsWaitEndsOnceItsNewOutputWentQuiet() async throws {
+        let harness = try ControlAgentWaitHarness(launchBackend: .nativePTY)
+        defer {
+            harness.stop()
+        }
+        harness.server.start()
+        let processID = try await harness.startScript(named: "Answer", """
+            #!/bin/sh
+            echo ready
+            read line
+            echo "got $line"
+            exec sleep 30
+            """)
+        try await Task.sleep(for: .milliseconds(300))
+        let sent = try await harness.send(.sendProcessInput(.init(processID: processID, text: "go\n", rawBase64: nil)))
+        #expect(sent.error == nil)
+
+        let waitResponse = try await harness.send(.waitForProcessIdle(.init(
+            processID: processID,
+            requireNewOutput: true,
+            quietMilliseconds: 400,
+            timeoutMilliseconds: 5_000,
+            lineLimit: 20
+        )))
+        guard case .waitForProcessIdle(let waited)? = waitResponse.result else {
+            Issue.record("Expected waitForProcessIdle result, got \(String(describing: waitResponse))")
+            return
+        }
+        #expect(waited.reason == .idle)
+        #expect(waited.observedNewOutput)
+        #expect(waited.output.lines.contains("got go"))
+        #expect(waited.outputVersion > waited.sinceOutputVersion)
+    }
+
     @Test func trimmedRawOutputSuffixSkipsPartialUTF8AndEscapeTails() async throws {
         let continuationTail = Data([0x9F, 0x92, 0x96]) + Data("hello\n".utf8)
         let trimmedContinuation = CherryControlServer.trimmedRawOutputSuffix(continuationTail)

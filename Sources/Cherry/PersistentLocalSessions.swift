@@ -960,7 +960,7 @@ final class PersistentHostSessions {
     /// will end this session (`endSessions(ofForgottenTabs:)`): the
     /// Background Sessions list leaves it out meanwhile.
     func isScheduledToEnd(_ info: HostedSessionInfo, hostID: String) -> Bool {
-        guard info.owner == owner, owningTab(of: info.id) == nil else { return false }
+        guard info.owner == owner, !forgottenTabTargets.isEmpty, owningTab(of: info.id) == nil else { return false }
         return forgottenTabTargets.values.contains { records in
             records.contains { Self.record($0, names: info, hostID: hostID, owner: owner, host: profile.host) }
         }
@@ -1114,17 +1114,47 @@ final class PersistentHostSessions {
     /// it (`attachedTabs`), the tab it was started for (`cherry.tab`), or a
     /// tab whose Create or restart started it and has not answered yet (its
     /// `persistentLaunchRequestID`). Anything else of this app's is in the
-    /// background (`BackgroundSessions`).
+    /// background (`BackgroundSessions`). For many sessions, look at the tabs
+    /// once (`openTabsShowing`).
     func isShownByOpenTab(_ info: HostedSessionInfo, hostID: String, attachedTabs: OpenHostedTabs = .shared) -> Bool {
-        if owningTab(of: info.id) != nil || attachedTabs.showsSession(hostID: hostID, sessionID: info.id) {
-            return true
+        openTabsShowing(hostID: hostID, attachedTabs: attachedTabs).shows(info)
+    }
+
+    /// What the open tabs show of the host `hostID`'s sessions, read once
+    /// (`isShownByOpenTab`): Background Sessions decides the host's whole
+    /// list every second, and a pass over every tab for each session cost
+    /// sessions × tabs.
+    func openTabsShowing(hostID: String, attachedTabs: OpenHostedTabs = .shared) -> OpenTabsShowing {
+        let attached = attachedTabs.showing(hostID: hostID)
+        var sessionIDs = attached.sessionIDs
+        var tabIDs = attached.tabIDs
+        var launchRequestIDs = Set<String>()
+        for tab in openTabs.values.compactMap(\.object) {
+            tabIDs.insert(tab.id)
+            if tab.isPersistentLocalSession, let sessionID = tab.persistentSession?.sessionID {
+                sessionIDs.insert(sessionID)
+            }
+            if let launchID = tab.persistentLaunchRequestID { launchRequestIDs.insert(launchID) }
         }
-        if let tabID = Self.tabID(of: info, owner: owner),
-           hasOpenTab(withID: tabID) || attachedTabs.hasOpenTab(withID: tabID) {
-            return true
+        return OpenTabsShowing(owner: owner, sessionIDs: sessionIDs, tabIDs: tabIDs, launchRequestIDs: launchRequestIDs)
+    }
+
+    /// The open tabs as `isShownByOpenTab` looks at them.
+    struct OpenTabsShowing {
+        let owner: String
+        /// The sessions open tabs own (`owningTab(of:)`) or are attached to.
+        let sessionIDs: Set<String>
+        /// The ids of the open tabs, persistent and attached.
+        let tabIDs: Set<UUID>
+        /// The Creates and restarts of open tabs not answered yet.
+        let launchRequestIDs: Set<String>
+
+        func shows(_ info: HostedSessionInfo) -> Bool {
+            if sessionIDs.contains(info.id) { return true }
+            if let tabID = PersistentHostSessions.tabID(of: info, owner: owner), tabIDs.contains(tabID) { return true }
+            guard info.owner == owner, let launchID = PersistentHostSessions.launchRequestID(of: info) else { return false }
+            return launchRequestIDs.contains(launchID)
         }
-        guard info.owner == owner, let launchID = Self.launchRequestID(of: info) else { return false }
-        return openTabs.values.contains { $0.object?.persistentLaunchRequestID == launchID }
     }
 
     /// Whether a tab of this app may own `info`'s session (Persistent

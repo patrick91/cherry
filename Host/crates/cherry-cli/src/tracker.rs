@@ -7,9 +7,12 @@
 //! bracketed paste and origin mode (see `Renderer::detach_reset`). Those
 //! change only through control sequences, so a small libghostty terminal (the
 //! shadow) is fed the stream's escape and CSI sequences and nothing else: no
-//! text, no SGR, no strings (OSC, DCS, APC, PM, SOS). It then holds the modes
-//! the copy would, from the same parser, while text runs are skipped with
-//! `memchr` rather than laid out on a screen.
+//! text, no strings (OSC, DCS, APC, PM, SOS), and none of the sequences that
+//! act only on the pen, the character sets, the cursor's position, the
+//! margins or the screen's cells (SGR, cursor moves, erases, scrolls: see
+//! `acts_on_modes`), which full-screen programs send most. It then holds the
+//! modes the copy would, from the same parser, while text runs are skipped
+//! with `memchr` rather than laid out on a screen.
 //!
 //! The scanner follows libghostty's parser (vt100.net's state machine) to
 //! tell where each sequence ends: ESC starts a sequence anywhere, CAN and SUB
@@ -20,16 +23,17 @@
 //! A sequence is fed to the shadow whole, so its parser takes it as the
 //! copy's does.
 //!
-//! What the shadow cannot tell is where the cursor is: text moves it. Only a
-//! reset that leaves origin mode on needs it, so a sequence that may set
-//! origin mode is noted (`origin`), and the renderer keeps a full copy from
-//! then on.
+//! What the shadow cannot tell is where the cursor is: text and the cursor
+//! moves it is not fed move it. Only a reset that leaves origin mode on needs
+//! it, so a sequence that may set origin mode is noted (`origin`), and the
+//! renderer keeps a full copy from then on.
 
 use anyhow::Result;
 use memchr::{memchr, memchr3};
 
 /// The shadow's screen. Its size matters to no mode; small keeps what the
-/// sequences do to the screen (erases, scrolls) cheap.
+/// sequences it is fed do to the screen (a reset, a screen switch, DECALN)
+/// cheap.
 const SHADOW_COLS: u16 = 20;
 const SHADOW_ROWS: u16 = 5;
 /// Longest sequence kept, as the host limits them (see `passthrough`); a
@@ -280,20 +284,44 @@ impl Tracker {
     }
 }
 
-/// Whether a whole escape or CSI sequence goes to the shadow: all but SGR,
-/// which sets the pen only, and a lone ST.
+/// Whether a whole escape or CSI sequence goes to the shadow: all but a
+/// lone ST, RI, IND and NEL (which move the cursor and may scroll), the
+/// designations of the G0-G3 character sets, and the CSI sequences that
+/// act on the screen only (see `screen_final`).
 fn acts_on_modes(sequence: &[u8]) -> bool {
-    if sequence == b"\x1b\\" {
-        return false;
+    if let Some((&last, parameters)) = sequence.strip_prefix(b"\x1b[").and_then(<[u8]>::split_last)
+    {
+        // Parameters alone are digits and the separators `:` and `;`.
+        return !(screen_final(last) && parameters.iter().all(|byte| matches!(byte, b'0'..=b';')));
     }
-    if let Some(body) = sequence.strip_prefix(b"\x1b[") {
-        if let Some((b'm', parameters)) = body.split_last() {
-            return !parameters
-                .iter()
-                .all(|&byte| byte.is_ascii_digit() || byte == b';' || byte == b':');
-        }
-    }
-    true
+    !matches!(
+        sequence,
+        b"\x1b\\"
+            | b"\x1bM"
+            | b"\x1bD"
+            | b"\x1bE"
+            | [0x1b, b'(' | b')' | b'*' | b'+', b'0' | b'A' | b'B']
+    )
+}
+
+/// The final of a CSI sequence that, with parameters alone (no private
+/// marker or intermediate byte), acts only on the pen, the cursor's
+/// position, the margins or the screen's cells in libghostty (its
+/// `stream.zig` and `Terminal.zig`): SGR (m), the cursor moves (CUU A, CUD
+/// B, CUF C, CUB D, CNL E, CPL F, CHA G, CUP H, HPA `, HPR a, VPA d, VPR e,
+/// HVP f), the erases (ED J, EL K, ECH X), inserts and deletes (ICH @, IL
+/// L, DL M, DCH P), scrolls (SU S, SD T) and the top and bottom margins
+/// (DECSTBM r). None changes a mode, the screen that shows or a keyboard
+/// setting, and what they change decides nothing about those for the
+/// sequences the shadow is fed. With a marker or an intermediate some are
+/// other sequences (`CSI ? 6 r` restores origin mode, `CSI > 4 ; 2 m` sets
+/// modifyOtherKeys), and those still go to the shadow.
+fn screen_final(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'@'..=b'H' | b'J'..=b'M' | b'P' | b'S' | b'T' | b'X' | b'`' | b'a' | b'd'..=b'f'
+            | b'm' | b'r'
+    )
 }
 
 /// A DECSET or XTRESTORE naming mode 6 (origin).
@@ -316,6 +344,7 @@ fn may_set_origin(sequence: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     /// What the attachment reads from a copy: the modes (`modes()`, which
     /// carries the screen switch, kitty flags and modifyOtherKeys), which
@@ -377,6 +406,17 @@ mod tests {
             // Charsets, keypad, DECALN, soft and full resets.
             b"\x1b(0\x1b)0\x0e\x1b=\x1b#8\x1b[!p\x1b[?1l",
             b"\x1b[?1049h\x1b[?1004h\x1b[>1u\x1bc\x1b[?2004h",
+            // Screen-only sequences among the modes, and the same finals
+            // with a marker or an intermediate, which are other sequences.
+            b"\x1b[?6h\x1b[s\x1b[?6l\x1b[5;5H\x1b[2J\x1b[u",
+            b"\x1b[?6h\x1b[?6s\x1b[?6l\x1b[3;4r\x1b[K\x1b[?6r",
+            b"\x1b[?6h\x1b7\x1b[?6l\x1bM\x1bD\x1bE\x1b(0\x1b8",
+            b"\x1b[?6h\x1b[3;3H\x1b#8\x1b[2;2f",
+            b"\x1b[?1049h\x1b[2J\x1b[H\x1b[>4;2m\x1b[1;5r\x1bM\x1b[?1049l\x1b[>4m",
+            b"\x1b[?1h\x1b[?1s\x1b[2A\x1b[?1l\x1b[3B\x1b[?1r\x1b[?2J\x1b[?1K",
+            b"\x1b[>1u\x1b[5S\x1b[2T\x1b[3L\x1b[2M\x1b[4@\x1b[P\x1b[X\x1b[=5;2u",
+            b"\x1b((B\x1b(=\x1b[1$K\x1b[2 @\x1b[?1049;2004h\x1b[1:2H\x1b[;r",
+            b"\x1b[20h\x1b[2;12l\x1b[H\x1b[20l\x1b[K\x1b[12h",
         ] {
             agrees(&[stream]);
             // Split anywhere.
@@ -421,6 +461,45 @@ mod tests {
             b"\x1b>",
             b"\x1b[5;10r",
             b"\x1b[H\x1b[2J",
+            // Screen-only sequences (see `screen_final`), and the same
+            // finals with a marker or an intermediate.
+            b"\x1b[K",
+            b"\x1b[2K",
+            b"\x1b[?2K",
+            b"\x1b[J",
+            b"\x1b[?2J",
+            b"\x1b[3;4H",
+            b"\x1b[5A",
+            b"\x1b[2X",
+            b"\x1b[3@",
+            b"\x1b[2 @",
+            b"\x1b[2L",
+            b"\x1b[M",
+            b"\x1b[P",
+            b"\x1b[S",
+            b"\x1b[2T",
+            b"\x1b[r",
+            b"\x1b[3G",
+            b"\x1b[4d",
+            b"\x1b[1$K",
+            b"\x1bM",
+            b"\x1bD",
+            b"\x1bE",
+            b"\x1b(0",
+            b"\x1b(B",
+            b"\x1b[?6h",
+            b"\x1b[?6l",
+            b"\x1b[?6s",
+            b"\x1b[?6r",
+            b"\x1b[s",
+            b"\x1b[u",
+            b"\x1b#8",
+            b"\x1b[>4;2m",
+            b"\x1b[>4m",
+            b"\x1b[?1h",
+            b"\x1b[?1l",
+            b"\x1b[20h",
+            b"\x1b[20l",
             b"\x1b]2;title\x07",
             b"\x1b]8;;http://x\x1b\\",
             b"\x1bP+q544e\x1b\\",
@@ -480,6 +559,13 @@ mod tests {
             b"\x1b[?2004h",
             b"\x1b[>1u",
             b"\x1b[?1004h",
+            b"\x1b[?1000h",
+            b"\x1b[?1006h",
+            b"\x1b[20h",
+            b"\x1b[?1h",
+            b"\x1b=",
+            b"\x1b[>4;2m",
+            b"\x1b[1 q",
         ] {
             let mut copy = cherry_vt::Terminal::new(80, 24, 0).unwrap();
             copy.feed(mode);
@@ -499,6 +585,159 @@ mod tests {
         let modes = tracker.shadow.modes().unwrap();
         tracker.feed(b"\x1b[?1049h");
         assert_ne!(tracker.shadow.modes().unwrap(), modes);
+    }
+
+    /// A frame of a full-screen program, as Neovim and ncurses programs
+    /// draw them: text between cursor moves, erases, scrolls, inserts and
+    /// deletes, margins, pens and character sets, and no mode.
+    fn frame(n: usize) -> Vec<u8> {
+        let mut frame = b"\x1b[H".to_vec();
+        for row in 1..=24 {
+            let colour = (n * 7 + row) % 256;
+            write!(
+                frame,
+                "\x1b[{row};1H\x1b[K\x1b(B\x1b[m\x1b[38;5;{colour}m{n:>6} {row}\x1b[m"
+            )
+            .unwrap();
+            write!(frame, "\x1b[{}X\x1b[{}G|", row % 7, row * 3 % 80 + 1).unwrap();
+        }
+        frame.extend_from_slice(
+            concat!(
+                "\x1b[3;20r\x1b[5S\x1b[2T\x1b[r\x1b[2L\x1b[3M\x1b[4@\x1b[2P",
+                "\x1bM\x1bD\x1bE\x1b[J\x1b[1J\x1b[2J\x1b[3J\x1b[1K\x1b[2K",
+                "\x1b[7`\x1b[2a\x1b[4d\x1b[e\x1b[2;2f",
+                "\x1b[A\x1b[2B\x1b[3C\x1b[D\x1b[E\x1b[F",
+                "\x1b(0lqqk\x1b(B\x1b)0\x0eq\x0f\x1b[1;4;38:2::1:2:3mx\x1b[m",
+            )
+            .as_bytes(),
+        );
+        frame
+    }
+
+    /// A session that full-screen programs run in: they enter and leave
+    /// the alternate screens, and between their frames (see `frame`, left
+    /// out without `frames`), each a synchronized update, set and reset the
+    /// modes the attachment reads: cursor keys and the keypad, bracketed
+    /// paste, focus and mouse reports, kitty keyboard flags,
+    /// modifyOtherKeys, the cursor's style and origin mode.
+    fn full_screen_session(frames: bool) -> Vec<u8> {
+        let steps: [&[u8]; 12] = [
+            // Neovim starts, changes modes as it goes, and quits.
+            b"$ nvim\r\n\x1b[?1049h\x1b[22;0;0t\x1b[?1h\x1b=\x1b[H\x1b[2J\x1b[?2004h\x1b[?1004h\
+              \x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[>1u\x1b[>4;2m\x1b[2 q",
+            b"\x1b[?1l\x1b>",
+            b"\x1b[?1h\x1b=\x1b[?1002l\x1b[?1003h",
+            b"\x1b[>5u\x1b[=3;1u",
+            b"\x1b[<u\x1b[?2004l\x1b[?1s\x1b[?1l",
+            b"\x1b[?1r\x1b7\x1b[?6h\x1b[5;10r\x1b[2;3H\x1b8",
+            b"\x1b[?1004l\x1b[?1006l\x1b[?1000l\x1b[?1003l\x1b[<u\x1b[>4m\x1b[?1l\x1b>\
+              \x1b[0 q\x1b[?1049l\x1b[23;0;0t",
+            // At the prompt, and a program that uses ANSI modes.
+            b"\r\x1b[K$ less\x1b[K\r\n\x1b[?2004h\x1b[?2004l\x1b[4h\x1b[20h",
+            // Programs on the other alternate screens.
+            b"\x1b[4l\x1b[20l\x1b[?1047h\x1b[?1h\x1b=\x1b[>3u",
+            b"\x1b[?1047l\x1b[?47h\x1b[?1000h\x1b[?1005h",
+            b"\x1b[?1000l\x1b[?1005l\x1b[?47l\x1b[?1049h\x1b[?6h\x1b[?2004h",
+            b"\x1b[?6l\x1b[?1049l\x1b[?2004l\x1b[?1l\x1b>",
+        ];
+        let mut session = Vec::new();
+        for (n, step) in steps.into_iter().enumerate() {
+            session.extend_from_slice(step);
+            session.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+            if frames {
+                session.extend(frame(n));
+            }
+            session.extend_from_slice(b"\x1b[?25h\x1b[?2026l");
+        }
+        session
+    }
+
+    /// What the attachment reads (see `reading`), without writing to the
+    /// terminal, which may be inside a sequence.
+    fn modes_now(terminal: &cherry_vt::Terminal) -> (Vec<u8>, Vec<bool>) {
+        let screens = [1049, 1047, 47, 6, 2026].map(|mode| terminal.mode(mode, false).unwrap());
+        (terminal.modes().unwrap(), screens.to_vec())
+    }
+
+    #[test]
+    fn screen_sequences_never_reach_the_shadow() {
+        let mut tracker = Tracker::new().unwrap();
+        for n in 0..3 {
+            let frame = frame(n);
+            tracker.feed(&frame[..frame.len() / 3]);
+            tracker.feed(&frame[frame.len() / 3..]);
+        }
+        assert_eq!(tracker.forwarded, 0);
+        assert_eq!(tracker.state, State::Ground);
+        // The same finals with a private marker or an intermediate, and the
+        // other escape sequences, may act on modes: they are fed whole.
+        for sequence in [
+            &b"\x1b[?2J"[..],
+            b"\x1b[?1K",
+            b"\x1b[>4;2m",
+            b"\x1b[?6r",
+            b"\x1b[?1S",
+            b"\x1b[>T",
+            b"\x1b[2 @",
+            b"\x1b[1$K",
+            b"\x1b[1;1;2;2;1$r",
+            b"\x1b[?1;2H",
+            b"\x1b[=5H",
+            b"\x1b[4h",
+            b"\x1b[20l",
+            b"\x1b[s",
+            b"\x1b[u",
+            b"\x1b[!p",
+            b"\x1b((B",
+            b"\x1b(=",
+            b"\x1b#8",
+            b"\x1b7",
+            b"\x1b8",
+            b"\x1b=",
+            b"\x1bc",
+        ] {
+            let mut tracker = Tracker::new().unwrap();
+            tracker.feed(sequence);
+            assert_eq!(tracker.forwarded, sequence.len() as u64, "{sequence:?}");
+        }
+    }
+
+    /// The tracker, which skips the frames' sequences, against a copy of
+    /// the session that is fed every byte: what the attachment reads from
+    /// them is the same after every piece, the session fed whole or in
+    /// random pieces.
+    #[test]
+    fn a_full_screen_program_keeps_its_modes() {
+        let session = full_screen_session(true);
+        let mut without_frames = Tracker::new().unwrap();
+        without_frames.feed(&full_screen_session(false));
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for longest in [usize::MAX, 1, 7, 64, 1020] {
+            let mut tracker = Tracker::new().unwrap();
+            let mut copy = cherry_vt::Terminal::new(80, 24, 0).unwrap();
+            let mut fed = 0;
+            while fed < session.len() {
+                let cut = ((next() % longest as u64) as usize + 1).min(session.len() - fed);
+                let piece = &session[fed..fed + cut];
+                tracker.feed(piece);
+                copy.feed(piece);
+                fed += cut;
+                assert_eq!(
+                    modes_now(&tracker.shadow),
+                    modes_now(&copy),
+                    "pieces of {longest} at most, {fed} bytes in"
+                );
+            }
+            assert_eq!(reading(&mut tracker.shadow), reading(&mut copy));
+            // Only the modes reached the shadow, none of the frames.
+            assert_eq!(tracker.forwarded, without_frames.forwarded);
+        }
     }
 
     #[test]

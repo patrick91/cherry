@@ -19,7 +19,7 @@ use std::{
     io::{self, Write},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-        io::AsRawFd,
+        io::{AsRawFd, FromRawFd, RawFd},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -1003,10 +1003,21 @@ impl Drop for SocketGuard {
     }
 }
 
+/// Names the descriptor `cherry-host start` waits on (`launch::start`): it
+/// gets one byte once the daemon listens, and ends without one when the
+/// daemon gives up. In the environment, not on the command line, which
+/// stays `serve --socket PATH`; it is not one the daemon passes on
+/// (`environment::inherited`).
+pub const READY_FD_VAR: &str = "CHERRY_HOST_READY_FD";
+
 pub fn serve(path: &Path) -> Result<()> {
-    // Nothing the starter left open (a script's lock file, a pipe) may be
-    // held for the daemon's lifetime, and its cwd must not pin a volume.
-    environment::close_inherited_fds();
+    let ready = std::env::var(READY_FD_VAR)
+        .ok()
+        .and_then(|fd| fd.parse().ok())
+        .and_then(take_ready_fd);
+    // Nothing else the starter left open (a script's lock file, a pipe) may
+    // be held for the daemon's lifetime, and its cwd must not pin a volume.
+    environment::close_inherited_fds(ready.as_ref().map(AsRawFd::as_raw_fd));
     let _ = std::env::set_current_dir("/");
     // Connection threads and session workers run at interactive priority
     // while they serve an attachment; every other thread, and the holders
@@ -1120,6 +1131,10 @@ pub fn serve(path: &Path) -> Result<()> {
     {
         log(format_args!("cannot watch lent agents: {error}"));
     }
+    // Connections queue on the listener until the loop takes them.
+    if let Some(mut ready) = ready {
+        let _ = ready.write_all(b"\n");
+    }
     accept_loop(&listener, &stopped, &host, path);
     // Give up the socket and the lock before Shutdown or Replace is
     // acknowledged, so a client can start a new host right away instead of
@@ -1138,6 +1153,22 @@ pub fn serve(path: &Path) -> Result<()> {
         thread::sleep(Duration::from_millis(10));
     }
     Ok(())
+}
+
+/// The readiness descriptor (`READY_FD_VAR`): a socket or a pipe above
+/// stderr, which no holder inherits. Anything else is closed with the
+/// starter's other descriptors and never written to.
+fn take_ready_fd(fd: RawFd) -> Option<File> {
+    let mut info: libc::stat = unsafe { std::mem::zeroed() };
+    if fd <= libc::STDERR_FILENO || unsafe { libc::fstat(fd, &mut info) } != 0 {
+        return None;
+    }
+    let kind = info.st_mode & libc::S_IFMT;
+    if kind != libc::S_IFSOCK && kind != libc::S_IFIFO {
+        return None;
+    }
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    Some(unsafe { File::from_raw_fd(fd) })
 }
 
 /// Replace a socket only when nothing is listening on it.

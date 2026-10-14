@@ -181,13 +181,18 @@ impl TerminalThread {
     }
 
     /// Output for the terminal, and the kitty notifications in it, each
-    /// where it came. It is handed over once `CHUNK` bytes gather, or with
-    /// `flush`, which the holder calls before it sleeps: while output
-    /// keeps coming, a flood costs one hand-off per chunk rather than per
-    /// read. Returns whether the holder may read more.
-    pub fn feed(&mut self, bytes: Vec<u8>, notifications: Vec<(usize, Vec<u8>)>) -> bool {
+    /// where it came, read at `now`. It is handed over once `CHUNK` bytes
+    /// gather, or with `flush`, which the holder calls before it sleeps:
+    /// while output keeps coming, a flood costs one hand-off per chunk
+    /// rather than per read. Returns whether the holder may read more.
+    pub fn feed(
+        &mut self,
+        bytes: Vec<u8>,
+        notifications: Vec<(usize, Vec<u8>)>,
+        now: Instant,
+    ) -> bool {
         if !self.has_pending() {
-            self.since = Some(Instant::now());
+            self.since = Some(now);
         }
         let base = self.pending.len();
         if base == 0 {
@@ -200,7 +205,7 @@ impl TerminalThread {
                 .into_iter()
                 .map(|(at, sequence)| (base + at, sequence)),
         );
-        if self.due() {
+        if self.due(now) {
             self.flush();
         }
         self.accepting
@@ -211,16 +216,20 @@ impl TerminalThread {
         !self.pending.is_empty() || !self.marks.is_empty()
     }
 
-    /// Whether what waits must be handed over now: a chunk's worth, or
-    /// held for `MAX_HOLD`.
-    pub fn due(&self) -> bool {
-        self.pending.len() >= CHUNK || self.since.is_some_and(|since| since.elapsed() >= MAX_HOLD)
+    /// Whether what waits must be handed over at `now`: a chunk's worth,
+    /// or held for `MAX_HOLD`.
+    pub fn due(&self, now: Instant) -> bool {
+        self.pending.len() >= CHUNK
+            || self
+                .since
+                .is_some_and(|since| now.saturating_duration_since(since) >= MAX_HOLD)
     }
 
-    /// How long what waits may still wait to be handed over (`MAX_HOLD`).
-    pub fn hold_left(&self) -> Option<Duration> {
+    /// How long, from `now`, what waits may still wait to be handed over
+    /// (`MAX_HOLD`).
+    pub fn hold_left(&self, now: Instant) -> Option<Duration> {
         self.since
-            .map(|since| MAX_HOLD.saturating_sub(since.elapsed()))
+            .map(|since| MAX_HOLD.saturating_sub(now.saturating_duration_since(since)))
     }
 
     /// Hand over the output fed so far; whether the holder may read more.
@@ -465,4 +474,37 @@ pub fn program_status(terminal: &Terminal) -> Vec<ProgramStatus> {
             message: record.message.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_is_handed_over_once_its_oldest_waited_max_hold_or_a_chunk_gathered() {
+        let terminal = Terminal::new(80, 24, 64 * 1024).unwrap();
+        let mut thread = TerminalThread::start(terminal).unwrap();
+        let start = Instant::now();
+        assert_eq!(thread.hold_left(start), None);
+        assert!(thread.feed(b"one".to_vec(), Vec::new(), start));
+        // Output that joins it does not restart the wait.
+        let later = start + MAX_HOLD / 2;
+        assert!(thread.feed(b"two".to_vec(), Vec::new(), later));
+        assert!(thread.has_pending());
+        assert!(!thread.due(later));
+        assert_eq!(thread.hold_left(later), Some(MAX_HOLD - MAX_HOLD / 2));
+        let end = start + MAX_HOLD;
+        assert!(thread.due(end));
+        assert_eq!(thread.hold_left(end), Some(Duration::ZERO));
+        // Output fed once the wait is over goes with it.
+        assert!(thread.feed(b"three".to_vec(), Vec::new(), end));
+        assert!(!thread.has_pending());
+        assert_eq!(thread.hold_left(end), None);
+        // A chunk's worth goes at once.
+        assert!(thread.feed(vec![b'x'; CHUNK], Vec::new(), end));
+        assert!(!thread.has_pending());
+        thread.sync();
+        let _ = thread.take();
+        assert!(thread.settled());
+    }
 }

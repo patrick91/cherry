@@ -234,6 +234,10 @@ pub fn start(path: &Path) -> Result<()> {
         .open(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
     let log_start = log.seek(io::SeekFrom::End(0))?;
+    // The daemon writes a byte to its end once it listens, and closes it
+    // without one when it gives up.
+    let (ready, ready_end) = UnixStream::pair()?;
+    let ready_fd = ready_end.as_raw_fd();
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("serve")
@@ -243,6 +247,7 @@ pub fn start(path: &Path) -> Result<()> {
         // keeps only neutral variables and does not pin this directory.
         .env_clear()
         .envs(environment::inherited_vars())
+        .env(crate::daemon::READY_FD_VAR, ready_fd.to_string())
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -257,17 +262,25 @@ pub fn start(path: &Path) -> Result<()> {
     if let Some(build) = std::env::var_os("CHERRY_HOST_TEST_SERVE_BUILD") {
         command.env("CHERRY_HOST_TEST_BUILD", build);
     }
+    let mut fds = environment::FdList::before_fork();
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
-            environment::cloexec_from_3();
+            fds.cloexec_from_3();
+            if libc::fcntl(ready_fd, libc::F_SETFD, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
             Ok(())
         });
     }
     let mut child = command.spawn().context("starting detached host")?;
+    drop(ready_end);
     let deadline = Instant::now() + Duration::from_secs(10);
+    // However the wait ends, look: the daemon that answers may be one
+    // another client started at the same time.
+    wait_ready(&ready, deadline);
     let mut exited = None;
     loop {
         match probe(path)? {
@@ -307,6 +320,15 @@ pub fn start(path: &Path) -> Result<()> {
             bail!("host did not become ready; inspect {}", log_path.display());
         }
         thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// Wait until the daemon `start` started says it listens, ends its side of
+/// `ready` without saying so, or `deadline` passes.
+fn wait_ready(mut ready: &UnixStream, deadline: Instant) {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if !left.is_zero() && ready.set_read_timeout(Some(left)).is_ok() {
+        let _ = ready.read(&mut [0u8; 1]);
     }
 }
 

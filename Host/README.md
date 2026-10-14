@@ -650,6 +650,13 @@ only, and neither `cherry start` nor `cherry-host start` replaces a daemon.
 (see [Sockets, state, and access](#sockets-state-and-access)), or the systemd
 user service when it is enabled (see
 [Lifetime](#lifetime-service-setup-and-updates)), and returns once it answers.
+A detached daemon says when it listens, through a descriptor it inherits
+(named in `CHERRY_HOST_READY_FD`), so `start` returns then without polling
+the socket; a daemon that gives up first (another one won the socket, or it
+failed) closes it, and `start` then looks for a daemon that answers until the
+one it started has been gone for 2 seconds, at most 10 seconds in all. A
+client waits for `cherry-host start` to exit, which the end of its stdout
+tells it at once.
 `cherry-host serve` runs the daemon in the foreground with stderr on the
 terminal; the systemd unit uses it. Both take `--socket PATH`.
 
@@ -1362,7 +1369,11 @@ cherry-host.service` also moves the daemon to it.
   client's socket itself when nothing waits ahead of it.
 - **Heartbeat.** An attached client sends `Ping` every 15 seconds, also while
   a slow terminal is still taking its output, so a slow terminal does not get
-  the attachment evicted; so does a subscribed control connection. The host
+  the attachment evicted; so does a subscribed control connection. Between
+  Pings an idle `cherry attach` sleeps, and `cherry control` (which relays
+  the app's) sleeps until something arrives: the signals they handle (a
+  resize, SIGUSR1, those that end them) wake them through a socket the
+  signal handler writes to, so no wait ends early to look for one. The host
   drops an attached or subscribed connection that sends nothing for 45
   seconds, so a vanished laptop stops constraining the shared grid; a client
   whose input it holds back is exempt (see input backpressure). A connection

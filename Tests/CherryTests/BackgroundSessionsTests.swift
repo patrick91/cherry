@@ -800,6 +800,50 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     #expect(try await list([ProgramStatus(state: .done, app: "claude-code")])?.isWorking == false)
 }
 
+/// A background session's row follows what the host reports of it: made
+/// again when its info changes (a refresh of the same list keeps the rows
+/// it made, `BackgroundSessionRows`).
+@Test @MainActor func aBackgroundSessionsRowFollowsWhatTheHostReports() async throws {
+    let harness = try PersistentHarness()
+    let model = makeModel(harness)
+    defer {
+        model.stop()
+        harness.cleanUp()
+    }
+    let project = harness.project.path
+    let tab = UUID()
+    func shell(title: String? = nil, foreground: String? = nil) -> HostedSessionInfo {
+        HostedSessionInfo(
+            id: "s-shell", name: "Shell 6", cwd: project, pid: 300, title: title,
+            foreground: foreground.map { HostedSessionForeground(pid: 99, name: $0) },
+            owner: "CherryTests",
+            tags: [
+                PersistentSessionTag.tab: tab.uuidString, PersistentSessionTag.kind: "terminal",
+                PersistentSessionTag.project: project,
+            ]
+        )
+    }
+    func list(_ info: HostedSessionInfo) async throws -> BackgroundSession? {
+        harness.fake.sessions = [info]
+        _ = try await harness.control.list()
+        model.refresh()
+        return model.sessions.first
+    }
+    let idle = try #require(try await list(shell()))
+    #expect(idle.displayTitle == harness.project.lastPathComponent)
+    #expect(BackgroundSessionPresentation.statusText(of: idle) == "idle")
+    model.refresh()
+    #expect(model.sessions == [idle])
+
+    // Its shell runs a command, then it ends.
+    let busy = try #require(try await list(shell(title: "npm run dev", foreground: "node")))
+    #expect(busy.displayTitle == "npm run dev")
+    #expect(BackgroundSessionPresentation.statusText(of: busy) == "node")
+    let ended = try #require(try await list(shell(title: "npm run dev").exited(code: 2, signal: nil)))
+    #expect(ended.exitStatus == 2)
+    #expect(BackgroundSessionPresentation.statusText(of: ended) == "exit 2")
+}
+
 /// What a background session's program reports (OSC 7501) as the host
 /// changes it: a turn that finished or failed marks it unread; one that
 /// waits for the user is posted too, quoting the program, once per wait;
@@ -957,6 +1001,59 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     let idleTab = MenuBarAgentItem(id: UUID(), projectRoot: "/p", title: "Claude", agentKey: "claude", activity: .idle)
     #expect(MenuBarAggregateState(items: [idleTab], background: []) == .idle)
     #expect(MenuBarAggregateState(items: [idleTab], background: [.needsInput]) == .attention)
+}
+
+/// The menu bar's agents (`MenuBarAgentsModel`): the running agent tabs of
+/// the project windows, looked at again on each of Background Sessions'
+/// ticks; a look that finds what the last one did publishes nothing.
+@Test @MainActor func theMenuBarListsRunningAgentTabsOnBackgroundSessionsTick() async throws {
+    let harness = try PersistentHarness()
+    let registry = ProjectWindowRegistry()
+    let background = makeModel(harness, registry: registry)
+    let workspace = harness.workspace()
+    let window = testWindow()
+    _ = registry.register(
+        window: window, projectRoot: harness.project.path, workspace: workspace,
+        noteStore: nil, todoStore: nil, chromeState: nil
+    )
+    defer {
+        background.stop()
+        registry.unregister(window: window, projectRoot: harness.project.path)
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let claude = workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Claude", command: "/bin/cat"), projectRoot: harness.project.path, select: false
+    )
+    #expect(await harness.waitUntilAttached(claude))
+    let model = MenuBarAgentsModel(registry: registry, background: background)
+    let group = try #require(model.groups.first)
+    #expect(model.groups.count == 1)
+    #expect(group.projectName == harness.project.lastPathComponent)
+    #expect(group.items.map(\.id) == [claude.id])
+    #expect(group.items.map(\.agentKey) == ["claude"])
+    #expect(model.aggregate == .idle)
+
+    // Nothing changed: nothing is published.
+    let published = Recorder(0)
+    let observation = model.objectWillChange.sink { published.value += 1 }
+    defer { observation.cancel() }
+    model.refresh()
+    model.refresh()
+    #expect(published.value == 0)
+
+    // Another agent is listed on Background Sessions' next tick, and gone
+    // on the one after its tab closed.
+    background.start()
+    let codex = workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Codex", command: "/bin/cat"), projectRoot: harness.project.path, select: false
+    )
+    #expect(await harness.waitUntilAttached(codex))
+    #expect(await eventually(timeout: 3) { model.groups.first?.items.map(\.id) == [claude.id, codex.id] })
+    #expect(model.groups.first?.items.map(\.agentKey) == ["claude", "codex"])
+    #expect(published.value > 0)
+    workspace.close(codex)
+    #expect(await eventually(timeout: 3) { model.groups.first?.items.map(\.id) == [claude.id] })
 }
 
 

@@ -8,7 +8,7 @@ each package; copyright text is preserved. Ghostty and its native
 dependencies are covered separately by vendor/ghostty-vt/LICENSE and
 vendor/ghostty-vt/THIRD_PARTY_NOTICES.txt.
 
-Cargo.lock SHA-256: 60e97d41133629bb78ecf9020b8907762a97dda0fae350abe66df95faf9c7702
+Cargo.lock SHA-256: 0e8aae62ac93223d1ec6e0e7c3637a1a1314e8407b51cc2cca02dd3ed18b4a7a
 
 PACKAGE INDEX
 

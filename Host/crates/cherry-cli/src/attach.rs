@@ -101,9 +101,6 @@ pub const RESIZE_COALESCE: Duration = Duration::from_millis(50);
 /// new size without a viewport in between (whose modes() would, for example,
 /// make the terminal report focus again).
 pub const GRID_WAIT: Duration = Duration::from_millis(300);
-/// Upper bound on one poll, which also bounds how late a signal that arrives
-/// just before poll() is noticed.
-const MAX_WAIT: Duration = Duration::from_millis(250);
 /// While buffered frames are handled, terminal input is looked for at most
 /// this often, and at the latest once they are (the next poll). One look
 /// per frame would cost more than writing the frame: a poll on a macOS
@@ -818,13 +815,14 @@ impl Attachment<'_> {
                     },
                     libc::POLLIN,
                 ),
+                // A signal ends the wait, so it lasts until the next deadline.
+                pollfd(sys::signal_wake_fd(), libc::POLLIN),
             ];
             let wait = if (read_stdin && self.stdin_is_file) || frame_wait == FrameWait::Now {
                 Duration::ZERO
             } else {
                 let detach = connection.detach.as_ref();
-                let mut deadline = now + MAX_WAIT;
-                for candidate in [
+                [
                     detach
                         .is_none()
                         .then(|| self.input.next_deadline())
@@ -849,12 +847,15 @@ impl Attachment<'_> {
                 ]
                 .into_iter()
                 .flatten()
-                {
-                    deadline = deadline.min(candidate);
-                }
-                deadline.saturating_duration_since(now)
+                .min()
+                .map_or(Duration::MAX, |deadline| {
+                    deadline.saturating_duration_since(now)
+                })
             };
             poll(&mut fds, wait)?;
+            if fds[4].revents != 0 {
+                sys::clear_signal_wake();
+            }
             self.interrupted(transport, connection)?;
             if fds[3].revents != 0 {
                 self.output.clear_wake();
@@ -1190,7 +1191,7 @@ impl Attachment<'_> {
             }
             if now < next_attempt {
                 if let Waited::Detached =
-                    self.wait(next_attempt.min(deadline), None, &mut noticed)?
+                    self.wait(Some(next_attempt.min(deadline)), None, &mut noticed)?
                 {
                     return Ok(Reconnected::Ended(detached_while_reconnecting()));
                 }
@@ -1260,7 +1261,7 @@ impl Attachment<'_> {
                 }
             });
             let waited = loop {
-                match self.wait(Instant::now() + MAX_WAIT, Some(done.as_raw_fd()), noticed) {
+                match self.wait(None, Some(done.as_raw_fd()), noticed) {
                     Ok(Waited::Pending) => {}
                     waited => break waited,
                 }
@@ -1279,21 +1280,30 @@ impl Attachment<'_> {
         })
     }
 
-    /// Wait until `until` at most (and `MAX_WAIT`) for the terminal, or for
-    /// `wake` to be readable or closed, while reconnecting. Terminal input
-    /// is read only to see the detach key and the end of input.
-    fn wait(&mut self, until: Instant, wake: Option<RawFd>, noticed: &mut bool) -> Result<Waited> {
+    /// Wait until `until` at most for the terminal, for `wake` to be
+    /// readable or closed, or for a signal, while reconnecting. Terminal
+    /// input is read only to see the detach key and the end of input.
+    fn wait(
+        &mut self,
+        until: Option<Instant>,
+        wake: Option<RawFd>,
+        noticed: &mut bool,
+    ) -> Result<Waited> {
         let now = Instant::now();
         let read = self.stdin_open && self.stdin_is_terminal;
         let mut fds = [
             pollfd(if read { libc::STDIN_FILENO } else { -1 }, libc::POLLIN),
             pollfd(wake.unwrap_or(-1), libc::POLLIN),
+            pollfd(sys::signal_wake_fd(), libc::POLLIN),
         ];
-        let mut wake_at = until.min(now + MAX_WAIT);
-        if let Some(at) = self.input.next_deadline() {
-            wake_at = wake_at.min(at);
+        let wake_at = until.into_iter().chain(self.input.next_deadline()).min();
+        poll(
+            &mut fds,
+            wake_at.map_or(Duration::MAX, |at| at.saturating_duration_since(now)),
+        )?;
+        if fds[2].revents != 0 {
+            sys::clear_signal_wake();
         }
-        poll(&mut fds, wake_at.saturating_duration_since(now))?;
         interrupted()?;
         let expired = self.input.expire(Instant::now());
         self.discard(&expired.data, noticed);

@@ -29,6 +29,8 @@ struct CherryMCPStdioMain {
             capabilities: .init(tools: .init(listChanged: false))
         )
 
+        // CherryMCPToolListTransport answers tools/list; this handler answers
+        // the requests it passes on.
         await server.withMethodHandler(ListTools.self) { _ in
             ListTools.Result(tools: CherryMCPTools.all)
         }
@@ -42,7 +44,7 @@ struct CherryMCPStdioMain {
         }
 
         do {
-            try await server.start(transport: CherryStdioTransport())
+            try await server.start(transport: CherryMCPToolListTransport(base: CherryStdioTransport()))
             await server.waitUntilCompleted()
         } catch {
             fputs("[mcp-stdio] failed: \(error.localizedDescription)\n", stderr)

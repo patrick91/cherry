@@ -19,9 +19,6 @@ use std::{
 /// Bytes read from one side and not yet written to the other, at most per
 /// direction; beyond it that side is not read until the other catches up.
 const HIGH_WATER: usize = 1024 * 1024;
-/// Upper bound on one poll, which also bounds how late a signal that arrives
-/// just before poll() is noticed.
-const MAX_WAIT: Duration = Duration::from_millis(250);
 /// Once standard input ended: how long the host may take to answer what it
 /// read and close, counted from when bytes last moved either way.
 pub const QUIET_WAIT: Duration = RPC_TIMEOUT;
@@ -104,20 +101,24 @@ pub fn relay(transport: &mut Transport, host_id: String, build: Option<String>) 
                 libc::POLLIN,
             ),
             pollfd(output.poll_fd(), libc::POLLOUT),
+            // A signal ends the wait, so it lasts until the next deadline.
+            pollfd(sys::signal_wake_fd(), libc::POLLIN),
         ];
         let wait = if read_input && input_never_waits {
             Duration::ZERO
         } else {
-            let mut deadline = now + MAX_WAIT;
-            for candidate in [transport.closed_deadline(), quiet_until]
+            [transport.closed_deadline(), quiet_until]
                 .into_iter()
                 .flatten()
-            {
-                deadline = deadline.min(candidate);
-            }
-            deadline.saturating_duration_since(now)
+                .min()
+                .map_or(Duration::MAX, |deadline| {
+                    deadline.saturating_duration_since(now)
+                })
         };
         poll(&mut fds, wait)?;
+        if fds[4].revents != 0 {
+            sys::clear_signal_wake();
+        }
         interrupted()?;
         if fds[1].revents != 0 {
             transport.write_ready()?;

@@ -3326,6 +3326,36 @@ fn kill_remove_and_shutdown_never_start_a_host_but_list_does() {
 }
 
 #[test]
+fn what_cherry_host_start_does_with_its_stdout_never_holds_the_start_up() {
+    // `cherry` waits for the end of its stdout, and then its exit: one that
+    // writes more than a pipe holds, and one that closes its stdout well
+    // before it exits, are both seen to fail.
+    for body in [
+        "head -c 1048576 /dev/zero\nexit 3\n",
+        "exec >&-\nsleep 0.3\nexit 3\n",
+    ] {
+        let directory = private_directory();
+        let host = directory.path().join("fake-cherry-host");
+        script(&host, body);
+        let output = Command::new(env!("CARGO_BIN_EXE_cherry"))
+            .arg("--socket")
+            .arg(directory.path().join("host.sock"))
+            .args(["list", "--json"])
+            .env("CHERRY_HOST_PATH", &host)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{body}");
+        assert!(output.stdout.is_empty(), "{body}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("cherry-host start failed (exit status: 3)"),
+            "{body}: {error}"
+        );
+    }
+}
+
+#[test]
 fn a_socket_in_a_directory_others_can_reach_is_never_used() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();

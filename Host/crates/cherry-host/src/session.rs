@@ -449,6 +449,7 @@ fn start_holder(
     }
     let fd = theirs.as_raw_fd();
     let limit = daemon::child_fd_limit();
+    let mut fds = environment::FdList::before_fork();
     unsafe {
         command.pre_exec(move || {
             // Never the daemon's child, so that it outlives the daemon and a
@@ -466,7 +467,7 @@ fn start_holder(
             // macOS sets close-on-exec on an accepted connection only after
             // accept returns, so another thread's client could otherwise
             // leak in.
-            environment::cloexec_from_3();
+            fds.cloexec_from_3();
             if fd == LINK_FD {
                 libc::fcntl(fd, libc::F_SETFD, 0);
             } else if libc::dup2(fd, LINK_FD) == -1 {

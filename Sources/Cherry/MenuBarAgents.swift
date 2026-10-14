@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 // A menu-bar (an AppKit NSStatusItem, `MenuBarStatusItem`) summary of every live agent
@@ -174,58 +175,99 @@ final class MenuBarAgentsModel: ObservableObject {
     @Published private(set) var groups: [MenuBarProjectGroup] = []
     @Published private(set) var aggregate: MenuBarAggregateState = .none
 
-    private var timer: Timer?
+    private let registry: ProjectWindowRegistry
+    private let background: BackgroundSessionsModel
+    private var tick: AnyCancellable?
+    /// What the latest refresh read: a tick that reads the same builds
+    /// nothing.
+    private var lastInputs: Inputs?
 
-    init() {
+    /// The app's windows and Background Sessions list; tests give their own.
+    init(registry: ProjectWindowRegistry = .shared, background: BackgroundSessionsModel = .shared) {
+        self.registry = registry
+        self.background = background
         refresh()
         // A light 1s poll keeps the glanceable icon current without wiring Combine
         // across a set of workspaces/sessions/windows that churns as windows open and
-        // close. It only reads cheap published properties (never probes the process
-        // table) and republishes solely when the deduped snapshot actually changes.
-        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] timer in
-            guard let self else {
-                timer.invalidate()
-                return
-            }
-            MainActor.assumeIsolated { self.refresh() }
+        // close. It rides Background Sessions' tick (`BackgroundSessionsModel.ticks`,
+        // one wakeup a second for both, this list after that one), only reads cheap
+        // published properties (never probes the process table), builds the rows
+        // only when what it read changed (`Inputs`), and republishes solely when the
+        // deduped snapshot actually changes.
+        tick = background.ticks.sink { [weak self] in
+            MainActor.assumeIsolated { self?.refresh() }
         }
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
+    }
+
+    /// What the rows and the icon are made of: each project's running agents
+    /// as their tabs stand, and what background sessions add to the icon.
+    /// Rows, titles, logos and their order follow from these alone.
+    private struct Inputs: Equatable {
+        struct Agent: Equatable {
+            let id: UUID
+            let title: String
+            let titleSource: TerminalSession.TitleSource
+            let agentName: String?
+            let subtitle: String
+            let activity: AgentActivityState
+        }
+
+        struct Project: Equatable {
+            let root: String
+            let agents: [Agent]
+        }
+
+        var projects: [Project] = []
+        var background: [AgentActivityState] = []
     }
 
     func refresh() {
-        var groups: [MenuBarProjectGroup] = []
-        for (root, workspace) in ProjectWindowRegistry.shared.workspacesByProjectRoot() {
+        var inputs = Inputs()
+        for (root, workspace) in registry.workspacesByProjectRoot() {
             let agents = workspace.runningAgentSessions
             guard !agents.isEmpty else { continue }
-            let items = agents.map { session in
-                MenuBarAgentItem(
+            inputs.projects.append(Inputs.Project(root: root, agents: agents.map { session in
+                Inputs.Agent(
                     id: session.id,
-                    projectRoot: root,
-                    title: MenuBarAgentPresentation.agentTitle(
-                        title: session.title,
-                        titleSource: session.titleSource,
-                        agentName: session.agentName,
-                        commandLine: session.subtitle
-                    ),
-                    agentKey: session.agentToolKey,
+                    title: session.title,
+                    titleSource: session.titleSource,
+                    agentName: session.agentName,
+                    subtitle: session.subtitle,
                     activity: session.agentActivityState
                 )
-            }
-            groups.append(MenuBarProjectGroup(
-                projectRoot: root,
-                projectName: MenuBarAgentPresentation.projectName(projectRoot: root),
-                items: items
-            ))
+            }))
         }
-        groups.sort { $0.projectName.localizedCaseInsensitiveCompare($1.projectName) == .orderedAscending }
-        let background = BackgroundSessionsModel.shared
-        let backgroundActivities = ([background] + background.devices).flatMap { list in
+        inputs.background = ([background] + background.devices).flatMap { list in
             list.sessions.compactMap { session in
                 MenuBarAggregateState.backgroundActivity(of: session, isUnread: list.unreadSessionIDs.contains(session.id))
             }
         }
-        apply(groups: groups, background: backgroundActivities)
+        guard inputs != lastInputs else { return }
+        lastInputs = inputs
+        var groups = inputs.projects.map { project in
+            let items = project.agents.map { agent in
+                MenuBarAgentItem(
+                    id: agent.id,
+                    projectRoot: project.root,
+                    title: MenuBarAgentPresentation.agentTitle(
+                        title: agent.title,
+                        titleSource: agent.titleSource,
+                        agentName: agent.agentName,
+                        commandLine: agent.subtitle
+                    ),
+                    // As `TerminalSession.agentToolKey`, from what was read.
+                    agentKey: AgentScreenActivity.agentKey(name: agent.agentName ?? agent.title, commandLine: agent.subtitle),
+                    activity: agent.activity
+                )
+            }
+            return MenuBarProjectGroup(
+                projectRoot: project.root,
+                projectName: MenuBarAgentPresentation.projectName(projectRoot: project.root),
+                items: items
+            )
+        }
+        groups.sort { $0.projectName.localizedCaseInsensitiveCompare($1.projectName) == .orderedAscending }
+        apply(groups: groups, background: inputs.background)
     }
 
     private func apply(groups: [MenuBarProjectGroup], background: [AgentActivityState]) {
@@ -236,7 +278,7 @@ final class MenuBarAgentsModel: ObservableObject {
     }
 
     func reveal(_ item: MenuBarAgentItem) {
-        ProjectWindowRegistry.shared.revealSession(id: item.id, projectRoot: item.projectRoot)
+        registry.revealSession(id: item.id, projectRoot: item.projectRoot)
     }
 }
 

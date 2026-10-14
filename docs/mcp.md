@@ -125,8 +125,9 @@ checks without an MCP client.
 
 - `list_projects` lists the saved and open projects: each one's root, name,
   whether it is active or open, and its to-dos feature.
-- `open_project` focuses a project's window by absolute `project_root`,
-  opening it when the project is saved in Cherry but its window is closed.
+- `open_project` focuses the project's most recently active window by
+  absolute `project_root`, opening it when the project is saved in Cherry
+  but none of its windows is open.
 
 Cherry has no Git worktree support: a worktree is a folder, opened as a
 project like any other.

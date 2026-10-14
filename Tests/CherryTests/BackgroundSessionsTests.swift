@@ -1559,7 +1559,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
         try? FileManager.default.removeItem(at: storeDirectory)
     }
     // The launch asked for the window, which has not opened yet.
-    notice.launchWindowsOpened(expecting: [root.path])
+    notice.launchWindowsOpened(expecting: [.primary(root.path)])
     #expect(notice.phase == .checking)
     try await Task.sleep(for: .milliseconds(100))
     repository = openProject(
@@ -1606,7 +1606,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     // this launch or the next.
     chromeState.toasts.dismiss(id: toast.id)
     #expect(notice.toldIDs() == ["s-closed"])
-    notice.launchWindowsOpened(expecting: [root.path])
+    notice.launchWindowsOpened(expecting: [.primary(root.path)])
     #expect(notice.shownContent == content)
     let nextLaunch = makeNotice(model: model, registry: registry, defaults: noticeDefaults.defaults)
     nextLaunch.launchWindowsOpened()
@@ -1816,7 +1816,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
         try? FileManager.default.removeItem(at: storeDirectory)
     }
     _ = try await harness.control.list()
-    notice.launchWindowsOpened(expecting: [rootA.path])
+    notice.launchWindowsOpened(expecting: [.primary(rootA.path)])
     #expect(await eventually { notice.shownContent != nil })
     #expect(Set(try #require(notice.shownContent).sessionIDs) == ["s-server", "s-agent"])
     let toast = try #require(chromeState.toasts.current)

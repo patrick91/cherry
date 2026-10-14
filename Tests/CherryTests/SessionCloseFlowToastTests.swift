@@ -425,11 +425,11 @@ private let persistentSessionsLine = "Attach to it again from File › Persisten
     }
     /// `other` was active, then the closing window.
     func activate(_ other: Int) {
-        for (root, workspace, state) in [
-            (otherRoots[other].path, others[other], otherChromeStates[other]),
-            (harness.project.path, closing, chromeState),
+        for (activeWindow, workspace, state) in [
+            (otherWindows[other], others[other], otherChromeStates[other]),
+            (window, closing, chromeState),
         ] {
-            registry.activateWindow(projectRoot: root, workspace: workspace, todoStore: nil, chromeState: state)
+            registry.activateWindow(activeWindow, workspace: workspace, todoStore: nil, chromeState: state)
         }
     }
     /// Opens an agent as the closing window's last tab and detaches it with ⌘D.
@@ -1138,7 +1138,7 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
             workspace.close(shell, intent: .windowClosedEndingSessions)
         }
         #expect(workspace.sessions.map(\.id) == [tab.id])
-        registry.activateWindow(projectRoot: otherRoot.path, workspace: other, todoStore: nil, chromeState: otherChromeState)
+        registry.activateWindow(otherWindow, workspace: other, todoStore: nil, chromeState: otherChromeState)
         let (window, _) = try #require(windows.last)
         SessionCloseCoordinator.detachSelectedTabOrWindow(
             workspace: workspace, repository: repository, chromeState: nil, window: window, registry: registry

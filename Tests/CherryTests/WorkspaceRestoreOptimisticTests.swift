@@ -494,10 +494,15 @@ private struct OptimisticWindow {
     #expect(LaunchWindowOrder.frontFirst(["/a", "/b", "/c"]) { dates[$0] } == ["/c", "/a", "/b"])
     #expect(LaunchWindowOrder.frontFirst(["/a", "/b"]) { _ in nil } == ["/a", "/b"])
     #expect(LaunchWindowOrder.frontFirst([]) { dates[$0] } == [])
+    // A project's windows share its date: its first in saved order (its
+    // most recently active) goes first, the others keep their places.
+    let other = ProjectWindowValue(projectRoot: "/c", windowID: UUID())
+    let windows: [ProjectWindowValue] = [.primary("/a"), other, .primary("/b"), .primary("/c")]
+    #expect(LaunchWindowOrder.frontFirst(windows) { dates[$0.projectRoot] } == [other, .primary("/a"), .primary("/b"), .primary("/c")])
 }
 
 /// The first window opens alone; the others once it is on screen (and the
-/// launch's gate let them), together on one turn; until they open they
+/// launch's gate let them), together on one turn; until they register they
 /// count as open for the saved window list, so a quit meanwhile keeps them.
 @Test @MainActor func theLaunchOpensItsFirstWindowAloneAndTheOthersOnceItShows() async throws {
     let registry = ProjectWindowRegistry()
@@ -521,21 +526,21 @@ private struct OptimisticWindow {
         }
     }
     let workspace = TerminalWorkspace(projectRoot: roots[0], createInitialSession: false)
-    registry.openLaunchWindows(roots, beforeLaterWindows: { gateAsked += 1; proceed = $0 }) { root in
-        opened.append(root)
+    registry.openLaunchWindows(roots.map(ProjectWindowValue.primary), beforeLaterWindows: { gateAsked += 1; proceed = $0 }) { value in
+        opened.append(value.projectRoot)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200), styleMask: [.titled],
                               backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         windows.append(window)
-        _ = registry.register(window: window, projectRoot: root, workspace: workspace,
-                              todoStore: nil, chromeState: nil)
+        _ = registry.register(window: window, projectRoot: value.projectRoot, windowID: value.windowID,
+                              workspace: workspace, todoStore: nil, chromeState: nil)
     }
     var allOpened = false
     registry.whenLaunchWindowsOpened { allOpened = true }
     // The first window has nothing to restore: it shows at once, and the
     // launch then asks its gate before building the others.
     #expect(opened == [roots[0]])
-    #expect(registry.pendingLaunchWindowRoots == [roots[1], roots[2]])
+    #expect(registry.pendingLaunchWindows == [.primary(roots[1]), .primary(roots[2])])
     registry.flushWorkspacePersistence()
     #expect(store.loadOpenProjectWindowRoots() == roots.sorted())
     #expect(await eventually { gateAsked == 1 })
@@ -547,7 +552,7 @@ private struct OptimisticWindow {
     #expect(opened == [roots[0]])
     turns.removeFirst()()
     #expect(opened == roots)
-    #expect(registry.pendingLaunchWindowRoots.isEmpty)
+    #expect(registry.pendingLaunchWindows.isEmpty)
     #expect(await eventually { allOpened })
 }
 
@@ -856,7 +861,8 @@ private final class HeldHostLists: @unchecked Sendable {
 }
 
 /// A quit while the launch's later windows are still to open: they never
-/// open, and a quit that ends sessions ends theirs too.
+/// open, and a quit that ends sessions ends theirs too, as the launch read
+/// them.
 @Test @MainActor func aQuitBeforeTheLaterLaunchWindowsOpenedCountsTheirSessions() async throws {
     let harness = try PersistentHarness()
     defer { harness.cleanUp() }
@@ -865,7 +871,6 @@ private final class HeldHostLists: @unchecked Sendable {
     let storeDirectory = try canonicalTemporaryDirectory("cherry-launch-quit-store")
     defer { try? FileManager.default.removeItem(at: storeDirectory) }
     let store = WorkspaceStateStore(directory: storeDirectory)
-    registry.setWorkspaceStateStoreForTesting(store)
     registry.launchWindowHosting = harness.hosting
     var turns: [@MainActor () -> Void] = []
     registry.scheduleLaunchWindowTurn = { turns.append($0) }
@@ -875,9 +880,17 @@ private final class HeldHostLists: @unchecked Sendable {
     let native = savedTab(title: "Native", sessionID: nil, workingDirectory: roots[1])
     harness.fake.sessions = [running("s-later", later, pid: 5)]
     store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: roots[0], activeWorktreeRoot: roots[0],
+        worktrees: [WorktreeStateRecord(root: roots[0], sessions: [savedTab(title: "Front", sessionID: nil, workingDirectory: roots[0])])]
+    ))
+    store.saveSynchronously(RepositoryStateRecord(
         repositoryRoot: roots[1], activeWorktreeRoot: roots[1],
         worktrees: [WorktreeStateRecord(root: roots[1], sessions: [later, native])]
     ))
+    store.saveOpenProjectWindows(roots.map(ProjectWindowValue.primary), synchronously: true)
+    registry.configureWorkspacePersistence(store: store)
+    let reopened = registry.takeProjectWindowsToReopen()
+    #expect(reopened == roots.map(ProjectWindowValue.primary))
     var opened: [String] = []
     var windows: [NSWindow] = []
     defer {
@@ -888,14 +901,14 @@ private final class HeldHostLists: @unchecked Sendable {
     }
     let workspace = TerminalWorkspace(projectRoot: roots[0], createInitialSession: false)
     var proceed: (@MainActor () -> Void)?
-    registry.openLaunchWindows(roots, beforeLaterWindows: { proceed = $0 }) { root in
-        opened.append(root)
+    registry.openLaunchWindows(reopened, beforeLaterWindows: { proceed = $0 }) { value in
+        opened.append(value.projectRoot)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200), styleMask: [.titled],
                               backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         windows.append(window)
-        _ = registry.register(window: window, projectRoot: root, workspace: workspace,
-                              todoStore: nil, chromeState: nil)
+        _ = registry.register(window: window, projectRoot: value.projectRoot, windowID: value.windowID,
+                              workspace: workspace, todoStore: nil, chromeState: nil)
     }
     #expect(await eventually { proceed != nil })
     #expect(registry.localSessionsEndedByAQuit().map(\.sessionID) == ["s-later"])

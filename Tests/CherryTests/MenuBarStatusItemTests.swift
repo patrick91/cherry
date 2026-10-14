@@ -27,13 +27,13 @@ import Testing
     }
     let workspace = TerminalWorkspace(projectRoot: roots[0], createInitialSession: false)
     var proceed: (@MainActor () -> Void)?
-    registry.openLaunchWindows(roots, beforeLaterWindows: { proceed = $0 }) { root in
+    registry.openLaunchWindows(roots.map(ProjectWindowValue.primary), beforeLaterWindows: { proceed = $0 }) { value in
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200), styleMask: [.titled],
                               backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
-        windows.append((window, root))
-        _ = registry.register(window: window, projectRoot: root, workspace: workspace,
-                              todoStore: nil, chromeState: nil)
+        windows.append((window, value.projectRoot))
+        _ = registry.register(window: window, projectRoot: value.projectRoot, windowID: value.windowID,
+                              workspace: workspace, todoStore: nil, chromeState: nil)
     }
     var installed = 0
     CherryAppDelegate.installMenuBarItemOnceLaunchWindowsOpened(registry: registry) { installed += 1 }

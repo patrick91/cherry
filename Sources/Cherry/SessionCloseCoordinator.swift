@@ -601,12 +601,13 @@ enum SessionCloseCoordinator {
     /// A toast's Reopen: shows a closed tab's session in a tab again where
     /// that tab was, and returns the tab. This app's own session goes the
     /// way Background Sessions → Open takes it
-    /// (`ProjectWindowRegistry.showBackgroundSession`: its project's
-    /// window, opened again when it closed with its last tab, adopted with
-    /// its tab id, kind, agent and command); a session the tab did not own
-    /// is attached again in the project window it was closed from, its
-    /// window opened again likewise
-    /// (`ProjectWindowRegistry.workspaceOpeningWindow`). `workspace` (the
+    /// (`ProjectWindowRegistry.showBackgroundSession`: its project's most
+    /// recently active window, or its primary opened again when it closed
+    /// with its last tab, adopted with its tab id, kind, agent and
+    /// command); a session the tab did not own is attached again in its
+    /// project's most recently active window, its window opened again
+    /// likewise (`ProjectWindowRegistry.workspaceOpeningWindow`). Either
+    /// tab is then shown in the window that has it. `workspace` (the
     /// toast's window's) takes a session whose project no window shows.
     /// Nothing when a session of This Mac is gone; an SSH host's is not
     /// asked.
@@ -630,9 +631,7 @@ enum SessionCloseCoordinator {
             }
             guard let destination, !destination.isTornDown else { return nil }
             let tab = destination.attachHostedSession(attachment)
-            if let root = registry.projectRoot(containing: tab.id) {
-                registry.revealSession(id: tab.id, projectRoot: root)
-            } else {
+            if !registry.revealSession(id: tab.id) {
                 chromeState?.selectTerminal()
             }
             return tab

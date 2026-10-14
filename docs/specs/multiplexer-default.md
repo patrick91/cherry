@@ -250,7 +250,8 @@ The Cherry menu bar icon's panel lists them under **Background sessions**,
 below the agents and in the same scrolling list: the command's or agent's
 name (or the session's), the project, and `idle`, the foreground program of a
 busy terminal, `running`, `attached` or `exit N`. Clicking a row shows it in a
-tab: its project's window opens (or is focused), and that window's restore
+tab: its project's most recently active window is focused (or its primary
+window, opened again, when none is open), and that window's restore
 brings a closed window's session back with its sibling tabs and layout; a
 session no saved tab names is adopted into that window as the tab it was
 started for (same tab id, kind, agent and command), or attached when another
@@ -276,8 +277,9 @@ command, or a terminal whose host reports a foreground job; never an idle
 shell) that it has not told about: "3 sessions are still running in the
 background", "From tabs or windows you closed (<projects>). Open or end them
 from Background Sessions in the Cherry menu bar icon.", with **Reopen**
-(each session back in a tab of its project's window, as Background Sessions
-→ Open does), **End…** (the End Background Sessions confirmation for those
+(each session back in a tab of its project's most recently active window,
+or of its primary one, opened again, as Background Sessions → Open does),
+**End…** (the End Background Sessions confirmation for those
 sessions only) and dismiss. Its time runs only while that window is key in
 the active app, and it takes turns with a closed tab's toast: it waits for
 one on screen to go, and one shown over it sets it aside until that one
@@ -1164,11 +1166,13 @@ differs from the design above.
   **Undo** instead (see Undo below); a native tab's close shows nothing.
   While ⌘Z can still undo it, Reopen is that undo; after that, Reopen brings a session back where its tab was: this
   app's own session the way Background Sessions → Open does
-  (`ProjectWindowRegistry.showBackgroundSession`: its project's window,
+  (`ProjectWindowRegistry.showBackgroundSession`: its project's most
+  recently active window (its primary, opened again, when none is open),
   adopted with its tab id, kind, agent and command), and a session the tab
-  did not own attached again in the project window it was closed from
-  (`ProjectWindowRegistry.workspaceOpeningWindow`); either opens that
-  project's window again when it closed with its last tab. A session of
+  did not own attached again in its project's most recently active window
+  (`ProjectWindowRegistry.workspaceOpeningWindow`), the project's primary
+  window opened again when none is open; either tab is then shown in the
+  window that has it (`revealSession(id:)`). A session of
   This Mac that is gone brings nothing back. On a window's last tab the
   window closes too, and the toast goes on the project window that was
   active last and is on screen (not minimized), when there is one. A window
@@ -1752,8 +1756,8 @@ differs from the design above.
 - End Sessions on quit ends the sessions of saved tabs no open tab shows
   only if the host lists them before the quit's wait ends; otherwise they
   are recorded in `sessions-to-end.json` and ended when the next launch
-  opens the project's window, after its restore (which may bring such a tab
-  back first).
+  opens a window of the project, after its restore (which may bring such a
+  tab back first).
 - Test gaps: bringing the quit sheet's window on screen is not unit-tested
   (it would take focus from the user's apps), nor is the quit's reply to
   AppKit after the sessions question (what it does is: `SessionQuitPlan`,

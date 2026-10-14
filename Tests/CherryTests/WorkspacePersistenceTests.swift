@@ -1272,6 +1272,8 @@ struct WorkspaceRegistryPersistenceTests {
         registry.flushWorkspacePersistence()
         #expect(savedSessionIDs(store.load(repositoryRoot: repositoryKey(rootA)), root: rootA.path) == [savedA.id, early.id])
         #expect(store.loadOpenProjectWindowRoots() == bothWindows)
+        // Each project's primary window, the one active last first.
+        #expect(store.loadOpenProjectWindows() == [.primary(repositoryKey(rootA)), .primary(repositoryKey(rootB))])
 
         // While the alert is up, window B closes (as its close delegate
         // does) and window A opens a tab.
@@ -1350,10 +1352,10 @@ struct WorkspaceRegistryPersistenceTests {
         ))
 
         // The project without saved tabs does not come back.
-        #expect(registry.launchWindowPlan(hasVisibleWindow: true) == .reopen([projects[1].path]))
+        #expect(registry.launchWindowPlan(hasVisibleWindow: true) == .reopen([.primary(projects[1].path)]))
         // Once: the open window is all there is to show now.
         #expect(registry.launchWindowPlan(hasVisibleWindow: true) == .nothing)
-        #expect(registry.takeProjectWindowRootsToReopen().isEmpty)
+        #expect(registry.takeProjectWindowsToReopen().isEmpty)
     }
 
     /// Project windows are not restorable by AppKit, so relaunching the app
@@ -1405,9 +1407,11 @@ struct WorkspaceRegistryPersistenceTests {
         workspaces.removeAll()
 
         // The next run, however the app was launched: no window was restored.
+        // Each one's primary window, the one active last first.
         let nextRun = ProjectWindowRegistry()
         nextRun.configureWorkspacePersistence(store: store)
-        #expect(nextRun.launchWindowPlan(hasVisibleWindow: false) == .reopen(projects.map(\.path)))
+        #expect(store.loadOpenProjectWindows() == projects.map { .primary($0.path) })
+        #expect(nextRun.launchWindowPlan(hasVisibleWindow: false) == .reopen(projects.map { .primary($0.path) }))
     }
 
     /// Saved windows open at once at launch (`savedWindowsLaunchPlan`);
@@ -1436,10 +1440,10 @@ struct WorkspaceRegistryPersistenceTests {
         store.saveOpenProjectWindowRoots(projects.map(\.path), synchronously: true)
         let registry = ProjectWindowRegistry()
         registry.configureWorkspacePersistence(store: store)
-        #expect(registry.savedWindowsLaunchPlan() == .reopen(projects.map(\.path)))
+        #expect(registry.savedWindowsLaunchPlan() == .reopen(projects.map { .primary($0.path) }))
         // Taken once.
         #expect(registry.savedWindowsLaunchPlan() == nil)
-        #expect(registry.takeProjectWindowRootsToReopen().isEmpty)
+        #expect(registry.takeProjectWindowsToReopen().isEmpty)
     }
 
     @Test func launchOpensTheDefaultWindowOnlyWhenNothingElseOpens() throws {

@@ -469,13 +469,13 @@ struct OmniBarPerformer {
             promptRenameSession(tab.session)
         case .detachTab(let id):
             guard let tab = tab(id) else { return }
-            let context = closeContext(tab.workspace, projectRoot: tab.projectRoot)
+            let context = closeContext(tab.workspace)
             SessionCloseCoordinator.detach(
                 tab.session, in: tab.workspace, chromeState: context.chromeState, closingWindow: context.closingWindow
             )
         case .closeTab(let id):
             guard let tab = tab(id) else { return }
-            let context = closeContext(tab.workspace, projectRoot: tab.projectRoot)
+            let context = closeContext(tab.workspace)
             SessionCloseCoordinator.close(
                 tab.session, in: tab.workspace, chromeState: context.chromeState, closingWindow: context.closingWindow
             )
@@ -638,11 +638,12 @@ struct OmniBarPerformer {
             workspace.addSession(workingDirectory: directory)
             return
         }
-        let target: (projectRoot: String, workspace: TerminalWorkspace)? = machine == .thisMac && path == nil
-            ? registry.frontmostLocalWorkspace().flatMap { other in other.projectRoot.map { (projectRoot: $0, workspace: other) } }
-            : registry.workspacesByProjectRoot().first { ProjectSwitcherModel.Machine(projectKey: $0.projectRoot) == machine }
-        if let (root, other) = target, registry.focus(projectRoot: root) {
-            registry.chromeState(for: root)?.selectTerminal()
+        let target = machine == .thisMac && path == nil
+            ? registry.frontmostLocalWorkspace()
+            : registry.workspacesByProjectRoot().first { ProjectSwitcherModel.Machine(projectKey: $0.projectRoot) == machine }?.workspace
+        // That workspace's own window, never another window of its project.
+        if let other = target, registry.focus(workspace: other) {
+            registry.chromeState(for: other)?.selectTerminal()
             other.addSession(workingDirectory: directory)
         } else if let directory {
             if !switcher.openPath(directory, on: machine) { NSSound.beep() }
@@ -653,23 +654,24 @@ struct OmniBarPerformer {
         }
     }
 
-    private func tab(_ id: UUID) -> (session: TerminalSession, workspace: TerminalWorkspace, projectRoot: String)? {
-        for (root, workspace) in registry.workspacesByProjectRoot() {
+    private func tab(_ id: UUID) -> (session: TerminalSession, workspace: TerminalWorkspace)? {
+        for (_, workspace) in registry.workspacesByProjectRoot() {
             if let session = workspace.sessions.first(where: { $0.id == id }) {
-                return (session, workspace, root)
+                return (session, workspace)
             }
         }
         return nil
     }
 
-    /// As ⌘W and ⌘D work out for the selected tab: the tab's window's
-    /// chrome, and the window that closes after its last tab.
+    /// As ⌘W and ⌘D work out for the selected tab: the chrome of the
+    /// tab's own window (its close question, toast and ⌘Z; never another
+    /// window of its project's), and that window when it closes after its
+    /// last tab.
     private func closeContext(
-        _ workspace: TerminalWorkspace,
-        projectRoot: String
+        _ workspace: TerminalWorkspace
     ) -> (chromeState: ProjectWindowChromeState?, closingWindow: NSWindow?) {
-        let chromeState = registry.chromeState(for: projectRoot)
-        let window = chromeState.flatMap { registry.window(for: $0) }
+        let chromeState = registry.chromeState(for: workspace)
+        let window = registry.window(for: workspace)
         return (chromeState, SessionCloseCoordinator.shouldCloseWindow(for: workspace) ? window : nil)
     }
 }

@@ -681,6 +681,64 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     #expect(workspace.sessions.isEmpty)
 }
 
+/// Closing a tab of another window from the bar goes as ⌘W in that window
+/// goes: its own chrome asks, and its window is the one that closes after
+/// its last tab, never the bar's, though both are the project's.
+@Test @MainActor func closingATabOfAnotherWindowUsesThatWindowsChrome() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-omni-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let barChrome = ProjectWindowChromeState()
+    let tabChrome = ProjectWindowChromeState()
+    let repository = RepositoryWorkspace(projectRoot: root.path)
+    let tabWorkspace = TerminalWorkspace(projectRoot: root.path, createInitialSession: false, launchBackend: .hostManaged)
+    let windows = (0..<2).map { _ in
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200), styleMask: [.titled], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        return window
+    }
+    let registry = ProjectWindowRegistry()
+    registry.bringWindowForward = { _ in }
+    defer {
+        windows.forEach { registry.unregister(window: $0, projectRoot: root.path) }
+        repository.closeAllSessions(intent: .windowClosed)
+        tabWorkspace.closeAllSessions(intent: .windowClosed)
+        try? FileManager.default.removeItem(at: root)
+    }
+    // The bar's window, the project's primary and active last; the tab is
+    // in the project's other window, its only tab.
+    #expect(registry.register(
+        window: windows[0], projectRoot: root.path, workspace: repository.workspace, repository: repository,
+        todoStore: nil, chromeState: barChrome
+    ))
+    #expect(registry.register(
+        window: windows[1], projectRoot: root.path, windowID: UUID(), workspace: tabWorkspace,
+        todoStore: nil, chromeState: tabChrome
+    ))
+    let agent = tabWorkspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Claude", command: "/bin/cat"), projectRoot: root.path
+    )
+    #expect(await eventually { agent.isProgramRunning })
+    let performer = OmniBarPerformer(
+        window: OmniBarWindow(projectRoot: root.path, repository: repository, workspace: repository.workspace, chromeState: barChrome),
+        settings: .shared,
+        registry: registry,
+        backgroundSessionsModel: { preconditionFailure("not asked in this test") },
+        switcher: ProjectSwitcherActions(settings: .shared, chromeState: barChrome, openProject: { _ in }),
+        editorDiscovery: ExternalEditorDiscovery(appURLResolver: { _ in nil }),
+        projects: { ProjectSwitcherModel(machines: [], locations: []) },
+        openSettings: {},
+        toggleAppearance: {}
+    )
+    // Its program is at work: "Close “Claude”?" goes up in its window,
+    // which closes after it.
+    performer.perform(.closeTab(agent.id))
+    let request = try #require(tabChrome.pendingTabClose)
+    #expect(request.sessionID == agent.id)
+    #expect(request.closingWindow === windows[1])
+    #expect(barChrome.pendingTabClose == nil)
+    #expect(tabWorkspace.sessions.map(\.id) == [agent.id])
+}
+
 // MARK: - Editor icons
 
 @Test @MainActor func omniEditorRowsShowTheirAppsIconWithTheSymbolAsFallback() {

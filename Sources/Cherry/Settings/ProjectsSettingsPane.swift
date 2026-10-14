@@ -68,7 +68,7 @@ struct ProjectSettingsPane: View {
     private func openProject(_ project: CherryProject) {
         settings.markProjectOpened(project.root)
         guard !ProjectWindowRegistry.shared.focus(projectRoot: project.root) else { return }
-        openWindow(value: project.root)
+        openWindow(value: ProjectWindowValue.primary(project.root))
     }
 }
 
@@ -203,7 +203,7 @@ struct ProjectDetailSettingsPane: View {
     private func openProject() {
         settings.markProjectOpened(project.root)
         guard !ProjectWindowRegistry.shared.focus(projectRoot: project.root) else { return }
-        openWindow(value: project.root)
+        openWindow(value: ProjectWindowValue.primary(project.root))
     }
 }
 

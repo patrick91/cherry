@@ -116,6 +116,49 @@ private func remote(
     #expect(recency.recentKeys(limit: 1) == [key])
 }
 
+/// A project's open status (the Omni bar's project rows) counts the
+/// working agents of every one of its windows.
+@Test @MainActor func projectStatusesCountWorkingAgentsOfEveryWindow() async throws {
+    let registry = ProjectWindowRegistry()
+    registry.bringWindowForward = { _ in }
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("cherry-switcher-windows-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let workspaces = (0..<2).map { _ in
+        TerminalWorkspace(projectRoot: root.path, createInitialSession: false, launchBackend: .hostManaged)
+    }
+    let windows = workspaces.map { _ in
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200), styleMask: [.titled], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        return window
+    }
+    defer {
+        windows.forEach { registry.unregister(window: $0, projectRoot: root.path) }
+        workspaces.forEach { $0.closeAllSessions(intent: .windowClosed) }
+        try? FileManager.default.removeItem(at: root)
+    }
+    // The project's primary window and another one.
+    for (index, window) in windows.enumerated() {
+        #expect(registry.register(
+            window: window, projectRoot: root.path, windowID: index == 0 ? nil : UUID(), workspace: workspaces[index],
+            todoStore: nil, chromeState: nil
+        ))
+    }
+    // Two agents at work in the first, one in the other, and one done.
+    let agent = AgentToolDefinition(name: "Claude", command: "/bin/cat")
+    let agents = [workspaces[0], workspaces[0], workspaces[1], workspaces[1]].map {
+        $0.addAgentSession(agent: agent, projectRoot: root.path, select: false)
+    }
+    for (index, session) in agents.enumerated() {
+        session.applyProgramStatus([ProgramStatus(state: index == 3 ? .done : .working, app: "claude-code")])
+    }
+    let key = registry.canonicalProjectRoot(for: root.path)
+    #expect(registry.openProjectWindowStatuses() == [key: .init(workingAgents: 3)])
+    // The first window closes: the other's are left.
+    registry.unregister(window: windows[0], projectRoot: root.path)
+    #expect(registry.openProjectWindowStatuses() == [key: .init(workingAgents: 1)])
+}
+
 // MARK: - Offline Macs
 
 @Test func anOfflineMacsProjectsStillOpenButAnotherIdentityCannot() {

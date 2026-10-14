@@ -405,3 +405,519 @@ private func makeResizableWindow(_ frame: NSRect) -> NSWindow {
     #expect(primaryState.windowID == nil)
     #expect(primaryState.worktree(root: root.path)?.sessions.map(\.id) == [savedPrimary.id, primaryTab.id])
 }
+
+// MARK: - The registry
+
+/// The session the fake host lists for a saved tab.
+private func listed(_ record: WorkspaceSessionRecord) -> HostedSessionInfo {
+    HostedSessionInfo(
+        id: record.hosted?.sessionID ?? "", name: record.title, cwd: record.workingDirectory, pid: 5,
+        owner: "CherryTests", tags: [PersistentSessionTag.tab: record.id.uuidString]
+    )
+}
+
+/// The windows a test registers, each with a workspace that runs nothing
+/// (the registry holds them weakly, as their scenes do).
+@MainActor
+private final class TestWindows {
+    let registry: ProjectWindowRegistry
+    private(set) var windows: [(window: NSWindow, value: ProjectWindowValue, workspace: TerminalWorkspace)] = []
+    /// The windows `focus` brought forward, in order.
+    private(set) var focused: [NSWindow] = []
+
+    init(_ registry: ProjectWindowRegistry = ProjectWindowRegistry()) {
+        self.registry = registry
+        registry.bringWindowForward = { [unowned self] in focused.append($0) }
+    }
+
+    /// Registers a new window for `value`, as its binder does.
+    @discardableResult
+    func open(
+        _ value: ProjectWindowValue,
+        implicit: Bool = false,
+        window: NSWindow = testWindow(),
+        workspace: TerminalWorkspace? = nil,
+        todoStore: ProjectTodoStore? = nil,
+        chromeState: ProjectWindowChromeState? = nil
+    ) -> (claimed: Bool, window: NSWindow, workspace: TerminalWorkspace) {
+        let workspace = workspace ?? TerminalWorkspace(projectRoot: value.projectRoot, createInitialSession: false)
+        windows.append((window, value, workspace))
+        let claimed = register(window, value, implicit: implicit, workspace: workspace, todoStore: todoStore, chromeState: chromeState)
+        return (claimed, window, workspace)
+    }
+
+    /// Registers `window` again (every update of its view does).
+    @discardableResult
+    func register(
+        _ window: NSWindow,
+        _ value: ProjectWindowValue,
+        implicit: Bool = false,
+        workspace: TerminalWorkspace,
+        todoStore: ProjectTodoStore? = nil,
+        chromeState: ProjectWindowChromeState? = nil
+    ) -> Bool {
+        registry.register(
+            window: window, projectRoot: value.projectRoot, windowID: value.windowID, implicit: implicit,
+            workspace: workspace, todoStore: todoStore, chromeState: chromeState
+        )
+    }
+
+    func close(_ window: NSWindow) {
+        guard let index = windows.firstIndex(where: { $0.window === window }) else { return }
+        let closing = windows.remove(at: index)
+        registry.unregister(window: window, projectRoot: closing.value.projectRoot)
+        closing.workspace.closeAllSessions(intent: .windowClosed)
+        window.close()
+    }
+
+    func closeAll() {
+        windows.map(\.window).forEach(close)
+    }
+}
+
+@Test @MainActor func twoWindowsOfOneProjectRegisterApartAndComeBackAtTheirOwnFrames() throws {
+    let suite = "CherryTests.TwoWindowFrames.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let frames = ProjectWindowFrameStore(defaults: defaults)
+    let root = try canonicalTemporaryDirectory("cherry-two-window-frames")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-two-window-frames-store")
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: storeDirectory)
+    }
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let primary = ProjectWindowValue.primary(root.path)
+    let other = ProjectWindowValue(projectRoot: root.path, windowID: UUID())
+    let saved = [NSRect(x: 120, y: 140, width: 800, height: 500), NSRect(x: 360, y: 200, width: 900, height: 560)]
+
+    // The last run: the project's primary window and another one, each
+    // moved and resized.
+    let lastRun = TestWindows()
+    defer { lastRun.closeAll() }
+    lastRun.registry.configureWindowFrames(frames)
+    lastRun.registry.setWorkspaceStateStoreForTesting(store)
+    let first = lastRun.open(primary, window: makeResizableWindow(NSRect(x: 0, y: 0, width: 320, height: 200)))
+    let second = lastRun.open(other, window: makeResizableWindow(NSRect(x: 0, y: 0, width: 320, height: 200)))
+    #expect(first.claimed && second.claimed)
+    // Each is its own window: neither took the other's place.
+    #expect(lastRun.registry.hasWindow(primary))
+    #expect(lastRun.registry.hasWindow(other))
+    #expect(!lastRun.registry.hasWindow(ProjectWindowValue(projectRoot: root.path, windowID: UUID())))
+    #expect(lastRun.registry.hasWindow(for: root.path))
+    #expect(lastRun.registry.allWorkspaces().count == 2)
+    #expect(lastRun.registry.key(of: second.window) == ProjectWindowKey(root: root.path, windowID: other.windowID))
+    // Registering again claims nothing new; another window never takes
+    // either's key.
+    #expect(lastRun.register(second.window, other, workspace: second.workspace))
+    #expect(!lastRun.open(other).claimed)
+    #expect(!lastRun.open(primary).claimed)
+    for (window, frame) in zip([first.window, second.window], saved) {
+        window.setFrame(frame, display: false)
+    }
+    #expect(frames.frameDescriptor(projectRoot: root.path) == first.window.frameDescriptor)
+    #expect(frames.frameDescriptor(projectRoot: root.path, windowID: other.windowID) == second.window.frameDescriptor)
+    // Both are saved as open, the one active last first.
+    store.flush()
+    #expect(store.loadOpenProjectWindows() == [primary, other])
+    // Closing one leaves the other.
+    lastRun.close(second.window)
+    #expect(lastRun.registry.hasWindow(primary))
+    #expect(!lastRun.registry.hasWindow(other))
+    store.flush()
+    #expect(store.loadOpenProjectWindows() == [primary])
+    lastRun.close(first.window)
+
+    // The next run opens them the other way round: each at its own frame.
+    let nextRun = TestWindows()
+    defer { nextRun.closeAll() }
+    nextRun.registry.configureWindowFrames(frames)
+    let reopenedOther = nextRun.open(other, window: makeResizableWindow(NSRect(x: 0, y: 0, width: 320, height: 200)))
+    #expect(reopenedOther.claimed)
+    #expect(reopenedOther.window.frame == saved[1])
+    let reopenedPrimary = nextRun.open(primary, window: makeResizableWindow(NSRect(x: 0, y: 0, width: 320, height: 200)))
+    #expect(reopenedPrimary.claimed)
+    #expect(reopenedPrimary.window.frame == saved[0])
+}
+
+/// A window opened with no value (SwiftUI's own, a URL event, onboarding)
+/// claims its project's primary window only while none of the project's
+/// windows is open; a window opened for a value claims its own key while
+/// it is free.
+@Test @MainActor func aWindowOpenedWithNoProjectClaimsOneOnlyWhileNoneOfItsWindowsIsOpen() throws {
+    let root = try canonicalTemporaryDirectory("cherry-implicit-window")
+    let elsewhere = try canonicalTemporaryDirectory("cherry-implicit-window-elsewhere")
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: elsewhere)
+    }
+    let windows = TestWindows()
+    defer { windows.closeAll() }
+    let primary = ProjectWindowValue.primary(root.path)
+    let other = ProjectWindowValue(projectRoot: root.path, windowID: UUID())
+
+    // None of the project's windows is open: it claims the primary.
+    let implicit = windows.open(primary, implicit: true)
+    #expect(implicit.claimed)
+    #expect(windows.registry.hasWindow(primary))
+    // Now another such window is refused (its binder closes it).
+    #expect(!windows.open(primary, implicit: true).claimed)
+    // A window opened for another window of the project claims it.
+    let explicit = windows.open(other)
+    #expect(explicit.claimed)
+    // The first keeps its key as its view updates.
+    #expect(windows.register(implicit.window, primary, implicit: true, workspace: implicit.workspace))
+
+    // Its primary closed; the project's other window is open: a window with
+    // no value does not take the free primary, a window opened for it does.
+    windows.close(implicit.window)
+    #expect(!windows.open(primary, implicit: true).claimed)
+    #expect(!windows.registry.hasWindow(primary))
+    #expect(windows.open(primary).claimed)
+    #expect(windows.registry.hasWindow(primary))
+    // Another project's windows are not this one's.
+    #expect(windows.open(.primary(elsewhere.path), implicit: true).claimed)
+    #expect(windows.registry.hasWindow(other))
+}
+
+/// The launch reopens every saved window of a project: the most recently
+/// active project first, its window active last first; the others stay
+/// pending (open for the saved list) until each registers, and one window
+/// showing does not end the wait for another of its project.
+@Test @MainActor func theLaunchReopensEveryWindowOfAProjectItsMostRecentlyActiveFirst() async throws {
+    let app = try canonicalTemporaryDirectory("cherry-launch-app")
+    let lib = try canonicalTemporaryDirectory("cherry-launch-lib")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-launch-windows-store")
+    defer {
+        for directory in [app, lib, storeDirectory] { try? FileManager.default.removeItem(at: directory) }
+    }
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let appOther = ProjectWindowValue(projectRoot: app.path, windowID: UUID())
+    // The last run's windows, the one active last first: the lib's, then
+    // the app's other window and its primary.
+    let saved: [ProjectWindowValue] = [.primary(lib.path), appOther, .primary(app.path)]
+    for (index, window) in saved.enumerated() {
+        store.saveSynchronously(state(window.projectRoot, windowID: window.windowID, sessions: [boundRecord(sessionID: "s-\(index)")]))
+    }
+    store.saveOpenProjectWindows(saved, synchronously: true)
+
+    let windows = TestWindows()
+    defer { windows.closeAll() }
+    let registry = windows.registry
+    registry.windowRevealMaximumWait = .seconds(60)
+    var turns: [@MainActor () -> Void] = []
+    registry.scheduleLaunchWindowTurn = { turns.append($0) }
+    registry.configureWorkspacePersistence(store: store)
+    #expect(registry.savedWindowsLaunchPlan() == .reopen(saved))
+
+    // The app was the project active last (`ProjectRecencyStore`): its
+    // first window in saved order, its most recently active, opens first.
+    let lastOpened = [lib.path: Date(timeIntervalSince1970: 10), app.path: Date(timeIntervalSince1970: 20)]
+    let ordered = LaunchWindowOrder.frontFirst(saved) { lastOpened[$0.projectRoot] }
+    #expect(ordered == [appOther, .primary(lib.path), .primary(app.path)])
+    var opened: [ProjectWindowValue] = []
+    var proceed: (@MainActor () -> Void)?
+    registry.openLaunchWindows(ordered, beforeLaterWindows: { proceed = $0 }) { value in
+        opened.append(value)
+        // The front window registers as it is built; the test registers
+        // the others itself, later.
+        if value == ordered[0] { windows.open(value) }
+    }
+    var allOpened = false
+    registry.whenLaunchWindowsOpened { allOpened = true }
+    #expect(opened == [appOther])
+    #expect(registry.pendingLaunchWindows == [.primary(lib.path), .primary(app.path)])
+    registry.flushWorkspacePersistence()
+    #expect(store.loadOpenProjectWindows() == ordered)
+
+    // The app's other window showed; its primary has not.
+    var shown: [ProjectWindowValue] = []
+    for value in ordered {
+        registry.whenLaunchWindowShown(value, waitingAtMost: .seconds(60)) { shown.append(value) }
+    }
+    #expect(shown == [appOther])
+    #expect(await eventually { proceed != nil })
+    let proceedNow = try #require(proceed)
+    proceedNow()
+    #expect(turns.count == 1)
+    turns.removeFirst()()
+    #expect(opened == ordered)
+    // Opened, not registered yet: still pending.
+    #expect(registry.pendingLaunchWindows == [.primary(lib.path), .primary(app.path)])
+    #expect(!allOpened)
+    windows.open(.primary(lib.path))
+    #expect(registry.pendingLaunchWindows == [.primary(app.path)])
+    #expect(shown == [appOther, .primary(lib.path)])
+    windows.open(.primary(app.path))
+    #expect(registry.pendingLaunchWindows.isEmpty)
+    #expect(shown == [appOther, .primary(lib.path), .primary(app.path)])
+    #expect(await eventually { allOpened })
+    // Nothing is left to reopen.
+    #expect(registry.savedWindowsLaunchPlan() == nil)
+}
+
+/// A quit (one that ends sessions) before a project's later launch window
+/// registered ends the sessions of that window's own file, as the launch
+/// read it: the quit reads no file, and never the primary's, whose window
+/// is open.
+@Test @MainActor func aQuitBeforeAProjectsLaterWindowOpenedEndsTheSessionsOfItsOwnFile() async throws {
+    let harness = try PersistentHarness()
+    defer { harness.cleanUp() }
+    let root = try canonicalTemporaryDirectory("cherry-launch-quit-window")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-launch-quit-window-store")
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: storeDirectory)
+    }
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let other = ProjectWindowValue(projectRoot: root.path, windowID: UUID())
+    let primaryTab = boundRecord(title: "Primary", sessionID: "s-primary")
+    let otherTab = boundRecord(title: "Other", sessionID: "s-other")
+    store.saveSynchronously(state(root.path, sessions: [primaryTab]))
+    store.saveSynchronously(state(root.path, windowID: other.windowID, sessions: [otherTab]))
+    store.saveOpenProjectWindows([.primary(root.path), other], synchronously: true)
+    harness.fake.sessions = [listed(primaryTab), listed(otherTab)]
+
+    let windows = TestWindows()
+    defer { windows.closeAll() }
+    let registry = windows.registry
+    registry.windowRevealMaximumWait = .seconds(60)
+    registry.launchWindowHosting = harness.hosting
+    var turns: [@MainActor () -> Void] = []
+    registry.scheduleLaunchWindowTurn = { turns.append($0) }
+    registry.configureWorkspacePersistence(store: store)
+    let reopened = registry.takeProjectWindowsToReopen()
+    #expect(reopened == [.primary(root.path), other])
+    // Read at launch: the quit reads no file.
+    try FileManager.default.removeItem(at: store.stateFileURL(repositoryRoot: root.path, windowID: other.windowID))
+
+    var proceed: (@MainActor () -> Void)?
+    registry.openLaunchWindows(reopened, beforeLaterWindows: { proceed = $0 }) { value in
+        // Only the project's primary window registers before the quit.
+        if value.isPrimary { windows.open(value) }
+    }
+    #expect(await eventually { proceed != nil })
+    #expect(registry.pendingLaunchWindows == [other])
+    #expect(registry.localSessionsEndedByAQuit().map(\.sessionID) == ["s-other"])
+    registry.tearDownForQuit(intent: .appQuitEndingSessions)
+    #expect(await harness.fake.wait { harness.requestIDs("kill").contains("s-other") })
+    #expect(!harness.requestIDs("kill").contains("s-primary"))
+    // It never opens now, and stays saved as open.
+    let proceedNow = try #require(proceed)
+    proceedNow()
+    turns.forEach { $0() }
+    #expect(registry.pendingLaunchWindows == [other])
+    store.flush()
+    #expect(store.loadOpenProjectWindows() == [.primary(root.path), other])
+}
+
+/// "The project's window" (`focus(projectRoot:)`, `repository(for:)` and
+/// the other lookups by root) is its most recently active window; windows
+/// a launch reopened that were never active rank by the launch's order.
+@Test @MainActor func aProjectsWindowIsItsMostRecentlyActiveOne() async throws {
+    let root = try canonicalTemporaryDirectory("cherry-most-recent-window")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-most-recent-window-store")
+    let todoDirectory = try canonicalTemporaryDirectory("cherry-most-recent-window-todos")
+    let elsewhere = try canonicalTemporaryDirectory("cherry-most-recent-window-elsewhere")
+    defer {
+        for directory in [root, storeDirectory, todoDirectory, elsewhere] { try? FileManager.default.removeItem(at: directory) }
+    }
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let other = ProjectWindowValue(projectRoot: root.path, windowID: UUID())
+    // Two windows of the project, each restoring one saved tab that
+    // launches nothing.
+    let restorer = RecordingRestorer()
+    let repositories = [ProjectWindowValue.primary(root.path), other].enumerated().map { index, value in
+        store.saveSynchronously(RepositoryStateRecord(
+            repositoryRoot: repositoryKey(root),
+            activeWorktreeRoot: root.path,
+            worktrees: [WorktreeStateRecord(root: root.path, sessions: [boundRecord(sessionID: "s-\(index)")])],
+            windowID: value.windowID
+        ))
+        return RepositoryWorkspace(
+            projectRoot: root.path, windowID: value.windowID, stateStore: store,
+            sessionRestorer: restorer.restorer, autoStartCommands: { _ in [] }
+        )
+    }
+    let chromes = [quietChromeState(), quietChromeState()]
+    let todoStores = [
+        ProjectTodoStore(projectRoot: root.path, storageDirectory: todoDirectory),
+        ProjectTodoStore(projectRoot: root.path, storageDirectory: todoDirectory),
+    ]
+    let windows = TestWindows()
+    defer {
+        windows.closeAll()
+        repositories.forEach { $0.closeAllSessions(intent: .windowClosed) }
+    }
+    let registry = windows.registry
+    var opened: [NSWindow] = []
+    for (index, value) in [ProjectWindowValue.primary(root.path), other].enumerated() {
+        let window = testWindow()
+        opened.append(window)
+        #expect(registry.register(
+            window: window, projectRoot: value.projectRoot, windowID: value.windowID,
+            workspace: repositories[index].workspace, repository: repositories[index],
+            todoStore: todoStores[index], chromeState: chromes[index]
+        ))
+        repositories[index].beginRestoringSavedStateIfNeeded(chromeState: chromes[index])
+        await repositories[index].waitForPendingRestores()
+    }
+    defer { opened.forEach { registry.unregister(window: $0, projectRoot: root.path) } }
+
+    // The primary registered first and was active; the other never was.
+    func expectProjectWindow(_ index: Int, _ comment: Comment) {
+        #expect(registry.repository(for: root.path) === repositories[index], comment)
+        #expect(registry.workspace(for: root.path) === repositories[index].workspace, comment)
+        #expect(registry.chromeState(for: root.path) === chromes[index], comment)
+        #expect(registry.todoStore(for: root.path) === todoStores[index], comment)
+        // However its folder is spelled.
+        #expect(registry.repository(for: repositoryKey(root)) === repositories[index], comment)
+        #expect(registry.focus(projectRoot: root.path), comment)
+        #expect(windows.focused.last === opened[index], comment)
+    }
+    expectProjectWindow(0, "the primary, active last")
+    // The other window becomes key.
+    registry.activateWindow(opened[1], workspace: repositories[1].workspace, todoStore: todoStores[1], chromeState: chromes[1])
+    expectProjectWindow(1, "the other window, now active last")
+    // It closes: the primary is the project's window again.
+    registry.unregister(window: opened[1], projectRoot: root.path)
+    expectProjectWindow(0, "the window left")
+    registry.unregister(window: opened[0], projectRoot: root.path)
+    #expect(!registry.focus(projectRoot: root.path))
+    #expect(registry.repository(for: root.path) == nil)
+
+    // A launch reopens the project's windows behind the window that is
+    // active (another project's): never active, they rank by the
+    // launch's order, the one active last before the quit first, though
+    // the primary comes first in their stable order.
+    let launch = TestWindows()
+    defer { launch.closeAll() }
+    launch.registry.windowRevealMaximumWait = .seconds(60)
+    launch.registry.scheduleLaunchWindowTurn = { $0() }
+    let active = launch.open(.primary(elsewhere.path))
+    #expect(active.claimed)
+    let launchChromes = [other: quietChromeState(), .primary(root.path): quietChromeState()]
+    launch.registry.openLaunchWindows([other, .primary(root.path)]) { value in
+        launch.open(value, chromeState: launchChromes[value])
+    }
+    #expect(await eventually { launch.windows.count == 3 })
+    #expect(launch.registry.chromeState(for: root.path) === launchChromes[other])
+    #expect(launch.registry.focus(projectRoot: root.path))
+    #expect(launch.focused.last === launch.windows.first { $0.value == other }?.window)
+    // Once it is active, by activation: the primary when it becomes key.
+    let primaryWindow = try #require(launch.windows.first { $0.value == .primary(root.path) })
+    launch.registry.activateWindow(
+        primaryWindow.window, workspace: primaryWindow.workspace, todoStore: nil, chromeState: launchChromes[.primary(root.path)]
+    )
+    #expect(launch.registry.chromeState(for: root.path) === launchChromes[.primary(root.path)])
+}
+
+/// "A tab's window" (notifications, the menu bar, the Omni bar's tabs,
+/// terminal links) is the window whose workspace has the tab, whichever of
+/// the project's windows was active last; a to-do link goes to the
+/// project's most recently active window.
+@Test @MainActor func aTabsWindowIsTheOneThatHasIt() throws {
+    let root = try canonicalTemporaryDirectory("cherry-tab-window")
+    let elsewhere = try canonicalTemporaryDirectory("cherry-tab-window-elsewhere")
+    let todoDirectory = try canonicalTemporaryDirectory("cherry-tab-window-todos")
+    defer {
+        for directory in [root, elsewhere, todoDirectory] { try? FileManager.default.removeItem(at: directory) }
+    }
+    // To-dos are on for the project.
+    try Data("[features]\ntodos = true\n".utf8).write(to: root.appendingPathComponent("cherry.toml"))
+    let windows = TestWindows()
+    defer { windows.closeAll() }
+    let registry = windows.registry
+    let other = ProjectWindowValue(projectRoot: root.path, windowID: UUID())
+    let chromes = [quietChromeState(), quietChromeState()]
+    // One store the project's windows share, as they do (one per project).
+    let todos = ProjectTodoStore(projectRoot: root.path, storageDirectory: todoDirectory)
+    let first = windows.open(.primary(root.path), todoStore: todos, chromeState: chromes[0])
+    let second = windows.open(other, todoStore: todos, chromeState: chromes[1])
+    let firstTab = first.workspace.attachHostedSession(localAttachment(sessionID: "s-1"), launchShell: false)
+    let secondTab = second.workspace.attachHostedSession(localAttachment(sessionID: "s-2"), launchShell: false)
+    _ = first.workspace.attachHostedSession(localAttachment(sessionID: "s-3"), launchShell: false)
+    // The primary is the project's most recently active window.
+    #expect(registry.chromeState(for: root.path) === chromes[0])
+
+    // A notification's click, the Omni bar's tab row.
+    let todo = try todos.create(title: "Ship it", markdown: "")
+    chromes[1].selectTodo(id: todo.id)
+    #expect(registry.focusSession(sessionID: secondTab.id, projectRoot: nil))
+    #expect(windows.focused.last === second.window)
+    #expect(second.workspace.selectedSessionID == secondTab.id)
+    #expect(chromes[1].isShowingTerminalContent)
+    // Narrowed to another project, it is not found.
+    #expect(!registry.focusSession(sessionID: secondTab.id, projectRoot: elsewhere.path))
+    #expect(registry.focusSession(sessionID: secondTab.id, projectRoot: root.path))
+
+    // The menu bar's row, a toast's Reopen.
+    #expect(registry.revealSession(id: firstTab.id))
+    #expect(windows.focused.last === first.window)
+    #expect(first.workspace.selectedSessionID == firstTab.id)
+    #expect(!registry.revealSession(id: UUID()))
+    #expect(windows.focused.last === first.window)
+
+    // A terminal link selects its tab in the window that has it, though the
+    // primary was active last.
+    let terminalLink = CherryDeepLink(projectRoot: root.path, kind: .terminal, targetID: secondTab.id.uuidString)
+    #expect(registry.select(terminalLink, projectRoot: root.path))
+    #expect(windows.focused.last === second.window)
+    // A to-do link: the project's most recently active window, now the
+    // other one.
+    chromes[1].selectTerminal()
+    let todoLink = CherryDeepLink(projectRoot: root.path, kind: .todo, targetID: todo.id.uuidString)
+    #expect(registry.select(todoLink, projectRoot: root.path))
+    #expect(windows.focused.last === second.window)
+    #expect(chromes[1].selectedTodoID == todo.id)
+    #expect(chromes[0].selectedTodoID == nil)
+    // A tab or to-do no window has selects nothing and focuses nothing.
+    let focusCount = windows.focused.count
+    #expect(!registry.select(CherryDeepLink(projectRoot: root.path, kind: .terminal, targetID: UUID().uuidString), projectRoot: root.path))
+    #expect(!registry.select(CherryDeepLink(projectRoot: root.path, kind: .todo, targetID: UUID().uuidString), projectRoot: root.path))
+    #expect(windows.focused.count == focusCount)
+}
+
+/// Code that holds a window or a workspace (menu actions, the Omni bar's
+/// close, a toast) finds that window and its chrome by identity, never
+/// another window of its project.
+@Test @MainActor func lookupsByWindowFindThatWindowNotAnotherOfItsProject() throws {
+    let root = try canonicalTemporaryDirectory("cherry-window-identity")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let windows = TestWindows()
+    defer { windows.closeAll() }
+    let registry = windows.registry
+    let other = ProjectWindowValue(projectRoot: root.path, windowID: UUID())
+    let chromes = [quietChromeState(), quietChromeState()]
+    let first = windows.open(.primary(root.path), chromeState: chromes[0])
+    let second = windows.open(other, chromeState: chromes[1])
+    // The primary is the project's most recently active window.
+    #expect(registry.chromeState(for: root.path) === chromes[0])
+
+    #expect(registry.key(of: second.window) == ProjectWindowKey(root: root.path, windowID: other.windowID))
+    #expect(registry.chromeState(for: second.window) === chromes[1])
+    #expect(registry.chromeState(for: second.workspace) === chromes[1])
+    #expect(registry.window(for: second.workspace) === second.window)
+    #expect(registry.window(for: chromes[1]) === second.window)
+    #expect(registry.focus(workspace: second.workspace))
+    #expect(windows.focused.last === second.window)
+    // Focusing it made it the project's window.
+    #expect(registry.chromeState(for: root.path) === chromes[1])
+    // A window that becomes key, by identity.
+    registry.activateWindow(first.window, workspace: first.workspace, todoStore: nil, chromeState: chromes[0])
+    #expect(registry.chromeState(for: root.path) === chromes[0])
+    #expect(registry.chromeState(for: first.workspace) === chromes[0])
+
+    // A workspace or window no window registered: none.
+    let stray = TerminalWorkspace(projectRoot: root.path, createInitialSession: false)
+    #expect(registry.window(for: stray) == nil)
+    #expect(registry.chromeState(for: stray) == nil)
+    #expect(!registry.focus(workspace: stray))
+    #expect(registry.key(of: testWindow()) == nil)
+    // Unregistering goes by identity: the other window stays.
+    registry.unregister(window: second.window, projectRoot: "/elsewhere")
+    #expect(registry.window(for: second.workspace) === second.window)
+    windows.close(first.window)
+    #expect(registry.chromeState(for: second.window) === chromes[1])
+    #expect(registry.chromeState(for: root.path) === chromes[1])
+}

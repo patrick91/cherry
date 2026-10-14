@@ -41,8 +41,7 @@ import Security
 /// with the same program, and its token works again.
 final class RemoteMCPTokens: @unchecked Sendable {
     static let shared = RemoteMCPTokens(
-        keyURL: AppInstanceLock.defaultFileURL().deletingLastPathComponent()
-            .appendingPathComponent("mcp-token-key", isDirectory: false)
+        keyURL: CherryAppIdentity.applicationSupportDirectory().appendingPathComponent("mcp-token-key", isDirectory: false)
     )
 
     private let keyURL: URL?
@@ -127,8 +126,7 @@ final class RemoteMCPTokens: @unchecked Sendable {
     private func loadGenerationsLocked() -> [UUID: Generation] {
         if let generations { return generations }
         var loaded: [UUID: Generation] = [:]
-        if let url = generationsURL, Self.isPrivateFile(url.path),
-           let data = FileManager.default.contents(atPath: url.path),
+        if let url = generationsURL, let data = PrivateFile.contents(of: url),
            let decoded = try? JSONDecoder().decode([String: Generation].self, from: data) {
             let oldest = Date().addingTimeInterval(-Self.generationLifetime)
             for (key, value) in decoded where value.madeAt > oldest {
@@ -144,16 +142,7 @@ final class RemoteMCPTokens: @unchecked Sendable {
         guard let url = generationsURL else { return }
         let encoded = Dictionary(uniqueKeysWithValues: all.map { ($0.key.uuidString, $0.value) })
         guard let data = try? JSONEncoder().encode(encoded) else { return }
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let temporary = url.deletingLastPathComponent().appendingPathComponent(".mcp-generations.\(UUID().uuidString)")
-        guard FileManager.default.createFile(atPath: temporary.path, contents: data, attributes: [.posixPermissions: 0o600]) else { return }
-        if rename(temporary.path, url.path) != 0 { unlink(temporary.path) }
-    }
-
-    private static func isPrivateFile(_ path: String) -> Bool {
-        var status = stat()
-        return lstat(path, &status) == 0 && status.st_mode & S_IFMT == S_IFREG
-            && status.st_uid == geteuid() && status.st_mode & 0o077 == 0
+        try? PrivateFile.write(data, to: url, durable: false)
     }
 
     /// 32 random bytes in a file only this user can read: made with
@@ -162,10 +151,10 @@ final class RemoteMCPTokens: @unchecked Sendable {
     /// read it.
     static func loadOrCreateKey(at url: URL) -> SymmetricKey? {
         let path = url.path
-        if let key = readKey(at: path) { return key }
+        if let key = readKey(at: url) { return key }
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
-        if fd < 0 { return errno == EEXIST ? readKey(at: path) : nil }
+        if fd < 0 { return errno == EEXIST ? readKey(at: url) : nil }
         defer { close(fd) }
         let key = SymmetricKey(size: .bits256)
         let written = key.withUnsafeBytes { raw in write(fd, raw.baseAddress, raw.count) }
@@ -176,12 +165,8 @@ final class RemoteMCPTokens: @unchecked Sendable {
         return key
     }
 
-    private static func readKey(at path: String) -> SymmetricKey? {
-        var status = stat()
-        guard lstat(path, &status) == 0, status.st_mode & S_IFMT == S_IFREG,
-              status.st_uid == geteuid(), status.st_mode & 0o077 == 0,
-              let data = FileManager.default.contents(atPath: path), data.count == 32
-        else { return nil }
+    private static func readKey(at url: URL) -> SymmetricKey? {
+        guard let data = PrivateFile.contents(of: url), data.count == 32 else { return nil }
         return SymmetricKey(data: data)
     }
 }
@@ -194,7 +179,7 @@ enum RemoteMCPPaths {
 
     /// 16 hex digits of the SHA-256 of `text`.
     static func shortHash(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        sha256Hex(text, bytes: 8)
     }
 
     /// Names a device's listener here (`mcp-<name>.sock`).
@@ -406,12 +391,7 @@ final class RemoteMCPForwards {
         self.masters = masters
         self.shell = shell
         self.server = server
-        stopObserver = NotificationCenter.default.addObserver(
-            forName: HostSSHMasterManager.masterDidStopNotification, object: masters, queue: .main
-        ) { [weak self] notification in
-            guard let destination = notification.userInfo?[HostSSHMasterManager.destinationKey] as? String else { return }
-            MainActor.assumeIsolated { self?.masterStopped(destination) }
-        }
+        stopObserver = masters.observeStops { [weak self] destination in self?.masterStopped(destination) }
     }
 
     deinit {
@@ -495,16 +475,14 @@ final class RemoteMCPForwards {
         temporaryDirectoryFound(deviceID, temporary)
         let remote = directory + "/control.sock"
         let local = try server.addDeviceListener(deviceID: deviceID)
-        let result = await Self.runSSH(
-            shell: shell,
-            arguments: Self.commandArguments("forward", remote: remote, local: local.path, controlPath: controlPath, destination: target.destination)
+        let result = await shell.runMasterCommand(
+            Self.commandArguments("forward", remote: remote, local: local.path, controlPath: controlPath, destination: target.destination)
         )
         guard generations[deviceID, default: 0] == generation else {
             // Stopped meanwhile: the forward just made goes too.
             if result.status == 0 {
-                _ = await Self.runSSH(
-                    shell: shell,
-                    arguments: Self.commandArguments("cancel", remote: remote, local: local.path, controlPath: controlPath, destination: target.destination)
+                _ = await shell.runMasterCommand(
+                    Self.commandArguments("cancel", remote: remote, local: local.path, controlPath: controlPath, destination: target.destination)
                 )
                 _ = await shell.run(Self.cleanupScript(directoryName: name), on: target.destination)
             }
@@ -535,9 +513,8 @@ final class RemoteMCPForwards {
         else { return }
         var shell = await shell()
         shell.controlPath = controlPath
-        _ = await Self.runSSH(
-            shell: shell,
-            arguments: Self.commandArguments("cancel", remote: remote, local: local, controlPath: controlPath, destination: target.destination)
+        _ = await shell.runMasterCommand(
+            Self.commandArguments("cancel", remote: remote, local: local, controlPath: controlPath, destination: target.destination)
         )
         _ = await shell.run(
             Self.cleanupScript(directoryName: RemoteMCPPaths.directoryName(installationID: target.installationID, deviceID: deviceID)),
@@ -561,13 +538,9 @@ final class RemoteMCPForwards {
 
     /// `ssh -o ControlPath=<master> -O forward|cancel -R <there>:<here> -- <destination>`.
     nonisolated static func commandArguments(_ command: String, remote: String, local: String, controlPath: String, destination: String) -> [String] {
-        [
-            "-o", HostSSHMasterManager.controlPathOption(controlPath),
-            "-o", "BatchMode=yes",
-            "-O", command,
-            "-R", "\(remote):\(local)",
-            "--", destination,
-        ]
+        HostSSHMasterManager.commandArguments(
+            command, destination: destination, controlPath: controlPath, extra: ["-R", "\(remote):\(local)"]
+        )
     }
 
     /// Whether ssh's error says the server refused the forward (sshd's
@@ -611,14 +584,5 @@ final class RemoteMCPForwards {
             "if [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -O \"$d\" ]; then /bin/rm -f \"$d/control.sock\"; /bin/rmdir \"$d\" 2>/dev/null; fi",
             "exit 0",
         ].joined(separator: "\n") + "\n"
-    }
-
-    private static func runSSH(shell: RemoteDeviceShell, arguments: [String]) async -> (status: Int32?, errors: String) {
-        await Task.detached(priority: .userInitiated) {
-            let result = HostSpawnedProcess.run(
-                executable: shell.sshExecutable, arguments: arguments, environment: shell.environment, timeout: 15
-            )
-            return (status: result.exitCode, errors: result.errors)
-        }.value
     }
 }

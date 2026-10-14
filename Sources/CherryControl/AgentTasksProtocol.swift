@@ -117,21 +117,6 @@ public enum JSONValue: Codable, Equatable, Sendable {
         default: nil
         }
     }
-
-    /// Equal as JSON: numbers compare by value (1 equals 1.0).
-    public func isJSONEqual(to other: JSONValue) -> Bool {
-        if let left = numberValue, let right = other.numberValue { return left == right }
-        switch (self, other) {
-        case (.array(let left), .array(let right)):
-            return left.count == right.count && zip(left, right).allSatisfy { $0.isJSONEqual(to: $1) }
-        case (.object(let left), .object(let right)):
-            return left.count == right.count && left.allSatisfy { key, value in
-                right[key].map { value.isJSONEqual(to: $0) } ?? false
-            }
-        default:
-            return self == other
-        }
-    }
 }
 
 /// A task's state, as `get_task`, `wait_for_tasks` and the process
@@ -838,8 +823,8 @@ public enum TaskResultSchema {
         }
     }
 
-    /// A key equal for values `isJSONEqual` takes as equal (numbers by
-    /// value, object keys in any order), counting one step per node.
+    /// A key equal for values equal as JSON (numbers by value, so 1 equals
+    /// 1.0; object keys in any order), counting one step per node.
     static func canonicalKey(_ value: JSONValue, steps: inout Int) -> String {
         steps += 1
         switch value {

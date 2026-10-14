@@ -1,5 +1,6 @@
 //! What programs tell their terminal besides what to draw: a title, a working
 //! directory, the bell, desktop notifications and progress reports.
+use crate::graphics::decode_base64;
 use std::collections::VecDeque;
 
 /// Something a program did that a terminal reports rather than shows.
@@ -131,8 +132,7 @@ impl ProgressState {
 /// At most this many events wait to be taken: beyond it, the oldest are
 /// dropped, except that the latest title, working directory and progress
 /// report are kept apart when no later one of their kind waits (see
-/// `Terminal::take_events`). `Terminal::title()` and `Terminal::pwd()`
-/// always give the current values.
+/// `Terminal::take_events`), so the current values are never lost.
 pub const MAX_PENDING_EVENTS: usize = 256;
 /// The text of the events waiting to be taken is at most this long in all
 /// (besides the title and working directory kept apart).
@@ -343,12 +343,6 @@ impl Osc99 {
     }
 }
 
-/// The notification one OSC 99 sequence shows on its own (see
-/// [`Osc99::feed`]); None when it is only a chunk or not a notification.
-pub fn parse_osc99(sequence: &[u8]) -> Option<VtEvent> {
-    Osc99::default().feed(sequence)
-}
-
 /// Kitty's notification identifiers: `[A-Za-z0-9_+.-]`, not empty.
 fn is_identifier(value: &[u8]) -> bool {
     !value.is_empty()
@@ -356,34 +350,4 @@ fn is_identifier(value: &[u8]) -> bool {
         && value
             .iter()
             .all(|&byte| byte.is_ascii_alphanumeric() || b"_+-.".contains(&byte))
-}
-
-/// Standard base64, padding optional.
-fn decode_base64(text: &[u8]) -> Option<Vec<u8>> {
-    let text = text
-        .strip_suffix(b"==")
-        .or_else(|| text.strip_suffix(b"="))
-        .unwrap_or(text);
-    if text.len() % 4 == 1 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(text.len() / 4 * 3 + 2);
-    let (mut bits, mut count) = (0u32, 0);
-    for &byte in text {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        };
-        bits = (bits << 6) | u32::from(value);
-        count += 6;
-        if count >= 8 {
-            count -= 8;
-            out.push((bits >> count) as u8);
-        }
-    }
-    Some(out)
 }

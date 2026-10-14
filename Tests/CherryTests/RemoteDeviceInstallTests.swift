@@ -583,10 +583,11 @@ private enum MachOFixture {
     guard case .hostMissing = state else { Issue.record("\(state)"); return }
     #expect(state.dot == .red && state.subtitle() == "Its session host is missing")
     let device = RemoteDevice(name: "Studio", sshDestination: "studio")
-    let menu = TitlebarProjectMenuModel(
-        projects: [], devices: [.init(device: device, state: state, sessions: [])], currentProjectKey: nil
-    ).snapshot
-    #expect(menu.contains("  Reinstall Session Host…"))
+    var sources = OmniSources()
+    sources.devices = [.init(device: device, state: state, sessions: [])]
+    #expect(OmniProviders.macActions(.device(device.id), sources: sources).contains {
+        $0.title == "Reinstall Session Host…" && $0.command == .switcher(.updateDeviceHost(device.id))
+    })
     let availability = RemoteDeviceAvailability.of(.waitingToReconnect(missing), installationProblem: nil)
     #expect(availability.action == .reinstall && availability.actionTitle == "Reinstall…")
     #expect(RemoteDeviceAvailability.of(.failed(missing), installationProblem: nil).action == .reinstall)
@@ -658,32 +659,34 @@ private enum MachOFixture {
 
 // MARK: - The device
 
-@Test func remoteDeviceInstallMenuOffersUpdateSessionHostForAnOlderInstall() {
+@Test func remoteDeviceInstallMenuOffersUpdateSessionHostForAnOlderInstall() throws {
     // Installed with Ghostty's resources (phase 3); one without them is
     // offered the update at any build (RemoteDeviceParityTests).
     let device = RemoteDevice(
         name: "Studio", sshDestination: "studio", installedBuild: "20260101000000.old", installedArch: "arm64",
         installedResources: true
     )
-    func menu(_ entry: TitlebarProjectMenuModel.Device) -> String {
-        TitlebarProjectMenuModel(projects: [], devices: [entry], currentProjectKey: nil).snapshot
+    func actions(_ entry: TitlebarProjectMenuModel.Device, canModify: Bool = true) -> [String] {
+        var sources = OmniSources()
+        sources.devices = [entry]
+        sources.canModifyDevices = canModify
+        return OmniProviders.macActions(.device(entry.device.id), sources: sources).map(\.title)
     }
-    #expect(menu(.init(device: device, state: .connected(sessionCount: 0), sessions: [], bundledBuild: "20260928120000.new"))
-        .contains("  Update Session Host…\n  Persistent Sessions on Studio…"))
-    #expect(!menu(.init(device: device, state: .connected(sessionCount: 0), sessions: [], bundledBuild: "20260101000000.old"))
+    let newer = actions(.init(device: device, state: .connected(sessionCount: 0), sessions: [], bundledBuild: "20260928120000.new"))
+    let update = try #require(newer.firstIndex(of: "Update Session Host…"))
+    #expect(newer.firstIndex(of: "Persistent Sessions on Studio…") == update + 1)
+    #expect(!actions(.init(device: device, state: .connected(sessionCount: 0), sessions: [], bundledBuild: "20260101000000.old"))
         .contains("Update Session Host…"))
-    #expect(!menu(.init(device: device, state: .connected(sessionCount: 0), sessions: [])).contains("Update Session Host…"))
+    #expect(!actions(.init(device: device, state: .connected(sessionCount: 0), sessions: [])).contains("Update Session Host…"))
     // Another protocol answers: offered whatever the builds say.
     var manual = device
     manual.installedBuild = nil
-    #expect(menu(.init(device: manual, state: .incompatible(reason: "x"), sessions: [])).contains("Update Session Host…"))
+    #expect(actions(.init(device: manual, state: .incompatible(reason: "x"), sessions: [])).contains("Update Session Host…"))
     // Only the copy that keeps the devices changes one.
-    let readOnly = TitlebarProjectMenuModel(
-        projects: [],
-        devices: [.init(device: device, state: .connected(sessionCount: 0), sessions: [], bundledBuild: "20260928120000.new")],
-        currentProjectKey: nil, canModifyDevices: false
-    )
-    #expect(readOnly.snapshot.contains("Update Session Host… (off)"))
+    #expect(!actions(
+        .init(device: device, state: .connected(sessionCount: 0), sessions: [], bundledBuild: "20260928120000.new"),
+        canModify: false
+    ).contains("Update Session Host…"))
 }
 
 @Test func remoteDeviceInstallRecordsTheInstalledBuildAndReadsOlderFiles() throws {

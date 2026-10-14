@@ -169,8 +169,8 @@ private final class WaitMessages {
     let request = PersistentSessionRequest(
         tabID: UUID(), name: "Shell", kind: .terminal, agentName: nil, commandName: nil, projectRoot: nil, columns: 80, rows: 24
     )
-    #expect(PersistentLocalSessions.tags(for: request, requestID: request.requestID, resourcesCopy: hash)[PersistentSessionTag.resources] == hash)
-    #expect(PersistentLocalSessions.tags(for: request, requestID: request.requestID)[PersistentSessionTag.resources] == nil)
+    #expect(PersistentLocalSessions.tags(for: request, resourcesCopy: hash)[PersistentSessionTag.resources] == hash)
+    #expect(PersistentLocalSessions.tags(for: request)[PersistentSessionTag.resources] == nil)
 }
 
 @Test @MainActor func theLaunchTouchesTheLockOnlyAfterItsBackgroundWaitAndQuitAndReopenDoNotWait() async throws {

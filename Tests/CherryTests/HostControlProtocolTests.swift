@@ -491,7 +491,8 @@ private func decode(_ text: String) throws -> HostResponse {
     #expect(session.kittyKeyboardFlags == 31)
     #expect(session.requestID == "6f1a2b3c-4d5e-4f60-8172-8394a5b6c7d8")
 
-    // A host from before these fields: unknown, not false or 0.
+    // A host from before these fields: unknown, not false or 0. A list
+    // without pending holders is complete.
     let older = try decode("""
     {"type":"sessions","host_id":"h","sessions":[
      {"id":"s1","name":"n","cwd":"/","command":[],"cols":80,"rows":24,"state":"running","pid":9}]}
@@ -500,9 +501,9 @@ private func decode(_ text: String) throws -> HostResponse {
         Issue.record("Expected sessions, got \(older.message)")
         return
     }
-    #expect(olderList.pendingHolders == nil)
+    #expect(olderList.pendingHolders == 0)
     #expect(!olderList.awaitsHolders)
-    #expect(!olderList.isComplete)
+    #expect(olderList.isComplete)
     let olderSession = try #require(olderList.sessions.first)
     #expect(olderSession.alternateScreen == nil)
     #expect(olderSession.kittyKeyboardFlags == nil)
@@ -527,9 +528,10 @@ private func decode(_ text: String) throws -> HostResponse {
     #expect(bare["request_id"] == nil)
     let response = HostResponse(req: 3, message: .sessions(HostedSessionList(hostID: "h", sessions: [info], pendingHolders: 1)))
     #expect(try decode(String(decoding: JSONEncoder().encode(response), as: UTF8.self)) == response)
-    let unreported = HostResponse(req: 3, message: .sessions(HostedSessionList(hostID: "h", sessions: [])))
-    #expect(try json(JSONEncoder().encode(unreported))["pending_holders"] == nil)
-    #expect(try json(JSONEncoder().encode(unreported))["lost_sessions"] == nil)
+    // A list always says how many holders are pending, even none.
+    let empty = HostResponse(req: 3, message: .sessions(HostedSessionList(hostID: "h", sessions: [])))
+    #expect(try json(JSONEncoder().encode(empty))["pending_holders"] as? Int == 0)
+    #expect(try json(JSONEncoder().encode(empty))["lost_sessions"] == nil)
     // An exit keeps what identifies the session.
     #expect(info.exited(code: 1, signal: nil).requestID == "r")
 }

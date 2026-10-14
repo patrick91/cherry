@@ -42,17 +42,22 @@ struct RemoteDeviceShell: Sendable {
             let environment = HostControl.sshMasterEnvironment(
                 base: ProcessInfo.processInfo.environment, login: HostedSessionLoginEnvironment.shared.resolve()
             )
-            return RemoteDeviceShell(sshExecutable: sshExecutable(environment: environment), environment: environment)
+            // The same ssh as the masters its scripts may go through.
+            return RemoteDeviceShell(
+                sshExecutable: HostSSHMasterManager.sshExecutable(in: environment), environment: environment
+            )
         }.value
     }
 
-    /// `ssh` on the environment's PATH, else /usr/bin/ssh.
-    static func sshExecutable(environment: [String: String]) -> String {
-        for directory in (environment["PATH"] ?? "").split(separator: ":") where !directory.isEmpty {
-            let candidate = "\(directory)/ssh"
-            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
-        }
-        return "/usr/bin/ssh"
+    /// The app's, through `destination`'s SSH master while it is up (else
+    /// its own BatchMode ssh).
+    static func app(
+        through destination: String, masters: HostSSHMasterManager = .shared, timeout: TimeInterval? = nil
+    ) async -> RemoteDeviceShell {
+        var shell = await app()
+        shell.controlPath = masters.controlPathIfUp(for: destination)
+        if let timeout { shell.timeout = timeout }
+        return shell
     }
 
     /// The ssh arguments for running `sh -s` on `destination`.
@@ -77,9 +82,27 @@ struct RemoteDeviceShell: Sendable {
     /// Runs `script` on `destination`. Never on the main actor's time: the
     /// process is waited for on a thread of its own.
     func run(_ script: String, on destination: String) async -> Output {
+        await runData(script, on: destination).text
+    }
+
+    /// `run`, with what the script printed as bytes.
+    func runData(_ script: String, on destination: String) async -> DataOutput {
+        let shell = self
+        return await Self.onOwnThread { shell.runSynchronously(script, on: destination) }
+    }
+
+    /// Runs `ssh <arguments>`, a command to a master
+    /// (`HostSSHMasterManager.commandArguments`), with this ssh and
+    /// environment for at most 15 s, on a thread of its own: its exit
+    /// status (nil when it was signalled or outlived that) and the start of
+    /// its standard error.
+    func runMasterCommand(_ arguments: [String]) async -> (status: Int32?, errors: String) {
         let shell = self
         return await Self.onOwnThread {
-            shell.runSynchronously(script, on: destination).text
+            let result = HostSpawnedProcess.run(
+                executable: shell.sshExecutable, arguments: arguments, environment: shell.environment, timeout: 15
+            )
+            return (status: result.exitCode, errors: result.errors)
         }
     }
 
@@ -165,43 +188,21 @@ struct RemoteDeviceShell: Sendable {
         input: String,
         timeout: TimeInterval
     ) -> DataOutput {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.environment = environment
-        let stdin = Pipe()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardInput = stdin
-        process.standardOutput = stdout
-        process.standardError = stderr
-        do {
-            try process.run()
-        } catch {
-            return DataOutput(status: 255, standardOutput: Data(), standardError: "Could not run ssh: \(error.localizedDescription)")
+        let result = CapturedProcess.run(
+            executable: URL(fileURLWithPath: executable),
+            arguments: arguments,
+            environment: environment,
+            input: Data(input.utf8),
+            timeout: timeout
+        )
+        if let launchError = result.launchError {
+            return DataOutput(status: 255, standardOutput: Data(), standardError: "Could not run ssh: \(launchError.localizedDescription)")
         }
-        let group = DispatchGroup()
-        let outData = PipeOutputBox()
-        let errData = PipeOutputBox()
-        readToEnd(stdout.fileHandleForReading, into: outData, group: group)
-        readToEnd(stderr.fileHandleForReading, into: errData, group: group)
-        stdin.fileHandleForWriting.write(Data(input.utf8))
-        try? stdin.fileHandleForWriting.close()
-        var timedOut = false
-        if group.wait(timeout: .now() + timeout) == .timedOut {
-            timedOut = true
-            process.terminate()
-            if group.wait(timeout: .now() + 2) == .timedOut {
-                kill(process.processIdentifier, SIGKILL)
-                _ = group.wait(timeout: .now() + 2)
-            }
-        }
-        process.waitUntilExit()
         return DataOutput(
-            status: timedOut ? 255 : process.terminationStatus,
-            standardOutput: outData.data,
-            standardError: String(decoding: errData.data, as: UTF8.self),
-            timedOut: timedOut
+            status: result.timedOut ? 255 : result.status,
+            standardOutput: result.standardOutput,
+            standardError: String(decoding: result.standardError, as: UTF8.self),
+            timedOut: result.timedOut
         )
     }
 }
@@ -435,6 +436,24 @@ enum RemoteDeviceProbe {
         return lines.joined(separator: "\n") + "\n"
     }
 
+    /// The script that runs the device's cherry-host (`remoteHostPath`,
+    /// else the one on its PATH) as `<command> --json <arguments>` (words
+    /// for sh) after `prelude`, `begin` printed on its own line first: what
+    /// `project-info` and `ports` run.
+    static func hostCommandScript(
+        remoteHostPath: String?, begin: String, command: String, arguments: [String], prelude: [String] = []
+    ) -> String {
+        var lines = prelude
+        if let path = remoteHostPath?.nilIfEmpty {
+            lines.append("host=\(shellWord(path))")
+        } else {
+            lines.append("host=cherry-host")
+        }
+        lines.append("printf '%s\\n' '\(begin)'")
+        lines.append("exec \"$host\" \(command) --json " + arguments.joined(separator: " "))
+        return lines.joined(separator: "\n") + "\n"
+    }
+
     /// `~/…` as `"$HOME"/'…'`, anything else single-quoted, for sh.
     static func shellWord(_ path: String) -> String {
         if let rest = path.nilIfEmpty.flatMap({ $0.hasPrefix("~/") ? String($0.dropFirst(2)) : nil }) {
@@ -444,8 +463,9 @@ enum RemoteDeviceProbe {
         return singleQuoted(path)
     }
 
+    /// `ShellQuoting.singleQuoted`, which the device scripts here use.
     nonisolated static func singleQuoted(_ text: String) -> String {
-        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        ShellQuoting.singleQuoted(text)
     }
 
     /// Parses what the script printed (and how ssh ended).

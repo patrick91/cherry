@@ -87,22 +87,6 @@ enum RemoteLaunchSpec {
         /// Why they are not known (the capture failed, or has not run), for
         /// the message of a command that is then not found.
         var loginEnvironmentProblem: String?
-
-        init(
-            shell: String? = nil,
-            homeDirectory: String? = nil,
-            resources: Resources? = nil,
-            mcp: RemoteMCPLaunch? = nil,
-            loginEnvironment: [String: String]? = nil,
-            loginEnvironmentProblem: String? = nil
-        ) {
-            self.shell = shell
-            self.homeDirectory = homeDirectory
-            self.resources = resources
-            self.mcp = mcp
-            self.loginEnvironment = loginEnvironment
-            self.loginEnvironmentProblem = loginEnvironmentProblem
-        }
     }
 
     /// What a command's launch says when the device's login environment
@@ -214,7 +198,7 @@ enum RemoteLaunchSpec {
                 )
                 argv = HostedLaunchSpec.argv(
                     command: command,
-                    account: HostedLaunchAccount(userName: "remote", homeDirectory: "", shell: loginShell, hushLogin: false)
+                    account: HostedLaunchAccount(userName: "remote", homeDirectory: "", shell: loginShell)
                 )
             }
         } else {

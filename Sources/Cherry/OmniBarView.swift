@@ -132,12 +132,7 @@ struct OmniBarOverlay: View {
             settings: .shared,
             registry: .shared,
             backgroundSessionsModel: { .shared },
-            switcher: ProjectSwitcherActions(
-                settings: .shared,
-                chromeState: chromeState,
-                openProject: openProject,
-                openSettings: openSettings
-            ),
+            switcher: ProjectSwitcherActions(settings: .shared, chromeState: chromeState, openProject: openProject),
             editorDiscovery: .shared,
             projects: { live.controller.sources.projects },
             openSettings: openSettings,
@@ -200,7 +195,6 @@ private struct OmniBarPanel: View {
                     text: Binding(get: { controller.query }, set: { controller.setQuery($0) }),
                     placeholder: controller.placeholder,
                     focusRequest: focusRequest,
-                    onSubmit: {},
                     accessibilityLabel: controller.scope.map { "Search \($0.label)" } ?? "Search everything",
                     onCommand: handleCommand
                 )

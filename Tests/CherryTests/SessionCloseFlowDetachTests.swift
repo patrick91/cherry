@@ -29,21 +29,6 @@ private final class ClosingWindow: NSWindow {
     }
 }
 
-/// A window's chrome whose toasts never dismiss themselves or announce.
-@MainActor
-private func quietChromeState() -> ProjectWindowChromeState {
-    ProjectWindowChromeState(toasts: ProjectWindowToasts(
-        schedule: { _, _ in },
-        announce: { _ in },
-        voiceOverEnabled: { false }
-    ))
-}
-
-@MainActor
-private func sidebarName(of session: TerminalSession) -> String {
-    SidebarSessionLabel.label(for: session, pathDisplayMode: TerminalSettings.shared.sidebarTerminalPathDisplayMode).title
-}
-
 @Test @MainActor func commandDDetachesOnlyTheFocusedPaneOfASplit() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()

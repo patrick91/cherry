@@ -8,11 +8,10 @@ mod graphics;
 pub mod kitty;
 mod program_status;
 use events::ProgramStatusReport;
-pub use events::{
-    parse_osc99, Osc99, ProgressState, VtEvent, MAX_PENDING_EVENTS, MAX_PENDING_EVENT_BYTES,
-};
+pub use events::{Osc99, ProgressState, VtEvent, MAX_PENDING_EVENTS, MAX_PENDING_EVENT_BYTES};
 pub use graphics::{
-    base64, decode_rgba, GraphicsReplay, Placement, IMAGE_RESET, MAX_DECODED_BYTES, MAX_IMAGE_SIDE,
+    base64, decode_base64, decode_rgba, GraphicsReplay, Placement, IMAGE_RESET, MAX_DECODED_BYTES,
+    MAX_IMAGE_SIDE,
 };
 pub use program_status::{
     ProgramState, ProgramStatusKind, ProgramStatusRecord, MAX_PROGRAM_STATUS_RECORDS,
@@ -95,7 +94,6 @@ unsafe extern "C" {
     fn cherry_vt_plain_active(term: Handle, out: *mut *mut u8, len: *mut usize) -> i32;
     fn cherry_vt_string(term: Handle, which: i32, ptr: *mut *const u8, len: *mut usize) -> i32;
     fn cherry_vt_info(term: Handle, out: *mut Info) -> i32;
-    fn cherry_vt_set_terminfo_name(term: Handle, name: *const u8, len: usize) -> i32;
     fn cherry_vt_set_colors(
         term: Handle,
         foreground: *const u8,
@@ -474,7 +472,7 @@ pub struct Cursor {
     /// Whether the alternate screen shows.
     pub alternate: bool,
     /// Rows of history above the active screen: screen row `history_rows`
-    /// is the active screen's first (see `Terminal::row_wraps`).
+    /// is the active screen's first (see `Terminal::lines_ending`).
     pub history_rows: u64,
 }
 
@@ -602,29 +600,12 @@ impl Terminal {
         self.callbacks().events.take()
     }
 
-    /// The title the program set (OSC 0 or 2); None while it has none.
-    pub fn title(&self) -> Option<String> {
-        self.string(TITLE)
-    }
-
-    /// The working directory the program reported, raw (see
-    /// `VtEvent::Pwd`); None while it has reported none.
-    pub fn pwd(&self) -> Option<String> {
-        self.string(PWD)
-    }
-
     /// Whether mode `value` is set, as the terminal holds it now: a DEC
     /// private mode (`CSI ? value h`), or an ANSI mode (`CSI value h`) when
     /// `ansi`. For example `mode(1, false)` is DECCKM, application cursor
     /// keys. An error for a mode libghostty-vt does not know.
     pub fn mode(&self, value: u16, ansi: bool) -> Result<bool> {
         mode(self.handle.as_ptr(), value, ansi)
-    }
-
-    fn string(&self, which: i32) -> Option<String> {
-        // Borrowed until the next mutating call: copied at once.
-        let bytes = self.borrowed_string(which);
-        (!bytes.is_empty()).then(|| String::from_utf8_lossy(bytes).into_owned())
     }
 
     /// The title or working directory as the terminal holds it, valid until
@@ -691,46 +672,55 @@ impl Terminal {
     /// when a prompt is cleared this way; otherwise the resize is Ghostty's.
     ///
     /// The clear is a cursor position, an erase below and the cursor put
-    /// back, fed as the output's own would be: an unfinished sequence the
-    /// output left is taken aside and fed again after it, as in
-    /// `clear_history` (one that leaves a UTF-8 character half written
-    /// makes the resize Ghostty's).
+    /// back, fed as the output's own would be (`write_between_output`, as
+    /// in `clear_history`; output that leaves a UTF-8 character half
+    /// written makes the resize Ghostty's).
     fn clear_prompt_for_reflow(&mut self) {
         if self.prompt_redraw != PromptRedraw::All {
             return;
         }
-        let handle = self.handle.as_ptr();
         let mut start = -1;
-        if unsafe { cherry_vt_prompt_start(handle, &mut start) } != 0 || start < 0 {
+        if unsafe { cherry_vt_prompt_start(self.handle.as_ptr(), &mut start) } != 0 || start < 0 {
             return;
         }
         let Ok(cursor) = self.cursor() else {
             return;
         };
-        let Ok(continuation) = allocated(|ptr, len| unsafe {
-            ghostty_terminal_continuation_alloc(handle, std::ptr::null(), ptr, len)
-        }) else {
-            return;
-        };
-        if continuation.first().is_some_and(|&byte| byte >= 0x80) {
-            return;
-        }
         let clear = format!(
             "\x1b[{};1H\x1b[J\x1b[{};{}H",
             start + 1,
             cursor.y + 1,
             cursor.x + 1
         );
+        let _ = self.write_between_output(clear.as_bytes());
+    }
+
+    /// Feed `bytes`, which have no reply, at this point of the output
+    /// without disturbing what the output left unfinished: an unfinished
+    /// escape sequence or string is taken aside (its continuation), ended
+    /// with CAN, and fed again after them, so the output that follows
+    /// completes it as it would have. False, and nothing fed, while a UTF-8
+    /// character is half written (CAN would make it U+FFFD). Replies the
+    /// output caused are kept.
+    fn write_between_output(&mut self, bytes: &[u8]) -> Result<bool> {
+        let handle = self.handle.as_ptr();
+        let continuation = continuation(handle)?;
+        // In the middle of a UTF-8 character (a lead or continuation byte
+        // first: every sequence starts with a C0 control, ESC among them).
+        if continuation.first().is_some_and(|&byte| byte >= 0x80) {
+            return Ok(false);
+        }
         let replies = std::mem::take(&mut self.callbacks().replies);
         if continuation.is_empty() {
-            write(handle, clear.as_bytes());
+            write(handle, bytes);
         } else {
             write(handle, b"\x18");
-            write(handle, clear.as_bytes());
+            write(handle, bytes);
             write(handle, &continuation);
         }
-        // Neither the clear nor an unfinished sequence has a reply.
+        // Neither the bytes nor an unfinished sequence has a reply.
         self.callbacks().replies = replies;
+        Ok(true)
     }
 
     /// Test support: how many images `graphics_replay` compressed (those
@@ -956,16 +946,6 @@ impl Terminal {
         Ok(replay)
     }
 
-    /// The terminfo entry name the program runs under (its TERM), reported
-    /// for an XTGETTCAP `TN` query. Without one (the default, or after an
-    /// empty name) `TN` goes unanswered. At most 128 bytes.
-    pub fn set_terminfo_name(&mut self, name: &str) -> Result<()> {
-        check(
-            unsafe { cherry_vt_set_terminfo_name(self.handle.as_ptr(), name.as_ptr(), name.len()) },
-            "terminfo name",
-        )
-    }
-
     /// Clear the history above the screen, as ED 3 (`CSI 3 J`) would at
     /// this point of the output, without disturbing what the output left
     /// unfinished. An unfinished escape sequence or string is taken aside
@@ -983,31 +963,10 @@ impl Terminal {
     }
 
     fn try_clear_history(&mut self) -> Result<bool> {
-        let handle = self.handle.as_ptr();
-        let continuation = match allocated(|ptr, len| unsafe {
-            ghostty_terminal_continuation_alloc(handle, std::ptr::null(), ptr, len)
-        }) {
-            Ok(continuation) => continuation,
-            Err(error) => {
-                self.history_clear_pending = false;
-                return Err(error);
-            }
-        };
-        // In the middle of a UTF-8 character (a lead or continuation byte
-        // first: every sequence starts with a C0 control, ESC among them).
-        if continuation.first().is_some_and(|&byte| byte >= 0x80) {
-            return Ok(false);
-        }
-        self.history_clear_pending = false;
-        if continuation.is_empty() {
-            write(handle, b"\x1b[3J");
-        } else {
-            write(handle, b"\x18\x1b[3J");
-            write(handle, &continuation);
-        }
-        // Neither the erase nor an unfinished sequence has a reply.
-        self.callbacks().replies.clear();
-        Ok(true)
+        let cleared = self.write_between_output(b"\x1b[3J");
+        // Only a half-written character makes it wait.
+        self.history_clear_pending = matches!(cleared, Ok(false));
+        cleared
     }
 
     /// The colours and appearance the terminal reports to the program: the
@@ -1325,25 +1284,6 @@ impl Terminal {
         Ok(count)
     }
 
-    /// Whether screen row `y` (history first, then the active screen; see
-    /// `Cursor::history_rows`) is soft-wrapped: its text continues on the
-    /// next row.
-    pub fn row_wraps(&self, y: u64) -> Result<bool> {
-        let (mut wrap, mut continuation) = (false, false);
-        check(
-            unsafe {
-                cherry_vt_row_flags(
-                    self.handle.as_ptr(),
-                    u32::try_from(y)?,
-                    &mut wrap,
-                    &mut continuation,
-                )
-            },
-            "row",
-        )?;
-        Ok(wrap)
-    }
-
     #[doc(hidden)]
     pub fn inspect(&self) -> Result<Inspection> {
         let handle = self.handle.as_ptr();
@@ -1413,20 +1353,11 @@ impl Terminal {
         })
     }
 
-    /// `graphics`: kitty graphics commands that follow the active screen's
-    /// content in a snapshot (never in a refresh).
     /// Test support: each placement of the active screen, with its image.
     fn describe_graphics(&self) -> Result<Vec<String>> {
         let handle = self.handle.as_ptr();
-        let mut placements = vec![graphics::RawPlacement::default(); 256];
-        let mut count = 0;
-        check(
-            unsafe { cherry_vt_placements(handle, placements.as_mut_ptr(), 256, &mut count) },
-            "placements",
-        )?;
-        placements.truncate(count.min(256));
         let mut out = Vec::new();
-        for p in placements {
+        for p in self.placements()? {
             let mut raw = graphics::RawImage {
                 width: 0,
                 height: 0,
@@ -1477,9 +1408,7 @@ impl Terminal {
 
     fn encode(&self, replay: Replay<'_>, graphics: &[u8]) -> Result<Vec<u8>> {
         let handle = self.handle.as_ptr();
-        let continuation = allocated(|ptr, len| unsafe {
-            ghostty_terminal_continuation_alloc(handle, std::ptr::null(), ptr, len)
-        })?;
+        let continuation = continuation(handle)?;
         let (refresh, skip, layout) = match replay {
             Replay::Snapshot { skip, layout } => (false, skip, layout),
             Replay::Refresh => (true, 0, None),
@@ -1968,6 +1897,15 @@ fn clone_terminal(term: Handle) -> Result<OwnedHandle> {
     let mut cloned = std::ptr::null_mut();
     check(unsafe { cherry_vt_clone(term, &mut cloned) }, "clone")?;
     Ok(OwnedHandle(NonNull::new(cloned).expect("successful clone")))
+}
+
+/// What the output left unfinished: an escape sequence or string, or a
+/// UTF-8 character (empty when nothing is), to be fed again after bytes
+/// written in between.
+fn continuation(term: Handle) -> Result<Vec<u8>> {
+    allocated(|ptr, len| unsafe {
+        ghostty_terminal_continuation_alloc(term, std::ptr::null(), ptr, len)
+    })
 }
 
 fn allocated(f: impl FnOnce(*mut *mut u8, *mut usize) -> i32) -> Result<Vec<u8>> {

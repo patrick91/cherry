@@ -1,11 +1,15 @@
 import CherryControl
-import CryptoKit
 import Foundation
 
 @MainActor
 final class ProjectTodoStore: ObservableObject {
     @Published private(set) var todos: [ProjectTodo] = []
     @Published private(set) var tagCatalog: [TodoTag] = []
+
+    /// The todo to select when none is: the first one not done, else the first.
+    var firstSelectableTodo: ProjectTodo? {
+        todos.first { $0.status != .done } ?? todos.first
+    }
 
     let projectRoot: String
     private let fileURL: URL
@@ -41,18 +45,11 @@ final class ProjectTodoStore: ObservableObject {
     }
 
     static func defaultStorageDirectory() -> URL {
-        FileManager.default
-            .homeDirectoryForCurrentUser
-            .appendingPathComponent("Library", isDirectory: true)
-            .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent(CherryAppIdentity.current.applicationSupportName, isDirectory: true)
-            .appendingPathComponent("Todos", isDirectory: true)
+        CherryAppIdentity.applicationSupportDirectory().appendingPathComponent("Todos", isDirectory: true)
     }
 
     static func projectStorageName(projectRoot: String) -> String {
-        let digest = SHA256.hash(data: Data(projectRoot.utf8))
-        let hex = digest.map { String(format: "%02x", $0) }.joined()
-        return "\(hex).json"
+        CherryAppIdentity.projectFileName(for: projectRoot)
     }
 
     func create(title: String, markdown: String, status: TodoStatus = .backlog, tags: [String] = []) throws -> ProjectTodo {
@@ -75,10 +72,7 @@ final class ProjectTodoStore: ObservableObject {
     }
 
     func update(id: UUID, title: String?, markdown: String?, status: TodoStatus?, tags: [String]? = nil) throws -> ProjectTodo {
-        guard let index = todos.firstIndex(where: { $0.id == id }) else {
-            throw CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(id.uuidString).")
-        }
-
+        let index = try indexOfTodo(id)
         var todo = todos[index]
         let oldStatus = todo.status
         if let title {
@@ -106,19 +100,14 @@ final class ProjectTodoStore: ObservableObject {
     }
 
     func move(id: UUID, status requestedStatus: TodoStatus?, afterTodoID: UUID?) throws -> ProjectTodo {
-        guard let index = todos.firstIndex(where: { $0.id == id }) else {
-            throw CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(id.uuidString).")
-        }
-
+        let index = try indexOfTodo(id)
         let originalStatus = todos[index].status
         let targetStatus = requestedStatus ?? originalStatus
         if let afterTodoID, afterTodoID == id {
             throw CherryControlError(code: "invalid_todo_move", message: "A todo cannot be moved after itself.")
         }
         if let afterTodoID {
-            guard let after = todos.first(where: { $0.id == afterTodoID }) else {
-                throw CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(afterTodoID.uuidString).")
-            }
+            guard let after = todos.first(where: { $0.id == afterTodoID }) else { throw Self.notFound(afterTodoID) }
             guard after.status == targetStatus else {
                 throw CherryControlError(code: "invalid_todo_move", message: "afterTodoID must refer to a todo in the target status.")
             }
@@ -190,9 +179,7 @@ final class ProjectTodoStore: ObservableObject {
         authorTerminalID: String?,
         authorAgentName: String?
     ) throws -> ProjectTodo {
-        guard let index = todos.firstIndex(where: { $0.id == id }) else {
-            throw CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(id.uuidString).")
-        }
+        let index = try indexOfTodo(id)
         let now = Date()
         var todo = todos[index]
         todo.comments.append(.init(
@@ -211,9 +198,7 @@ final class ProjectTodoStore: ObservableObject {
     }
 
     func updateComment(todoID: UUID, commentID: UUID, markdown: String) throws -> ProjectTodo {
-        guard let todoIndex = todos.firstIndex(where: { $0.id == todoID }) else {
-            throw CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(todoID.uuidString).")
-        }
+        let todoIndex = try indexOfTodo(todoID)
         guard let commentIndex = todos[todoIndex].comments.firstIndex(where: { $0.id == commentID }) else {
             throw CherryControlError(code: "todo_comment_not_found", message: "No Cherry todo comment exists with id \(commentID.uuidString).")
         }
@@ -226,9 +211,7 @@ final class ProjectTodoStore: ObservableObject {
     }
 
     func deleteComment(todoID: UUID, commentID: UUID) throws -> ProjectTodo {
-        guard let todoIndex = todos.firstIndex(where: { $0.id == todoID }) else {
-            throw CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(todoID.uuidString).")
-        }
+        let todoIndex = try indexOfTodo(todoID)
         let originalCount = todos[todoIndex].comments.count
         todos[todoIndex].comments.removeAll { $0.id == commentID }
         guard todos[todoIndex].comments.count != originalCount else {
@@ -244,9 +227,7 @@ final class ProjectTodoStore: ObservableObject {
     func delete(id: UUID) throws {
         let originalCount = todos.count
         todos.removeAll { $0.id == id }
-        guard todos.count != originalCount else {
-            throw CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(id.uuidString).")
-        }
+        guard todos.count != originalCount else { throw Self.notFound(id) }
         for status in TodoStatus.allCases {
             normalizePositions(in: status)
         }
@@ -255,10 +236,16 @@ final class ProjectTodoStore: ObservableObject {
     }
 
     func todo(id: UUID) throws -> ProjectTodo {
-        guard let todo = todos.first(where: { $0.id == id }) else {
-            throw CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(id.uuidString).")
-        }
-        return todo
+        try todos[indexOfTodo(id)]
+    }
+
+    private func indexOfTodo(_ id: UUID) throws -> Int {
+        guard let index = todos.firstIndex(where: { $0.id == id }) else { throw Self.notFound(id) }
+        return index
+    }
+
+    private static func notFound(_ id: UUID) -> CherryControlError {
+        CherryControlError(code: "todo_not_found", message: "No Cherry todo exists with id \(id.uuidString).")
     }
 
     private func load() {
@@ -345,8 +332,8 @@ final class ProjectTodoStore: ObservableObject {
         var seen = Set<String>()
 
         for rawName in names {
-            guard let name = normalizedTagName(rawName) else { continue }
-            let id = tagID(forNormalizedName: name)
+            guard let name = Self.normalizedTagName(rawName) else { continue }
+            let id = Self.tagID(forNormalizedName: name)
             guard seen.insert(id).inserted else { continue }
 
             if let existing = tagCatalog.first(where: { $0.id == id }) {
@@ -365,8 +352,8 @@ final class ProjectTodoStore: ObservableObject {
     private func reconcileTagsAfterLoad() {
         var catalogByID: [String: TodoTag] = [:]
         for tag in tagCatalog {
-            guard let name = normalizedTagName(tag.name) else { continue }
-            let id = tagID(forNormalizedName: name)
+            guard let name = Self.normalizedTagName(tag.name) else { continue }
+            let id = Self.tagID(forNormalizedName: name)
             if catalogByID[id] == nil {
                 catalogByID[id] = TodoTag(
                     id: id,
@@ -380,8 +367,8 @@ final class ProjectTodoStore: ObservableObject {
             var resolved: [TodoTag] = []
             var seen = Set<String>()
             for tag in todos[todoIndex].tags {
-                guard let name = normalizedTagName(tag.name) else { continue }
-                let id = tagID(forNormalizedName: name)
+                guard let name = Self.normalizedTagName(tag.name) else { continue }
+                let id = Self.tagID(forNormalizedName: name)
                 guard seen.insert(id).inserted else { continue }
 
                 if let catalogTag = catalogByID[id] {
@@ -410,13 +397,16 @@ final class ProjectTodoStore: ObservableObject {
         }
     }
 
-    private func normalizedTagName(_ name: String) -> String? {
+    /// A tag name with its words joined by single spaces; nil when it has none.
+    static func normalizedTagName(_ name: String) -> String? {
         let parts = name.split(whereSeparator: \.isWhitespace)
         let normalized = parts.joined(separator: " ")
         return normalized.isEmpty ? nil : normalized
     }
 
-    private func tagID(forNormalizedName name: String) -> String {
+    /// The id of the tag with this normalized name, the same for any case or
+    /// diacritics.
+    static func tagID(forNormalizedName name: String) -> String {
         name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
             .lowercased()
     }

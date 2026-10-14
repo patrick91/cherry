@@ -564,10 +564,8 @@ final class UpdateDeviceHostModel: ObservableObject {
         switch control.state {
         case .connected, .connecting:
             return
-        case .waitingToReconnect:
-            control.reconnectNow()
-        case .idle, .failed:
-            Task { _ = try? await control.connect(retryingLoginEnvironment: true) }
+        case .waitingToReconnect, .idle, .failed:
+            control.reconnectAsked()
         }
     }
 }
@@ -638,14 +636,14 @@ struct UpdateDeviceHostSheet: View {
     }
 }
 
-/// Shows Update Session Host… for a device as a sheet on the key window
-/// (the device menu, and the Update… of a tab's or window's bar).
+/// Shows a device's sheet (Update Session Host…, Set Up Cherry MCP…) on
+/// the key window, else as a window of its own; `content` is given what
+/// closes it.
 @MainActor
-enum RemoteDeviceUpdatePresenter {
-    static func present(deviceID: UUID, store: RemoteDeviceStore = .shared) {
-        guard store.device(id: deviceID) != nil else { return }
+enum RemoteDeviceSheet {
+    static func present<Content: View>(size: NSSize, content: (_ close: @escaping () -> Void) -> Content) {
         let panel = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 240),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.titled], backing: .buffered, defer: true
         )
         weak let weakPanel = panel
@@ -653,9 +651,7 @@ enum RemoteDeviceUpdatePresenter {
             guard let panel = weakPanel else { return }
             if let parent = panel.sheetParent { parent.endSheet(panel) } else { panel.close() }
         }
-        panel.contentViewController = NSHostingController(
-            rootView: UpdateDeviceHostSheet(model: UpdateDeviceHostModel(deviceID: deviceID, store: store), close: close)
-        )
+        panel.contentViewController = NSHostingController(rootView: content(close))
         if let parent = NSApp.keyWindow ?? NSApp.mainWindow {
             parent.beginSheet(panel)
         } else {
@@ -663,10 +659,22 @@ enum RemoteDeviceUpdatePresenter {
             panel.makeKeyAndOrderFront(nil)
         }
     }
+}
+
+/// Shows Update Session Host… for a device as a sheet on the key window
+/// (the device menu, and the Update… of a tab's or window's bar).
+@MainActor
+enum RemoteDeviceUpdatePresenter {
+    static func present(deviceID: UUID, store: RemoteDeviceStore = .shared) {
+        guard store.device(id: deviceID) != nil else { return }
+        RemoteDeviceSheet.present(size: NSSize(width: 520, height: 240)) { close in
+            UpdateDeviceHostSheet(model: UpdateDeviceHostModel(deviceID: deviceID, store: store), close: close)
+        }
+    }
 
     /// The device a hosting runs on.
     static func deviceID(for host: HostedSessionHost, store: RemoteDeviceStore = .shared) -> UUID? {
-        store.devices.first { $0.host == host }?.id
+        store.device(for: host)?.id
     }
 }
 
@@ -875,12 +883,7 @@ enum RemoteDeviceAvailability: Equatable {
         case .reconnectNow, .retryLogin:
             // Retry: looks at it (Background Sessions, the picker) may run
             // again too.
-            RemoteDevicePeeks.shared.retry(hosting.profile.host)
-            if case .waitingToReconnect = control.state {
-                control.reconnectNow()
-            } else {
-                Task { _ = try? await control.connect(retryingLoginEnvironment: true) }
-            }
+            control.reconnectAsked()
         case .trustNewIdentity:
             RemoteDeviceAlerts.confirmTrustNewIdentity(of: hosting.profile.host, name: hosting.profile.displayName)
         case .update, .reinstall:
@@ -963,16 +966,7 @@ private struct RemoteHostStateBarContent: View {
                 }
             }
             .help(availability.detail ?? "")
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
-            .frame(maxWidth: 460)
-            .projectWindowToastObstacle()
+            .floatingBarChrome()
         }
     }
 }
@@ -996,16 +990,7 @@ struct RemoteLaunchFailureBar: View {
                 Button("Retry") { session.retryPersistentSession() }
                     .controlSize(.small)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
-            .frame(maxWidth: 520)
-            .projectWindowToastObstacle()
+            .floatingBarChrome(maxWidth: 520)
         }
     }
 }

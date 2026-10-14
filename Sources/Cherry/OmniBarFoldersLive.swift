@@ -43,14 +43,10 @@ enum OmniLocalFolders {
             return lhs < rhs
         }
         var entries: [OmniFolderEntry] = []
-        var truncated = false
         for name in ordered {
             var isFolder: ObjCBool = false
             guard fileManager.fileExists(atPath: base + "/" + name, isDirectory: &isFolder), isFolder.boolValue else { continue }
-            guard entries.count < OmniFolderListingLimits.entries else {
-                truncated = true
-                break
-            }
+            guard entries.count < OmniFolderListingLimits.entries else { break }
             let isProtected = base == home && privacyProtectedHomeFolders.contains(name)
             entries.append(OmniFolderEntry(
                 name: name,
@@ -60,8 +56,7 @@ enum OmniLocalFolders {
         return .listed(OmniFolderContents(
             path: path,
             isRepository: fileManager.fileExists(atPath: base + "/.git"),
-            entries: entries,
-            truncated: truncated
+            entries: entries
         ))
     }
 
@@ -176,7 +171,6 @@ enum OmniRemoteFolders {
         var path: String?
         var isRepository = false
         var entries: [OmniFolderEntry] = []
-        var truncated = false
         var ended = false
         for record in records {
             guard let tag = record.first else { continue }
@@ -189,7 +183,6 @@ enum OmniRemoteFolders {
                       entries.count < OmniFolderListingLimits.entries
                 else { continue }
                 entries.append(OmniFolderEntry(name: value, isRepository: tag == "G"))
-            case "T": truncated = true
             case "E": ended = true
             default: continue
             }
@@ -197,7 +190,7 @@ enum OmniRemoteFolders {
         guard ended, let path, path.hasPrefix("/") else {
             return .failed(output.timedOut ? "it did not answer in time" : "the listing was cut short")
         }
-        return .listed(OmniFolderContents(path: path, isRepository: isRepository, entries: entries, truncated: truncated))
+        return .listed(OmniFolderContents(path: path, isRepository: isRepository, entries: entries))
     }
 
     /// Makes the folder `path` (absolute) there, not its parents: `K` when
@@ -287,31 +280,25 @@ enum OmniRemoteFolders {
     /// The app's shell to `device`: through its SSH master while that is
     /// up, with a short timeout.
     static func shell(for device: RemoteDevice, masters: HostSSHMasterManager = .shared) async -> RemoteDeviceShell {
-        var shell = await RemoteDeviceShell.app()
-        shell.controlPath = masters.controlPathIfUp(for: device.sshDestination)
+        var shell = await RemoteDeviceShell.app(through: device.sshDestination, masters: masters, timeout: timeout)
         shell.connectTimeout = Int(timeout)
-        shell.timeout = timeout
         return shell
     }
 
     static func list(_ directory: String, on destination: String, shell: RemoteDeviceShell) async -> OmniFolderListing {
-        let script = listScript(directory: directory)
-        let output = await RemoteDeviceShell.onOwnThread { shell.runSynchronously(script, on: destination) }
+        let output = await shell.runData(listScript(directory: directory), on: destination)
         return parseListing(output)
     }
 
     static func create(_ path: String, on destination: String, shell: RemoteDeviceShell) async -> OmniFolderCreation {
-        let script = createScript(path: path)
-        let output = await RemoteDeviceShell.onOwnThread { shell.runSynchronously(script, on: destination) }
+        let output = await shell.runData(createScript(path: path), on: destination)
         return parseCreation(output, path: path)
     }
 
     static func scan(on destination: String, shell: RemoteDeviceShell) async -> [String]? {
         var shell = shell
         shell.timeout = max(shell.timeout, 10)
-        let script = scanScript()
-        let captured = shell
-        let output = await RemoteDeviceShell.onOwnThread { captured.runSynchronously(script, on: destination) }
+        let output = await shell.runData(scanScript(), on: destination)
         return parseScan(output)
     }
 }
@@ -487,7 +474,7 @@ final class OmniFolderBrowser {
 @MainActor
 final class OmniRepositoryScanner {
     static let shared = OmniRepositoryScanner(
-        cacheURL: AppInstanceLock.defaultFileURL().deletingLastPathComponent()
+        cacheURL: CherryAppIdentity.applicationSupportDirectory()
             .appendingPathComponent(OmniRepositoryScanner.fileName, isDirectory: false),
         canWrite: { AppInstanceLock.shared.isHeld }
     )
@@ -631,8 +618,7 @@ enum RemoteDeviceProjectAdding {
     /// The app's: `RemoteDeviceProbe.resolveDirectory` over the device's
     /// master while it is up.
     static func resolveOverSSH(_ path: String, _ device: RemoteDevice) async -> Result<String, RemoteDeviceProbe.RemoteDirectoryError> {
-        var shell = await RemoteDeviceShell.app()
-        shell.controlPath = HostSSHMasterManager.shared.controlPathIfUp(for: device.sshDestination)
+        let shell = await RemoteDeviceShell.app(through: device.sshDestination)
         return await RemoteDeviceProbe.resolveDirectory(path, on: device.sshDestination, shell: shell)
     }
 

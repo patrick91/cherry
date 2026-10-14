@@ -10,10 +10,6 @@ private func mcpControlDebugLog(_ message: @autoclosure () -> String) {
 }
 
 final class CherryControlServer: @unchecked Sendable {
-    private weak var workspace: TerminalWorkspace?
-    private weak var noteStore: ProjectNoteStore?
-    private weak var todoStore: ProjectTodoStore?
-    private weak var chromeState: ProjectWindowChromeState?
     private let workspaceProvider: @MainActor () -> TerminalWorkspace?
     private let noteStoreProvider: @MainActor () -> ProjectNoteStore?
     private let todoStoreProvider: @MainActor () -> ProjectTodoStore?
@@ -27,14 +23,15 @@ final class CherryControlServer: @unchecked Sendable {
     private let agentSettings: AgentSettings
     private let serviceDetector: any ServiceDetecting
     /// Services of tabs of other Macs (docs/specs/remote-devices.md, phase 4a).
-    private let remoteServiceDetector: any RemoteServiceDetecting
+    private let remoteServiceDetector: DeviceServiceDetector
     private let socketURL: URL
     private let queue = DispatchQueue(label: "Cherry.ControlServer", qos: .userInitiated)
     private var listenFileDescriptor: Int32 = -1
     private var acceptSource: DispatchSourceRead?
 
+    /// A server for one window and its stores (tests).
     @MainActor
-    init(
+    convenience init(
         workspace: TerminalWorkspace,
         noteStore: ProjectNoteStore? = nil,
         todoStore: ProjectTodoStore? = nil,
@@ -42,41 +39,38 @@ final class CherryControlServer: @unchecked Sendable {
         socketURL: URL = CherryControl.socketURL,
         agentSettings: AgentSettings = .shared,
         serviceDetector: any ServiceDetecting = MacOSServiceDetector(),
-        remoteServiceDetector: (any RemoteServiceDetecting)? = nil,
+        remoteServiceDetector: DeviceServiceDetector? = nil,
         monitorDefaults: UserDefaults = .standard,
         taskBoard: AgentTaskBoard? = nil
     ) {
-        self.monitors = AgentMonitorRegistry(defaults: monitorDefaults)
-        self.tasks = AgentTaskRegistry(board: taskBoard ?? .shared)
-        self.workspace = workspace
-        self.noteStore = noteStore
-        self.todoStore = todoStore
-        self.chromeState = chromeState
-        self.workspaceProvider = { workspace }
-        self.noteStoreProvider = { noteStore }
-        self.todoStoreProvider = { todoStore }
-        self.chromeStateProvider = { chromeState }
-        self.workspaceForProjectRootProvider = { projectRoot in
-            workspace.projectRoot == projectRoot ? workspace : nil
-        }
-        self.noteStoreForProjectRootProvider = { projectRoot in
-            noteStore?.projectRoot == projectRoot ? noteStore : nil
-        }
-        self.todoStoreForProjectRootProvider = { projectRoot in
-            todoStore?.projectRoot == projectRoot ? todoStore : nil
-        }
-        self.chromeStateForProjectRootProvider = { projectRoot in
-            workspace.projectRoot == projectRoot ? chromeState : nil
-        }
-        self.openProjectRootsProvider = {
-            workspace.projectRoot.map { [$0] } ?? []
-        }
-        self.openProjectProvider = { _ in }
-        self.agentSettings = agentSettings
-        self.serviceDetector = serviceDetector
-        self.remoteServiceDetector = remoteServiceDetector ?? DeviceServiceDetector()
-        self.socketURL = socketURL
-        tasks.wakeLinesEnabled = { [monitors] in monitors.wakeLinesEnabled }
+        self.init(
+            workspaceProvider: { workspace },
+            noteStoreProvider: { noteStore },
+            todoStoreProvider: { todoStore },
+            chromeStateProvider: { chromeState },
+            workspaceForProjectRootProvider: { projectRoot in
+                workspace.projectRoot == projectRoot ? workspace : nil
+            },
+            noteStoreForProjectRootProvider: { projectRoot in
+                noteStore?.projectRoot == projectRoot ? noteStore : nil
+            },
+            todoStoreForProjectRootProvider: { projectRoot in
+                todoStore?.projectRoot == projectRoot ? todoStore : nil
+            },
+            chromeStateForProjectRootProvider: { projectRoot in
+                workspace.projectRoot == projectRoot ? chromeState : nil
+            },
+            openProjectRootsProvider: {
+                workspace.projectRoot.map { [$0] } ?? []
+            },
+            openProjectProvider: { _ in },
+            socketURL: socketURL,
+            agentSettings: agentSettings,
+            serviceDetector: serviceDetector,
+            remoteServiceDetector: remoteServiceDetector,
+            monitorDefaults: monitorDefaults,
+            taskBoard: taskBoard
+        )
     }
 
     @MainActor
@@ -110,16 +104,12 @@ final class CherryControlServer: @unchecked Sendable {
         socketURL: URL = CherryControl.socketURL,
         agentSettings: AgentSettings = .shared,
         serviceDetector: any ServiceDetecting = MacOSServiceDetector(),
-        remoteServiceDetector: (any RemoteServiceDetecting)? = nil,
+        remoteServiceDetector: DeviceServiceDetector? = nil,
         monitorDefaults: UserDefaults = .standard,
         taskBoard: AgentTaskBoard? = nil
     ) {
         self.monitors = AgentMonitorRegistry(defaults: monitorDefaults)
         self.tasks = AgentTaskRegistry(board: taskBoard ?? .shared)
-        self.workspace = nil
-        self.noteStore = nil
-        self.todoStore = nil
-        self.chromeState = nil
         self.workspaceProvider = workspaceProvider
         self.noteStoreProvider = noteStoreProvider
         self.todoStoreProvider = todoStoreProvider
@@ -155,7 +145,7 @@ final class CherryControlServer: @unchecked Sendable {
     /// The window an unscoped request falls back to.
     @MainActor
     func workspaceForMonitors() -> TerminalWorkspace? {
-        workspace ?? workspaceProvider()
+        workspaceProvider()
     }
 
     func stop() {
@@ -295,33 +285,16 @@ final class CherryControlServer: @unchecked Sendable {
         guard fd >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        setCloseOnExec(fileDescriptor: fd)
+        UnixIO.setCloseOnExec(fd)
 
         let currentFlags = fcntl(fd, F_GETFL)
         if currentFlags >= 0 {
             _ = fcntl(fd, F_SETFL, currentFlags | O_NONBLOCK)
         }
 
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        let maximumPathLength = MemoryLayout.size(ofValue: address.sun_path)
-        guard path.utf8.count < maximumPathLength else {
+        guard let bindResult = UnixIO.withSocketAddress(path: path, { Darwin.bind(fd, $0, $1) }) else {
             close(fd)
             throw CherryControlError(code: "socket_path_too_long", message: "Control socket path is too long.")
-        }
-
-        withUnsafeMutablePointer(to: &address.sun_path) { pointer in
-            path.withCString { pathPointer in
-                let rawPointer = UnsafeMutableRawPointer(pointer).assumingMemoryBound(to: CChar.self)
-                strncpy(rawPointer, pathPointer, maximumPathLength)
-            }
-        }
-
-        let length = socklen_t(MemoryLayout<sa_family_t>.size + path.utf8.count + 1)
-        let bindResult = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                Darwin.bind(fd, socketAddress, length)
-            }
         }
 
         guard bindResult == 0 else {
@@ -355,12 +328,11 @@ final class CherryControlServer: @unchecked Sendable {
         while true {
             let clientFD = accept(listenFileDescriptor, nil, nil)
             if clientFD >= 0 {
-                Self.setCloseOnExec(fileDescriptor: clientFD)
+                UnixIO.setCloseOnExec(clientFD)
                 Self.configureBlocking(fileDescriptor: clientFD)
                 // A client that went away (a device's ssh, whose other end
                 // closed) makes a write fail with EPIPE, never SIGPIPE.
-                var noSigpipe: Int32 = 1
-                _ = setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
+                UnixIO.setNoSigPipe(clientFD)
                 // A silent client must not pin a pool thread forever (enough of
                 // them starves EVERY later connection), and a client that stops
                 // reading must not block response writes indefinitely.
@@ -382,9 +354,6 @@ final class CherryControlServer: @unchecked Sendable {
 
             if errno == EINTR {
                 continue
-            }
-            if errno == EAGAIN || errno == EWOULDBLOCK {
-                return
             }
             return
         }
@@ -486,7 +455,7 @@ final class CherryControlServer: @unchecked Sendable {
             return try await handleUnscoped(request, workspace: callerWorkspace, isProjectScoped: true)
         }
 
-        guard let workspace = workspace ?? workspaceProvider() else {
+        guard let workspace = workspaceProvider() else {
             throw CherryControlError(code: "workspace_unavailable", message: "Cherry workspace is unavailable.")
         }
 
@@ -512,7 +481,7 @@ final class CherryControlServer: @unchecked Sendable {
         )
         guard let tabID = UUID(uuidString: credentials.processID) else { throw refused }
         let workspaces = openProjectRootsProvider().compactMap { workspaceForProjectRootProvider($0) }
-            + [workspace, workspaceProvider()].compactMap { $0 }
+            + [workspaceProvider()].compactMap { $0 }
         for candidate in workspaces {
             guard let session = candidate.sessions.first(where: { $0.id == tabID }),
                   let key = candidate.projectRoot,
@@ -622,8 +591,7 @@ final class CherryControlServer: @unchecked Sendable {
     /// `childAgentCount` of the tabs the caller may see.
     @MainActor
     private func callerChildAgentCount(of session: TerminalSession, in workspace: TerminalWorkspace) -> Int {
-        guard Self.remoteDevice != nil else { return workspace.childAgentCount(of: session) }
-        return workspace.childAgentSessions(of: session).filter { callerReaches($0, in: workspace) }.count
+        workspace.childAgentSessions(of: session).filter { callerReaches($0, in: workspace) }.count
     }
 
     /// A request of a caller on another Mac: scoped as a local agent in the
@@ -680,7 +648,7 @@ final class CherryControlServer: @unchecked Sendable {
         let location = try Self.remoteProjectLocation(projectRoot, deviceID: deviceID)
         let path = location.path
         let workspaces = (openProjectRootsProvider().compactMap { workspaceForProjectRootProvider($0) }
-            + [workspace, workspaceProvider()].compactMap { $0 })
+            + [workspaceProvider()].compactMap { $0 })
             .filter { Self.isOnDevice($0.projectRoot, deviceID) }
         if let exact = workspaces.first(where: { $0.projectRoot.map { ProjectLocation(key: $0).path } == path }) {
             return exact
@@ -719,7 +687,7 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     private func callerWorkspace(peerPID: Int32?) -> TerminalWorkspace? {
         guard let peerPID else { return nil }
-        let ancestry = Set(Self.processAncestry(of: peerPID))
+        let ancestry = Set(CherryControl.processAncestry(of: peerPID))
         guard !ancestry.isEmpty else { return nil }
         let workspaces = openProjectRootsProvider().compactMap { workspaceForProjectRootProvider($0) }
         // The tab that runs the caller's program first: a tab attached to
@@ -737,32 +705,6 @@ final class CherryControlServer: @unchecked Sendable {
             }
         }
         return nil
-    }
-
-    /// `[pid, ppid, …]` up the process tree, via sysctl.
-    nonisolated static func processAncestry(of pid: Int32, maxDepth: Int = 20) -> [Int32] {
-        var result: [Int32] = [pid]
-        var seen: Set<Int32> = [pid]
-        var current = pid
-        for _ in 0..<maxDepth {
-            guard let parent = parentProcessID(of: current), parent > 1, !seen.contains(parent) else { break }
-            result.append(parent)
-            seen.insert(parent)
-            current = parent
-        }
-        return result
-    }
-
-    private nonisolated static func parentProcessID(of pid: Int32) -> Int32? {
-        var info = kinfo_proc()
-        var size = MemoryLayout<kinfo_proc>.size
-        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
-        let result = mib.withUnsafeMutableBufferPointer { buffer in
-            sysctl(buffer.baseAddress, u_int(buffer.count), &info, &size, nil, 0)
-        }
-        guard result == 0, size > 0 else { return nil }
-        let ppid = info.kp_eproc.e_ppid
-        return ppid > 0 ? ppid : nil
     }
 
     /// PID of the process on the other end of a connected unix-domain socket.
@@ -958,82 +900,14 @@ final class CherryControlServer: @unchecked Sendable {
         case .listTodos:
             let todoStore = try activeTodoStore(for: workspace)
             return .init(result: .listTodos(listTodos(todoStore: todoStore)))
-        case .createTerminal(let request):
-            let session = workspace.addSession(
-                title: request.title,
-                workingDirectory: request.workingDirectory,
-                command: request.command,
-                select: false
-            )
-            return .init(result: .createTerminal(summary(for: session, workspace: workspace)))
-        case .runAgent(let request):
-            guard let projectRoot = workspace.projectRoot else {
-                throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
-            }
-            let resolvedAgent = try findAgent(named: request.agentName)
-            guard resolvedAgent.isLaunchable else {
-                throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(resolvedAgent.name)' is not launchable.")
-            }
-            let agent = try agentDefinition(resolvedAgent.definition, overridingModel: request.model)
-            let session = workspace.addAgentSession(
-                agent: agent,
-                projectRoot: projectRoot,
-                title: request.title,
-                parentAgentID: try parentAgentID(from: request.parentAgentID, workspace: workspace),
-                select: request.select ?? false
-            )
-            if request.select ?? false {
-                chromeState(for: workspace)?.selectTerminal()
-            }
-            let initialInput = try runAgentInitialInput(
-                text: request.text,
-                rawBase64: request.rawBase64,
-                submit: request.submit,
-                keyboardProtocolFlags: session.keyboardProtocolFlags
-            )
-            let sentBytes: Int
-            if let initialInput, !initialInput.isEmpty {
-                await waitForAgentInitialInputReadiness(session: session, agent: agent)
-                // The agent exists either way: sentBytes says whether its
-                // first input reached it.
-                sentBytes = (try? await sendInitialAgentInput(initialInput, to: session, agent: agent)) ?? 0
-            } else {
-                sentBytes = 0
-            }
-            let waitMilliseconds = min(max(request.waitMilliseconds ?? 0, 0), 5_000)
-            let lineLimit = min(max(request.lineLimit ?? 200, 1), 2_000)
-            if waitMilliseconds > 0 {
-                try? await Task.sleep(for: .milliseconds(waitMilliseconds))
-                await session.refreshContentFromHostIfNeeded()
-            }
-            let output = waitMilliseconds > 0 ? terminalOutput(for: session, startLine: nil, lineLimit: lineLimit) : nil
-            return .init(result: .runAgent(.init(
-                terminalID: session.id.uuidString,
-                link: link(for: session, workspace: workspace),
-                title: session.title,
-                state: session.state.label,
-                kind: session.kind.rawValue,
-                agentName: session.agentName,
-                summary: nil,
-                parentAgentID: session.parentAgentID?.uuidString,
-                childAgentCount: callerChildAgentCount(of: session, in: workspace),
-                projectRoot: projectRoot,
-                sentBytes: sentBytes,
-                output: output
-            )))
         case .createNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
             let note = try noteStore.create(title: request.title, markdown: request.markdown)
-            if request.open ?? false {
-                select(note: note, workspace: workspace)
-            }
-            let selected = chromeState(for: workspace)?.selectedNoteID == note.id
-            return .init(result: .createNote(.init(note: note, link: link(for: note), selected: selected)))
+            return .init(result: .createNote(noteDetail(note, in: workspace)))
         case .getNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
             let note = try noteStore.note(id: try noteID(from: request.noteID))
-            let selected = chromeState(for: workspace)?.selectedNoteID == note.id
-            return .init(result: .getNote(.init(note: note, link: link(for: note), selected: selected)))
+            return .init(result: .getNote(noteDetail(note, in: workspace)))
         case .updateNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
             let note = try noteStore.update(
@@ -1041,32 +915,17 @@ final class CherryControlServer: @unchecked Sendable {
                 title: request.title,
                 markdown: request.markdown
             )
-            if request.open ?? false {
-                select(note: note, workspace: workspace)
-            }
-            return .init(result: .updateNote(.init(
-                note: note,
-                link: link(for: note),
-                selected: chromeState(for: workspace)?.selectedNoteID == note.id
-            )))
+            return .init(result: .updateNote(noteDetail(note, in: workspace)))
         case .appendNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
             let existing = try noteStore.note(id: try noteID(from: request.noteID))
             let separator = existing.markdown.isEmpty || request.markdown.isEmpty ? "" : "\n"
             let note = try noteStore.update(id: existing.id, title: nil, markdown: existing.markdown + separator + request.markdown)
-            return .init(result: .appendNote(.init(
-                note: note,
-                link: link(for: note),
-                selected: chromeState(for: workspace)?.selectedNoteID == note.id
-            )))
+            return .init(result: .appendNote(noteDetail(note, in: workspace)))
         case .renameNote(let request):
             let noteStore = try activeNoteStore(for: workspace)
             let note = try noteStore.update(id: try noteID(from: request.noteID), title: request.title, markdown: nil)
-            return .init(result: .renameNote(.init(
-                note: note,
-                link: link(for: note),
-                selected: chromeState(for: workspace)?.selectedNoteID == note.id
-            )))
+            return .init(result: .renameNote(noteDetail(note, in: workspace)))
         case .searchNotes(let request):
             let noteStore = try activeNoteStore(for: workspace)
             return .init(result: .searchNotes(searchNotes(noteStore: noteStore, request: request)))
@@ -1091,22 +950,11 @@ final class CherryControlServer: @unchecked Sendable {
                 status: request.status ?? .backlog,
                 tags: request.tags ?? []
             )
-            if request.open ?? false {
-                select(todo: todo, workspace: workspace)
-            }
-            return .init(result: .createTodo(.init(
-                todo: todo,
-                link: link(for: todo),
-                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
-            )))
+            return .init(result: .createTodo(todoDetail(todo, in: workspace)))
         case .getTodo(let request):
             let todoStore = try activeTodoStore(for: workspace)
             let todo = try todoStore.todo(id: try todoID(from: request.todoID))
-            return .init(result: .getTodo(.init(
-                todo: todo,
-                link: link(for: todo),
-                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
-            )))
+            return .init(result: .getTodo(todoDetail(todo, in: workspace)))
         case .updateTodo(let request):
             let todoStore = try activeTodoStore(for: workspace)
             let todo = try todoStore.update(
@@ -1116,14 +964,7 @@ final class CherryControlServer: @unchecked Sendable {
                 status: request.status,
                 tags: request.tags
             )
-            if request.open ?? false {
-                select(todo: todo, workspace: workspace)
-            }
-            return .init(result: .updateTodo(.init(
-                todo: todo,
-                link: link(for: todo),
-                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
-            )))
+            return .init(result: .updateTodo(todoDetail(todo, in: workspace)))
         case .moveTodo(let request):
             let todoStore = try activeTodoStore(for: workspace)
             let afterTodoID = try request.afterTodoID.map { try todoID(from: $0) }
@@ -1132,14 +973,7 @@ final class CherryControlServer: @unchecked Sendable {
                 status: request.status,
                 afterTodoID: afterTodoID
             )
-            if request.open ?? false {
-                select(todo: todo, workspace: workspace)
-            }
-            return .init(result: .moveTodo(.init(
-                todo: todo,
-                link: link(for: todo),
-                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
-            )))
+            return .init(result: .moveTodo(todoDetail(todo, in: workspace)))
         case .deleteTodo(let request):
             let id = try todoID(from: request.todoID)
             let todoStore = try activeTodoStore(for: workspace)
@@ -1163,14 +997,7 @@ final class CherryControlServer: @unchecked Sendable {
                 authorTerminalID: author.terminalID,
                 authorAgentName: author.agentName
             )
-            if request.open ?? false {
-                select(todo: todo, workspace: workspace)
-            }
-            return .init(result: .addTodoComment(.init(
-                todo: todo,
-                link: link(for: todo),
-                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
-            )))
+            return .init(result: .addTodoComment(todoDetail(todo, in: workspace)))
         case .listTodoComments(let request):
             let todoStore = try activeTodoStore(for: workspace)
             let todo = try todoStore.todo(id: try todoID(from: request.todoID))
@@ -1182,58 +1009,14 @@ final class CherryControlServer: @unchecked Sendable {
                 commentID: try commentID(from: request.commentID),
                 markdown: request.markdown
             )
-            return .init(result: .updateTodoComment(.init(
-                todo: todo,
-                link: link(for: todo),
-                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
-            )))
+            return .init(result: .updateTodoComment(todoDetail(todo, in: workspace)))
         case .deleteTodoComment(let request):
             let todoStore = try activeTodoStore(for: workspace)
             let todo = try todoStore.deleteComment(
                 todoID: try todoID(from: request.todoID),
                 commentID: try commentID(from: request.commentID)
             )
-            return .init(result: .deleteTodoComment(.init(
-                todo: todo,
-                link: link(for: todo),
-                selected: chromeState(for: workspace)?.selectedTodoID == todo.id
-            )))
-        case .renameTerminal(let request):
-            let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
-            session.rename(to: request.title)
-            return .init(result: .renameTerminal(summary(for: session, workspace: sessionWorkspace)))
-        case .selectTerminal(let request):
-            let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
-            sessionWorkspace.select(session)
-            chromeState(for: sessionWorkspace)?.selectTerminal()
-            return .init(result: .selectTerminal(.init(terminalID: session.id.uuidString, selected: true)))
-        case .sendInput(let request):
-            let session = try findSession(workspace: workspace, terminalID: request.terminalID)
-            let input = try terminalInputPayload(from: request, for: session)
-            if session.kind == .agent {
-                try await refuseInputIntoPermissionPrompt(of: session, keysOnly: input.isRaw)
-            }
-            try await sendTerminalInput(input, to: session)
-            let waitMilliseconds = min(max(request.waitMilliseconds ?? 0, 0), 5_000)
-            let lineLimit = min(max(request.lineLimit ?? 200, 1), 2_000)
-            if waitMilliseconds > 0 {
-                try? await Task.sleep(for: .milliseconds(waitMilliseconds))
-                await session.refreshContentFromHostIfNeeded()
-            }
-            let output = waitMilliseconds > 0 ? terminalOutput(for: session, startLine: nil, lineLimit: lineLimit) : nil
-            return .init(result: .sendInput(.init(terminalID: session.id.uuidString, sentBytes: input.payload.count, output: output)))
-        case .getTerminalOutput(let request):
-            let session = try findSession(workspace: workspace, terminalID: request.terminalID)
-            await session.refreshContentFromHostIfNeeded()
-            return .init(result: .getTerminalOutput(terminalOutput(for: session, startLine: request.startLine, lineLimit: request.lineLimit)))
-        case .getTerminalRawOutput(let request):
-            let session = try findSession(workspace: workspace, terminalID: request.terminalID)
-            await session.refreshContentFromHostIfNeeded()
-            return .init(result: .getTerminalRawOutput(rawOutput(for: session, maxBytes: request.maxBytes)))
-        case .searchOutput(let request):
-            let session = try findSession(workspace: workspace, terminalID: request.terminalID)
-            await session.refreshContentFromHostIfNeeded()
-            return .init(result: .searchOutput(searchOutput(for: session, request: request)))
+            return .init(result: .deleteTodoComment(todoDetail(todo, in: workspace)))
         case .clearOutput(let request):
             let session = try findSession(workspace: workspace, terminalID: request.terminalID)
             // A persistent tab's host clears its copy before this answers,
@@ -1242,14 +1025,6 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .clearOutput(.init(
                 terminalID: session.id.uuidString, cleared: kept == nil, hostKeptHistory: kept
             )))
-        case .restartTerminal(let request):
-            let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
-            try restartProcess(session, in: sessionWorkspace)
-            return .init(result: .restartTerminal(summary(for: session, workspace: sessionWorkspace)))
-        case .closeTerminal(let request):
-            let (session, sessionWorkspace) = try findSessionWithWorkspace(workspace: workspace, terminalID: request.terminalID)
-            try closeFromControl(session, workspace: sessionWorkspace, agentClosePolicy: request.agentClosePolicy)
-            return .init(result: .closeTerminal(.init(terminalID: session.id.uuidString, closed: true)))
         }
     }
 
@@ -1383,7 +1158,7 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     private func noteStore(forProjectRoot projectRoot: String, fallbackWorkspace workspace: TerminalWorkspace) -> ProjectNoteStore {
         if workspace.projectRoot == projectRoot,
-           let store = noteStore ?? noteStoreProvider(),
+           let store = noteStoreProvider(),
            store.projectRoot == projectRoot {
             return store
         }
@@ -1396,7 +1171,7 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     private func todoStore(forProjectRoot projectRoot: String, fallbackWorkspace workspace: TerminalWorkspace) -> ProjectTodoStore {
         if workspace.projectRoot == projectRoot,
-           let store = todoStore ?? todoStoreProvider(),
+           let store = todoStoreProvider(),
            store.projectRoot == projectRoot {
             return store
         }
@@ -1420,7 +1195,6 @@ final class CherryControlServer: @unchecked Sendable {
                     link: link(for: session, workspace: workspace),
                     kind: session.kind.rawValue,
                     agentName: session.agentName,
-                    summary: nil,
                     parentAgentID: session.parentAgentID?.uuidString,
                     childAgentCount: callerChildAgentCount(of: session, in: workspace)
                 )
@@ -1433,8 +1207,8 @@ final class CherryControlServer: @unchecked Sendable {
     private func listAgents(workspace: TerminalWorkspace) -> ListAgentsResult {
         ListAgentsResult(
             activeProjectRoot: workspace.projectRoot,
-            agents: agentSettings.resolvedAgents.map { agent in
-                let normalizedName = agent.definition.normalizedName
+            agents: agentSettings.agents.map { agent in
+                let normalizedName = agent.normalizedName
                 let activeSessionCount = workspace.agentSessions.filter { callerReaches($0, in: workspace) }.filter {
                     $0.agentName.map { AgentToolDefinition.normalizedName($0) } == normalizedName
                 }.count
@@ -1442,8 +1216,8 @@ final class CherryControlServer: @unchecked Sendable {
                 return AgentInfo(
                     id: agent.id,
                     name: agent.name,
-                    command: agent.definition.command,
-                    arguments: agent.definition.arguments,
+                    command: agent.command,
+                    arguments: agent.arguments,
                     commandLine: agent.commandLine,
                     enabled: agent.enabled,
                     launchable: agent.isLaunchable,
@@ -1468,19 +1242,19 @@ final class CherryControlServer: @unchecked Sendable {
         if let activeRepositoryRoot, !roots.contains(activeRepositoryRoot) {
             roots.insert(activeRepositoryRoot, at: 0)
         }
-        let openRoots = Set(openProjectRootsProvider().map(standardizedProjectRoot))
+        let openRoots = Set(openProjectRootsProvider().map(CherryControl.standardizedProjectRoot))
         var seenRepositoryRoots = Set<String>()
 
         return ListProjectsResult(
             activeProjectRoot: activeRoot,
             projects: roots.compactMap { requestedRoot in
                 let root = agentSettings.repositoryRoot(for: requestedRoot) ?? requestedRoot
-                let standardizedRoot = standardizedProjectRoot(root)
+                let standardizedRoot = CherryControl.standardizedProjectRoot(root)
                 guard seenRepositoryRoots.insert(standardizedRoot).inserted else { return nil }
                 return ProjectInfo(
                     root: root,
                     name: URL(fileURLWithPath: root, isDirectory: true).lastPathComponent,
-                    active: standardizedRoot == activeRepositoryRoot.map(standardizedProjectRoot),
+                    active: standardizedRoot == activeRepositoryRoot.map(CherryControl.standardizedProjectRoot),
                     open: openRoots.contains(standardizedRoot),
                     features: projectFeatureAvailability(for: root)
                 )
@@ -1494,20 +1268,20 @@ final class CherryControlServer: @unchecked Sendable {
         fallbackWorkspace workspace: TerminalWorkspace
     ) throws -> OpenProjectResult {
         if Self.remoteDevice != nil { throw Self.refusedOutsideDevice("that project") }
-        let requestedRoot = standardizedProjectRoot(request.projectRoot)
+        let requestedRoot = CherryControl.standardizedProjectRoot(request.projectRoot)
         let candidateRoots = agentSettings.projects.map(\.root)
             + openProjectRootsProvider()
             + ProjectWindowRegistry.shared.knownProjectRoots
             + [workspace.projectRoot].compactMap { $0 }
-        guard let projectRoot = candidateRoots.first(where: { standardizedProjectRoot($0) == requestedRoot }) else {
+        guard let projectRoot = candidateRoots.first(where: { CherryControl.standardizedProjectRoot($0) == requestedRoot }) else {
             throw CherryControlError(
                 code: "project_not_found",
                 message: "Cherry project is not configured: \(request.projectRoot)."
             )
         }
 
-        let openRoots = Set(openProjectRootsProvider().map(standardizedProjectRoot))
-        let alreadyOpen = openRoots.contains(standardizedProjectRoot(projectRoot))
+        let openRoots = Set(openProjectRootsProvider().map(CherryControl.standardizedProjectRoot))
+        let alreadyOpen = openRoots.contains(CherryControl.standardizedProjectRoot(projectRoot))
         openProjectProvider(projectRoot)
 
         return OpenProjectResult(projectRoot: projectRoot, alreadyOpen: alreadyOpen)
@@ -1533,8 +1307,7 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func performanceStatus(workspace: TerminalWorkspace) -> PerformanceStatusResult {
-        let counters = TerminalPerformanceMonitor.snapshot()
-        return PerformanceStatusResult(
+        PerformanceStatusResult(
             activeProjectRoot: workspace.projectRoot,
             processCounts: processCounts(workspace: workspace),
             selectedProcessID: callerSelectedSession(workspace)?.id.uuidString,
@@ -1544,40 +1317,14 @@ final class CherryControlServer: @unchecked Sendable {
             rawOutputRetainedBytes: callerSessions(workspace).reduce(0) { $0 + $1.rawOutputRetainedByteCount },
             rawOutputRetainedChunkCount: callerSessions(workspace).reduce(0) { $0 + $1.rawOutputRetainedChunkCount },
             terminalPerfEnabled: TerminalPerformanceMonitor.isEnabled,
-            terminalPerfCounters: TerminalPerformanceCounters(
-                ptyChunks: counters.ptyChunks,
-                ptyBytes: counters.ptyBytes,
-                ghosttyFeedChunks: counters.ghosttyFeedChunks,
-                ghosttyFeedBytes: counters.ghosttyFeedBytes,
-                processorBacklogDropCount: counters.processorBacklogDropCount,
-                processorBacklogDroppedBytes: counters.processorBacklogDroppedBytes,
-                backgroundOutputThrottleCount: counters.backgroundOutputThrottleCount,
-                processorChanges: counters.processorChanges,
-                representableUpdates: counters.representableUpdates,
-                containerConfigures: counters.containerConfigures,
-                bridgeAttaches: counters.bridgeAttaches,
-                reusedBridgeAttaches: counters.reusedBridgeAttaches,
-                fitToSizeCalls: counters.fitToSizeCalls,
-                settingsApplies: counters.settingsApplies,
-                settingsReconfigures: counters.settingsReconfigures,
-                renderTicks: counters.renderTicks
-            )
+            terminalPerfCounters: TerminalPerformanceMonitor.snapshot()
         )
     }
 
     @MainActor
     private func processCounts(workspace: TerminalWorkspace) -> ProcessCounts {
-        guard Self.remoteDevice != nil else {
-            return ProcessCounts(
-                total: workspace.sessions.count,
-                terminals: workspace.terminalSessions.count,
-                agents: workspace.agentSessions.count,
-                commands: workspace.commandSessions.count
-            )
-        }
-        let reachable = callerSessions(workspace)
-        return ProcessCounts(
-            total: reachable.count,
+        ProcessCounts(
+            total: callerSessions(workspace).count,
             terminals: workspace.terminalSessions.filter { callerReaches($0, in: workspace) }.count,
             agents: workspace.agentSessions.filter { callerReaches($0, in: workspace) }.count,
             commands: workspace.commandSessions.filter { callerReaches($0, in: workspace) }.count
@@ -1623,7 +1370,6 @@ final class CherryControlServer: @unchecked Sendable {
             // hooks per session, saturating the main actor (list_processes timeouts).
             lineCount: session.listingLineCount,
             outputVersion: session.outputVersion,
-            summary: nil,
             selected: workspace.selectedSessionID == session.id,
             agentName: session.agentName,
             commandName: session.commandName,
@@ -1778,7 +1524,7 @@ final class CherryControlServer: @unchecked Sendable {
             guard resolvedAgent.isLaunchable else {
                 throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(resolvedAgent.name)' is not launchable.")
             }
-            let agentDefinition = try agentDefinition(resolvedAgent.definition, overridingModel: request.model, effort: request.effort)
+            let agentDefinition = try agentDefinition(resolvedAgent, overridingModel: request.model, effort: request.effort)
             let parentID = try parentAgentID(from: request.parentAgentID, workspace: workspace)
             // Checked (its schema too) before anything is spawned.
             let taskPlan = try prepareTaskSpawn(request, parentAgentID: parentID, workspace: workspace)
@@ -1826,8 +1572,7 @@ final class CherryControlServer: @unchecked Sendable {
             let input = try agentInputPayload(
                 text: text,
                 rawBase64: request.rawBase64,
-                submit: submit,
-                keyboardProtocolFlags: session.keyboardProtocolFlags
+                submit: submit
             )
             var inputError: CherryControlError?
             let typedSince = Date()
@@ -1854,7 +1599,7 @@ final class CherryControlServer: @unchecked Sendable {
                 noteKickoff(task, delivered: sentBytes > 0, error: inputError, typedSince: typedSince)
             }
         } else {
-            let input = try optionalTerminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
+            let input = try optionalTerminalInputPayload(text: request.text, rawBase64: request.rawBase64)
             if let input, !input.payload.isEmpty || request.submit == true {
                 do {
                     sentBytes = try await sendTerminalInput(input, submit: request.submit == true, to: session)
@@ -1953,7 +1698,7 @@ final class CherryControlServer: @unchecked Sendable {
             guard agent.isLaunchable else {
                 throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(agent.name)' is not launchable.")
             }
-            return workspace.addAgentSession(agent: agent.definition, projectRoot: projectRoot, select: false)
+            return workspace.addAgentSession(agent: agent, projectRoot: projectRoot, select: false)
         case .command, nil:
             let command = try findProjectCommand(named: request.processName ?? "", projectRoot: projectRoot)
             return workspace.addCommandSession(command: command, projectRoot: projectRoot, select: false)
@@ -2307,7 +2052,7 @@ final class CherryControlServer: @unchecked Sendable {
             }
             workspace.closeAgentGroup(session, intent: .mcpClose)
         case .promoteSubAgents:
-            workspace.closeAgentPromotingChildren(session, intent: .mcpClose)
+            workspace.close(session, intent: .mcpClose)
         }
     }
 
@@ -2423,7 +2168,7 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     private func rejectAmbiguousUnscopedProjectMutation(_ request: CherryControlRequest) throws {
         guard requestRequiresProjectScope(request) else { return }
-        let openRoots = Set(openProjectRootsProvider().map(standardizedProjectRoot))
+        let openRoots = Set(openProjectRootsProvider().map(CherryControl.standardizedProjectRoot))
         guard openRoots.count > 1 else { return }
 
         throw CherryControlError(
@@ -2525,9 +2270,9 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func findAgent(named requestedName: String) throws -> ResolvedAgentTool {
+    private func findAgent(named requestedName: String) throws -> AgentToolDefinition {
         let normalizedName = AgentToolDefinition.normalizedName(requestedName)
-        guard let agent = agentSettings.resolvedAgents.first(where: { $0.definition.normalizedName == normalizedName }) else {
+        guard let agent = agentSettings.agents.first(where: { $0.normalizedName == normalizedName }) else {
             throw CherryControlError(code: "agent_not_found", message: "No Cherry agent is configured with name \(requestedName).")
         }
         return agent
@@ -2569,12 +2314,9 @@ final class CherryControlServer: @unchecked Sendable {
 
     @MainActor
     private func scopedWorkspace(projectRoot rawProjectRoot: String) throws -> TerminalWorkspace {
-        let projectRoot = standardizedProjectRoot(rawProjectRoot)
-        if let workspace, workspace.projectRoot.map(standardizedProjectRoot) == projectRoot {
-            return workspace
-        }
+        let projectRoot = CherryControl.standardizedProjectRoot(rawProjectRoot)
         if let activeWorkspace = workspaceProvider(),
-           activeWorkspace.projectRoot.map(standardizedProjectRoot) == projectRoot {
+           activeWorkspace.projectRoot.map(CherryControl.standardizedProjectRoot) == projectRoot {
             return activeWorkspace
         }
         if let registeredWorkspace = workspaceForProjectRootProvider(rawProjectRoot)
@@ -2595,17 +2337,9 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     private func containingOpenProjectRoot(for path: String) -> String? {
         openProjectRootsProvider()
-            .map(standardizedProjectRoot)
-            .filter { contains(path: path, inProjectRoot: $0) }
+            .map(CherryControl.standardizedProjectRoot)
+            .filter { CherryControl.path(path, isInsideProjectRoot: $0) }
             .max { $0.count < $1.count }
-    }
-
-    private func contains(path: String, inProjectRoot projectRoot: String) -> Bool {
-        path == projectRoot || path.hasPrefix(projectRoot.hasSuffix("/") ? projectRoot : projectRoot + "/")
-    }
-
-    private func standardizedProjectRoot(_ projectRoot: String) -> String {
-        URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL.path
     }
 
     @MainActor
@@ -2614,9 +2348,6 @@ final class CherryControlServer: @unchecked Sendable {
             throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
         }
         try requireNotesEnabled(projectRoot: projectRoot)
-        if let store = noteStore, store.projectRoot == projectRoot {
-            return store
-        }
         if let store = noteStoreForProjectRootProvider(projectRoot) {
             return store
         }
@@ -2633,9 +2364,6 @@ final class CherryControlServer: @unchecked Sendable {
             throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
         }
         try requireTodosEnabled(projectRoot: projectRoot)
-        if let store = todoStore, store.projectRoot == projectRoot {
-            return store
-        }
         if let store = todoStoreForProjectRootProvider(projectRoot) {
             return store
         }
@@ -2679,9 +2407,6 @@ final class CherryControlServer: @unchecked Sendable {
     private func chromeState(forProjectRoot projectRoot: String) -> ProjectWindowChromeState? {
         if let state = chromeStateForProjectRootProvider(projectRoot) {
             return state
-        }
-        if let workspace, workspace.projectRoot == projectRoot {
-            return chromeState ?? chromeStateProvider()
         }
         if let activeWorkspace = workspaceProvider(), activeWorkspace.projectRoot == projectRoot {
             return chromeStateProvider()
@@ -2758,30 +2483,19 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
+    private func noteDetail(_ note: ProjectNote, in workspace: TerminalWorkspace) -> NoteDetailResult {
+        NoteDetailResult(note: note, link: link(for: note), selected: chromeState(for: workspace)?.selectedNoteID == note.id)
+    }
+
+    @MainActor
+    private func todoDetail(_ todo: ProjectTodo, in workspace: TerminalWorkspace) -> TodoDetailResult {
+        TodoDetailResult(todo: todo, link: link(for: todo), selected: chromeState(for: workspace)?.selectedTodoID == todo.id)
+    }
+
+    @MainActor
     private func link(for session: TerminalSession, workspace: TerminalWorkspace) -> String? {
         guard let projectRoot = workspace.projectRoot else { return nil }
         return CherryDeepLink.terminalURL(projectRoot: projectRoot, terminalID: session.id)
-    }
-
-    @MainActor
-    private func link(for session: TerminalSession) -> String? {
-        guard let projectRoot = ProjectWindowRegistry.shared.projectRoot(containing: session.id) else { return nil }
-        return CherryDeepLink.terminalURL(projectRoot: projectRoot, terminalID: session.id)
-    }
-
-    @MainActor
-    private func summary(for session: TerminalSession, workspace: TerminalWorkspace) -> TerminalSummaryResult {
-        TerminalSummaryResult(
-            terminalID: session.id.uuidString,
-            link: link(for: session, workspace: workspace),
-            title: session.title,
-            state: session.state.label,
-            kind: session.kind.rawValue,
-            agentName: session.agentName,
-            summary: nil,
-            parentAgentID: session.parentAgentID?.uuidString,
-            childAgentCount: callerChildAgentCount(of: session, in: workspace)
-        )
     }
 
     private struct TerminalControlInput {
@@ -2790,42 +2504,21 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func terminalInputPayload(from request: SendInputRequest, for session: TerminalSession) throws -> TerminalControlInput {
-        try terminalInputPayload(text: request.text, rawBase64: request.rawBase64, for: session)
-    }
-
-    @MainActor
-    private func terminalInputPayload(text: String?, rawBase64: String?, for session: TerminalSession) throws -> TerminalControlInput {
-        switch (text, rawBase64) {
-        case let (text?, nil):
-            return .init(
-                payload: TerminalInputEncoder.terminalTextData(
-                    text,
-                    keyboardProtocolFlags: session.keyboardProtocolFlags
-                ),
-                isRaw: false
-            )
-        case let (nil, rawBase64?):
-            guard let data = Data(base64Encoded: rawBase64) else {
-                throw CherryControlError(code: "invalid_base64", message: "raw_base64 is not valid base64.")
-            }
-            return .init(payload: data, isRaw: true)
-        default:
+    private func terminalInputPayload(text: String?, rawBase64: String?) throws -> TerminalControlInput {
+        guard (text == nil) != (rawBase64 == nil),
+              let input = try optionalTerminalInputPayload(text: text, rawBase64: rawBase64)
+        else {
             throw CherryControlError(code: "invalid_input", message: "Provide exactly one of text or raw_base64.")
         }
+        return input
     }
 
+    /// Text or raw bytes (base64); nil when neither is given.
     @MainActor
-    private func optionalTerminalInputPayload(text: String?, rawBase64: String?, for session: TerminalSession) throws -> TerminalControlInput? {
+    private func optionalTerminalInputPayload(text: String?, rawBase64: String?) throws -> TerminalControlInput? {
         switch (text, rawBase64) {
         case let (text?, nil):
-            return .init(
-                payload: TerminalInputEncoder.terminalTextData(
-                    text,
-                    keyboardProtocolFlags: session.keyboardProtocolFlags
-                ),
-                isRaw: false
-            )
+            return .init(payload: TerminalInputEncoder.terminalTextData(text), isRaw: false)
         case let (nil, rawBase64?):
             guard let data = Data(base64Encoded: rawBase64) else {
                 throw CherryControlError(code: "invalid_base64", message: "raw_base64 is not valid base64.")
@@ -2864,7 +2557,7 @@ final class CherryControlServer: @unchecked Sendable {
             try await sendTerminalInput(input, to: session)
             try? await Task.sleep(for: Self.terminalSubmitPause)
         }
-        let enter = TerminalInputEncoder.enterSequence(keyboardProtocolFlags: session.keyboardProtocolFlags)
+        let enter = TerminalInputEncoder.enterData
         try await deliver(enter, raw: false, to: session, alreadySent: input.payload.count)
         return input.payload.count + enter.count
     }
@@ -2973,8 +2666,7 @@ final class CherryControlServer: @unchecked Sendable {
             let input = try agentInputPayload(
                 text: text,
                 rawBase64: rawBase64,
-                submit: submit,
-                keyboardProtocolFlags: session.keyboardProtocolFlags
+                submit: submit
             )
             guard let input, !input.isEmpty else { return 0 }
             return try await sendAgentInput(
@@ -2985,7 +2677,7 @@ final class CherryControlServer: @unchecked Sendable {
             )
         }
 
-        let input = try terminalInputPayload(text: text, rawBase64: rawBase64, for: session)
+        let input = try terminalInputPayload(text: text, rawBase64: rawBase64)
         return try await sendTerminalInput(input, submit: submit == true, to: session)
     }
 
@@ -3034,24 +2726,13 @@ final class CherryControlServer: @unchecked Sendable {
         source: String
     ) async throws -> Int {
         if shouldDeferSubmit, input.submit {
-            if !input.payload.isEmpty {
-                mcpControlDebugLog("agent \(source) input type session=\(session.id.uuidString) bytes=\(input.payload.count)")
-                try await deliver(input.payload, raw: false, to: session)
-                try? await Task.sleep(for: .milliseconds(150))
-            }
-            let enterSequence = TerminalInputEncoder.enterSequence(
-                keyboardProtocolFlags: session.keyboardProtocolFlags
-            )
-            mcpControlDebugLog("agent \(source) input submit session=\(session.id.uuidString) bytes=\(enterSequence.count)")
-            try await deliver(enterSequence, raw: false, to: session, alreadySent: input.payload.count)
-            return input.payload.count + enterSequence.count
+            // The text, then its Enter on its own (`terminalSubmitPause`).
+            return try await sendTerminalInput(.init(payload: input.payload, isRaw: false), submit: true, to: session)
         }
 
         var payload = input.payload
         if input.submit {
-            payload.append(TerminalInputEncoder.enterSequence(
-                keyboardProtocolFlags: session.keyboardProtocolFlags
-            ))
+            payload.append(TerminalInputEncoder.enterData)
         }
         guard !payload.isEmpty else { return 0 }
         mcpControlDebugLog("agent \(source) input combined session=\(session.id.uuidString) bytes=\(payload.count) submit=\(input.submit)")
@@ -3237,9 +2918,7 @@ final class CherryControlServer: @unchecked Sendable {
                         acknowledgedStartupPromptCount += 1
                         awaitingOutputAfterAcknowledgementVersion = session.outputVersion
                         startupPromptSearchStartLine = session.lineCount
-                        let enterSequence = TerminalInputEncoder.enterSequence(
-                            keyboardProtocolFlags: session.keyboardProtocolFlags
-                        )
+                        let enterSequence = TerminalInputEncoder.enterData
                         mcpControlDebugLog("agent startup prompt acknowledged session=\(session.id.uuidString) bytes=\(enterSequence.count)")
                         // As MCP's other input: through the host while the
                         // attach adapter is not known to be attached.
@@ -3354,50 +3033,19 @@ final class CherryControlServer: @unchecked Sendable {
         return trimmed.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
     }
 
+    /// An agent's input: text is submitted unless `submit` says otherwise,
+    /// raw bytes only when it asks; never a second Enter after one the
+    /// input ends with.
+    @MainActor
     private func agentInputPayload(
         text: String?,
         rawBase64: String?,
-        submit: Bool?,
-        keyboardProtocolFlags: Int
+        submit: Bool?
     ) throws -> AgentInitialInput? {
-        let payload: Data
-        let isTextInput: Bool
-        switch (text, rawBase64) {
-        case let (text?, nil):
-            payload = TerminalInputEncoder.terminalTextData(
-                text,
-                keyboardProtocolFlags: keyboardProtocolFlags
-            )
-            isTextInput = true
-        case let (nil, rawBase64?):
-            guard let data = Data(base64Encoded: rawBase64) else {
-                throw CherryControlError(code: "invalid_base64", message: "raw_base64 is not valid base64.")
-            }
-            payload = data
-            isTextInput = false
-        case (nil, nil):
-            return nil
-        case (_?, _?):
-            throw CherryControlError(code: "invalid_input", message: "Provide at most one of text or raw_base64.")
-        }
-
-        let wantsSubmit = submit ?? isTextInput
-        let shouldSubmit = wantsSubmit && payload.last != 0x0d && payload.last != 0x0a
-        return AgentInitialInput(payload: payload, submit: shouldSubmit)
-    }
-
-    private func runAgentInitialInput(
-        text: String?,
-        rawBase64: String?,
-        submit: Bool?,
-        keyboardProtocolFlags: Int
-    ) throws -> AgentInitialInput? {
-        try agentInputPayload(
-            text: text,
-            rawBase64: rawBase64,
-            submit: submit,
-            keyboardProtocolFlags: keyboardProtocolFlags
-        )
+        guard let input = try optionalTerminalInputPayload(text: text, rawBase64: rawBase64) else { return nil }
+        let wantsSubmit = submit ?? !input.isRaw
+        let shouldSubmit = wantsSubmit && input.payload.last != 0x0d && input.payload.last != 0x0a
+        return AgentInitialInput(payload: input.payload, submit: shouldSubmit)
     }
 
     @MainActor
@@ -3448,16 +3096,6 @@ final class CherryControlServer: @unchecked Sendable {
             }
         }
         return Data(bytes)
-    }
-
-    @MainActor
-    private func searchOutput(for session: TerminalSession, request: SearchOutputRequest) -> SearchOutputResult {
-        searchOutput(
-            for: session,
-            query: request.query,
-            caseSensitive: request.caseSensitive,
-            maxMatches: request.maxMatches
-        )
     }
 
     @MainActor
@@ -3551,12 +3189,6 @@ final class CherryControlServer: @unchecked Sendable {
         var timeout = timeval(tv_sec: seconds, tv_usec: 0)
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-    }
-
-    private nonisolated static func setCloseOnExec(fileDescriptor fd: Int32) {
-        let flags = fcntl(fd, F_GETFD)
-        guard flags >= 0 else { return }
-        _ = fcntl(fd, F_SETFD, flags | FD_CLOEXEC)
     }
 
     private nonisolated static func writeResponse(_ response: CherryControlResponse, to fd: Int32) {

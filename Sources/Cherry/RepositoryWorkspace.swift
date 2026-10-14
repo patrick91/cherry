@@ -80,7 +80,7 @@ final class RepositoryWorkspace: ObservableObject {
     /// Tabs this window's restores brought back ended by the system during
     /// this run, which its toast names and Restart All starts
     /// (`announceSystemEndedTabs`).
-    private var systemEndedTabs: [WeakSession] = []
+    private var systemEndedTabs: [WeakReference<TerminalSession>] = []
     /// Whether orphaned sessions were looked for (once per run).
     private var didScanForOrphans = false
     private var orphanScanTask: Task<Void, Never>?
@@ -302,10 +302,7 @@ final class RepositoryWorkspace: ObservableObject {
     /// Nil for a device Cherry no longer knows (its stand-in hosting holds
     /// no connection).
     var remoteHosting: PersistentHostSessions? {
-        guard isRemote, let hosting = backendPolicy.localSessions, !hosting.profile.isThisMac,
-              hosting.profile.isKnownDevice
-        else { return nil }
-        return hosting
+        deviceHosting.flatMap { $0.profile.isKnownDevice ? $0 : nil }
     }
 
     /// A device window's hosting, known device or not (its bar says why
@@ -679,7 +676,7 @@ final class RepositoryWorkspace: ObservableObject {
     /// The saved tabs no open tab shows that may own a session of This Mac
     /// (`endSavedSessionsNotOpen`).
     private func savedRecordsWhoseSessionsEndWithTheWindow() -> [WorkspaceSessionRecord] {
-        guard let hosting = backendPolicy.localSessions, backendPolicy.hostedLocalTabsFollowSettings else { return [] }
+        guard let hosting = backendPolicy.localSessions else { return [] }
         let host = hosting.profile.host
         return savedRecordsNotOpen().filter { $0.mayOwnSession(on: host) }
     }
@@ -711,30 +708,28 @@ final class RepositoryWorkspace: ObservableObject {
             guard let self, !Task.isCancelled, !isTearingDown else { return }
             orphanScanTask = nil
             guard let list else {
-                orphanScanRetry = localSessions.hostAvailability(after: generation)
-                    .receive(on: DispatchQueue.main)
-                    .sink { [weak self] in
-                        MainActor.assumeIsolated {
-                            self?.orphanScanRetry = nil
-                            self?.scanForOrphanedSessions()
-                        }
-                    }
+                retryOrphanScan(when: localSessions.hostAvailability(after: generation))
                 return
             }
             adoptOrphanedSessions(in: list, criteria: criteria, localSessions: localSessions)
             if list.awaitsHolders {
                 // A restarted daemon lists a session only once its holder
                 // registered: look again once none is expected.
-                orphanScanRetry = localSessions.control.holdersRegistered()
-                    .receive(on: DispatchQueue.main)
-                    .sink { [weak self] in
-                        MainActor.assumeIsolated {
-                            self?.orphanScanRetry = nil
-                            self?.scanForOrphanedSessions()
-                        }
-                    }
+                retryOrphanScan(when: localSessions.control.holdersRegistered())
             }
         }
+    }
+
+    /// Scans for orphaned sessions again once `trigger` fires.
+    private func retryOrphanScan(when trigger: AnyPublisher<Void, Never>) {
+        orphanScanRetry = trigger
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                MainActor.assumeIsolated {
+                    self?.orphanScanRetry = nil
+                    self?.scanForOrphanedSessions()
+                }
+            }
     }
 
     private func adoptOrphanedSessions(
@@ -1234,9 +1229,9 @@ final class RepositoryWorkspace: ObservableObject {
             return !names.contains(AgentToolDefinition.normalizedName(name))
         }
         guard !tabs.isEmpty, let chromeState else { return }
-        systemEndedTabs = systemEndedTabs.filter { $0.session?.systemSessionEnd != nil && $0.session?.isRunning == false }
-            + tabs.map(WeakSession.init)
-        let ended = systemEndedTabs.compactMap(\.session)
+        systemEndedTabs = systemEndedTabs.filter { $0.object?.systemSessionEnd != nil && $0.object?.isRunning == false }
+            + tabs.map { WeakReference($0) }
+        let ended = systemEndedTabs.compactMap(\.object)
         guard let end = ended.first?.systemSessionEnd else { return }
         let machine = ended.first?.persistentHosting.flatMap { $0.profile.isThisMac ? nil : $0.profile.displayName }
         chromeState.toasts.show(ProjectWindowToast.systemEndedTabs(count: ended.count, end: end, machine: machine) { [weak self] in
@@ -1248,7 +1243,7 @@ final class RepositoryWorkspace: ObservableObject {
     /// system ended that its toast named and that is still ended.
     func restartSystemEndedTabs() {
         guard !isTearingDown else { return }
-        for tab in systemEndedTabs.compactMap(\.session)
+        for tab in systemEndedTabs.compactMap(\.object)
         where tab.systemSessionEnd != nil && !tab.isRunning && tab.savedExitStatus == nil {
             guard workspace.session(withID: tab.id) === tab else { continue }
             workspace.restart(tab)
@@ -1438,7 +1433,8 @@ final class RepositoryWorkspace: ObservableObject {
         waiters.forEach { $0() }
     }
 
-    private static func resolvedPath(_ root: String) -> String {
+    /// `root` standardized, with its links resolved when it exists.
+    static func resolvedPath(_ root: String) -> String {
         let standardized = URL(fileURLWithPath: root, isDirectory: true)
             .standardizedFileURL
             .path
@@ -1448,13 +1444,6 @@ final class RepositoryWorkspace: ObservableObject {
         defer { free(resolved) }
         return String(cString: resolved)
     }
-}
-
-/// A tab held without keeping it open.
-@MainActor
-private final class WeakSession {
-    weak var session: TerminalSession?
-    init(_ session: TerminalSession) { self.session = session }
 }
 
 /// A workspace's selection at one moment (nil: none).

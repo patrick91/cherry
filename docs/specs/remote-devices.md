@@ -245,24 +245,25 @@ What exists (`Sources/Cherry/RemoteDevices.swift`, `RemoteDeviceCheck.swift`,
   **Add**, for exactly what was checked (editing the host or its
   cherry-host path asks for a new check). A cherry-host found in a known
   install place is kept as `remoteHostPath` (`~/…`).
-- **Picker** (`TitlebarProjectMenuModel`, pure and tested by snapshot;
-  `TitlebarProjectMenuController` builds the `NSMenu`): after This Mac's
-  projects (remote keys never listed there), **Devices**, each Mac with a
-  status dot and subtitle (`RemoteDeviceConnectionState`: not checked /
-  last seen, connecting, connected · N sessions, offline, identity changed,
-  login refused, another protocol) and a submenu: its projects, which are
-  the `cherry.project` tags of every owner's sessions on its host (a device
-  key's path, or a plain path from that Mac's own Cherry) with counts, plus
-  `addedProjects`, minus `hiddenProjects` (an Option-alternate item hides
-  one); **Other sessions** (untagged; the Persistent Sessions sheet on that
-  host); **Open Home Folder**; **Add Project on <Mac>…** (a path, checked
-  there with `test -d` and `pwd -P`; there is no remote folder browser and
-  no `ListDir` request); a state row with **Reconnect** / **Trust New
-  Identity…**; **Persistent Sessions on <Mac>…**; **Rename…**;
-  **Remove…**. Then **Add Mac…**. The menu is built from what the hosts'
-  `HostControl`s last listed and, while open, lists each host again without
-  a lease (never one whose SSH login was refused, nor one another identity
-  or protocol answers) and updates each device's item in place.
+- **Picker** (phase 1's title-bar menu; the Omni bar has replaced it):
+  each Mac is a row of the bar (`OmniProviders.macs`) with a status dot
+  (`RemoteDeviceConnectionState`: not checked / last seen, connecting,
+  connected · N sessions, offline, identity changed, login refused, another
+  protocol), and its projects are among the bar's projects
+  (`ProjectSwitcherModel.make`): the `cherry.project` tags of every owner's
+  sessions on its host (a device key's path, or a plain path from that
+  Mac's own Cherry), plus `addedProjects`, minus `hiddenProjects` (a device
+  project's Remove from Projects hides it). A Mac row's ⌘K actions
+  (`OmniProviders.macActions`, from `TitlebarProjectMenuModel.Device`):
+  **Open Home Folder**; **Add Project on <Mac>…** (folder completion there)
+  and **New Terminal on <Mac>**; **Reconnect** / **Trust New Identity…** /
+  **Update Session Host…**; **Persistent Sessions on <Mac>…**; **Set Up
+  Cherry MCP on <Mac>…**; **Rename…**; **Remove…**. **Add Mac…** is one of
+  the bar's commands. The bar is built from what the hosts' `HostControl`s
+  last listed and, while open, lists each host again
+  (`OmniBarLiveModel.lookAtHosts`: a connected one over its connection, any
+  other with a look that starts nothing there, never one whose SSH login
+  was refused, nor one another identity or protocol answers).
 - **Remote windows**: `ProjectWorkspaceView` gives a `device:` key the
   device's hosting (`SessionBackendPolicy.remote`) and
   `hostedByDefault(localSessions: device hosting)`. A key of a device the
@@ -329,8 +330,8 @@ What exists (`Sources/Cherry/RemoteDevices.swift`, `RemoteDeviceCheck.swift`,
   sessions to end and the restore use it. `wasEndedOnPurpose` and the ended
   and lost session files are keyed by host identity for every host.
 - **Tests**: `RemoteDeviceTests` (store, SSH config, check parsing and
-  checklist, SSH error mapping, picker snapshots per state and the live
-  `NSMenu` update, discovery grouping, restore wording, reopen, records,
+  checklist, SSH error mapping, each device's state and its Omni bar
+  actions, discovery grouping, restore wording, reopen, records,
   offline adapter wait and keys, ends recorded offline, detach/⌘Z/quit
   count) and `RemoteDeviceRealHost*` (real helpers through
   `Scripts/fake-remote-mac`: Add Mac check and its SSH failures, a bare Mac
@@ -1065,8 +1066,8 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
   refused, with no spawn in and no input to the This Mac window (whose
   command a local caller shows live); a nested scoped JSON line refused;
   a This Mac tab's and another device's tab's ids `terminal_not_found`
-  for status, output, input, send_input, restart, stop, close, ports and
-  terminal output, and a link to it not found; another device's key and
+  for status, output, input, restart, stop, close and ports, and a link
+  to it not found; another device's key and
   This Mac's root refused, its own path, key and a folder inside resolving;
   list_projects, list_processes, list_terminals and status of its Mac only;
   the envelope; the unreachable message; the launch environment in the

@@ -12,7 +12,7 @@ import Foundation
 struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
     /// Assigned by this Cherry; part of every project key on the device
     /// (`ProjectLocation.remote`).
-    var id: UUID
+    var id = UUID()
     var name: String
     /// An OpenSSH alias or `user@host` (`HostedSessionHost.ssh`).
     var sshDestination: String
@@ -20,13 +20,13 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
     /// (absolute, or `~/…`): `cherry --remote-host-path`.
     var remoteHostPath: String?
     /// The names its programs' directory reports (OSC 7) may give it.
-    var machineNames: [String]
+    var machineNames: [String] = []
     /// Its home directory (Open Home Folder), as the check found it.
     var homeDirectory: String?
     /// Folders added with Add Project on <Mac>… (absolute paths there).
-    var addedProjects: [String]
+    var addedProjects: [String] = []
     /// Folders the picker leaves out, even while sessions name them.
-    var hiddenProjects: [String]
+    var hiddenProjects: [String] = []
     /// When its host last answered.
     var lastSeen: Date?
     /// Its host's identity when it was added (`status --json`), which tells
@@ -35,7 +35,7 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
     /// Add Mac… made its SSH destination a saved host (it was not one
     /// already): Remove forgets that host (and its trusted identity) only
     /// then, never a host the user had saved.
-    var createdHostEntry: Bool
+    var createdHostEntry = false
     /// The build of the cherry-host this Cherry installed there (its
     /// `remoteHostPath` is then that build's), for Update Session Host….
     var installedBuild: String?
@@ -46,7 +46,7 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
     var shell: String?
     /// The install there (`remoteHostPath`) has this Cherry's Ghostty
     /// resources (terminfo, shell integration) next to cherry-host.
-    var installedResources: Bool
+    var installedResources = false
     /// Its account's per-user temporary directory (`getconf
     /// DARWIN_USER_TEMP_DIR`), from the check or the first Cherry MCP
     /// forward: where the forwarded control socket goes (phase 4b).
@@ -61,42 +61,35 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
     /// Nil until read; a failed read keeps the last one.
     var loginEnvironment: RemoteLoginEnvironment? = nil
 
-    init(
-        id: UUID = UUID(),
-        name: String,
-        sshDestination: String,
-        remoteHostPath: String? = nil,
-        machineNames: [String] = [],
-        homeDirectory: String? = nil,
-        addedProjects: [String] = [],
-        hiddenProjects: [String] = [],
-        lastSeen: Date? = nil,
-        hostID: String? = nil,
-        createdHostEntry: Bool = false,
-        installedBuild: String? = nil,
-        installedArch: String? = nil,
-        shell: String? = nil,
-        installedResources: Bool = false,
-        color: RemoteDeviceColor? = nil
-    ) {
-        self.id = id
-        self.name = name
-        self.sshDestination = sshDestination
-        self.remoteHostPath = remoteHostPath
-        self.machineNames = machineNames
-        self.homeDirectory = homeDirectory
-        self.addedProjects = addedProjects
-        self.hiddenProjects = hiddenProjects
-        self.lastSeen = lastSeen
-        self.hostID = hostID
-        self.createdHostEntry = createdHostEntry
-        self.installedBuild = installedBuild
-        self.installedArch = installedArch
-        self.shell = shell
-        self.installedResources = installedResources
-        self.color = color
+    /// What its tabs' launches need of it (`RemoteLaunchSpec.Device`).
+    var launchDevice: RemoteLaunchSpec.Device {
+        RemoteLaunchSpec.Device(
+            shell: shell,
+            homeDirectory: homeDirectory,
+            resources: installedResources
+                ? RemoteLaunchSpec.Resources.of(remoteHostPath: remoteHostPath, homeDirectory: homeDirectory)
+                : nil,
+            loginEnvironment: loginEnvironment?.environment
+        )
     }
 
+    /// Update Session Host… is offered: the cherry-host this Cherry
+    /// installed there is an older build than the one it bundles now.
+    func hostIsOlder(thanBundled bundled: String?) -> Bool {
+        HostBuildOrder.isNewer(bundled, than: installedBuild)
+    }
+
+    /// Its host, when the destination is valid.
+    var host: HostedSessionHost? { try? HostedSessionHost.ssh(sshDestination) }
+
+    /// The key of the project at `path` on this device.
+    func projectKey(path: String) -> String {
+        ProjectLocation.remote(deviceID: id, path: path).key
+    }
+}
+
+// In an extension, so the struct keeps its memberwise initializer.
+extension RemoteDevice {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
@@ -126,44 +119,13 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
             .flatMap { $0 }
             .flatMap { $0.environment["PATH"]?.nilIfEmpty == nil ? nil : $0 }
     }
-
-    /// What its tabs' launches need of it (`RemoteLaunchSpec.Device`).
-    var launchDevice: RemoteLaunchSpec.Device {
-        RemoteLaunchSpec.Device(
-            shell: shell,
-            homeDirectory: homeDirectory,
-            resources: installedResources
-                ? RemoteLaunchSpec.Resources.of(remoteHostPath: remoteHostPath, homeDirectory: homeDirectory)
-                : nil,
-            loginEnvironment: loginEnvironment?.environment
-        )
-    }
-
-    /// Update Session Host… is offered: the cherry-host this Cherry
-    /// installed there is an older build than the one it bundles now.
-    func hostIsOlder(thanBundled bundled: String?) -> Bool {
-        HostBuildOrder.isNewer(bundled, than: installedBuild)
-    }
-
-    /// Its host, when the destination is valid.
-    var host: HostedSessionHost? { try? HostedSessionHost.ssh(sshDestination) }
-
-    /// The key of the project at `path` on this device.
-    func projectKey(path: String) -> String {
-        ProjectLocation.remote(deviceID: id, path: path).key
-    }
 }
 
 /// devices.json.
 struct RemoteDevicesRecord: Codable, Equatable, Sendable {
     static let currentVersion = 1
-    var version: Int
+    var version: Int = RemoteDevicesRecord.currentVersion
     var devices: [RemoteDevice]
-
-    init(version: Int = RemoteDevicesRecord.currentVersion, devices: [RemoteDevice]) {
-        self.version = version
-        self.devices = devices
-    }
 }
 
 /// The devices this Cherry knows, kept in `devices.json` in the app
@@ -181,7 +143,7 @@ final class RemoteDeviceStore: ObservableObject {
     static let fileName = "devices.json"
 
     static let shared = RemoteDeviceStore(
-        fileURL: AppInstanceLock.defaultFileURL().deletingLastPathComponent()
+        fileURL: CherryAppIdentity.applicationSupportDirectory()
             .appendingPathComponent(RemoteDeviceStore.fileName, isDirectory: false),
         canWrite: { AppInstanceLock.shared.isHeld },
         hostStore: .shared,
@@ -274,6 +236,11 @@ final class RemoteDeviceStore: ObservableObject {
     /// The device a project key (`device:<uuid>:<path>`) names.
     func device(forProjectKey key: String) -> RemoteDevice? {
         ProjectLocation(key: key).deviceID.flatMap(device(id:))
+    }
+
+    /// The device `host` reaches (its SSH destination's).
+    func device(for host: HostedSessionHost) -> RemoteDevice? {
+        devices.first { $0.host == host }
     }
 
     /// The device whose host answered with `hostID` (another alias of the
@@ -612,40 +579,13 @@ final class RemoteDeviceStore: ObservableObject {
             return
         }
         guard let read = refreshLoginEnvironment(of: id) else { return }
-        await Self.wait(for: read, upTo: loginEnvironmentLaunchWait)
-    }
-
-    /// Waits for `task` to finish, at most `timeout` (the task goes on).
-    private static func wait(for task: Task<Void, Never>, upTo timeout: Duration) async {
-        let waiter = FirstResume()
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            waiter.continuation = continuation
-            Task { @MainActor in
-                await task.value
-                waiter.resume()
-            }
-            Task { @MainActor in
-                try? await Task.sleep(for: timeout)
-                waiter.resume()
-            }
-        }
-    }
-
-    @MainActor
-    private final class FirstResume {
-        var continuation: CheckedContinuation<Void, Never>?
-
-        func resume() {
-            continuation?.resume()
-            continuation = nil
-        }
+        await waitForTask(read, upTo: loginEnvironmentLaunchWait)
     }
 
     /// Reads the device's login environment over its ssh (its master when
     /// up), with its recorded login shell.
     static func captureLoginEnvironmentOverSSH(_ device: RemoteDevice) async -> RemoteLoginEnvironmentCapture.Outcome {
-        var shell = await RemoteDeviceShell.app()
-        shell.controlPath = HostSSHMasterManager.shared.controlPathIfUp(for: device.sshDestination)
+        let shell = await RemoteDeviceShell.app(through: device.sshDestination)
         return await RemoteLoginEnvironmentCapture.run(on: device.sshDestination, loginShell: device.shell, shell: shell)
     }
 
@@ -665,8 +605,7 @@ final class RemoteDeviceStore: ObservableObject {
     /// Runs `RemoteHostInstaller.markScript` over the device's ssh (its
     /// master when up).
     static func markBuildOverSSH(_ device: RemoteDevice, directoryName: String, installationID: UUID) async {
-        var shell = await RemoteDeviceShell.app()
-        shell.controlPath = HostSSHMasterManager.shared.controlPathIfUp(for: device.sshDestination)
+        let shell = await RemoteDeviceShell.app(through: device.sshDestination)
         let output = await shell.run(
             RemoteHostInstaller.markScript(directoryName: directoryName, installationID: installationID),
             on: device.sshDestination

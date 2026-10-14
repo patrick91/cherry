@@ -13,13 +13,6 @@ import Testing
 private let studioID = UUID(uuidString: "00000000-0000-0000-0000-00000000D00D")!
 private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
-private func privateDefaults() -> UserDefaults {
-    let name = "cherry-omni-bar-tests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: name)!
-    defaults.removePersistentDomain(forName: name)
-    return defaults
-}
-
 private func local(
     _ name: String,
     open: ProjectSwitcherModel.OpenStatus? = nil,
@@ -51,22 +44,18 @@ private let tabStudio = UUID()
 /// windows, a background session and an agent.
 private func fixture(extraProjects: Int = 0) -> OmniSources {
     let thisMac = ProjectSwitcherModel.MachineInfo(
-        machine: .thisMac, name: "This Mac", status: "14 sessions", dot: .green, sessionCount: 14, detail: "",
-        symbol: "laptopcomputer"
+        machine: .thisMac, name: "This Mac", dot: .green, sessionCount: 14, symbol: "laptopcomputer"
     )
-    let studio = ProjectSwitcherModel.MachineInfo(
-        machine: .device(studioID), name: "patstudio", status: "Connected · 2 sessions", dot: .green,
-        sessionCount: 2, detail: ""
-    )
+    let studio = ProjectSwitcherModel.MachineInfo(machine: .device(studioID), name: "patstudio", dot: .green, sessionCount: 2)
     var locations = [
-        local("cherry", open: .init(tabs: 2, workingAgents: 1), current: true, lastOpened: now),
-        local("pix", open: .init(tabs: 1, workingAgents: 0), lastOpened: now.addingTimeInterval(-60)),
+        local("cherry", open: .init(workingAgents: 1), current: true, lastOpened: now),
+        local("pix", open: .init(workingAgents: 0), lastOpened: now.addingTimeInterval(-60)),
         local("strawberry.rocks", lastOpened: now.addingTimeInterval(-600)),
         local("fastapi-cli", lastOpened: now.addingTimeInterval(-900)),
         local("django-lsp"),
         local("sqlmodel"),
         local("shop"),
-        remote("rignore", open: .init(tabs: 1, workingAgents: 0)),
+        remote("rignore", open: .init(workingAgents: 0)),
         remote("cherry"),
     ]
     for index in 0 ..< extraProjects {
@@ -84,7 +73,7 @@ private func fixture(extraProjects: Int = 0) -> OmniSources {
         OmniBackgroundSession(id: "s-graphql", title: "GraphQL core 3.3 references update", machine: .thisMac, isWorking: true),
     ]
     sources.window = OmniWindowContext(
-        hasWorkspace: true, hasSelectedTab: true, canSplit: true, canDetach: true, canReopenClosedTab: true,
+        hasSelectedTab: true, canSplit: true, canDetach: true, canReopenClosedTab: true,
         hasProject: true
     )
     sources.listedLocalProjects = ["/Users/me/code/cherry", "/Users/me/code/pix"]
@@ -118,10 +107,10 @@ private func titles(_ controller: OmniBarController) -> [String] {
 
 @MainActor
 private func select(_ title: String, detail: String? = nil, in controller: OmniBarController) throws {
-    let index = try #require(controller.rows.firstIndex {
+    let row = try #require(controller.rows.first {
         $0.item.title == title && (detail == nil || $0.item.detail == detail)
     })
-    controller.select(index)
+    controller.select(id: row.id)
 }
 
 // MARK: - Matching
@@ -191,7 +180,7 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
 // MARK: - Frecency
 
 @Test @MainActor func omniFrecencyTakesOverThePalettesUsageAndCountsProjectWindows() throws {
-    let defaults = privateDefaults()
+    let defaults = privateDefaults("cherry-omni-bar-tests")
     let legacy: [String: OmniFrecencyStore.Entry] = [
         "command:toggleAppearance": .init(selectionCount: 3, lastSelectedAt: now.addingTimeInterval(-7_200)),
     ]
@@ -433,7 +422,7 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
 
     // What the window cannot do now is not offered.
     var bare = fixture()
-    bare.window = OmniWindowContext(hasWorkspace: true)
+    bare.window = OmniWindowContext()
     bare.backgroundSessions = []
     bare.editors = []
     bare.canModifyDevices = false
@@ -672,8 +661,8 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
         settings: .shared,
         registry: registry,
         backgroundSessionsModel: { preconditionFailure("not asked in this test") },
-        switcher: ProjectSwitcherActions(settings: .shared, chromeState: chrome, openProject: { _ in }, openSettings: {}),
-        editorDiscovery: ExternalEditorDiscovery(appURLResolver: { _ in nil }, iconProvider: { _ in NSImage() }),
+        switcher: ProjectSwitcherActions(settings: .shared, chromeState: chrome, openProject: { _ in }),
+        editorDiscovery: ExternalEditorDiscovery(appURLResolver: { _ in nil }),
         projects: { ProjectSwitcherModel(machines: [], locations: []) },
         openSettings: { settingsOpened += 1 },
         toggleAppearance: {},

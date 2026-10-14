@@ -5,83 +5,16 @@ import Testing
 @testable import Cherry
 
 @MainActor
-private final class ControlActivityHarness {
-    let defaultsName: String
-    let defaults: UserDefaults
-    let settings: AgentSettings
-    let projectRoot: URL
-    let workspace: TerminalWorkspace
-    let socketURL: URL
-    let server: CherryControlServer
-
-    init() throws {
-        defaultsName = "CherryTests.ControlActivity.\(UUID().uuidString)"
-        defaults = try #require(UserDefaults(suiteName: defaultsName))
-
-        projectRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
-
-        let socketDirectory = URL(
-            fileURLWithPath: "/tmp/cherry-control-\(UUID().uuidString.prefix(8))",
-            isDirectory: true
-        )
-        socketURL = socketDirectory.appendingPathComponent("control.sock")
-
-        settings = AgentSettings(defaults: defaults)
-        _ = settings.addProject(path: projectRoot.path)
-        workspace = TerminalWorkspace(projectRoot: projectRoot.path, launchBackend: .hostManaged)
-        server = CherryControlServer(
-            workspace: workspace,
-            socketURL: socketURL,
-            agentSettings: settings
-        )
-    }
-
-    func spawnAgentSession(named name: String) async throws -> TerminalSession {
-        let response = try await send(.spawnProcess(.init(kind: "agent", name: name)))
-        guard case .spawnProcess(let spawned)? = response.result else {
-            Issue.record("Expected spawnProcess result, got \(String(describing: response))")
-            throw CherryControlError(code: "spawn_failed", message: "Expected spawnProcess result.")
-        }
-        return try #require(workspace.session(id: spawned.process.id))
-    }
-
-    func send(_ request: CherryControlRequest) async throws -> CherryControlResponse {
-        let socketURL = socketURL
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    let response = try CherryControlClient(socketURL: socketURL).send(request)
-                    continuation.resume(returning: response)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-    }
-
-    func stop() {
-        server.stop()
-        workspace.sessions.forEach { $0.stop() }
-        defaults.removePersistentDomain(forName: defaultsName)
-        try? FileManager.default.removeItem(at: projectRoot)
-        try? FileManager.default.removeItem(at: socketURL.deletingLastPathComponent())
-    }
-}
-
-@MainActor
 @Suite(.serialized)
 struct ControlActivityTests {
     @Test func processStatusExposesAgentActivityFields() async throws {
-        let harness = try ControlActivityHarness()
+        let harness = try ControlAgentWaitHarness()
         defer {
             harness.stop()
         }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "/bin/cat"))
         harness.server.start()
 
-        let session = try await harness.spawnAgentSession(named: "Claude")
+        let session = try await harness.spawnAgent(named: "Claude")
         session.ingestTestingData(Data("❯ \(programStatus("state=idle:app=claude-code"))".utf8))
         try await Task.sleep(for: .milliseconds(150))
 
@@ -103,7 +36,7 @@ struct ControlActivityTests {
     /// (Claude Code in a terminal tab) takes the line as a paste and never
     /// runs it.
     @Test func aTerminalsSubmitSendsItsEnterOnItsOwnAfterTheText() async throws {
-        let harness = try ControlActivityHarness()
+        let harness = try ControlAgentWaitHarness()
         defer {
             harness.stop()
         }
@@ -153,7 +86,7 @@ struct ControlActivityTests {
     }
 
     @Test func processOutputReportsScreenMode() async throws {
-        let harness = try ControlActivityHarness()
+        let harness = try ControlAgentWaitHarness()
         defer {
             harness.stop()
         }
@@ -190,14 +123,13 @@ struct ControlActivityTests {
             TerminalNotificationCenter.shared.isDeliveryEnabled = true
         }
 
-        let harness = try ControlActivityHarness()
+        let harness = try ControlAgentWaitHarness()
         defer {
             harness.stop()
         }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "/bin/cat"))
         harness.server.start()
 
-        let session = try await harness.spawnAgentSession(named: "Claude")
+        let session = try await harness.spawnAgent(named: "Claude")
         // "approve Bash: ls", as Claude Code 2.1.295 sends it.
         session.ingestTestingData(Data(programStatus("state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiBscw==").utf8))
         #expect(session.agentActivityState == .permission)
@@ -224,14 +156,13 @@ struct ControlActivityTests {
     }
 
     @Test func waitForProcessIdleTimesOutWhileAgentIsWorking() async throws {
-        let harness = try ControlActivityHarness()
+        let harness = try ControlAgentWaitHarness()
         defer {
             harness.stop()
         }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "/bin/cat"))
         harness.server.start()
 
-        let session = try await harness.spawnAgentSession(named: "Claude")
+        let session = try await harness.spawnAgent(named: "Claude")
         // Its screen looks idle; what it reports is what counts.
         session.ingestTestingData(Data("❯ \n\(programStatus("state=working:app=claude-code"))".utf8))
         try await Task.sleep(for: .milliseconds(150))
@@ -258,14 +189,13 @@ struct ControlActivityTests {
     /// state, however its screen looks; MCP's idle wait falls back to its
     /// output going quiet.
     @Test func anAgentThatReportsNothingIsUnknownAndItsWaitEndsWhenItGoesQuiet() async throws {
-        let harness = try ControlActivityHarness()
+        let harness = try ControlAgentWaitHarness()
         defer {
             harness.stop()
         }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "Codex", command: "/bin/cat"))
         harness.server.start()
 
-        let session = try await harness.spawnAgentSession(named: "Codex")
+        let session = try await harness.spawnAgent(named: "Codex")
         session.ingestTestingData(Data("\u{1B}]0;⠋ project\u{7}• Working (3s • esc to interrupt)\n› \n".utf8))
         try await Task.sleep(for: .milliseconds(150))
         #expect(session.agentActivityState == .unknown)
@@ -287,23 +217,24 @@ struct ControlActivityTests {
         #expect(waited.process.programStatus == nil)
     }
 
+#if DEBUG
     /// A turn as Claude Code reports it: `working` at the submit, `done`
     /// at its end. A result that comes while the tab is not seen stays
     /// unseen until it is; an `idle` straight after `working` is a turn the
-    /// user cancelled.
+    /// user cancelled. (`noteTestingInput` is DEBUG only: release builds,
+    /// such as Scripts/perf-terminal-stress's, compile without this test.)
     @Test func reportedTurnsAreCountedAndTheirResultsAreUnseenUntilViewed() async throws {
         TerminalNotificationCenter.shared.isDeliveryEnabled = false
         defer {
             TerminalNotificationCenter.shared.isDeliveryEnabled = true
         }
-        let harness = try ControlActivityHarness()
+        let harness = try ControlAgentWaitHarness()
         defer {
             harness.stop()
         }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "/bin/cat"))
         harness.server.start()
 
-        let session = try await harness.spawnAgentSession(named: "Claude")
+        let session = try await harness.spawnAgent(named: "Claude")
         session.ingestTestingData(Data(programStatus("state=idle:app=claude-code").utf8))
         #expect(session.agentTurnState == .notStarted)
         #expect(session.agentTurnCount == 0)
@@ -343,6 +274,7 @@ struct ControlActivityTests {
         #expect(session.agentActivityState == .unknown)
         #expect(session.programStatus.isEmpty)
     }
+#endif
 
     @Test func trimmedRawOutputSuffixSkipsPartialUTF8AndEscapeTails() async throws {
         let continuationTail = Data([0x9F, 0x92, 0x96]) + Data("hello\n".utf8)

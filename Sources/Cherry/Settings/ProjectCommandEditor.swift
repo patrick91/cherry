@@ -39,8 +39,7 @@ struct ProjectCommandRow: View {
             Button("Edit", action: onEdit)
                 .settingsGlassButtonStyle()
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 13)
+        .settingsRowPadding()
         .contextMenu {
             Button("Delete", role: .destructive, action: onDelete)
         }
@@ -53,17 +52,17 @@ struct ProjectCommandEditor: View {
     let projectRoot: String
     let canDelete: Bool
     let errorMessage: String?
-    let onSave: (ProjectCommandDefinition, ProjectCommandStorage) -> Void
+    let onSave: (ProjectCommandDefinition, ProjectSettingStorage) -> Void
     let onDelete: () -> Void
     let onCancel: () -> Void
 
     init(
         command: ProjectCommandDefinition,
         projectRoot: String,
-        storage: ProjectCommandStorage = .local,
+        storage: ProjectSettingStorage = .local,
         canDelete: Bool,
         errorMessage: String?,
-        onSave: @escaping (ProjectCommandDefinition, ProjectCommandStorage) -> Void,
+        onSave: @escaping (ProjectCommandDefinition, ProjectSettingStorage) -> Void,
         onDelete: @escaping () -> Void,
         onCancel: @escaping () -> Void
     ) {
@@ -210,21 +209,18 @@ struct ProjectCommandEditor: View {
     }
 
     private func chooseWorkingDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
-        if !draft.workingDirectory.isEmpty {
-            panel.directoryURL = URL(
+        let directoryURL: URL? = if !draft.workingDirectory.isEmpty {
+            URL(
                 fileURLWithPath: draft.definition.resolvedWorkingDirectory(projectRoot: projectRoot),
                 isDirectory: true
             )
         } else if !projectRoot.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: projectRoot, isDirectory: true)
+            URL(fileURLWithPath: projectRoot, isDirectory: true)
+        } else {
+            nil
         }
 
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let url = NSOpenPanel.chooseFolder(prompt: "Choose", directoryURL: directoryURL) else { return }
         draft.workingDirectory = ProjectCommandDefinition.portableWorkingDirectory(url.path, projectRoot: projectRoot)
     }
 
@@ -325,10 +321,10 @@ private struct ProjectCommandDraft {
     var autoStart: Bool
     var autoRestart: Bool
     var enabled: Bool
-    var storage: ProjectCommandStorage
+    var storage: ProjectSettingStorage
     let projectRoot: String
 
-    init(command: ProjectCommandDefinition, projectRoot: String, storage: ProjectCommandStorage) {
+    init(command: ProjectCommandDefinition, projectRoot: String, storage: ProjectSettingStorage) {
         name = command.name
         commandLine = command.commandLine
         workingDirectory = ProjectCommandDefinition.portableWorkingDirectory(
@@ -348,9 +344,6 @@ private struct ProjectCommandDraft {
         enabled = command.enabled
         self.storage = storage
         self.projectRoot = projectRoot
-        if name.isEmpty, commandLine.isEmpty, workingDirectory.isEmpty {
-            self.workingDirectory = ""
-        }
     }
 
     var definition: ProjectCommandDefinition {

@@ -55,7 +55,10 @@
 //! session's latest progress still queued, which a listing does not tell,
 //! follows it. Events never hold back the session workers that publish
 //! them, nor count against the replies' bound.
-use crate::{signals::Wake, stream::MAX_CLIPBOARD};
+use crate::{
+    signals::{self, Wake},
+    stream::MAX_CLIPBOARD,
+};
 use cherry_protocol::{
     encode_frame, encode_output_frame, output_frame_parts, priority, ServerMessage, SessionEvent,
     SessionInfo, OUTPUT_HEADER,
@@ -418,7 +421,7 @@ impl State {
         self.output_bytes + self.rest_bytes + self.writing_output
     }
 
-    fn push(&mut self, frame: Arc<Vec<u8>>, kind: Kind, output: bool) {
+    fn push(&mut self, frame: Arc<Vec<u8>>, kind: Kind) {
         self.waiting_from_now();
         self.bytes += frame.len();
         if kind == Kind::Output {
@@ -428,7 +431,7 @@ impl State {
             frame,
             start: 0,
             kind,
-            output,
+            output: matches!(kind, Kind::Output | Kind::Carried),
             key: None,
             seq: 0,
         });
@@ -990,20 +993,13 @@ impl Outbox {
         let Some(fd) = self.lock().socket.as_ref().map(AsRawFd::as_raw_fd) else {
             return false;
         };
-        let mut poll = libc::pollfd {
-            fd,
-            events: libc::POLLOUT,
-            revents: 0,
-        };
         // Until there is room or the connection is shut down (a vanished
         // peer is noticed by the reader, which shuts the socket down), or
         // `WRITABLE_RECHECK`: a macOS Unix socket reports room only once
         // its peer read nearly all it holds, though it takes more as soon
         // as the peer reads any. Trying again sooner keeps a slow peer's
         // socket topped up, and shows that it reads (`pacing`).
-        unsafe {
-            libc::poll(&mut poll, 1, WRITABLE_RECHECK.as_millis() as libc::c_int);
-        }
+        signals::wait_for(fd, libc::POLLOUT, Some(WRITABLE_RECHECK));
         true
     }
 
@@ -1015,7 +1011,7 @@ impl Outbox {
 
     /// Write `frame` now if nothing is ahead of it, or queue it as `kind`.
     /// False when the connection turned out to be gone.
-    fn deliver(&self, state: &mut State, frame: Arc<Vec<u8>>, kind: Kind, output: bool) -> bool {
+    fn deliver(&self, state: &mut State, frame: Arc<Vec<u8>>, kind: Kind) -> bool {
         match state.write_now(&frame, kind == Kind::Output) {
             Some(Ok(queued_rest)) => {
                 if queued_rest {
@@ -1033,7 +1029,10 @@ impl Outbox {
                 false
             }
             None => {
-                state.push(frame, kind, output);
+                if kind == Kind::Query {
+                    state.query_bytes += frame.len();
+                }
+                state.push(frame, kind);
                 self.ready.notify_one();
                 true
             }
@@ -1069,7 +1068,7 @@ impl Outbox {
             self.ready.notify_one();
             true
         } else {
-            self.deliver(&mut state, output.frame.clone(), Kind::Output, true)
+            self.deliver(&mut state, output.frame.clone(), Kind::Output)
         };
         if !queued {
             return Push::Gone;
@@ -1188,12 +1187,12 @@ impl Outbox {
         state.hold_queries(superseded_by_resync);
         state.drop_where(superseded_by_resync);
         state.lagging = false;
-        state.push(frame, Kind::Resync, false);
+        state.push(frame, Kind::Resync);
         if let Some(output) = carried {
-            state.push(output.frame, Kind::Carried, true);
+            state.push(output.frame, Kind::Carried);
         }
         while let Some(query) = state.held.pop_front() {
-            state.push(query, Kind::Query, false);
+            state.push(query, Kind::Query);
         }
         self.ready.notify_one();
         true
@@ -1213,20 +1212,7 @@ impl Outbox {
             state.held.push_back(frame);
             return true;
         }
-        match state.write_now(&frame, false) {
-            Some(Ok(_)) => true,
-            Some(Err(())) => {
-                drop(state);
-                self.fail();
-                false
-            }
-            None => {
-                state.query_bytes += frame.len();
-                state.push(frame, Kind::Query, false);
-                self.ready.notify_one();
-                true
-            }
-        }
+        self.deliver(&mut state, frame, Kind::Query)
     }
 
     /// Whether a full replacement is queued, which a newer replacement
@@ -1255,7 +1241,7 @@ impl Outbox {
             Kind::Resized => true,
             _ => false,
         });
-        state.push(frame, Kind::Replacement { full }, false);
+        state.push(frame, Kind::Replacement { full });
         self.ready.notify_one();
         true
     }
@@ -1268,7 +1254,7 @@ impl Outbox {
         if state.dead || state.closed {
             return false;
         }
-        self.deliver(&mut state, frame, Kind::Resized, false)
+        self.deliver(&mut state, frame, Kind::Resized)
     }
 
     /// A reply or notice that is never dropped.
@@ -1277,7 +1263,7 @@ impl Outbox {
         if state.dead || state.closed {
             return false;
         }
-        self.deliver(&mut state, frame, Kind::Control, false)
+        self.deliver(&mut state, frame, Kind::Control)
     }
 
     /// An event for this subscribed connection, in order with its replies.
@@ -1340,7 +1326,7 @@ impl Outbox {
         if state.dead || state.closed {
             return;
         }
-        state.push(frame, Kind::Final, false);
+        state.push(frame, Kind::Final);
         state.closed = true;
         self.ready.notify_one();
     }
@@ -2814,6 +2800,33 @@ mod tests {
         assert_eq!(all.len(), big.len() + 7);
         assert!(all[..big.len()] == big[..], "the frame arrived whole");
         assert_eq!(&all[big.len()..], &[0; 7]);
+    }
+
+    #[test]
+    fn the_rest_of_a_query_written_in_part_goes_without_another_frame() {
+        let (outbox, mut peer) = connected();
+        let writer = outbox.lock().socket.as_ref().unwrap().try_clone().unwrap();
+        // Far more than the socket takes at once; queries wait up to
+        // `QUERY_LIMIT`.
+        let query: Vec<u8> = (0..QUERY_LIMIT / 2).map(|i| (i % 251) as u8).collect();
+        std::thread::scope(|scope| {
+            scope.spawn(|| outbox.write_all_to(&writer));
+            // The writer waits for frames by then.
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(outbox.push_query(Arc::new(query.clone())));
+            // Written in part at once, and the rest by the writer, which
+            // nothing else wakes.
+            peer.set_nonblocking(false).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut all = vec![0; query.len()];
+            let read = std::io::Read::read_exact(&mut peer, &mut all);
+            outbox.close();
+            // A writer woken only now ends, the peer gone.
+            peer.shutdown(std::net::Shutdown::Both).unwrap();
+            read.expect("the rest of the query arrived");
+            assert!(all == query, "the query arrived whole");
+        });
     }
 
     #[test]

@@ -62,21 +62,18 @@ struct AgentTaskSessionBinding: Codable, Equatable, Hashable, Sendable {
     var hostID: String?
     var sessionID: String
 
-    init(host: String, hostID: String?, sessionID: String) {
-        self.host = host
-        self.hostID = hostID
-        self.sessionID = sessionID
-    }
-
-    init(_ attachment: HostedSessionAttachment) {
-        self.init(host: attachment.host.id, hostID: attachment.hostID, sessionID: attachment.sessionID)
-    }
-
     /// Whether `attachment` names this session.
     func names(_ attachment: HostedSessionAttachment?) -> Bool {
         guard let attachment else { return false }
         return attachment.sessionID == sessionID && attachment.host.id == host
             && (hostID == nil || attachment.hostID == hostID)
+    }
+}
+
+// In an extension, so the memberwise initializer stays.
+extension AgentTaskSessionBinding {
+    init(_ attachment: HostedSessionAttachment) {
+        self.init(host: attachment.host.id, hostID: attachment.hostID, sessionID: attachment.sessionID)
     }
 }
 
@@ -205,23 +202,6 @@ final class AgentTask {
         self.brief = brief
         self.resultSchema = resultSchema
         self.createdAt = createdAt
-    }
-
-    convenience init(
-        id: String,
-        runID: String,
-        device: UUID?,
-        worker: TerminalSession,
-        workspace: TerminalWorkspace,
-        label: String,
-        phase: String?,
-        brief: String,
-        resultSchema: JSONValue?
-    ) {
-        self.init(
-            id: id, runID: runID, device: device, workerID: worker.id, worker: worker, workspace: workspace,
-            label: label, phase: phase, brief: brief, resultSchema: resultSchema
-        )
     }
 
     var kickoffLine: String { AgentTaskRegistry.kickoffLine(taskID: id) }
@@ -980,6 +960,7 @@ extension CherryControlServer {
             id: AgentTaskRegistry.newID("task"),
             runID: run.id,
             device: plan.device,
+            workerID: worker.id,
             worker: worker,
             workspace: workspace,
             label: plan.label,
@@ -1081,7 +1062,7 @@ extension CherryControlServer {
     @MainActor
     private func awayWorkerTaskOfCaller() -> AgentTask? {
         guard Self.remoteDevice == nil, callerSessionResolverForTesting == nil, let peerPID = Self.callerPeerPID else { return nil }
-        let ancestry = Set(Self.processAncestry(of: peerPID))
+        let ancestry = Set(CherryControl.processAncestry(of: peerPID))
         for id in tasks.taskOrder.reversed() {
             guard let task = tasks.tasks[id], task.state != .cancelled, locateWorker(task) == nil,
                   let hosting = hosting(of: task), let sessionID = task.hostSessionID ?? task.workerSession?.sessionID,
@@ -1632,18 +1613,13 @@ extension CherryControlServer {
             // Shown before its host answered (a relaunch): nothing is
             // decided or typed until the restore confirms the tab.
             if worker.isProvisionalRestore { continue }
-            let key = ObjectIdentifier(worker)
-            let now = Date()
-            if monitors.lastRefreshAt[key].map({ now.timeIntervalSince($0) >= monitors.refreshInterval }) ?? true {
-                monitors.lastRefreshAt[key] = now
-                await refreshForMonitor(worker)
-            }
+            await refreshForMonitorIfDue(worker, now: Date())
             // A report may have come in meanwhile.
             guard !task.state.isSettled else { continue }
             if let end = worker.systemSessionEnd {
                 // It came back ended: the system ended its session while
                 // Cherry was closed.
-                let reason = "its session " + AgentTaskRegistry.lowercasedFirst(end.message)
+                let reason = "its session " + end.endedClause()
                 tasks.update(task, to: .failed, event: .failed, text: "The worker's session is gone: \(reason).", reason: reason)
                 continue
             }
@@ -1727,11 +1703,6 @@ extension CherryControlServer {
         task.kickoffCopiesBefore = AgentTaskRegistry.kickoffCopies(taskID: task.id, in: kickoffScreen(of: worker))
     }
 
-    @MainActor
-    private func screenKey(of worker: TerminalSession) -> String {
-        AgentScreenActivity.agentKey(name: worker.agentName ?? worker.title, commandLine: worker.subtitle)
-    }
-
     /// The worker's screen has not changed for `interval`.
     @MainActor
     private func screenIsStill(_ worker: TerminalSession, for interval: TimeInterval, now: Date) -> Bool {
@@ -1773,7 +1744,7 @@ extension CherryControlServer {
             return
         }
         let lines = kickoffScreen(of: worker)
-        let agent = screenKey(of: worker)
+        let agent = worker.agentToolKey
         let placement = AgentTaskRegistry.kickoffPlacement(taskID: task.id, in: lines, agent: agent, copiesBefore: task.kickoffCopiesBefore)
         if placement == .submitted || kickoffTurnStarted(worker, since: typedAt) {
             noteKickoffDelivered(task, at: typedAt)
@@ -1847,7 +1818,7 @@ extension CherryControlServer {
         if worker.reportsProgramStatus {
             return worker.agentActivityState == .idle
         }
-        let verdict = AgentScreenActivity.verdict(for: kickoffScreen(of: worker, lineLimit: 80), agent: screenKey(of: worker))
+        let verdict = AgentScreenActivity.verdict(for: kickoffScreen(of: worker, lineLimit: 80), agent: worker.agentToolKey)
         return verdict == .prompt || verdict == .none
     }
 
@@ -1962,7 +1933,7 @@ extension CherryControlServer {
         task.turnBaselineAt = nil
         task.kickoffEnterPresses = 0
         let lines = kickoffScreen(of: worker)
-        if AgentTaskRegistry.kickoffPlacement(taskID: task.id, in: lines, agent: screenKey(of: worker)) == .composer {
+        if AgentTaskRegistry.kickoffPlacement(taskID: task.id, in: lines, agent: worker.agentToolKey) == .composer {
             // Its last one still sits in the composer (taken as sent by
             // mistake): its Enter, not a second copy.
             task.kickoffTypedAt = now

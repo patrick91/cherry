@@ -10,6 +10,14 @@ struct AgentScreenActivityTests {
         AgentScreenActivity.verdict(for: screen, agent: agent)
     }
 
+    /// The menu `lines` end with, ranked as `verdict` ranks them: a
+    /// permission menu first, then a question.
+    private func answerMenu(in lines: [String]) -> AgentScreenActivity.Verdict? {
+        if AgentPermissionPrompt.isShowing(in: lines) { return .permission }
+        if AgentQuestionPrompt.isShowing(in: lines) { return .question }
+        return nil
+    }
+
     private let claudeComposer = [
         "────────────────────────────────────────",
         "❯ ",
@@ -305,7 +313,7 @@ struct AgentScreenActivityTests {
         #expect(verdict(Self.claudeTallQuestion + ["", "", ""], "claude") == .question)
         // The agent key does not matter: the recognizer is the same for all.
         #expect(verdict(Self.claudeShortQuestion, "fixture") == .question)
-        #expect(AgentScreenActivity.answerMenu(in: Self.claudeTallQuestion) == .question)
+        #expect(answerMenu(in: Self.claudeTallQuestion) == .question)
         // A question outranks a background task row still at work.
         let withTask = Self.claudeShortQuestion.dropLast() + [
             "  ◯ general-purpose  Reading holder.rs",
@@ -317,7 +325,7 @@ struct AgentScreenActivityTests {
     @Test func codexQuestionAndApprovalWaitOnTheUser() {
         #expect(verdict(Self.codexQuestion, "codex") == .question)
         #expect(verdict(Self.codexApproval, "codex") == .permission)
-        #expect(AgentScreenActivity.answerMenu(in: Self.codexApproval) == .permission)
+        #expect(answerMenu(in: Self.codexApproval) == .permission)
     }
 
     @Test func aMenuAnsweredLongAgoNoLongerCounts() {
@@ -349,7 +357,7 @@ struct AgentScreenActivityTests {
             "",
         ] + claudeComposer + ["  ? for shortcuts"]
         #expect(verdict(claudeAnswer, "claude") == .prompt)
-        #expect(AgentScreenActivity.answerMenu(in: claudeAnswer) == nil)
+        #expect(answerMenu(in: claudeAnswer) == nil)
 
         // The user's own numbered message echoed after the prompt glyph.
         let echoedMessage = [
@@ -384,7 +392,7 @@ struct AgentScreenActivityTests {
             "  4. Fourth",
             "  5. Fifth",
         ]
-        #expect(AgentScreenActivity.answerMenu(in: phraseAbove) == nil)
+        #expect(answerMenu(in: phraseAbove) == nil)
 
         // A Claude composer draft that starts with a number.
         let draft = [
@@ -410,11 +418,11 @@ struct AgentScreenActivityTests {
             "",
             " ↑↓ navigate · enter select · esc cancel",
         ]
-        #expect(AgentScreenActivity.answerMenu(in: piSelector) == nil)
+        #expect(answerMenu(in: piSelector) == nil)
         #expect(verdict(piSelector, "pi") == .prompt)
 
         let ampAnswer = ["Options:", "1. Keep it", "2. Drop it", ""] + ampBox("")
-        #expect(AgentScreenActivity.answerMenu(in: ampAnswer) == nil)
+        #expect(answerMenu(in: ampAnswer) == nil)
         #expect(verdict(ampAnswer, "amp") == .prompt)
     }
 

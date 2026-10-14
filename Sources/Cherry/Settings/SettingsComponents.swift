@@ -105,25 +105,21 @@ extension View {
 struct SettingsPaneScroll<Content: View>: View {
     let title: String
     let subtitle: String
-    let systemImage: String
     let content: Content
 
     init(page: SettingsPage, @ViewBuilder content: () -> Content) {
         title = page.title
         subtitle = page.subtitle
-        systemImage = page.systemImage
         self.content = content()
     }
 
     init(
         title: String,
         subtitle: String,
-        systemImage: String,
         @ViewBuilder content: () -> Content
     ) {
         self.title = title
         self.subtitle = subtitle
-        self.systemImage = systemImage
         self.content = content()
     }
 

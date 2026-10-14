@@ -14,15 +14,6 @@ import Testing
 // control` (FakeControlHelper); nothing reaches a real cherry-host or the
 // app's real Application Support.
 
-private func temporaryDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    let resolved = try #require(url.path.withCString { realpath($0, nil) })
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-}
-
 /// A value the fake's thread reads while the test sets it.
 private final class LockedValue<Value>: @unchecked Sendable {
     private let lock = NSLock()
@@ -99,7 +90,7 @@ private func restore(
 // MARK: - One copy of the app
 
 @Test func anInstanceLockIsHeldByOneCopyAtATimeAndExplainsWhoHasIt() throws {
-    let directory = try temporaryDirectory("cherry-instance-lock")
+    let directory = try canonicalTemporaryDirectory("cherry-instance-lock")
     defer { try? FileManager.default.removeItem(at: directory) }
     let url = directory.appendingPathComponent("Test App", isDirectory: true).appendingPathComponent("instance.lock")
     let first = AppInstanceLock(fileURL: url, applicationSupportName: "Test App")
@@ -138,7 +129,7 @@ private func restore(
 }
 
 @Test @MainActor func aSecondCopyWithTheSameIdentityLeavesSessionsAndSavedTabsAlone() async throws {
-    let directory = try temporaryDirectory("cherry-second-copy")
+    let directory = try canonicalTemporaryDirectory("cherry-second-copy")
     defer { try? FileManager.default.removeItem(at: directory) }
     let lockURL = directory.appendingPathComponent("instance.lock")
     let owner = AppInstanceLock(fileURL: lockURL, applicationSupportName: "CherryTests")
@@ -217,7 +208,7 @@ private func restore(
 // MARK: - State files of another version
 
 @Test func aStateFileThisVersionCannotUseIsMovedAsideNotWrittenOver() throws {
-    let directory = try temporaryDirectory("cherry-state-aside")
+    let directory = try canonicalTemporaryDirectory("cherry-state-aside")
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = WorkspaceStateStore(directory: directory)
     let fileURL = store.stateFileURL(repositoryRoot: "/repo")
@@ -420,7 +411,7 @@ private func restore(
 
 @Test @MainActor func closingAWindowEndingSessionsEndsTheSessionsOfItsSavedTabsThatAreNotTabs() async throws {
     let harness = try PersistentHarness()
-    let container = try temporaryDirectory("cherry-forgotten")
+    let container = try canonicalTemporaryDirectory("cherry-forgotten")
     let root = container.appendingPathComponent("repo", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     let store = WorkspaceStateStore(directory: container.appendingPathComponent("store", isDirectory: true))
@@ -496,8 +487,8 @@ private func restore(
 
 @Test @MainActor func sessionsOfThisAppThatNoSavedTabNamesComeBackAsTabsOfTheirWindow() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-orphans")
-    let storeDirectory = try temporaryDirectory("cherry-orphans-store")
+    let root = try canonicalTemporaryDirectory("cherry-orphans")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-orphans-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     defer {
         harness.cleanUp()
@@ -566,7 +557,7 @@ private func restore(
 
     // A project with no saved state at all adopts its sessions whenever
     // they were created (before this run).
-    let fresh = try temporaryDirectory("cherry-orphans-fresh")
+    let fresh = try canonicalTemporaryDirectory("cherry-orphans-fresh")
     defer { try? FileManager.default.removeItem(at: fresh) }
     let lost = UUID()
     harness.fake.sessions.append(session("s-lost", tab: lost, project: fresh.path, createdAt: Date(timeIntervalSince1970: 1_000)))
@@ -589,8 +580,8 @@ private func restore(
 
 @Test @MainActor func anOrphanedTerminalThatExitedCleanlyIsRemovedNotAdopted() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-orphans-exited")
-    let storeDirectory = try temporaryDirectory("cherry-orphans-exited-store")
+    let root = try canonicalTemporaryDirectory("cherry-orphans-exited")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-orphans-exited-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     defer {
         harness.cleanUp()
@@ -648,8 +639,8 @@ private func restore(
 
 @Test @MainActor func aNewPersistentTabIsSavedAtOnce() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-save-at-once")
-    let storeDirectory = try temporaryDirectory("cherry-save-at-once-store")
+    let root = try canonicalTemporaryDirectory("cherry-save-at-once")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-save-at-once-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     defer {
         harness.cleanUp()
@@ -704,7 +695,7 @@ private func restore(
 // MARK: - Review follow-ups
 
 @Test func aCopyLaunchedWhileTheHolderQuitsWaitsForItAndNoFlockDoesNotTurnPersistenceOff() throws {
-    let directory = try temporaryDirectory("cherry-instance-quit")
+    let directory = try canonicalTemporaryDirectory("cherry-instance-quit")
     defer { try? FileManager.default.removeItem(at: directory) }
     let url = directory.appendingPathComponent("instance.lock")
     let first = AppInstanceLock(fileURL: url, applicationSupportName: "Test App")
@@ -761,7 +752,7 @@ private func restore(
 }
 
 @Test @MainActor func quittingMarksTheInstanceLockForACopyLaunchedMeanwhile() throws {
-    let directory = try temporaryDirectory("cherry-instance-quit-mark")
+    let directory = try canonicalTemporaryDirectory("cherry-instance-quit-mark")
     defer { try? FileManager.default.removeItem(at: directory) }
     let lock = AppInstanceLock(fileURL: directory.appendingPathComponent("instance.lock"), applicationSupportName: "CherryTests")
     #expect(lock.isHeld)
@@ -775,7 +766,7 @@ private func restore(
     }
     // Every quit marks it, whether it keeps sessions or ends them.
     for intent in [SessionCloseIntent.appQuit, .appQuitEndingSessions] {
-        let marked = try temporaryDirectory("cherry-instance-quit-mark-\(intent)")
+        let marked = try canonicalTemporaryDirectory("cherry-instance-quit-mark-\(intent)")
         defer { try? FileManager.default.removeItem(at: marked) }
         let markedLock = AppInstanceLock(fileURL: marked.appendingPathComponent("instance.lock"), applicationSupportName: "CherryTests")
         #expect(markedLock.isHeld)
@@ -788,7 +779,7 @@ private func restore(
 }
 
 @Test @MainActor func theSessionsOfForgottenTabsThisRunCouldNotEndAreEndedAtTheNextLaunch() async throws {
-    let storeDirectory = try temporaryDirectory("cherry-sessions-to-end")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-sessions-to-end")
     defer { try? FileManager.default.removeItem(at: storeDirectory) }
     let store = WorkspaceStateStore(directory: storeDirectory)
     var configuration = PersistentHarness.fastConfiguration
@@ -863,8 +854,8 @@ private func restore(
 
 @Test @MainActor func aStateFileMovedAsideStillKeepsSessionsClosedOnPurposeFromComingBack() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-orphans-aside")
-    let storeDirectory = try temporaryDirectory("cherry-orphans-aside-store")
+    let root = try canonicalTemporaryDirectory("cherry-orphans-aside")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-orphans-aside-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     defer {
         harness.cleanUp()
@@ -929,7 +920,7 @@ private func restore(
 }
 
 @Test func whatAStateFileThisVersionCannotUseSaidDecidesWhichSessionsComeBack() throws {
-    let directory = try temporaryDirectory("cherry-set-aside-summary")
+    let directory = try canonicalTemporaryDirectory("cherry-set-aside-summary")
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = WorkspaceStateStore(directory: directory)
     // Nothing was ever saved or set aside.
@@ -1014,7 +1005,7 @@ private func restore(
 
 @Test @MainActor func closingAWindowWhileItsRestoreWaitsLeavesNoTabOwningItsSessions() async throws {
     let harness = try PersistentHarness()
-    let container = try temporaryDirectory("cherry-restore-waits")
+    let container = try canonicalTemporaryDirectory("cherry-restore-waits")
     let root = container.appendingPathComponent("repo", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     let store = WorkspaceStateStore(directory: container.appendingPathComponent("store", isDirectory: true))

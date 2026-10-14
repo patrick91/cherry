@@ -32,7 +32,6 @@ struct BackgroundSession: Equatable, Identifiable, Sendable {
     let kind: TerminalSession.SessionKind
     /// The agent (`cherry.agent`), for its logo.
     let agentKey: String?
-    let commandName: String?
     /// The project folder its tab ran in (`cherry.project`).
     let projectRoot: String?
     let projectName: String
@@ -51,9 +50,8 @@ struct BackgroundSession: Equatable, Identifiable, Sendable {
     /// The device it runs on (its name); nil for This Mac.
     var machine: String? = nil
     /// What its program says about itself: its root program status
-    /// record's state and kind (OSC 7501, set by
-    /// `BackgroundSessionsModel.refresh`), nil while it reports nothing.
-    /// Not its message, which changes as it works.
+    /// record's state and kind (OSC 7501, from the host's list), nil while
+    /// it reports nothing. Not its message, which changes as it works.
     var programState: ProgramStatus.State?
     var programKind: ProgramStatus.Kind?
 
@@ -86,7 +84,8 @@ enum BackgroundSessionPresentation {
         case ended
     }
 
-    static func session(_ info: HostedSessionInfo, hostID: String) -> BackgroundSession {
+    /// `machine`: the device it runs on (its name); nil for This Mac.
+    static func session(_ info: HostedSessionInfo, hostID: String, machine: String? = nil) -> BackgroundSession {
         let kind = info.tags[PersistentSessionTag.kind].flatMap(TerminalSession.SessionKind.init(rawValue:)) ?? .terminal
         let projectRoot = OrphanedSessionCriteria.projectRoot(of: info)
         return BackgroundSession(
@@ -96,7 +95,6 @@ enum BackgroundSessionPresentation {
             displayTitle: SessionDisplayTitle.background(info, kind: kind, home: nil),
             kind: kind,
             agentKey: kind == .agent ? info.tags[PersistentSessionTag.agent]?.nilIfEmpty : nil,
-            commandName: kind == .command ? info.tags[PersistentSessionTag.command]?.nilIfEmpty : nil,
             projectRoot: projectRoot,
             projectName: projectName(projectRoot: projectRoot),
             foregroundName: info.isBusy ? info.foreground?.name.nilIfEmpty : nil,
@@ -104,7 +102,10 @@ enum BackgroundSessionPresentation {
             exitStatus: info.isRunning ? nil : PersistentLocalSessions.exitStatus(of: info),
             hostCrashed: !info.isRunning && info.end?.isHolderLost == true,
             clients: info.clients,
-            createdAt: info.createdDate
+            createdAt: info.createdDate,
+            machine: machine,
+            programState: info.programStatus.root?.state,
+            programKind: info.programStatus.root?.kind
         )
     }
 
@@ -188,14 +189,16 @@ enum BackgroundSessions {
     /// are in the background: `owner`'s, not shown by an open tab
     /// (`isShown`), not being ended (`isEnding`), and not named by a saved
     /// tab an open window may still restore (`awaitingRestore`). Running
-    /// and ended ones, by project, running first, newest first.
+    /// and ended ones, by project, running first, newest first. `machine`:
+    /// the device they run on (its name); nil for This Mac.
     static func classify(
         _ sessions: [HostedSessionInfo],
         hostID: String,
         owner: String,
         isShown: (HostedSessionInfo) -> Bool,
         isEnding: (HostedSessionInfo) -> Bool,
-        awaitingRestore: [WorkspaceSessionRecord]
+        awaitingRestore: [WorkspaceSessionRecord],
+        machine: String? = nil
     ) -> [BackgroundSession] {
         sessions
             .filter { info in
@@ -206,7 +209,7 @@ enum BackgroundSessions {
                         PersistentLocalSessions.record(record, names: info, hostID: hostID, owner: owner, includingAttached: true)
                     }
             }
-            .map { BackgroundSessionPresentation.session($0, hostID: hostID) }
+            .map { BackgroundSessionPresentation.session($0, hostID: hostID, machine: machine) }
             .sorted { lhs, rhs in
                 let byProject = lhs.projectName.localizedCaseInsensitiveCompare(rhs.projectName)
                 if byProject != .orderedSame { return byProject == .orderedAscending }
@@ -586,7 +589,6 @@ final class BackgroundSessionsModel: ObservableObject {
             listed = knownHostID.map { backgroundSessions(in: infos, hostID: $0) } ?? []
             isFromControl = knownHostID != nil
         }
-        listed = withProgramStatus(listed, from: infos)
         if isFromControl, let hostID = knownHostID {
             noteProgramStatus(of: listed, in: infos, hostID: hostID)
         }
@@ -607,21 +609,6 @@ final class BackgroundSessionsModel: ObservableObject {
         }
         updateSummary()
         updateLease()
-    }
-
-    /// Sets `programState` and `programKind` of the sessions of `listed`
-    /// from their programs' status in `infos` (OSC 7501: the root record).
-    private func withProgramStatus(_ listed: [BackgroundSession], from infos: [HostedSessionInfo]) -> [BackgroundSession] {
-        let roots = Dictionary(
-            infos.compactMap { info in info.programStatus.root.map { (info.id, $0) } },
-            uniquingKeysWith: { first, _ in first }
-        )
-        return listed.map { session in
-            var session = session
-            session.programState = roots[session.id]?.state
-            session.programKind = roots[session.id]?.kind
-            return session
-        }
     }
 
     /// Notes the program status of every session of `listed` (the control
@@ -846,7 +833,6 @@ final class BackgroundSessionsModel: ObservableObject {
         else { return [] }
         let attachedTabs = attachedTabs
         let endsRequested = endsRequested
-        let machine = device?.name
         return BackgroundSessions.classify(
             sessions,
             hostID: hostID,
@@ -857,13 +843,9 @@ final class BackgroundSessionsModel: ObservableObject {
                     || localSessions.isEnding(info.id)
                     || localSessions.isScheduledToEnd(info, hostID: hostID)
             },
-            awaitingRestore: registry.sessionRecordsAwaitingRestore()
+            awaitingRestore: registry.sessionRecordsAwaitingRestore(),
+            machine: device?.name
         )
-        .map { session in
-            var session = session
-            session.machine = machine
-            return session
-        }
     }
 
     /// How the Persistent Sessions sheet marks a session of This Mac: this

@@ -39,26 +39,6 @@ private final class KeyView: NSView {
     override var acceptsFirstResponder: Bool { true }
 }
 
-/// A clock the test moves, and the checks scheduled on it.
-@MainActor
-private final class ManualClock {
-    private(set) var now = Date(timeIntervalSince1970: 1_000)
-    private var scheduled: [(at: Date, work: @MainActor () -> Void)] = []
-
-    var schedule: ProjectWindowToasts.Scheduler {
-        { [unowned self] delay, work in scheduled.append((now.addingTimeInterval(delay), work)) }
-    }
-
-    /// Moves the clock on by `seconds`, running what falls due, in order.
-    func advance(by seconds: TimeInterval) {
-        now = now.addingTimeInterval(seconds)
-        while let next = scheduled.enumerated().filter({ $0.element.at <= now }).min(by: { $0.element.at < $1.element.at }) {
-            scheduled.remove(at: next.offset)
-            next.element.work()
-        }
-    }
-}
-
 /// A window's chrome whose toasts and closed tabs keep time on `clock`
 /// (never running out by themselves without one) and announce nothing.
 @MainActor
@@ -75,32 +55,6 @@ private func windowChrome(clock: ManualClock? = nil, voiceOver: Bool = false) ->
         announce: { _ in },
         voiceOverEnabled: { voiceOver }
     ))
-}
-
-private func temporaryDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    let resolved = try #require(url.path.withCString { realpath($0, nil) })
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-}
-
-@MainActor
-private func sidebarName(of session: TerminalSession) -> String {
-    SidebarSessionLabel.label(for: session, pathDisplayMode: TerminalSettings.shared.sidebarTerminalPathDisplayMode).title
-}
-
-/// Waits (polling the main loop) until `condition` holds; false after
-/// `timeout`.
-@MainActor
-private func eventually(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return condition()
 }
 
 /// A session this app (CherryTests) started for tab `tab` of `project`,
@@ -138,7 +92,7 @@ private func syntheticTab(_ name: String) -> ClosedTab {
 @Test @MainActor func commandWLeavesAPersistentTabsSessionRunningAndCommandZBringsTheTabBackWhereItWas() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()
-    let storeDirectory = try temporaryDirectory("cherry-undo-store")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-undo-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let registry = ProjectWindowRegistry()
     registry.setWorkspaceStateStoreForTesting(store)
@@ -214,7 +168,7 @@ private func syntheticTab(_ name: String) -> ClosedTab {
 @Test @MainActor func aClosedTabsSessionEndsWhenItsUndoRunsOutWhichWaitsWhileItsToastIsHoveredOrItsWindowIsNotKey() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()
-    let storeDirectory = try temporaryDirectory("cherry-undo-expiry-store")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-undo-expiry-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let registry = ProjectWindowRegistry()
     registry.setWorkspaceStateStoreForTesting(store)
@@ -704,8 +658,8 @@ private func syntheticTab(_ name: String) -> ClosedTab {
     let harness = try PersistentHarness()
     harness.fake.pendingHolders = 0
     let root = harness.project.path
-    let storeDirectory = try temporaryDirectory("cherry-undo-hidden-store")
-    let otherStoreDirectory = try temporaryDirectory("cherry-undo-hidden-other-store")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-undo-hidden-store")
+    let otherStoreDirectory = try canonicalTemporaryDirectory("cherry-undo-hidden-other-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let registry = ProjectWindowRegistry()
     registry.setWorkspaceStateStoreForTesting(store)

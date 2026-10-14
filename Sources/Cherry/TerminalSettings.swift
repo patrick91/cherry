@@ -134,9 +134,6 @@ struct SessionPersistenceSettings: Equatable, Sendable {
 struct SessionBackendPolicy {
     /// Read at every decision, so a settings change applies to the next one.
     var settings: @MainActor () -> SessionPersistenceSettings
-    /// Whether closing a local persistent tab follows its intent; see
-    /// `SessionClosePolicy.hostedLocalTabsFollowSettings`.
-    var hostedLocalTabsFollowSettings = SessionClosePolicy.hostedLocalTabsFollowSettings
     /// Ends a local persistent tab's session on its host after a
     /// `.terminate` close action detached the tab: Kill, then Remove once the
     /// host reports the exit (bounded). For a user's close in a window that
@@ -228,11 +225,7 @@ struct SessionBackendPolicy {
     }
 
     func closeAction(for session: TerminalSession, intent: SessionCloseIntent) -> SessionCloseAction {
-        SessionClosePolicy.closeAction(
-            for: session,
-            intent: intent,
-            hostedLocalTabsFollowSettings: hostedLocalTabsFollowSettings
-        )
+        SessionClosePolicy.closeAction(for: SessionCloseBackend(session), intent: intent)
     }
 }
 
@@ -523,23 +516,13 @@ final class TerminalSettings: ObservableObject {
 
     func ghosttyTheme() -> TerminalTheme {
         TerminalTheme(
-            light: terminalTheme(named: lightTerminalThemeName, fallback: Defaults.lightTerminalThemeName)
-                .toTerminalConfiguration(),
-            dark: terminalTheme(named: darkTerminalThemeName, fallback: Defaults.darkTerminalThemeName)
-                .toTerminalConfiguration()
+            light: terminalTheme(for: .light).toTerminalConfiguration(),
+            dark: terminalTheme(for: .dark).toTerminalConfiguration()
         )
     }
 
     func ghosttyThemeColors(for colorScheme: ColorScheme) -> TerminalThemeColors {
-        let theme = switch colorScheme {
-        case .light:
-            terminalTheme(named: lightTerminalThemeName, fallback: Defaults.lightTerminalThemeName)
-        case .dark:
-            terminalTheme(named: darkTerminalThemeName, fallback: Defaults.darkTerminalThemeName)
-        @unknown default:
-            terminalTheme(named: darkTerminalThemeName, fallback: Defaults.darkTerminalThemeName)
-        }
-
+        let theme = terminalTheme(for: colorScheme)
         return TerminalThemeColors(
             background: theme.background,
             foreground: theme.foreground,
@@ -554,12 +537,7 @@ final class TerminalSettings: ObservableObject {
     /// Nil when the theme's colours are not `#rrggbb` (the host then
     /// reports its defaults).
     func hostTerminalColors(for colorScheme: ColorScheme) -> HostTerminalColors? {
-        let theme = switch colorScheme {
-        case .light:
-            terminalTheme(named: lightTerminalThemeName, fallback: Defaults.lightTerminalThemeName)
-        default:
-            terminalTheme(named: darkTerminalThemeName, fallback: Defaults.darkTerminalThemeName)
-        }
+        let theme = terminalTheme(for: colorScheme)
         return HostTerminalColors(
             foreground: theme.foreground,
             background: theme.background,
@@ -568,25 +546,8 @@ final class TerminalSettings: ObservableObject {
         )
     }
 
-    func isKnownGhosttyTheme(_ name: String) -> Bool {
-        GhosttyThemeCatalog.theme(named: name.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
-    }
-
-    private func save(_ value: Double, forKey key: String, notifyTerminal: Bool = true) {
-        defaults.set(value, forKey: key)
-        if notifyTerminal {
-            notifyChanged()
-        }
-    }
-
-    private func save(_ value: Bool, forKey key: String, notifyTerminal: Bool = true) {
-        defaults.set(value, forKey: key)
-        if notifyTerminal {
-            notifyChanged()
-        }
-    }
-
-    private func save(_ value: String, forKey key: String, notifyTerminal: Bool = true) {
+    /// Writes a setting's value (a Double, Bool or String) to the defaults.
+    private func save(_ value: Any, forKey key: String, notifyTerminal: Bool = true) {
         defaults.set(value, forKey: key)
         if notifyTerminal {
             notifyChanged()
@@ -633,6 +594,14 @@ final class TerminalSettings: ObservableObject {
         static let noticeBackgroundSessionsAtLaunch = "sessions.backgroundNoticeAtLaunch"
         static let notifyWhenBackgroundProgramNeedsInput = "sessions.background.notifyNeedsInput"
         static let notifyWhenBackgroundProgramFinishes = "sessions.background.notifyFinished"
+    }
+
+    /// The terminal theme `colorScheme` shows: the light one in light mode,
+    /// else the dark one.
+    private func terminalTheme(for colorScheme: ColorScheme) -> GhosttyThemeDefinition {
+        colorScheme == .light
+            ? terminalTheme(named: lightTerminalThemeName, fallback: Defaults.lightTerminalThemeName)
+            : terminalTheme(named: darkTerminalThemeName, fallback: Defaults.darkTerminalThemeName)
     }
 
     private func terminalTheme(named name: String, fallback: String) -> GhosttyThemeDefinition {

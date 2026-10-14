@@ -117,15 +117,6 @@ private extension PersistentHarness {
     }
 }
 
-private func canonicalDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    let resolved = try #require(url.path.withCString { realpath($0, nil) })
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-}
-
 // MARK: - This Mac
 
 @Test @MainActor func restoringThisMacsSessionsFollowsTheMatrixAndAttachesLater() async throws {
@@ -384,8 +375,8 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
 
 @Test @MainActor func restoredAgentTreesPutParentsFirstAndKeepGroupsLayoutAndSelection() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-tree")
-    let storeDirectory = try canonicalDirectory("cherry-restore-tree-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-tree")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-tree-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let parent = localRecord(kind: .agent, title: "Lead", sessionID: "s-parent", agentName: "Claude", workingDirectory: root.path)
     let child = localRecord(
@@ -498,8 +489,8 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
 
 @Test @MainActor func tabsKeptWhileThisMacsHostIsUnreachableComeBackWhenItIsUp() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-retry")
-    let storeDirectory = try canonicalDirectory("cherry-restore-retry-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-retry")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-retry-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let editor = localRecord(title: "Editor", sessionID: "s-editor", workingDirectory: root.path)
     let server = localRecord(kind: .command, title: "server", sessionID: "s-server", commandName: "server", workingDirectory: root.path)
@@ -575,8 +566,8 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
 
 @Test @MainActor func autoStartNeverDuplicatesARestoredCommandAndRestartsEndedOnesByTheirPolicy() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-autostart-hosted")
-    let storeDirectory = try canonicalDirectory("cherry-restore-autostart-hosted-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-autostart-hosted")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-autostart-hosted-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     // Running while Cherry was closed; an auto-start command.
     let web = localRecord(kind: .command, title: "web", sessionID: "s-web", commandName: "web", workingDirectory: root.path)
@@ -749,35 +740,10 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
 
 // MARK: - Slow and restarted hosts
 
-/// Holds restores until the test opens it.
-@MainActor
-private final class RestorerGate {
-    private var continuations: [CheckedContinuation<Void, Never>] = []
-    private var isOpen = false
-    private(set) var waiting = 0
-
-    func wait() async {
-        guard !isOpen else { return }
-        waiting += 1
-        await withCheckedContinuation { continuations.append($0) }
-    }
-
-    func open() {
-        isOpen = true
-        let waiting = continuations
-        continuations.removeAll()
-        waiting.forEach { $0.resume() }
-    }
-}
-
-private func repositoryKey(_ root: URL) -> String {
-    URL(fileURLWithPath: root.path, isDirectory: true).standardizedFileURL.path
-}
-
 @Test @MainActor func aSlowSSHHostNeverHoldsUpThisMacsTabs() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-slow-host")
-    let storeDirectory = try canonicalDirectory("cherry-restore-slow-host-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-slow-host")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-slow-host-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let remote = FakeControlHelper()
     remote.hostID = "host-ssh"
@@ -850,8 +816,8 @@ private func repositoryKey(_ root: URL) -> String {
 
 @Test @MainActor func aWindowWhoseTabsAreAllOnAnUnreachableHostAutoStartsAndOpensItsShellWhenItGivesUp() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-unreachable-ssh")
-    let storeDirectory = try canonicalDirectory("cherry-restore-unreachable-ssh-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-unreachable-ssh")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-unreachable-ssh-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let remote = FakeControlHelper()
     remote.hostID = "host-ssh"
@@ -908,11 +874,9 @@ private func repositoryKey(_ root: URL) -> String {
 }
 
 @Test @MainActor func aSessionMissingFromTheFirstListIsLookedForAgainBeforeItsTabIsDropped() async throws {
-    var configuration = PersistentHarness.fastConfiguration
-    configuration.disappearanceConfirmationDelay = .seconds(1)
-    let harness = try PersistentHarness(configuration: configuration)
-    let root = try canonicalDirectory("cherry-restore-late-holder")
-    let storeDirectory = try canonicalDirectory("cherry-restore-late-holder-store")
+    let harness = try PersistentHarness()
+    let root = try canonicalTemporaryDirectory("cherry-restore-late-holder")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-late-holder-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let editor = localRecord(title: "Editor", sessionID: "s-editor", workingDirectory: root.path)
     let server = localRecord(kind: .command, title: "server", sessionID: "s-server", commandName: "server", workingDirectory: root.path)
@@ -922,8 +886,9 @@ private func repositoryKey(_ root: URL) -> String {
                           tags: [PersistentSessionTag.tab: record.id.uuidString])
     }
     // A daemon that just restarted: the server's holder has not registered
-    // again yet.
+    // again yet, and the host still expects it.
     harness.fake.sessions = [info(editor, pid: 96)]
+    harness.fake.pendingHolders = 1
     store.saveSynchronously(RepositoryStateRecord(
         repositoryRoot: repositoryKey(root),
         activeWorktreeRoot: root.path,
@@ -953,14 +918,17 @@ private func repositoryKey(_ root: URL) -> String {
     #expect(workspace.isRestoringCommand(named: "Server"))
     #expect(workspace.commandSessions.isEmpty)
 
-    // Its holder registers; the second look finds it.
+    // Its holder registers, and the host expects no more: the second look
+    // finds it.
     harness.fake.sessions = [info(editor, pid: 96), info(server, pid: 97)]
+    harness.fake.pendingHolders = 0
     await repository.waitForPendingRestores()
     #expect(workspace.sessions.map(\.id) == [editor.id, server.id])
     #expect(workspace.commandSessions.first?.persistentSession?.sessionID == "s-server")
     #expect(!workspace.isRestoringCommand(named: "server"))
     #expect(harness.creates().isEmpty)
-    // A session missing from both lists is gone: its tab is dropped.
+    // A session missing from the complete list too is gone: its tab is
+    // dropped.
     repository.flushPersistentState()
     #expect(store.load(repositoryRoot: repository.repositoryRoot)?.worktree(root: root.path)?.sessions.map(\.id)
         == [editor.id, server.id])
@@ -970,8 +938,8 @@ private func repositoryKey(_ root: URL) -> String {
 
 @Test @MainActor func aCommandStartedWhileItsTabIsBeingRestoredGetsThatTab() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-start-pending")
-    let storeDirectory = try canonicalDirectory("cherry-restore-start-pending-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-start-pending")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-start-pending-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let server = localRecord(kind: .command, title: "server", sessionID: "s-server", commandName: "server", workingDirectory: root.path)
     let worker = localRecord(kind: .command, title: "worker", sessionID: "s-worker", commandName: "worker", workingDirectory: root.path)
@@ -984,7 +952,7 @@ private func repositoryKey(_ root: URL) -> String {
         activeWorktreeRoot: root.path,
         worktrees: [WorktreeStateRecord(root: root.path, sessions: [server, worker])]
     ))
-    let gate = RestorerGate()
+    let gate = RestoreGate()
     let restorer = harness.restorer
     let repository = RepositoryWorkspace(
         projectRoot: root.path,
@@ -1120,7 +1088,7 @@ private func repositoryKey(_ root: URL) -> String {
 /// and the next save writes them as the window's one record.
 @Test @MainActor func tabsSavedForSeveralWorktreesComeBackInTheProjectsWindow() async throws {
     let harness = try PersistentHarness()
-    let container = try canonicalDirectory("cherry-restore-folded-worktrees")
+    let container = try canonicalTemporaryDirectory("cherry-restore-folded-worktrees")
     let root = container.appendingPathComponent("repo", isDirectory: true)
     let feature = container.appendingPathComponent("feature", isDirectory: true)
     let storeDirectory = container.appendingPathComponent("store", isDirectory: true)
@@ -1173,8 +1141,8 @@ private func repositoryKey(_ root: URL) -> String {
 
 @Test @MainActor func aRetryThatFiresAsItIsSubscribedCanKeepAndRetryAgain() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-retry-at-once")
-    let storeDirectory = try canonicalDirectory("cherry-restore-retry-at-once-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-retry-at-once")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-retry-at-once-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let server = localRecord(kind: .command, title: "server", sessionID: "s-server", commandName: "server", workingDirectory: root.path)
     harness.fake.sessions = [HostedSessionInfo(
@@ -1241,8 +1209,6 @@ private func repositoryKey(_ root: URL) -> String {
 
 @Test @MainActor func aRestartedDaemonIsListedUntilItsHoldersRegisteredBeforeMissingTabsAreDropped() async throws {
     var configuration = PersistentHarness.fastConfiguration
-    // Never waited for: this host reports the holders it still expects.
-    configuration.disappearanceConfirmationDelay = .seconds(30)
     configuration.pendingHoldersPollInterval = .milliseconds(50)
     configuration.pendingHoldersWait = .seconds(5)
     let harness = try PersistentHarness(configuration: configuration)
@@ -1288,7 +1254,6 @@ private func repositoryKey(_ root: URL) -> String {
 
 @Test @MainActor func aCompleteListDropsMissingTabsAtOnceAndHoldersThatNeverCameBackKeepThem() async throws {
     var configuration = PersistentHarness.fastConfiguration
-    configuration.disappearanceConfirmationDelay = .seconds(30)
     configuration.pendingHoldersPollInterval = .milliseconds(20)
     configuration.pendingHoldersWait = .milliseconds(300)
     let harness = try PersistentHarness(configuration: configuration)
@@ -1335,12 +1300,11 @@ private func repositoryKey(_ root: URL) -> String {
 
 @Test @MainActor func autoStartWaitsForCommandsWhoseHoldersARestartedDaemonStillExpectsUntilItExpectsNone() async throws {
     var configuration = PersistentHarness.fastConfiguration
-    configuration.disappearanceConfirmationDelay = .seconds(30)
     configuration.pendingHoldersPollInterval = .milliseconds(20)
     configuration.pendingHoldersWait = .milliseconds(300)
     let harness = try PersistentHarness(configuration: configuration)
-    let root = try canonicalDirectory("cherry-restore-holders-retry")
-    let storeDirectory = try canonicalDirectory("cherry-restore-holders-retry-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-holders-retry")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-holders-retry-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let server = localRecord(kind: .command, title: "server", sessionID: "s-server", commandName: "server", workingDirectory: root.path)
     let worker = localRecord(kind: .command, title: "worker", sessionID: "s-worker", commandName: "worker", workingDirectory: root.path)
@@ -1465,8 +1429,8 @@ private func repositoryKey(_ root: URL) -> String {
 
 @Test @MainActor func aTabSavedWhileItsCreateWasUnderWayComesBackEvenAsItsWindowsOnlyTab() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-request-id")
-    let storeDirectory = try canonicalDirectory("cherry-restore-request-id-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-request-id")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-request-id-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     defer {
         harness.cleanUp()
@@ -1531,14 +1495,6 @@ private func repositoryKey(_ root: URL) -> String {
 
 // MARK: - Sessions the system ended
 
-/// A chrome state whose toasts never go by themselves and reach no VoiceOver.
-@MainActor
-private func quietChromeState() -> ProjectWindowChromeState {
-    ProjectWindowChromeState(toasts: ProjectWindowToasts(
-        schedule: { _, _ in }, announce: { _ in }, voiceOverEnabled: { false }
-    ))
-}
-
 /// Before This Mac's last boot: a state saved then was saved before a restart.
 private func beforeTheLastBoot() throws -> Date {
     try #require(SystemEndedSessions.currentBootTime()).addingTimeInterval(-3_600)
@@ -1575,10 +1531,10 @@ private func beforeTheLastBoot() throws -> Date {
 
 @Test @MainActor func aRebootBringsTabsBackEndedInTheirPlacesWithoutAShellAndRestartStartsEachKind() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-reboot")
-    let storeDirectory = try canonicalDirectory("cherry-restore-reboot-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-reboot")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-reboot-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
-    let elsewhere = try canonicalDirectory("cherry-restore-reboot-cwd")
+    let elsewhere = try canonicalTemporaryDirectory("cherry-restore-reboot-cwd")
     let left = localRecord(title: "Left", sessionID: "s-left", workingDirectory: elsewhere.path)
     let right = localRecord(title: "Right", sessionID: "s-right", workingDirectory: root.path)
     let lead = localRecord(kind: .agent, title: "Lead", sessionID: "s-lead", agentName: "Claude", workingDirectory: root.path)
@@ -1711,8 +1667,8 @@ private func beforeTheLastBoot() throws -> Date {
 
 @Test @MainActor func aNormalRelaunchStillDropsATabWhoseSessionIsGoneAndOpensTheShell() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-no-reboot")
-    let storeDirectory = try canonicalDirectory("cherry-restore-no-reboot-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-no-reboot")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-no-reboot-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let gone = localRecord(title: "Gone", sessionID: "s-gone", workingDirectory: root.path)
     harness.fake.pendingHolders = 0
@@ -1754,8 +1710,8 @@ private func beforeTheLastBoot() throws -> Date {
 
 @Test @MainActor func tabsWhoseSessionsWereEndedOnPurposeStayDroppedAfterAReboot() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-reboot-purpose")
-    let storeDirectory = try canonicalDirectory("cherry-restore-reboot-purpose-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-reboot-purpose")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-reboot-purpose-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     defer {
         harness.cleanUp()
@@ -1823,7 +1779,6 @@ private func beforeTheLastBoot() throws -> Date {
 
 @Test @MainActor func aLogOutOrALostHolderBringsTabsBackOnlyOnceNothingMoreIsComing() async throws {
     var configuration = PersistentHarness.fastConfiguration
-    configuration.disappearanceConfirmationDelay = .milliseconds(200)
     configuration.pendingHoldersPollInterval = .milliseconds(20)
     configuration.pendingHoldersWait = .milliseconds(300)
     let harness = try PersistentHarness(configuration: configuration)
@@ -1866,16 +1821,21 @@ private func beforeTheLastBoot() throws -> Date {
     #expect(normal.sessions.isEmpty)
     #expect(normal.keptRecordIDs.isEmpty)
 
-    // A host that does not report pending holders: only after its second
-    // look, as a dropped tab would be.
-    harness.fake.pendingHolders = nil
-    let older = await harness.restore([gone], into: workspace, systemEnds: evidence(quits: [justNow.addingTimeInterval(5)]))
-    #expect(older.sessions.isEmpty)
-    #expect(older.pendingRecordIDs == [gone.id])
-    let olderRest = try await #require(older.remainder).value
-    #expect(olderRest.sessions.map(\.id) == [gone.id])
-    #expect(olderRest.sessions.first?.systemSessionEnd == .logout)
-    WorkspaceRestoreResult.discard(olderRest, in: workspace)
+    // Holders still expected at first: only once the host expects none, as
+    // a dropped tab would be.
+    let expectsAHolderOnce = FakeCountdown(1)
+    harness.fake.respond = { [fake = harness.fake] request, _ in
+        guard request.op == "list", expectsAHolderOnce.take() else { return nil }
+        return .answer(.sessions(HostedSessionList(hostID: fake.hostID, sessions: fake.sessions, pendingHolders: 1)))
+    }
+    let registering = await harness.restore([gone], into: workspace, systemEnds: evidence(quits: [justNow.addingTimeInterval(5)]))
+    #expect(registering.sessions.isEmpty)
+    #expect(registering.pendingRecordIDs == [gone.id])
+    let registered = try await #require(registering.remainder).value
+    #expect(registered.sessions.map(\.id) == [gone.id])
+    #expect(registered.sessions.first?.systemSessionEnd == .logout)
+    WorkspaceRestoreResult.discard(registered, in: workspace)
+    harness.fake.respond = nil
 
     // Holders still expected when the wait runs out: kept, not ended.
     harness.fake.pendingHolders = 2
@@ -1887,8 +1847,8 @@ private func beforeTheLastBoot() throws -> Date {
 
 @Test @MainActor func tabsSavedEndedComeBackEndedWithoutAskingOrAToastAndCommandsStartByTheirRules() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-saved-ended")
-    let storeDirectory = try canonicalDirectory("cherry-restore-saved-ended-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-saved-ended")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-saved-ended-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     defer {
         harness.cleanUp()
@@ -1957,8 +1917,8 @@ private func beforeTheLastBoot() throws -> Date {
 
 @Test @MainActor func exitedSessionsComeBackShowingTheirExitAndNeverRestartByThemselves() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-reboot-exited")
-    let storeDirectory = try canonicalDirectory("cherry-restore-reboot-exited-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-reboot-exited")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-reboot-exited-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     defer {
         harness.cleanUp()
@@ -2044,8 +2004,8 @@ private func beforeTheLastBoot() throws -> Date {
 
 @Test @MainActor func aRecordKeptWhileTheHostWasUnreachableKeepsItsEvidenceWhenSavedAgain() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-reboot-kept")
-    let storeDirectory = try canonicalDirectory("cherry-restore-reboot-kept-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-reboot-kept")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-reboot-kept-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     defer {
         harness.cleanUp()
@@ -2138,8 +2098,8 @@ private func beforeTheLastBoot() throws -> Date {
 
 @Test @MainActor func lostSessionsTheHostReportedStillCountOnceItsDaemonRestarted() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-restore-lost-recorded")
-    let storeDirectory = try canonicalDirectory("cherry-restore-lost-recorded-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-lost-recorded")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-lost-recorded-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     defer {
         harness.cleanUp()
@@ -2255,24 +2215,13 @@ private func makeRevealTestWindow() -> NSWindow {
     return window
 }
 
-/// Waits (at most `timeout`) for `condition`, turning the main loop.
-@MainActor
-private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool) async -> Bool {
-    let deadline = ContinuousClock.now + timeout
-    while !condition() {
-        guard ContinuousClock.now < deadline else { return false }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return true
-}
-
 /// A window whose saved tabs are still being restored registers off screen
 /// (transparent, letting clicks through) and comes on screen only once they
 /// are in place, never empty first.
 @Test @MainActor func aRestoredWindowStaysOffScreenUntilItsTabsAreBack() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-reveal-restored")
-    let storeDirectory = try canonicalDirectory("cherry-reveal-restored-store")
+    let root = try canonicalTemporaryDirectory("cherry-reveal-restored")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-reveal-restored-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let shell = localRecord(title: "Shell", sessionID: "s-shell", workingDirectory: root.path)
     harness.fake.sessions = [HostedSessionInfo(id: "s-shell", name: "Shell", cwd: root.path, pid: 98, owner: "CherryTests")]
@@ -2281,7 +2230,7 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
         activeWorktreeRoot: root.path,
         worktrees: [WorktreeStateRecord(root: root.path, sessions: [shell])]
     ))
-    let gate = RestorerGate()
+    let gate = RestoreGate()
     let restorer = harness.restorer
     let repository = RepositoryWorkspace(
         projectRoot: root.path,
@@ -2345,8 +2294,8 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
 /// and the tabs come into it when the host answers.
 @Test @MainActor func aSlowRestoreShowsItsWindowOnceTheWaitRunsOut() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-reveal-slow")
-    let storeDirectory = try canonicalDirectory("cherry-reveal-slow-store")
+    let root = try canonicalTemporaryDirectory("cherry-reveal-slow")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-reveal-slow-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let shell = localRecord(title: "Shell", sessionID: "s-shell", workingDirectory: root.path)
     harness.fake.sessions = [HostedSessionInfo(id: "s-shell", name: "Shell", cwd: root.path, pid: 98, owner: "CherryTests")]
@@ -2355,7 +2304,7 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
         activeWorktreeRoot: root.path,
         worktrees: [WorktreeStateRecord(root: root.path, sessions: [shell])]
     ))
-    let gate = RestorerGate()
+    let gate = RestoreGate()
     let restorer = harness.restorer
     let repository = RepositoryWorkspace(
         projectRoot: root.path,
@@ -2410,8 +2359,8 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
 /// while its restore waits lets its waiters go.
 @Test @MainActor func aWindowWithNothingToRestoreShowsAtOnce() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-reveal-nothing")
-    let storeDirectory = try canonicalDirectory("cherry-reveal-nothing-store")
+    let root = try canonicalTemporaryDirectory("cherry-reveal-nothing")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-reveal-nothing-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let repository = RepositoryWorkspace(
         projectRoot: root.path,
@@ -2450,8 +2399,8 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
 
 @Test @MainActor func closingAWindowWhoseRestoreWaitsSettlesIt() async throws {
     let harness = try PersistentHarness()
-    let root = try canonicalDirectory("cherry-reveal-closed")
-    let storeDirectory = try canonicalDirectory("cherry-reveal-closed-store")
+    let root = try canonicalTemporaryDirectory("cherry-reveal-closed")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-reveal-closed-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let shell = localRecord(title: "Shell", sessionID: "s-shell", workingDirectory: root.path)
     harness.fake.sessions = [HostedSessionInfo(id: "s-shell", name: "Shell", cwd: root.path, pid: 98, owner: "CherryTests")]
@@ -2460,7 +2409,7 @@ private func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool
         activeWorktreeRoot: root.path,
         worktrees: [WorktreeStateRecord(root: root.path, sessions: [shell])]
     ))
-    let gate = RestorerGate()
+    let gate = RestoreGate()
     let restorer = harness.restorer
     let repository = RepositoryWorkspace(
         projectRoot: root.path,

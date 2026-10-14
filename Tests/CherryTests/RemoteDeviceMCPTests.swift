@@ -406,12 +406,10 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         .getProcessStatus(.init(processID: id, processName: nil)),
         .getProcessOutput(.init(processID: id)),
         .sendProcessInput(.init(processID: id, text: "remote-input\n")),
-        .sendInput(.init(terminalID: id, text: "remote-send-input\n", rawBase64: nil, waitMilliseconds: nil, lineLimit: nil)),
         .restartProcess(.init(processID: id)),
         .closeProcess(.init(processID: id)),
         .stopProcess(.init(processID: id)),
         .getProcessPorts(.init(processID: id)),
-        .getTerminalOutput(.init(terminalID: id, startLine: nil, lineLimit: nil)),
         .getProcessStatus(.init(processID: otherDeviceTab, processName: nil)),
     ]
     for request in requests {
@@ -429,7 +427,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     try await Task.sleep(for: .milliseconds(300))
     #expect(echo.isRunning)
     let echoed = try await harness.output(of: echo)
-    #expect(!echoed.contains("remote-input") && !echoed.contains("remote-send-input"))
+    #expect(!echoed.contains("remote-input"))
 }
 
 /// (d) Another device's key, or a This Mac root, as a project: refused.
@@ -957,24 +955,20 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     let claudeLog = try String(contentsOf: root.appendingPathComponent("claude.log"), encoding: .utf8)
     #expect(claudeLog.components(separatedBy: "\n").filter { $0.hasPrefix("mcp add") }.count == 2)
     // The sheet shows exactly these commands.
-    #expect(RemoteMCPSetup.commands(mode: .install, name: "cherry").contains(
+    #expect(RemoteMCPSetup.installCommands(name: "cherry").contains(
         "claude mcp remove --scope user cherry; claude mcp add --scope user --transport stdio cherry -- \"$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp\""
     ))
 }
 
 @Test @MainActor func RemoteDeviceMCPSetupIsInTheDeviceMenu() throws {
     let device = RemoteDevice(name: "Studio", sshDestination: "studio")
-    let item = TitlebarProjectMenuModel.deviceItem(
+    var sources = OmniSources()
+    sources.devices = [
         .init(device: device, state: RemoteDeviceConnectionState(control: .connected, sessionCount: 0, lastSeen: nil), sessions: []),
-        currentProjectKey: nil, now: Date()
-    )
-    let actions = (item.children ?? []).compactMap { entry -> TitlebarProjectMenuModel.Item? in
-        if case .item(let item) = entry { return item }
-        return nil
-    }
-    let setUp = try #require(actions.first { $0.action == .setUpDeviceMCP(device.id) })
+    ]
+    let actions = OmniProviders.macActions(.device(device.id), sources: sources)
+    let setUp = try #require(actions.first { $0.command == .switcher(.setUpDeviceMCP(device.id)) })
     #expect(setUp.title == "Set Up Cherry MCP on Studio…")
-    #expect(setUp.isEnabled)
 }
 
 // MARK: - Second review: sessions of other hosts, local scans, the directory there, request limits
@@ -1036,12 +1030,8 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
             .getProcessOutput(.init(processID: id)),
             .sendProcessInput(.init(processID: id, text: "remote-input\n")),
             .sendProcessInput(.init(processName: foreign.title, text: "remote-input\n")),
-            .sendInput(.init(terminalID: id, text: "x\n", rawBase64: nil, waitMilliseconds: nil, lineLimit: nil)),
-            .getTerminalOutput(.init(terminalID: id, startLine: nil, lineLimit: nil)),
             .restartProcess(.init(processID: id)),
-            .restartTerminal(.init(terminalID: id)),
             .closeProcess(.init(processID: id)),
-            .closeTerminal(.init(terminalID: id)),
             .stopProcess(.init(processID: id)),
             .selectProcess(.init(processID: id)),
             .waitForProcessIdle(.init(processID: id, timeoutMilliseconds: 50)),

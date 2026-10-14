@@ -55,7 +55,7 @@ enum AgentPermissionPrompt {
         for line in tail {
             let normalized = normalize(line)
             guard !normalized.isEmpty else { continue }
-            if let option = optionText(normalized) {
+            if let option = optionText(Substring(normalized)) {
                 if option.hasPrefix("yes") { hasYesOption = true }
                 if option == "no" || option.hasPrefix("no,") || option.hasPrefix("no ") || option.hasPrefix("no(") {
                     hasNoOption = true
@@ -88,19 +88,20 @@ enum AgentPermissionPrompt {
         return plain.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
-    /// The text of a numbered menu option ("2. yes, and don't ask again" →
-    /// "yes, and don't ask again"); nil for any other line.
-    private static func optionText(_ normalized: String) -> String? {
-        var index = normalized.startIndex
+    /// The text of a numbered menu option, "1. Text" or "2) Text" ("2. yes,
+    /// and don't ask again" → "yes, and don't ask again"); nil for any other
+    /// line. `AgentQuestionPrompt` reads its options with it too.
+    static func optionText(_ text: Substring) -> String? {
+        var index = text.startIndex
         var digits = 0
-        while index < normalized.endIndex, normalized[index].isASCII, normalized[index].isNumber, digits < 2 {
-            index = normalized.index(after: index)
+        while index < text.endIndex, text[index].isASCII, text[index].isNumber, digits < 2 {
+            index = text.index(after: index)
             digits += 1
         }
-        guard digits > 0, index < normalized.endIndex,
-              normalized[index] == "." || normalized[index] == ")"
+        guard digits > 0, index < text.endIndex,
+              text[index] == "." || text[index] == ")"
         else { return nil }
-        let rest = normalized[normalized.index(after: index)...]
+        let rest = text[text.index(after: index)...]
         guard rest.first == " " else { return nil }
         return String(rest.dropFirst())
     }

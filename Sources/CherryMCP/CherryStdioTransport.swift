@@ -11,7 +11,6 @@ public actor CherryStdioTransport: Transport {
     private let readQueue = DispatchQueue(label: "CherryMCP.StdioTransport.read")
     private let readState: CherryStdioReadState
     private let messageStream: AsyncThrowingStream<Data, Swift.Error>
-    private let messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
 
     private var isConnected = false
     private var readSource: DispatchSourceRead?
@@ -32,7 +31,6 @@ public actor CherryStdioTransport: Transport {
         self.outputFileDescriptor = outputFileDescriptor
         self.logger = resolvedLogger
         messageStream = stream
-        messageContinuation = continuation
         readState = CherryStdioReadState(
             inputFileDescriptor: inputFileDescriptor,
             continuation: continuation,

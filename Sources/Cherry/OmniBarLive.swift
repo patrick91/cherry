@@ -31,20 +31,13 @@ final class OmniFrecencyStore: ObservableObject {
     @Published private(set) var entries: [String: Entry]
 
     private let defaults: UserDefaults
-    private let storageKey: String
 
-    init(
-        defaults: UserDefaults = .standard,
-        storageKey: String = OmniFrecencyStore.storageKey,
-        legacyStorageKey: String? = OmniFrecencyStore.legacyStorageKey
-    ) {
+    init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.storageKey = storageKey
-        if let data = defaults.data(forKey: storageKey),
+        if let data = defaults.data(forKey: Self.storageKey),
            let decoded = try? JSONDecoder().decode([String: Entry].self, from: data) {
             entries = decoded
-        } else if let legacyStorageKey,
-                  let data = defaults.data(forKey: legacyStorageKey),
+        } else if let data = defaults.data(forKey: Self.legacyStorageKey),
                   let decoded = try? JSONDecoder().decode([String: Entry].self, from: data) {
             entries = decoded
             persist()
@@ -100,7 +93,7 @@ final class OmniFrecencyStore: ObservableObject {
 
     private func persist() {
         guard let data = try? JSONEncoder().encode(entries) else { return }
-        defaults.set(data, forKey: storageKey)
+        defaults.set(data, forKey: Self.storageKey)
     }
 }
 
@@ -252,8 +245,6 @@ enum OmniBarGathering {
         sources.projects = projects
         sources.devices = devices
         sources.canModifyDevices = deviceStore.canModify
-        // Minutes: a finer clock would change the sources every second.
-        sources.now = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 / 60).rounded(.down) * 60)
 
         sources.tabs = tabs(registry: registry, current: window.workspace) { machine in
             switch machine {
@@ -314,7 +305,7 @@ enum OmniBarGathering {
         return windows.flatMap { projectRoot, workspace in
             let canonical = registry.canonicalProjectRoot(for: projectRoot)
             let location = ProjectLocation(key: canonical)
-            let machine: ProjectSwitcherModel.Machine = location.deviceID.map { .device($0) } ?? .thisMac
+            let machine = ProjectSwitcherModel.Machine(projectKey: canonical)
             let windowPath = location.isRemote ? location.path : canonical
             let machineHome = home(machine)
             return workspace.sessions.map { session in
@@ -352,11 +343,9 @@ enum OmniBarGathering {
     }
 
     /// An agent tab's tool, as the menu-bar agent list names it
-    /// (`MenuBarAgentsModel.refresh`); nil for other tabs.
+    /// (`TerminalSession.agentToolKey`); nil for other tabs.
     static func agentKey(of session: TerminalSession) -> String? {
-        guard session.kind == .agent else { return nil }
-        let brand = AgentToolBrand.detect(name: session.agentName ?? session.title, commandLine: session.subtitle)
-        return brand?.rawValue ?? AgentToolDefinition.normalizedName(session.agentName ?? session.title)
+        session.kind == .agent ? session.agentToolKey : nil
     }
 
     /// This Mac's background sessions, then each device's.
@@ -467,10 +456,6 @@ struct OmniBarPerformer {
             settings.removeProject(project)
         case .switcher(let action):
             switcher.perform(action)
-        case .openFolder(let machine):
-            switcher.openFolder(on: machine)
-        case .addProject(let machine):
-            switcher.addProject(on: machine)
         case .newTerminal(let machine):
             newTerminal(on: machine)
         case .endBackgroundSessions(let machine):
@@ -508,7 +493,7 @@ struct OmniBarPerformer {
                   let agent = project.launchableAgents.first(where: { $0.id == id })
             else { return NSSound.beep() }
             chromeState.selectTerminal()
-            workspace.addAgentSession(agent: agent.definition, projectRoot: root)
+            workspace.addAgentSession(agent: agent, projectRoot: root)
         case .openInEditor(let editorID):
             guard let root = settings.resolvedProject(for: window.projectRoot).validProjectRoot else { return }
             let editors = ExternalEditorLauncher.editors(editorDiscovery.installedEditors, forProjectRoot: root)
@@ -549,8 +534,6 @@ struct OmniBarPerformer {
             chromeState.isHostedSessionsPresented = true
         case .toggleSidebar:
             chromeState.toggleSidebar()
-        case .addProject:
-            switcher.chooseProjectRoot()
         case .toggleAppearance:
             toggleAppearance()
         }
@@ -638,60 +621,35 @@ struct OmniBarPerformer {
         }
     }
 
-    /// New Terminal Here: a terminal in `path` on `machine`, in this window
-    /// when it is that Mac's, else in the window of that Mac active last,
-    /// else in a new window of that folder.
-    private func newTerminal(on machine: ProjectSwitcherModel.Machine, at path: String) {
-        func machineOf(_ key: String?) -> ProjectSwitcherModel.Machine {
-            key.flatMap { ProjectLocation(key: $0).deviceID }.map { .device($0) } ?? .thisMac
+    /// A new terminal on `machine`, in `path` (New Terminal Here) or else
+    /// its home folder: in this window when it is that Mac's, else in a
+    /// window of that Mac (with no path, This Mac's active last), else in a
+    /// new window of that folder.
+    private func newTerminal(on machine: ProjectSwitcherModel.Machine, at path: String? = nil) {
+        let directory = path.map { path -> String in
+            let home: String? = switch machine {
+            case .thisMac: NSHomeDirectory()
+            case .device(let id): RemoteDeviceStore.shared.device(id: id)?.homeDirectory
+            }
+            return ProjectSwitcherModel.expandedPath(path, home: home) ?? path
         }
-        let home: String? = switch machine {
-        case .thisMac: NSHomeDirectory()
-        case .device(let id): RemoteDeviceStore.shared.device(id: id)?.homeDirectory
-        }
-        let directory = ProjectSwitcherModel.expandedPath(path, home: home) ?? path
-        if machineOf(window.projectRoot ?? workspace.projectRoot) == machine {
+        if ProjectSwitcherModel.Machine(projectKey: window.projectRoot ?? workspace.projectRoot) == machine {
             chromeState.selectTerminal()
             workspace.addSession(workingDirectory: directory)
             return
         }
-        if let (root, other) = registry.workspacesByProjectRoot().first(where: { machineOf($0.projectRoot) == machine }),
-           registry.focus(projectRoot: root) {
+        let target: (projectRoot: String, workspace: TerminalWorkspace)? = machine == .thisMac && path == nil
+            ? registry.frontmostLocalWorkspace().flatMap { other in other.projectRoot.map { (projectRoot: $0, workspace: other) } }
+            : registry.workspacesByProjectRoot().first { ProjectSwitcherModel.Machine(projectKey: $0.projectRoot) == machine }
+        if let (root, other) = target, registry.focus(projectRoot: root) {
             registry.chromeState(for: root)?.selectTerminal()
             other.addSession(workingDirectory: directory)
-        } else if !switcher.openPath(directory, on: machine) {
+        } else if let directory {
+            if !switcher.openPath(directory, on: machine) { NSSound.beep() }
+        } else if case .device(let id) = machine {
+            switcher.perform(.openDeviceHome(id))
+        } else if !switcher.openPath("~", on: .thisMac) {
             NSSound.beep()
-        }
-    }
-
-    /// A new terminal on `machine`: in this window when it is that Mac's,
-    /// else in the window of that Mac active last, else in a new window of
-    /// its home folder.
-    private func newTerminal(on machine: ProjectSwitcherModel.Machine) {
-        func machineOf(_ key: String?) -> ProjectSwitcherModel.Machine {
-            key.flatMap { ProjectLocation(key: $0).deviceID }.map { .device($0) } ?? .thisMac
-        }
-        if machineOf(window.projectRoot ?? workspace.projectRoot) == machine {
-            chromeState.selectTerminal()
-            workspace.addSession()
-            return
-        }
-        switch machine {
-        case .thisMac:
-            if let other = registry.frontmostLocalWorkspace(), let root = other.projectRoot, registry.focus(projectRoot: root) {
-                registry.chromeState(for: root)?.selectTerminal()
-                other.addSession()
-            } else if !switcher.openPath("~", on: .thisMac) {
-                NSSound.beep()
-            }
-        case .device(let id):
-            if let (root, other) = registry.workspacesByProjectRoot().first(where: { machineOf($0.projectRoot) == machine }),
-               registry.focus(projectRoot: root) {
-                registry.chromeState(for: root)?.selectTerminal()
-                other.addSession()
-            } else {
-                switcher.perform(.openDeviceHome(id))
-            }
         }
     }
 

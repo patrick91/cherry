@@ -50,8 +50,10 @@
 //!   request ID a client sees (`SessionInfo::request_id`) is the hello's
 //!   `receipt`, which every version carries.
 //! - Version 4 adds application cursor keys (DECCKM), as a field:
-//!   `application_cursor_keys` in `Info` and in the hello's session. A
-//!   daemon takes it as off for an older holder, which never reports it.
+//!   `application_cursor_keys` in `Info` and in the hello's session. It is
+//!   the first version a holder was built with (the ones before it never
+//!   left development), and the oldest a daemon serves
+//!   (`MIN_LINK_VERSION`).
 //! - Version 5 adds, daemon to holder, `Attended` (whether any client is
 //!   attached, which the holder serves at interactive priority; see
 //!   `cherry_protocol::priority`), and the snapshot kind `resized`, which
@@ -121,9 +123,6 @@ use std::{
 
 /// The link version this build speaks.
 pub const LINK_VERSION: u16 = 11;
-/// The oldest link version whose holders limit screen text themselves
-/// (`ScreenRequest::max_lines`).
-pub const SCREEN_LINES_VERSION: u16 = 3;
 /// The oldest link version whose holders answer the snapshot kind
 /// `resized`.
 pub const RESIZED_SNAPSHOT_VERSION: u16 = 5;
@@ -136,8 +135,9 @@ pub const CLEAR_HISTORY_VERSION: u16 = 7;
 pub const CELL_SIZE_VERSION: u16 = 8;
 /// The oldest link version whose holders take `graphics` in a `Snapshot`.
 pub const VIEWPORT_GRAPHICS_VERSION: u16 = 9;
-/// The oldest link version this daemon adopts holders of.
-pub const MIN_LINK_VERSION: u16 = 1;
+/// The oldest link version this daemon adopts holders of: the first a
+/// holder was ever built with.
+pub const MIN_LINK_VERSION: u16 = 4;
 /// Frames are at most this long (an 8 MiB snapshot with its images, and
 /// room to spare).
 pub const MAX_FRAME: usize = 32 * 1024 * 1024;
@@ -189,10 +189,10 @@ pub mod kind {
     /// Version 7.
     pub const CLEAR_HISTORY: u8 = 77;
 
-    /// The link version that introduced a daemon-to-holder kind.
+    /// The link version that introduced a daemon-to-holder kind; 1 for
+    /// one that every holder a daemon serves (`MIN_LINK_VERSION`) knows.
     pub fn since(kind: u8) -> u16 {
         match kind {
-            SCREEN | UPDATE => 2,
             ATTENDED => 5,
             PACE => 6,
             CLEAR_HISTORY => super::CLEAR_HISTORY_VERSION,
@@ -443,14 +443,7 @@ impl Writer {
             if left.is_zero() {
                 return false;
             }
-            let mut poll = libc::pollfd {
-                fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            unsafe {
-                libc::poll(&mut poll, 1, left.as_millis().max(1) as libc::c_int);
-            }
+            crate::signals::wait_for(fd, libc::POLLOUT, Some(left));
         }
     }
 }

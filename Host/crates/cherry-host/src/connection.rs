@@ -13,7 +13,8 @@ use crate::{
     daemon::{self, Host},
     environment, link,
     outbox::Outbox,
-    session::{ClearOutcome, Command, Launch, Session},
+    session::{AttachRequest, ClearOutcome, Command, Launch, Session},
+    signals,
 };
 use anyhow::{bail, Context, Result};
 use cherry_protocol::{
@@ -166,15 +167,9 @@ fn mismatched(mut stream: UnixStream, host: &Arc<Host>, version: u32) -> Result<
     };
     let reply = match message {
         ClientMessage::Replace if version > PROTOCOL_VERSION => {
-            {
-                // After any launch in progress, and before any other.
-                let _launch = host.launches.lock().unwrap_or_else(|e| e.into_inner());
-                host.stop();
-            }
-            daemon::log(format_args!(
+            make_way(host, format_args!(
                 "replaced by a client speaking protocol {version}; exiting, and leaving the sessions to the next host"
             ));
-            host.wait_until_released(FLUSH_TIMEOUT);
             ServerMessage::Ok
         }
         ClientMessage::Replace => ServerMessage::error(
@@ -188,6 +183,20 @@ fn mismatched(mut stream: UnixStream, host: &Arc<Host>, version: u32) -> Result<
     };
     write_frame(&mut stream, &Response::new(req, reply))?;
     Ok(())
+}
+
+/// Stop this host (`Replace`, `Restart`) after any launch in progress, log
+/// `why`, and wait until it no longer holds its socket or its lock, so that
+/// the client can start the next host at once. The sessions carry on in
+/// their holders, which register with that host.
+fn make_way(host: &Host, why: std::fmt::Arguments) {
+    {
+        // After any launch in progress, and before any other.
+        let _launch = host.launches.lock().unwrap_or_else(|e| e.into_inner());
+        host.stop();
+    }
+    daemon::log(why);
+    host.wait_until_released(FLUSH_TIMEOUT);
 }
 
 /// Stop accepting connections and release the socket and lock, unless
@@ -385,24 +394,11 @@ impl Read for Timed<'_> {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 read => return read,
             }
-            let millis = match deadline {
-                None => -1,
-                Some(deadline) => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        return Err(io::ErrorKind::WouldBlock.into());
-                    }
-                    left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int
-                }
-            };
-            let mut fd = libc::pollfd {
-                fd: self.stream.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            unsafe {
-                libc::poll(&mut fd, 1, millis);
+            let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            if left.is_some_and(|left| left.is_zero()) {
+                return Err(io::ErrorKind::WouldBlock.into());
             }
+            signals::wait_for(self.stream.as_raw_fd(), libc::POLLIN, left);
         }
     }
 }
@@ -600,22 +596,11 @@ impl Connection {
                 id,
                 scrollback,
                 max_lines,
-            } => {
-                let session = self.session(&id)?;
-                let (reply, replied) = mpsc::sync_channel(1);
-                session
-                    .send(Command::Screen {
-                        scrollback,
-                        max_lines,
-                        reply,
-                    })
-                    .map_err(|_| self.gone(&id))?;
-                match replied.recv_timeout(REQUEST_TIMEOUT) {
-                    Ok(reply) => reply,
-                    Err(mpsc::RecvTimeoutError::Timeout) => bail!("the session did not answer"),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err(self.gone(&id)),
-                }
-            }
+            } => self.ask(&id, |reply| Command::Screen {
+                scrollback,
+                max_lines,
+                reply,
+            })?,
             ClientMessage::Update { id, name, tags } => {
                 if name
                     .as_ref()
@@ -626,17 +611,10 @@ impl Connection {
                 if let Some(tags) = &tags {
                     cherry_protocol::check_tags(tags).map_err(anyhow::Error::msg)?;
                 }
-                let session = self.session(&id)?;
-                let (ack, acknowledged) = mpsc::sync_channel(1);
-                session
-                    .send(Command::Update { name, tags, ack })
-                    .map_err(|_| self.gone(&id))?;
-                match acknowledged.recv_timeout(REQUEST_TIMEOUT) {
-                    Ok(true) => ServerMessage::Ok,
-                    Ok(false) => return Err(unknown_session(&id)),
-                    Err(mpsc::RecvTimeoutError::Timeout) => bail!("the session did not answer"),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err(self.gone(&id)),
+                if !self.ask(&id, |ack| Command::Update { name, tags, ack })? {
+                    return Err(unknown_session(&id));
                 }
+                ServerMessage::Ok
             }
             ClientMessage::Ping => ServerMessage::Pong,
             ClientMessage::Status => ServerMessage::Status {
@@ -690,24 +668,19 @@ impl Connection {
                 cherry_protocol::valid_cell_size(cell_width, cell_height),
             )?,
             ClientMessage::ClearHistory { id } => {
-                let session = self.session(&id)?;
-                let (ack, acknowledged) = mpsc::sync_channel(1);
-                session
-                    .send(Command::ClearHistory { ack })
-                    .map_err(|_| self.gone(&id))?;
-                match acknowledged.recv_timeout(REQUEST_TIMEOUT) {
-                    Ok(ClearOutcome::Cleared) => ServerMessage::Ok,
-                    Ok(ClearOutcome::Removed) => return Err(unknown_session(&id)),
-                    Ok(ClearOutcome::AlternateScreen) => bail!(
+                match self.ask(&id, |ack| Command::ClearHistory { ack })? {
+                    ClearOutcome::Cleared => ServerMessage::Ok,
+                    ClearOutcome::Removed => return Err(unknown_session(&id)),
+                    ClearOutcome::AlternateScreen => bail!(
                         "session {id} shows its alternate screen, which has no history; the primary screen's history was kept"
                     ),
-                    Ok(ClearOutcome::NotLinked) => bail!(
+                    ClearOutcome::NotLinked => bail!(
                         "session {id}'s holder is not connected to this host right now, so its history was kept"
                     ),
-                    Ok(ClearOutcome::Failed(why)) => {
+                    ClearOutcome::Failed(why) => {
                         bail!("session {id}'s holder could not clear its history: {why}")
                     }
-                    Ok(ClearOutcome::Unsupported) => {
+                    ClearOutcome::Unsupported => {
                         return Err(refused(
                             error_code::UNSUPPORTED_OPERATION,
                             format!(
@@ -715,8 +688,6 @@ impl Connection {
                             ),
                         ))
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => bail!("the session did not answer"),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err(self.gone(&id)),
                 }
             }
             ClientMessage::Attach {
@@ -745,7 +716,7 @@ impl Connection {
                 let client_id = client_id.filter(|client| !client.is_empty());
                 let session = self.session(&id)?;
                 let (ack, acknowledged) = mpsc::sync_channel(1);
-                let attach = session.send(Command::Attach {
+                let attach = session.send(Command::Attach(AttachRequest {
                     lease: self.lease,
                     cols,
                     rows,
@@ -759,7 +730,7 @@ impl Connection {
                     abort: self.stream.try_clone()?,
                     cancelled: self.cancelled.clone(),
                     ack,
-                });
+                }));
                 attach.map_err(|_| self.gone(&id))?;
                 // The worker replies itself: the snapshot, or why it failed.
                 match acknowledged.recv_timeout(HOLDER_TIMEOUT) {
@@ -872,17 +843,11 @@ impl Connection {
                 ServerMessage::Ok
             }
             ClientMessage::Restart => {
-                {
-                    // After any launch in progress, and before any other.
-                    let _launch = self.host.launches.lock().unwrap_or_else(|e| e.into_inner());
-                    self.host.stop();
-                }
-                daemon::log(format_args!(
+                // Answered once the socket is gone and the lock is free, as
+                // `Replace` is: the client starts the next host right away.
+                make_way(&self.host, format_args!(
                     "restarting at a client's request; exiting, and leaving the sessions to the next host"
                 ));
-                // Once the socket is gone and the lock is free, as for
-                // `Replace`: the client starts the next host right away.
-                self.host.wait_until_released(FLUSH_TIMEOUT);
                 ServerMessage::Ok
             }
             ClientMessage::Shutdown => {
@@ -904,6 +869,19 @@ impl Connection {
             .get(id)
             .cloned()
             .ok_or_else(|| unknown_session(id))
+    }
+
+    /// Send session `id`'s worker the command `command` makes with the
+    /// channel it answers on, and wait for the answer.
+    fn ask<T>(&self, id: &str, command: impl FnOnce(mpsc::SyncSender<T>) -> Command) -> Result<T> {
+        let session = self.session(id)?;
+        let (answer, answered) = mpsc::sync_channel(1);
+        session.send(command(answer)).map_err(|_| self.gone(id))?;
+        match answered.recv_timeout(REQUEST_TIMEOUT) {
+            Ok(answer) => Ok(answer),
+            Err(mpsc::RecvTimeoutError::Timeout) => bail!("the session did not answer"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.gone(id)),
+        }
     }
 
     /// Why the worker of a session found a moment ago is gone: the session

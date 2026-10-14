@@ -24,7 +24,7 @@ killed and removed, the daemon is shut down and the directory is deleted.
 Preferences are the unbundled executable's own defaults domain ("Cherry"), which
 the installed app does not use.
 """
-import json, os, signal, socket, subprocess, sys, threading, time
+import os, signal, subprocess, sys, threading, time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -38,25 +38,14 @@ PRIVATE = cherry_private_host.make_private_directory("cherry-mcp-")
 HOME, SOCK, HOST_SOCK = cherry_private_host.layout(PRIVATE)
 LOG = Path("/tmp/mcp-conc.log")
 
-def ec(n, p=None): return {n: {"_0": p} if p is not None else {}}
+ec = cherry_private_host.enum_case
 def sc(r): return ec("scoped", {"projectRoot": str(REPO), "request": r})
 
 def send(req, t=30):
     """Returns (result, elapsed_seconds). Raises RuntimeError on a control error."""
-    d = json.dumps(req, separators=(",", ":")).encode() + b"\n"
     start = time.monotonic()
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(t); s.connect(str(SOCK)); s.sendall(d); s.shutdown(socket.SHUT_WR)
-        b = bytearray()
-        while True:
-            c = s.recv(65536)
-            if not c: break
-            b.extend(c)
-            if b.endswith(b"\n"): break
-    elapsed = time.monotonic() - start
-    r = json.loads(b.decode())
-    if r.get("error"): raise RuntimeError(r["error"])
-    return r["result"], elapsed
+    result = cherry_private_host.control_request(SOCK, req, t)
+    return result, time.monotonic() - start
 
 def lp():
     _, e = send(sc(ec("listProcesses", {})), t=20)

@@ -28,9 +28,10 @@ struct MacOSServiceDetector: ServiceDetecting {
     }
 
     func detectServices(processes: [InspectableProcess], includeUnattributed: Bool) async throws -> [ServiceRecord] {
-        // `ps`/`lsof` are blocking subprocesses; run them off the @MainActor control
-        // server so they can't pin it and starve every other MCP request — the
-        // cause of nested-agent "Transport closed" hangs.
+        // `lsof` is a blocking subprocess (and the process table a sysctl); run
+        // them off the @MainActor control server so they can't pin it and starve
+        // every other MCP request — the cause of nested-agent "Transport closed"
+        // hangs.
         let processTreeProvider = self.processTreeProvider
         let lsofOutputProvider = self.lsofOutputProvider
         let (processTree, lsofOutput) = try await Task.detached(priority: .utility) {
@@ -84,11 +85,15 @@ struct MacOSServiceDetector: ServiceDetecting {
         processes: [InspectableProcess],
         processTree: [Int32: Int32]
     ) -> [Int32: InspectableProcess] {
+        var childrenByParent: [Int32: [Int32]] = [:]
+        for (pid, parentPID) in processTree {
+            childrenByParent[parentPID, default: []].append(pid)
+        }
         var lookup: [Int32: InspectableProcess] = [:]
         for process in processes {
             guard let rootPID = process.rootPID, rootPID > 0 else { continue }
             lookup[rootPID] = process
-            for descendant in Self.descendants(of: rootPID, processTree: processTree) {
+            for descendant in Self.descendants(of: rootPID, childrenByParent: childrenByParent) {
                 lookup[descendant] = process
             }
         }
@@ -170,35 +175,24 @@ struct MacOSServiceDetector: ServiceDetecting {
         return (host.isEmpty ? "*" : host, port)
     }
 
-    private static func descendants(of rootPID: Int32, processTree: [Int32: Int32]) -> Set<Int32> {
+    private static func descendants(of rootPID: Int32, childrenByParent: [Int32: [Int32]]) -> Set<Int32> {
         var descendants = Set<Int32>()
         var frontier = [rootPID]
         while let parent = frontier.popLast() {
-            for (pid, ppid) in processTree where ppid == parent && !descendants.contains(pid) {
-                descendants.insert(pid)
+            for pid in childrenByParent[parent] ?? [] where descendants.insert(pid).inserted {
                 frontier.append(pid)
             }
         }
         return descendants
     }
 
+    /// Every process's parent, from the process table read in-process
+    /// (`ShellProcessController.enumerateProcesses`, the table `ps` reads).
     private static func currentProcessTree() -> [Int32: Int32] {
-        guard let output = try? runTool(path: "/bin/ps", arguments: ["-axo", "pid=,ppid="]) else {
-            return [:]
-        }
-
-        var tree: [Int32: Int32] = [:]
-        for line in output.split(whereSeparator: \.isNewline) {
-            let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
-            guard parts.count >= 2,
-                  let pid = Int32(parts[0]),
-                  let ppid = Int32(parts[1])
-            else {
-                continue
-            }
-            tree[pid] = ppid
-        }
-        return tree
+        Dictionary(
+            ShellProcessController.enumerateProcesses().map { ($0.pid, $0.parentPID) },
+            uniquingKeysWith: { first, _ in first }
+        )
     }
 
     private static func currentLsofOutput() throws -> String {
@@ -213,41 +207,21 @@ struct MacOSServiceDetector: ServiceDetecting {
         )
     }
 
-    /// Runs `path` and returns its standard output, when it exits (not killed
-    /// by a signal, as the watchdog does after `timeout`) with one of
-    /// `acceptedStatuses`.
+    /// Runs `path` and returns its standard output, when it exits within
+    /// `timeout` (else it is stopped) with one of `acceptedStatuses`.
     static func runTool(
         path: String,
         arguments: [String],
         timeout: TimeInterval = 4.0,
         acceptedStatuses: Set<Int32> = [0]
     ) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = arguments
-
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-
         let startedAt = Date()
-        try process.run()
-
-        // Bound the wait: if ps/lsof ever hangs (weird network/filesystem state) it
-        // must not block forever even off the main actor. Terminating closes the
-        // pipe, which unblocks the read below.
-        let watchdog = DispatchWorkItem {
-            if process.isRunning { process.terminate() }
-        }
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
-
-        // Read BEFORE waitUntilExit: large output (many listeners) can exceed the
-        // 64KB pipe buffer and deadlock if we wait first. readDataToEndOfFile drains
-        // until EOF (process exit or watchdog kill).
-        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        watchdog.cancel()
+        // Bounded: if ps/lsof ever hangs (weird network/filesystem state) it
+        // must not block forever even off the main actor.
+        let result = CapturedProcess.run(
+            executable: URL(fileURLWithPath: path), arguments: arguments, environment: nil, input: nil, timeout: timeout
+        )
+        if let launchError = result.launchError { throw launchError }
 
         // Diagnostic: service detection used to run on the main actor; if these ever
         // get slow under load it explains MCP latency. Now off-actor, but worth a log.
@@ -256,12 +230,11 @@ struct MacOSServiceDetector: ServiceDetecting {
             NSLog("[cherry] service-detect %@ took %.2fs", path, elapsed)
         }
 
-        if process.terminationReason == .exit, acceptedStatuses.contains(process.terminationStatus) {
-            return String(decoding: output, as: UTF8.self)
+        if result.exitedNormally, !result.timedOut, acceptedStatuses.contains(result.status) {
+            return String(decoding: result.standardOutput, as: UTF8.self)
         }
 
-        let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        let message = String(decoding: errorOutput, as: UTF8.self)
+        let message = String(decoding: result.standardError, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         throw CherryControlError(
             code: "service_detection_failed",

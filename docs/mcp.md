@@ -31,8 +31,8 @@ old direct HTTP MCP endpoint has been removed.
 
 ## Scope And Identity
 
-- `whoami` reports the MCP session ID, caller process, active/effective project
-  root, selected process, and bound process.
+- `whoami` reports the caller process, active/effective project root,
+  selected process, and bound process.
 - `CHERRY_PROCESS_ID` identifies the Cherry process that launched the helper.
   `CHERRY_AGENT_ID` is still exported for agent processes as a compatibility
   alias.

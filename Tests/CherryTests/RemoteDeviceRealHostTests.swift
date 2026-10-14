@@ -201,7 +201,6 @@ final class FakeRemoteMac {
         configuration.terminationTimeout = .seconds(5)
         configuration.restartExitTimeout = .seconds(5)
         configuration.reconnectDelay = (0.1, 0.5)
-        configuration.disappearanceConfirmationDelay = .milliseconds(400)
         configuration.lostCreateChecks = [.milliseconds(300)]
         return configuration
     }()
@@ -316,13 +315,8 @@ final class FakeRemoteMac {
             .split(separator: "\n").map(String.init)
     }
 
-    func waitFor(_ description: String, timeout: TimeInterval = 20, _ predicate: () async throws -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if try await predicate() { return }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        throw HostedSessionError.message("Timed out waiting for \(description)")
+    func waitFor(_ description: String, timeout: TimeInterval = 20, _ predicate: @MainActor () async throws -> Bool) async throws {
+        try await poll(description, timeout: timeout, predicate)
     }
 
     /// Every session, as the device's own Cherry lists it (not through ssh).
@@ -574,13 +568,6 @@ private func remoteRepository(
         #expect(projects.first?.sessionCount == 2)
         #expect(other == 1)
         #expect(RemoteDeviceDiscovery.projects(sessions: listed, added: [], hidden: [mac.projectPath]).projects.isEmpty)
-        let device = RemoteDevice(id: mac.deviceID, name: "Studio", sshDestination: "studio", homeDirectory: mac.home.path)
-        let menu = TitlebarProjectMenuModel(
-            projects: [], devices: [.init(device: device, state: .connected(sessionCount: listed.count), sessions: listed)],
-            currentProjectKey: mac.projectKey
-        )
-        #expect(menu.snapshot.contains("[x] app — 2 sessions · \(mac.projectPath)"))
-        #expect(menu.snapshot.contains("Other sessions — 1 session"))
 
         // Neither adopts the other's: the device's own Cherry never takes
         // this installation's session, and this one never takes theirs.

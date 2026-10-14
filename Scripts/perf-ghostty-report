@@ -5,6 +5,11 @@ from pathlib import Path
 import sys
 
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import perf_common  # noqa: E402
+
+
 SHAPE_KEYS = ("scale", "mode", "duration", "sleep_ms", "windows")
 
 
@@ -42,28 +47,28 @@ def compare(candidate, baseline, max_regression_pct, rss_growth_slack_mib, max_r
 
     candidate_summary = summary(candidate)
     baseline_summary = summary(baseline)
-    compare_upper(
+    perf_common.compare_upper(
         failures,
         "max_total_rss_bytes",
         candidate_summary["max_total_rss_bytes"],
         baseline_summary["max_total_rss_bytes"],
         tolerance,
     )
-    compare_upper(
+    perf_common.compare_upper(
         failures,
         "max_process_rss_bytes",
         candidate_summary["max_process_rss_bytes"],
         baseline_summary["max_process_rss_bytes"],
         tolerance,
     )
-    compare_upper(
+    perf_common.compare_upper(
         failures,
         "last_total_rss_bytes",
         candidate_summary["last_total_rss_bytes"],
         baseline_summary["last_total_rss_bytes"],
         tolerance,
     )
-    compare_with_slack(
+    perf_common.compare_with_slack(
         failures,
         "rss_delta_bytes",
         candidate_summary["rss_delta_bytes"],
@@ -71,7 +76,7 @@ def compare(candidate, baseline, max_regression_pct, rss_growth_slack_mib, max_r
         tolerance,
         rss_growth_slack_mib * 1_048_576,
     )
-    compare_upper(
+    perf_common.compare_upper(
         failures,
         "max_total_cpu_percent",
         candidate_summary["max_total_cpu_percent"],
@@ -92,28 +97,6 @@ def compare(candidate, baseline, max_regression_pct, rss_growth_slack_mib, max_r
         )
 
     return failures
-
-
-def compare_upper(failures, metric, current, baseline, tolerance):
-    if current is None or baseline is None or baseline <= 0:
-        return
-    limit = baseline * (1 + tolerance)
-    if current > limit:
-        failures.append(
-            f"{metric} regressed: {current:.3f} > {limit:.3f} "
-            f"(baseline {baseline:.3f}, tolerance {tolerance * 100:.1f}%)"
-        )
-
-
-def compare_with_slack(failures, metric, current, baseline, tolerance, slack):
-    if current is None or baseline is None:
-        return
-    limit = max(baseline, 0) * (1 + tolerance) + slack
-    if current > limit:
-        failures.append(
-            f"{metric} regressed: {current:.3f} > {limit:.3f} "
-            f"(baseline {baseline:.3f}, tolerance {tolerance * 100:.1f}%, slack {slack:.3f})"
-        )
 
 
 def print_summary(path, report):

@@ -3,6 +3,17 @@ import Foundation
 import Testing
 @testable import Cherry
 
+private extension HostedSessionAttachment {
+    /// The adapter's arguments for a launch that registers with `masters`
+    /// as it starts, as a tab's launch does (`TerminalSession`).
+    func launchArguments(statusFile: URL?, masters: HostSSHMasterManager = .shared) -> [String] {
+        arguments(
+            statusFile: statusFile,
+            sshControlPath: statusFile.flatMap { registerAdapterLaunch(statusFile: $0, masters: masters) }
+        )
+    }
+}
+
 /// A stand-in for OpenSSH's master and `-O` commands. `ssh -M` records how
 /// it was started, creates its "socket" (a plain file is enough for `-O
 /// check` here) and runs until signalled; `-O check` succeeds while the
@@ -122,19 +133,6 @@ private struct FakeSSH {
     }
 }
 
-private func eventually(
-    isolation: isolated (any Actor)? = #isolation,
-    _ timeout: TimeInterval = 5,
-    _ condition: () -> Bool
-) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return condition()
-}
-
 @Test func HostSSHMasterCommandsAreExactAndPathsFitASocket() throws {
     #expect(HostSSHMasterManager.masterArguments(destination: "me@devbox", controlPath: "/t/cherry-ssh-1/abc") == [
         "-M", "-N", "-T",
@@ -170,7 +168,7 @@ private func eventually(
     let attachment = HostedSessionAttachment(
         host: devbox, hostID: "host-a", sessionID: "s", name: "S", remoteWorkingDirectory: "~", executablePath: "/c"
     )
-    #expect(!attachment.arguments(statusFile: URL(fileURLWithPath: "/tmp/x/status.json")).contains("--ssh-control-path"))
+    #expect(!attachment.launchArguments(statusFile: URL(fileURLWithPath: "/tmp/x/status.json")).contains("--ssh-control-path"))
 }
 
 @Test func HostedSessionHostArgumentsNameTheRemoteCherryHostWhenItIsNotOnThePath() throws {
@@ -642,7 +640,7 @@ private func shardManager(
     func launch() throws -> [String] {
         let directory = try HostedAttachmentStatusFile.makeLaunchDirectory(in: ssh.directory)
         launches.append(directory)
-        return attachment.arguments(statusFile: HostedAttachmentStatusFile.statusFileURL(in: directory), masters: manager)
+        return attachment.launchArguments(statusFile: HostedAttachmentStatusFile.statusFileURL(in: directory), masters: manager)
     }
     for _ in 1...8 { #expect(try launch().contains(path)) }
     // One master only (maxMasters 1): the ninth runs its own ssh, and
@@ -678,19 +676,19 @@ private func shardManager(
     )
     let launch = try HostedAttachmentStatusFile.makeLaunchDirectory(in: ssh.directory)
     let statusFile = HostedAttachmentStatusFile.statusFileURL(in: launch)
-    let arguments = attachment.arguments(statusFile: statusFile, masters: manager)
+    let arguments = attachment.launchArguments(statusFile: statusFile, masters: manager)
     #expect(Array(arguments.prefix(8)) == [
         "--host", "devbox", "--ssh-control-path", path, "--expected-host-id", "host-a", "attach", "s",
     ])
     #expect(manager.status(of: "devbox")?.launches == 1)
     // Without a status file there is no launch to keep the master for.
-    #expect(!attachment.arguments(statusFile: nil, masters: manager).contains("--ssh-control-path"))
+    #expect(!attachment.launchArguments(statusFile: nil, masters: manager).contains("--ssh-control-path"))
 
     // The adapter ended and its directory is gone. Computing its arguments
     // again (not to launch) keeps nothing running.
     HostedAttachmentStatusFile.removeLaunchDirectory(launch, after: 0, masters: manager)
     #expect(manager.status(of: "devbox")?.launches == 0)
-    #expect(!attachment.arguments(statusFile: statusFile, masters: manager).contains("--ssh-control-path"))
+    #expect(!attachment.launchArguments(statusFile: statusFile, masters: manager).contains("--ssh-control-path"))
     #expect(manager.status(of: "devbox")?.launches == 0)
     lease.release()
     #expect(await eventually { manager.status(of: "devbox")?.phase == .stopped })
@@ -813,7 +811,7 @@ private func shardManager(
         kill(master, SIGKILL)
         #expect(await eventually { manager.status(of: "devbox")?.phase == .waitingToRestart })
         #expect(manager.status(of: "devbox")?.failures == round)
-        #expect(await eventually(10) { ssh.masterCalls.count == round + 1 && manager.status(of: "devbox")?.phase == .up })
+        #expect(await eventually(timeout: 10) { ssh.masterCalls.count == round + 1 && manager.status(of: "devbox")?.phase == .up })
         restartedAfter.append(Date().timeIntervalSince(killedAt))
     }
     #expect(restartedAfter[2] >= 0.4)

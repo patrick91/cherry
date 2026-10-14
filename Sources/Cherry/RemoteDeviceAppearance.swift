@@ -103,16 +103,6 @@ struct RemoteDeviceBadge: Equatable, Sendable {
     let name: String
     let color: RemoteDeviceColor
 
-    init(deviceID: UUID, name: String, color: RemoteDeviceColor) {
-        self.deviceID = deviceID
-        self.name = name
-        self.color = color
-    }
-
-    init(device: RemoteDevice) {
-        self.init(deviceID: device.id, name: device.name, color: device.effectiveColor)
-    }
-
     /// The badge of the Mac a project key names; nil for This Mac's keys
     /// (the store is never asked then). A device the store no longer knows
     /// still gets one ("Unknown Mac"), so its window still says it is not
@@ -122,6 +112,13 @@ struct RemoteDeviceBadge: Equatable, Sendable {
         guard let key, let deviceID = ProjectLocation(key: key).deviceID else { return nil }
         if let device = devices.first(where: { $0.id == deviceID }) { return RemoteDeviceBadge(device: device) }
         return RemoteDeviceBadge(deviceID: deviceID, name: unknownName, color: .automatic(for: deviceID))
+    }
+}
+
+// In an extension, so the struct keeps its memberwise initializer.
+extension RemoteDeviceBadge {
+    init(device: RemoteDevice) {
+        self.init(deviceID: device.id, name: device.name, color: device.effectiveColor)
     }
 }
 

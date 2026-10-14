@@ -23,10 +23,7 @@ struct ShellIntegrationBootstrap: Equatable, Sendable {
             return nil
         }
 
-        let directory = homeDirectory
-            .appendingPathComponent("Library", isDirectory: true)
-            .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent(CherryAppIdentity.current.applicationSupportName, isDirectory: true)
+        let directory = CherryAppIdentity.applicationSupportDirectory(homeDirectory: homeDirectory)
             .appendingPathComponent("ShellIntegration", isDirectory: true)
             .appendingPathComponent("zsh", isDirectory: true)
 
@@ -430,10 +427,10 @@ final class ShellProcessController: @unchecked Sendable {
     /// Resolves the `(command, environment)` for ghostty's native EXEC backend so
     /// a libghostty-spawned shell matches the host-managed forkpty launch.
     ///
-    /// IMPORTANT: this MIRRORS the forkpty child setup below (the `setenv` block
-    /// ~908-953 and the `execv` argv ~956-994). Keep the two in sync — host-managed
-    /// uses the forkpty path; native-PTY uses this. ghostty word-splits `command`
-    /// like a shell, so the common shell-integration path returns `"<shell> -l"`
+    /// The host-managed forkpty launch (`launch()`) builds its child's
+    /// environment from this too, less `CHERRY_EMIT_OSC133`, and keeps its
+    /// argv in step with `command`. ghostty word-splits `command` like a
+    /// shell, so the common shell-integration path returns `"<shell> -l"`
     /// and delivers the startup/agent command via `CHERRY_STARTUP_COMMAND`.
     /// Hosted local sessions build on the explicit overload below
     /// (`HostedLaunchSpec`); HostedLaunchSpecTests pin the two together.
@@ -524,18 +521,13 @@ final class ShellProcessController: @unchecked Sendable {
             command = "\(shellPath) -l"
         } else if let startupCommand = configuration.startupCommand, !startupCommand.isEmpty {
             // No shell integration: a login+interactive shell that execs the
-            // startup command (mirrors the `execv` fallback at ~956-979).
-            command = "\(shellPath) -l -i -c \(singleQuoted("exec \(startupCommand)"))"
+            // startup command (as `launch()`'s argv does).
+            command = "\(shellPath) -l -i -c \(ShellQuoting.singleQuoted("exec \(startupCommand)"))"
         } else {
             command = "\(shellPath) -l"
         }
 
         return (command, environment)
-    }
-
-    /// POSIX single-quote a token so ghostty's shell-style splitter keeps it whole.
-    private static func singleQuoted(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     struct TerminfoSelection {
@@ -658,7 +650,7 @@ final class ShellProcessController: @unchecked Sendable {
     /// One-shot snapshot of every process (pid, ppid, process group,
     /// controlling tty and its foreground group, name) via
     /// `sysctl(KERN_PROC_ALL)`. Empty on failure.
-    private static func enumerateProcesses() -> [ProcessSnapshotEntry] {
+    static func enumerateProcesses() -> [ProcessSnapshotEntry] {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
         var byteCount = 0
         guard sysctl(&mib, u_int(mib.count), nil, &byteCount, nil, 0) == 0, byteCount > 0 else {
@@ -693,7 +685,6 @@ final class ShellProcessController: @unchecked Sendable {
     private let onExit: (Int32) -> Void
     private let ioQueueIdentity = IOQueueIdentity()
     private let ioQueue = DispatchQueue(label: "Cherry.ShellProcess", qos: .userInitiated)
-    private let urgentWriteQueue = DispatchQueue(label: "Cherry.ShellProcess.UrgentWrite", qos: .userInteractive)
     private let masterFDLock = NSLock()
     private let readBufferBytes = 16 * 1024
     private let maximumReadBatchBytes = 256 * 1024
@@ -778,78 +769,6 @@ final class ShellProcessController: @unchecked Sendable {
         }
     }
 
-    func writeUrgent(_ data: Data) {
-        guard !data.isEmpty else { return }
-
-        urgentWriteQueue.async { [self] in
-            var remaining = data
-            while !remaining.isEmpty {
-                switch directWriteToMaster(remaining, label: "urgent write") {
-                case .wrote(let byteCount):
-                    remaining.removeSubrange(0..<byteCount)
-                case .interrupted:
-                    continue
-                case .wouldBlock:
-                    write(remaining)
-                    return
-                case .closed, .failed:
-                    return
-                }
-            }
-        }
-    }
-
-    private enum DirectWriteResult {
-        case wrote(Int)
-        case interrupted
-        case wouldBlock
-        case closed
-        case failed(Int32)
-    }
-
-    private func directWriteToMaster(_ data: Data, label: String) -> DirectWriteResult {
-        masterFDLock.lock()
-        defer { masterFDLock.unlock() }
-
-        guard masterFD >= 0 else {
-            if shellTransportDebugEnabled {
-                fputs("[pty \(label) skipped] closed fd child=\(childPID)\n", stderr)
-            }
-            return .closed
-        }
-
-        let written = data.withUnsafeBytes { rawBuffer -> Int in
-            guard let baseAddress = rawBuffer.baseAddress else { return 0 }
-            return Darwin.write(masterFD, baseAddress, rawBuffer.count)
-        }
-
-        if written > 0 {
-            if shellTransportDebugEnabled {
-                let chunk = data.prefix(written)
-                let rendered = chunk.map { String(format: "%02x", $0) }.joined(separator: " ")
-                fputs("[pty \(label)] fd=\(masterFD) bytes=\(written) data=\(rendered)\n", stderr)
-            }
-            return .wrote(written)
-        }
-
-        if written == 0 {
-            return .wouldBlock
-        }
-
-        let writeError = errno
-        if writeError == EINTR {
-            return .interrupted
-        }
-        if writeError == EAGAIN || writeError == EWOULDBLOCK {
-            return .wouldBlock
-        }
-
-        if shellTransportDebugEnabled {
-            fputs("[pty \(label) error] fd=\(masterFD) errno=\(writeError)\n", stderr)
-        }
-        return .failed(writeError)
-    }
-
     func resize(columns: Int, rows: Int) {
         syncOnIOQueue { [self] in
             guard self.masterFD >= 0 else { return }
@@ -909,28 +828,41 @@ final class ShellProcessController: @unchecked Sendable {
         let shellPath = configuration.shellPath
         let shellName = URL(fileURLWithPath: shellPath).lastPathComponent
         let workingDirectory = configuration.workingDirectory
-        let projectRoot = configuration.projectRoot
-        let processID = configuration.processID
-        let agentID = configuration.agentID
-        let environment = configuration.environment
-        let term = configuration.term
-        let startupCommand = configuration.startupCommand
-        let mcpHelperPath = Self.appMCPHelperPath
-        let inheritedZDOTDIR = ProcessInfo.processInfo.environment["ZDOTDIR"]
-        let inheritedCherryBootstrapZDOTDIR = ProcessInfo.processInfo.environment["CHERRY_BOOTSTRAP_ZDOTDIR"]
-        let originalZDOTDIR = if inheritedZDOTDIR == inheritedCherryBootstrapZDOTDIR {
-            String?.none
-        } else {
-            inheritedZDOTDIR
-        }
         let shellIntegration = try? ShellIntegrationBootstrap.prepare(shellPath: shellPath)
-        let extraTerminfoDirs = Self.preferredTerminfo.additionalDirs
-        let inheritedTerminfoDirs = ProcessInfo.processInfo.environment["TERMINFO_DIRS"]
-        let mergedTerminfoDirs: String? = {
-            guard let extraTerminfoDirs, !extraTerminfoDirs.isEmpty else { return nil }
-            guard let inheritedTerminfoDirs, !inheritedTerminfoDirs.isEmpty else { return extraTerminfoDirs }
-            return "\(extraTerminfoDirs):\(inheritedTerminfoDirs)"
-        }()
+        let inheritedEnvironment = ProcessInfo.processInfo.environment
+        // The same environment rules as the native EXEC launch, less its
+        // OSC 133 switch: the host-managed byte stream stays the default.
+        var launchEnvironment = Self.nativeExecLaunch(
+            for: configuration,
+            shellIntegration: shellIntegration,
+            inheritedEnvironment: inheritedEnvironment,
+            terminfoDirectories: Self.preferredTerminfo.additionalDirs
+        ).environment
+        launchEnvironment["CHERRY_EMIT_OSC133"] = nil
+        // Over this process's environment without what a Cherry tab or an
+        // agent CLI exports (the app clears them from itself at launch,
+        // `CherryTabEnvironment.removeFromProcess`) and NO_COLOR: Cherry is
+        // a color-capable terminal, so a launcher's or automation's NO_COLOR
+        // must not leak into interactive children.
+        let removedKeys = CherryTabEnvironment.keys
+            .union(CherryTabEnvironment.agentChildMarkers)
+            .union(["NO_COLOR"])
+        let childEnvironment = inheritedEnvironment
+            .filter { !removedKeys.contains($0.key) }
+            .merging(launchEnvironment) { _, launched in launched }
+        let arguments: [String] = if let startupCommand = configuration.startupCommand, shellIntegration == nil {
+            [shellName, "-l", "-i", "-c", "exec \(startupCommand)"]
+        } else {
+            [shellName, "-l"]
+        }
+        // Built before fork(): the child of a multithreaded process only
+        // changes directory and execs.
+        let argv = arguments.map { strdup($0) } + [nil]
+        let envp = childEnvironment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer {
+            argv.forEach { free($0) }
+            envp.forEach { free($0) }
+        }
 
         let pid = forkpty(&master, nil, nil, &size)
         if pid < 0 {
@@ -940,108 +872,14 @@ final class ShellProcessController: @unchecked Sendable {
         if pid == 0 {
             Self.closeInheritedFileDescriptorsForChild()
             _ = chdir(workingDirectory)
-            // Cherry is a color-capable terminal; do not let launcher or
-            // automation environment leak NO_COLOR into interactive children.
-            _ = unsetenv("NO_COLOR")
-            for (name, value) in environment {
-                _ = setenv(name, value, 1)
-            }
-            _ = setenv("TERM", term, 1)
-            if let mergedTerminfoDirs {
-                _ = setenv("TERMINFO_DIRS", mergedTerminfoDirs, 1)
-            }
-            // Keep PWD aligned with the inherited cwd, matching Ghostty's
-            // launch behavior so shells preserve user-facing directory text.
-            _ = setenv("PWD", workingDirectory, 1)
-            // Cherry embeds Ghostty's terminal core; advertise that
-            // compatibility so TUIs choose richer terminal protocols such as
-            // OSC 9 notifications instead of falling back to a bare BEL.
-            _ = setenv("TERM_PROGRAM", "Ghostty", 1)
-            _ = setenv("CHERRY_TERM_PROGRAM", "Cherry", 1)
-            _ = setenv("COLORTERM", "truecolor", 1)
-            _ = setenv("INSIDE_CHERRY", "1", 1)
-            if let projectRoot, !projectRoot.isEmpty {
-                _ = setenv(CherryControl.projectRootEnvironmentKey, projectRoot, 1)
-            } else {
-                _ = unsetenv(CherryControl.projectRootEnvironmentKey)
-            }
-            if let processID, !processID.isEmpty {
-                _ = setenv(CherryControl.processIDEnvironmentKey, processID, 1)
-            } else {
-                _ = unsetenv(CherryControl.processIDEnvironmentKey)
-            }
-            if let agentID, !agentID.isEmpty {
-                _ = setenv(CherryControl.agentIDEnvironmentKey, agentID, 1)
-            } else {
-                _ = unsetenv(CherryControl.agentIDEnvironmentKey)
-            }
-            if let mcpHelperPath {
-                _ = setenv(CherryControl.mcpHelperEnvironmentKey, mcpHelperPath, 1)
-            } else {
-                _ = unsetenv(CherryControl.mcpHelperEnvironmentKey)
-            }
-            if let shellIntegration {
-                _ = setenv("CHERRY_BOOTSTRAP_ZDOTDIR", shellIntegration.zdotdir, 1)
-                if let startupCommand, !startupCommand.isEmpty {
-                    _ = setenv("CHERRY_STARTUP_COMMAND", startupCommand, 1)
-                } else {
-                    _ = unsetenv("CHERRY_STARTUP_COMMAND")
-                }
-                if let originalZDOTDIR, !originalZDOTDIR.isEmpty {
-                    _ = setenv("CHERRY_ORIGINAL_ZDOTDIR", originalZDOTDIR, 1)
-                } else {
-                    _ = unsetenv("CHERRY_ORIGINAL_ZDOTDIR")
-                }
-                _ = setenv("ZDOTDIR", shellIntegration.zdotdir, 1)
-            }
-
-            if let startupCommand, shellIntegration == nil {
-                let command = "exec \(startupCommand)"
-                shellPath.withCString { shellPathPointer in
-                    shellName.withCString { shellNamePointer in
-                        "-l".withCString { loginFlagPointer in
-                            "-i".withCString { interactiveFlagPointer in
-                                "-c".withCString { commandFlagPointer in
-                                    command.withCString { commandPointer in
-                                        var arguments: [UnsafeMutablePointer<CChar>?] = [
-                                            UnsafeMutablePointer(mutating: shellNamePointer),
-                                            UnsafeMutablePointer(mutating: loginFlagPointer),
-                                            UnsafeMutablePointer(mutating: interactiveFlagPointer),
-                                            UnsafeMutablePointer(mutating: commandFlagPointer),
-                                            UnsafeMutablePointer(mutating: commandPointer),
-                                            nil
-                                        ]
-
-                                        execv(shellPathPointer, &arguments)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                shellPath.withCString { shellPathPointer in
-                    shellName.withCString { shellNamePointer in
-                        "-l".withCString { loginFlagPointer in
-                            var arguments: [UnsafeMutablePointer<CChar>?] = [
-                                UnsafeMutablePointer(mutating: shellNamePointer),
-                                UnsafeMutablePointer(mutating: loginFlagPointer),
-                                nil
-                            ]
-
-                            execv(shellPathPointer, &arguments)
-                        }
-                    }
-                }
-            }
-
+            execve(shellPath, argv, envp)
             _exit(127)
         }
 
         setMasterFD(master)
         childPID = pid
 
-        Self.setCloseOnExec(fileDescriptor: master)
+        UnixIO.setCloseOnExec(master)
 
         let currentFlags = fcntl(master, F_GETFL)
         if currentFlags >= 0 {
@@ -1552,11 +1390,5 @@ final class ShellProcessController: @unchecked Sendable {
         for fileDescriptor in 3..<Int32(maximumDescriptor) {
             _ = close(fileDescriptor)
         }
-    }
-
-    private static func setCloseOnExec(fileDescriptor: Int32) {
-        let flags = fcntl(fileDescriptor, F_GETFD)
-        guard flags >= 0 else { return }
-        _ = fcntl(fileDescriptor, F_SETFD, flags | FD_CLOEXEC)
     }
 }

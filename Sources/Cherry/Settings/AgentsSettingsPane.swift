@@ -11,22 +11,22 @@ struct AgentSettingsPane: View {
     var body: some View {
         SettingsPaneScroll(page: .agents) {
             SettingsCard("Agent Tools") {
-                if settings.resolvedAgents.isEmpty {
+                if settings.agents.isEmpty {
                     SettingsEmptyState(
                         title: "No agents configured",
                         message: "Add one of the presets to start launching agents from Cherry.",
                         systemImage: "sparkles"
                     )
                 } else {
-                    ForEach(Array(settings.resolvedAgents.enumerated()), id: \.element.id) { index, agent in
+                    ForEach(Array(settings.agents.enumerated()), id: \.element.id) { index, agent in
                         AgentToolRow(agent: agent) {
-                            editingAgent = agent.definition
+                            editingAgent = agent
                             editingOriginalName = agent.name
                         } onReset: {
                             settings.removeAgent(named: agent.name)
                         }
 
-                        if index < settings.resolvedAgents.count - 1 {
+                        if index < settings.agents.count - 1 {
                             SettingsDivider()
                         }
                     }
@@ -86,7 +86,7 @@ struct AgentSettingsPane: View {
 }
 
 private struct AgentToolRow: View {
-    let agent: ResolvedAgentTool
+    let agent: AgentToolDefinition
     let onEdit: () -> Void
     let onReset: () -> Void
 
@@ -121,7 +121,7 @@ private struct AgentToolRow: View {
 
             Spacer()
 
-            Text(sourceLabel)
+            Text("Global")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
@@ -129,15 +129,7 @@ private struct AgentToolRow: View {
                 .settingsGlassButtonStyle()
             Button("Delete", role: .destructive, action: onReset)
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 13)
-    }
-
-    private var sourceLabel: String {
-        switch agent.source {
-        case .global:
-            "Global"
-        }
+        .settingsRowPadding()
     }
 }
 

@@ -21,10 +21,6 @@ use std::{
 /// sockaddr_un holds 104 bytes on macOS; stay below it everywhere.
 const MAX_SOCKET_PATH: usize = 100;
 
-pub fn euid() -> u32 {
-    unsafe { libc::geteuid() }
-}
-
 /// Create (mode 0700) or verify the directory that holds the socket.
 pub fn socket_dir(socket: &Path) -> Result<PathBuf> {
     let dir = socket_parent(socket)?;
@@ -65,7 +61,7 @@ pub fn untrusted_socket_dir(dir: &Path, error: impl std::fmt::Display) -> anyhow
     anyhow::anyhow!(
         "cannot use socket directory {}: {error}.{owner} The host needs a directory owned by this user (uid {}) with mode 0700 that is not a symlink. Remove or fix it, or set CHERRY_HOST_SOCKET to a socket path inside a private directory.",
         dir.display(),
-        euid()
+        cherry_protocol::euid()
     )
 }
 
@@ -94,7 +90,7 @@ pub fn occupied_socket_path(path: &Path, action: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "{action} {}: {what}, not a socket owned by this user (uid {}). Remove it, or set CHERRY_HOST_SOCKET to another socket path.",
         path.display(),
-        euid()
+        cherry_protocol::euid()
     )
 }
 
@@ -170,8 +166,8 @@ pub struct Manifest {
     /// Milliseconds since the Unix epoch.
     pub created_at: u64,
     pub link_version: u16,
-    /// When the holder process started (`processes::start_identity`): a
-    /// process that got its PID later, or after a reboot, is not it.
+    /// When the holder process started (`cherry_protocol::start_identity`):
+    /// a process that got its PID later, or after a reboot, is not it.
     #[serde(default)]
     pub holder_started: Option<String>,
     /// The holder's build (`cherry_protocol::BUILD`), for `cherry doctor`.
@@ -216,32 +212,14 @@ pub fn read_manifests(state: &Path) -> Vec<(PathBuf, Manifest)> {
         .collect()
 }
 
-/// Replace `dir/name` with `bytes`: readers see the old file or the new
-/// one, never a partial one. A `durable` file is on disk before it gets its
-/// name, so a crash of the system leaves one of them too.
+/// Replace `dir/name` with `bytes` (`cherry_protocol::write_private_atomic`):
+/// readers see the old file or the new one, never a partial one. A `durable`
+/// file is on disk before it gets its name, and its directory is synced
+/// after, so a crash of the system leaves one of them too.
 fn write_atomic(dir: &Path, name: &str, bytes: &[u8], durable: bool) -> Result<()> {
-    use io::Write;
     let path = dir.join(name);
-    let temporary = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    let _ = fs::remove_file(&temporary);
-    let written = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temporary)
-        .and_then(|mut file| {
-            file.write_all(bytes)?;
-            if durable {
-                file.sync_all()?;
-            }
-            Ok(())
-        })
-        .and_then(|()| fs::rename(&temporary, &path));
-    if let Err(error) = written {
-        let _ = fs::remove_file(&temporary);
-        return Err(error).with_context(|| format!("writing {}", path.display()));
-    }
+    cherry_protocol::write_private_atomic(&path, bytes, durable)
+        .with_context(|| format!("writing {}", path.display()))?;
     if durable {
         if let Ok(dir) = fs::File::open(dir) {
             let _ = dir.sync_all();

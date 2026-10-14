@@ -391,13 +391,14 @@ def main():
         control(socket_path, request("openProject", {"projectRoot": str(project)}))
         terminals = scoped("listTerminals")["terminals"]
         terminal_ids.extend(terminal["id"] for terminal in terminals)
-        created = scoped("createTerminal", {"title": "Packaged app smoke", "workingDirectory": str(project)})
-        terminal_id = created["terminalID"]
+        created = scoped("spawnProcess", {"kind": "terminal", "title": "Packaged app smoke",
+                                          "workingDirectory": str(project)})
+        terminal_id = created["process"]["id"]
         terminal_ids.append(terminal_id)
-        scoped("selectTerminal", {"terminalID": terminal_id})
+        scoped("selectProcess", {"processID": terminal_id})
         while True:
             check_running(process)
-            initial = scoped("getTerminalOutput", {"terminalID": terminal_id, "lineLimit": 100})
+            initial = scoped("getProcessOutput", {"processID": terminal_id, "lineLimit": 100})
             if any("Ghostty failed to launch" in line for line in initial["lines"]):
                 raise RuntimeError(f"Native shell did not launch: {initial['lines']}")
             if any(line.strip() for line in initial["lines"]):
@@ -408,11 +409,11 @@ def main():
         # The complete marker never occurs in the input, so echoed input cannot
         # pass this check without the shell actually executing the command.
         marker = "CHERRY_PACKAGED_" + unique
-        scoped("sendInput", {"terminalID": terminal_id,
-                             "text": "printf '\\n%s%s\\n' 'CHERRY_PACKAGED_' '" + unique + "'\n"})
+        scoped("sendProcessInput", {"processID": terminal_id,
+                                    "text": "printf '\\n%s%s\\n' 'CHERRY_PACKAGED_' '" + unique + "'\n"})
         while True:
             check_running(process)
-            output = scoped("getTerminalOutput", {"terminalID": terminal_id, "lineLimit": 100})
+            output = scoped("getProcessOutput", {"processID": terminal_id, "lineLimit": 100})
             if any(line.strip() == marker for line in output["lines"]):
                 break
             if time.monotonic() >= deadline:
@@ -447,7 +448,7 @@ def main():
                 try:
                     control(socket_path, request("scoped", {
                         "projectRoot": str(project),
-                        "request": request("closeTerminal", {"terminalID": terminal_id}),
+                        "request": request("closeProcess", {"processID": terminal_id}),
                     }), timeout=1)
                 except (OSError, ValueError, RuntimeError):
                     pass

@@ -19,7 +19,7 @@ struct CherryMCPStdioMain {
         }
 
         let toolContext = CherryMCPToolContext.bound(
-            callerProcessID: await CherryMCPTools.callerProcessID(processPID: getpid(), parentPID: getppid())
+            callerProcessID: await CherryMCPTools.callerProcessID(processPID: getpid())
         )
         let server = Server(
             name: "cherry",
@@ -67,7 +67,7 @@ struct CherryMCPStdioMain {
             toolArguments = decoded
         }
         let context = CherryMCPToolContext.bound(
-            callerProcessID: await CherryMCPTools.callerProcessID(processPID: getpid(), parentPID: getppid())
+            callerProcessID: await CherryMCPTools.callerProcessID(processPID: getpid())
         )
         let result = await CherryMCPTools.call(name: name, arguments: toolArguments, context: context)
         for content in result.content {

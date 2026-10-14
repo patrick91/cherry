@@ -1,178 +1,51 @@
 # Native-PTY migration (eliminating terminal replay)
 
 Status: **running sessions always use Ghostty's EXEC backend**. Ghostty owns the
-surface's PTY; Attention Study no longer changes the terminal architecture.
-Shell-less previews and renderer tests retain the in-memory backend. The
-remaining cleanup is deleting replay-only implementation that those tests still
-exercise.
+surface's PTY. Shell-less previews and renderer tests retain the in-memory
+backend. The remaining cleanup is deleting replay-only implementation that those
+tests still exercise.
 
 Since [multiplexer-default.md](specs/multiplexer-default.md), local tabs are
 persistent sessions by default: the EXEC child is the `cherry attach` adapter,
 and the program itself runs in a `cherry-host` holder with its own PTY. A tab
-runs its program directly on the EXEC PTY, as this document describes, when
-persistent sessions are off or the local host cannot run them.
+runs its program directly on the EXEC PTY when persistent sessions are off or
+the local host cannot run them. AGENTS.md › Terminal Architecture describes both
+paths as they are now; this document keeps only why the migration happened and
+what it left.
 
 ## Why
 
 Cherry's terminal "replay" pain — lossy color recovery, first-mount catch-up,
-resize-repaint, blank panes, the whole resident-surfaces grind — all comes from
-**one architectural choice**: Cherry uses libghostty's **host-managed** I/O
-backend. Cherry runs each PTY in its own layer (`TerminalSession` /
-`ShellProcessController`) and feeds bytes to the ghostty surface used as a *pure
-renderer*. The surface does **not** own the terminal state, so on
-mount/resize/switch Cherry must **reconstruct** the screen from bytes — and
-reconstruction is what keeps going wrong.
+resize-repaint, blank panes, the whole resident-surfaces grind — all came from
+**one architectural choice**: Cherry used libghostty's **host-managed** I/O
+backend. Cherry ran each PTY in its own layer (`TerminalSession` /
+`ShellProcessController`) and fed bytes to the ghostty surface used as a *pure
+renderer*. The surface did **not** own the terminal state, so on
+mount/resize/switch Cherry had to **reconstruct** the screen from bytes — and
+reconstruction is what kept going wrong.
 
 Ghostty (and cmux, the libghostty peer) never replay because **the surface owns
-the PTY + Screen**. There is nothing to reconstruct. This migration adopts that
+the PTY + Screen**. There is nothing to reconstruct. This migration adopted that
 model: let the ghostty surface own the PTY (`EXEC` backend), so replay is
 **impossible by construction**.
 
-## Feasibility (verified)
-
-- The vendored `libghostty-spm` 1.2.7 already ships `GHOSTTY_SURFACE_IO_BACKEND_EXEC`
-  (it's even the wrapper default). Cherry was opting *out* via `.inMemory(...)`.
-- Chrome hooks exist: `GHOSTTY_ACTION_PWD/_SET_TITLE/_RING_BELL/_PROGRESS_REPORT/`
-  `_DESKTOP_NOTIFICATION`, `ghostty_surface_read_text` (full scrollback), childexited.
-- Cherry isn't sandboxed, so an EXEC-spawned child is allowed.
-- One genuine gap: `ghostty_surface_foreground_pid`/`tty_name` are absent from this
-  binary (needs an XCFramework rebuild) — deferred.
-
-## How to run it
-
-Use `swift run -c release Cherry` or `Scripts/install-local-app`. There is no
-native-PTY environment switch; the app has one production terminal path.
-
-**Revert to the stable build:** `git checkout main && Scripts/install-local-app`.
-
-## Done
-
-- **Spike** (`56e9e15`) — `backend: .exec`; ghostty owns the PTY. *Verified: renders + inputs, no replay.*
-- **Stage A — command/env injection** (`d8e1b03`): native panes run **Cherry's
-  resolved shell + environment** (login zsh + shell-integration `ZDOTDIR` +
-  `CHERRY_STARTUP_COMMAND` + the ~15 env vars), not ghostty's default shell.
-  - Wrapper: `TerminalSurfaceOptions.execCommand/execEnvironment`;
-    `TerminalController+Surface.finalizeSurface` populates the C config
-    `command`/`env_vars` with a strdup arena (correct pointer lifetime).
-  - Cherry: `ShellProcessController.nativeExecLaunch` (mirrors the forkpty child
-    setup), fed from the same `shellLaunchConfiguration()` the host path uses (parity).
-- **Stage B — single shell** (`d8e1b03`): `TerminalSession.startShell` gates off
-  the host forkpty for native panes (else **two shells per pane, two agents per
-  agent pane**) and reaches `.live` so the surface mounts.
-  - *Verified via control socket: spawns + selects native sessions, no crash.*
-- **Stage C — chrome + data layer + input** (`c0aa764`, `2235f73`): everything the
-  host path derived from the PTY byte stream is now re-sourced from the surface, so
-  native panes are usable end to end. All flag-gated; host path untouched.
-  - **Chrome from ghostty actions** (`c0aa764`): new wrapper delegates +
-    `handleAction` cases for `GHOSTTY_ACTION_PWD` / `DESKTOP_NOTIFICATION` /
-    `SHOW_CHILD_EXITED` / `SET_TITLE`; `GhosttySessionBridge` forwards (gated on
-    native) into `TerminalSession.ingestNative{Title,WorkingDirectory,Notification,
-    ChildExit}`, which mirror the `ingestTerminalMetadata` cases. Child-exit closes
-    Stage B's exit-detection gap.
-  - **Data layer** (`2235f73`): `TerminalSurface.readText(screen:)` over
-    `ghostty_surface_read_text` + `free_text`. `getProcessRawOutput` and a native
-    line model behind `lineCount`/`snapshot(range:)` (→ search, getTerminalOutput,
-    agent activity) pull the surface scrollback lazily on read (throttled). A
-    full-screen-hash change probe — driven by a debounced `GHOSTTY_ACTION_RENDER`
-    signal (new `TerminalSurfaceRenderDelegate`) *and* on every read — advances
-    `outputVersion`/`contentVersion`/`lastContentChangeAt` and the agent
-    activity hooks, so `waitForProcessIdle` and agent idle work.
-  - **Input** (`2235f73`): `send(text:)`/`send(data:)`/`sendInterrupt` route to the
-    surface under native (`shellProcess` is nil). Printable runs go through
-    `ghostty_surface_text`; CR/LF and Ctrl-C become real key events
-    (`sendKeyPress`) — a trailing CR via the text path does **not** submit.
-  - *Verified via control socket against the native build:* getProcessRawOutput is
-    live; injected input submits and runs; search finds produced output;
-    `outputVersion` advances; `cd` updates the sidebar cwd (PWD action); `exit`
-    flips the session to `.exited` with the right code (child-exited action).
-
-- **Resident surfaces — agents/commands run without being displayed** (`45688c6`):
-  the core EXEC tension. A surface *is* its child process, and it was only built when
-  the view entered a window — so an AI-spawned agent in a non-active tab never
-  started until opened. Fix: build EXEC surfaces even while detached (the child runs
-  on ghostty's IO thread; `read_text`/input work with no render/pump — verified a
-  never-displayed terminal runs and executes input), eagerly build the bridge on
-  `startShell`, and never evict/free an EXEC surface while backgrounded (that kills a
-  live process). *This is what unblocked end-to-end agent orchestration.*
-- **Keyboard** (`7599c79`): native gates off Cherry's `handleLocalKeyDown` monitor
-  and instead honors the user's own `~/.config/ghostty/config` — forwarding
-  input-producing keybinds (`text:`/`csi:`/`esc:`, e.g. `shift+enter=text:\n`) and
-  `macos-option-as-alt`. Programmatic input uses `NativeInputTranslator` (byte→key).
-- **OSC 133 / precise script idle** (`41c405c`): shell integration emits OSC 133
-  A/C/D (native-gated env `CHERRY_EMIT_OSC133`) → ghostty `command_finished` →
-  `noteNativeCommandFinished` → a precise command boundary in `waitForProcessIdle`
-  for non-agent sessions.
-
-- **Subagent nesting + multi-window routing** (`ec96c5b`, `fe431a5`): root cause —
-  **Codex doesn't propagate `CHERRY_*` into its MCP subprocess** (Claude does), so
-  the orchestrator's MCP can't read `CHERRY_PROCESS_ID`/`CHERRY_PROJECT_ROOT`; host
-  mode survived via process-ancestry PID matching, but `process.pid` was nil under
-  native (no `foreground_pid`). Fix: the native shell **self-reports its PID** to a
-  per-session file (`CHERRY_SHELL_PID_FILE`) which Cherry polls into
-  `childProcessID`, restoring ancestry matching. (1) Subagent parent resolution
-  works (verified: `parent=<uuid>`, children nest). (2) The control server resolves
-  an **unscoped** request's workspace from the connecting MCP's peer PID
-  (`LOCAL_PEERPID`) + ancestry, so agents spawn into the caller's project window
-  even with multiple windows open.
-- **Agent input colors (Codex)** (`fe431a5`): a background-spawned agent's EXEC
-  surface is created before display, and Codex probes **OSC 11** for its input-box
-  background on first paint. The surface must carry the right theme background at
-  creation — and it must come from **Cherry's own appearance**
-  (`TerminalSettings.appearance.preferredColorScheme`), not the system (the app
-  forces its own dark/light). Verified via an OSC 11 probe: f7f7f7 → 212121.
-
-- **Image paste + drag** (`eb9abda`): terminals can't carry image bytes, so
-  materialize them as a temp file and insert the path (agents attach it) — added in
-  the wrapper (Cherry's ghostty apprt): the clipboard-read callback pastes an image
-  as a temp-PNG path, and `AppTerminalView` is an `NSDraggingDestination` (dropped
-  files → escaped paths; dropped image bytes → temp file + path). `TerminalPasteboardImage`.
-
-## Open items (noted, not yet done)
-
-- **Agent-CLI hook system — deferred** (not needed yet; content/output-based
-  readiness now works because the data layer is live). It's the *robust* upgrade for
-  agent readiness/idle/lineage: a PATH shim injecting Claude/Codex lifecycle hooks
-  (`SessionStart`→ready, `Stop`→idle, `Notification`→needsInput, `SubagentStart`→
-  lineage) that call back over the control socket. Plugs into
-  `waitForDeferredAgentInputReadiness` (readiness) and the parent resolver (lineage).
-  See the research synthesis in memory (`cherry-agent-state-detection`).
-- **Image paste / drag** — pre-existing (never worked); needs ghostty's
-  clipboard-image path. Lower priority.
-
 ## Remaining cleanup
 
-1. **Delete the replay subsystem** — `renderedReplayOutput`, `rawOutputStore`
-   style-recovery merge, the first-mount/resize replay, and the (now-moot)
-   resident-surfaces code after replacing the remaining renderer-test coverage.
+1. **Delete the replay subsystem** — `renderedReplayOutput`,
+   `renderedReplayCache` and the first-mount/resize replay
+   (`replayCurrentFrameForMountedGrid`) that the in-memory backend still uses,
+   after replacing the remaining renderer-test coverage.
 
-## Residual gaps / decisions for review
+## Known gaps
 
-These remain under native and want a decision before/at cutover:
+These hold for native and persistent tabs alike:
 
-- **`read_text` is rendered text, not raw VT bytes** — `getProcessRawOutput` for
-  native panes returns screen text without escape sequences. Fine for human/agent
-  reading; a behavior change for any byte-exact consumer.
-- **Lost custom OSC 777** (`cherry-command` / `cherry-nix`) — no ghostty action
-  equivalent, so resolved-command-line and **nix-shell env tracking degrade** under
-  native PTY. Needs an out-of-band channel or a ghostty patch.
-- **foreground_pid / tty_name** absent from this binary → ServiceDetector / sidebar
-  program label need an XCFramework rebuild.
-- **Input** — *handled both ways.* Interactive keyboard is fully native: the local
-  key-down monitor is gated off under EXEC, so the ghostty surface encodes its own
-  keys (arrows, paste, option-combos, app-cursor-keys, kitty protocol). The
-  *programmatic* path (MCP/agent `send`, incl. agents driving other agents' TUIs)
-  goes through `NativeInputTranslator`, which turns the raw input byte stream into
-  text runs + synthesized key events (CR/LF→Return, CSI/SS3 + modified arrows,
-  `CSI ~` nav keys, Shift-Tab, Tab, Backspace, lone Esc, Ctrl-A..Z). Edge that
-  remains: ESC-as-meta (`ESC`+letter → option+letter) isn't decoded — a lone Esc
-  is emitted and the letter follows as text.
-- **Restart-on-exit** (command panes) under EXEC re-mounts the surface; now that
-  exit is detected the path runs, but it's only socket-verified for plain exit, not
-  visually for the restart redraw.
-- **Title / desktop-notification actions** are wired identically to cwd (verified)
-  but weren't separately socket-asserted.
-
-## Rules being followed
-Everything flag-gated; default/`main` untouched; verify via control socket since
-screen capture is unavailable; **do not flip the default or delete replay** —
-that waits for visual review.
+- **Cherry's OSC 777 marks** (`cherry-command` / `cherry-nix`, written by the
+  zsh integration) are read only by Cherry's own metadata parser, which sees
+  only host-managed and injected output. Ghostty has no action for them and the
+  host does not report them, so these tabs track no resolved command line and
+  no nix-shell environment.
+- **`get_process_raw_output` returns rendered text, not raw VT bytes**: the
+  screen text of the surface (or of the host, when a persistent tab's surface
+  does not show its program's whole screen), without escape sequences. Fine for
+  human/agent reading; not byte-exact.

@@ -368,8 +368,8 @@ pub const PID_FILE: &str = "host.pid";
 #[derive(serde::Serialize)]
 struct PidFile<'a> {
     pid: u32,
-    /// When the process started (`processes::start_identity`): a process
-    /// that got the pid later is not the daemon.
+    /// When the process started (`cherry_protocol::start_identity`): a
+    /// process that got the pid later is not the daemon.
     started: Option<String>,
     build: &'a str,
     started_at: u64,
@@ -400,26 +400,15 @@ fn write_pid_file(state: &Path, socket: &Path, started_at: u64) -> Option<PidFil
     let path = state.join(PID_FILE);
     let record = PidFile {
         pid: std::process::id(),
-        started: processes::start_identity(unsafe { libc::getpid() }),
+        started: cherry_protocol::start_identity(unsafe { libc::getpid() }),
         build: build(),
         started_at,
         socket,
     };
     let bytes = serde_json::to_vec(&record).ok()?;
-    let temporary = state.join(format!(".{PID_FILE}.{}.tmp", std::process::id()));
-    let written = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temporary)
-        .and_then(|mut file| file.write_all(&bytes))
-        .and_then(|()| fs::rename(&temporary, &path));
-    match written {
+    match cherry_protocol::write_private_atomic(&path, &bytes, false) {
         Ok(()) => Some(PidFileGuard(path)),
         Err(error) => {
-            let _ = fs::remove_file(&temporary);
             log(format_args!("cannot write {}: {error}", path.display()));
             None
         }
@@ -828,7 +817,8 @@ impl Host {
     pub fn pending_holders(&self) -> u32 {
         let mut awaited = self.awaited();
         awaited.retain(|_, manifest| {
-            holder_exists(manifest) && !processes::is_zombie(manifest.holder_pid as libc::pid_t)
+            cherry_protocol::process_runs(manifest.holder_pid, manifest.holder_started.as_deref())
+                && !processes::is_zombie(manifest.holder_pid as libc::pid_t)
         });
         u32::try_from(awaited.len()).unwrap_or(u32::MAX)
     }
@@ -896,7 +886,7 @@ impl Host {
         while lent
             && Instant::now() < deadline
             && !self.client_is_connected(pid)
-            && is_own_socket(&record)
+            && cherry_protocol::is_own_socket(&record)
         {
             thread::sleep(Duration::from_millis(20));
         }
@@ -929,29 +919,9 @@ impl Host {
     }
 }
 
-/// An existing socket (after following links) owned by this user.
-fn is_own_socket(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|meta| meta.file_type().is_socket() && meta.uid() == paths::euid())
-}
-
 fn process_exists(pid: u32) -> bool {
     // 0 and values beyond pid_t would address process groups.
     i32::try_from(pid).is_ok_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0)
-}
-
-/// Whether the holder a manifest names still runs: its PID exists, and was
-/// not given to another process since (unless that cannot be told).
-fn holder_exists(manifest: &paths::Manifest) -> bool {
-    if !process_exists(manifest.holder_pid) {
-        return false;
-    }
-    match (
-        &manifest.holder_started,
-        processes::start_identity(manifest.holder_pid as libc::pid_t),
-    ) {
-        (Some(recorded), Some(current)) => *recorded == current,
-        _ => true,
-    }
 }
 
 /// Check lent agents every `AGENT_CHECK_INTERVAL` while clients are
@@ -1081,7 +1051,7 @@ pub fn serve(path: &Path) -> Result<()> {
     let mut awaited = HashMap::new();
     let mut lost = Vec::new();
     for (manifest_path, manifest) in paths::read_manifests(&state) {
-        if !holder_exists(&manifest) {
+        if !cherry_protocol::process_runs(manifest.holder_pid, manifest.holder_started.as_deref()) {
             let _ = fs::remove_file(manifest_path);
             lost.push(manifest.id);
         } else if manifest.link_version >= link::MIN_LINK_VERSION {
@@ -1177,7 +1147,7 @@ fn remove_stale_socket(path: &Path) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).with_context(|| format!("inspecting {}", path.display())),
     };
-    if !meta.file_type().is_socket() || meta.uid() != paths::euid() {
+    if !meta.file_type().is_socket() || meta.uid() != cherry_protocol::euid() {
         return Err(paths::occupied_socket_path(path, "refusing to replace"));
     }
     // A listener with a full backlog can refuse a connection for a moment.
@@ -1224,14 +1194,7 @@ fn refuse_over_limit(mut stream: UnixStream, limit: usize, over_limit: &mut Diag
 fn stderr_log(state: &Path) -> Option<PathBuf> {
     let path = state.join("host.log");
     let file = fs::metadata(&path).ok()?;
-    let mut stderr: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(libc::STDERR_FILENO, &mut stderr) } != 0 {
-        return None;
-    }
-    // `st_dev` is an i32 on macOS and a u64 on Linux.
-    #[allow(clippy::unnecessary_cast)]
-    let same = stderr.st_dev as u64 == file.dev() && stderr.st_ino as u64 == file.ino();
-    same.then_some(path)
+    (fd_identity(libc::STDERR_FILENO) == Some((file.dev(), file.ino()))).then_some(path)
 }
 
 /// Rate-limited diagnostics for the host log.

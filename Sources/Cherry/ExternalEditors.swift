@@ -47,9 +47,8 @@ struct InstalledEditor: Identifiable, Equatable {
 
 /// Resolves which known editors are installed, via Launch Services.
 ///
-/// Discovery and icon loading only run inside `refresh()` — call it when a
-/// surface appears (Omni bar open, settings pane appear), never from a SwiftUI
-/// body.
+/// Discovery only runs inside `refresh()` — call it when a surface appears
+/// (Omni bar open, settings pane appear), never from a SwiftUI body.
 @MainActor
 final class ExternalEditorDiscovery: ObservableObject {
     static let shared = ExternalEditorDiscovery()
@@ -57,19 +56,13 @@ final class ExternalEditorDiscovery: ObservableObject {
     @Published private(set) var installedEditors: [InstalledEditor] = []
 
     private let appURLResolver: (String) -> URL?
-    private let iconProvider: (URL) -> NSImage
-    private var iconCache: [String: NSImage] = [:]
 
     init(
         appURLResolver: @escaping (String) -> URL? = { bundleID in
             NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
-        },
-        iconProvider: @escaping (URL) -> NSImage = { appURL in
-            NSWorkspace.shared.icon(forFile: appURL.path)
         }
     ) {
         self.appURLResolver = appURLResolver
-        self.iconProvider = iconProvider
     }
 
     func refresh() {
@@ -82,17 +75,9 @@ final class ExternalEditorDiscovery: ObservableObject {
             }
         }
 
-        for installed in editors where iconCache[installed.appURL.path] == nil {
-            iconCache[installed.appURL.path] = iconProvider(installed.appURL)
-        }
-
         if editors != installedEditors {
             installedEditors = editors
         }
-    }
-
-    func icon(for editor: InstalledEditor) -> NSImage? {
-        iconCache[editor.appURL.path]
     }
 
     nonisolated static func resolveDefault(
@@ -105,12 +90,10 @@ final class ExternalEditorDiscovery: ObservableObject {
 
 /// How an editor opens a folder on another Mac over SSH
 /// (docs/specs/remote-devices.md, phase 3): VS Code and Cursor through their
-/// Remote - SSH URL, Zed through its `zed://ssh/` hotlink. Other editors
-/// cannot, and are not offered for a device's project.
-enum RemoteEditorLink: Equatable {
-    /// Opened with the editor's app.
-    case url(URL)
-
+/// Remote - SSH URL, Zed through its `zed://ssh/` hotlink, each opened with
+/// the editor's app. Other editors cannot, and are not offered for a
+/// device's project.
+enum RemoteEditorLink {
     /// The URL scheme of a VS Code-family editor that opens
     /// `<scheme>://vscode-remote/ssh-remote+<destination><path>`.
     static func vscodeScheme(bundleIdentifier: String) -> String? {
@@ -129,12 +112,12 @@ enum RemoteEditorLink: Equatable {
 
     /// The link that opens `path` (absolute, on the device) on the SSH
     /// `destination` in `editor`; nil when it cannot.
-    static func make(editor: InstalledEditor, destination: String, path: String) -> RemoteEditorLink? {
+    static func url(editor: InstalledEditor, destination: String, path: String) -> URL? {
         guard path.hasPrefix("/"), !destination.isEmpty else { return nil }
         let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
         let encodedDestination = destination.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed.union(["@"])) ?? destination
         if let scheme = vscodeScheme(bundleIdentifier: editor.bundleIdentifier) {
-            return URL(string: "\(scheme)://vscode-remote/ssh-remote+\(encodedDestination)\(encodedPath)").map { .url($0) }
+            return URL(string: "\(scheme)://vscode-remote/ssh-remote+\(encodedDestination)\(encodedPath)")
         }
         if editor.id == "zed" {
             // Zed's documented hotlink, `zed://ssh/[user@]host/<path>`,
@@ -142,7 +125,7 @@ enum RemoteEditorLink: Equatable {
             // as named). Not its CLI's `ssh://host/<path>`, whose decoding
             // Zed does not document; the host is left unencoded (Zed reads
             // `user@host:port` there).
-            return URL(string: "zed://ssh/\(destination)\(encodedPath)").map { .url($0) }
+            return URL(string: "zed://ssh/\(destination)\(encodedPath)")
         }
         return nil
     }
@@ -150,10 +133,9 @@ enum RemoteEditorLink: Equatable {
 
 @MainActor
 struct ExternalEditorLauncher {
-    typealias RemoteOpener = @MainActor (RemoteEditorLink, InstalledEditor) -> Void
-
+    /// Opens a folder, or a device folder's link (`RemoteEditorLink`),
+    /// with the editor's app.
     private let openHandler: (URL, URL) -> Void
-    private let remoteOpener: RemoteOpener
     /// The SSH destination of the device a project key names.
     private let destination: @MainActor (String) -> String?
 
@@ -169,13 +151,11 @@ struct ExternalEditorLauncher {
                 }
             }
         },
-        remoteOpener: @escaping RemoteOpener = ExternalEditorLauncher.openRemote,
         destination: @escaping @MainActor (String) -> String? = { key in
             RemoteDeviceStore.shared.device(forProjectKey: key)?.sshDestination
         }
     ) {
         self.openHandler = openHandler
-        self.remoteOpener = remoteOpener
         self.destination = destination
     }
 
@@ -188,11 +168,11 @@ struct ExternalEditorLauncher {
             return
         }
         guard let destination = destination(projectRoot),
-              let link = RemoteEditorLink.make(
+              let link = RemoteEditorLink.url(
                 editor: editor, destination: destination, path: ProjectLocation.launchPath(forKey: projectRoot)
               )
         else { return }
-        remoteOpener(link, editor)
+        openHandler(link, editor.appURL)
     }
 
     /// The editors a project's Open in… offers: every installed one for
@@ -200,14 +180,5 @@ struct ExternalEditorLauncher {
     static func editors(_ installed: [InstalledEditor], forProjectRoot projectRoot: String?) -> [InstalledEditor] {
         guard let projectRoot, ProjectLocation.isRemoteKey(projectRoot) else { return installed }
         return installed.filter(RemoteEditorLink.supports)
-    }
-
-    static let openRemote: RemoteOpener = { link, editor in
-        switch link {
-        case .url(let url):
-            NSWorkspace.shared.open([url], withApplicationAt: editor.appURL, configuration: NSWorkspace.OpenConfiguration()) { _, error in
-                if let error { NSLog("[cherry] open-in-editor failed: %@", error.localizedDescription) }
-            }
-        }
     }
 }

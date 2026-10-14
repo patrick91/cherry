@@ -30,29 +30,16 @@ enum RemoteMCPSetup {
     /// The launcher as the commands name it there.
     static let launcherExpression = "\"$HOME/\(RemoteMCPPaths.launcherRelativePath)\""
 
-    /// The commands the sheet shows, as the script runs them (`claude`,
-    /// `codex` and `pi` from that Mac's login PATH).
-    static func commands(mode: Mode, name: String = serverName) -> [String] {
-        switch mode {
-        case .check:
-            return []
-        case .install:
-            return [
-                "# writes the launcher ~/\(RemoteMCPPaths.launcherRelativePath)",
-                "claude mcp remove --scope user \(name); claude mcp add --scope user --transport stdio \(name) -- \(launcherExpression)",
-                "codex mcp remove \(name); codex mcp add \(name) -- \(launcherExpression)",
-                "# Codex passes an MCP server only the variables it lists: adds",
-                "#   env_vars = \(codexEnvVars) to [mcp_servers.\(name)] in ~/.codex/config.toml",
-                "pi mcp add \(name) --exposure direct -- \(launcherExpression)",
-            ]
-        case .remove:
-            return [
-                "claude mcp remove --scope user \(name)",
-                "codex mcp remove \(name)",
-                "pi mcp remove \(name)",
-            ]
-        }
-    }
+    /// The commands the sheet shows, as the install script runs them
+    /// (`claude`, `codex` and `pi` from that Mac's login PATH).
+    static func installCommands(name: String = serverName) -> [String] { [
+        "# writes the launcher ~/\(RemoteMCPPaths.launcherRelativePath)",
+        "claude mcp remove --scope user \(name); claude mcp add --scope user --transport stdio \(name) -- \(launcherExpression)",
+        "codex mcp remove \(name); codex mcp add \(name) -- \(launcherExpression)",
+        "# Codex passes an MCP server only the variables it lists: adds",
+        "#   env_vars = \(codexEnvVars) to [mcp_servers.\(name)] in ~/.codex/config.toml",
+        "pi mcp add \(name) --exposure direct -- \(launcherExpression)",
+    ] }
 
     /// The variables Codex must pass to CherryMCP (its `env_vars`): Codex
     /// starts MCP servers with only a few of its own.
@@ -250,9 +237,7 @@ enum RemoteMCPSetup {
 
     /// Runs `mode`'s script on the device (over its master while it is up).
     static func run(_ mode: Mode, on device: RemoteDevice) async -> Result<Report, HostedSessionError> {
-        var shell = await RemoteDeviceShell.app()
-        shell.controlPath = HostSSHMasterManager.shared.controlPathIfUp(for: device.sshDestination)
-        shell.timeout = 90
+        let shell = await RemoteDeviceShell.app(through: device.sshDestination, timeout: 90)
         let helper = device.installedResources
             ? RemoteMCPPaths.helperPath(remoteHostPath: device.remoteHostPath, homeDirectory: device.homeDirectory)
             : nil
@@ -356,7 +341,7 @@ struct RemoteMCPSetupSheet: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Text(RemoteMCPSetup.commands(mode: .install).joined(separator: "\n"))
+            Text(RemoteMCPSetup.installCommands().joined(separator: "\n"))
                 .font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled)
                 .padding(8)
@@ -411,23 +396,8 @@ struct RemoteMCPSetupSheet: View {
 enum RemoteMCPSetupPresenter {
     static func present(deviceID: UUID, store: RemoteDeviceStore = .shared) {
         guard store.device(id: deviceID) != nil else { return }
-        let panel = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 320),
-            styleMask: [.titled], backing: .buffered, defer: true
-        )
-        weak let weakPanel = panel
-        let close = {
-            guard let panel = weakPanel else { return }
-            if let parent = panel.sheetParent { parent.endSheet(panel) } else { panel.close() }
-        }
-        panel.contentViewController = NSHostingController(
-            rootView: RemoteMCPSetupSheet(model: RemoteMCPSetupModel(deviceID: deviceID, store: store), close: close)
-        )
-        if let parent = NSApp.keyWindow ?? NSApp.mainWindow {
-            parent.beginSheet(panel)
-        } else {
-            panel.center()
-            panel.makeKeyAndOrderFront(nil)
+        RemoteDeviceSheet.present(size: NSSize(width: 560, height: 320)) { close in
+            RemoteMCPSetupSheet(model: RemoteMCPSetupModel(deviceID: deviceID, store: store), close: close)
         }
     }
 }

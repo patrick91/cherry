@@ -201,20 +201,12 @@ struct RemoteHostHelpers: Equatable, Sendable {
     }
 
     private static func runHelper(_ executable: URL, arguments: [String]) throws -> String {
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = arguments
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        process.standardInput = FileHandle.nullDevice
-        try process.run()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw HostedSessionError.message("\(executable.path) \(arguments.joined(separator: " ")) exited \(process.terminationStatus).")
+        let result = CapturedProcess.run(executable: executable, arguments: arguments, environment: nil, input: nil, timeout: nil)
+        if let launchError = result.launchError { throw launchError }
+        guard result.status == 0 else {
+            throw HostedSessionError.message("\(executable.path) \(arguments.joined(separator: " ")) exited \(result.status).")
         }
-        return String(decoding: data, as: UTF8.self)
+        return String(decoding: result.standardOutput, as: UTF8.self)
     }
 
     /// Whether a Mac of `architecture` (`uname -m`) can run them.
@@ -328,7 +320,7 @@ enum RemoteHostResources {
         for file in files {
             listing += "\(try RemoteHostHelpers.sha256(file.url))  \(file.path)\n"
         }
-        return SHA256.hash(data: Data(listing.utf8)).map { String(format: "%02x", $0) }.joined()
+        return sha256Hex(listing)
     }
 
     private static func collectFiles(in directory: URL, relativePath: String, into files: inout [(path: String, url: URL)]) throws {
@@ -946,7 +938,6 @@ struct RemoteHostInstaller: Sendable {
             "  for tree in Ghostty terminfo; do [ -d \"$src/$tree\" ] && \(Tool.xattr) -cr \"$src/$tree\" 2>/dev/null; done",
             "  [ -f \"$src/CherryMCP\" ] && \(Tool.xattr) -c \"$src/CherryMCP\" 2>/dev/null",
             "  printf 'resources_hash=%s\\n' \"$(resources_hash \"$src\")\"",
-            "  printf 'xattrs=%s\\n' \"$(\(Tool.xattr) \"$src/cherry\" \"$src/cherry-host\" 2>/dev/null | tr '\\n' ' ')\"",
             "  if signature=$(\(Tool.codesign) --verify --strict \"$src/cherry-host\" 2>&1) && signature=$(\(Tool.codesign) --verify --strict \"$src/cherry\" 2>&1); then",
             "    echo codesign=ok",
             "  else",
@@ -1152,8 +1143,6 @@ struct RemoteHostInstaller: Sendable {
         var version: RemoteHostVersionReport?
         var hashes: [String] = []
         var missing = false
-        /// Extended attributes still on the files after `xattr -c`.
-        var remainingAttributes: String?
         /// The copy's Ghostty resources digest (`-`: none).
         var resourcesHash: String?
 
@@ -1167,7 +1156,6 @@ struct RemoteHostInstaller: Sendable {
                 case "verify": version = try? JSONDecoder().decode(RemoteHostVersionReport.self, from: Data(value.utf8))
                 case "hashes": hashes = value.split(separator: " ").map(String.init)
                 case "missing": missing = true
-                case "xattrs": remainingAttributes = value.trimmingCharacters(in: .whitespaces).nilIfEmpty
                 default: break
                 }
             }

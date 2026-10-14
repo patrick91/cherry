@@ -79,11 +79,7 @@ final class AppInstanceLock: @unchecked Sendable {
     static func defaultFileURL(
         applicationSupportName: String = CherryAppIdentity.current.applicationSupportName
     ) -> URL {
-        FileManager.default
-            .homeDirectoryForCurrentUser
-            .appendingPathComponent("Library", isDirectory: true)
-            .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent(applicationSupportName, isDirectory: true)
+        CherryAppIdentity.applicationSupportDirectory(applicationSupportName: applicationSupportName)
             .appendingPathComponent("instance.lock", isDirectory: false)
     }
 

@@ -246,13 +246,6 @@ final class PersistentHostSessions {
         /// When the answer to Create never came, the host is listed after
         /// each of these delays to end a session it may have made anyway.
         var lostCreateChecks: [Duration] = [.seconds(2), .seconds(12), .seconds(30)]
-        /// A running session missing from the list of a host that does not
-        /// report pending holders (an older host) is listed again after
-        /// this long before its tab takes it as gone: a restarted daemon
-        /// lists a session only once its holder registered again. A restore
-        /// looks for a saved tab's missing session again after it too,
-        /// before it drops the tab.
-        var disappearanceConfirmationDelay: Duration = .seconds(2)
         /// A host that reports holders it still expects after a restart is
         /// listed again this often until it expects none, for at most
         /// `pendingHoldersWait`, before a session missing from its list is
@@ -400,11 +393,6 @@ final class PersistentHostSessions {
     private var installationCheck: (reason: String?, checkedAt: Date)?
     private var launchFailure: (reason: String, retryAt: Date)?
 
-    private final class WeakTab {
-        weak var session: TerminalSession?
-        init(_ session: TerminalSession) { self.session = session }
-    }
-
     /// A session whose tab a user closed (⌘W) while that close can still be
     /// undone (`deferEnd`), and how it ends once it cannot.
     private struct DeferredEnd {
@@ -417,11 +405,11 @@ final class PersistentHostSessions {
 
     /// Tabs by the host session their program runs in, while it runs: they
     /// follow its events.
-    private var boundTabs: [String: WeakTab] = [:]
+    private var boundTabs: [String: WeakReference<TerminalSession>] = [:]
     /// Every open tab built to run as a persistent session (even one that
     /// then fell back to the native backend), until it closes. The owner of
     /// a session is the open one that names it (`owningTab(of:)`).
-    private var openTabs: [ObjectIdentifier: WeakTab] = [:]
+    private var openTabs: [ObjectIdentifier: WeakReference<TerminalSession>] = [:]
     private var creatingCount = 0
 
     /// How long a tab waits for the session it is about to create
@@ -522,13 +510,7 @@ final class PersistentHostSessions {
     /// This app cannot run local sessions: a disk image or App Translocation
     /// copy, or no `cherry` helper. Cheap (file checks only).
     static func localInstallationUnavailableReason() -> String? {
-        if let reason = HostedSessionInstallation.localHostUnavailableReason() { return reason }
-        do {
-            _ = try HostedSessionClient.installed()
-            return nil
-        } catch {
-            return (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
-        }
+        HostedSessionInstallation.localHostUnavailableReason() ?? remoteInstallationUnavailableReason()
     }
 
     /// This app cannot reach other Macs' hosts: no `cherry` helper (it runs
@@ -539,7 +521,7 @@ final class PersistentHostSessions {
             _ = try HostedSessionClient.installed()
             return nil
         } catch {
-            return (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
+            return error.localizedDescription
         }
     }
 
@@ -672,7 +654,7 @@ final class PersistentHostSessions {
             status.lastLaunchFailure = failure
         }
         guard Self.meansHostUnavailable(error) else { return }
-        let reason = "\(Self.capitalizedFirst(profile.hostPhrase)) could not start a session: \(Self.errorMessage(error))"
+        let reason = "\(Self.capitalizedFirst(profile.hostPhrase)) could not start a session: \(error.localizedDescription)"
         launchFailure = (reason, Date().addingTimeInterval(configuration.unavailableRetryInterval))
         publish(instanceUnavailableReason ?? installationCheck?.reason ?? reason)
     }
@@ -682,11 +664,7 @@ final class PersistentHostSessions {
     /// (the session limit, a holder that failed to start, a daemon whose
     /// executable was removed), else what went wrong reaching it.
     nonisolated static func launchFailureReason(_ error: Error) -> String {
-        errorMessage(error)
-    }
-
-    private nonisolated static func errorMessage(_ error: Error) -> String {
-        (error as? HostedSessionError)?.errorDescription ?? error.localizedDescription
+        error.localizedDescription
     }
 
     /// Whether a failed Create says the local host cannot run sessions now:
@@ -775,7 +753,7 @@ final class PersistentHostSessions {
             cols: min(max(request.columns, 2), 500),
             rows: min(max(request.rows, 1), 200),
             owner: owner,
-            tags: Self.tags(for: request, requestID: requestID, resourcesCopy: spec.resourcesCopy),
+            tags: Self.tags(for: request, resourcesCopy: spec.resourcesCopy),
             // A program that asks sees the colours of the terminal it is
             // shown in, as in a native tab.
             colors: terminalColors(),
@@ -805,13 +783,8 @@ final class PersistentHostSessions {
         noteLaunchSucceeded()
         return PersistentSessionLaunch(
             attachment: HostedSessionAttachment(
-                host: profile.host,
-                hostID: hostID,
-                sessionID: info.id,
-                name: info.name,
-                remoteWorkingDirectory: info.cwd,
-                executablePath: executable.path,
-                environment: loginEnvironment ?? [:]
+                host: profile.host, hostID: hostID, info: info,
+                executablePath: executable.path, environment: loginEnvironment ?? [:]
             ),
             info: info,
             loginPathProblem: spec.loginPathProblem
@@ -839,13 +812,7 @@ final class PersistentHostSessions {
         let host = profile.host
         return (list, { info in
             HostedSessionAttachment(
-                host: host,
-                hostID: list.hostID,
-                sessionID: info.id,
-                name: info.name,
-                remoteWorkingDirectory: info.cwd,
-                executablePath: executablePath,
-                environment: environment
+                host: host, hostID: list.hostID, info: info, executablePath: executablePath, environment: environment
             )
         })
     }
@@ -856,13 +823,8 @@ final class PersistentHostSessions {
         let control = control
         guard let hostID = control.hostID, let executable = control.executableURL else { return nil }
         return HostedSessionAttachment(
-            host: profile.host,
-            hostID: hostID,
-            sessionID: info.id,
-            name: info.name,
-            remoteWorkingDirectory: info.cwd,
-            executablePath: executable.path,
-            environment: control.loginEnvironment?.environment ?? [:]
+            host: profile.host, hostID: hostID, info: info,
+            executablePath: executable.path, environment: control.loginEnvironment?.environment ?? [:]
         )
     }
 
@@ -885,13 +847,7 @@ final class PersistentHostSessions {
                     && self.owningTab(of: info.id) == nil
                     && self.endings[info.id] == nil {
                     self.end(HostedSessionAttachment(
-                        host: profile.host,
-                        hostID: hostID,
-                        sessionID: info.id,
-                        name: info.name,
-                        remoteWorkingDirectory: info.cwd,
-                        executablePath: control.executableURL?.path ?? "",
-                        environment: [:]
+                        host: profile.host, hostID: hostID, info: info, executablePath: control.executableURL?.path ?? ""
                     ))
                 }
             }
@@ -1038,8 +994,8 @@ final class PersistentHostSessions {
 
     /// Records an open tab built to run as a persistent session.
     func register(_ tab: TerminalSession) {
-        openTabs = openTabs.filter { $0.value.session != nil }
-        openTabs[ObjectIdentifier(tab)] = WeakTab(tab)
+        openTabs = openTabs.filter { $0.value.object != nil }
+        openTabs[ObjectIdentifier(tab)] = WeakReference(tab)
     }
 
     /// The tab closed: it no longer owns the session it names, which another
@@ -1054,14 +1010,14 @@ final class PersistentHostSessions {
     /// showing it is only attached (`hostedAttachment`), and closing that
     /// tab only disconnects.
     func owningTab(of sessionID: String) -> TerminalSession? {
-        openTabs.values.lazy.compactMap(\.session).first { tab in
+        openTabs.values.lazy.compactMap(\.object).first { tab in
             tab.isPersistentLocalSession && tab.persistentSession?.sessionID == sessionID
         }
     }
 
     /// Whether any tab built to run as a persistent session here is open.
     var hasOpenTabs: Bool {
-        openTabs.values.contains { $0.session != nil }
+        openTabs.values.contains { $0.object != nil }
     }
 
     /// Windows that use this hosting (`beginUse`), even while they have no
@@ -1124,12 +1080,12 @@ final class PersistentHostSessions {
 
     /// Whether an open tab built to run as a persistent session has this id.
     func hasOpenTab(withID id: UUID) -> Bool {
-        openTabs.values.contains { $0.session?.id == id }
+        openTabs.values.contains { $0.object?.id == id }
     }
 
     /// Whether an open tab other than `tab` has this id.
     func hasOpenTab(withID id: UUID, besides tab: TerminalSession?) -> Bool {
-        openTabs.values.contains { $0.session?.id == id && $0.session !== tab }
+        openTabs.values.contains { $0.object?.id == id && $0.object !== tab }
     }
 
     /// How a tab's adapter reaches the session `binding` names on this
@@ -1168,7 +1124,7 @@ final class PersistentHostSessions {
             return true
         }
         guard info.owner == owner, let launchID = Self.launchRequestID(of: info) else { return false }
-        return openTabs.values.contains { $0.session?.persistentLaunchRequestID == launchID }
+        return openTabs.values.contains { $0.object?.persistentLaunchRequestID == launchID }
     }
 
     /// Whether a tab of this app may own `info`'s session (Persistent
@@ -1185,11 +1141,11 @@ final class PersistentHostSessions {
     /// Follows the session for `session`: its exit, pid and removal. Only
     /// its owner follows a session; another tab is never bound in its place.
     func bind(_ session: TerminalSession, to sessionID: String) {
-        if let bound = boundTabs[sessionID]?.session, bound !== session {
+        if let bound = boundTabs[sessionID]?.object, bound !== session {
             SessionLog.notice("session \(sessionID) already belongs to tab \(bound.id.uuidString); tab \(session.id.uuidString) does not follow it")
             return
         }
-        boundTabs[sessionID] = WeakTab(session)
+        boundTabs[sessionID] = WeakReference(session)
         updateLease()
         // What the program signalled before its tab followed it (while no
         // app ran, or before its Create answer arrived).
@@ -1209,13 +1165,13 @@ final class PersistentHostSessions {
 
     /// Stops following the session for `session`, unless another tab does.
     func unbind(_ session: TerminalSession, from sessionID: String) {
-        guard let bound = boundTabs[sessionID], bound.session == nil || bound.session === session else { return }
+        guard let bound = boundTabs[sessionID], bound.object == nil || bound.object === session else { return }
         unbind(sessionID: sessionID)
     }
 
     /// The tab that runs its program in this session, if one is open.
     func boundTab(for sessionID: String) -> TerminalSession? {
-        boundTabs[sessionID]?.session
+        boundTabs[sessionID]?.object
     }
 
     /// The session as the host last reported it.
@@ -1225,18 +1181,13 @@ final class PersistentHostSessions {
 
     /// The program's state after the host's list lacked its session while it
     /// ran, so a session whose holder registers late with a restarted
-    /// daemon is not taken for gone: from a list that is complete (the host
-    /// is listed until it expects no more holders, at most
-    /// `pendingHoldersWait`), or, from a host that does not report pending
-    /// holders, from a fresh list after `disappearanceConfirmationDelay`.
-    /// `.unknown` when the host cannot be listed, or still expects holders.
+    /// daemon is not taken for gone: from a fresh list that is complete
+    /// (the host is listed until it expects no more holders, at most
+    /// `pendingHoldersWait`). `.unknown` when the host cannot be listed, or
+    /// still expects holders.
     func confirmedProgramState(of binding: HostedSessionAttachment) async -> PersistentProgramState {
         guard var list = try? await control.list() else { return .unknown }
-        if list.pendingHolders == nil {
-            try? await Task.sleep(for: configuration.disappearanceConfirmationDelay)
-            guard let later = try? await control.list() else { return .unknown }
-            list = later
-        } else if list.awaitsHolders {
+        if list.awaitsHolders {
             guard let later = try? await completeList(after: list) else { return .unknown }
             list = later
         }
@@ -1682,14 +1633,14 @@ final class PersistentHostSessions {
             do {
                 try await control.update(binding.sessionID, name: name, expectedHostID: binding.hostID)
             } catch {
-                SessionLog.error("could not rename session \(binding.sessionID): \(Self.errorMessage(error))")
+                SessionLog.error("could not rename session \(binding.sessionID): \(error.localizedDescription)")
             }
         }
     }
 
     /// Clears the history above the session's screen on its host (Clear
-    /// Scrollback, MCP `clear_output`): reads of its screen (`screen(of:)`)
-    /// and an adapter that attaches no longer bring it back.
+    /// Scrollback, the control request `clearOutput`): reads of its screen
+    /// (`screen(of:)`) and an adapter that attaches no longer bring it back.
     func clearHistory(of binding: HostedSessionAttachment) async throws {
         try await control.clearHistory(binding.sessionID, expectedHostID: binding.hostID)
     }
@@ -1697,7 +1648,7 @@ final class PersistentHostSessions {
     // MARK: Events
 
     private func updateLease() {
-        boundTabs = boundTabs.filter { $0.value.session != nil }
+        boundTabs = boundTabs.filter { $0.value.object != nil }
         let needed = creatingCount > 0 || !boundTabs.isEmpty || !endings.isEmpty || !deferredEnds.isEmpty
             || !inputChains.isEmpty || forgottenTabSearches > 0
         if needed, lease == nil {
@@ -1738,7 +1689,7 @@ final class PersistentHostSessions {
         case .resync:
             // Events may have been missed: take the list as it is now.
             for (id, weakTab) in boundTabs {
-                guard let tab = weakTab.session else { continue }
+                guard let tab = weakTab.object else { continue }
                 if let info = sessionInfo(id) {
                     if info.isRunning {
                         tab.persistentSessionDidChange(info)
@@ -1847,11 +1798,11 @@ final class PersistentHostSessions {
         !info.isRunning && info.exitCode == 0 && info.exitSignal == nil
     }
 
-    static func tags(for request: PersistentSessionRequest, requestID: UUID, resourcesCopy: String? = nil) -> [String: String] {
+    static func tags(for request: PersistentSessionRequest, resourcesCopy: String? = nil) -> [String: String] {
         var tags = [
             PersistentSessionTag.tab: request.tabID.uuidString,
             PersistentSessionTag.kind: request.kind.rawValue,
-            PersistentSessionTag.launch: requestID.uuidString.lowercased()
+            PersistentSessionTag.launch: request.requestID.uuidString.lowercased()
         ]
         if let agentName = request.agentName?.nilIfEmpty { tags[PersistentSessionTag.agent] = agentName }
         if let commandName = request.commandName?.nilIfEmpty { tags[PersistentSessionTag.command] = commandName }

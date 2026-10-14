@@ -17,16 +17,7 @@ private func minutesAgo(_ minutes: Double) -> Date {
     now.addingTimeInterval(-minutes * 60)
 }
 
-private func privateDefaults() -> UserDefaults {
-    let name = "cherry-project-switcher-tests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: name)!
-    defaults.removePersistentDomain(forName: name)
-    return defaults
-}
-
-private let thisMac = ProjectSwitcherModel.MachineInfo(
-    machine: .thisMac, name: "This Mac", status: "3 sessions", dot: .green, sessionCount: 3, detail: "MacBook"
-)
+private let thisMac = ProjectSwitcherModel.MachineInfo(machine: .thisMac, name: "This Mac", dot: .green, sessionCount: 3)
 
 private func device(
     _ id: UUID,
@@ -35,10 +26,8 @@ private func device(
     allowsOpening: Bool = true
 ) -> ProjectSwitcherModel.MachineInfo {
     .init(
-        machine: .device(id), name: name, status: reachable ? "Connected · 1 session" : "Offline",
-        dot: reachable ? .green : .gray, sessionCount: reachable ? 1 : nil, detail: name,
-        isReachable: reachable, allowsOpening: allowsOpening,
-        unreachableMessage: reachable ? nil : "\(name) isn't reachable."
+        machine: .device(id), name: name, dot: reachable ? .green : .gray, sessionCount: reachable ? 1 : nil,
+        isReachable: reachable, allowsOpening: allowsOpening
     )
 }
 
@@ -74,7 +63,7 @@ private func remote(
 // MARK: - Recency
 
 @Test @MainActor func recencyStoreKeepsTheLastOpeningPerKeyAcrossInstances() {
-    let defaults = privateDefaults()
+    let defaults = privateDefaults("cherry-project-switcher-tests")
     let store = ProjectRecencyStore(defaults: defaults)
     store.markOpened("/a", at: minutesAgo(30))
     store.markOpened("/b", at: minutesAgo(20))
@@ -91,7 +80,7 @@ private func remote(
 }
 
 @Test @MainActor func recencyStoreKeepsOnlyTheMostRecentKeys() {
-    let store = ProjectRecencyStore(defaults: privateDefaults())
+    let store = ProjectRecencyStore(defaults: privateDefaults("cherry-project-switcher-tests"))
     for index in 0 ..< (ProjectRecencyStore.capacity + 10) {
         store.markOpened("/p\(index)", at: now.addingTimeInterval(Double(index) * 60))
     }
@@ -103,7 +92,7 @@ private func remote(
 @Test @MainActor func aProjectWindowMarksItsProjectOpenedWhenItBecomesActive() throws {
     let registry = ProjectWindowRegistry()
     registry.bringWindowForward = { _ in }
-    let recency = ProjectRecencyStore(defaults: privateDefaults())
+    let recency = ProjectRecencyStore(defaults: privateDefaults("cherry-project-switcher-tests"))
     registry.projectRecency = recency
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("cherry-switcher-\(UUID().uuidString)", isDirectory: true)
@@ -121,7 +110,7 @@ private func remote(
     ))
     let key = registry.canonicalProjectRoot(for: root.path)
     #expect(recency.lastOpened(key) != nil)
-    #expect(registry.openProjectWindowStatuses()[key] == .init(tabs: 0, workingAgents: 0))
+    #expect(registry.openProjectWindowStatuses()[key] == .init(workingAgents: 0))
 
     #expect(registry.focus(projectRoot: root.path))
     #expect(recency.recentKeys(limit: 1) == [key])
@@ -138,9 +127,7 @@ private func remote(
     // Its projects still open (the window waits for it), as from the menu.
     #expect(model.action(opening: model.locations[1]) == .openDeviceProject(deviceID: miniID, path: "/Users/me/code/argocd"))
     #expect(model.action(opening: model.locations[0]) == .openProject("/Users/me/code/shop"))
-    #expect(model.machine(.device(miniID))?.unreachableMessage == "Mini isn't reachable.")
     #expect(model.name(of: .device(studioID)) == "Studio")
-    #expect(model.projectCount(on: .thisMac) == 1)
 
     let changed = ProjectSwitcherModel(
         machines: [thisMac, device(miniID, "Mini", reachable: false, allowsOpening: false)],
@@ -156,32 +143,26 @@ private func remote(
         installedBuild: "20260928211211"
     )
     let offline = ProjectSwitcherModel.machineInfo(
-        for: .init(device: studio, state: .offline(reason: "timed out"), sessions: []),
-        projectCount: 1, now: now
+        for: .init(device: studio, state: .offline(reason: "timed out"), sessions: [])
     )
+    #expect(offline.name == "Studio")
     #expect(!offline.isReachable)
     #expect(offline.allowsOpening)
-    #expect(offline.status == "Offline")
     #expect(offline.dot == .gray)
     #expect(offline.sessionCount == nil)
-    #expect(offline.unreachableMessage?.hasPrefix("Studio isn't reachable (last seen") == true)
-    #expect(offline.detail == "studio over SSH · session host 20260928211211 · 1 project")
 
     let reachable = ProjectSwitcherModel.machineInfo(
-        for: .init(device: studio, state: .reachable(sessionCount: 2), sessions: []),
-        projectCount: 1, now: now
+        for: .init(device: studio, state: .reachable(sessionCount: 2), sessions: [])
     )
     #expect(reachable.isReachable)
     #expect(reachable.sessionCount == 2)
-    #expect(reachable.status == "Reachable · 2 sessions")
-    #expect(reachable.unreachableMessage == nil)
+    #expect(reachable.dot == .green)
 
     let changed = ProjectSwitcherModel.machineInfo(
-        for: .init(device: studio, state: .identityChanged(reason: "Expected a, received b."), sessions: []),
-        projectCount: 1, now: now
+        for: .init(device: studio, state: .identityChanged(reason: "Expected a, received b."), sessions: [])
     )
+    #expect(!changed.isReachable)
     #expect(!changed.allowsOpening)
-    #expect(changed.offersTrustNewIdentity)
 }
 
 // MARK: - Building from the app's state
@@ -201,22 +182,20 @@ private func remote(
         ],
         devices: [.init(device: studio, state: .connected(sessionCount: 0), sessions: [])],
         openWindows: [
-            "/Users/me/code/pix": .init(tabs: 3, workingAgents: 2),
-            homeKey: .init(tabs: 1, workingAgents: 0),
+            "/Users/me/code/pix": .init(workingAgents: 2),
+            homeKey: .init(workingAgents: 0),
         ],
         recency: [cherryKey: minutesAgo(3), "/Users/me/code/cherry": minutesAgo(30)],
         currentProjectKey: homeKey,
         thisMac: thisMac,
-        localHome: "/Users/me",
-        now: now
+        localHome: "/Users/me"
     )
     #expect(model.machines.map(\.name) == ["This Mac", "Studio"])
-    #expect(model.currentMachine == .device(studioID))
     #expect(model.locations.filter { $0.machine == .thisMac }.map(\.name) == ["cherry", "pix"])
     let locations = Dictionary(uniqueKeysWithValues: model.locations.map { ($0.key, $0) })
     #expect(locations[cherryKey]?.lastOpened == minutesAgo(3))
     #expect(locations["/Users/me/code/cherry"]?.lastOpened == minutesAgo(30))
-    #expect(locations["/Users/me/code/pix"]?.openStatus?.text == "2 agents working · 3 tabs")
+    #expect(locations["/Users/me/code/pix"]?.openStatus?.workingAgents == 2)
     #expect(locations["/Users/me/code/pix"]?.displayPath == "~/code/pix")
     // A device window of a folder its host does not list is listed too.
     #expect(locations[homeKey]?.name == "me")

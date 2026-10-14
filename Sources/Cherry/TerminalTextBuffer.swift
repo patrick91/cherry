@@ -19,10 +19,6 @@ enum TerminalMouseTrackingMode: Equatable {
     case normal
     case buttonEvent
     case anyEvent
-
-    var isEnabled: Bool {
-        self != .disabled
-    }
 }
 
 struct TerminalMouseState: Equatable {
@@ -30,73 +26,6 @@ struct TerminalMouseState: Equatable {
     var usesSGREncoding = false
     var alternateScrollMode = true
     var sendsFocusEvents = false
-}
-
-struct TerminalGridPoint: Equatable, Comparable {
-    let row: Int
-    let column: Int
-
-    init(row: Int, column: Int) {
-        self.row = row
-        self.column = column
-    }
-
-    static func < (lhs: TerminalGridPoint, rhs: TerminalGridPoint) -> Bool {
-        if lhs.row != rhs.row {
-            return lhs.row < rhs.row
-        }
-
-        return lhs.column < rhs.column
-    }
-}
-
-struct TerminalSelectionRange: Equatable {
-    let anchor: TerminalGridPoint
-    let extent: TerminalGridPoint
-
-    var isEmpty: Bool {
-        anchor == extent
-    }
-
-    var normalized: (start: TerminalGridPoint, end: TerminalGridPoint) {
-        anchor <= extent
-            ? (anchor, extent)
-            : (extent, anchor)
-    }
-}
-
-protocol TerminalBuffering {
-    var lineCount: Int { get }
-    var storedLineCount: Int { get }
-    var cursorState: TerminalCursorState { get }
-    var usesAlternateScreen: Bool { get }
-    var usesApplicationCursorKeys: Bool { get }
-    var usesBracketedPasteMode: Bool { get }
-    var mouseState: TerminalMouseState { get }
-
-    func snapshot(range: Range<Int>) -> [String]
-    func lineLength(at row: Int) -> Int
-    func gridPoint(row: Int, column: Int) -> TerminalGridPoint
-    func selectedText(in selection: TerminalSelectionRange) -> String
-
-    mutating func clear()
-    mutating func clearScreenAndScrollbackPreservingState()
-    mutating func resize(to viewportSize: TerminalViewportSize)
-    mutating func appendPlainLines(_ newLines: [String])
-
-    @discardableResult
-    mutating func ingest(_ data: Data, viewportSize: TerminalViewportSize) -> [Data]
-}
-
-extension TerminalBuffering {
-    mutating func clearScreenAndScrollbackPreservingState() {
-        clear()
-    }
-
-    @discardableResult
-    mutating func ingest(_ data: Data) -> [Data] {
-        ingest(data, viewportSize: TerminalViewportSize(columns: 120, rows: 32))
-    }
 }
 
 private func terminalNumericParameters(from payload: String) -> [Int?] {
@@ -137,7 +66,7 @@ private func terminalNumericParameters(from payload: String) -> [Int?] {
     return parameters
 }
 
-struct LiveTerminalOutputBuffer: TerminalBuffering {
+struct LiveTerminalOutputBuffer {
     private enum ParserState {
         case ground
         case escape
@@ -186,10 +115,6 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         max(1, activeCompletedLineCount + 1)
     }
 
-    var storedLineCount: Int {
-        lineCount
-    }
-
     var cursorState: TerminalCursorState {
         TerminalCursorState(
             row: cursorRow,
@@ -217,40 +142,6 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
 
     func snapshot(range: Range<Int>) -> [String] {
         range.map { line(at: $0) ?? "" }
-    }
-
-    func lineLength(at row: Int) -> Int {
-        line(at: row)?.count ?? 0
-    }
-
-    func gridPoint(row: Int, column: Int) -> TerminalGridPoint {
-        TerminalGridPoint(row: row, column: column)
-    }
-
-    func selectedText(in selection: TerminalSelectionRange) -> String {
-        let lower = min(selection.anchor.row, selection.extent.row)
-        let upper = max(selection.anchor.row, selection.extent.row)
-        guard lower <= upper else { return "" }
-
-        return (lower...upper).compactMap { row -> String? in
-            guard let line = line(at: row) else { return nil }
-            let startColumn: Int
-            let endColumn: Int
-            if row == selection.anchor.row && row == selection.extent.row {
-                startColumn = min(selection.anchor.column, selection.extent.column)
-                endColumn = max(selection.anchor.column, selection.extent.column)
-            } else if row == selection.anchor.row {
-                startColumn = selection.anchor.row < selection.extent.row ? selection.anchor.column : 0
-                endColumn = selection.anchor.row < selection.extent.row ? line.count : selection.anchor.column
-            } else if row == selection.extent.row {
-                startColumn = selection.anchor.row < selection.extent.row ? 0 : selection.extent.column
-                endColumn = selection.anchor.row < selection.extent.row ? selection.extent.column : line.count
-            } else {
-                startColumn = 0
-                endColumn = line.count
-            }
-            return line.substringByCharacterColumns(startColumn..<endColumn)
-        }.joined(separator: "\n")
     }
 
     mutating func clear() {
@@ -490,24 +381,6 @@ struct LiveTerminalOutputBuffer: TerminalBuffering {
         while activeCompletedLineCount < targetRow {
             appendCompletedLine(activeCurrentLineText)
             clearCurrentLine(keepingCapacity: activeCurrentLineCount <= 4_096)
-        }
-    }
-
-    private mutating func makeActiveLineCurrent(at row: Int) {
-        let targetRow = max(0, row)
-        ensureActiveLineExists(at: targetRow)
-        let line = activeLineText(at: targetRow)
-
-        if isUsingAlternateScreen {
-            if targetRow < alternateCompletedLines.count {
-                alternateCompletedLines.removeSubrange(targetRow..<alternateCompletedLines.count)
-            }
-            alternateCurrentLine = line
-        } else {
-            if targetRow < completedLines.count {
-                completedLines.removeSubrange(targetRow..<completedLines.count)
-            }
-            currentLine = line
         }
     }
 

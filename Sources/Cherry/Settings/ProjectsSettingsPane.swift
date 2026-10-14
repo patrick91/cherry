@@ -59,14 +59,7 @@ struct ProjectSettingsPane: View {
     }
 
     private func chooseProjectRoot() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.canCreateDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Add"
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let url = NSOpenPanel.chooseFolder(prompt: "Add", canCreateDirectories: true) else { return }
         if let project = settings.addProject(path: url.path) {
             openProject(project)
         }
@@ -107,8 +100,7 @@ struct ProjectDetailSettingsPane: View {
     var body: some View {
         SettingsPaneScroll(
             title: project.name,
-            subtitle: project.root,
-            systemImage: "folder.fill"
+            subtitle: project.root
         ) {
             SettingsCard("Project") {
                 SettingsRow("Location", subtitle: project.root) {
@@ -128,14 +120,12 @@ struct ProjectDetailSettingsPane: View {
 
             SettingsCard("Features") {
                 ProjectFeatureControls(settings: settings, project: project)
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 13)
+                    .settingsRowPadding()
             }
 
             SettingsCard("Appearance") {
                 ProjectAppearanceControls(settings: settings, project: project)
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 13)
+                    .settingsRowPadding()
             }
 
             SettingsCard("Commands") {

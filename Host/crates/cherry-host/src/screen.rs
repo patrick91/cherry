@@ -212,30 +212,6 @@ pub fn read(terminal: &Terminal, scrollback: bool, max_lines: Option<u32>) -> Re
     })
 }
 
-/// Limit a screen text that a holder older than link version 3 sent in full
-/// (it knows nothing of `max_lines`) to its last `max_lines` lines. Its
-/// `cursor_row` is the cursor's row on the screen: the line holding it is
-/// estimated as if each screen row were one line and, with the history
-/// (`history`), as if the screen's last row ended the text. Returns the
-/// cursor's row counted from the first line kept.
-pub fn limit_whole(
-    text: &mut String,
-    cursor_row: u16,
-    rows: u16,
-    history: bool,
-    max_lines: u32,
-) -> u16 {
-    let lines = line_count(text) as i64;
-    let cursor = if history {
-        (lines - i64::from(rows) + i64::from(cursor_row)).max(0)
-    } else {
-        i64::from(cursor_row)
-    };
-    let dropped = keep_last_lines(text, usize::try_from(max_lines).unwrap_or(usize::MAX));
-    let dropped = dropped + keep_last(text, MAX_SCREEN_TEXT_BYTES);
-    (cursor - dropped as i64).clamp(0, i64::from(u16::MAX)) as u16
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,19 +797,5 @@ mod tests {
             );
             assert!(screen.alternate_screen);
         }
-    }
-
-    #[test]
-    fn whole_texts_of_older_holders_are_limited_by_estimate() {
-        let mut text = "h1\nh2\nh3\ns1\ns2\ns3".to_string();
-        // The cursor on the last screen row, with history.
-        assert_eq!(limit_whole(&mut text, 2, 3, true, 2), 1);
-        assert_eq!(text, "s2\ns3");
-        let mut text = "s1\ns2\ns3".to_string();
-        assert_eq!(limit_whole(&mut text, 0, 3, false, 2), 0);
-        assert_eq!(text, "s2\ns3");
-        let mut text = "s1\ns2\ns3".to_string();
-        assert_eq!(limit_whole(&mut text, 2, 3, false, 5), 2);
-        assert_eq!(text, "s1\ns2\ns3");
     }
 }

@@ -7,69 +7,6 @@ import Foundation
 /// `CHERRY_DEBUG_INPUT=1`: trace typed input and the buffer's tail to the
 /// unified log (as private data). Tests switch it on.
 nonisolated(unsafe) var inputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
-private let ptyTraceDirectory = ProcessInfo.processInfo.environment["CHERRY_TRACE_PTY_DIR"]
-private let prototypeProcessorDisabledForPerf =
-    ProcessInfo.processInfo.environment["CHERRY_DISABLE_PROTOTYPE_PROCESSOR"] == "1"
-
-private final class TerminalTraceRecorder {
-    let outputURL: URL
-
-    private let outputHandle: FileHandle
-
-    init?(sessionID: UUID, title: String) {
-        guard let ptyTraceDirectory, !ptyTraceDirectory.isEmpty else { return nil }
-
-        let directoryPath = NSString(string: ptyTraceDirectory).expandingTildeInPath
-        let directoryURL = URL(fileURLWithPath: directoryPath, isDirectory: true)
-
-        do {
-            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        } catch {
-            SessionLog.debug("[pty trace] failed to create \(directoryURL.path): \(error.localizedDescription)")
-            return nil
-        }
-
-        let filename = "\(Self.timestamp())-\(Self.safeFilename(title))-\(sessionID.uuidString.prefix(8)).pty"
-        outputURL = directoryURL.appendingPathComponent(filename)
-
-        FileManager.default.createFile(atPath: outputURL.path, contents: Data())
-
-        do {
-            outputHandle = try FileHandle(forWritingTo: outputURL)
-        } catch {
-            SessionLog.debug("[pty trace] failed to open \(outputURL.path): \(error.localizedDescription)")
-            return nil
-        }
-
-        SessionLog.debug("[pty trace] writing raw PTY output to \(outputURL.path)")
-    }
-
-    deinit {
-        try? outputHandle.close()
-    }
-
-    func recordOutput(_ data: Data) {
-        guard !data.isEmpty else { return }
-        try? outputHandle.write(contentsOf: data)
-    }
-
-    private static func timestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return formatter.string(from: Date())
-    }
-
-    private static func safeFilename(_ value: String) -> String {
-        let allowed = CharacterSet.alphanumerics
-        let sanitized = value.unicodeScalars
-            .map { allowed.contains($0) ? String($0) : "-" }
-            .joined()
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-
-        return sanitized.isEmpty ? "session" : sanitized
-    }
-}
 
 final class TerminalProcessor: @unchecked Sendable {
     enum BackpressurePolicy {
@@ -86,7 +23,7 @@ final class TerminalProcessor: @unchecked Sendable {
     private let notificationLock = NSLock()
     private let backpressurePolicy: BackpressurePolicy
 
-    private var buffer: any TerminalBuffering
+    private var buffer: LiveTerminalOutputBuffer
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
     private var activeLaunchID: UUID?
     private var outputEpoch = 0
@@ -99,7 +36,7 @@ final class TerminalProcessor: @unchecked Sendable {
 
     init(
         maxScrollback: Int?,
-        buffer: (any TerminalBuffering)? = nil,
+        buffer: LiveTerminalOutputBuffer? = nil,
         backpressurePolicy: BackpressurePolicy = .preserveAll
     ) {
         self.buffer = buffer ?? LiveTerminalOutputBuffer(maxScrollback: maxScrollback)
@@ -108,10 +45,6 @@ final class TerminalProcessor: @unchecked Sendable {
 
     var lineCount: Int {
         locked { buffer.lineCount }
-    }
-
-    var storedLineCount: Int {
-        locked { buffer.storedLineCount }
     }
 
     var cursorState: TerminalCursorState {
@@ -155,18 +88,6 @@ final class TerminalProcessor: @unchecked Sendable {
 
     func snapshot(range: Range<Int>) -> [String] {
         locked { buffer.snapshot(range: range) }
-    }
-
-    func lineLength(at row: Int) -> Int {
-        locked { buffer.lineLength(at: row) }
-    }
-
-    func gridPoint(row: Int, column: Int) -> TerminalGridPoint {
-        locked { buffer.gridPoint(row: row, column: column) }
-    }
-
-    func selectedText(in selection: TerminalSelectionRange) -> String {
-        locked { buffer.selectedText(in: selection) }
     }
 
     func clear() {
@@ -377,17 +298,14 @@ final class TerminalProcessor: @unchecked Sendable {
     }
 }
 
+/// Not Foundation's `NSLocking.withLock`: a closure formed in main-actor
+/// code and given to that one is checked to run on the main actor, and
+/// `TerminalSession.enqueueTerminalMetadata` runs on the PTY's read queue.
 private extension NSLock {
     func withLock<T>(_ body: () -> T) -> T {
         lock()
         defer { unlock() }
         return body()
-    }
-}
-
-extension String {
-    var nilIfEmpty: String? {
-        isEmpty ? nil : self
     }
 }
 
@@ -521,12 +439,9 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
         }
     }
 
-    func observe(replayExistingOutput: Bool, _ observer: @escaping @Sendable (Data) -> Void) -> UUID {
+    func observe(_ observer: @escaping @Sendable (Data) -> Void) -> UUID {
         let id = UUID()
         lock.withLock {
-            if replayExistingOutput, byteCount > 0 {
-                observer(snapshotLocked(maxBytes: maximumBytes).data)
-            }
             observers[id] = observer
         }
         return id
@@ -676,7 +591,6 @@ private enum NixShellMetadataEvent: Equatable {
 
 struct TerminalNotificationRequest: Equatable {
     enum Source: Equatable {
-        case bel
         case osc9
         case osc777
     }
@@ -1454,10 +1368,6 @@ final class TerminalWorkspace: ObservableObject {
         childAgentSessions(parentID: parent.id)
     }
 
-    func childAgentCount(of parent: TerminalSession) -> Int {
-        childAgentSessions(of: parent).count
-    }
-
     func descendantAgentSessions(of parent: TerminalSession) -> [TerminalSession] {
         guard parent.kind == .agent else { return [] }
         return childAgentSessions(of: parent)
@@ -1507,45 +1417,6 @@ final class TerminalWorkspace: ObservableObject {
         let session = reordered.remove(at: currentIndex)
         reordered.insert(session, at: clampedIndex)
         sessions = reordered
-    }
-
-    func moveSession(id sessionID: UUID, to targetIndex: Int, within kind: TerminalSession.SessionKind) {
-        if kind == .terminal {
-            moveTerminalDisplayItem(containing: sessionID, to: targetIndex)
-            return
-        }
-
-        let scopedSessions = sessions.filter { $0.kind == kind }
-        guard let currentScopedIndex = scopedSessions.firstIndex(where: { $0.id == sessionID }) else { return }
-
-        let clampedScopedIndex = min(max(targetIndex, 0), scopedSessions.count - 1)
-        guard currentScopedIndex != clampedScopedIndex else { return }
-
-        let session = scopedSessions[currentScopedIndex]
-        let remainingScopedIDs = scopedSessions
-            .filter { $0.id != sessionID }
-            .map(\.id)
-        var nextScopedIDs = remainingScopedIDs
-        nextScopedIDs.insert(session.id, at: min(clampedScopedIndex, nextScopedIDs.count))
-
-        let sessionsByID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
-        var scopedIterator = nextScopedIDs.makeIterator()
-        sessions = sessions.map { existing in
-            guard existing.kind == kind, let nextID = scopedIterator.next(),
-                  let replacement = sessionsByID[nextID]
-            else {
-                return existing
-            }
-            return replacement
-        }
-    }
-
-    func moveTerminalDisplayItem(containing sessionID: UUID, to targetIndex: Int) {
-        guard let currentIndex = terminalDisplayItems.firstIndex(where: { displayItemContains($0, sessionID: sessionID) }) else {
-            return
-        }
-
-        moveTerminalDisplayItem(at: currentIndex, to: targetIndex)
     }
 
     func moveTerminalDisplayItem(id displayItemID: UUID, to targetIndex: Int) {
@@ -1847,15 +1718,11 @@ final class TerminalWorkspace: ObservableObject {
         let workingDirectory = (hosting.profile.isThisMac
             ? launch.info.localWorkingDirectory
             : hosting.reportedWorkingDirectory(of: launch.info)) ?? record.workingDirectory
-        let subtitle: String = switch record.kind {
-        case .terminal: "\(ShellProcessController.defaultShellName) login shell"
-        case .agent, .command: record.launchCommand ?? ""
-        }
         let session = TerminalSession(
             id: record.id,
             title: record.title.nilIfEmpty ?? launch.info.displayName,
             titleSource: record.title.isEmpty ? .explicit : record.titleSource,
-            subtitle: subtitle,
+            subtitle: Self.restoredSubtitle(for: record),
             tint: Self.palette[sessions.count % Self.palette.count],
             workingDirectory: Self.startingDirectory(
                 hosting.profile.isThisMac ? workingDirectory : workingDirectory ?? launch.info.cwd.nilIfEmpty,
@@ -1891,10 +1758,6 @@ final class TerminalWorkspace: ObservableObject {
     /// it started or its project when that is gone. Not added:
     /// `restoreSessions(_:from:)` adds it with the saved layout.
     func makeSystemEndedSession(record: WorkspaceSessionRecord, ended end: SystemSessionEnd) -> TerminalSession {
-        let subtitle: String = switch record.kind {
-        case .terminal: "\(ShellProcessController.defaultShellName) login shell"
-        case .agent, .command: record.launchCommand ?? ""
-        }
         // A device's tab (docs/specs/remote-devices.md): its directories
         // are that Mac's, never looked for here, and Restart starts it on
         // the device again whatever the local setting.
@@ -1908,10 +1771,7 @@ final class TerminalWorkspace: ObservableObject {
         } else {
             let directory = [record.workingDirectory, record.launchWorkingDirectory, record.projectRoot]
                 .compactMap { $0 }
-                .first { path in
-                    var isDirectory: ObjCBool = false
-                    return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
-                }
+                .first(where: isExistingDirectory)
             workingDirectory = Self.resolvedWorkingDirectory(directory)
         }
         let hosting = remoteHosting ?? (launchBackend == .nativePTY && backendPolicy.prefersPersistentLocalSessions
@@ -1921,7 +1781,7 @@ final class TerminalWorkspace: ObservableObject {
             id: record.id,
             title: record.title.nilIfEmpty ?? record.commandName ?? record.agentName ?? "Shell",
             titleSource: record.title.isEmpty ? .explicit : record.titleSource,
-            subtitle: subtitle,
+            subtitle: Self.restoredSubtitle(for: record),
             tint: Self.palette[sessions.count % Self.palette.count],
             workingDirectory: workingDirectory,
             projectRoot: record.projectRoot,
@@ -1939,6 +1799,14 @@ final class TerminalWorkspace: ObservableObject {
         session.showSystemSessionEnd(end, exitStatus: record.exitStatus)
         if record.hasUnreadNotification == true { session.markUnread() }
         return session
+    }
+
+    /// The subtitle of a tab built from a saved record.
+    private static func restoredSubtitle(for record: WorkspaceSessionRecord) -> String {
+        switch record.kind {
+        case .terminal: "\(ShellProcessController.defaultShellName) login shell"
+        case .agent, .command: record.launchCommand ?? ""
+        }
     }
 
     private func hostedSession(attachedTo attachment: HostedSessionAttachment) -> TerminalSession? {
@@ -2273,90 +2141,6 @@ final class TerminalWorkspace: ObservableObject {
         return session
     }
 
-    @discardableResult
-    func installPreviewAgentTree() -> [TerminalSession] {
-        guard agentSessions.isEmpty else { return [] }
-
-        let workingDirectory = launchRoot ?? NSHomeDirectory()
-        var previewSessions: [TerminalSession] = []
-
-        func appendPreviewAgent(
-            title: String,
-            subtitle: String,
-            agentName: String,
-            parentAgentID: UUID? = nil
-        ) -> TerminalSession {
-            let session = Self.makePreviewAgentSession(
-                index: previewSessions.count + 1,
-                title: title,
-                subtitle: subtitle,
-                agentName: agentName,
-                workingDirectory: workingDirectory,
-                projectRoot: projectRoot,
-                parentAgentID: parentAgentID,
-                launchBackend: launchBackend
-            )
-            previewSessions.append(session)
-            return session
-        }
-
-        let parent = appendPreviewAgent(
-            title: "Claude",
-            subtitle: "Investigate Profile Cache Loading",
-            agentName: "Claude"
-        )
-        [
-            ("Codex", "tuning sidebar UI", "Codex"),
-            ("Gemini", "no agent process running", "Gemini"),
-            ("Amp", "previewed empty agent tree", "Amp"),
-            ("Codex Review", "check close confirmation", "Codex"),
-            ("Claude Notes", "inspect sidebar spacing", "Claude"),
-            ("Gemini Audit", "", "Gemini"),
-            ("Amp Layout", "", "Amp"),
-            ("Codex MCP", "validate parent_agent_id", "Codex"),
-            ("Claude Cache", "read cached profile data", "Claude"),
-            ("Gemini Trace", "measure row rhythm", "Gemini"),
-            ("Amp Snapshot", "compare guide alignment", "Amp"),
-            ("Codex Docs", "", "Codex")
-        ].forEach { title, subtitle, agentName in
-            _ = appendPreviewAgent(
-                title: title,
-                subtitle: subtitle,
-                agentName: agentName,
-                parentAgentID: parent.id
-            )
-        }
-
-        let designParent = appendPreviewAgent(
-            title: "Codex Design",
-            subtitle: "agent tree preview visible",
-            agentName: "Codex"
-        )
-        [
-            ("Claude Close", "group close prompt", "Claude"),
-            ("Gemini Commands", "shortcut numbering", "Gemini"),
-            ("Amp Icons", "mixed provider logos", "Amp"),
-            ("Codex Empty", "", "Codex"),
-            ("Claude Labels", "longer sidebar details", "Claude")
-        ].forEach { title, subtitle, agentName in
-            _ = appendPreviewAgent(
-                title: title,
-                subtitle: subtitle,
-                agentName: agentName,
-                parentAgentID: designParent.id
-            )
-        }
-
-        _ = appendPreviewAgent(
-            title: "Claude Scratch",
-            subtitle: "",
-            agentName: "Claude"
-        )
-        sessions.append(contentsOf: previewSessions)
-        selectedSessionID = parent.id
-        return previewSessions
-    }
-
     func commandSession(named name: String) -> TerminalSession? {
         let normalizedName = AgentToolDefinition.normalizedName(name)
         return commandSessions.first {
@@ -2392,28 +2176,6 @@ final class TerminalWorkspace: ObservableObject {
 
     func splitGroup(containing sessionID: UUID) -> TerminalSplitGroup? {
         terminalSplitGroups.first { $0.paneSessionIDs.contains(sessionID) }
-    }
-
-    func sessions(for displayItem: TerminalDisplayItem) -> [TerminalSession] {
-        switch displayItem {
-        case .single(let sessionID):
-            return sessions.first { $0.id == sessionID }.map { [$0] } ?? []
-        case .split(let groupID):
-            guard let group = splitGroup(id: groupID) else { return [] }
-            return group.paneSessionIDs.compactMap { paneID in
-                sessions.first { $0.id == paneID }
-            }
-        }
-    }
-
-    func activeSession(for displayItem: TerminalDisplayItem) -> TerminalSession? {
-        switch displayItem {
-        case .single(let sessionID):
-            return sessions.first { $0.id == sessionID }
-        case .split(let groupID):
-            guard let group = splitGroup(id: groupID) else { return nil }
-            return sessions.first { $0.id == group.activeSessionID }
-        }
     }
 
     /// A local terminal, native or persistent, can be split: the new pane is
@@ -2498,15 +2260,6 @@ final class TerminalWorkspace: ObservableObject {
         )
     }
 
-    func balanceActiveSplitGroup() {
-        guard let selectedSessionID,
-              let group = splitGroup(containing: selectedSessionID)
-        else {
-            return
-        }
-        balanceSplitGroup(id: group.id)
-    }
-
     func setSplitGroupWidthWeights(id groupID: UUID, weights: [Double]) {
         guard let groupIndex = terminalSplitGroups.firstIndex(where: { $0.id == groupID }),
               let normalizedWeights = Self.normalizedWidthWeights(
@@ -2532,15 +2285,6 @@ final class TerminalWorkspace: ObservableObject {
             displayIndex...displayIndex,
             with: group.paneSessionIDs.map { .single($0) }
         )
-    }
-
-    func separateActiveSplitGroup() {
-        guard let selectedSessionID,
-              let group = splitGroup(containing: selectedSessionID)
-        else {
-            return
-        }
-        separateSplitGroup(id: group.id)
     }
 
     func canCloseSplitGroup(id groupID: UUID) -> Bool {
@@ -2580,11 +2324,6 @@ final class TerminalWorkspace: ObservableObject {
     ) {
         let groupIDs = Set(([session] + descendantAgentSessions(of: session)).map(\.id))
         closeSessions(withIDs: groupIDs, allowEmptyWorkspace: allowEmptyWorkspace, intent: intent)
-    }
-
-    func closeAgentPromotingChildren(_ session: TerminalSession, intent: SessionCloseIntent = .userClosedTab) {
-        promoteChildAgents(of: session)
-        closeSessions(withIDs: Set([session.id]), intent: intent)
     }
 
     /// Closes every tab. The default is a window teardown; production callers
@@ -2744,11 +2483,6 @@ final class TerminalWorkspace: ObservableObject {
                 finishClosing(session, intent: intent)
             }
         }
-    }
-
-    func closeSelectedSession(intent: SessionCloseIntent = .userClosedTab) {
-        guard let selectedSession else { return }
-        close(selectedSession, intent: intent)
     }
 
     func closeActivePane(intent: SessionCloseIntent = .userClosedTab) {
@@ -3044,10 +2778,7 @@ final class TerminalWorkspace: ObservableObject {
     /// was relaunched because an attached session ended.
     @discardableResult
     func restart(_ session: TerminalSession) -> Bool {
-        switch backendPolicy.closeAction(for: session, intent: .restart) {
-        case .stop, .detach, .terminate:
-            return session.restart()
-        }
+        session.restart()
     }
 
     func clearSelectedSessionScrollback() {
@@ -3110,15 +2841,6 @@ final class TerminalWorkspace: ObservableObject {
 
     static let minimumSplitPaneWidth: CGFloat = 280
     private static let maximumSplitPaneCount = 3
-
-    private func displayItemContains(_ item: TerminalDisplayItem, sessionID: UUID) -> Bool {
-        switch item {
-        case .single(let itemSessionID):
-            itemSessionID == sessionID
-        case .split(let groupID):
-            splitGroup(id: groupID)?.paneSessionIDs.contains(sessionID) == true
-        }
-    }
 
     private func addTerminalPane(_ paneSessionID: UUID, after activeSessionID: UUID) -> Bool {
         guard paneSessionID != activeSessionID,
@@ -3422,39 +3144,13 @@ final class TerminalWorkspace: ObservableObject {
         )
     }
 
-    private static func makePreviewAgentSession(
-        index: Int,
-        title: String,
-        subtitle: String,
-        agentName: String,
-        workingDirectory: String,
-        projectRoot: String?,
-        parentAgentID: UUID? = nil,
-        launchBackend: TerminalSessionLaunchBackend
-    ) -> TerminalSession {
-        let session = TerminalSession(
-            title: title,
-            subtitle: subtitle,
-            tint: palette[(index - 1) % palette.count],
-            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
-            projectRoot: projectRoot,
-            launchShell: false,
-            kind: .agent,
-            agentName: agentName,
-            parentAgentID: parentAgentID,
-            launchBackend: launchBackend
-        )
-        return session
-    }
-
     private static func resolvedWorkingDirectory(_ requestedWorkingDirectory: String?) -> String {
         guard let requestedWorkingDirectory, !requestedWorkingDirectory.isEmpty else {
             return NSHomeDirectory()
         }
 
         let expandedPath = NSString(string: requestedWorkingDirectory).expandingTildeInPath
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: expandedPath, isDirectory: &isDirectory), isDirectory.boolValue else {
+        guard isExistingDirectory(expandedPath) else {
             return NSHomeDirectory()
         }
 
@@ -3468,6 +3164,12 @@ final class TerminalWorkspace: ObservableObject {
         NSColor(calibratedRed: 0.93, green: 0.47, blue: 0.62, alpha: 1),
         NSColor(calibratedRed: 0.70, green: 0.63, blue: 0.97, alpha: 1)
     ]
+}
+
+/// Whether `path` names an existing directory (as it is: no `~`).
+private func isExistingDirectory(_ path: String) -> Bool {
+    var isDirectory: ObjCBool = false
+    return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
 }
 
 /// Production sessions use Ghostty's EXEC backend. The host-managed case is an
@@ -3601,7 +3303,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var hostedLaunchSizeFile: URL?
     private var announcedAdapterWindowSize: HostedAttachmentSizeFile.Content?
     /// The latest adapter's outcome may be resumed by launching it again
-    /// (`HostedAttachmentStatusFile.isRetryable`).
+    /// (`HostedAttachmentStatusFile.readEnding`'s `retryable`).
     private var hostedLaunchRetryable = false
     /// Brings this tab back when its adapter gave up while attached to an
     /// SSH host's session (`HostedReconnects`): the workspace's
@@ -3895,7 +3597,6 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     let projectRoot: String?
     let tint: NSColor
-    let maxScrollback: Int?
     private(set) var launchWorkingDirectory: String
     let kind: SessionKind
     private let launchBackend: TerminalSessionLaunchBackend
@@ -4039,31 +3740,33 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// the session owns a live native surface. Once injected, data-layer reads use
     /// the processor snapshot and ignore unrelated shell redraws for that fixture.
     private var usesInjectedTestingContent = false
+    /// The tab's Ghostty surface owns its PTY (an EXEC surface, native or
+    /// persistent), and no fixture injected content in its place.
+    private var usesLiveNativeSurface: Bool {
+        ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent
+    }
+    /// The tab's lines are `nativeContentLines` (the surface's, or the
+    /// host's), not the processor's.
+    private var readsNativeContentLines: Bool {
+        readsContentFromHost || usesLiveNativeSurface
+    }
     /// OSC 133 command-end signal (native). A precise "back at prompt / command
     /// done" marker for non-TUI commands; published so idle detection can use it.
     @Published private(set) var lastNativeCommandFinishedAt: Date?
-    private(set) var lastNativeCommandExitCode: Int32?
     let hostInputWriter = TerminalInputWriter()
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
     /// The surface reported its grid (`resize`): a seed no longer applies.
     private var viewportWasReported = false
-    private var traceRecorder: TerminalTraceRecorder?
     /// Tells the user a program finished or needs them while its tab is
     /// not in front (`TerminalNotificationCenter.postProgramStatus`).
     private let programStatusNotificationHandler: @MainActor (ProgramStatus, TerminalSession) -> Void
     /// The records of output Cherry parses itself (`ingestTerminalMetadata`:
     /// the host-managed path, tests); a persistent tab's host keeps its own.
     private var parsedProgramStatus = ProgramStatusRecords()
-    private var lastViewportResizeAt: Date?
     /// Where the program's latest turn stands, from its reports.
     private(set) var agentTurnState: AgentTurnState = .notStarted
-    private var outputHoldUntil: Date?
-    private var isOutputPausedForInteraction = false
-    private var isOutputPausedForBackgroundThrottle = false
-    private var backgroundOutputThrottleTask: Task<Void, Never>?
-    private var backgroundOutputBytesSinceThrottle = 0
     private var keyboardProtocolFlagStack: [Int] = []
     private var ghosttyBridgeStorage: GhosttySessionBridge?
     private var renderedReplayCache: RenderedReplayCache?
@@ -4127,9 +3830,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     private static let auxiliaryTerminalProcessorStartupGrace: TimeInterval = 3.0
     private static let metadataOutputPendingByteLimit = 512 * 1024
     private static let metadataOutputFlushInterval: TimeInterval = 0.2
-    private static let backgroundOutputThrottleByteInterval = 256 * 1024
-    private static let backgroundOutputThrottleDuration: TimeInterval = 0.5
-    private static let userScrollOutputHoldInterval: TimeInterval = 0.16
     private static let contentFingerprintTailLineLimit = 40
 
     init(
@@ -4141,7 +3841,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         workingDirectory: String = NSHomeDirectory(),
         projectRoot: String? = nil,
         maxScrollback: Int? = TerminalSession.defaultMaxScrollback,
-        buffer: (any TerminalBuffering)? = nil,
+        buffer: LiveTerminalOutputBuffer? = nil,
         launchShell: Bool = true,
         kind: SessionKind = .terminal,
         agentName: String? = nil,
@@ -4169,7 +3869,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.workingDirectory = workingDirectory
         self.launchWorkingDirectory = workingDirectory
         self.projectRoot = projectRoot
-        self.maxScrollback = maxScrollback
         self.kind = kind
         self.launchBackend = launchBackend
         self.hostedAttachment = hostedAttachment
@@ -4197,7 +3896,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             buffer: processorBuffer,
             backpressurePolicy: processorBackpressurePolicy
         )
-        self.traceRecorder = TerminalTraceRecorder(sessionID: id, title: title)
         self.processor.setChangeHandler { [weak self] in
             Task { @MainActor [weak self] in
                 self?.handleProcessorDidChange()
@@ -4291,12 +3989,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         isAuxiliaryProcessingActive = isActive
         processor.setOutputProcessingSuspended(!isActive)
 
-        if isActive {
-            cancelBackgroundOutputThrottle()
-        } else {
-            backgroundOutputBytesSinceThrottle = 0
-        }
-
         guard isActive else { return }
 
         processor.clear()
@@ -4304,53 +3996,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard !replay.isEmpty else { return }
 
         ingestTerminalMetadata(replay)
-        guard !prototypeProcessorDisabledForPerf else { return }
         processor.enqueueOutput(replay, launchID: activeLaunchID, responseWriter: { _ in })
-    }
-
-    private func noteProcessOutputForBackgroundThrottle(bytes: Int) {
-        guard kind == .terminal,
-              !isAuxiliaryProcessingActive,
-              bytes > 0,
-              !isOutputPausedForBackgroundThrottle
-        else {
-            return
-        }
-
-        backgroundOutputBytesSinceThrottle += bytes
-        guard backgroundOutputBytesSinceThrottle >= Self.backgroundOutputThrottleByteInterval else { return }
-        backgroundOutputBytesSinceThrottle = 0
-        isOutputPausedForBackgroundThrottle = true
-        TerminalPerformanceMonitor.recordBackgroundOutputThrottle()
-        updateShellOutputPauseState()
-
-        backgroundOutputThrottleTask?.cancel()
-        backgroundOutputThrottleTask = Task { [weak self] in
-            let nanoseconds = UInt64(Self.backgroundOutputThrottleDuration * 1_000_000_000)
-            try? await Task.sleep(nanoseconds: nanoseconds)
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                guard let self else { return }
-                self.isOutputPausedForBackgroundThrottle = false
-                self.updateShellOutputPauseState()
-            }
-        }
-    }
-
-    private func cancelBackgroundOutputThrottle() {
-        backgroundOutputThrottleTask?.cancel()
-        backgroundOutputThrottleTask = nil
-        isOutputPausedForBackgroundThrottle = false
-        backgroundOutputBytesSinceThrottle = 0
-        updateShellOutputPauseState()
-    }
-
-    private func updateShellOutputPauseState() {
-        if isOutputPausedForInteraction || isOutputPausedForBackgroundThrottle {
-            shellProcess?.pauseOutput()
-        } else {
-            shellProcess?.resumeOutput()
-        }
     }
 
     var lineCount: Int {
@@ -4365,7 +4011,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         // Lines read from the host (a persistent tab no surface shows, such
         // as a restored one whose adapter waits) are the ones MCP output
         // numbers, as `lineCount` counts them.
-        return readsContentFromHost || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent)
+        return readsNativeContentLines
             ? nativeContentLines.count
             : processor.lineCount
     }
@@ -4448,10 +4094,6 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     var mouseState: TerminalMouseState {
         processor.mouseState
-    }
-
-    var statusLine: String {
-        "\(state.label) · \(lineSummary)"
     }
 
     /// Whether MCP input (`sendControlInput`) can reach the program: when
@@ -4688,18 +4330,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         viewportSize
     }
 
-    func lineLength(at row: Int) -> Int {
-        processor.lineLength(at: row)
-    }
-
-    func gridPoint(row: Int, column: Int) -> TerminalGridPoint {
-        processor.gridPoint(row: row, column: column)
-    }
-
-    func selectedText(in selection: TerminalSelectionRange) -> String {
-        processor.selectedText(in: selection)
-    }
-
     func setParentAgentID(_ parentAgentID: UUID?) {
         guard kind == .agent else { return }
         let changed = self.parentAgentID != parentAgentID
@@ -4719,7 +4349,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             SessionLog.debugContent("[send text] \(text.debugDescription)")
         }
         if routePersistentInput(data) { return }
-        if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
+        if usesLiveNativeSurface {
             ghosttyBridgeStorage?.sendNativeInput(data)
             return
         }
@@ -4742,8 +4372,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         // the input as sent. Only bytes that reach the program as they are
         // (the host's `SendInput`, a host-managed PTY) are normalized for
         // the kitty flags the program set.
-        let toSurface = ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent
-            && !persistentInputGoesThroughHost
+        let toSurface = usesLiveNativeSurface && !persistentInputGoesThroughHost
         let outboundData = normalize && !toSurface ? normalizedInputData(data) : data
         if !outboundData.isEmpty {
             noteInputBurst(outboundData)
@@ -5097,21 +4726,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         return .notDelivered(inputFailureReason(error))
     }
 
-    func sendInterrupt() {
-        guard acceptsInput else { return }
-        if inputDebugEnabled {
-            SessionLog.debug("[send interrupt] shellProcess=\(shellProcess != nil)")
-        }
-        noteAgentDraftCleared()
-        processor.discardPendingOutput()
-        if routePersistentInput(Data([0x03])) { return }
-        if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
-            ghosttyBridgeStorage?.sendNativeInput(Data([0x03]))
-            return
-        }
-        shellProcess?.writeUrgent(Data([0x03]))
-    }
-
     func noteNativeHostInput(event: NSEvent?) {
         noteInputOutputBaseline()
         guard kind == .agent, let event else { return }
@@ -5129,10 +4743,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.discardPendingOutput()
     }
 
-    /// Clear Scrollback (⌘K) and MCP `clear_output`: the tab's screen and
-    /// history, and for a persistent tab its host's copy of the history too
-    /// (`clearHostHistory`), which reads through the host (MCP output and
-    /// search) and the next attach adapter would otherwise bring back.
+    /// Clear Scrollback (⌘K) and the control request `clearOutput`: the
+    /// tab's screen and history, and for a persistent tab its host's copy
+    /// of the history too (`clearHostHistory`), which reads through the host
+    /// (MCP output and search) and the next attach adapter would otherwise
+    /// bring back.
     /// Returns the host's clear, for a caller that waits for it: nil when
     /// the host cleared it, else why it kept it.
     @discardableResult
@@ -5164,8 +4779,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func clearScrollback(preservingTerminalState: Bool) {
-        outputHoldUntil = nil
-        resumeOutputIfPausedForInteraction()
         renderedReplayCache = nil
         rawOutputStore.clear()
         if preservingTerminalState {
@@ -5325,19 +4938,13 @@ final class TerminalSession: ObservableObject, Identifiable {
         activeLaunchID = nil
         auxiliaryProcessingSuspensionTask?.cancel()
         auxiliaryProcessingSuspensionTask = nil
-        backgroundOutputThrottleTask?.cancel()
-        backgroundOutputThrottleTask = nil
-        isOutputPausedForBackgroundThrottle = false
-        backgroundOutputBytesSinceThrottle = 0
         nixShellEnvironment = nil
         resetKeyboardProtocolState()
         lastHumanKeystrokeAt = nil
         hasUnsubmittedHumanInput = false
-        outputHoldUntil = nil
         pendingResolvedCommandLine = nil
         resolvedCommandLine = nil
         processor.endLaunch(launchID)
-        updateShellOutputPauseState()
         hostInputWriter.set(nil)
         // Stopping kills only the local adapter. A close reported before the
         // exit callback may follow an outcome the adapter already wrote, so
@@ -5660,11 +5267,16 @@ final class TerminalSession: ObservableObject, Identifiable {
         if state != .exited(0) || exitCode != 0 {
             markStoppedOnRequest()
         }
-        let hideCursor = Data("\u{1B}[?25l".utf8)
-        renderedReplayCache = nil
-        rawOutputStore.append(hideCursor)
-        processor.ingestTestingData(hideCursor)
+        appendLocalOutput(Data("\u{1B}[?25l".utf8))
         bumpRevision()
+    }
+
+    /// Output Cherry writes into the tab itself, not the program: kept with
+    /// its raw output and parsed into the processor's screen.
+    private func appendLocalOutput(_ data: Data) {
+        renderedReplayCache = nil
+        rawOutputStore.append(data)
+        processor.ingestTestingData(data)
     }
 
     func updateManagedCommand(_ command: ProjectCommandDefinition, workingDirectory: String) {
@@ -5697,28 +5309,17 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.resize(to: size)
     }
 
-    func resize(columns: Int, rows: Int, forceShellResize: Bool = false) {
+    func resize(columns: Int, rows: Int) {
         let nextSize = TerminalViewportSize(columns: columns, rows: rows)
         guard nextSize.columns > 0, nextSize.rows > 0 else { return }
         viewportWasReported = true
-        guard nextSize != viewportSize else {
-            if forceShellResize {
-                shellProcess?.resize(columns: nextSize.columns, rows: nextSize.rows)
-            }
-            return
-        }
+        guard nextSize != viewportSize else { return }
 
         viewportSize = nextSize
-        lastViewportResizeAt = Date()
         renderedReplayCache = nil
         processor.resize(to: nextSize)
         shellProcess?.resize(columns: nextSize.columns, rows: nextSize.rows)
         revision &+= 1
-    }
-
-    func deferOutputForUserInteraction() {
-        outputHoldUntil = Date(timeIntervalSinceNow: Self.userScrollOutputHoldInterval)
-        pauseOutputForInteractionIfNeeded()
     }
 
     func ingestTestingData(_ data: Data) {
@@ -5739,7 +5340,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 #endif
 
     func rawOutput(maxBytes: Int) -> (data: Data, truncated: Bool) {
-        if readsContentFromHost || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
+        if readsNativeContentLines {
             // Native-PTY: the host owns no byte stream, so the surface IS the
             // source of truth. NOTE: this is rendered text, not raw VT bytes — a
             // deliberate semantic change for native panes (no escape sequences, no
@@ -5757,8 +5358,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         return rawOutputStore.snapshot(maxBytes: maxBytes)
     }
 
-    func observeRawOutput(replayExistingOutput: Bool, _ observer: @escaping @Sendable (Data) -> Void) -> UUID {
-        rawOutputStore.observe(replayExistingOutput: replayExistingOutput, observer)
+    func observeRawOutput(_ observer: @escaping @Sendable (Data) -> Void) -> UUID {
+        rawOutputStore.observe(observer)
     }
 
     func removeRawOutputObserver(id: UUID) {
@@ -5908,14 +5509,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         resetAutomaticTitleForNewAgentLaunch()
         resetKeyboardProtocolState()
-        outputHoldUntil = nil
-        backgroundOutputThrottleTask?.cancel()
-        backgroundOutputThrottleTask = nil
-        isOutputPausedForInteraction = false
-        isOutputPausedForBackgroundThrottle = false
-        backgroundOutputBytesSinceThrottle = 0
         processor.beginLaunch(launchID)
-        updateShellOutputPauseState()
         state = .launching
         if isAutoRestartPaused {
             isAutoRestartPaused = false
@@ -5951,21 +5545,16 @@ final class TerminalSession: ObservableObject, Identifiable {
         // dependency. No app setting or environment variable selects this path.
         do {
             let processor = processor
-            let traceRecorder = traceRecorder
             let process = try ShellProcessController(
                 configuration: shellLaunchConfiguration(),
                 onData: { data in
                     TerminalPerformanceMonitor.recordPTYOutputChunk(bytes: data.count)
-                    traceRecorder?.recordOutput(data)
                     self.renderedReplayCache = nil
                     self.rawOutputStore.append(data)
                     self.enqueueTerminalMetadata(data)
-                    self.noteProcessOutputForBackgroundThrottle(bytes: data.count)
-                    if !prototypeProcessorDisabledForPerf {
-                        processor.enqueueOutput(data, launchID: launchID, responseWriter: { response in
-                            self.hostInputWriter.write(response, normalize: false, notifyInput: false)
-                        })
-                    }
+                    processor.enqueueOutput(data, launchID: launchID, responseWriter: { response in
+                        self.hostInputWriter.write(response, normalize: false, notifyInput: false)
+                    })
                 },
                 onExit: { [weak self] status in
                     DispatchQueue.main.async {
@@ -6096,7 +5685,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             workingDirectory: hosting.profile.isThisMac
                 ? [workingDirectory, launchWorkingDirectory, projectRoot]
                     .compactMap { $0 }
-                    .first(where: Self.isExistingDirectory) ?? NSHomeDirectory()
+                    .first(where: isExistingDirectory) ?? NSHomeDirectory()
                 // Another Mac's directories are not looked for here: its
                 // host refuses one that does not exist.
                 : [workingDirectory, launchWorkingDirectory, projectRoot.map(ProjectLocation.launchPath(forKey:))]
@@ -6131,8 +5720,8 @@ final class TerminalSession: ObservableObject, Identifiable {
                     // run at once (a server releases its port). Bounded: a
                     // host that does not answer delays this launch no more.
                     if let earlierLaunch {
-                        await Self.wait(
-                            for: earlierLaunch,
+                        await waitForTask(
+                            earlierLaunch,
                             upTo: restartExitTimeout * 2 + .seconds(hosting.configuration.creationTimeout)
                         )
                     }
@@ -6241,7 +5830,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         while let (key, entry) = persistentLaunchesInFlight.first(where: { !$0.value.claim.keepsSession }) {
             let remaining = deadline - ContinuousClock.now
             guard remaining > .zero else { return }
-            await wait(for: entry.task, upTo: remaining)
+            await waitForTask(entry.task, upTo: remaining)
             persistentLaunchesInFlight[key] = nil
         }
     }
@@ -6334,11 +5923,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         // With the pixels its window's terminal of that grid reports, which
         // its adapter will.
         return (grid, windowTerminalCell?(grid))
-    }
-
-    private static func isExistingDirectory(_ path: String) -> Bool {
-        var isDirectory: ObjCBool = false
-        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
     }
 
     private func bindPersistentSession(
@@ -6941,9 +6525,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             lastHostReportedTitle = info.title
             if !passesThrough, let title = info.title?.nilIfEmpty {
                 if kind == .agent {
-                    // A title reported earlier is no sign of what the agent
-                    // does now.
-                    didChange = (resynchronizing ? applyAutomaticAgentTitle(from: title) : recordAgentTitleActivity(title)) || didChange
+                    didChange = applyAutomaticAgentTitle(from: title) || didChange
                 } else if systemTitle != title {
                     updateSystemTitle(title)
                     didChange = true
@@ -7242,9 +6824,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         // persistent tab's host drops them itself).
         endParsedProgramStatus()
         resetKeyboardProtocolState()
-        outputHoldUntil = nil
         processor.endLaunch(launchID)
-        resumeOutputIfPausedForInteraction()
         if hostedAttachment != nil {
             // The adapter's own exit status does not say whether the hosted
             // program ended; its status file does.
@@ -7260,10 +6840,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             SessionLog.notice("tab \(id.uuidString): \(notFound)")
         }
         if kind == .agent || kind == .command {
-            let hideCursor = Data("\u{1B}[?25l".utf8)
-            renderedReplayCache = nil
-            rawOutputStore.append(hideCursor)
-            processor.ingestTestingData(hideCursor)
+            appendLocalOutput(Data("\u{1B}[?25l".utf8))
             if kind == .command, restartOnExit {
                 if let hostSessionEnd {
                     // Not the command's own failure: restarting it would
@@ -7518,48 +7095,12 @@ final class TerminalSession: ObservableObject, Identifiable {
                 lines += ["", "[shell exited with status \(status)]"]
             }
             guard !lines.isEmpty else { return }
-            let data = Data(lines.joined(separator: "\r\n").utf8)
-            self.renderedReplayCache = nil
-            self.rawOutputStore.append(data)
-            self.processor.ingestTestingData(data)
+            self.appendLocalOutput(Data(lines.joined(separator: "\r\n").utf8))
             self.outputVersion &+= 1
             self.contentVersion &+= 1
             self.lastContentChangeAt = Date()
             self.bumpRevision()
         }
-    }
-
-    private func pauseOutputForInteractionIfNeeded() {
-        guard !isOutputPausedForInteraction else { return }
-        isOutputPausedForInteraction = true
-        updateShellOutputPauseState()
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.userScrollOutputHoldInterval) { [weak self] in
-            self?.resumeOutputIfScrollHoldExpired()
-        }
-    }
-
-    private func resumeOutputIfScrollHoldExpired() {
-        guard let outputHoldUntil else {
-            resumeOutputIfPausedForInteraction()
-            return
-        }
-
-        let remaining = outputHoldUntil.timeIntervalSinceNow
-        if remaining > 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
-                self?.resumeOutputIfScrollHoldExpired()
-            }
-            return
-        }
-
-        self.outputHoldUntil = nil
-        resumeOutputIfPausedForInteraction()
-    }
-
-    private func resumeOutputIfPausedForInteraction() {
-        guard isOutputPausedForInteraction else { return }
-        isOutputPausedForInteraction = false
-        updateShellOutputPauseState()
     }
 
     private func handleProcessorDidChange() {
@@ -7612,10 +7153,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         lastInputOutputVersion = outputVersion
     }
 
-    private func enqueueTerminalMetadata(_ data: Data, parseMetadata: Bool = true) {
+    private func enqueueTerminalMetadata(_ data: Data) {
         let shouldSchedule = metadataOutputLock.withLock {
             hasPendingOutputActivity = true
-            if parseMetadata, !data.isEmpty {
+            if !data.isEmpty {
                 if pendingMetadataOutput.count + data.count > Self.metadataOutputPendingByteLimit {
                     pendingMetadataOutput.removeAll(keepingCapacity: true)
                     if data.count > Self.metadataOutputPendingByteLimit {
@@ -7686,7 +7227,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 pendingResolvedCommandLine = nil
 
                 if kind == .agent {
-                    didChange = recordAgentTitleActivity(nextTitle) || didChange
+                    didChange = applyAutomaticAgentTitle(from: nextTitle) || didChange
                 } else {
                     if resolvedCommandLine != nextResolvedCommandLine {
                         resolvedCommandLine = nextResolvedCommandLine
@@ -7787,7 +7328,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func ingestNativeTitle(_ nextTitle: String) {
         if kind == .agent {
-            if recordAgentTitleActivity(nextTitle) { bumpRevision() }
+            if applyAutomaticAgentTitle(from: nextTitle) { bumpRevision() }
         } else {
             guard systemTitle != nextTitle else { return }
             updateSystemTitle(nextTitle)
@@ -7863,7 +7404,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     func noteNativeCommandFinished(exitCode: Int32?) {
         guard ghosttyBridgeStorage?.isNativePTYBacked == true else { return }
         lastNativeCommandFinishedAt = Date()
-        lastNativeCommandExitCode = exitCode
         // Capture the command's final output and advance the counters so idle
         // detection converges on the real boundary, not a heuristic timeout.
         refreshNativeContentNow()
@@ -7893,35 +7433,11 @@ final class TerminalSession: ObservableObject, Identifiable {
             // Read from the host by `refreshContentFromHostIfNeeded`.
             return nativeContentLines.count
         }
-        guard ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent else {
+        guard usesLiveNativeSurface else {
             return processor.lineCount
         }
         ensureNativeContentFresh()
         return nativeContentLines.count
-    }
-
-    /// `contentLineCount` and `contentSnapshot` without refreshing a native
-    /// surface's lines: what the tab read last.
-    private func lastReadContentLineCount() -> Int {
-        if let closedTabContentLines {
-            return closedTabContentLines.count
-        }
-        if readsContentFromHost
-            || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
-            return nativeContentLines.count
-        }
-        return processor.lineCount
-    }
-
-    private func lastReadContentSnapshot(range: Range<Int>) -> [String] {
-        if let closedTabContentLines {
-            return Array(closedTabContentLines[range.clamped(to: 0..<closedTabContentLines.count)])
-        }
-        if readsContentFromHost
-            || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
-            return nativeContentSnapshot(range: range)
-        }
-        return processor.snapshot(range: range)
     }
 
     private func contentSnapshot(range: Range<Int>) -> [String] {
@@ -7931,7 +7447,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if readsContentFromHost {
             return nativeContentSnapshot(range: range)
         }
-        guard ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent else {
+        guard usesLiveNativeSurface else {
             return processor.snapshot(range: range)
         }
         ensureNativeContentFresh()
@@ -7955,7 +7471,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// Render-signal entry point: schedule a debounced content refresh so the
     /// output/idle counters advance even when nothing is actively reading.
     func noteNativeRenderRequest() {
-        guard ghosttyBridgeStorage?.isNativePTYBacked == true, !usesInjectedTestingContent else { return }
+        guard usesLiveNativeSurface else { return }
         guard !nativeContentRefreshScheduled else { return }
         nativeContentRefreshScheduled = true
         // Off-screen sessions (e.g. background agents an orchestrator drives) refresh
@@ -7996,7 +7512,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// selection isn't reliably readable), which cursor blink etc. don't alter.
     @discardableResult
     private func refreshNativeContentNow() -> Bool {
-        guard ghosttyBridgeStorage?.isNativePTYBacked == true, !usesInjectedTestingContent else { return false }
+        guard usesLiveNativeSurface else { return false }
         // The surface does not show the program now; its text comes from
         // the host (`refreshContentFromHostIfNeeded`).
         guard !readsContentFromHost else { return false }
@@ -8106,7 +7622,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             hostContentRead = read
             hostContentReadIsWhole = !recentOnly
         }
-        await Self.wait(for: read, upTo: configuration.hostScreenWait)
+        await waitForTask(read, upTo: configuration.hostScreenWait)
     }
 
     /// Takes a screen read from the host as the tab's lines. `recentLines`:
@@ -8246,7 +7762,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         let task = Task { @MainActor in
             result.screen = try? await read()
         }
-        await wait(for: task, upTo: timeout)
+        await waitForTask(task, upTo: timeout)
         guard let screen = result.screen else { return nil }
         let lines = screen.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         return Array(AgentPermissionPrompt.tail(of: lines).suffix(limit))
@@ -8255,32 +7771,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     @MainActor
     private final class HostScreenReadResult {
         var screen: HostScreenText?
-    }
-
-    /// Waits for `task`, or until `timeout` passed, whichever comes first.
-    private static func wait(for task: Task<Void, Never>, upTo timeout: Duration) async {
-        let waiter = FirstResume()
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            waiter.continuation = continuation
-            Task { @MainActor in
-                await task.value
-                waiter.resume()
-            }
-            Task { @MainActor in
-                try? await Task.sleep(for: timeout)
-                waiter.resume()
-            }
-        }
-    }
-
-    @MainActor
-    private final class FirstResume {
-        var continuation: CheckedContinuation<Void, Never>?
-
-        func resume() {
-            continuation?.resume()
-            continuation = nil
-        }
     }
 
     // MARK: Program status (OSC 7501)
@@ -8392,13 +7882,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         programStatusNotificationHandler(status, self)
     }
 
-    /// An agent's title also names its task (`applyAutomaticAgentTitle`).
-    @discardableResult
-    private func recordAgentTitleActivity(_ title: String) -> Bool {
-        guard kind == .agent else { return false }
-        return applyAutomaticAgentTitle(from: title)
-    }
-
+    /// An agent's title also names its task.
     private func applyAutomaticAgentTitle(from terminalTitle: String) -> Bool {
         let brand = AgentToolBrand.detect(
             name: agentName ?? systemTitle,
@@ -8601,11 +8085,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
     }
 
-    private func noteAgentDraftCleared() {
-        guard kind == .agent else { return }
-        applyAgentDraftInputEffect(.cleared)
-    }
-
     private func normalizedInputData(_ data: Data) -> Data {
         TerminalInputNormalizer.normalize(data, keyboardProtocolFlags: keyboardProtocolFlags)
     }
@@ -8658,15 +8137,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             streamKeyboardProtocolFlags & ~flags
         default:
             flags
-        }
-    }
-
-    private var lineSummary: String {
-        let visibleLineCount = max(processor.storedLineCount, 1)
-        if let maxScrollback {
-            return "\(min(visibleLineCount, maxScrollback))/\(maxScrollback) lines"
-        } else {
-            return "\(visibleLineCount) lines · unlimited"
         }
     }
 

@@ -385,14 +385,6 @@ from `Cherry` only by case. `CHERRY_ICON_PATH` sets an `.icns` icon; a relative
 path is relative to your current directory. A build whose Info.plist holds an
 invalid folder name or scheme logs a warning and uses Cherry's.
 
-Installed builds keep recently-used Ghostty terminal surfaces alive across tab
-switches (no per-switch replay). To build the older replay-on-switch behavior
-instead, opt out:
-
-```bash
-CHERRY_KEEP_SURFACES_WARM=0 Scripts/install-local-app
-```
-
 The installer signs with the first Developer ID Application certificate of
 Cherry's team (`TEAM_ID` in `Packaging/release.conf`) in your keychain, else
 the first Apple Development one, else ad hoc, and says which it chose; a
@@ -458,20 +450,6 @@ Scripts/terminal-hell-test
 
 The most useful panels for background rendering bugs are `256-color and truecolor full-row backgrounds`, `Reset boundaries and inverse video`, and `Codex-style prompt paint`.
 
-To capture the actual PTY stream while reproducing a rendering bug:
-
-```bash
-CHERRY_TRACE_PTY_DIR=/tmp/cherry-traces swift run
-```
-
-Then inspect the latest trace for palette queries and background SGR:
-
-```bash
-Scripts/analyze-terminal-trace /tmp/cherry-traces/*.pty --show-erase
-```
-
-Raw traces can include terminal output and prompt text, so treat them like logs.
-
 ## Performance Stress
 
 Run the opt-in terminal stress suite:
@@ -481,11 +459,13 @@ Scripts/perf-terminal-stress --standard
 ```
 
 Use `--smoke` for a quick check and `--soak` before perf-sensitive changes. For
-real app UI soak runs, start Cherry and run `Scripts/perf-app-soak --scale
-standard`. `Scripts/perf-app-report` summarizes peak RSS, end-to-start RSS
-drift, MiB/hour growth, Ghostty bridge/observer counts, and raw replay
-retention, with hard gates for CPU, memory drift, retained output, and PTY
-callback density so long-session leaks are visible. Use paced TUI soaks such as
+real app UI soak runs, run `Scripts/perf-run-emulator-comparison --cherry-only`,
+which runs Cherry from a private directory and drives it with
+`Scripts/perf-app-soak` (which refuses to drive your own Cherry unless forced).
+`Scripts/perf-app-report` summarizes peak RSS, end-to-start RSS drift, MiB/hour
+growth and Ghostty bridge/observer counts of Cherry's processes (the app, its
+helpers and its session host), with hard gates for CPU and memory drift so
+long-session leaks are visible. Use paced TUI soaks such as
 `--mode tui --sleep-ms 4` for long-session stability, and keep unpaced `mixed`
 runs as overload/flood stress. `Scripts/perf-ghostty-workload` and
 `Scripts/perf-ghostty-report` capture the same workload in Ghostty as a control

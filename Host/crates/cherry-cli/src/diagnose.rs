@@ -1,11 +1,15 @@
 //! `cherry status` (what the daemon says about itself and its sessions) and
 //! `cherry doctor` (what is wrong with the local host, and how to fix it).
 //! Neither starts a host.
-use crate::{handover::own_build, transport::Transport, unexpected};
+use crate::{
+    handover::own_build,
+    transport::{Transport, RPC_TIMEOUT},
+    unexpected,
+};
 use anyhow::Result;
 use cherry_protocol::{
-    error_code, read_frame, write_frame, ClientMessage, HostStatus, ServerMessage, SessionInfo,
-    SessionState, PROTOCOL_VERSION,
+    error_code, process_runs, read_frame, write_frame, ClientMessage, HostStatus, ServerMessage,
+    SessionInfo, SessionState, PROTOCOL_VERSION,
 };
 use serde_json::json;
 use std::{
@@ -100,30 +104,29 @@ pub fn not_running(socket: &Path, as_json: bool) -> Result<u32> {
     Ok(NOT_RUNNING)
 }
 
+/// The `Status` of the host on a connection that said Hello, or None from a
+/// host that predates it.
+pub fn request_status(transport: &mut Transport) -> Result<Option<HostStatus>> {
+    transport.send(&ClientMessage::Status)?;
+    match transport.receive(RPC_TIMEOUT)? {
+        ServerMessage::Status { status } => Ok(Some(status)),
+        ServerMessage::Error { code, .. } if code == error_code::UNSUPPORTED_OPERATION => Ok(None),
+        message => Err(unexpected("status", message)),
+    }
+}
+
 /// `cherry status` on a connection that said Hello: the host's `Status`
 /// (a host that predates it says less), then its sessions.
 pub fn status(transport: &mut Transport, greeting: &Greeting, as_json: bool) -> Result<u32> {
-    let rpc = crate::transport::RPC_TIMEOUT;
-    transport.send(&ClientMessage::Status)?;
-    let host = match transport.receive(rpc)? {
-        ServerMessage::Status { status } => Some(status),
-        ServerMessage::Error { code, .. } if code == error_code::UNSUPPORTED_OPERATION => None,
-        message => {
-            unexpected("status", message)?;
-            unreachable!()
-        }
-    };
+    let host = request_status(transport)?;
     transport.send(&ClientMessage::List)?;
-    let (sessions, pending_holders) = match transport.receive(rpc)? {
+    let (sessions, pending_holders) = match transport.receive(RPC_TIMEOUT)? {
         ServerMessage::Sessions {
             sessions,
             pending_holders,
             ..
         } => (sessions, pending_holders),
-        message => {
-            unexpected("session list", message)?;
-            unreachable!()
-        }
+        message => return Err(unexpected("session list", message)),
     };
     let text = if as_json {
         let sessions: Vec<_> = sessions.iter().map(session_json).collect();
@@ -721,21 +724,6 @@ struct Manifest {
     holder_started: Option<String>,
 }
 
-/// Whether the process a PID file or manifest names still runs, and was not
-/// given to another process since (when that can be told).
-fn runs(pid: u32, started: Option<&str>) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0 || unsafe { libc::kill(pid, 0) } != 0 {
-        return false;
-    }
-    match (started, crate::status::start_identity(pid)) {
-        (Some(recorded), Some(current)) => recorded == current,
-        _ => true,
-    }
-}
-
 fn check_state(report: &mut Report, state: &Path, daemon: Option<&Answered>) {
     match fs::symlink_metadata(state) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -778,7 +766,7 @@ fn check_state(report: &mut Report, state: &Path, daemon: Option<&Answered>) {
                         pid_file.display()
                     ),
                 ),
-                None if daemon.is_none() && runs(pid, started.as_deref()) => report.problem(
+                None if daemon.is_none() && process_runs(pid, started.as_deref()) => report.problem(
                     format!(
                         "PID file {} names pid {pid}, which runs, but no host answers at the socket",
                         pid_file.display()
@@ -842,7 +830,7 @@ fn check_state(report: &mut Report, state: &Path, daemon: Option<&Answered>) {
             else {
                 continue;
             };
-            if runs(manifest.holder_pid, manifest.holder_started.as_deref()) {
+            if process_runs(manifest.holder_pid, manifest.holder_started.as_deref()) {
                 held.push(format!("{} (pid {})", manifest.id, manifest.holder_pid));
             } else {
                 gone.push(manifest.id);

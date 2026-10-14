@@ -39,13 +39,12 @@ extension WorkspaceSessionRestorers {
     ///   and restored again once the host expects none
     ///   (`HostControl.holdersRegistered()`, the result's
     ///   `retryWhenAvailable`), or at the next launch. A complete list drops
-    ///   it at once. A host that does not report pending holders is listed
-    ///   once more after `disappearanceConfirmationDelay`. A record the
-    ///   system ended (`WorkspaceRestoreRequest.systemEnds`: a restart or log
-    ///   out while Cherry was closed) comes back as an ended tab instead of
-    ///   being dropped (`makeSystemEndedSession`), and so does a record
-    ///   saved as one (`WorkspaceSessionRecord.systemEnd`), with nothing to
-    ///   ask its host.
+    ///   it at once. A record the system ended
+    ///   (`WorkspaceRestoreRequest.systemEnds`: a restart or log out while
+    ///   Cherry was closed) comes back as an ended tab instead of being
+    ///   dropped (`makeSystemEndedSession`), and so does a record saved as
+    ///   one (`WorkspaceSessionRecord.systemEnd`), with nothing to ask its
+    ///   host.
     /// - Host unreachable (or This Mac cannot run sessions): the record stays
     ///   saved for the next launch, and is restored once the host comes up
     ///   during this run (`WorkspaceRestoreResult.retryWhenAvailable`; an SSH
@@ -292,21 +291,6 @@ private final class ControlPlaneRestore {
         return lhs.merge(with: rhs).first().eraseToAnyPublisher()
     }
 
-    /// Looks again, after `disappearanceConfirmationDelay`, for the sessions
-    /// of `records` that a host that does not report pending holders (an
-    /// older host) did not list.
-    private func lookingAgain(
-        for records: [WorkspaceSessionRecord],
-        _ work: @escaping @MainActor ([WorkspaceSessionRecord]) async -> WorkspaceRestoreResult
-    ) -> (pending: Set<UUID>, remainder: Task<WorkspaceRestoreResult, Never>?) {
-        guard !records.isEmpty else { return ([], nil) }
-        let delay = localSessions.configuration.disappearanceConfirmationDelay
-        return (Self.ids(records), Task { @MainActor in
-            try? await Task.sleep(for: delay)
-            return await work(records)
-        })
-    }
-
     /// Looks again for the sessions of `records` that a daemon that just
     /// restarted did not list while it still expected holders (`list`):
     /// once it lists with none pending (at most `pendingHoldersWait`).
@@ -378,10 +362,9 @@ private final class ControlPlaneRestore {
 
     private typealias LocalListing = (list: HostedSessionList, attachment: (HostedSessionInfo) -> HostedSessionAttachment)
 
-    /// `lookingAgain`: records whose session the host did not list are
-    /// looked for once more later (the result's remainder): once a daemon
-    /// that just restarted expects no more holders, or, for a host that
-    /// does not report them, after `disappearanceConfirmationDelay`.
+    /// `lookingAgain`: records whose session the host did not list while
+    /// a daemon that just restarted still expected holders are looked for
+    /// once more later (the result's remainder), once it expects none.
     /// Otherwise (a complete list, or the second look) they are dropped,
     /// unless the host still expected holders when the wait for them ran
     /// out: then they are kept, and restored again once it expects none
@@ -494,30 +477,20 @@ private final class ControlPlaneRestore {
         }
         // Only a tab whose Create was under way names a session to wait for.
         unmatched = unmatched.filter { $0.launchRequestID != nil }
-        // Those dropped now whose sessions the system ended come back ended:
-        // missing ones once no second look is due (this list is complete,
-        // or it is the second look), unmatched ones unless holders are
-        // still expected.
-        let dropsMissing = !list.awaitsHolders && !(lookingAgain && list.pendingHolders == nil)
-        result.sessions += systemEndedTabs(
-            of: (dropsMissing ? missing : []) + (list.awaitsHolders ? [] : unmatched),
-            missingFrom: list
-        )
-        if lookingAgain {
-            if list.awaitsHolders {
-                let control = localSessions.control
-                (result.pendingRecordIDs, result.remainder) = lookingAgainOnceHoldersRegistered(
-                    for: missing + unmatched, after: list, on: control
-                ) { [self] later in
-                    await restoreLocal(
-                        missing, unbound: unmatched, lookingAgain: false,
-                        listing: later.map { localSessions.listing(of: $0) }
-                    )
-                }
-            } else if list.pendingHolders == nil {
-                (result.pendingRecordIDs, result.remainder) = self.lookingAgain(for: missing) { [self] records in
-                    await restoreLocal(records, unbound: [], lookingAgain: false)
-                }
+        // Those dropped now (the list is complete) whose sessions the system
+        // ended come back ended.
+        if !list.awaitsHolders {
+            result.sessions += systemEndedTabs(of: missing + unmatched, missingFrom: list)
+        }
+        if lookingAgain, list.awaitsHolders {
+            let control = localSessions.control
+            (result.pendingRecordIDs, result.remainder) = lookingAgainOnceHoldersRegistered(
+                for: missing + unmatched, after: list, on: control
+            ) { [self] later in
+                await restoreLocal(
+                    missing, unbound: unmatched, lookingAgain: false,
+                    listing: later.map { localSessions.listing(of: $0) }
+                )
             }
         } else if list.awaitsHolders, !(missing + unmatched).isEmpty {
             // Holders were still expected when the wait ran out: these
@@ -661,13 +634,7 @@ private final class ControlPlaneRestore {
             }
             guard claimed.insert(Self.key(hostID: list.hostID, sessionID: info.id)).inserted else { continue }
             let attachment = HostedSessionAttachment(
-                host: host,
-                hostID: list.hostID,
-                sessionID: info.id,
-                name: info.name,
-                remoteWorkingDirectory: info.cwd,
-                executablePath: executable.path,
-                environment: environment
+                host: host, hostID: list.hostID, info: info, executablePath: executable.path, environment: environment
             )
             result.sessions.append(built(request.workspace.makeRestoredHostedSession(
                 attachment,
@@ -677,18 +644,12 @@ private final class ControlPlaneRestore {
                 following: control
             )))
         }
-        if lookingAgain {
-            if list.awaitsHolders {
-                (result.pendingRecordIDs, result.remainder) = lookingAgainOnceHoldersRegistered(
-                    for: missing, after: list, on: control
-                ) { [self] later in
-                    guard let later else { return .keeping(missing) }
-                    return await restoreRemote(missing, on: host, control: control, lookingAgain: false, list: later)
-                }
-            } else if list.pendingHolders == nil {
-                (result.pendingRecordIDs, result.remainder) = self.lookingAgain(for: missing) { [self] records in
-                    await restoreRemote(records, on: host, control: control, lookingAgain: false)
-                }
+        if lookingAgain, list.awaitsHolders {
+            (result.pendingRecordIDs, result.remainder) = lookingAgainOnceHoldersRegistered(
+                for: missing, after: list, on: control
+            ) { [self] later in
+                guard let later else { return .keeping(missing) }
+                return await restoreRemote(missing, on: host, control: control, lookingAgain: false, list: later)
             }
         } else if list.awaitsHolders, !missing.isEmpty {
             result.keptRecordIDs.formUnion(Self.ids(missing))
@@ -808,16 +769,11 @@ enum OptimisticRestore {
 final class OpenHostedTabs {
     static let shared = OpenHostedTabs()
 
-    private final class WeakTab {
-        weak var session: TerminalSession?
-        init(_ session: TerminalSession) { self.session = session }
-    }
-
-    private var tabs: [ObjectIdentifier: WeakTab] = [:]
+    private var tabs: [ObjectIdentifier: WeakReference<TerminalSession>] = [:]
 
     func register(_ tab: TerminalSession) {
-        tabs = tabs.filter { $0.value.session != nil }
-        tabs[ObjectIdentifier(tab)] = WeakTab(tab)
+        tabs = tabs.filter { $0.value.object != nil }
+        tabs[ObjectIdentifier(tab)] = WeakReference(tab)
     }
 
     func unregister(_ tab: TerminalSession) {
@@ -825,12 +781,12 @@ final class OpenHostedTabs {
     }
 
     func hasOpenTab(withID id: UUID) -> Bool {
-        tabs.values.contains { $0.session?.id == id }
+        tabs.values.contains { $0.object?.id == id }
     }
 
     /// The open tab attached to this session of the host `hostID`.
     func tab(showingSession sessionID: String, hostID: String) -> TerminalSession? {
-        tabs.values.lazy.compactMap(\.session).first { tab in
+        tabs.values.lazy.compactMap(\.object).first { tab in
             tab.hostedAttachment?.hostID == hostID && tab.hostedAttachment?.sessionID == sessionID
         }
     }
@@ -842,7 +798,7 @@ final class OpenHostedTabs {
 
 // MARK: - Staggered attach
 
-/// Launches restored tabs' attach adapters `batchSize` per main run loop turn,
+/// Launches restored tabs' attach adapters one per main run loop turn,
 /// so a launch that restores many tabs never builds every surface at once.
 /// The pause between turns is `interval`, or as long as the last turn took
 /// when that was longer (each launch builds a surface on the main actor), so
@@ -869,8 +825,6 @@ final class OpenHostedTabs {
 final class RestoredTabLaunchQueue {
     static let shared = RestoredTabLaunchQueue()
 
-    /// Adapters launched per turn (each builds a surface on the main actor).
-    var batchSize = 1
     /// The shortest pause between turns.
     var interval: TimeInterval = 0.05
 
@@ -962,28 +916,25 @@ final class RestoredTabLaunchQueue {
     private func runBatch() {
         isScheduled = false
         let started = ContinuousClock.now
-        var launched = 0
-        while launched < max(1, batchSize), let tab = next() {
+        // One adapter per turn: each builds a surface on the main actor.
+        var launched = false
+        while !launched, let tab = next() {
             if tab.launchDeferredAdapterIfNeeded() {
-                launched += 1
+                launched = true
                 LaunchTimeline.mark("adapter launched \(tab.title)")
             }
         }
         if !shown.isEmpty || (!background.isEmpty && !isHoldingBackgroundTabs) {
             let now = ContinuousClock.now
             let delay: Duration
-            if launched == 0, let look = nextWindowGridLook {
+            if !launched, let look = nextWindowGridLook {
                 // Only tabs waiting for their window's grid: look again then.
                 delay = max(look - now, .zero)
             } else {
                 delay = max(now - started, .seconds(interval))
             }
-            schedule(after: Self.seconds(delay))
+            schedule(after: delay.timeInterval)
         }
-    }
-
-    private static func seconds(_ duration: Duration) -> TimeInterval {
-        Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
     }
 
     /// The next tab to launch: a shown one, else a background one whose

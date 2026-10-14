@@ -52,9 +52,10 @@ match the app's terminal, into which snapshots are replayed.
 `clear_history` clears the history above the screen as `ED 3` would, keeping
 an unfinished escape sequence the output left (its continuation is fed again
 after the erase); when the output left a UTF-8 character half written, the
-erase waits for the `feed` that completes it (it returns false then).
-XTGETTCAP `TN` (the terminfo name) is answered only after
-`set_terminfo_name`, with the name given (the program's TERM).
+erase waits for the `feed` that completes it (it returns false then), whose
+replies still come.
+XTGETTCAP `TN` (the terminfo name) is never answered here: the host forwards
+it to the renderer, which answers it.
 
 The library is built with `-Doptimize=ReleaseSafe` (`Scripts/build-host-vt`):
 the host parses untrusted output from every session, so Zig's runtime safety
@@ -107,13 +108,12 @@ replaces the one before it when nothing came between, a bell right after a bell 
 beyond the bounds the oldest are dropped. A title, working directory or
 progress report is state, not news: when the bounds drop the latest of its
 kind, it is kept apart and taken first, so a taker never misses the current
-value (which, set again unchanged, would not be reported again). `title()`
-and `pwd()` always read the current values, and `mode(value, ansi)` reads one
-mode as the terminal holds it (DECCKM, application cursor keys, is
-`mode(1, false)`). modifyOtherKeys has no getter: `modes()` writes
-`ESC[>4;2m`, right before its kitty keyboard pop, exactly when it is at level
-2 (libghostty keeps only that level; 1 and `ESC[>4m` are off), and
-cherry-host's `screen::terminal_state` reads it there.
+value (which, set again unchanged, would not be reported again).
+`mode(value, ansi)` reads one mode as the terminal holds it (DECCKM,
+application cursor keys, is `mode(1, false)`). modifyOtherKeys has no getter:
+`modes()` writes `ESC[>4;2m`, right before its kitty keyboard pop, exactly
+when it is at level 2 (libghostty keeps only that level; 1 and `ESC[>4m` are
+off), and cherry-host's `screen::terminal_state` reads it there.
 
 The terminal can also be read as text in place, without a copy:
 `screen_text()` gives the whole of it with its history and `active_text()`
@@ -129,7 +129,7 @@ never come from `take_events`. `Osc99` (one per session) takes each complete
 `ESC ] 99 ; metadata ; payload` sequence, as a reader of the output stream
 that keeps whole control strings sees it, and assembles notifications sent in
 chunks (`i` identifier, `d=0` more to come, `p=title|body`, `e=1` base64);
-`parse_osc99` handles a single sequence. Icons, buttons and payload types it
+a fresh `Osc99` handles a single sequence. Icons, buttons and payload types it
 does not know are parts of a notification that are not reported: their
 chunks still end it (without `d=0`). Queries (`p=?`), close requests and
 liveness checks are not notifications and give nothing.
@@ -276,8 +276,8 @@ For a physical terminal whose size differs from the canonical grid:
   tests check that against libghostty-vt), for the host and `cherry
   attach` to tell which commands name a file.
 - Palette and dynamic colour changes (OSC 4/10/11/12), the working directory
-  (OSC 7) and the title are not exported; `title()` and `pwd()` give the
-  last two.
+  (OSC 7) and the title are not exported; `take_events` reports the last
+  two as they change.
 - Cursor shape (DECSCUSR block, underline or bar) is not restored; its blink
   setting is (mode 12). The pinned API exposes the shape only through the
   render state, which cannot tell a program's choice from the default.

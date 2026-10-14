@@ -62,13 +62,6 @@ final class HostControlChannel: @unchecked Sendable {
 
 typealias HostControlLauncher = @Sendable (HostControlLaunch) throws -> HostControlChannel
 
-final class HostControlFlag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage = false
-    func set() { lock.withLock { storage = true } }
-    var value: Bool { lock.withLock { storage } }
-}
-
 /// One helper's frame stream. Reading, decoding, encoding and writing happen
 /// off the main thread; everything received comes out of `received`, in
 /// order, ending with `.closed`.
@@ -76,7 +69,7 @@ final class HostControlConnection: @unchecked Sendable {
     enum Received: Sendable {
         case frame(HostResponse)
         /// A frame whose message this version cannot read; `req` when it had one.
-        case unreadable(req: UInt64?, reason: String)
+        case unreadable(req: UInt64?)
         /// No more frames follow. `reason` is the helper's explanation (its
         /// standard error) or a stream error, when there is one.
         case closed(reason: String?)
@@ -233,9 +226,7 @@ final class HostControlConnection: @unchecked Sendable {
                     do {
                         continuation.yield(.frame(try HostResponse.decode(frameBody: body, using: json)))
                     } catch {
-                        continuation.yield(.unreadable(
-                            req: HostResponse.requestID(inUndecodable: body), reason: String(describing: error)
-                        ))
+                        continuation.yield(.unreadable(req: HostResponse.requestID(inUndecodable: body)))
                     }
                 }
             } catch {
@@ -257,9 +248,12 @@ final class HostControlConnection: @unchecked Sendable {
     }
 }
 
-/// Keeps a host's control connection up while held. Releasing twice is
-/// harmless; a lease released by deallocation releases on the main actor.
-final class HostControlLease: @unchecked Sendable {
+/// Keeps something running while held: a host's control connection
+/// (`HostControl.retain`, `HostControlLease`, which releases on the main
+/// actor, also when deallocated) or an SSH master
+/// (`HostSSHMasterManager.acquire`, `HostSSHMasterLease`). Releasing twice
+/// is harmless: the action runs once.
+final class HostLease: @unchecked Sendable {
     private let lock = NSLock()
     private var onRelease: (@Sendable () -> Void)?
 
@@ -278,8 +272,11 @@ final class HostControlLease: @unchecked Sendable {
     }
 }
 
+/// Keeps a host's control connection up while held (`HostLease`).
+typealias HostControlLease = HostLease
+
 /// The app's one control connection to a session host (`cherry control`,
-/// protocol 6). It verifies the host's identity, subscribes to events, keeps
+/// protocol 7). It verifies the host's identity, subscribes to events, keeps
 /// `sessions` current from them, pings every heartbeat interval, and — while
 /// leased — reconnects with backoff, re-listing after every reconnect or
 /// host resync.
@@ -318,7 +315,7 @@ final class HostControl: ObservableObject {
         var idleDisconnectDelay: Duration = .seconds(60)
         /// How long a connection to an SSH host waits for the app's master.
         var masterStartTimeout: TimeInterval = 15
-        /// How often `waitForSession` lists when the host sends no events.
+        /// How often `waitForSession` lists while there is no connection.
         var pollInterval: Duration = .milliseconds(150)
         /// After a list that says holders are still expected (a daemon that
         /// just restarted), the host is listed again this often,
@@ -357,8 +354,6 @@ final class HostControl: ObservableObject {
     /// How many connections have come up so far. It grows before `state`
     /// turns `.connected`, so an observer of that change sees the new count.
     private(set) var connectionCount = 0
-    /// Whether the host pushes events on this connection.
-    private(set) var isSubscribed = false
     /// The helper and login environment of the latest connection attempt,
     /// which attach adapters for this host should get too.
     private(set) var executableURL: URL?
@@ -372,10 +367,8 @@ final class HostControl: ObservableObject {
     let configuration: Configuration
 
     private let eventSubject = PassthroughSubject<HostSessionEvent, Never>()
-    private var eventContinuations: [UUID: AsyncStream<HostSessionEvent>.Continuation] = [:]
 
     private struct PendingRequest {
-        let connection: HostControlConnection
         let continuation: CheckedContinuation<HostServerMessage, Error>
         let timeout: Task<Void, Never>?
         /// Made by the control itself (a heartbeat Ping, a re-list after a
@@ -447,20 +440,8 @@ final class HostControl: ObservableObject {
     /// Every event, as the host sent it or as a re-list revealed it.
     var events: AnyPublisher<HostSessionEvent, Never> { eventSubject.eraseToAnyPublisher() }
 
-    /// The events from now on, until the stream is dropped.
-    func eventStream() -> AsyncStream<HostSessionEvent> {
-        let id = UUID()
-        let (stream, continuation) = AsyncStream.makeStream(of: HostSessionEvent.self)
-        eventContinuations[id] = continuation
-        continuation.onTermination = { [weak self] _ in
-            Task { @MainActor in self?.eventContinuations[id] = nil }
-        }
-        return stream
-    }
-
     private func publish(_ event: HostSessionEvent) {
         eventSubject.send(event)
-        for continuation in eventContinuations.values { continuation.yield(event) }
     }
 
     // MARK: Leases and connection
@@ -528,8 +509,7 @@ final class HostControl: ObservableObject {
             // Published before the change: run once it is in place.
             DispatchQueue.main.async { MainActor.assumeIsolated { once() } }
         }
-        let seconds = Double(limit.components.seconds) + Double(limit.components.attoseconds) / 1e18
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { MainActor.assumeIsolated { once() } }
+        DispatchQueue.main.asyncAfter(deadline: .now() + limit.timeInterval) { MainActor.assumeIsolated { once() } }
     }
 
     /// The helper a connection would start, found without connecting (the
@@ -790,14 +770,7 @@ final class HostControl: ObservableObject {
         }
         self.hostID = hostID
 
-        do {
-            _ = try expectOK(try await send(.subscribe, on: connection))
-            isSubscribed = true
-        } catch HostedSessionError.rejected(let code, _) where code == HostProtocol.ErrorCode.unsupportedOperation {
-            // A host without events: lists are polled instead, and the idle
-            // limit needs more frequent pings.
-            isSubscribed = false
-        }
+        _ = try expectOK(try await send(.subscribe, on: connection))
         announcesResyncAfterNextList = hasListed
         guard case .sessions = try await send(.list, on: connection) else {
             throw HostedSessionError.message("The session host answered the session list with something else.")
@@ -869,12 +842,8 @@ final class HostControl: ObservableObject {
         heartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self, self.connection === connection else { return }
-                // Before subscribing (or on a host without events) the idle
-                // limit applies instead.
-                let interval = isSubscribed
-                    ? configuration.heartbeatInterval
-                    : min(configuration.heartbeatInterval, HostProtocol.idleTimeout / 2)
-                try? await Task.sleep(for: interval)
+                // Started once the connection subscribed to events.
+                try? await Task.sleep(for: configuration.heartbeatInterval)
                 guard !Task.isCancelled, self.connection === connection else { return }
                 do {
                     _ = try await send(.ping, on: connection, timeout: configuration.pingTimeout, background: true)
@@ -938,7 +907,7 @@ final class HostControl: ObservableObject {
             }
             // Anything else without a `req` (attachment traffic, which
             // includes every binary frame) is not for a control connection.
-        case .unreadable(let req, _):
+        case .unreadable(let req):
             guard let req, let request = pending.removeValue(forKey: req) else { return }
             request.timeout?.cancel()
             pruneSessionEventSequences()
@@ -954,7 +923,6 @@ final class HostControl: ObservableObject {
     private func connectionEnded(_ connection: HostControlConnection, reason: String?, reconnect: Bool) {
         guard connection === self.connection else { return }
         self.connection = nil
-        isSubscribed = false
         hostID = nil
         heartbeatTask?.cancel()
         heartbeatTask = nil
@@ -1174,8 +1142,7 @@ final class HostControl: ObservableObject {
                     ))
                 }
                 pending[req] = PendingRequest(
-                    connection: connection, continuation: continuation, timeout: timer, isBackground: background,
-                    sentAtEvent: eventSequence
+                    continuation: continuation, timeout: timer, isBackground: background, sentAtEvent: eventSequence
                 )
                 connection.send(HostRequest(req: req, message: message)) { [weak self] error in
                     guard let error else { return }
@@ -1241,7 +1208,7 @@ final class HostControl: ObservableObject {
     /// host `hostID` names and following its events, which keep `sessions`
     /// current. Nil otherwise (`sessions` may then be stale).
     func currentSession(_ id: String, hostID expected: String) -> HostedSessionInfo? {
-        guard state == .connected, isSubscribed, hostID == expected else { return nil }
+        guard state == .connected, hostID == expected else { return nil }
         return sessions.first { $0.id == id }
     }
 
@@ -1271,9 +1238,8 @@ final class HostControl: ObservableObject {
     /// Lists the host again every `pollInterval` while a daemon that just
     /// restarted still expects holders to register (`pendingHolders` > 0),
     /// until none is pending or `timeout` passed; returns the last list
-    /// (check `isComplete`). `first` is a list taken already. A host that
-    /// does not report pending holders is listed once. Throws what a list
-    /// throws, and CancellationError.
+    /// (check `isComplete`). `first` is a list taken already. Throws what a
+    /// list throws, and CancellationError.
     func listUntilHoldersRegistered(
         after first: HostedSessionList? = nil,
         timeout: Duration,
@@ -1478,11 +1444,11 @@ final class HostControl: ObservableObject {
     }
 
     /// Waits until `satisfied` holds for the session (nil once it is gone),
-    /// following events, or polling the list on a host without events or
-    /// after the connection was lost. False when `timeout` passes first, or
-    /// at once when another identity answers for the host (`state` is then
-    /// `.failed(.identityMismatch)`): nothing that host says is about this
-    /// session. Throws only CancellationError.
+    /// following events, or polling the list after the connection was lost.
+    /// False when `timeout` passes first, or at once when another identity
+    /// answers for the host (`state` is then `.failed(.identityMismatch)`):
+    /// nothing that host says is about this session. Throws only
+    /// CancellationError.
     func waitForSession(
         _ id: String,
         timeout: Duration,
@@ -1496,10 +1462,10 @@ final class HostControl: ObservableObject {
             switch state {
             case .failed(let error) where error.isIdentityMismatch:
                 return false
-            case .connected where isSubscribed, .connecting, .waitingToReconnect:
+            case .connected, .connecting, .waitingToReconnect:
                 // Events, or the reconnect under way (with its backoff), wake it.
                 await waitForSessionsChange(until: deadline)
-            case .connected, .idle, .failed:
+            case .idle, .failed:
                 try await Task.sleep(for: min(configuration.pollInterval, deadline - ContinuousClock.now))
                 _ = try? await list()
             }
@@ -1558,7 +1524,7 @@ final class HostControl: ObservableObject {
     }
 
     private static func seconds(_ duration: Duration) -> Int {
-        max(1, Int((Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18).rounded(.up)))
+        max(1, Int(duration.timeInterval.rounded(.up)))
     }
 }
 
@@ -1666,42 +1632,18 @@ extension HostControl {
         return Self.peek(status: output.status, standardOutput: output.output, standardError: output.errors, trusted: trusted)
     }
 
-    /// Runs a helper to its end (or `timeout`, then terminates it) and
-    /// returns what it printed.
+    /// Runs a helper to its end (or `timeout`, then stops it) and returns
+    /// what it printed.
     nonisolated static func runCapturing(
         executable: URL, arguments: [String], environment: [String: String], timeout: TimeInterval
     ) -> (status: Int32, output: String, errors: String) {
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = arguments
-        process.environment = environment
-        let out = Pipe()
-        let err = Pipe()
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = out
-        process.standardError = err
-        do {
-            try process.run()
-        } catch {
-            return (127, "", "Could not run \(executable.lastPathComponent): \(error.localizedDescription)")
+        let result = CapturedProcess.run(
+            executable: executable, arguments: arguments, environment: environment, input: nil, timeout: timeout
+        )
+        if let launchError = result.launchError {
+            return (127, "", "Could not run \(executable.lastPathComponent): \(launchError.localizedDescription)")
         }
-        final class Box: @unchecked Sendable { var data = Data() }
-        let outBox = Box()
-        let errBox = Box()
-        let group = DispatchGroup()
-        for (pipe, box) in [(out, outBox), (err, errBox)] {
-            group.enter()
-            DispatchQueue.global().async {
-                box.data = pipe.fileHandleForReading.readDataToEndOfFile()
-                group.leave()
-            }
-        }
-        if group.wait(timeout: .now() + timeout) == .timedOut {
-            process.terminate()
-            _ = group.wait(timeout: .now() + 2)
-        }
-        process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: outBox.data, as: UTF8.self), String(decoding: errBox.data, as: UTF8.self))
+        return (result.status, String(decoding: result.standardOutput, as: UTF8.self), String(decoding: result.standardError, as: UTF8.self))
     }
 
     /// Reads what `cherry list --json --no-start` printed.
@@ -1720,5 +1662,12 @@ extension HostControl {
             .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
         let message = lines.isEmpty ? "cherry list exited \(status)" : String(lines.joined(separator: " ").prefix(2_000))
         return .failed(.unavailable(message))
+    }
+}
+
+extension Duration {
+    /// The duration in seconds, for APIs that take a `TimeInterval`.
+    var timeInterval: TimeInterval {
+        Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 }

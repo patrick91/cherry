@@ -45,14 +45,9 @@ final class HostedReconnects: ObservableObject {
     /// change or Retry Now probes once more.
     @Published private(set) var pausedReasons: [String: String] = [:]
 
-    private final class WeakTab {
-        weak var tab: TerminalSession?
-        init(_ tab: TerminalSession) { self.tab = tab }
-    }
-
     private final class Group {
         let host: HostedSessionHost
-        var tabs: [ObjectIdentifier: WeakTab] = [:]
+        var tabs: [ObjectIdentifier: WeakReference<TerminalSession>] = [:]
         /// Probes since a tab of this host last attached: the backoff.
         var attempts = 0
         var timer: Task<Void, Never>?
@@ -66,7 +61,7 @@ final class HostedReconnects: ObservableObject {
             self.host = host
         }
 
-        var liveTabs: [TerminalSession] { tabs.values.compactMap(\.tab) }
+        var liveTabs: [TerminalSession] { tabs.values.compactMap(\.object) }
     }
 
     let configuration: Configuration
@@ -111,7 +106,7 @@ final class HostedReconnects: ObservableObject {
         startMonitoringSystem()
         let group = groups[host.id] ?? Group(host: host)
         groups[host.id] = group
-        group.tabs[ObjectIdentifier(tab)] = WeakTab(tab)
+        group.tabs[ObjectIdentifier(tab)] = WeakReference(tab)
         tab.setWaitingForHost(true)
         publishCounts()
         if group.timer == nil, group.probe == nil, group.paused == nil {
@@ -133,13 +128,6 @@ final class HostedReconnects: ObservableObject {
     func tabAttached(_ tab: TerminalSession) {
         guard let host = tab.hostedAttachment?.host else { return }
         groups[host.id]?.attempts = 0
-    }
-
-    /// Tabs waiting for `host` (nil: any host), for Retry Now and tests.
-    func waitingTabs(for host: HostedSessionHost? = nil) -> [TerminalSession] {
-        groups.values
-            .filter { host == nil || $0.host == host }
-            .flatMap(\.liveTabs)
     }
 
     // MARK: Triggers
@@ -167,11 +155,9 @@ final class HostedReconnects: ObservableObject {
     }
 
     /// A network path became available (NWPathMonitor reported satisfied
-    /// after it was not).
+    /// after it was not): as after a wake.
     func networkBecameAvailable() {
-        RemoteDevicePeeks.shared.systemChanged()
-        retryNow()
-        for control in controls() { control.reconnectNow() }
+        systemDidWake()
     }
 
     /// Follows the Mac's wakes and network changes from now on (a device's
@@ -249,20 +235,21 @@ final class HostedReconnects: ObservableObject {
         case .success(let list):
             for tab in group.liveTabs {
                 guard let attachment = tab.hostedAttachment else { continue }
+                let listed = list.sessions.contains { $0.id == attachment.sessionID }
                 if attachment.hostID != list.hostID {
                     giveUp(tab, in: group, because: "Another host answers for \(group.host.displayName) (identity \(list.hostID), not \(attachment.hostID)); reconnect to the intended host.")
-                } else if !list.sessions.contains(where: { $0.id == attachment.sessionID }), !list.awaitsHolders {
-                    giveUp(tab, in: group, because: "\(group.host.displayName) no longer has this session.")
-                } else if list.sessions.contains(where: { $0.id == attachment.sessionID }) {
+                } else if listed {
                     group.tabs[ObjectIdentifier(tab)] = nil
                     tab.setWaitingForHost(false)
                     tab.reconnectHostedSession()
+                } else if !list.awaitsHolders {
+                    giveUp(tab, in: group, because: "\(group.host.displayName) no longer has this session.")
                 }
                 // Listed later by a host whose holders still register: wait.
             }
         case .failure(let error):
             let hosted = error as? HostedSessionError
-            let reason = hosted?.errorDescription ?? error.localizedDescription
+            let reason = error.localizedDescription
             if hosted?.isIdentityMismatch == true || hosted?.isVersionMismatch == true {
                 for tab in group.liveTabs { giveUp(tab, in: group, because: reason) }
             } else if hosted?.isAuthenticationFailure == true {
@@ -284,7 +271,7 @@ final class HostedReconnects: ObservableObject {
     /// Schedules the next probe while tabs still wait; forgets a host none
     /// waits for (keeping its backoff until one of its tabs attaches).
     private func settle(_ group: Group) {
-        group.tabs = group.tabs.filter { $0.value.tab != nil }
+        group.tabs = group.tabs.filter { $0.value.object != nil }
         if group.tabs.isEmpty {
             group.timer?.cancel()
             group.timer = nil

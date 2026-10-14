@@ -91,22 +91,6 @@ struct MenuBarAgentPresentation {
 
 // MARK: - Model
 
-struct MenuBarShimmerSettings: Equatable {
-    // Baked from the in-app design panel (Speed 1.9×, Pulse 40%, Peak 93%, Base 59%,
-    // Stagger 5% ≈ 71 ms). All values are fractions of the shimmer cycle except `duration`.
-    var duration: Double = 2.7 / 1.9   // 1.9× the 2.7 s reference cycle
-    var pulseWidth: Double = 0.4       // each layer's highlight lasts 40% of the cycle
-    var peakAlpha: Double = 0.93       // brightest alpha at the pulse peak
-    var baseAlpha: Double = 0.59       // resting alpha
-    var layerStagger: Double = 0.05    // delay between adjacent layers (drives top→bottom sweep)
-
-    var cacheKey: String {
-        [duration, pulseWidth, peakAlpha, baseAlpha, layerStagger]
-            .map { String(Int(($0 * 1_000).rounded())) }
-            .joined(separator: ":")
-    }
-}
-
 /// Drives the working-state shimmer of the menu-bar glyph: small highlight
 /// sweeps across the stack layers.
 ///
@@ -129,7 +113,6 @@ final class MenuBarShimmerModel: ObservableObject {
     static let shared = MenuBarShimmerModel()
 
     @Published private(set) var frame = 0
-    let settings = MenuBarShimmerSettings()
 
     private var timer: Timer?
     private var step = 0
@@ -140,28 +123,30 @@ final class MenuBarShimmerModel: ObservableObject {
     // stable per-frame cache key so the label reuses a small set of NSImages.
     static let frameCount = 18
 
+    // Baked from the in-app design panel (Speed 1.9×, Pulse 40%, Peak 93%, Base 59%,
+    // Stagger 5% ≈ 71 ms). All values are fractions of the shimmer cycle except `duration`.
+    static let duration: Double = 2.7 / 1.9   // 1.9× the 2.7 s reference cycle
+    static let pulseWidth: Double = 0.4       // each layer's highlight lasts 40% of the cycle
+    static let peakAlpha: Double = 0.93       // brightest alpha at the pulse peak
+    static let baseAlpha: Double = 0.59       // resting alpha
+    static let layerStagger: Double = 0.05    // delay between adjacent layers (drives top→bottom sweep)
+
     func setWorkingAgentsActive(_ active: Bool) {
         guard hasWorkingAgents != active else { return }
         hasWorkingAgents = active
-        reconcileTimer(resetFrame: active)
-    }
-
-    private func reconcileTimer(resetFrame: Bool) {
-        if hasWorkingAgents {
-            if resetFrame {
-                step = 0
-                frame = 0
-            }
+        if active {
+            step = 0
+            frame = 0
             if timer == nil {
                 startTimer()
             }
         } else {
-            stopTimer(resetFrame: true)
+            stopTimer()
         }
     }
 
     private func startTimer() {
-        let interval = max(0.05, settings.duration / Double(Self.frameCount))
+        let interval = max(0.05, Self.duration / Double(Self.frameCount))
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] timer in
             guard let self else {
                 timer.invalidate()
@@ -176,13 +161,11 @@ final class MenuBarShimmerModel: ObservableObject {
         self.timer = timer
     }
 
-    private func stopTimer(resetFrame: Bool) {
+    private func stopTimer() {
         timer?.invalidate()
         timer = nil
-        if resetFrame {
-            step = 0
-            frame = 0
-        }
+        step = 0
+        frame = 0
     }
 }
 
@@ -216,11 +199,7 @@ final class MenuBarAgentsModel: ObservableObject {
             let agents = workspace.runningAgentSessions
             guard !agents.isEmpty else { continue }
             let items = agents.map { session in
-                let brand = AgentToolBrand.detect(
-                    name: session.agentName ?? session.title,
-                    commandLine: session.subtitle
-                )
-                return MenuBarAgentItem(
+                MenuBarAgentItem(
                     id: session.id,
                     projectRoot: root,
                     title: MenuBarAgentPresentation.agentTitle(
@@ -229,8 +208,7 @@ final class MenuBarAgentsModel: ObservableObject {
                         agentName: session.agentName,
                         commandLine: session.subtitle
                     ),
-                    agentKey: brand?.rawValue
-                        ?? AgentToolDefinition.normalizedName(session.agentName ?? session.title),
+                    agentKey: session.agentToolKey,
                     activity: session.agentActivityState
                 )
             }
@@ -289,21 +267,8 @@ extension AgentActivityState {
 
 // MARK: - Menu-bar icon (app brandmark + state badge)
 
-struct MenuBarStatusLabel: View {
-    @ObservedObject var model: MenuBarAgentsModel
-    @ObservedObject private var shimmer = MenuBarShimmerModel.shared
-    @Environment(\.colorScheme) private var colorScheme
-
-    var body: some View {
-        Image(nsImage: Self.cachedIcon(
-            for: model.aggregate,
-            dark: colorScheme == .dark,
-            shimmerFrame: shimmer.frame,
-            settings: shimmer.settings
-        ))
-            .accessibilityLabel("Cherry agents")
-    }
-
+@MainActor
+enum MenuBarStatusLabel {
     // Reuse one NSImage per (state, appearance, shimmer frame): the shimmer revisits
     // the same frame table every cycle, and handing AppKit the same instance lets its
     // symbol rasterization cache hit instead of re-rendering a fresh image per frame.
@@ -314,26 +279,14 @@ struct MenuBarStatusLabel: View {
     static func icon(
         for state: MenuBarAggregateState,
         dark: Bool,
-        shimmerFrame: Int,
-        settings: MenuBarShimmerSettings
-    ) -> NSImage {
-        cachedIcon(for: state, dark: dark, shimmerFrame: shimmerFrame, settings: settings)
-    }
-
-    @MainActor
-    private static func cachedIcon(
-        for state: MenuBarAggregateState,
-        dark: Bool,
-        shimmerFrame: Int,
-        settings: MenuBarShimmerSettings
+        shimmerFrame: Int
     ) -> NSImage {
         let normalizedFrame = state == .working ? shimmerFrame % MenuBarShimmerModel.frameCount : 0
-        let settingsKey = state == .working ? settings.cacheKey : "static"
-        let key = "\(state)|\(dark)|\(normalizedFrame)|\(settingsKey)"
+        let key = "\(state)|\(dark)|\(normalizedFrame)"
         if let cached = iconCache[key] { return cached }
         let image: NSImage
         if state == .working {
-            image = workingIcon(dark: dark, frame: normalizedFrame, settings: settings)
+            image = workingIcon(dark: dark, frame: normalizedFrame)
         } else {
             image = glyphImage(layerColors: paletteColors(for: state, dark: dark))
         }
@@ -360,8 +313,7 @@ struct MenuBarStatusLabel: View {
     private static func paletteColors(for state: MenuBarAggregateState, dark: Bool) -> [NSColor] {
         let glyph: NSColor = dark ? .white : NSColor(white: 0.12, alpha: 1)
         switch state {
-        case .none, .idle: return [glyph]
-        case .working: return [glyph]
+        case .none, .idle, .working: return [glyph]
         case .attention: return [.systemOrange]
         case .error: return [.systemRed]
         }
@@ -372,27 +324,23 @@ struct MenuBarStatusLabel: View {
     // up one after another. Purely a palette-alpha modulation — no per-frame
     // compositing — which keeps every frame a cheap symbol re-render.
     @MainActor
-    private static func workingIcon(dark: Bool, frame: Int, settings: MenuBarShimmerSettings) -> NSImage {
+    private static func workingIcon(dark: Bool, frame: Int) -> NSImage {
         let glyph: NSColor = dark ? .white : NSColor(white: 0.12, alpha: 1)
         let phase = CGFloat(frame) / CGFloat(MenuBarShimmerModel.frameCount)
-        let base = CGFloat(settings.baseAlpha)
-        let peak = CGFloat(settings.peakAlpha)
-        let width = CGFloat(settings.pulseWidth)
-        let stagger = CGFloat(settings.layerStagger)
+        let base = CGFloat(MenuBarShimmerModel.baseAlpha)
+        let peak = CGFloat(MenuBarShimmerModel.peakAlpha)
+        let width = CGFloat(MenuBarShimmerModel.pulseWidth)
+        let stagger = CGFloat(MenuBarShimmerModel.layerStagger)
 
+        // Plate 0 is the top of the gem, so pulsing in plate order sweeps the highlight
+        // top → bottom.
         let colors: [NSColor] = (0..<stackLayerCount).map { layer in
-            let layerPhase = wrappedPhase(phase - CGFloat(sweepOrder(layer)) * stagger)
+            let layerPhase = wrappedPhase(phase - CGFloat(layer) * stagger)
             let pulse = layerPulse(layerPhase, width: width)
             let alpha = base + (peak - base) * pulse
             return glyph.withAlphaComponent(min(1, max(0, alpha)))
         }
         return glyphImage(layerColors: colors)
-    }
-
-    // Plate 0 is the top of the gem, so pulsing in plate order sweeps the highlight
-    // top → bottom. Return `stackLayerCount - 1 - layer` to reverse it.
-    private static func sweepOrder(_ layer: Int) -> Int {
-        layer
     }
 
     // The prototype's `layer-wave` curve as a scalar: 0 at rest, ramps to 1 at 40% of

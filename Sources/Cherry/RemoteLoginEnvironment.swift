@@ -151,10 +151,7 @@ enum RemoteLoginEnvironmentCapture {
         var shell = shell
         shell.timeout = min(shell.timeout, timeout)
         let script = script(loginShell: loginShell, marker: marker, shellTimeout: shellTimeout)
-        let runner = shell
-        let output = await RemoteDeviceShell.onOwnThread {
-            runner.runSynchronously(script, on: destination)
-        }
+        let output = await shell.runData(script, on: destination)
         return parse(output, marker: marker, now: Date(), shellTimeout: shellTimeout)
     }
 

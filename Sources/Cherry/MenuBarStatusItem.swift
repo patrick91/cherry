@@ -74,8 +74,7 @@ final class MenuBarStatusItem: NSObject, NSWindowDelegate {
         let image = MenuBarStatusLabel.icon(
             for: model.aggregate,
             dark: dark,
-            shimmerFrame: MenuBarShimmerModel.shared.frame,
-            settings: MenuBarShimmerModel.shared.settings
+            shimmerFrame: MenuBarShimmerModel.shared.frame
         )
         if button.image !== image { button.image = image }
     }

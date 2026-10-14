@@ -19,7 +19,6 @@ import re
 import shlex
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -117,28 +116,6 @@ def parse_written_json(output, label):
     return Path(matches[-1]).expanduser().resolve()
 
 
-def send(socket_path, request, timeout=10):
-    payload = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        sock.connect(str(socket_path))
-        sock.sendall(payload)
-        sock.shutdown(socket.SHUT_WR)
-        data = bytearray()
-        while True:
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            data.extend(chunk)
-            if data.endswith(b"\n"):
-                break
-    response = json.loads(data.decode("utf-8"))
-    if response.get("error"):
-        error = response["error"]
-        raise RuntimeError(f"{error.get('code')}: {error.get('message')}")
-    return response["result"]
-
-
 def wait_for_cherry(socket_path, process, timeout):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -146,7 +123,8 @@ def wait_for_cherry(socket_path, process, timeout):
             raise RuntimeError(f"Cherry exited before control socket was ready (exit {process.returncode})")
         if socket_path.exists():
             try:
-                send(socket_path, {"listProjects": {}}, timeout=2)
+                cherry_private_host.control_request(
+                    socket_path, cherry_private_host.enum_case("listProjects"), timeout=2)
                 return
             except Exception:
                 pass

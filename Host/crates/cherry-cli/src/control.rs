@@ -5,14 +5,13 @@
 //! standard input every byte for the host, relayed verbatim both ways: the
 //! app speaks the protocol, starting with its first request after Hello.
 use crate::{
-    sys::{self, interrupted, poll, pollfd, read_some, set_nonblocking, write_some},
+    sys::{self, interrupted, poll, pollfd, read_some, write_some, NonBlocking},
     timing::timing,
     transport::{stopped_reading, Transport, RPC_TIMEOUT},
 };
 use anyhow::{Context, Result};
 use cherry_protocol::{encode_frame, ServerMessage, PROTOCOL_VERSION};
 use std::{
-    io,
     os::fd::RawFd,
     time::{Duration, Instant},
 };
@@ -147,8 +146,7 @@ pub fn relay(transport: &mut Transport, host_id: String, build: Option<String>) 
 /// Standard output, non-blocking while relaying so that neither direction
 /// waits for the other, restored on drop.
 struct Output {
-    fd: RawFd,
-    original_flags: i32,
+    output: NonBlocking,
     never_waits: bool,
     bytes: Vec<u8>,
     written: usize,
@@ -156,14 +154,8 @@ struct Output {
 
 impl Output {
     fn new(fd: RawFd) -> Result<Self> {
-        let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if original_flags < 0 {
-            return Err(io::Error::last_os_error()).context("could not read standard output flags");
-        }
-        set_nonblocking(fd)?;
         Ok(Self {
-            fd,
-            original_flags,
+            output: NonBlocking::set(fd, "standard output")?,
             never_waits: sys::never_waits(fd),
             bytes: Vec::new(),
             written: 0,
@@ -185,7 +177,7 @@ impl Output {
     /// What to poll for room, if anything waits.
     fn poll_fd(&self) -> RawFd {
         if self.pending() > 0 && !self.never_waits {
-            self.fd
+            self.output.fd()
         } else {
             -1
         }
@@ -194,7 +186,7 @@ impl Output {
     /// Write what the output accepts now. False once the reader closed it.
     fn flush(&mut self) -> Result<bool> {
         while self.pending() > 0 {
-            match write_some(self.fd, &self.bytes[self.written..]) {
+            match write_some(self.output.fd(), &self.bytes[self.written..]) {
                 Ok(Some(n)) => self.written += n,
                 Ok(None) => break,
                 Err(error) if stopped_reading(&error) => return Ok(false),
@@ -215,20 +207,12 @@ impl Output {
     /// `CLOSED_WAIT` or is closed.
     fn finish(&mut self) {
         let _ = sys::write_all(
-            self.fd,
+            self.output.fd(),
             &self.bytes[self.written..],
             timing().closed_wait,
             true,
         );
         self.bytes.clear();
         self.written = 0;
-    }
-}
-
-impl Drop for Output {
-    fn drop(&mut self) {
-        unsafe {
-            libc::fcntl(self.fd, libc::F_SETFL, self.original_flags);
-        }
     }
 }

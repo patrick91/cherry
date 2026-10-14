@@ -33,20 +33,29 @@ fn session_members(leader: libc::pid_t) -> Vec<libc::pid_t> {
         .collect()
 }
 
-/// Exited processes keep their PID until reaped but can no longer run.
-pub fn is_zombie(pid: libc::pid_t) -> bool {
-    #[cfg(target_os = "macos")]
+/// What the kernel keeps of a process (`PROC_PIDTBSDINFO`); None when it
+/// cannot be read.
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
     unsafe {
         let mut info: libc::proc_bsdinfo = std::mem::zeroed();
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        libc::proc_pidinfo(
+        (libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
             0,
             (&mut info as *mut libc::proc_bsdinfo).cast(),
             size,
-        ) != size
-            || info.pbi_status == libc::SZOMB
+        ) == size)
+            .then_some(info)
+    }
+}
+
+/// Exited processes keep their PID until reaped but can no longer run.
+pub fn is_zombie(pid: libc::pid_t) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        bsd_info(pid).is_none_or(|info| info.pbi_status == libc::SZOMB)
     }
     #[cfg(target_os = "linux")]
     {
@@ -81,19 +90,9 @@ pub fn signal_session(leader: libc::pid_t, signal: libc::c_int) {
 /// when the listing is incomplete (an unreadable /proc, no descriptors
 /// left): it is unreaped, so its PID cannot belong to anyone else.
 fn signal_members(leader: libc::pid_t, members: Vec<libc::pid_t>, signal: libc::c_int) {
-    let others = members.into_iter().filter(|pid| *pid != leader);
-    for pid in others.chain([leader]) {
-        // Re-check right before signalling: a member that exited since the
-        // listing may already have a new, unrelated owner of its PID.
-        if pid == leader || unsafe { libc::getsid(pid) } == leader {
-            unsafe {
-                libc::kill(pid, signal);
-                if !matches!(signal, libc::SIGKILL | libc::SIGSTOP) {
-                    libc::kill(pid, libc::SIGCONT);
-                }
-            }
-        }
-    }
+    let others: Vec<libc::pid_t> = members.into_iter().filter(|pid| *pid != leader).collect();
+    signal_listed(leader, &others, signal);
+    send(leader, signal);
 }
 
 /// The last resort: stop every member first, so none can fork a replacement
@@ -106,8 +105,8 @@ pub fn kill_session(leader: libc::pid_t) {
 }
 
 /// A process as it was while its session's holder was linked: its PID and
-/// when it started (`start_identity`), so that a process that got the PID
-/// later is not taken for it.
+/// when it started (`cherry_protocol::start_identity`), so that a process
+/// that got the PID later is not taken for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Recorded {
     pub pid: libc::pid_t,
@@ -118,7 +117,7 @@ impl Recorded {
     pub fn of(pid: libc::pid_t) -> Self {
         Self {
             pid,
-            started: start_identity(pid),
+            started: cherry_protocol::start_identity(pid),
         }
     }
 
@@ -130,7 +129,7 @@ impl Recorded {
     /// Whether the PID now belongs to another process (unless that cannot
     /// be told).
     fn reused(&self) -> bool {
-        match (&self.started, start_identity(self.pid)) {
+        match (&self.started, cherry_protocol::start_identity(self.pid)) {
             (Some(recorded), Some(current)) => *recorded != current,
             _ => false,
         }
@@ -207,12 +206,18 @@ pub fn end_abandoned_session(
 fn signal_listed(leader: libc::pid_t, members: &[libc::pid_t], signal: libc::c_int) {
     for &pid in members {
         if unsafe { libc::getsid(pid) } == leader {
-            unsafe {
-                libc::kill(pid, signal);
-                if !matches!(signal, libc::SIGKILL | libc::SIGSTOP) {
-                    libc::kill(pid, libc::SIGCONT);
-                }
-            }
+            send(pid, signal);
+        }
+    }
+}
+
+/// Send `signal` to `pid`, followed by SIGCONT (except for SIGKILL and
+/// SIGSTOP) so that a stopped process acts on it.
+fn send(pid: libc::pid_t, signal: libc::c_int) {
+    unsafe {
+        libc::kill(pid, signal);
+        if !matches!(signal, libc::SIGKILL | libc::SIGSTOP) {
+            libc::kill(pid, libc::SIGCONT);
         }
     }
 }
@@ -245,19 +250,10 @@ pub fn exited(pid: libc::pid_t) -> bool {
 /// it cannot be read.
 pub fn process_name(pid: libc::pid_t) -> String {
     #[cfg(target_os = "macos")]
-    unsafe {
-        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        if libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&mut info as *mut libc::proc_bsdinfo).cast(),
-            size,
-        ) != size
-        {
+    {
+        let Some(info) = bsd_info(pid) else {
             return String::new();
-        }
+        };
         let name = |chars: &[libc::c_char]| {
             let bytes: Vec<u8> = chars
                 .iter()
@@ -279,37 +275,6 @@ pub fn process_name(pid: libc::pid_t) -> String {
         std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .map(|name| name.trim_end_matches('\n').to_string())
             .unwrap_or_default()
-    }
-}
-
-/// When a process started, as a token that another process with the same
-/// PID (after the PID was reused, or after a reboot) never has: the start
-/// time to the microsecond on macOS; on Linux the boot and the start time
-/// in clock ticks since it. None when it cannot be read.
-pub fn start_identity(pid: libc::pid_t) -> Option<String> {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        (libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&mut info as *mut libc::proc_bsdinfo).cast(),
-            size,
-        ) == size)
-            .then(|| format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-        // After the parenthesised command name: the state (field 3) comes
-        // first, and the start time is field 22.
-        let end = stat.iter().rposition(|&b| b == b')')?;
-        let fields = std::str::from_utf8(&stat[end + 1..]).ok()?;
-        let started = fields.split_ascii_whitespace().nth(22 - 3)?;
-        Some(format!("{}/{started}", boot.trim()))
     }
 }
 
@@ -383,24 +348,6 @@ pub fn reap(pid: libc::pid_t) -> Option<ExitStatus> {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
-
-    #[test]
-    fn a_start_identity_tells_processes_apart() {
-        let own = start_identity(unsafe { libc::getpid() });
-        assert!(own.is_some());
-        assert_eq!(start_identity(unsafe { libc::getpid() }), own);
-        // Started later than this process: another identity.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
-        let other = start_identity(child.id() as libc::pid_t);
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(other.is_some());
-        assert_ne!(other, own);
-    }
 
     #[test]
     fn the_leader_is_signalled_even_when_listing_members_fails() {

@@ -6,6 +6,8 @@ usage() {
 Usage: Scripts/perf-terminal-stress [--smoke|--standard|--soak]
 
 Runs Cherry's opt-in terminal performance stress suite under /usr/bin/time.
+When a test fails, the report still has what the suite measured, and the
+script exits with the suite's status.
 
 Environment:
   CHERRY_PERF_SCALE          smoke, standard, or soak (default: standard)
@@ -58,6 +60,11 @@ report_file="${log_file%.log}.json"
 
 mkdir -p "$log_dir"
 
+# A failing suite still gets its report, and the script then exits with the
+# suite's status. In a pipeline tested with ||, -e no longer stops the block,
+# so a failed build ends it explicitly (the measured run would use a stale
+# build).
+suite_status=0
 {
     printf 'Cherry terminal performance stress\n'
     printf '  date: %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
@@ -80,7 +87,7 @@ mkdir -p "$log_dir"
     env -u CHERRY_PERF_STRESS swift test \
         -c "$configuration" \
         --no-parallel \
-        --filter TerminalPerformanceStressTests
+        --filter TerminalPerformanceStressTests || exit
     printf '\n'
 
     /usr/bin/time -lp env \
@@ -91,7 +98,7 @@ mkdir -p "$log_dir"
             --skip-build \
             --no-parallel \
             --filter TerminalPerformanceStressTests
-} 2>&1 | tee "$log_file"
+} 2>&1 | tee "$log_file" || suite_status=$?
 
 printf '\nWrote %s\n' "$log_file"
 
@@ -103,4 +110,10 @@ if [[ -n "${CHERRY_PERF_MAX_REGRESSION_PCT:-}" ]]; then
     report_args+=(--max-regression-pct "$CHERRY_PERF_MAX_REGRESSION_PCT")
 fi
 
-"$(dirname "$0")/perf-terminal-report" "${report_args[@]}"
+report_status=0
+"$(dirname "$0")/perf-terminal-report" "${report_args[@]}" || report_status=$?
+if ((suite_status != 0)); then
+    printf 'The stress suite failed (exit %s); see %s\n' "$suite_status" "$log_file" >&2
+    exit "$suite_status"
+fi
+exit "$report_status"

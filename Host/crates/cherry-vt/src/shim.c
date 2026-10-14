@@ -312,11 +312,6 @@ int cherry_vt_info(GhosttyTerminal term, CherryInfo *out) {
     return 0;
 }
 
-int cherry_vt_set_terminfo_name(GhosttyTerminal term, const uint8_t *name, size_t len) {
-    GhosttyString value = { .ptr = name, .len = len };
-    return ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_TERMINFO_NAME, &value);
-}
-
 int cherry_vt_mode(GhosttyTerminal term, uint16_t value, bool ansi, bool *on) {
     GhosttyTerminalModeConfig mode = { .mode = ghostty_mode_new(value, ansi) };
     int rc = ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_MODE, &mode);

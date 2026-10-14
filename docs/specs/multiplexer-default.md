@@ -569,13 +569,14 @@ differs from the design above.
   implemented as designed. The holder link is at `LINK_VERSION` 11 (11 adds
   `program_status`, OSC 7501 program status records, to `Info` and the
   hello's session), and a
-  daemon speaks every version from 1. Beyond the frames listed above it has
+  daemon speaks every version from 4 (`MIN_LINK_VERSION`: no holder was
+  ever built with an older one). Beyond the frames listed above it has
   `Launch` and `Failed` (Create goes through the holder), `Update` (rename /
   retag kept by the holder), `Info` (title/pwd/foreground, from version 3
   `alternate_screen` and `kitty_keyboard_flags`, from version 4
-  `application_cursor_keys`), `ScreenReply` (from version 3,
-  `SCREEN_LINES_VERSION`, `Screen` carries `max_lines`) and `Refused` (a
-  daemon that will never serve a holder, with `retry`). All of them are
+  `application_cursor_keys`), `ScreenReply` (from version 3 `Screen`
+  carries `max_lines`) and `Refused` (a daemon that will never serve a
+  holder, with `retry`). All of them are
   additive; version 4 adds only `application_cursor_keys` (in `Info` and
   the hello's session), and version 7 adds `bracketed_paste` there (left
   out by older holders, which the daemon then reports as unknown), the
@@ -693,7 +694,7 @@ differs from the design above.
   `MAX_CONNECTIONS` (1024), holders registered and still expected, lost
   sessions and its descriptor limit.
 - The daemon writes `host.pid` in its state directory (JSON: pid, its
-  start identity (`processes::start_identity`), build, start time, socket)
+  start identity (`cherry_protocol::start_identity`), build, start time, socket)
   once it holds the lock, and removes it when it exits normally. Its log lines and its holders' say when, who and which build:
   `2026-09-27T10:15:00.123Z cherry-host[1234] daemon <build>: <message>`
   (`holder` for a holder); other roles (`start`, the gateway) still write
@@ -1027,12 +1028,12 @@ differs from the design above.
   with `ESC [ 201 ~`. (Holding the paste for the adapter was rejected: it
   would arrive later, after whatever the user typed meanwhile, and the
   surface learns the mode only from the adapter's repaint.)
-- Clear Scrollback (⌘K) and MCP `clear_output` on a persistent tab also send
-  `ClearHistory`, and forget the screen read from the host; `clear_output`
-  answers once the host did, so MCP output and search read after it no
-  longer have the history, and neither does the next attach adapter. The
-  holder answers how it went (`HistoryCleared`): `clear_output` says
-  `cleared: false` with the host's reason (`hostKeptHistory`) when the
+- Clear Scrollback (⌘K) and the control request `clearOutput` on a persistent
+  tab also send `ClearHistory`, and forget the screen read from the host;
+  `clearOutput` answers once the host did, so MCP output and search read
+  after it no longer have the history, and neither does the next attach
+  adapter. The holder answers how it went (`HistoryCleared`): `clearOutput`
+  says `cleared: false` with the host's reason (`hostKeptHistory`) when the
   alternate screen shows, the holder predates link 7, is not connected, or
   failed. A UTF-8 character the output left half written is never broken:
   the holder's erase then waits for the output that completes it.
@@ -1384,13 +1385,11 @@ differs from the design above.
     and the record is kept if holders are still pending then; kept records
     are restored again once the host expects none
     (`HostControl.holdersRegistered()`), or at the next launch. A complete
-    list (`pending_holders` 0) drops the record at once. A host without
-    `pending_holders` (an older one) is listed once more after
-    `disappearanceConfirmationDelay` (2 s); still missing, the record is
-    dropped. A local host that now has another identity (its state was
-    reset) drops it at once. Whenever a record of This Mac would be dropped
-    this way, one whose session the system ended comes back as an ended tab
-    instead (next bullet).
+    list (`pending_holders` 0) drops the record at once. A local host that
+    now has another identity (its state was reset) drops it at once.
+    Whenever a record of This Mac would be dropped this way, one whose
+    session the system ended comes back as an ended tab instead (next
+    bullet).
   - Unreachable, an SSH host that answers with an identity other than the
     trusted one, or this app cannot run local sessions: the record stays
     saved, and so does a record saved while its Create had not answered

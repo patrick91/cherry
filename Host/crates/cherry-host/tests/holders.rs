@@ -41,16 +41,20 @@ fn a_killed_daemon_leaves_its_sessions_running_with_their_exact_screens() {
     // Output is flowing when the daemon dies: a counter redrawn in place,
     // which keeps the history short. The rest comes while no daemon runs,
     // up to a status query that the holder answers: then it has taken in
-    // everything before it.
+    // everything before it. The program writes its own CR LF, with the
+    // terminal's output processing off: a macOS terminal whose output
+    // queue fills at a newline (the holder fell behind) sends the CR that
+    // ONLCR adds there twice, output the transcript would not have.
     let session = host.create(shell_in(
         &dir,
-        r#"printf 'START\n'
+        r#"stty -opost
+printf 'START\r\n'
 i=0
 while [ ! -e "$CHERRY_TEST_DIR/crashed" ]; do printf '\033[2;1Hcount %07d' $i; i=$((i+1)); done
-printf '\n'
+printf '\r\n'
 j=0
-while [ $j -lt 150 ]; do printf 'down %04d\n' $j; j=$((j+1)); done
-printf 'END\n'
+while [ $j -lt 150 ]; do printf 'down %04d\r\n' $j; j=$((j+1)); done
+printf 'END\r\n'
 stty raw -echo
 printf '\033[5n'
 dd bs=1 count=4 >/dev/null 2>&1

@@ -591,8 +591,11 @@ fn drain(screen: &mut Screen, socket: &mut UnixStream) {
 #[test]
 fn an_attach_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
     let host = Host::new();
+    // Each line ends the output, its newline before it: a client that
+    // shows it has all of it (Linux writes the CR LF of a newline apart
+    // from the text before it, so it may come in an output of its own).
     let session = host.create(shell(
-        "stty -echo; printf 'READY\\n'; while IFS= read -r line; do printf 'LINE:%s\\n' \"$line\"; done",
+        "stty -echo; printf 'READY\\n'; while IFS= read -r line; do printf '\\nLINE:%s' \"$line\"; done",
     ));
     let (mut first, _, offset, snapshot) = host.attach(&session.id, 100, 30);
     let mut first_screen = Screen::new(100, 30, offset, &snapshot);
@@ -658,9 +661,12 @@ fn a_resync_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
     let host = Host::new();
     // Far more styled output than a client may have queued: a client that
     // does not read falls behind, and stays behind, since the large resync
-    // snapshot queued for it keeps it from catching up.
+    // snapshot queued for it keeps it from catching up. Each line ends the
+    // output, its newline before it: a client that shows it has all of it
+    // (Linux writes the CR LF of a newline apart from the text before it,
+    // so it may come in an output of its own).
     let session = host.create(shell(&format!(
-        "stty -echo; IFS= read -r start; {STYLED_HISTORY}; printf 'FLOOD_%s\\n' DONE; while IFS= read -r line; do printf 'LINE:%s\\n' \"$line\"; done"
+        "stty -echo; IFS= read -r start; {STYLED_HISTORY}; printf 'FLOOD_%s\\n' DONE; while IFS= read -r line; do printf '\\nLINE:%s' \"$line\"; done"
     )));
     let (mut lagging, _, offset, snapshot) = host.attach(&session.id, 100, 30);
     let mut lagging_screen = Screen::new(100, 30, offset, &snapshot);

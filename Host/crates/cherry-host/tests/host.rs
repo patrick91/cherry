@@ -351,9 +351,12 @@ fn a_lone_windows_drag_changes_the_grid_at_every_step() {
 fn a_lagging_client_is_resynchronized_instead_of_disconnected() {
     let host = Host::new();
     // About 12 MiB without pauses: far more than one client may have
-    // waiting for it (see `flood`).
+    // waiting for it (see `flood`). The live line ends the output, its
+    // newline before it: a client that shows it has all of it (Linux
+    // writes the CR LF of a newline apart from the text before it, so it
+    // may come in an output of its own).
     let session = host.create(shell(
-        "stty -echo; IFS= read -r start; dd if=/dev/zero bs=65536 count=192 2>/dev/null | tr '\\0' x; printf '\\r\\nFLOOD_%s\\r\\n' COMPLETE; IFS= read -r line; printf 'LIVE:%s\\r\\n' \"$line\"; exec sleep 60",
+        "stty -echo; IFS= read -r start; dd if=/dev/zero bs=65536 count=192 2>/dev/null | tr '\\0' x; printf '\\r\\nFLOOD_%s\\r\\n' COMPLETE; IFS= read -r line; printf '\\r\\nLIVE:%s' \"$line\"; exec sleep 60",
     ));
     let (mut stalled, _, offset, snapshot) = host.attach(&session.id, 80, 24);
     let mut stalled_screen = Screen::new(80, 24, offset, &snapshot);

@@ -67,6 +67,20 @@ Images there are removed a week later. Text wins when the clipboard has
 text too, and files copied in Finder paste as before. Edit › Paste and
 dropping image data do the same.
 
+### Keyboard Diagnostics (temporary)
+
+**Help › Keyboard Diagnostics…** shows which Ghostty config files exist
+and which one Cherry reads, the keyboard lines Cherry applies to its
+terminals, the TERM a new tab gets, the current input source, and the
+keyboard modes the front tab's program asked for. **Open Key Test Tab**
+runs `CherryMCP --key-echo` in a new tab of the front project window: it
+prints what each key sends (keys 1–4 switch between the legacy, kitty,
+modifyOtherKeys and Claude Code's keyboard modes; q quits), and the
+window lists the results. **Copy Command** copies the same test to run
+in Ghostty, to compare. **Copy Report** copies all of it as text, for an
+issue. It will be removed once the Shift+Enter and Shift+Tab reports are
+understood.
+
 ## Persistent Sessions
 
 Local terminal, command and agent tabs run as persistent sessions by default.

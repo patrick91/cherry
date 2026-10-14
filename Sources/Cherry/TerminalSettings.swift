@@ -424,16 +424,26 @@ final class TerminalSettings: ObservableObject {
     /// forwarded — app-action keybinds (tabs/splits) are Cherry's job.
     static let nativeUserKeyboardConfig: [(String, String)] = loadUserGhosttyKeyboardConfig()
 
+    /// The file `nativeUserKeyboardConfig` was read from, chosen once with it
+    /// (`userGhosttyKeyboardConfigFile`), for the Keyboard Diagnostics window.
+    /// Temporary keyboard diagnostics; remove once the Shift+Enter/Shift+Tab report is understood.
+    static let nativeUserKeyboardConfigFile: URL? = userGhosttyKeyboardConfigFile(
+        home: FileManager.default.homeDirectoryForCurrentUser
+    ) { FileManager.default.fileExists(atPath: $0) }
+
     private static func loadUserGhosttyKeyboardConfig() -> [(String, String)] {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let candidates = [
+        let contents = nativeUserKeyboardConfigFile.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+        return parseUserGhosttyKeyboardConfig(contents ?? "")
+    }
+
+    /// The ghostty config `nativeUserKeyboardConfig` reads: the first of
+    /// these that exists.
+    /// Temporary keyboard diagnostics; remove once the Shift+Enter/Shift+Tab report is understood.
+    nonisolated static func userGhosttyKeyboardConfigFile(home: URL, fileExists: (String) -> Bool) -> URL? {
+        [
             home.appendingPathComponent(".config/ghostty/config"),
             home.appendingPathComponent("Library/Application Support/com.mitchellh.ghostty/config"),
-        ]
-        let contents = candidates
-            .first(where: { FileManager.default.fileExists(atPath: $0.path) })
-            .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
-        return parseUserGhosttyKeyboardConfig(contents ?? "")
+        ].first { fileExists($0.path) }
     }
 
     /// Pure parser: keep `macos-option-as-alt` and input-producing `keybind` lines,

@@ -269,6 +269,12 @@ final class PersistentHostSessions {
         /// An attach adapter that has reported itself reconnecting (its
         /// host restarted) for this long shows the tab's reconnect bar.
         var adapterReconnectingNoticeDelay: TimeInterval = 2
+        /// An adapter that reports its program's exit while the host's
+        /// connection still lists the session running: the tab waits this
+        /// long for the host's own report, which alone says whether the
+        /// session's holder died (`HostSessionEnd`), before it takes the
+        /// adapter's status.
+        var adapterExitHostReportWait: TimeInterval = 1
         /// Bells and notifications for a session no tab follows yet (its
         /// Create answer or its tab's restore is still to come) are kept
         /// this long, at most `pendingSignalLimit` of them, for the tab that

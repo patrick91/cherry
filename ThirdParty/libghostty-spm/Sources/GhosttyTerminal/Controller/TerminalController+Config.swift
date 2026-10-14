@@ -48,6 +48,37 @@ extension TerminalController {
         return true
     }
 
+    /// The lines of `configuration` that Ghostty rejects, by their index in
+    /// it (one line per command, as a surface's configuration file has
+    /// them), each with Ghostty's diagnostic. A configuration with any of
+    /// them fails to load, and a controller then falls back to no
+    /// configuration at all (`applyInitialConfig`).
+    public static func rejectedLines(of configuration: TerminalConfiguration) -> [Int: String] {
+        let lines = configuration.commands.map(\.renderedLine)
+        guard !lines.isEmpty else { return [:] }
+        initializeRuntimeIfNeeded()
+        guard case let .success(url) = writeManagedConfig(contents: lines.joined(separator: "\n") + "\n") else {
+            return [:]
+        }
+        defer { try? FileManager.default.removeItem(at: url) }
+        guard let rawValue = ghostty_config_new() else { return [:] }
+        defer { ghostty_config_free(rawValue) }
+        ghostty_config_load_file(rawValue, url.path)
+        ghostty_config_finalize(rawValue)
+
+        // A line's diagnostic begins with `<file>:<line>:`.
+        let prefix = url.path + ":"
+        var rejected: [Int: String] = [:]
+        for message in configDiagnostics(from: rawValue) where message.hasPrefix(prefix) {
+            let rest = message.dropFirst(prefix.count)
+            guard let colon = rest.firstIndex(of: ":"), let line = Int(rest[..<colon]),
+                  lines.indices.contains(line - 1)
+            else { continue }
+            rejected[line - 1] = String(rest[rest.index(after: colon)...])
+        }
+        return rejected
+    }
+
     func applyInitialConfig(source: ConfigSource) {
         switch Self.prepareConfig(source: source) {
         case let .success(prepared):

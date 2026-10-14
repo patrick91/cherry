@@ -1000,6 +1000,9 @@ struct CherryApp: App {
         // not reach this app's tabs, whose adapters would refuse to attach
         // that tab's session as "from inside itself".
         CherryTabEnvironment.removeFromProcess()
+        // Native surfaces take the user's own Ghostty keybinds (read when
+        // the first one needs them; tests never read the user's files).
+        TerminalSettings.readsUserGhosttyConfiguration = true
         RemoteViewCrashGuard.installIfNeeded()
         // Helpers and adapters start with the last run's login environment
         // while this run's is captured (`LoginEnvironmentCache`).

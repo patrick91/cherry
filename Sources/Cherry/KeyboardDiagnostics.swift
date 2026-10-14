@@ -13,41 +13,30 @@ import CherryControl
 import SwiftUI
 
 enum KeyboardDiagnostics {
-    /// The config files Ghostty 1.3 loads, all of them, in its order
-    /// (`Config.loadDefaultFiles`): `$XDG_CONFIG_HOME/ghostty` (else
-    /// `$HOME/.config/ghostty`), then Application Support's; in each, `config`
-    /// before `config.ghostty`.
-    nonisolated static func ghosttyConfigFiles(homeDirectory: URL, environment: [String: String]) -> [URL] {
-        let home = environment["HOME"]?.nilIfEmpty.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? homeDirectory
-        let xdg = environment["XDG_CONFIG_HOME"]?.nilIfEmpty.map { URL(fileURLWithPath: $0, isDirectory: true) }
-            ?? home.appendingPathComponent(".config", isDirectory: true)
-        let appSupport = homeDirectory.appendingPathComponent("Library/Application Support/com.mitchellh.ghostty", isDirectory: true)
-        return [
-            xdg.appendingPathComponent("ghostty/config"),
-            xdg.appendingPathComponent("ghostty/config.ghostty"),
-            appSupport.appendingPathComponent("config"),
-            appSupport.appendingPathComponent("config.ghostty"),
-        ]
-    }
-
     struct ConfigFile: Equatable {
         var path: String
         var exists: Bool
-        /// One of the files Ghostty itself loads (`ghosttyConfigFiles`).
-        var loadedByGhostty: Bool
-        /// The file Cherry read its keyboard lines from at launch
-        /// (`TerminalSettings.nativeUserKeyboardConfigFile`).
+        /// A file a `config-file` line named, not one of the files Ghostty
+        /// looks for (`TerminalSettings.ghosttyDefaultConfigPaths`).
+        var isIncluded: Bool
+        /// Cherry read its keyboard lines at launch
+        /// (`TerminalSettings.nativeUserKeyboardConfigReading`).
         var readByCherry: Bool
-        /// The file Cherry would read if it launched now: another one than
-        /// `readByCherry` when a config was added, moved or removed since.
+        /// Cherry would read it if it launched now: another answer than
+        /// `readByCherry` when a file was added, moved or removed since.
         var readByCherryNext: Bool
-        /// Its keybind, macos-option-as-alt and config-file lines (`masked`).
-        var keyboardLines: [String]
+        /// Read at launch and now, with other keyboard lines now.
+        var changedSinceLaunch = false
+        /// Its keybind and macos-option-as-alt lines as Cherry reads them
+        /// now, and what it does with each.
+        var lines: [ConfigLine]
 
         var state: String {
             var parts = [exists ? "exists" : "missing"]
-            if !loadedByGhostty { parts.append("not loaded by Ghostty") }
+            if isIncluded { parts.append("named by a config-file line") }
             switch (readByCherry, readByCherryNext) {
+            case (true, true) where changedSinceLaunch:
+                parts.append("read by Cherry, changed since launch (these lines apply from its next launch)")
             case (true, true): parts.append("read by Cherry")
             case (true, false): parts.append("read by Cherry at launch, not from its next launch")
             case (false, true): parts.append("read by Cherry from its next launch (changed since launch)")
@@ -57,41 +46,56 @@ enum KeyboardDiagnostics {
         }
     }
 
-    /// Ghostty's files, then the one Cherry read at launch (`readAtLaunch`)
-    /// and the one it would read now when they are none of them (an
-    /// XDG_CONFIG_HOME elsewhere).
-    nonisolated static func configFiles(
-        homeDirectory: URL,
-        environment: [String: String],
-        readAtLaunch: URL?,
-        fileExists: (String) -> Bool,
-        contents: (URL) -> String?
-    ) -> [ConfigFile] {
-        let ghostty = ghosttyConfigFiles(homeDirectory: homeDirectory, environment: environment)
-        let next = TerminalSettings.userGhosttyKeyboardConfigFile(home: homeDirectory, fileExists: fileExists)
-        var files = ghostty
-        for file in [readAtLaunch, next].compactMap(\.self) where !files.contains(where: { $0.path == file.path }) {
-            files.append(file)
-        }
-        return files.map { file in
-            let exists = fileExists(file.path)
-            return ConfigFile(
-                path: file.path,
-                exists: exists,
-                loadedByGhostty: ghostty.contains { $0.path == file.path },
-                readByCherry: file.path == readAtLaunch?.path,
-                readByCherryNext: file.path == next?.path,
-                keyboardLines: exists ? keyboardLines(in: contents(file) ?? "") : []
-            )
+    /// A keyboard line of a config file (`masked`), and what Cherry does
+    /// with it.
+    struct ConfigLine: Equatable {
+        var text: String
+        /// Cherry's terminals take it (`UserGhosttyKeyboardConfig.Line.isApplied`).
+        var isApplied: Bool
+        /// The embedded Ghostty's diagnostic for a line it rejects, which
+        /// Cherry leaves out.
+        var rejection: String?
+
+        var state: String {
+            if let rejection { return "left out: Ghostty rejects it (\(rejection))" }
+            return isApplied ? "applied" : "not applied"
         }
     }
 
-    nonisolated static func keyboardLines(in contents: String) -> [String] {
-        contents.split(whereSeparator: \.isNewline).compactMap { rawLine in
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.hasPrefix("#"), let equals = line.firstIndex(of: "=") else { return nil }
-            let key = line[..<equals].trimmingCharacters(in: .whitespaces)
-            return ["keybind", "macos-option-as-alt", "config-file"].contains(key) ? masked(line) : nil
+    /// Ghostty's files (`defaultPaths`), then the files their `config-file`
+    /// lines name, with whether Cherry read them at launch (`atLaunch`) and
+    /// would read them now (`now`), and their keyboard lines now.
+    nonisolated static func configFiles(
+        defaultPaths: [URL],
+        atLaunch: UserGhosttyKeyboardConfig?,
+        now: UserGhosttyKeyboardConfig,
+        fileExists: (String) -> Bool
+    ) -> [ConfigFile] {
+        let readAtLaunch = atLaunch?.files.map(\.path) ?? []
+        let readNow = now.files.map(\.path)
+        var paths = defaultPaths.map(\.path)
+        for path in readAtLaunch + readNow where !paths.contains(path) {
+            paths.append(path)
+        }
+        return paths.map { path in
+            let lines = now.lines.filter { $0.file.path == path }
+            let linesAtLaunch = atLaunch?.lines.filter { $0.file.path == path } ?? []
+            return ConfigFile(
+                path: path,
+                exists: fileExists(path),
+                isIncluded: !defaultPaths.contains { $0.path == path },
+                readByCherry: readAtLaunch.contains(path),
+                readByCherryNext: readNow.contains(path),
+                changedSinceLaunch: readAtLaunch.contains(path) && readNow.contains(path)
+                    && linesAtLaunch.map { [$0.key, $0.value] } != lines.map { [$0.key, $0.value] },
+                lines: lines.map { line in
+                    ConfigLine(
+                        text: masked("\(line.key) = \(line.value)"),
+                        isApplied: line.isApplied,
+                        rejection: line.rejection.map { masked($0.trimmingCharacters(in: .whitespaces)) }
+                    )
+                }
+            )
         }
     }
 
@@ -405,7 +409,7 @@ enum KeyboardDiagnostics {
             lines.append("Ghostty config files, in Ghostty's order:")
             for file in configFiles {
                 lines.append("  \(shortened(file.path)): \(file.state)")
-                lines += file.keyboardLines.map { "    \($0)" }
+                lines += file.lines.map { "    \($0.text)   (\($0.state))" }
             }
             if !configFiles.contains(where: { $0.readByCherry || $0.readByCherryNext }) { lines.append("  Cherry reads none of them.") }
             lines.append("Applied to Cherry's terminals (read once, at launch):")
@@ -440,6 +444,7 @@ final class KeyboardDiagnosticsModel: ObservableObject {
     func refresh() {
         let info = Bundle.main.infoDictionary ?? [:]
         let home = FileManager.default.homeDirectoryForCurrentUser
+        let environment = ProcessInfo.processInfo.environment
         let status = PersistentSessionsStatus.shared
         var report = report
         report.version = info["CFBundleShortVersionString"] as? String ?? "unknown"
@@ -453,11 +458,10 @@ final class KeyboardDiagnosticsModel: ObservableObject {
         report.homeDirectory = home.path
         report.appliedKeyboardLines = TerminalSettings.nativeUserKeyboardConfig.map { KeyboardDiagnostics.masked("\($0.0) = \($0.1)") }
         report.configFiles = KeyboardDiagnostics.configFiles(
-            homeDirectory: home,
-            environment: ProcessInfo.processInfo.environment,
-            readAtLaunch: TerminalSettings.nativeUserKeyboardConfigFile,
-            fileExists: { FileManager.default.fileExists(atPath: $0) },
-            contents: { try? String(contentsOf: $0, encoding: .utf8) }
+            defaultPaths: TerminalSettings.ghosttyDefaultConfigPaths(home: home, environment: environment),
+            atLaunch: TerminalSettings.nativeUserKeyboardConfigReading,
+            now: TerminalSettings.ghosttyKeyboardConfig(home: home, environment: environment),
+            fileExists: { FileManager.default.fileExists(atPath: $0) }
         )
         self.report = report
     }
@@ -560,8 +564,15 @@ struct KeyboardDiagnosticsView: View {
                                         Text(file.state)
                                             .foregroundStyle(file.readByCherry || file.readByCherryNext ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
                                     }
-                                    ForEach(Array(file.keyboardLines.enumerated()), id: \.offset) { _, line in
-                                        Text(line).font(.system(.caption, design: .monospaced)).padding(.leading, 22)
+                                    ForEach(Array(file.lines.enumerated()), id: \.offset) { _, line in
+                                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                            Text(line.text).font(.system(.caption, design: .monospaced))
+                                            Text(line.state)
+                                                .font(.caption)
+                                                .foregroundStyle(line.rejection != nil ? AnyShapeStyle(.red)
+                                                    : line.isApplied ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                                        }
+                                        .padding(.leading, 22)
                                     }
                                 }
                             }

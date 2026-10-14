@@ -167,114 +167,111 @@ private struct TemporaryHome {
         try contents.write(to: file, atomically: true, encoding: .utf8)
     }
 
-    func configFiles(environment: [String: String] = [:], readAtLaunch: String? = nil) -> [KeyboardDiagnostics.ConfigFile] {
+    func delete(_ relativePath: String) throws {
+        try FileManager.default.removeItem(at: url.appendingPathComponent(relativePath))
+    }
+
+    /// What Cherry reads of this home's Ghostty files now.
+    @MainActor
+    func reading() -> UserGhosttyKeyboardConfig {
+        TerminalSettings.ghosttyKeyboardConfig(home: url, environment: [:])
+    }
+
+    /// The window's files, as if Cherry read `atLaunch` at launch.
+    @MainActor
+    func configFiles(atLaunch: UserGhosttyKeyboardConfig?) -> [KeyboardDiagnostics.ConfigFile] {
         KeyboardDiagnostics.configFiles(
-            homeDirectory: url,
-            environment: environment,
-            readAtLaunch: readAtLaunch.map { url.appendingPathComponent($0) },
-            fileExists: { FileManager.default.fileExists(atPath: $0) },
-            contents: { try? String(contentsOf: $0, encoding: .utf8) }
+            defaultPaths: TerminalSettings.ghosttyDefaultConfigPaths(home: url, environment: [:]),
+            atLaunch: atLaunch,
+            now: reading(),
+            fileExists: { FileManager.default.fileExists(atPath: $0) }
         )
     }
 
     func remove() { try? FileManager.default.removeItem(at: url) }
 }
 
-@Test func ghosttyConfigFilesAreGhosttysFourInItsOrder() {
-    let home = URL(fileURLWithPath: "/Users/me", isDirectory: true)
-    #expect(KeyboardDiagnostics.ghosttyConfigFiles(homeDirectory: home, environment: [:]).map(\.path) == [
-        "/Users/me/.config/ghostty/config",
-        "/Users/me/.config/ghostty/config.ghostty",
-        "/Users/me/Library/Application Support/com.mitchellh.ghostty/config",
-        "/Users/me/Library/Application Support/com.mitchellh.ghostty/config.ghostty",
-    ])
-    #expect(KeyboardDiagnostics.ghosttyConfigFiles(
-        homeDirectory: home, environment: ["XDG_CONFIG_HOME": "/elsewhere", "HOME": "/Users/other"]
-    ).map(\.path) == [
-        "/elsewhere/ghostty/config",
-        "/elsewhere/ghostty/config.ghostty",
-        "/Users/me/Library/Application Support/com.mitchellh.ghostty/config",
-        "/Users/me/Library/Application Support/com.mitchellh.ghostty/config.ghostty",
-    ])
-    // An empty XDG_CONFIG_HOME is unset; HOME names the XDG one's home.
-    #expect(KeyboardDiagnostics.ghosttyConfigFiles(
-        homeDirectory: home, environment: ["XDG_CONFIG_HOME": "", "HOME": "/Users/other"]
-    ).first?.path == "/Users/other/.config/ghostty/config")
+private func describe(_ file: KeyboardDiagnostics.ConfigFile) -> [String] {
+    file.lines.map { "\($0.text): \($0.state)" }
 }
 
-@Test func cherryReadsOnlyTheFirstOfItsTwoConfigFiles() throws {
+@MainActor
+@Test func cherryReadsEveryGhosttyConfigFileAndSaysWhatItAppliesOfEachLine() throws {
     let home = try TemporaryHome()
     defer { home.remove() }
-    let exists = { FileManager.default.fileExists(atPath: $0) }
-    #expect(TerminalSettings.userGhosttyKeyboardConfigFile(home: home.url, fileExists: exists) == nil)
-
-    try home.write("Library/Application Support/com.mitchellh.ghostty/config", "keybind = shift+enter=text:\\n\nfont-size = 13\n")
-    #expect(TerminalSettings.userGhosttyKeyboardConfigFile(home: home.url, fileExists: exists)?.path
-        == home.url.appendingPathComponent("Library/Application Support/com.mitchellh.ghostty/config").path)
-
-    // A ~/.config one hides Application Support's, keybinds and all.
-    try home.write(".config/ghostty/config", "theme = dark\n")
-    let files = home.configFiles(readAtLaunch: ".config/ghostty/config")
-    #expect(files.map(\.exists) == [true, false, true, false])
-    #expect(files.map(\.loadedByGhostty) == [true, true, true, true])
-    #expect(files.map(\.readByCherry) == [true, false, false, false])
-    #expect(files.map(\.readByCherryNext) == [true, false, false, false])
-    #expect(files[0].state == "exists, read by Cherry")
-    #expect(files[0].keyboardLines == [])
-    #expect(files[2].keyboardLines == ["keybind = shift+enter=text:\\n"])
-}
-
-@Test func aConfigAddedSinceLaunchIsReadOnlyFromCherrysNextLaunch() throws {
-    let home = try TemporaryHome()
-    defer { home.remove() }
-    try home.write("Library/Application Support/com.mitchellh.ghostty/config", "keybind = shift+enter=text:\\n\n")
-    try home.write(".config/ghostty/config", "theme = dark\n")
-    let files = home.configFiles(readAtLaunch: "Library/Application Support/com.mitchellh.ghostty/config")
-    #expect(files.map(\.readByCherry) == [false, false, true, false])
-    #expect(files.map(\.readByCherryNext) == [true, false, false, false])
-    #expect(files[0].state == "exists, read by Cherry from its next launch (changed since launch)")
-    #expect(files[2].state == "exists, read by Cherry at launch, not from its next launch")
-}
-
-@Test func cherryReadsNoConfigGhosttyFile() throws {
-    let home = try TemporaryHome()
-    defer { home.remove() }
-    try home.write(".config/ghostty/config.ghostty", "keybind = shift+enter=text:\\n\n")
-    let files = home.configFiles()
-    #expect(files.map(\.exists) == [false, true, false, false])
-    #expect(!files.contains { $0.readByCherry || $0.readByCherryNext })
-}
-
-@Test func cherrysFileIsListedWhenXDGConfigHomeIsElsewhere() throws {
-    let home = try TemporaryHome()
-    defer { home.remove() }
-    try home.write(".config/ghostty/config", "keybind = shift+tab=text:x\n")
-    let files = home.configFiles(
-        environment: ["XDG_CONFIG_HOME": home.url.appendingPathComponent("xdg").path],
-        readAtLaunch: ".config/ghostty/config"
-    )
-    #expect(files.count == 5)
-    #expect(files.last?.path == home.url.appendingPathComponent(".config/ghostty/config").path)
-    #expect(files.last?.readByCherry == true)
-    #expect(files.last?.state == "exists, not loaded by Ghostty, read by Cherry")
-    #expect(files.last?.keyboardLines == ["keybind = shift+tab=text:x"])
-}
-
-@Test func keyboardLinesAreKeybindsOptionAsAltAndConfigFiles() {
-    let config = """
-    # keybind = shift+enter=text:\\n
+    let appSupport = "Library/Application Support/com.mitchellh.ghostty"
+    try home.write(".config/ghostty/config", """
+    theme = dark
     keybind = super+t=new_tab
-      keybind=shift+enter=text:\\x1b\\r
+    keybind = shift+enter=text:\\n
+    """)
+    // The Application Support file is read too, after it: its Shift+Enter
+    // binding replaces the first file's.
+    try home.write("\(appSupport)/config", """
+    keybind = shift+enter=text:\\x1b\\r
+    keybind = ctrl+e=text:secret\\r
+    macos-option-as-alt = yes
     macos-option-as-alt = left
-    config-file = ?keys.conf
-    font-family = Menlo
-    """
-    #expect(KeyboardDiagnostics.keyboardLines(in: config) == [
-        "keybind = super+t=new_tab",
-        "keybind=shift+enter=text:\\x1b\\r",
-        "macos-option-as-alt = left",
-        "config-file = ?keys.conf",
+    """)
+    let files = home.configFiles(atLaunch: home.reading())
+    #expect(files.map(\.path) == TerminalSettings.ghosttyDefaultConfigPaths(home: home.url, environment: [:]).map(\.path))
+    #expect(files.map(\.exists) == [true, false, true, false])
+    #expect(files.map(\.readByCherry) == [true, false, true, false])
+    #expect(files.map(\.readByCherryNext) == [true, false, true, false])
+    #expect(!files.contains { $0.isIncluded || $0.changedSinceLaunch })
+    #expect(files[0].state == "exists, read by Cherry")
+    #expect(files[1].state == "missing")
+    #expect(describe(files[0]) == [
+        "keybind = super+t=new_tab: not applied",
+        "keybind = shift+enter=text:\\n: not applied",
     ])
+    #expect(describe(files[2]).count == 4)
+    #expect(describe(files[2])[0] == "keybind = shift+enter=text:\\x1b\\r: applied")
+    #expect(describe(files[2])[1] == "keybind = ctrl+e=text:***\\r: applied")
+    #expect(files[2].lines[2].text == "macos-option-as-alt = yes")
+    #expect(files[2].lines[2].state.hasPrefix("left out: Ghostty rejects it ("))
+    #expect(!files[2].lines[2].isApplied)
+    #expect(describe(files[2])[3] == "macos-option-as-alt = left: applied")
+}
+
+@MainActor
+@Test func configChangesSinceLaunchApplyOnlyFromCherrysNextLaunch() throws {
+    let home = try TemporaryHome()
+    defer { home.remove() }
+    let appSupport = "Library/Application Support/com.mitchellh.ghostty"
+    try home.write("\(appSupport)/config", "keybind = shift+enter=text:\\n\n")
+    try home.write(".config/ghostty/config.ghostty", "font-size = 13\n")
+    let launch = home.reading()
+
+    // Added, changed and removed since launch.
+    try home.write(".config/ghostty/config", "theme = dark\n")
+    try home.write("\(appSupport)/config", "keybind = shift+enter=text:\\x1b\\r\n")
+    try home.delete(".config/ghostty/config.ghostty")
+    let files = home.configFiles(atLaunch: launch)
+    #expect(files.map(\.readByCherry) == [false, true, true, false])
+    #expect(files.map(\.readByCherryNext) == [true, false, true, false])
+    #expect(files[0].state == "exists, read by Cherry from its next launch (changed since launch)")
+    #expect(files[1].state == "missing, read by Cherry at launch, not from its next launch")
+    #expect(files[2].state == "exists, read by Cherry, changed since launch (these lines apply from its next launch)")
+    #expect(describe(files[2]) == ["keybind = shift+enter=text:\\x1b\\r: applied"])
+
+    // Without a reading at launch (a test's), none was read then.
+    #expect(!home.configFiles(atLaunch: nil).contains { $0.readByCherry })
+}
+
+@MainActor
+@Test func filesThatConfigFileLinesNameAreListedAfterGhosttysOwn() throws {
+    let home = try TemporaryHome()
+    defer { home.remove() }
+    try home.write(".config/ghostty/config.ghostty", "config-file = keys.conf\nconfig-file = ?missing.conf\n")
+    try home.write(".config/ghostty/keys.conf", "keybind = shift+enter=text:\\n\n")
+    let files = home.configFiles(atLaunch: home.reading())
+    #expect(files.count == 5)
+    #expect(files[1].state == "exists, read by Cherry")
+    #expect(files[1].lines.isEmpty)
+    #expect(files[4].path == home.url.appendingPathComponent(".config/ghostty/keys.conf").path)
+    #expect(files[4].state == "exists, named by a config-file line, read by Cherry")
+    #expect(describe(files[4]) == ["keybind = shift+enter=text:\\n: applied"])
 }
 
 @Test func textKeybindsWordsAreMaskedButTheirEscapesStay() {
@@ -290,7 +287,7 @@ private struct TemporaryHome {
     }
     #expect(KeyboardDiagnostics.masked("keybind = ctrl+e=text:hello world\\n") == "keybind = ctrl+e=text:*** ***\\n")
     #expect(KeyboardDiagnostics.masked("keybind = ctrl+e=text:\\u{1b}secret") == "keybind = ctrl+e=text:\\u{1b}***")
-    #expect(KeyboardDiagnostics.keyboardLines(in: "keybind = a=text:pässword\n") == ["keybind = a=text:***"])
+    #expect(KeyboardDiagnostics.masked("keybind = a=text:pässword") == "keybind = a=text:***")
 }
 
 // MARK: - Report
@@ -346,12 +343,17 @@ private struct TemporaryHome {
     report.nativeTab = "TERM=xterm-ghostty TERM_PROGRAM=Ghostty TERM_PROGRAM_VERSION=1.3.0"
     report.homeDirectory = "/Users/me"
     report.configFiles = [
-        .init(path: "/Users/me/.config/ghostty/config", exists: true, loadedByGhostty: true, readByCherry: true,
-              readByCherryNext: true, keyboardLines: []),
-        .init(path: "/Users/me/.config/ghostty/config.ghostty", exists: false, loadedByGhostty: true, readByCherry: false,
-              readByCherryNext: false, keyboardLines: []),
-        .init(path: "/Users/me/Library/Application Support/com.mitchellh.ghostty/config", exists: true, loadedByGhostty: true,
-              readByCherry: false, readByCherryNext: false, keyboardLines: ["keybind = shift+enter=text:\\n"]),
+        .init(path: "/Users/me/.config/ghostty/config", exists: true, isIncluded: false, readByCherry: true,
+              readByCherryNext: true, lines: [.init(text: "keybind = shift+enter=text:\\n", isApplied: false)]),
+        .init(path: "/Users/me/.config/ghostty/config.ghostty", exists: false, isIncluded: false, readByCherry: false,
+              readByCherryNext: false, lines: []),
+        .init(path: "/Users/me/Library/Application Support/com.mitchellh.ghostty/config", exists: true, isIncluded: false,
+              readByCherry: true, readByCherryNext: true, lines: [
+                  .init(text: "keybind = shift+enter=text:\\n", isApplied: true),
+                  .init(text: "macos-option-as-alt = yes", isApplied: false, rejection: "invalid value"),
+              ]),
+        .init(path: "/Users/me/.config/ghostty/keys.conf", exists: true, isIncluded: true, readByCherry: true,
+              readByCherryNext: true, lines: []),
     ]
     report.appliedKeyboardLines = ["keybind = shift+tab=csi:Z", "macos-option-as-alt = true"]
     let keyTest = KeyboardDiagnostics.Tab(id: UUID(), title: "Key Test", project: "cherry")
@@ -375,9 +377,12 @@ private struct TemporaryHome {
 
     Ghostty config files, in Ghostty's order:
       ~/.config/ghostty/config: exists, read by Cherry
+        keybind = shift+enter=text:\\n   (not applied)
       ~/.config/ghostty/config.ghostty: missing
-      ~/Library/Application Support/com.mitchellh.ghostty/config: exists
-        keybind = shift+enter=text:\\n
+      ~/Library/Application Support/com.mitchellh.ghostty/config: exists, read by Cherry
+        keybind = shift+enter=text:\\n   (applied)
+        macos-option-as-alt = yes   (left out: Ghostty rejects it (invalid value))
+      ~/.config/ghostty/keys.conf: exists, named by a config-file line, read by Cherry
     Applied to Cherry's terminals (read once, at launch):
       keybind = shift+tab=csi:Z
       macos-option-as-alt = true

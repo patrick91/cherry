@@ -308,6 +308,105 @@ private let backgroundSessionsLine = "Open or end it from Background Sessions in
     #expect(primary.workspace.sessions.count == 1)
 }
 
+/// File › New Window opens no other window of a project while its last
+/// window asks to close or closes: the question promised that window's tabs
+/// come back, which another window of the project opening meanwhile would
+/// break (the close would forget them). A window that is not the last
+/// promised nothing.
+@Test @MainActor func newWindowOpensNoWindowOfAProjectWhileAWindowOfItAsksToClose() async throws {
+    let harness = try PersistentHarness()
+    let questions = Questions()
+    let project = try ProjectWindows(harness, name: "cherry-close-new-window")
+    defer {
+        questions.restore()
+        project.cleanUp()
+        harness.cleanUp()
+    }
+    var opened: [ProjectWindowValue] = []
+    project.registry.newProjectWindowOpener = { opened.append($0) }
+    let primary = project.open()
+    let tab = try #require(primary.workspace.sessions.first)
+    #expect(await harness.waitUntilAttached(tab))
+
+    #expect(!primary.delegate.windowShouldClose(primary.window))
+    #expect(try #require(questions.asked.last).tabsComeBack)
+    #expect(!project.registry.canOpenAnotherWindow(from: primary.window))
+    #expect(!project.registry.openAnotherWindow(from: primary.window))
+    #expect(!project.registry.openAnotherWindow(from: nil))
+    questions.answer(.cancel)
+    #expect(project.registry.openAnotherWindow(from: primary.window))
+    #expect(opened.count == 1)
+
+    // Answered Keep Running: its tabs close first, then the window.
+    #expect(!primary.delegate.windowShouldClose(primary.window))
+    #expect(try #require(questions.asked.last).tabsComeBack)
+    questions.answer(.keep)
+    #expect(primary.repository.isTearingDown)
+    #expect(!project.registry.openAnotherWindow(from: primary.window))
+    #expect(opened.count == 1)
+    #expect(await eventually { primary.window.closeCount == 1 })
+    project.didClose(primary)
+    // As promised, its tab comes back when the project opens again.
+    #expect(project.savedTabIDs() == [tab.id])
+
+    // Two windows: one asking to close is not the last.
+    let reopened = project.open()
+    let other = project.open(UUID())
+    #expect(await harness.waitUntilAttached(try #require(other.workspace.sessions.first)))
+    #expect(!other.delegate.windowShouldClose(other.window))
+    #expect(try #require(questions.asked.last).tabsComeBack == false)
+    #expect(project.registry.openAnotherWindow(from: reopened.window))
+    #expect(opened.count == 2)
+    questions.answer(.cancel)
+}
+
+/// A project's commands run in one tab across its windows: a window closed
+/// with Keep Running while another of its project stays open hands its
+/// running command tabs to that window, with their sessions (no new
+/// Create, no Kill), so a Start of the command there finds its tab, and
+/// that window saves it (it comes back with that window). Its other kept
+/// sessions go to Background Sessions as before.
+@Test @MainActor func aWindowClosedKeepingSessionsHandsItsRunningCommandsToAnotherWindowOfItsProject() async throws {
+    let harness = try PersistentHarness()
+    let questions = Questions()
+    let project = try ProjectWindows(harness, name: "cherry-close-hands-over-commands")
+    defer {
+        questions.restore()
+        project.cleanUp()
+        harness.cleanUp()
+    }
+    let command = ProjectCommandDefinition(name: "dev", command: "serve")
+    let otherID = UUID()
+    let opener = project.open()
+    let other = project.open(otherID)
+    let shell = try #require(opener.workspace.sessions.first)
+    #expect(await harness.waitUntilAttached(shell))
+    #expect(await harness.waitUntilAttached(try #require(other.workspace.sessions.first)))
+    let dev = opener.workspace.addCommandSession(command: command, projectRoot: project.root.path, select: false)
+    #expect(await harness.waitUntilAttached(dev))
+    let devSession = try sessionID(of: dev)
+    let shellSession = try sessionID(of: shell)
+    let createsBefore = harness.creates().count
+
+    #expect(!opener.delegate.windowShouldClose(opener.window))
+    questions.answer(.keep)
+    #expect(await eventually { opener.window.closeCount == 1 })
+    project.didClose(opener)
+
+    let handed = try #require(other.workspace.commandSession(named: "dev"))
+    #expect(handed.id == dev.id)
+    #expect(handed.persistentSession?.sessionID == devSession)
+    #expect(harness.hosting.owningTab(of: devSession) === handed)
+    #expect(other.workspace.selectedSession?.id != handed.id)
+    #expect(harness.hosting.owningTab(of: shellSession) == nil)
+    #expect(other.workspace.addCommandSession(command: command, projectRoot: project.root.path) === handed)
+    #expect(await harness.fake.wait { project.savedTabIDs(otherID)?.contains(dev.id) == true })
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(harness.creates().count == createsBefore)
+    #expect(harness.fake.requests("kill").isEmpty)
+    #expect(harness.fake.sessions.contains { $0.id == devSession && $0.isRunning })
+}
+
 /// The project's primary window closed while another stays open: its file
 /// is written empty (no tabs, saved now), never removed, so the next primary
 /// window's look for orphans still knows when it was saved; its frame stays,

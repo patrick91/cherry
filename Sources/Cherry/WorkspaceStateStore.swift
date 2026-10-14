@@ -660,8 +660,14 @@ final class WorkspaceStateStore: @unchecked Sendable {
     /// The saved windows in their saved order; a file of a build before
     /// #22 lists primaries only (its `projectRoots`).
     func loadOpenProjectWindows() -> [ProjectWindowValue] {
-        guard let record = loadOpenProjectWindowsRecord() else { return [] }
-        return record.windows ?? record.projectRoots.map(ProjectWindowValue.primary)
+        loadSavedOpenProjectWindows() ?? []
+    }
+
+    /// The saved windows as `loadOpenProjectWindows` reads them, or nil when
+    /// there is no list this version can use: none was saved, or the file
+    /// was moved aside (unreadable, or of another version).
+    func loadSavedOpenProjectWindows() -> [ProjectWindowValue]? {
+        loadOpenProjectWindowsRecord().map { $0.windows ?? $0.projectRoots.map(ProjectWindowValue.primary) }
     }
 
     /// Saves `windows` in their order, with their projects, once each and
@@ -731,6 +737,22 @@ final class WorkspaceStateStore: @unchecked Sendable {
         }
     }
 
+    /// The saved windows of This Mac (`saved`) with saved tabs whose folder
+    /// is missing (an unmounted volume), once each, in saved order:
+    /// `projectWindowsToReopen` skips them, and they stay saved as open
+    /// until it can reopen them (`ProjectWindowRegistry`).
+    func projectWindowsAwaitingTheirFolder(_ saved: [ProjectWindowValue]) -> [ProjectWindowValue] {
+        var seen = Set<ProjectWindowValue>()
+        return saved.filter { window in
+            guard seen.insert(window).inserted, !ProjectLocation.isRemoteKey(window.projectRoot) else { return false }
+            var isDirectory: ObjCBool = false
+            guard !FileManager.default.fileExists(atPath: window.projectRoot, isDirectory: &isDirectory)
+                    || !isDirectory.boolValue
+            else { return false }
+            return load(repositoryRoot: window.projectRoot, windowID: window.windowID)?.hasSessions == true
+        }
+    }
+
     /// The projects of the windows to reopen at launch (`projectWindowsToReopen`).
     func projectWindowRootsToReopen(remoteProjectIsKnown: (String) -> Bool = { _ in false }) -> [String] {
         projectWindowsToReopen(remoteProjectIsKnown: remoteProjectIsKnown).map(\.window.projectRoot)
@@ -770,63 +792,119 @@ final class WorkspaceStateStore: @unchecked Sendable {
     /// `forgetWindowState` is.
     func moveWindowStateToPrimary(repositoryRoot: String, windowID: UUID) {
         guard isEnabled else { return }
+        queue.async {
+            self.moveWindowStateToPrimaryLocked(repositoryRoot: repositoryRoot, windowID: windowID)
+        }
+    }
+
+    /// `moveWindowStateToPrimary`'s work, on `queue`: true once the record
+    /// is the primary's and its own file is gone.
+    @discardableResult
+    private func moveWindowStateToPrimaryLocked(repositoryRoot: String, windowID: UUID) -> Bool {
         let fileURL = stateFileURL(repositoryRoot: repositoryRoot, windowID: windowID)
         let primaryURL = stateFileURL(repositoryRoot: repositoryRoot)
-        queue.async {
-            guard var state = self.readVersionedLocked(RepositoryStateRecord.self, from: fileURL),
-                  state.repositoryRoot == repositoryRoot, state.windowID == windowID
-            else { return }
-            if let primary = self.readVersionedLocked(RepositoryStateRecord.self, from: primaryURL),
-               primary.repositoryRoot != repositoryRoot || primary.windowID != nil {
-                self.setAsideLocked(primaryURL, label: "other-root")
-            }
-            state.windowID = nil
-            guard self.writeLocked(state, to: primaryURL) else { return }
-            unlink(fileURL.path)
+        guard var state = readVersionedLocked(RepositoryStateRecord.self, from: fileURL),
+              state.repositoryRoot == repositoryRoot, state.windowID == windowID
+        else { return false }
+        if let primary = readVersionedLocked(RepositoryStateRecord.self, from: primaryURL),
+           primary.repositoryRoot != repositoryRoot || primary.windowID != nil {
+            setAsideLocked(primaryURL, label: "other-root")
         }
+        state.windowID = nil
+        guard writeLocked(state, to: primaryURL) else { return false }
+        return unlink(fileURL.path) == 0
+    }
+
+    /// What the launch's sweep did with the state files of windows no list
+    /// named (`removeAbandonedWindowStates`).
+    struct AbandonedWindowStates: Sendable {
+        /// Removed: their frames go too.
+        var removed: [ProjectWindowValue] = []
+        /// Moved to their project's primary file: their frames go to the
+        /// primary's keys.
+        var movedToPrimary: [ProjectWindowValue] = []
+    }
+
+    /// What `removeAbandonedWindowStates` reads of a state file: never its
+    /// tabs.
+    private struct StateFileHeader: Decodable {
+        var version: Int
+        var repositoryRoot: String
+        var windowID: UUID?
     }
 
     /// In the background: removes the state files of This Mac's windows
     /// other than primaries (a `windowID`, a root that is no device's key)
-    /// that `listed` (the windows the launch read as open) does not name
-    /// and that were last written before `cutoff` (when it read them), then
-    /// gives `completion` the windows removed, on the main queue. They are
-    /// no window's: every window open this run was listed or has saved
-    /// since, and a window closed while its project stayed open removed its
-    /// own file. A crash between such a close's save and its removal leaves
-    /// one, and so does an older build, which reopens primaries only and
-    /// drops the others from the list. Never a primary's file, a device
-    /// project's (its device may be unknown now, and its stand-in window
-    /// keeps its tabs as saved), a protected or unusable one, one under
-    /// another window's name, or any while the store is disabled.
+    /// that `listed` (the windows the launch read as open, from a list it
+    /// could use) does not name and that were last written before `cutoff`
+    /// (when it read them), then gives `completion` what it did, on the
+    /// main queue. They are no window's: every window open this run was
+    /// listed or has saved since, a window the launch could not reopen
+    /// stays listed, and a window closed while its project stayed open
+    /// removed its own file. A crash between such a close's save and its
+    /// removal leaves one, and so does an older build, which reopens
+    /// primaries only and drops the others from the list. One of a project
+    /// no window of which is listed, whose primary file has no tabs, is
+    /// moved to the primary's file instead, the newest first, as the
+    /// project's last window's close would have (`moveWindowStateToPrimary`,
+    /// which may have failed); with a primary file this version cannot use,
+    /// it is left. Never a primary's file, a device project's (its device
+    /// may be unknown now, and its stand-in window keeps its tabs as
+    /// saved), a protected or unusable one, one under another window's
+    /// name, or any while the store is disabled. Reads only each file's
+    /// header (`StateFileHeader`), not its tabs.
     func removeAbandonedWindowStates(
         listed: Set<ProjectWindowValue>,
         modifiedBefore cutoff: Date,
-        completion: @escaping @MainActor @Sendable ([ProjectWindowValue]) -> Void
+        completion: @escaping @MainActor @Sendable (AbandonedWindowStates) -> Void
     ) {
         guard isEnabled else { return }
         let directory = directory
+        let listedRoots = Set(listed.map(\.projectRoot))
         queue.async {
             let manager = FileManager.default
-            var removed: [ProjectWindowValue] = []
+            var abandoned: [(url: URL, modified: Date, window: ProjectWindowValue)] = []
             for name in (try? manager.contentsOfDirectory(atPath: directory.path)) ?? [] where Self.isStateFileName(name) {
                 let url = directory.appendingPathComponent(name, isDirectory: false)
                 guard !self.protectedFiles.contains(url.path),
                       let modified = (try? manager.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
                       modified < cutoff,
-                      case .usable(let state) = Self.readFile(RepositoryStateRecord.self, from: url),
-                      state.version == RepositoryStateRecord.currentVersion,
-                      let windowID = state.windowID,
-                      !ProjectLocation.isRemoteKey(state.repositoryRoot),
-                      name == Self.stateFileName(repositoryRoot: state.repositoryRoot, windowID: windowID)
+                      case .usable(let header) = Self.readFile(StateFileHeader.self, from: url),
+                      header.version == RepositoryStateRecord.currentVersion,
+                      let windowID = header.windowID,
+                      !ProjectLocation.isRemoteKey(header.repositoryRoot),
+                      name == Self.stateFileName(repositoryRoot: header.repositoryRoot, windowID: windowID)
                 else { continue }
-                let window = ProjectWindowValue(projectRoot: state.repositoryRoot, windowID: windowID)
-                if !listed.contains(window), unlink(url.path) == 0 {
-                    removed.append(window)
+                let window = ProjectWindowValue(projectRoot: header.repositoryRoot, windowID: windowID)
+                if !listed.contains(window) {
+                    abandoned.append((url, modified, window))
+                }
+            }
+            var result = AbandonedWindowStates()
+            for file in abandoned.sorted(by: { $0.modified > $1.modified }) {
+                let root = file.window.projectRoot
+                if !listedRoots.contains(root) {
+                    switch Self.readFile(RepositoryStateRecord.self, from: self.stateFileURL(repositoryRoot: root)) {
+                    case .usable(let primary)
+                        where primary.version == RepositoryStateRecord.currentVersion
+                            && primary.repositoryRoot == root && primary.windowID == nil && primary.hasSessions:
+                        break
+                    case .missing, .usable:
+                        if let windowID = file.window.windowID,
+                           self.moveWindowStateToPrimaryLocked(repositoryRoot: root, windowID: windowID) {
+                            result.movedToPrimary.append(file.window)
+                        }
+                        continue
+                    case .unusable:
+                        continue
+                    }
+                }
+                if unlink(file.url.path) == 0 {
+                    result.removed.append(file.window)
                 }
             }
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { completion(removed) }
+                MainActor.assumeIsolated { completion(result) }
             }
         }
     }

@@ -1008,6 +1008,9 @@ struct CherryApp: App {
         ProjectWindowRegistry.shared.remoteProjectIsKnown = { key in
             RemoteDeviceStore.shared.device(forProjectKey: key) != nil
         }
+        // File › New Window opens nothing while the launch waits for the
+        // instance lock, as a Dock click does not.
+        ProjectWindowRegistry.shared.launchAwaitsInstanceLock = { !AppInstanceLock.shared.isResolved }
         // The saved state (`configureWorkspacePersistence`) is read once the
         // instance lock is resolved, off this thread (`applicationDidFinishLaunching`):
         // reading it here would take the lock on the main thread, blocking
@@ -1409,13 +1412,19 @@ private struct ProjectWindowView: View {
         // the project's most recently active window.
         let registry = ProjectWindowRegistry.shared
         if registry.hasWindow(for: projectRoot) {
+            // Not queued: only a window being opened takes queued links
+            // (as it appears), and the next one would be another window of
+            // the project, opened later for something else.
             if !registry.select(deepLink, projectRoot: projectRoot) {
                 _ = registry.focus(projectRoot: projectRoot)
-                CherryDeepLinkOpenQueue.shared.enqueue(deepLink, projectRoot: projectRoot)
             }
         } else {
+            // For the window that opens the project: one the launch still
+            // opens (`focus` waits for it), else its primary.
             CherryDeepLinkOpenQueue.shared.enqueue(deepLink, projectRoot: projectRoot)
-            openWindow(value: ProjectWindowValue.primary(projectRoot))
+            if !registry.focus(projectRoot: projectRoot) {
+                openWindow(value: ProjectWindowValue.primary(projectRoot))
+            }
         }
     }
 }

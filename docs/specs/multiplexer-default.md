@@ -184,9 +184,15 @@ is Keep Running, nor a detached tab's. A window closed while another window
 of its project stays open (or is still to open at launch) says instead that
 its kept sessions go to Background Sessions, and its saved tabs are
 forgotten (a primary's file is written empty, another window's removed with
-its frame); the project's last window keeps its tabs for the next time the
-project opens, another window's becoming the primary's
-(`ProjectWindowRegistry.windowDidClose`). A quit keeps every window's.
+its frame); its running command tabs go on, with their sessions, in the
+project's most recently active window instead
+(`ProjectWindowRegistry.commandTabsHandedOver`): a project's command runs in
+one tab across its windows. The project's last window keeps its tabs for the
+next time the project opens, another window's becoming the primary's
+(`ProjectWindowRegistry.windowDidClose`). A quit keeps every window's, and so
+does a second copy of the app. While the question of a project's last
+window is up, or that window closes, File › New Window opens no other window
+of its project.
 **Don't ask
 again** stores Keep Running or End Sessions as *on quit*; Cancel stores
 nothing. With *on quit* Keep Running or End Sessions, or with no running
@@ -1368,11 +1374,16 @@ differs from the design above.
   `launchRequestID`), and a window other than a project's primary is saved
   as it claims its project; it never saves during teardown, and quit
   flushes it first. A closed window's file is forgotten or moved to the
-  primary's name as the close question above says; once the launch's
-  windows opened, files of This Mac's windows other than primaries that the
-  saved list did not name and that were written before the launch read it
-  (a crash during a close, an older build's run) are removed in the
-  background. Records gained optional `owned` and `launchRequestID` fields (older
+  primary's name as the close question above says. The launch's saved
+  windows that cannot open (their folder is missing) or never register stay
+  in `open-windows.json` until a later launch reopens them. Once the
+  launch's windows opened (a few seconds after a launch that reopens none),
+  files of This Mac's windows other than primaries that the saved list did
+  not name and that were written before the launch read it (a crash during a
+  close, an older build's run) are removed in the background, reading only
+  each file's header; one of a project that list does not name, whose
+  primary file has no tabs, becomes the primary's instead. A launch that
+  read no list it could use (none, or one moved aside) removes none. Records gained optional `owned` and `launchRequestID` fields (older
   builds ignore them). A state file (or `open-windows.json`) of another
   version, one that does not decode, or one for another root is moved aside
   as `<file>.<vN|unreadable|other-root>-<UTC yyyyMMddTHHmmssZ>.bak` in the
@@ -1602,8 +1613,9 @@ differs from the design above.
     registered). It never adds a second tab for a command a restored tab of
     any of the project's windows runs (running or ended). An auto-start
     command whose tab is still being restored in any of them (a host that
-    answers late) or was kept because the local host was unreachable (or its
-    holders were pending) waits for that tab to come back during this run.
+    answers late, a tab shown before the host answered included) or was kept
+    because the local host was unreachable (or its holders were pending)
+    waits for that tab to come back during this run.
     Until then it does not start at all, which avoids two copies of a
     server.
   - Auto-start also restarts a restored auto-start command whose session

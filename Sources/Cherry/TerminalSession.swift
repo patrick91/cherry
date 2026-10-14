@@ -2633,6 +2633,28 @@ final class TerminalWorkspace: ObservableObject {
         return left
     }
 
+    /// This window's command tabs whose program runs in a session of this
+    /// app's that a close keeping sessions leaves running, as undo would
+    /// bring them back (`closedTab(for:name:)`), placed after any tabs:
+    /// read before the window's tabs close, so that another window of the
+    /// project shows them once they did
+    /// (`ProjectWindowRegistry.commandTabsHandedOver`).
+    func commandTabsKeptRunning() -> [ClosedTab] {
+        persistentSessionsEnded(by: .windowClosedEndingSessions).compactMap { session in
+            guard session.kind == .command || restoredSessionRecords[session.id]?.kind == .command,
+                  session.isProgramRunning,
+                  let closed = closedTab(for: session, name: session.title)
+            else { return nil }
+            return ClosedTab(
+                record: closed.record,
+                name: closed.name,
+                binding: closed.binding,
+                ownsSession: closed.ownsSession,
+                placement: ClosedTabPlacement(sessionIndex: .max, display: nil, wasSelected: false, subAgentIDs: [])
+            )
+        }
+    }
+
     /// What undoing a user's close or detach of `session` brings back, read
     /// before the tab closes (`ClosedTab`): its record, the host session it
     /// shows and where it is. Nil for a tab no undo brings back: a native

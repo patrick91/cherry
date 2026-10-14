@@ -491,6 +491,239 @@ private func makeResizableWindow(_ frame: NSRect) -> NSWindow {
     #expect(FileManager.default.fileExists(atPath: fileURL(newer).path))
 }
 
+/// The launch's saved windows that cannot open (their folder is missing:
+/// an unmounted volume) or that never register while it opens them stay
+/// saved as open, with their tabs: they reopen at a later launch, and that
+/// launch's sweep never takes their files for abandoned.
+@Test @MainActor func launchWindowsThatCannotOpenStaySavedAsOpenAndAreNeverSwept() async throws {
+    let root = try canonicalTemporaryDirectory("cherry-carried-windows")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-carried-windows-store")
+    let volume = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-unmounted-\(UUID().uuidString)")
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: storeDirectory)
+    }
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let key = repositoryKey(root)
+    let missing = volume.appendingPathComponent("app").path
+    let primary = ProjectWindowValue.primary(key)
+    let neverRegistered = ProjectWindowValue(projectRoot: key, windowID: UUID())
+    let missingPrimary = ProjectWindowValue.primary(missing)
+    let missingOther = ProjectWindowValue(projectRoot: missing, windowID: UUID())
+    let saved = [primary, neverRegistered, missingPrimary, missingOther]
+    func fileURL(_ window: ProjectWindowValue) -> URL {
+        store.stateFileURL(repositoryRoot: window.projectRoot, windowID: window.windowID)
+    }
+    for (index, window) in saved.enumerated() {
+        try WorkspaceStateStore.write(
+            state(window.projectRoot, windowID: window.windowID, sessions: [boundRecord(sessionID: "s-\(index)")]),
+            to: fileURL(window)
+        )
+    }
+    store.saveOpenProjectWindows(saved, synchronously: true)
+
+    // This launch: the missing folder's windows cannot open, and the
+    // project's other window never registers.
+    let windows = TestWindows()
+    defer { windows.closeAll() }
+    let registry = windows.registry
+    registry.windowRevealMaximumWait = .milliseconds(50)
+    registry.scheduleLaunchWindowTurn = { $0() }
+    registry.configureWorkspacePersistence(store: store)
+    #expect(registry.takeProjectWindowsToReopen() == [primary, neverRegistered])
+    registry.openLaunchWindows([primary, neverRegistered]) { window in
+        if window == primary { windows.open(window) }
+    }
+    var opened = false
+    registry.whenLaunchWindowsOpened { opened = true }
+    #expect(await eventually { opened })
+    #expect(registry.pendingLaunchWindows.isEmpty)
+    // (The registered window is saved as the registry resolves its root:
+    // the test registers it with no repository.)
+    let carried = [neverRegistered, missingPrimary, missingOther]
+    store.flush()
+    #expect(store.loadOpenProjectWindows().count == saved.count)
+    #expect(Set(store.loadOpenProjectWindows()).isSuperset(of: carried))
+    // The missing folder's windows are the project's windows still, for
+    // its primary that the user opens once the folder is back.
+    let reopened = windows.open(missingPrimary)
+    #expect(!registry.isLastWindowOfProject(reopened.window))
+    store.flush()
+    #expect(store.loadOpenProjectWindows().count == saved.count)
+    #expect(Set(store.loadOpenProjectWindows()).isSuperset(of: carried))
+
+    // The next launch reads them as open: its sweep keeps their files.
+    for window in saved {
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-3_600)], ofItemAtPath: fileURL(window).path
+        )
+    }
+    let next = ProjectWindowRegistry()
+    next.abandonedWindowStatesSweepDelay = .zero
+    next.configureWorkspacePersistence(store: store)
+    next.removeAbandonedWindowStatesOnceLaunchWindowsOpened()
+    try await Task.sleep(for: .milliseconds(300))
+    store.flush()
+    for window in saved {
+        #expect(FileManager.default.fileExists(atPath: fileURL(window).path), "\(window)")
+    }
+}
+
+/// With no open window list it can use (none, unreadable, of another
+/// version), the launch takes no window's file for abandoned. A window no
+/// list names whose project has no listed window and whose primary file
+/// has no tabs (its last close could not move them) becomes the primary's,
+/// with its frame; an older one of the project is then removed.
+@Test @MainActor func theSweepTakesNothingWithoutAListAndGivesAProjectWithoutTabsItsAbandonedWindow() async throws {
+    let root = try canonicalTemporaryDirectory("cherry-sweep-list")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-sweep-list-store")
+    let suite = "CherryTests.SweepList.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: storeDirectory)
+        defaults.removePersistentDomain(forName: suite)
+    }
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let frames = ProjectWindowFrameStore(defaults: defaults)
+    let key = repositoryKey(root)
+    let newest = ProjectWindowValue(projectRoot: key, windowID: UUID())
+    let older = ProjectWindowValue(projectRoot: key, windowID: UUID())
+    let newestTab = boundRecord(sessionID: "s-newest")
+    func fileURL(_ window: ProjectWindowValue) -> URL {
+        store.stateFileURL(repositoryRoot: window.projectRoot, windowID: window.windowID)
+    }
+    try WorkspaceStateStore.write(state(key, sessions: []), to: fileURL(.primary(key)))
+    try WorkspaceStateStore.write(state(key, windowID: newest.windowID, sessions: [newestTab]), to: fileURL(newest))
+    try WorkspaceStateStore.write(state(key, windowID: older.windowID, sessions: [boundRecord(sessionID: "s-older")]), to: fileURL(older))
+    for (window, age) in [(ProjectWindowValue.primary(key), 3_600.0), (newest, 3_600), (older, 7_200)] {
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-age)], ofItemAtPath: fileURL(window).path
+        )
+    }
+    let newestFrame = "360 200 900 560 0 0 1440 900 "
+    defaults.set(newestFrame, forKey: ProjectWindowFrameStore.key(projectRoot: root.path, windowID: newest.windowID))
+    func sweep() async throws {
+        let registry = ProjectWindowRegistry()
+        registry.abandonedWindowStatesSweepDelay = .zero
+        registry.configureWindowFrames(frames)
+        registry.configureWorkspacePersistence(store: store)
+        registry.removeAbandonedWindowStatesOnceLaunchWindowsOpened()
+        try await Task.sleep(for: .milliseconds(300))
+        store.flush()
+    }
+
+    // A list this version cannot use (set aside), then none at all.
+    try Data("{ not json".utf8).write(to: store.openProjectWindowsFileURL)
+    try await sweep()
+    #expect(!FileManager.default.fileExists(atPath: store.openProjectWindowsFileURL.path))
+    try await sweep()
+    for window in [newest, older] {
+        #expect(FileManager.default.fileExists(atPath: fileURL(window).path))
+    }
+
+    // A list naming no window of the project.
+    store.saveOpenProjectWindows([], synchronously: true)
+    try await sweep()
+    #expect(!FileManager.default.fileExists(atPath: fileURL(newest).path))
+    #expect(!FileManager.default.fileExists(atPath: fileURL(older).path))
+    let moved = try #require(store.load(repositoryRoot: key))
+    #expect(moved.windowID == nil)
+    #expect(moved.worktrees.flatMap(\.sessions).map(\.id) == [newestTab.id])
+    #expect(defaults.string(forKey: ProjectWindowFrameStore.key(projectRoot: root.path)) == newestFrame)
+    #expect(frames.frameDescriptor(projectRoot: root.path, windowID: newest.windowID) == nil)
+}
+
+/// A project whose only launch window is still to register (not its
+/// primary) counts as open: showing the project (Open Project, `open_project`,
+/// a link) brings that window forward once it came on screen, instead of
+/// opening the primary beside it, and a window opened with no value (a URL
+/// event's) does not claim the primary meanwhile.
+@Test @MainActor func aProjectWhoseLaunchWindowIsStillToOpenIsShownThereNotInANewPrimary() async throws {
+    let root = try canonicalTemporaryDirectory("cherry-pending-project")
+    let elsewhere = try canonicalTemporaryDirectory("cherry-pending-project-front")
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: elsewhere)
+    }
+    let windows = TestWindows()
+    defer { windows.closeAll() }
+    let registry = windows.registry
+    registry.windowRevealMaximumWait = nil
+    registry.scheduleLaunchWindowTurn = { $0() }
+    let front = ProjectWindowValue.primary(elsewhere.path)
+    let pending = ProjectWindowValue(projectRoot: root.path, windowID: UUID())
+    var openLater: (@MainActor () -> Void)?
+    var pendingWindow: NSWindow?
+    registry.openLaunchWindows([front, pending], beforeLaterWindows: { openLater = $0 }) { value in
+        let opened = windows.open(value)
+        if value == pending { pendingWindow = opened.window }
+    }
+    #expect(await eventually { openLater != nil })
+    #expect(registry.pendingLaunchWindows == [pending])
+    #expect(!registry.hasWindow(for: root.path))
+
+    #expect(registry.focus(projectRoot: root.path))
+    #expect(!windows.open(.primary(root.path), implicit: true).claimed)
+    #expect(windows.focused.isEmpty)
+
+    let openLaterNow = try #require(openLater)
+    openLaterNow()
+    let window = try #require(pendingWindow)
+    #expect(registry.hasWindow(pending))
+    #expect(await eventually { windows.focused.last === window })
+    // Registered now: the project opens there, as any open project does.
+    #expect(registry.focus(projectRoot: root.path))
+}
+
+/// A second copy of the app (its store disabled: another copy holds the
+/// instance lock) leaves the holder's saved frames as they are when its
+/// windows close: its project's last window, not the primary, moves no
+/// frame or full screen to the primary's keys.
+@Test @MainActor func aSecondCopysClosedWindowsLeaveTheHoldersFramesAlone() throws {
+    let directory = try canonicalTemporaryDirectory("cherry-second-copy-close")
+    let root = try canonicalTemporaryDirectory("cherry-second-copy-close-project")
+    let suite = "CherryTests.SecondCopyClose.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+        try? FileManager.default.removeItem(at: root)
+        defaults.removePersistentDomain(forName: suite)
+    }
+    let lockURL = directory.appendingPathComponent("instance.lock")
+    let holder = AppInstanceLock(fileURL: lockURL, applicationSupportName: "CherryTests")
+    #expect(holder.isHeld)
+    defer { holder.release() }
+    let lock = AppInstanceLock(fileURL: lockURL, applicationSupportName: "CherryTests")
+    let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces"), instanceLock: lock)
+    #expect(!store.isEnabled)
+    let frames = ProjectWindowFrameStore(defaults: defaults)
+    let holderFrame = "120 140 800 500 0 0 1440 900 "
+    defaults.set(holderFrame, forKey: ProjectWindowFrameStore.key(projectRoot: root.path))
+    frames.setFullScreen(true, projectRoot: root.path)
+
+    let registry = ProjectWindowRegistry()
+    registry.bringWindowForward = { _ in }
+    registry.windowRevealMaximumWait = nil
+    registry.enterFullScreen = { _, done in done() }
+    registry.configureWindowFrames(frames)
+    registry.setWorkspaceStateStoreForTesting(store)
+    let windowID = UUID()
+    let repository = RepositoryWorkspace(projectRoot: root.path, windowID: windowID)
+    defer { repository.closeAllSessions(intent: .windowClosed) }
+    let window = makeResizableWindow(NSRect(x: 360, y: 200, width: 900, height: 560))
+    #expect(registry.register(
+        window: window, projectRoot: root.path, windowID: windowID, workspace: repository.workspace,
+        repository: repository, todoStore: nil, chromeState: nil
+    ))
+    #expect(registry.closedWindowState(
+        of: ProjectWindowKey(root: root.path, windowID: windowID), repository: repository
+    ) == .leftAsSaved)
+    registry.windowDidClose(window, projectRoot: root.path, repository: repository)
+    #expect(defaults.string(forKey: ProjectWindowFrameStore.key(projectRoot: root.path)) == holderFrame)
+    #expect(frames.isFullScreen(projectRoot: root.path))
+}
+
 // MARK: - The registry
 
 /// The session the fake host lists for a saved tab.
@@ -1245,4 +1478,141 @@ private final class TestWindows {
     #expect(!frames.isFullScreen(projectRoot: root.path, windowID: second.value.windowID))
     #expect(enteredFullScreen == 0)
     #expect(source.frame == sourceFrame)
+}
+
+/// A window whose sheet parent the test sets (AppKit sets one only for a
+/// sheet it shows).
+@MainActor
+private final class SheetWindow: NSWindow {
+    weak var parentForTesting: NSWindow?
+    override var sheetParent: NSWindow? { parentForTesting }
+}
+
+/// File › New Window chosen in a sheet opens another window of the
+/// sheet's window's project, though another project's window was active
+/// last; chosen while the launch waits for the instance lock with no
+/// window open, it opens nothing (the launch opens the windows itself),
+/// as a Dock click does not.
+@Test @MainActor func newWindowFromASheetUsesItsWindowAndOpensNothingWhileTheLaunchWaitsForTheLock() throws {
+    let root = try canonicalTemporaryDirectory("cherry-new-window-sheet")
+    let elsewhere = try canonicalTemporaryDirectory("cherry-new-window-sheet-elsewhere")
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: elsewhere)
+    }
+    let registry = ProjectWindowRegistry()
+    registry.bringWindowForward = { _ in }
+    var opened: [ProjectWindowValue] = []
+    var defaultWindowsOpened = 0
+    registry.newProjectWindowOpener = { opened.append($0) }
+    registry.projectWindowOpener = { _ in defaultWindowsOpened += 1 }
+
+    // The launch still waits for the instance lock: nothing opens, and
+    // nothing beeps.
+    let awaitsLock = Recorder(true)
+    registry.launchAwaitsInstanceLock = { awaitsLock.value }
+    #expect(!registry.canOpenAnotherWindow(from: nil))
+    #expect(registry.openAnotherWindow(from: testWindow()))
+    #expect(defaultWindowsOpened == 0)
+    awaitsLock.value = false
+    #expect(registry.openAnotherWindow(from: nil))
+    #expect(defaultWindowsOpened == 1)
+
+    let project = RepositoryWorkspace(projectRoot: root.path)
+    let other = RepositoryWorkspace(projectRoot: elsewhere.path)
+    defer { [project, other].forEach { $0.closeAllSessions(intent: .windowClosed) } }
+    let projectWindow = testWindow()
+    let otherWindow = testWindow()
+    for (window, repository) in [(projectWindow, project), (otherWindow, other)] {
+        #expect(registry.register(
+            window: window, projectRoot: repository.repositoryRoot, workspace: repository.workspace,
+            repository: repository, todoStore: nil, chromeState: nil
+        ))
+    }
+    defer {
+        registry.unregister(window: projectWindow, projectRoot: project.repositoryRoot)
+        registry.unregister(window: otherWindow, projectRoot: other.repositoryRoot)
+    }
+    registry.activateWindow(otherWindow, workspace: other.workspace, todoStore: nil, chromeState: nil)
+    let sheet = SheetWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: true)
+    sheet.isReleasedWhenClosed = false
+    let alert = SheetWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: true)
+    alert.isReleasedWhenClosed = false
+    sheet.parentForTesting = projectWindow
+    alert.parentForTesting = sheet
+
+    #expect(registry.canOpenAnotherWindow(from: alert))
+    #expect(registry.openAnotherWindow(from: sheet))
+    #expect(registry.openAnotherWindow(from: alert))
+    #expect(opened.map(\.projectRoot) == [project.repositoryRoot, project.repositoryRoot])
+    // A window that is no project window's sheet: the one active last.
+    #expect(registry.openAnotherWindow(from: SheetWindow(contentRect: .zero, styleMask: [], backing: .buffered, defer: true)))
+    #expect(opened.last?.projectRoot == other.repositoryRoot)
+    #expect(defaultWindowsOpened == 1)
+}
+
+/// A window File › New Window opens is transparent from AppKit's first
+/// placement until it registers (`LaunchWindowCover.expect(1)`), and the
+/// keys typed into it meanwhile go to it once it shows; another window
+/// placed meanwhile is not covered.
+@Test @MainActor func aNewWindowIsCoveredUntilItRegistersAndGetsTheKeysTypedMeanwhile() throws {
+    let root = try canonicalTemporaryDirectory("cherry-new-window-cover")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let center = NotificationCenter()
+    var posted: [NSEvent] = []
+    let hold = HiddenWindowKeyHold(installsMonitor: false) { posted += $0 }
+    let cover = LaunchWindowCover(fallbackWait: .seconds(60), center: center, keyHold: hold) { window in
+        window.identifier?.rawValue.hasPrefix("project") ?? false
+    }
+    let windows = TestWindows()
+    defer { windows.closeAll() }
+    let registry = windows.registry
+    registry.windowRevealMaximumWait = nil
+    registry.launchWindowCover = cover
+    var opened: [ProjectWindowValue] = []
+    registry.newProjectWindowOpener = { opened.append($0) }
+    let repository = RepositoryWorkspace(projectRoot: root.path)
+    defer { repository.closeAllSessions(intent: .windowClosed) }
+    let source = testWindow()
+    #expect(registry.register(
+        window: source, projectRoot: root.path, workspace: repository.workspace, repository: repository,
+        todoStore: nil, chromeState: nil
+    ))
+    defer { registry.unregister(window: source, projectRoot: root.path) }
+    func projectWindow(_ number: Int) -> NSWindow {
+        // Not deferred: its keys name its window number.
+        let window = makeResizableWindow(NSRect(x: 0, y: 0, width: 320, height: 200))
+        window.identifier = NSUserInterfaceItemIdentifier("project-AppWindow-\(number)")
+        return window
+    }
+
+    #expect(registry.openAnotherWindow(from: source))
+    let value = try #require(opened.last)
+    // SwiftUI places the window before it orders it in, and long before
+    // its view registers it.
+    let window = projectWindow(2)
+    center.post(name: NSWindow.didMoveNotification, object: window)
+    #expect(window.alphaValue == 0)
+    #expect(window.ignoresMouseEvents)
+    #expect(hold.isHolding(window))
+    let typed = try #require(NSEvent.keyEvent(
+        with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber,
+        context: nil, characters: "l", charactersIgnoringModifiers: "l", isARepeat: false, keyCode: 37
+    ))
+    #expect(hold.take(typed))
+    // One window was expected.
+    let extra = projectWindow(3)
+    defer { extra.close() }
+    center.post(name: NSWindow.didMoveNotification, object: extra)
+    #expect(extra.alphaValue == 1)
+    #expect(posted.isEmpty)
+
+    // It registers: its registration takes it over and shows it, with the
+    // keys typed meanwhile.
+    #expect(windows.open(value, window: window).claimed)
+    #expect(!cover.isCovering(window))
+    #expect(window.alphaValue == 1)
+    #expect(!window.ignoresMouseEvents)
+    #expect(!hold.isHolding(window))
+    #expect(posted == [typed])
 }

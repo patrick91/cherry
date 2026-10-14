@@ -1163,7 +1163,8 @@ struct SessionTeardownQuestion {
     /// project opens again. They do from the project's last window
     /// (`ProjectWindowRegistry.isLastWindowOfProject`); a window closed
     /// while another of its project stays open forgets them, and its kept
-    /// sessions are only in Background Sessions.
+    /// sessions are only in Background Sessions (its running commands go on
+    /// in that other window, `ProjectWindowRegistry.commandTabsHandedOver`).
     let tabsComeBack: Bool
 
     init(teardown: SessionTeardown, summary: SessionTeardownSummary, projectName: String?, tabsComeBack: Bool = true) {

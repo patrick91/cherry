@@ -150,10 +150,9 @@ private func defaultKeyCases() throws -> [KeyCase] {
             key: try hardwareKey("Ctrl+Backspace", keyCode: 51, .control),
             expected: ["\u{08}", csi("127;5u"), csi("127;5u"), "\u{08}"]
         ),
-        // The host types `ESC DEL` under the kitty protocol.
         KeyCase(
             key: try hardwareKey("Option+Backspace", keyCode: 51, .option),
-            expected: ["\u{1B}\u{7F}", csi("127;3u"), csi("127;3u"), csi("27;3;127~")], hostDiffers: [1, 2]
+            expected: ["\u{1B}\u{7F}", csi("127;3u"), csi("127;3u"), csi("27;3;127~")]
         ),
         KeyCase(key: try hardwareKey("Escape", keyCode: 53), expected: ["\u{1B}", csi("27u"), csi("27u"), "\u{1B}"]),
         // The host types a bare ESC in legacy mode.
@@ -161,15 +160,13 @@ private func defaultKeyCases() throws -> [KeyCase] {
             key: try hardwareKey("Shift+Escape", keyCode: 53, .shift),
             expected: [csi("27;2;27~"), csi("27;2u"), csi("27;2u"), csi("27;2;27~")], hostDiffers: [0]
         ),
-        // The host types CR, and Cherry's `CSI 13;2u` for Shift, under the
-        // kitty protocol.
         KeyCase(
             key: try hardwareKey("Keypad Enter", keyCode: 76, extra: .numericPad),
-            expected: ["\r", csi("57414u"), csi("57414u"), "\r"], hostDiffers: [1, 2]
+            expected: ["\r", csi("57414u"), csi("57414u"), "\r"]
         ),
         KeyCase(
             key: try hardwareKey("Shift+Keypad Enter", keyCode: 76, .shift, extra: .numericPad),
-            expected: ["\r", csi("57414;2u"), csi("57414;2u"), "\r"], hostDiffers: [1, 2]
+            expected: ["\r", csi("57414;2u"), csi("57414;2u"), "\r"]
         ),
         KeyCase(key: controlJ, expected: controlKey(letterJ)),
         // Ghostty's own binding on macOS, `alt+left=esc:b`, in every mode;

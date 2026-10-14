@@ -3718,13 +3718,24 @@ enum HostRoutedKeyEncoder {
                 optionAsAlt: optionAsAlt
             )
         }
+        let held = modifiers.intersection([.shift, .control, .option])
+        let alt = optionAsAlt.applies(to: eventModifiers)
+        // xterm's modifier parameter: 1, plus 1 for Shift, 2 for Option
+        // (Alt), 4 for Control.
+        let parameter = 1 + (held.contains(.shift) ? 1 : 0) + (held.contains(.option) ? 2 : 0)
+            + (held.contains(.control) ? 4 : 0)
+        if isEnhancedKeyboardProtocolActive, keyCode == KeyCode.keypadEnter {
+            // The kitty keyboard protocol's own code for it (KP_ENTER), as
+            // Ghostty types it.
+            return csi(held.isEmpty ? "57414u" : "57414;\(parameter)u")
+        }
         if let sequence = TerminalInputEncoder.shiftEnterSequence(
             keyCode: keyCode, modifiers: modifiers, isEnhancedKeyboardProtocolActive: isEnhancedKeyboardProtocolActive
         ) ?? TerminalInputEncoder.shiftTabSequence(
             keyCode: keyCode, modifiers: modifiers, isEnhancedKeyboardProtocolActive: isEnhancedKeyboardProtocolActive
-        ) ?? TerminalInputEncoder.appKitOptionBackspaceSequence(
+        ) ?? (isEnhancedKeyboardProtocolActive ? nil : TerminalInputEncoder.appKitOptionBackspaceSequence(
             keyCode: keyCode, modifiers: modifiers
-        ) ?? TerminalInputEncoder.appKitOptionArrowSequence(
+        )) ?? TerminalInputEncoder.appKitOptionArrowSequence(
             keyCode: keyCode, modifiers: modifiers, sendsModifiedArrowKeys: sendsModifiedArrowKeys
         ) ?? TerminalInputEncoder.appKitOptionDigitTextData(
             keyCode: keyCode, characters: characters, charactersIgnoringModifiers: charactersIgnoringModifiers,
@@ -3734,12 +3745,6 @@ enum HostRoutedKeyEncoder {
         ) {
             return sequence
         }
-        let held = modifiers.intersection([.shift, .control, .option])
-        let alt = optionAsAlt.applies(to: eventModifiers)
-        // xterm's modifier parameter: 1, plus 1 for Shift, 2 for Option
-        // (Alt), 4 for Control.
-        let parameter = 1 + (held.contains(.shift) ? 1 : 0) + (held.contains(.option) ? 2 : 0)
-            + (held.contains(.control) ? 4 : 0)
 
         /// Return, Tab or Backspace (`byte`, kitty's `code`) with modifiers.
         func modifiedKey(_ byte: UInt8, code: Int) -> Data {
@@ -3777,13 +3782,15 @@ enum HostRoutedKeyEncoder {
         case KeyCode.forwardDelete:
             return csi(held.isEmpty ? "3~" : "3;\(parameter)~")
         case KeyCode.returnKey, KeyCode.keypadEnter:
-            // Shift alone: encoded above.
+            // Shift alone, and Keypad Enter under the kitty keyboard
+            // protocol: encoded above.
             return modifiedKey(0x0D, code: 13)
         case KeyCode.tab:
             // Shift alone: encoded above.
             return modifiedKey(0x09, code: 9)
         case KeyCode.backspace:
-            // Option alone: encoded above. Control+Backspace is ^H.
+            // Option alone: encoded above but under the kitty keyboard
+            // protocol. Control+Backspace is ^H.
             return modifiedKey(held.contains(.control) ? 0x08 : 0x7F, code: 127)
         case KeyCode.escape:
             if isEnhancedKeyboardProtocolActive { return csi(held.isEmpty ? "27u" : "27;\(parameter)u") }

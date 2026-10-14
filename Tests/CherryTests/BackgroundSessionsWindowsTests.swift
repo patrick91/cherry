@@ -133,3 +133,104 @@ private func register(
     #expect(focused.last === windows[1])
     #expect(workspaces[1].selectedSessionID == agents[0].id)
 }
+
+// MARK: - Which sessions are in the background
+
+/// A session a tab of a project's second window shows is not in the
+/// background; detached from it, it is.
+@Test @MainActor func aSessionShownInASecondWindowIsNotInTheBackground() async throws {
+    let harness = try PersistentHarness()
+    let registry = ProjectWindowRegistry()
+    registry.bringWindowForward = { _ in }
+    let model = makeModel(harness, registry: registry)
+    let project = harness.project.path
+    let other = ProjectWindowValue(projectRoot: project, windowID: UUID())
+    let windows = [testWindow(), testWindow()]
+    let workspaces = [
+        harness.workspace(),
+        TerminalWorkspace(projectRoot: project, createInitialSession: false, backendPolicy: harness.policy, windowID: other.windowID)
+    ]
+    defer {
+        model.stop()
+        registry.unregister(window: windows[0], projectRoot: project)
+        registry.unregister(window: windows[1], projectRoot: project)
+        workspaces.forEach { $0.closeAllSessions(intent: .windowClosed) }
+        harness.cleanUp()
+    }
+    register(windows[0], .primary(project), workspace: workspaces[0], in: registry)
+    register(windows[1], other, workspace: workspaces[1], in: registry)
+    let tab = workspaces[1].addSession(title: "Server")
+    #expect(await harness.waitUntilAttached(tab))
+    let sessionID = try #require(tab.persistentSession?.sessionID)
+    _ = try await harness.control.list()
+    model.refresh()
+    #expect(!model.sessions.contains { $0.id == sessionID })
+
+    workspaces[1].close(tab, allowEmptyWorkspace: true, intent: .userDetachedTab)
+    #expect(await eventually {
+        model.refresh()
+        return model.sessions.map(\.id) == [sessionID]
+    })
+}
+
+/// During a launch, the saved tabs of a window still to open (pending) are
+/// awaiting restore: their sessions are not in the background until the
+/// launch gives up on that window.
+@Test @MainActor func aPendingLaunchWindowsSessionsAreNotInTheBackground() async throws {
+    let harness = try PersistentHarness()
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-pending-window")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let registry = ProjectWindowRegistry()
+    registry.bringWindowForward = { _ in }
+    registry.windowRevealMaximumWait = .milliseconds(300)
+    let model = makeModel(harness, registry: registry)
+    let project = harness.project.path
+    let other = ProjectWindowValue(projectRoot: project, windowID: UUID())
+    let window = testWindow()
+    let workspace = harness.workspace()
+    defer {
+        model.stop()
+        registry.unregister(window: window, projectRoot: project)
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+        try? FileManager.default.removeItem(at: storeDirectory)
+    }
+    func savedTab(_ title: String, sessionID: String) -> WorkspaceSessionRecord {
+        WorkspaceSessionRecord(
+            id: UUID(), kind: .terminal, title: title, titleSource: .system, workingDirectory: project,
+            projectRoot: project,
+            hosted: HostedSessionBindingRecord(host: "local", hostID: "host-a", sessionID: sessionID, owned: true)
+        )
+    }
+    let primaryTab = savedTab("Primary", sessionID: "s-primary")
+    let otherTab = savedTab("Other", sessionID: "s-other")
+    for (value, tab) in [(ProjectWindowValue.primary(project), primaryTab), (other, otherTab)] {
+        store.saveSynchronously(RepositoryStateRecord(
+            repositoryRoot: project, activeWorktreeRoot: project,
+            worktrees: [WorktreeStateRecord(root: project, sessions: [tab])], windowID: value.windowID
+        ))
+    }
+    store.saveOpenProjectWindows([.primary(project), other], synchronously: true)
+    harness.fake.sessions = [primaryTab, otherTab].map { tab in
+        HostedSessionInfo(
+            id: tab.hosted?.sessionID ?? "", name: tab.title, cwd: project, pid: 5, owner: "CherryTests",
+            tags: [PersistentSessionTag.tab: tab.id.uuidString, PersistentSessionTag.project: project]
+        )
+    }
+    _ = try await harness.control.list()
+
+    registry.configureWorkspacePersistence(store: store)
+    let reopened = registry.takeProjectWindowsToReopen()
+    #expect(reopened == [.primary(project), other])
+    // Only the front window opens; the other stays pending.
+    registry.openLaunchWindows(reopened) { value in
+        if value.isPrimary { register(window, value, workspace: workspace, in: registry) }
+    }
+    #expect(registry.pendingLaunchWindows == [other])
+    model.refresh()
+    #expect(!model.sessions.contains { $0.id == "s-other" })
+    // The launch gave up on it: no window will bring it back.
+    #expect(await eventually { registry.pendingLaunchWindows.isEmpty })
+    model.refresh()
+    #expect(model.sessions.contains { $0.id == "s-other" })
+}

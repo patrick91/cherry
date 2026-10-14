@@ -1043,6 +1043,11 @@ final class TerminalWorkspace: ObservableObject {
     var launchRoot: String? {
         projectRoot.map(ProjectLocation.launchPath(forKey:))
     }
+    /// Which of the project's windows shows this workspace
+    /// (`ProjectWindowValue.windowID`): its tabs' new sessions are tagged
+    /// with it (`TerminalSession.creatingWindowID`). Nil for a project's
+    /// primary window, whose sessions carry no window tag.
+    let windowID: UUID?
     let backendPolicy: SessionBackendPolicy
     private let launchBackend: TerminalSessionLaunchBackend
     /// Fires for changes workspace persistence saves that the published
@@ -1074,8 +1079,10 @@ final class TerminalWorkspace: ObservableObject {
         projectRoot: String? = nil,
         createInitialSession: Bool = true,
         launchBackend: TerminalSessionLaunchBackend = .nativePTY,
-        backendPolicy: SessionBackendPolicy = .native
+        backendPolicy: SessionBackendPolicy = .native,
+        windowID: UUID? = nil
     ) {
+        self.windowID = windowID
         // A project on another Mac keeps its key: it is not a directory here.
         self.projectRoot = projectRoot.map { root in
             ProjectLocation.isRemoteKey(root) ? ProjectLocation(key: root).key : Self.resolvedWorkingDirectory(root)
@@ -1162,6 +1169,10 @@ final class TerminalWorkspace: ObservableObject {
                     guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return nil }
                     return self.windowGrid.observation()
                 })
+            }
+            session.creatingWindowID = { [weak self, weak session] in
+                guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return nil }
+                return self.windowID
             }
         }
     }
@@ -3655,6 +3666,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         wait: TerminalWindowGridWait,
         observe: @MainActor () -> TerminalWindowGridWait.Observation?
     )?
+    /// Set by the workspace showing the tab, as `detachedSurfaceSize`: the
+    /// project window a new session of this tab is created for
+    /// (`TerminalWorkspace.windowID`, the `cherry.window` tag), read when
+    /// its Create goes out; nil for a project's primary window.
+    var creatingWindowID: (@MainActor () -> UUID?)?
 
     /// This tab's surface, laid out in `window` at `size` points, has `grid`
     /// (`GhosttySessionBridge.reportWindowGrid`).
@@ -5751,6 +5767,9 @@ final class TerminalSession: ObservableObject, Identifiable {
                     // asked for only once the host is reached and the launch
                     // spec is ready: a new window settles meanwhile.
                     let startedAt = ContinuousClock.now
+                    // Tagged with the window that shows the tab now.
+                    var request = request
+                    request.windowID = self.creatingWindowID?()
                     launch = try await hosting.create(request, configuration: configuration) { [weak self] in
                         guard let self else { throw CancellationError() }
                         return try await self.persistentCreateGrid(

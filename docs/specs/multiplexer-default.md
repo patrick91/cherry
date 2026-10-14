@@ -915,7 +915,9 @@ differs from the design above.
   `GHOSTTY_SURFACE_ID`, `XPC_*` or `NO_COLOR`; stable staged paths; and the
   host adds `CHERRY_SESSION_ID`.
 - Create tags: `cherry.tab`, `cherry.kind`, `cherry.agent`, `cherry.command`,
-  `cherry.project` and `cherry.launch` (the Create request id). The app uses
+  `cherry.project`, `cherry.launch` (the Create request id) and, for a tab
+  of a window other than its project's primary one, `cherry.window` (that
+  window's id, as the Create goes out; never rewritten). The app uses
   the session's `request_id` (or else `cherry.launch`) to end a session whose
   Create answer was lost, and to find the session of a record saved before
   its Create answered. The owner is `CherryAppIdentity.applicationSupportName`.
@@ -1357,8 +1359,9 @@ differs from the design above.
   record; `open-windows.json` lists `windows` beside `projectRoots`). It
   saves 500 ms after changes, except that a newly opened persistent tab is
   saved at once (its record carries the Create's request id,
-  `launchRequestID`); it never saves during teardown, and quit flushes it
-  first. Records gained optional `owned` and `launchRequestID` fields (older
+  `launchRequestID`), and a window other than a project's primary is saved
+  as it claims its project; it never saves during teardown, and quit
+  flushes it first. Records gained optional `owned` and `launchRequestID` fields (older
   builds ignore them). A state file (or `open-windows.json`) of another
   version, one that does not decode, or one for another root is moved aside
   as `<file>.<vN|unreadable|other-root>-<UTC yyyyMMddTHHmmssZ>.bak` in the
@@ -1522,9 +1525,17 @@ differs from the design above.
   modification time) is the lower bound, and the tabs it named come back
   whenever they were created, until this version saves a file for the
   project. With no file of any version ever saved, any of the project's
-  sessions from before this run are adopted. Each window is scanned once
-  per run: at window open, again once the host is reachable, and after a
-  restarted daemon's holders have registered.
+  sessions from before this run are adopted. Of a project's several
+  windows, each adopts only the sessions tagged with its own id
+  (`cherry.window`), the primary only untagged ones, and none that a saved
+  tab of another window names while that window may still restore it (one
+  of the launch's windows still to open, or restoring:
+  `sessionRecordsAwaitingRestore`), since an untagged session can be in
+  another window's file (a command handed over at a close, or one opened
+  there from Background Sessions); a window other than the primary with no
+  saved state (opened this run) looks for none.
+  Each window is scanned once per run: at window open, again once the host
+  is reachable, and after a restarted daemon's holders have registered.
   Sessions recorded to be ended (below) are never adopted. With *close on
   exit* on, a terminal (its `cherry.kind` tag) whose shell exited with status
   0 is removed instead of adopted.

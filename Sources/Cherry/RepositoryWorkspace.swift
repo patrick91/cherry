@@ -197,16 +197,23 @@ final class RepositoryWorkspace: ObservableObject {
         isAwaitingInitialRestore = pendingRecord != nil
         if let stateStore, stateStore.isEnabled, let localSessions = backendPolicy.localSessions {
             let sessionsToEnd = stateStore.loadSessionsToEnd()
-            orphanCriteria = OrphanedSessionCriteria(
-                owner: localSessions.owner,
-                savedState: savedState,
-                // A file this version moved aside still says when it was
-                // saved and which tabs it had.
-                setAside: savedState == nil ? stateStore.setAsideState(repositoryRoot: root, windowID: windowID) : nil,
-                sessionsToEnd: sessionsToEnd,
-                createdBefore: runStartedAt,
-                host: localSessions.profile.host
-            )
+            // A file this version moved aside still says when it was saved
+            // and which tabs it had.
+            let setAside = savedState == nil ? stateStore.setAsideState(repositoryRoot: root, windowID: windowID) : nil
+            orphanCriteria = windowID != nil && savedState == nil && setAside == nil
+                // A window other than the project's primary that saved
+                // nothing was opened this run (File › New Window): no
+                // session was created for it before, so none is its orphan.
+                ? nil
+                : OrphanedSessionCriteria(
+                    owner: localSessions.owner,
+                    savedState: savedState,
+                    setAside: setAside,
+                    sessionsToEnd: sessionsToEnd,
+                    createdBefore: runStartedAt,
+                    host: localSessions.profile.host,
+                    windowID: windowID
+                )
             // As the window opened: ending them (`resumeEndingSessions`)
             // takes them out of the store once their sessions are gone.
             let toEndAtOpen = Set(sessionsToEnd.map(\.id))
@@ -229,7 +236,8 @@ final class RepositoryWorkspace: ObservableObject {
         let workspace = TerminalWorkspace(
             projectRoot: folder,
             createInitialSession: pendingRecord == nil,
-            backendPolicy: backendPolicy
+            backendPolicy: backendPolicy,
+            windowID: windowID
         )
         workspace.restoredTabLaunchQueue = restoredTabLaunchQueue
         workspace.windowGrid = windowGrid
@@ -564,6 +572,14 @@ final class RepositoryWorkspace: ObservableObject {
         if let stateStore, let localSessions = backendPolicy.localSessions {
             localSessions.resumeEndingSessions(recordedIn: stateStore)
         }
+        if windowID != nil, pendingRecord == nil {
+            // A window other than the project's primary, with nothing to
+            // restore, is saved at once (the registry saved it as open), so
+            // a crash before its first change still reopens it. The
+            // primary saves at its first change, as a project's one window
+            // did.
+            saveStateSoon()
+        }
     }
 
     /// Saved tabs that are not open tabs: not restored yet, still being
@@ -743,10 +759,21 @@ final class RepositoryWorkspace: ObservableObject {
     ) {
         // Scanned for good only from a list that is complete.
         if !list.awaitsHolders { didScanForOrphans = true }
+        // A saved tab of another window names it (one of the launch's
+        // windows still to open, or one restoring): that window brings it
+        // back, whatever its window tag says. The criteria read only this
+        // window's file.
+        lazy var awaitingRestore = windowRegistry?.sessionRecordsAwaitingRestore() ?? []
         var orphans: [(info: HostedSessionInfo, record: WorkspaceSessionRecord)] = []
         for info in list.sessions {
             guard let tabID = criteria.orphanTabID(of: info),
                   localSessions.owningTab(of: info.id) == nil,
+                  !awaitingRestore.contains(where: { record in
+                      PersistentLocalSessions.record(
+                          record, names: info, hostID: list.hostID, owner: localSessions.owner,
+                          host: localSessions.profile.host, includingAttached: true
+                      )
+                  }),
                   !localSessions.isEnding(info.id),
                   !localSessions.isScheduledToEnd(info, hostID: list.hostID),
                   !localSessions.hasOpenTab(withID: tabID),

@@ -1735,6 +1735,41 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(store.todos.filter { $0.status == .ready }.map(\.position) == [0, 1, 2])
 }
 
+/// A project's windows (#22) and MCP share one to-do store: each save
+/// writes the whole file, so two stores would write over each other's
+/// changes. One per root and storage directory, freed once nothing holds
+/// it.
+@MainActor
+@Test func aProjectsWindowsShareOneTodoStore() async throws {
+    let storageRoot = try canonicalTemporaryDirectory("CherryTodos-shared")
+    let otherStorageRoot = try canonicalTemporaryDirectory("CherryTodos-shared-other")
+    defer {
+        try? FileManager.default.removeItem(at: storageRoot)
+        try? FileManager.default.removeItem(at: otherStorageRoot)
+    }
+    let project = "/projects/\(UUID().uuidString)"
+    var first: ProjectTodoStore? = ProjectTodoStore.shared(projectRoot: project, storageDirectory: storageRoot)
+    var second: ProjectTodoStore? = ProjectTodoStore.shared(projectRoot: project, storageDirectory: storageRoot)
+    #expect(first === second)
+    // Another project's, or another directory's, is another store.
+    #expect(ProjectTodoStore.shared(projectRoot: project + "-other", storageDirectory: storageRoot) !== first)
+    #expect(ProjectTodoStore.shared(projectRoot: project, storageDirectory: otherStorageRoot) !== first)
+
+    // A change made in one window is the other's: neither writes over it.
+    let todo = try #require(first).create(title: "Ship it", markdown: "")
+    #expect(second?.todos.map(\.id) == [todo.id])
+    _ = try #require(second).create(title: "Then rest", markdown: "")
+    #expect(ProjectTodoStore(projectRoot: project, storageDirectory: storageRoot).todos.count == 2)
+
+    // Once no window holds it, it goes; the next reads the file again.
+    weak var freed = first
+    first = nil
+    second = nil
+    #expect(freed == nil)
+    let reopened = ProjectTodoStore.shared(projectRoot: project, storageDirectory: storageRoot)
+    #expect(reopened.todos.map(\.title) == ["Ship it", "Then rest"])
+}
+
 @MainActor
 @Test func controlServerListsConfiguredAgents() async throws {
     let harness = try ControlServerHarness()

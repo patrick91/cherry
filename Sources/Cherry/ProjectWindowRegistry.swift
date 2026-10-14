@@ -65,7 +65,8 @@ final class ProjectWindowRegistry {
     private var projectWindowsToReopenAtLaunch: [ProjectWindowValue] = []
     /// The launch's windows asked for later (`openLaunchWindows`; the front
     /// one is never pending) that have not registered: saved as open
-    /// meanwhile, so a quit before they registered keeps them, and a quit
+    /// meanwhile, so a quit before they registered keeps them, their saved
+    /// tabs awaiting restore (`sessionRecordsAwaitingRestore`), and a quit
     /// that ends sessions ends their saved tabs' (`launchWindowRecords`).
     /// Each leaves as it registers, the rest once the launch's windows
     /// opened.
@@ -589,9 +590,14 @@ final class ProjectWindowRegistry {
     }
 
     /// Saved tabs the open windows may still restore
-    /// (`RepositoryWorkspace.savedRecordsAwaitingRestore`).
+    /// (`RepositoryWorkspace.savedRecordsAwaitingRestore`), and those of
+    /// the launch's windows that have not registered yet
+    /// (`pendingLaunchWindows`, as the launch read them): a window still to
+    /// open brings its sessions back itself, so they are not in the
+    /// background meanwhile.
     func sessionRecordsAwaitingRestore() -> [WorkspaceSessionRecord] {
         allRepositories.flatMap { $0.savedRecordsAwaitingRestore() }
+            + pendingLaunchWindows.filter { !hasWindow($0) }.flatMap { launchWindowRecords[$0] ?? [] }
     }
 
     /// The repository of a window of `projectRoot`'s project once one has

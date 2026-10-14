@@ -973,8 +973,9 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
     `device:` key of its Mac, refused with `invalid_project_root` when it
     has a `.` or `..` component (in the raw key too) or is not absolute, and
     with `outside_caller_mac` when it is another device's key; the window
-    is the device window with that path, or the one whose path contains it;
-    never through `standardizedProjectRoot`;
+    is a window of that device with that path (the caller's own when it is
+    one, else the one active most recently), or one whose path contains
+    it; never through `standardizedProjectRoot`;
   - Open Project (`open_project`) opens only a known key of its Mac,
     matched exactly;
   - the one choke point, `requireOnRemoteDevice`, at the top of

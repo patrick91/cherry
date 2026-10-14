@@ -1454,7 +1454,9 @@ final class WorkspaceRestoreCancellation {
 /// this run belongs to this run's tabs) and after the saved state it would
 /// be missing from (`createdSince`, the last save, to the second): a
 /// session created before that save and missing from it was left running on
-/// purpose (a detached tab).
+/// purpose (a detached tab). Of a project's windows (#22), each adopts only
+/// the sessions created for it (`windowID`, the `cherry.window` tag), the
+/// project's primary window only those with no window tag.
 ///
 /// Without a usable state file:
 /// - When this version moved one aside (another version's, or one that
@@ -1475,6 +1477,9 @@ struct OrphanedSessionCriteria: Sendable {
     let recoveredTabIDs: Set<UUID>
     let recoveredSessionIDs: Set<String>
     let recoveredLaunchIDs: Set<String>
+    /// The window whose orphans these are (`ProjectWindowValue.windowID`);
+    /// nil for a project's primary window.
+    let windowID: UUID?
 
     init(
         owner: String,
@@ -1482,10 +1487,12 @@ struct OrphanedSessionCriteria: Sendable {
         setAside: SetAsideStateSummary? = nil,
         sessionsToEnd: [WorkspaceSessionRecord] = [],
         createdBefore: Date,
-        host: HostedSessionHost = .local
+        host: HostedSessionHost = .local,
+        windowID: UUID? = nil
     ) {
         self.owner = owner
         self.createdBefore = createdBefore
+        self.windowID = windowID
         let records = savedState?.worktrees.flatMap(\.sessions) ?? []
         let recovered = savedState == nil ? setAside : nil
         if let savedState {
@@ -1512,6 +1519,7 @@ struct OrphanedSessionCriteria: Sendable {
         guard info.owner == owner,
               let tabID = PersistentLocalSessions.tabID(of: info, owner: owner),
               info.tags[PersistentSessionTag.project]?.isEmpty == false,
+              isCreatedForThisWindow(info),
               !namedTabIDs.contains(tabID),
               !namedSessionIDs.contains(info.id),
               !(launchID.map(namedLaunchIDs.contains) ?? false),
@@ -1528,6 +1536,14 @@ struct OrphanedSessionCriteria: Sendable {
             return nil
         }
         return created < createdBefore ? tabID : nil
+    }
+
+    /// Whether `info` was created for this window: tagged with its id, or,
+    /// for a project's primary window, with no window tag (a tag no id
+    /// reads is no window's).
+    private func isCreatedForThisWindow(_ info: HostedSessionInfo) -> Bool {
+        guard info.tags[PersistentSessionTag.window] != nil else { return windowID == nil }
+        return windowID != nil && PersistentLocalSessions.windowID(of: info) == windowID
     }
 
     /// The project folder `info` was started in, as its tab saw it.

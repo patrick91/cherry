@@ -44,6 +44,25 @@ final class ProjectTodoStore: ObservableObject {
         load()
     }
 
+    /// The project's one store, which its windows (and MCP, while one is
+    /// open) share: each save writes the whole file, so two stores of one
+    /// project would write over each other's changes. Held weakly, by
+    /// storage directory and root: a store no window holds is freed, and
+    /// the next one reads the file again.
+    static func shared(
+        projectRoot: String,
+        storageDirectory: URL = ProjectTodoStore.defaultStorageDirectory()
+    ) -> ProjectTodoStore {
+        let key = storageDirectory.standardizedFileURL.path + "\u{0}" + projectRoot
+        if let store = sharedStores[key]?.object { return store }
+        let store = ProjectTodoStore(projectRoot: projectRoot, storageDirectory: storageDirectory)
+        sharedStores = sharedStores.filter { $0.value.object != nil }
+        sharedStores[key] = WeakReference(store)
+        return store
+    }
+
+    private static var sharedStores: [String: WeakReference<ProjectTodoStore>] = [:]
+
     static func defaultStorageDirectory() -> URL {
         CherryAppIdentity.applicationSupportDirectory().appendingPathComponent("Todos", isDirectory: true)
     }

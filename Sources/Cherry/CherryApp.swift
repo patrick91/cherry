@@ -1481,7 +1481,8 @@ private struct ProjectWorkspaceView: View {
             // wait for that Mac.
             showsSavedTabsBeforeHostAnswers: hosting.profile.isThisMac
         ))
-        _todoStore = StateObject(wrappedValue: ProjectTodoStore(projectRoot: projectRoot))
+        // The project's to-dos, which all its windows share.
+        _todoStore = StateObject(wrappedValue: ProjectTodoStore.shared(projectRoot: projectRoot))
     }
 
     /// Folder name of the project, or "Cherry" for a project-less window.

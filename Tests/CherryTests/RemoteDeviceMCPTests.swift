@@ -57,6 +57,7 @@ private final class DeviceMCPHarness {
     /// This Mac's port detection, as the server calls it.
     let localServices = RecordingLocalServices()
     private var windows: [(NSWindow, String)] = []
+    private var otherWindowWorkspaces: [TerminalWorkspace] = []
 
     static func inertHosting(_ destination: String, name: String) -> PersistentHostSessions {
         inertDeviceHosting(destination, name: name)
@@ -191,10 +192,33 @@ private final class DeviceMCPHarness {
         return Set(result.processes.map(\.id))
     }
 
+    /// Another window of the device's project (File › New Window), on the
+    /// same hosting, registered as the app registers it, with one tab.
+    func openAnotherDeviceWindow() -> (workspace: TerminalWorkspace, tab: TerminalSession) {
+        let workspace = TerminalWorkspace(
+            projectRoot: deviceKey, createInitialSession: false, launchBackend: .nativePTY,
+            backendPolicy: .remote(deviceHosting, settings: { .native }, hostReconnects: nil),
+            windowID: UUID()
+        )
+        let tab = workspace.addSession(title: "Agent in another window")
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
+            styleMask: [.titled, .closable], backing: .buffered, defer: true
+        )
+        window.isReleasedWhenClosed = false
+        #expect(ProjectWindowRegistry.shared.register(
+            window: window, projectRoot: deviceKey, windowID: workspace.windowID, workspace: workspace,
+            todoStore: nil, chromeState: nil
+        ))
+        windows.append((window, deviceKey))
+        otherWindowWorkspaces.append(workspace)
+        return (workspace, tab)
+    }
+
     func stop() {
         server.stop()
         for (window, root) in windows { ProjectWindowRegistry.shared.unregister(window: window, projectRoot: root) }
-        for workspace in [localWorkspace, deviceWorkspace, otherDeviceWorkspace] {
+        for workspace in [localWorkspace, deviceWorkspace, otherDeviceWorkspace] + otherWindowWorkspaces {
             workspace.sessions.forEach { $0.stop() }
             workspace.closeAllSessions(intent: .windowClosed)
         }
@@ -504,6 +528,31 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     let status = try await harness.send(.getProjectStatus, to: listener, credentials: harness.credentials)
     guard case .getProjectStatus(let project)? = status.result else { return }
     #expect(project.projectRoot == harness.deviceKey)
+}
+
+/// A device project's second window (#22): its tab's token is accepted,
+/// though the project's most recently active window is the first, and its
+/// requests, scoped ones too, go to its own window; the first window's tab
+/// still reaches its own.
+@Test @MainActor func RemoteDeviceMCPReachesATabOfAProjectsSecondWindow() async throws {
+    let harness = try DeviceMCPHarness()
+    defer { harness.stop() }
+    let listener = try harness.server.addDeviceListener(deviceID: harness.deviceID)
+    let (second, tab) = harness.openAnotherDeviceWindow()
+    #expect(ProjectWindowRegistry.shared.workspace(for: harness.deviceKey) === harness.deviceWorkspace)
+    let token = harness.tokens.newGeneration(tabID: tab.id, deviceID: harness.deviceID)
+    let credentials = CherryControlCredentials(token: token, processID: tab.id.uuidString)
+    let secondIDs = Set(second.sessions.map(\.id.uuidString))
+    let firstIDs = Set(harness.deviceWorkspace.sessions.map(\.id.uuidString))
+    let scoped = CherryControlRequest.scoped(.init(projectRoot: harness.remotePath, request: .listProcesses(.init())))
+
+    let unscoped = try await harness.send(.listProcesses(.init()), to: listener, credentials: credentials)
+    #expect(unscoped.error == nil)
+    #expect(harness.processIDs(unscoped) == secondIDs)
+    let inItsWindow = try await harness.send(scoped, to: listener, credentials: credentials)
+    #expect(inItsWindow.error == nil)
+    #expect(harness.processIDs(inItsWindow) == secondIDs)
+    #expect(harness.processIDs(try await harness.send(scoped, to: listener, credentials: harness.credentials)) == firstIDs)
 }
 
 /// Monitors keep to the caller's Mac: a caller on another Mac watches only

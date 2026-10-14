@@ -3916,7 +3916,10 @@ enum HostRoutedKeyEncoder {
     /// gives it (`TerminalKeyEventHandler`, `filteredCharacters`): the
     /// characters with the key's modifiers, but without Option when it acts
     /// as Alt (`ghostty_surface_key_translation_mods`), and without Control
-    /// when that makes a control character (Control+Shift+H types `H`).
+    /// when that makes a control character (Control+Shift+H types `H`); none
+    /// for a function key, or when that is still a control character
+    /// (Return, Tab, Escape, Backspace), as in Ghostty's macOS app
+    /// (`keyEventText`).
     static func surfaceText(for event: NSEvent, optionAsAlt: OptionAsAlt) -> String? {
         var modifiers = event.modifierFlags
         let translated = optionAsAlt.applies(to: modifiers)
@@ -3926,6 +3929,17 @@ enum HostRoutedKeyEncoder {
             modifiers.remove(.control)
             text = event.characters(byApplyingModifiers: modifiers)
         }
+        return keyEventText(text)
+    }
+
+    /// `text` as the text of a key event in Ghostty's macOS app
+    /// (`NSEvent.ghosttyCharacters`, `String.keyEventText`): none for a
+    /// function key's character (U+F700–U+F8FF: F13 and above, Help, Clear)
+    /// or a text that begins with a control character (C0 or DEL).
+    private static func keyEventText(_ text: String?) -> String? {
+        guard let text, let first = text.unicodeScalars.first, first.value >= 0x20, first.value != 0x7F,
+              text.unicodeScalars.count > 1 || !(0xF700...0xF8FF).contains(first.value)
+        else { return nil }
         return text
     }
 
@@ -3939,12 +3953,12 @@ enum HostRoutedKeyEncoder {
         charactersIgnoringModifiers: String?,
         optionActsAsAlt: Bool
     ) -> String? {
-        if optionActsAsAlt { return charactersIgnoringModifiers }
+        if optionActsAsAlt { return keyEventText(charactersIgnoringModifiers) }
         if let scalars = characters?.unicodeScalars, scalars.count == 1, let scalar = scalars.first,
            scalar.value < 0x20 || scalar.value == 0x7F {
-            return charactersIgnoringModifiers
+            return keyEventText(charactersIgnoringModifiers)
         }
-        return characters
+        return keyEventText(characters)
     }
 
     /// What Control and a key type: its C0 byte (Control+A is 0x01,

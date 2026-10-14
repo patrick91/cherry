@@ -13,6 +13,19 @@ struct TerminalInputTextTests {
     }
 
     @Test
+    func controlCharactersAreNoKeyEventText() {
+        #expect(TerminalInputText.keyEventText("\r") == nil)
+        #expect(TerminalInputText.keyEventText("\t") == nil)
+        #expect(TerminalInputText.keyEventText("\u{1B}") == nil)
+        #expect(TerminalInputText.keyEventText("\u{7F}") == nil)
+        #expect(TerminalInputText.keyEventText("") == nil)
+        #expect(TerminalInputText.keyEventText(nil) == nil)
+        #expect(TerminalInputText.keyEventText("a") == "a")
+        #expect(TerminalInputText.keyEventText(" ") == " ")
+        #expect(TerminalInputText.keyEventText("é") == "é")
+    }
+
+    @Test
     func recognizesPrivateUseFunctionKeyScalars() {
         #expect(TerminalInputText.isPrivateUseFunctionKey("\u{F702}"))
         #expect(TerminalInputText.isPrivateUseFunctionKey("\u{F703}"))

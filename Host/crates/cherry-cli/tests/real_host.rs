@@ -392,11 +392,12 @@ impl Attached {
         }
     }
 
-    /// How many cursor report requests the terminal received.
-    fn cursor_queries(&self) -> usize {
+    /// How many window position requests (XTWINOPS 13) the terminal
+    /// received.
+    fn position_queries(&self) -> usize {
         self.received
             .windows(5)
-            .filter(|bytes| *bytes == b"\x1b[?6n")
+            .filter(|bytes| *bytes == b"\x1b[13t")
             .count()
     }
 
@@ -406,8 +407,8 @@ impl Attached {
             .any(|bytes| bytes == needle)
     }
 
-    /// Read what the client wrote, and answer each new cursor report request
-    /// with `reply`, as a terminal does.
+    /// Read what the client wrote, and answer each new window position
+    /// request with `reply`, as a terminal does.
     fn answer(&mut self, answered: &mut usize, reply: &[u8]) {
         let mut bytes = [0u8; 16384];
         match self.master.read(&mut bytes) {
@@ -415,7 +416,7 @@ impl Attached {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => panic!("PTY read failed: {error}"),
         }
-        while *answered < self.cursor_queries() {
+        while *answered < self.position_queries() {
             self.master.write_all(reply).unwrap();
             *answered += 1;
         }
@@ -583,16 +584,17 @@ fn two_running_attachments_of_one_client_never_take_turns() {
 #[test]
 #[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
 fn only_the_terminal_that_typed_last_answers_the_programs_queries() {
-    const FIRST: &[u8] = b"\x1b[?11;1R";
-    const SECOND: &[u8] = b"\x1b[?22;1R";
+    const FIRST: &[u8] = b"\x1b[3;1;1t";
+    const SECOND: &[u8] = b"\x1b[3;2;2t";
     let host = Host::start();
     let directory = private_directory();
     let cwd = directory.path().to_str().unwrap();
-    // Each round asks for the cursor and reads one reply; a second reply
-    // would be read as the next round's go byte, or land in `extra`.
+    // Each round asks for the window's position and reads one reply; a
+    // second reply would be read as the next round's go byte, or land in
+    // `extra`.
     let created = host.json(&[
         "new", "--cwd", cwd, "--name", "Queries", "--", "/bin/sh", "-c",
-        "stty raw -echo; printf 'READY\\r\\n'; for round in 1 2 3; do dd bs=1 count=1 >/dev/null 2>&1; printf 'ASK%s\\033[?6n' $round; dd bs=1 count=8 2>/dev/null > reply$round; printf '\\r\\nROUND%s\\r\\n' $round; done; stty min 0 time 5; dd bs=1 count=64 2>/dev/null > extra; printf 'DONE\\r\\n'; exec sleep 60",
+        "stty raw -echo; printf 'READY\\r\\n'; for round in 1 2 3; do dd bs=1 count=1 >/dev/null 2>&1; printf 'ASK%s\\033[13t' $round; dd bs=1 count=8 2>/dev/null > reply$round; printf '\\r\\nROUND%s\\r\\n' $round; done; stty min 0 time 5; dd bs=1 count=64 2>/dev/null > extra; printf 'DONE\\r\\n'; exec sleep 60",
     ]);
     let id = created["id"].as_str().unwrap();
     // The first window has the shared grid's size and shows the stream
@@ -603,7 +605,7 @@ fn only_the_terminal_that_typed_last_answers_the_programs_queries() {
     second.expect(b"READY");
     let mut answered = (0, 0);
     for (round, first_types) in [(1, true), (2, false), (3, true)] {
-        let asked = (first.cursor_queries(), second.cursor_queries());
+        let asked = (first.position_queries(), second.position_queries());
         let typist = if first_types { &mut first } else { &mut second };
         typist.master.write_all(b"g").unwrap();
         let marker = format!("ROUND{round}");
@@ -622,7 +624,7 @@ fn only_the_terminal_that_typed_last_answers_the_programs_queries() {
             (asked.0, asked.1 + 1)
         };
         assert_eq!(
-            (first.cursor_queries(), second.cursor_queries()),
+            (first.position_queries(), second.position_queries()),
             expected,
             "round {round}"
         );

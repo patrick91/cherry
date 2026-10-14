@@ -434,7 +434,7 @@ fn a_resize_leaves_a_client_that_keeps_up_all_of_its_queued_output() {
     // write, a title and a kitty image sent in two chunks, around a query,
     // which goes to the client that typed, apart from the output.
     let session = host.create(shell(
-        "stty -echo; IFS= read -r go; stty raw; dd if=/dev/zero bs=65536 count=16 2>/dev/null | tr '\\0' x; printf '\\033]52;c;Q0xJUA==\\007\\033[?6n\\033]2;TITLE\\007\\033_Ga=T,f=24,s=1,v=1,m=1;AAAA\\033\\\\\\033_Gm=0;AAAA\\033\\\\\\r\\nFLOOD_DONE\\r\\n'; exec sleep 60",
+        "stty -echo; IFS= read -r go; stty raw; dd if=/dev/zero bs=65536 count=16 2>/dev/null | tr '\\0' x; printf '\\033]52;c;Q0xJUA==\\007\\033[13t\\033]2;TITLE\\007\\033_Ga=T,f=24,s=1,v=1,m=1;AAAA\\033\\\\\\033_Gm=0;AAAA\\033\\\\\\r\\nFLOOD_DONE\\r\\n'; exec sleep 60",
     ));
     let (mut slow, _, start, snapshot) = host.attach(&session.id, 80, 24);
     let mut slow_screen = Screen::new(80, 24, start, &snapshot);
@@ -485,7 +485,7 @@ fn a_resize_leaves_a_client_that_keeps_up_all_of_its_queued_output() {
             .iter()
             .map(|(_, data)| &data[..])
             .collect::<Vec<_>>(),
-        [b"\x1b[?6n"]
+        [b"\x1b[13t"]
     );
     // Where it stood in the output: right after the clipboard write.
     let clipboard = all
@@ -591,8 +591,11 @@ fn drain(screen: &mut Screen, socket: &mut UnixStream) {
 #[test]
 fn an_attach_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
     let host = Host::new();
+    // Each line ends the output, its newline before it: a client that
+    // shows it has all of it (Linux writes the CR LF of a newline apart
+    // from the text before it, so it may come in an output of its own).
     let session = host.create(shell(
-        "stty -echo; printf 'READY\\n'; while IFS= read -r line; do printf 'LINE:%s\\n' \"$line\"; done",
+        "stty -echo; printf 'READY\\n'; while IFS= read -r line; do printf '\\nLINE:%s' \"$line\"; done",
     ));
     let (mut first, _, offset, snapshot) = host.attach(&session.id, 100, 30);
     let mut first_screen = Screen::new(100, 30, offset, &snapshot);
@@ -658,9 +661,12 @@ fn a_resync_answered_after_the_grid_changed_is_brought_to_the_new_grid() {
     let host = Host::new();
     // Far more styled output than a client may have queued: a client that
     // does not read falls behind, and stays behind, since the large resync
-    // snapshot queued for it keeps it from catching up.
+    // snapshot queued for it keeps it from catching up. Each line ends the
+    // output, its newline before it: a client that shows it has all of it
+    // (Linux writes the CR LF of a newline apart from the text before it,
+    // so it may come in an output of its own).
     let session = host.create(shell(&format!(
-        "stty -echo; IFS= read -r start; {STYLED_HISTORY}; printf 'FLOOD_%s\\n' DONE; while IFS= read -r line; do printf 'LINE:%s\\n' \"$line\"; done"
+        "stty -echo; IFS= read -r start; {STYLED_HISTORY}; printf 'FLOOD_%s\\n' DONE; while IFS= read -r line; do printf '\\nLINE:%s' \"$line\"; done"
     )));
     let (mut lagging, _, offset, snapshot) = host.attach(&session.id, 100, 30);
     let mut lagging_screen = Screen::new(100, 30, offset, &snapshot);

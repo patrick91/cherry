@@ -644,9 +644,9 @@ impl Terminal {
     }
 
     /// Resize to `cols` by `rows` cells of `cell_width` by `cell_height`
-    /// pixels, which size reports (CSI 14t, 16t, 18t, mode 2048) and kitty
-    /// images then use. A new terminal's cells are 8×16. A change of the
-    /// cell size alone changes no cell but reports the new size (mode
+    /// pixels, which size reports (CSI 14t, 16t, 18t, 19t, mode 2048) and
+    /// kitty images then use. A new terminal's cells are 8×16. A change of
+    /// the cell size alone changes no cell but reports the new size (mode
     /// 2048) and ends synchronized output, as any resize does.
     pub fn resize_cells(
         &mut self,

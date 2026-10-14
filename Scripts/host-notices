@@ -1,0 +1,230 @@
+#!/usr/bin/env -S python3 -I
+"""Write or check the third-party notices of the Rust session helpers.
+
+    Scripts/host-notices --write | --check
+
+--write regenerates Host/THIRD_PARTY_NOTICES.txt (shipped in Scripts/package-host
+archives and as Contents/Resources/Licenses/Rust-THIRD_PARTY_NOTICES.txt): every
+crate cargo builds for the Host workspace (cherry, cherry-host, and their build
+and test dependencies) on macOS and GNU Linux, arm64 and x86_64, as
+Host/Cargo.lock pins it, with the LICENSE*, LICENCE*, COPYING*, COPYRIGHT* and
+NOTICE* files of its published source. Identical files are written once. Cargo
+downloads the sources it lacks.
+
+--check regenerates the file in memory and fails when it differs from
+Host/THIRD_PARTY_NOTICES.txt; host.yml runs it, so a Cargo.lock change without
+--write fails CI.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+
+REPOSITORY = Path(__file__).resolve().parent.parent
+HOST = REPOSITORY / "Host"
+MANIFEST = HOST / "Cargo.toml"
+LOCKFILE = HOST / "Cargo.lock"
+NOTICES = HOST / "THIRD_PARTY_NOTICES.txt"
+# The build targets Host/README.md supports.
+TARGETS = ("aarch64-apple-darwin", "x86_64-apple-darwin",
+           "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu")
+NOTICE_PREFIXES = ("LICENSE", "LICENCE", "COPYING", "COPYRIGHT", "NOTICE")
+CRATES_IO_SOURCES = ("registry+https://github.com/rust-lang/crates.io-index",
+                     "sparse+https://index.crates.io/")
+HASH_PREFIX = "Cargo.lock SHA-256: "
+TITLE = "CHERRY HOST — RUST DEPENDENCY NOTICES"
+INDEX = "PACKAGE INDEX"
+TEXTS = "FULL NOTICE TEXTS"
+
+
+class NoticesError(Exception):
+    pass
+
+
+def relative(path):
+    try:
+        return str(Path(path).relative_to(REPOSITORY))
+    except ValueError:
+        return str(path)
+
+
+def read_text(path):
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise NoticesError(f"cannot read {relative(path)}: {error}") from None
+    # Leading blank lines are kept: the notices are the files as published.
+    return text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
+
+
+def lockfile_sha256():
+    try:
+        return hashlib.sha256(LOCKFILE.read_bytes()).hexdigest()
+    except OSError as error:
+        raise NoticesError(f"cannot read {relative(LOCKFILE)}: {error}") from None
+
+
+def cargo(*arguments):
+    cargo = os.environ.get("CARGO", "cargo")
+    command = [cargo, *arguments, "--manifest-path", str(MANIFEST), "--locked", "--color", "never"]
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+    except OSError as error:
+        raise NoticesError(f"cannot run {cargo}: {error}") from None
+    except subprocess.CalledProcessError as error:
+        raise NoticesError(f"`{' '.join(command)}` failed:\n{error.stderr.strip()}") from None
+    return result.stdout
+
+
+def version_key(version):
+    return [(0, int(part), "") if part.isdigit() else (1, 0, part)
+            for part in re.split(r"[.+-]", version)]
+
+
+def packages():
+    """Every crate cargo builds for the workspace on one of TARGETS, by name and version."""
+    members = set()
+    known = {}
+    for target in TARGETS:
+        graph = json.loads(cargo("metadata", "--format-version", "1", "--filter-platform", target))
+        for package in graph["packages"]:
+            if package["id"] in graph["workspace_members"]:
+                members.add(package["name"])
+            else:
+                known.setdefault((package["name"], package["version"]), {})[package["id"]] = package
+    # Which of them a build compiles comes from `cargo tree`, which resolves features as
+    # a build does: `cargo metadata` also lists optional dependencies that only a weak
+    # feature names (flate2's `zlib-rs?/std` brings zlib-rs, which nothing builds).
+    targets = [argument for target in TARGETS for argument in ("--target", target)]
+    tree = cargo("tree", "--workspace", *targets, "--edges", "normal,build,dev",
+                 "--prefix", "none", "--format", "{p}")
+    found = []
+    for name, version in sorted(set(re.findall(r"^(\S+) v(\S+)", tree, flags=re.MULTILINE))):
+        if name in members:
+            continue
+        candidates = list(known.get((name, version), {}).values())
+        if len(candidates) != 1:
+            raise NoticesError(f"cargo tree lists {name} {version}, which cargo metadata "
+                               + ("does not know" if not candidates else "has from several sources"))
+        package = candidates[0]
+        if not (package.get("source") or "").startswith(CRATES_IO_SOURCES):
+            raise NoticesError(f"{name} {version} does not come from crates.io "
+                               f"({package.get('source') or 'a path'}): add its notices by hand")
+        found.append(package)
+    return sorted(found, key=lambda package: (package["name"], version_key(package["version"])))
+
+
+def notice_files(package):
+    directory = Path(package["manifest_path"]).parent
+    files = sorted(entry for entry in directory.iterdir()
+                   if entry.is_file() and entry.name.upper().startswith(NOTICE_PREFIXES))
+    if not files:
+        raise NoticesError(f"no LICENSE, COPYING or NOTICE file in {directory}")
+    return files
+
+
+def render():
+    index = []
+    texts = []
+    numbers = {}
+    for package in packages():
+        name, version = package["name"], package["version"]
+        lines = [f"{name} {version}",
+                 f"  Package: https://crates.io/crates/{name}/{version}",
+                 f"  Declared license: {package.get('license') or 'none'}"]
+        for path in notice_files(package):
+            text = read_text(path)
+            if text not in numbers:
+                numbers[text] = len(numbers) + 1
+                texts.append(f"===== NOTICE-{numbers[text]:03d} =====\n\n{text}")
+            lines.append(f"  {path.name}: NOTICE-{numbers[text]:03d}")
+        index.append("\n".join(lines) + "\n")
+    header = (
+        f"{TITLE}\n"
+        "\n"
+        "Generated by Scripts/host-notices from Cargo.lock and the published crate\n"
+        "license/notice files for the resolved macOS and GNU Linux (arm64 and x86_64)\n"
+        "dependency graphs. Includes build and test dependencies as well as runtime\n"
+        "dependencies. Identical notice files are included once and referenced from\n"
+        "each package; copyright text is preserved. Ghostty and its native\n"
+        "dependencies are covered separately by vendor/ghostty-vt/LICENSE and\n"
+        "vendor/ghostty-vt/THIRD_PARTY_NOTICES.txt.\n"
+        "\n"
+        f"{HASH_PREFIX}{lockfile_sha256()}\n"
+    )
+    return "\n".join([header, f"{INDEX}\n", *index, f"{TEXTS}\n", *texts])
+
+
+def recorded_hash(text):
+    for line in text.splitlines()[:16]:
+        if line.startswith(HASH_PREFIX):
+            return line[len(HASH_PREFIX):].strip()
+    return None
+
+
+def indexed_packages(text):
+    body = text.split(f"\n{INDEX}\n", 1)[-1].split(f"\n{TEXTS}\n", 1)[0]
+    return set(re.findall(r"^(\S+ \S+)$", body, flags=re.MULTILINE))
+
+
+def write():
+    text = render()
+    handle, staged = tempfile.mkstemp(prefix=".THIRD_PARTY_NOTICES.", dir=NOTICES.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as file:
+            file.write(text)
+        os.chmod(staged, 0o644)
+        os.replace(staged, NOTICES)
+    except BaseException:
+        Path(staged).unlink(missing_ok=True)
+        raise
+    print(f"Wrote {relative(NOTICES)} ({len(indexed_packages(text))} crates)", file=sys.stderr)
+
+
+def check():
+    if not NOTICES.is_file():
+        raise NoticesError(f"missing {relative(NOTICES)}: run Scripts/host-notices --write")
+    written = NOTICES.read_text(encoding="utf-8")
+    expected = render()
+    if written == expected:
+        print(f"{relative(NOTICES)} matches {relative(LOCKFILE)}", file=sys.stderr)
+        return
+    problems = []
+    written_hash, lock_hash = recorded_hash(written), lockfile_sha256()
+    if written_hash != lock_hash:
+        problems.append(f"it was written for Cargo.lock {written_hash or '(none)'}, which is now {lock_hash}")
+    missing = sorted(indexed_packages(expected) - indexed_packages(written))
+    extra = sorted(indexed_packages(written) - indexed_packages(expected))
+    if missing:
+        problems.append("it leaves out " + ", ".join(missing))
+    if extra:
+        problems.append("it lists " + ", ".join(extra) + ", which the workspace no longer uses")
+    if not problems:
+        problems.append("its text differs from what --write generates")
+    raise NoticesError(f"{relative(NOTICES)} is stale: " + "; ".join(problems)
+                       + ". Run Scripts/host-notices --write and commit it.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--write", action="store_true", help="Regenerate Host/THIRD_PARTY_NOTICES.txt")
+    mode.add_argument("--check", action="store_true", help="Fail when Host/THIRD_PARTY_NOTICES.txt is stale")
+    args = parser.parse_args()
+    try:
+        write() if args.write else check()
+    except NoticesError as error:
+        print(f"error: {error}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

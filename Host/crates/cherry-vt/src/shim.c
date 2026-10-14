@@ -18,8 +18,8 @@
 // Receives encoded bytes. Rust appends them to a Vec.
 typedef void (*CherrySink)(void *userdata, const uint8_t *bytes, size_t len);
 
-// Size reports (CSI 14t, 16t, 18t) give the cell size the terminal was last
-// resized with (`cherry_vt_new` starts it at 8x16).
+// Size reports (CSI 14t, 16t, 18t, 19t) give the cell size the terminal was
+// last resized with (`cherry_vt_new` starts it at 8x16).
 static bool terminal_size(GhosttyTerminal term, void *userdata, GhosttySizeReportSize *out) {
     (void)userdata;
     uint32_t width = 0, height = 0;

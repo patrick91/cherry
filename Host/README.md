@@ -23,9 +23,10 @@ install -d "$HOME/.local/bin"
 install -m 755 Host/target/release/cherry Host/target/release/cherry-host "$HOME/.local/bin/"
 ```
 
-The build requires Rust/Cargo, a C/C++ toolchain, Git, curl, tar, and network
-access for dependencies. On macOS, install the Xcode command-line tools; on
-Debian/Ubuntu, install `build-essential git curl xz-utils`. The VT build script
+The build requires Rust/Cargo 1.85 or later (the workspace's `rust-version`), a
+C/C++ toolchain, Git, curl, tar, and network access for dependencies. On macOS,
+install the Xcode command-line tools; on Debian/Ubuntu, install
+`build-essential git curl xz-utils`. The VT build script
 downloads checksum-pinned Zig 0.16.0 and builds a pinned Ghostty revision as a
 ReleaseSafe library. See [the VT dependency notes](vendor/ghostty-vt/README.md)
 for revision, stamp, and toolchain overrides. `Scripts/build-host-vt` accepts a
@@ -68,7 +69,7 @@ interactive shell's PATH may differ. Verify it with
 
 The supported build targets are macOS arm64/x86_64 and GNU Linux arm64/x86_64.
 Linux tests run natively in a Debian 12 container (`Scripts/test-host-linux`),
-and CI is configured for Ubuntu 22.04 x86_64 and 24.04 arm64. The Ghostty
+and CI is configured for Ubuntu 24.04 x86_64 and arm64. The Ghostty
 archive is built with a glibc 2.31 target, but this is
 **not a verified glibc floor for the complete Rust binaries**. Build on your
 deployment distribution or validate an archive there. Musl Linux and Windows
@@ -1576,7 +1577,8 @@ A program reports what it is doing with the program status protocol (OSC
 `error`, with an optional progress, title and one-line message. Claude Code
 and Pi report only after their terminal answers the support query
 (`OSC 7501 ; ?`). The holder's terminal answers it (libghostty-vt answers
-while its program status callback is set) and keeps the records by the
+while its program status callback is set, with `?` and, since revision 0.4 of
+the specification, the states and kinds it takes) and keeps the records by the
 specification's rules (`cherry-vt` `program_status.rs`): a report replaces
 its record whole; `clear` removes a record and every record beneath it
 (`build` takes `build/test`), or all of them; at most 64, the record updated
@@ -1837,9 +1839,9 @@ primary-screen frame left it. This also holds inside tmux.
 Each terminal query has one responder: the host or one attached client. The
 host's terminal answers a fixed set whether or not a client is attached, and
 removes those queries from what renderers receive: device attributes, status
-and cursor reports (`CSI 5n`, `CSI 6n`), the colour-scheme report, DEC private
+and cursor reports (`CSI 5n`, `CSI 6n`, `CSI ?6n`), the colour-scheme report, DEC private
 mode reports, XTVERSION, DECRQSS, the kitty keyboard, graphics, and clipboard
-(OSC 5522) queries, size reports (`CSI 14/16/18 t`), XTGETTCAP names it knows,
+(OSC 5522) queries, size reports (`CSI 14/16/18/19 t`), XTGETTCAP names it knows,
 and colour queries for the palette, foreground, background, and cursor (OSC 4,
 10–12, 21). It also keeps the report modes it answers itself, in-band resize
 (2048) and 2033, away from renderers: neither live output, snapshots, nor
@@ -1861,7 +1863,7 @@ changes nothing. Colour replies (OSC 10, 11 and 12) and the colour-scheme report
 Mac app passes its terminal theme for the appearance it shows), or light
 grey on black and dark without them. Kitty graphics reach renderers
 with `q=2`, so only the host replies (see [kitty graphics](#kitty-graphics)). Other queries (status reports such as
-`CSI ?6n`, OSC 5 and 13–19 colour queries, `CSI 11/13/15/19–21 t` and size
+`CSI ?15n`, OSC 5 and 13–19 colour queries, `CSI 11/13/15/20/21 t` and size
 reports with extra parameters, ANSI mode requests, DECREQTPARM, DECRQPSR,
 DECRQTSR, DECRQUPSS, DECRQCRA, XTREPORTSGR, XTQMODKEYS, XTSMGRAPHICS, OSC 52
 clipboard reads, OSC 22 pointer-shape and OSC 99 capability queries, ENQ, and
@@ -2056,7 +2058,9 @@ progress, and after `Detach` it sends no `Resize` or `Ping`.
 ```sh
 Scripts/build-host-vt
 cargo fmt --manifest-path Host/Cargo.toml --all -- --check
+Scripts/host-notices --check
 cargo clippy --manifest-path Host/Cargo.toml --locked --workspace --all-targets -- -D warnings
+cargo +1.85.0 check --manifest-path Host/Cargo.toml --locked --workspace --all-targets
 cargo test --manifest-path Host/Cargo.toml --locked --workspace -- --test-threads=1
 cargo build --manifest-path Host/Cargo.toml --locked --bins
 cargo test --manifest-path Host/Cargo.toml --locked -p cherry-cli --test real_host -- --ignored --test-threads=1
@@ -2215,7 +2219,8 @@ then shuts its daemon down and kills any `cherry-host serve` or `hold` still
 using its socket.
 
 Two GitHub workflows are configured. `host.yml` runs the Rust commands above on
-macOS 15 arm64, Ubuntu 22.04 x86_64, and Ubuntu 24.04 arm64, plus a job that
+macOS 15 arm64, Ubuntu 24.04 x86_64, and Ubuntu 24.04 arm64 (the Rust 1.85
+check, the workspace's `rust-version`, on Ubuntu x86_64 only), plus a job that
 runs `Scripts/test-host-ssh`. `app.yml`, on macOS 26, builds the Rust helpers
 (`Scripts/build-host debug`), runs `python3 Scripts/test_cherry_private_host.py`
 (the teardown the GUI test scripts use), builds the Swift tests, and then
@@ -2224,4 +2229,7 @@ runs `Scripts/test-session-suites --skip-build unit` and
 library keyed on `Scripts/build-host-vt`. Configuring a workflow does not
 establish that it has passed. Dependency notices are in
 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) and
-[vendor/ghostty-vt](vendor/ghostty-vt/README.md).
+[vendor/ghostty-vt](vendor/ghostty-vt/README.md). After a `Cargo.lock` change,
+`Scripts/host-notices --write` regenerates the first from the crates the
+workspace builds on macOS and Linux; `--check`, which `host.yml` runs, fails
+while it is stale.

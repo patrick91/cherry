@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/cherry-protocol", "crates/cherry-host", "crates/cherry-cli", "crates/cherry-vt"]
 
 [workspace.package]

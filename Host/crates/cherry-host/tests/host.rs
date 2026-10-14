@@ -351,9 +351,12 @@ fn a_lone_windows_drag_changes_the_grid_at_every_step() {
 fn a_lagging_client_is_resynchronized_instead_of_disconnected() {
     let host = Host::new();
     // About 12 MiB without pauses: far more than one client may have
-    // waiting for it (see `flood`).
+    // waiting for it (see `flood`). The live line ends the output, its
+    // newline before it: a client that shows it has all of it (Linux
+    // writes the CR LF of a newline apart from the text before it, so it
+    // may come in an output of its own).
     let session = host.create(shell(
-        "stty -echo; IFS= read -r start; dd if=/dev/zero bs=65536 count=192 2>/dev/null | tr '\\0' x; printf '\\r\\nFLOOD_%s\\r\\n' COMPLETE; IFS= read -r line; printf 'LIVE:%s\\r\\n' \"$line\"; exec sleep 60",
+        "stty -echo; IFS= read -r start; dd if=/dev/zero bs=65536 count=192 2>/dev/null | tr '\\0' x; printf '\\r\\nFLOOD_%s\\r\\n' COMPLETE; IFS= read -r line; printf '\\r\\nLIVE:%s' \"$line\"; exec sleep 60",
     ));
     let (mut stalled, _, offset, snapshot) = host.attach(&session.id, 80, 24);
     let mut stalled_screen = Screen::new(80, 24, offset, &snapshot);
@@ -1142,8 +1145,8 @@ fn attached_queries_have_exactly_one_responder() {
         r#"stty raw -echo
 printf 'READY\r\n'
 dd bs=1 count=1 >/dev/null 2>&1
-printf '\033[6n\033]52;c;?\007\033[?6n\033[>4n'
-dd bs=1 count=6 2>/dev/null | od -An -tx1 > "$CHERRY_TEST_DIR/reply"
+printf '\033[6n\033[?6n\033]52;c;?\007\033[13t\033[>4n'
+dd bs=1 count=15 2>/dev/null | od -An -tx1 > "$CHERRY_TEST_DIR/reply"
 stty min 0 time 5
 dd bs=1 count=64 2>/dev/null | od -An -tx1 > "$CHERRY_TEST_DIR/extra"
 printf 'DONE\r\n'
@@ -1162,24 +1165,25 @@ exec sleep 60"#,
             _ => {}
         }
     }
-    // The host answered the cursor report, so the renderer never saw it; the
-    // queries the host does not answer went to this client, apart from the
-    // output and where they stood in it. A setting stays in the output.
+    // The host answered the cursor reports, so the renderer never saw them;
+    // the queries the host does not answer went to this client, apart from
+    // the output and where they stood in it. A setting stays in the output.
     assert!(!contains(&output, b"\x1b[6n"));
-    assert!(!contains(&output, b"\x1b]52;c;?\x07"));
     assert!(!contains(&output, b"\x1b[?6n"));
+    assert!(!contains(&output, b"\x1b]52;c;?\x07"));
+    assert!(!contains(&output, b"\x1b[13t"));
     assert!(contains(&output, b"\x1b[>4n"));
     let before_query = output.len() - b"\x1b[>4nDONE\r\n".len();
     assert_eq!(
         queries,
-        [(before_query, b"\x1b]52;c;?\x07\x1b[?6n".to_vec())],
+        [(before_query, b"\x1b]52;c;?\x07\x1b[13t".to_vec())],
         "{:?}",
         String::from_utf8_lossy(&output)
     );
     let reply = fs::read_to_string(host.dir().join("reply")).unwrap();
     assert_eq!(
         reply.split_whitespace().collect::<Vec<_>>().join(" "),
-        "1b 5b 32 3b 31 52"
+        "1b 5b 32 3b 31 52 1b 5b 3f 32 3b 31 3b 31 52"
     );
     let extra = fs::read_to_string(host.dir().join("extra")).unwrap();
     assert!(extra.trim().is_empty(), "second reply: {extra}");

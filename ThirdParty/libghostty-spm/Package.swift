@@ -14,9 +14,6 @@ let package = Package(
         .library(name: "ShellCraftKit", targets: ["ShellCraftKit"]),
         .library(name: "GhosttyTheme", targets: ["GhosttyTheme"]),
     ],
-    dependencies: [
-        .package(url: "https://github.com/Lakr233/MSDisplayLink.git", from: "2.1.0"),
-    ],
     targets: [
         .target(
             name: "GhosttyKit",
@@ -29,7 +26,7 @@ let package = Package(
         ),
         .target(
             name: "GhosttyTerminal",
-            dependencies: ["GhosttyKit", "MSDisplayLink"],
+            dependencies: ["GhosttyKit"],
             path: "Sources/GhosttyTerminal",
             resources: [
                 .copy("Resources/Ghostty"),
@@ -49,8 +46,8 @@ let package = Package(
         ),
         .binaryTarget(
             name: "libghostty",
-            url: "https://github.com/Lakr233/libghostty-spm/releases/download/upstream.3c47ca159368-2/GhosttyKit.xcframework.zip",
-            checksum: "804d4c92cad153eb8d85ed86f4c98ca587e90ff47ac0a62c846c985ece02a9c3"
+            url: "https://github.com/Lakr233/libghostty-spm/releases/download/upstream.1e9e14af5df1-2/GhosttyKit.xcframework.zip",
+            checksum: "188b21d3c3f4f0a19fd71d7f3e6c6edc0e8e30fe04e09181d3db44810e21bf5f"
         ),
         .testTarget(
             name: "GhosttyKitTest",

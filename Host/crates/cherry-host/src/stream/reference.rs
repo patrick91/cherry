@@ -380,17 +380,18 @@ fn route_csi(token: &[u8]) -> Route {
     let host = match (last, prefix, intermediates) {
         // Device attributes (primary, secondary, tertiary).
         (b'c', None | Some(b'>' | b'='), b"") => true,
-        // Status and cursor reports, and the colour-scheme report.
+        // Status and cursor reports, the extended cursor report (DECXCPR)
+        // and the colour-scheme report.
         (b'n', None, b"") => matches!(params, b"5" | b"6"),
-        (b'n', Some(b'?'), b"") => params == b"996",
+        (b'n', Some(b'?'), b"") => matches!(params, b"6" | b"996"),
         // Mode reports (DECRQM), DEC private and ANSI.
         (b'p', Some(b'?') | None, b"$") => true,
         // XTVERSION.
         (b'q', Some(b'>'), b"") => true,
         // Kitty keyboard flags, whatever the parameters.
         (b'u', Some(b'?'), b"") => true,
-        // Text area and cell size reports.
-        (b't', None, b"") => matches!(params, b"14" | b"16" | b"18"),
+        // Text area, cell and screen size reports.
+        (b't', None, b"") => matches!(params, b"14" | b"16" | b"18" | b"19"),
         _ => false,
     };
     if host {
@@ -407,8 +408,8 @@ fn route_csi(token: &[u8]) -> Route {
 fn csi_query(last: u8, prefix: Option<u8>, params: &[u8], intermediates: &[u8]) -> bool {
     let first = params.split(|&b| b == b';').next().unwrap_or_default();
     match (last, prefix, intermediates) {
-        // Status reports (DSR, DECXCPR and the other DEC reports); `CSI > n`
-        // sets key modifier options instead.
+        // Status reports (DSR and the other DEC reports); `CSI > n` sets key
+        // modifier options instead.
         (b'n', None | Some(b'?'), b"") => true,
         // Window and title reports (XTWINOPS); not the window operations or
         // the title stack.

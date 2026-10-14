@@ -14,7 +14,10 @@ let package = Package(
     ],
     dependencies: [
         .package(path: "ThirdParty/libghostty-spm"),
-        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
+        // Up to the next minor: a 0.x minor may break, and `from:` would also take 0.13 and later.
+        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", .upToNextMinor(from: "0.12.1")),
+        // CherryStdioTransport imports Logging itself (swift-sdk depends on it too).
+        .package(url: "https://github.com/apple/swift-log.git", from: "1.16.1"),
         // Exact: the framework, its tools (sign_update), the launchd job labels Cherry removes and
         // the delegate behaviour Cherry relies on (docs/releasing.md) move together; upgrade deliberately.
         .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"),
@@ -35,6 +38,7 @@ let package = Package(
             dependencies: [
                 "CherryControl",
                 .product(name: "MCP", package: "swift-sdk"),
+                .product(name: "Logging", package: "swift-log"),
             ]
         ),
         .executableTarget(

@@ -27,6 +27,14 @@ final class RepositoryWorkspace: ObservableObject {
     /// The grid this window gives its terminals (`TerminalWindowGrid`).
     private let windowGrid = TerminalWindowGrid()
     private var didAutoStart = false
+    /// Auto-start was asked for before the window claimed its project: it
+    /// runs once it has (`beginRestoringSavedStateIfNeeded`).
+    private var autoStartAwaitsClaim = false
+    /// Whether this window starts the project's auto-start commands: the
+    /// one that opened the project (no other window of it was registered
+    /// when it claimed it: `ProjectWindowRegistry.register` sets it). True
+    /// for a window no registry claimed (tests).
+    var opensProject = true
 
     // Workspace persistence. Nothing is saved before the window claimed its
     // project (`beginRestoringSavedStateIfNeeded`), so a duplicate window
@@ -62,9 +70,10 @@ final class RepositoryWorkspace: ObservableObject {
     /// Kept records that come back when their host becomes reachable during
     /// this run (`WorkspaceRestoreResult.retryWhenAvailable`).
     private var restoreRetry: AnyCancellable?
-    /// Auto-start commands not started because a kept record (its host was
-    /// unreachable) may bring back their tab; they start once it has come
-    /// back.
+    /// Auto-start commands not started because a saved tab of the project
+    /// (in this window or another, still being restored or kept while its
+    /// host was unreachable) may bring back their tab; they start once it
+    /// has come back.
     private var autoStartsWaitingForRetry: [ProjectCommandDefinition] = []
     private var didBeginRestore = false
     private(set) var isTearingDown = false
@@ -514,33 +523,57 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     /// Starts the project's auto-start commands once its saved tabs are
-    /// restored, skipping commands a restored tab already runs.
+    /// restored, skipping commands a restored tab already runs. Nothing
+    /// starts before the window claimed its project (a refused window never
+    /// starts any), and only in the window that opened it (`opensProject`):
+    /// a project's commands run once across its windows.
     func autoStartInitialCommandsIfNeeded() {
         guard !didAutoStart else { return }
+        guard didBeginRestore else {
+            autoStartAwaitsClaim = true
+            return
+        }
         didAutoStart = true
+        guard opensProject else { return }
         whenRestored { [weak self] in
-            // A device's commands are known once its cherry.toml was read.
-            self?.whenRemoteProjectLoaded { [weak self] in
-                self?.startAutoStartCommands()
+            guard let self else { return }
+            let start: @MainActor () -> Void = { [weak self] in
+                // A device's commands are known once its cherry.toml was read.
+                self?.whenRemoteProjectLoaded { [weak self] in
+                    self?.startAutoStartCommands()
+                }
+            }
+            // At launch, once the project's other launch windows registered
+            // and began restoring: at once when none of them is still to
+            // open.
+            if let windowRegistry {
+                windowRegistry.whenLaunchWindowsOpened(ofProjectOf: self, start)
+            } else {
+                start()
             }
         }
     }
 
     /// `addCommandSession` returns the existing tab for a command that is
-    /// already open, restored ones included, so nothing starts twice. A
-    /// restored command tab whose session ended while Cherry was closed
-    /// starts again: auto-start commands run when their window opens. A
-    /// command whose saved tab is still being restored (its host answers
-    /// late), or was kept because its host could not be reached, waits for
-    /// that tab to come back during this run (`startAutoStartsNoLongerWaiting`)
-    /// instead of starting a second copy beside the one that may still run.
+    /// already open, restored ones included, in any window of the project,
+    /// so nothing starts twice. A restored command tab whose session ended
+    /// while Cherry was closed starts again, in whichever window it came
+    /// back: auto-start commands run when their project opens. A command
+    /// whose saved tab is still being restored in any window of the project
+    /// (its host answers late), or was kept because its host could not be
+    /// reached, waits for that tab to come back during this run
+    /// (`startAutoStartsNoLongerWaiting`) instead of starting a second copy
+    /// beside the one that may still run. So does one whose tab is shown
+    /// before its host answered (`TerminalSession.isProvisionalRestore`,
+    /// another launch window's, or one of this window's a second look
+    /// decides): that tab may come back ended, or not at all.
     private func startAutoStartCommands(_ commands: [ProjectCommandDefinition]? = nil) {
         guard !isTearingDown else { return }
         let root = workspace.projectRoot ?? workspaceRoot
         let waitingNames = commandNamesAutoStartWaitsFor()
         for command in commands ?? autoStartCommands(root) {
             if waitingNames.contains(AgentToolDefinition.normalizedName(command.name)),
-               workspace.commandSession(named: command.name) == nil {
+               workspace.projectCommandSession(named: command.name)?.isProvisionalRestore ?? true {
                 autoStartsWaitingForRetry.append(command)
                 continue
             }
@@ -565,6 +598,10 @@ final class RepositoryWorkspace: ObservableObject {
         }
         guard !didBeginRestore, !isTearingDown else { return }
         didBeginRestore = true
+        // A project's commands run in one tab across its windows.
+        workspace.otherProjectWindows = { [weak self] in
+            self.flatMap { $0.windowRegistry?.otherWorkspaces(ofProjectOf: $0) } ?? []
+        }
         restoreSavedTabsIfNeeded()
         scanForOrphanedSessions()
         // Sessions of saved tabs that an earlier run could not end before
@@ -579,6 +616,14 @@ final class RepositoryWorkspace: ObservableObject {
             // primary saves at its first change, as a project's one window
             // did.
             saveStateSoon()
+        }
+        if autoStartAwaitsClaim {
+            autoStartAwaitsClaim = false
+            // On the next turn: the window claims its project from inside
+            // a SwiftUI view update, where adding tabs is not allowed.
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated { self?.autoStartInitialCommandsIfNeeded() }
+            }
         }
     }
 
@@ -1227,7 +1272,7 @@ final class RepositoryWorkspace: ObservableObject {
             retryKeptRecords(when: trigger)
         }
         updateCommandsBeingRestored()
-        startAutoStartsNoLongerWaiting()
+        autoStartsMayNoLongerWait()
         // Adopted sessions never finish a restore: those waiting for the
         // window's saved tabs go on waiting.
         if step == .initial || (step != .orphans && restoreTask == nil) {
@@ -1362,7 +1407,7 @@ final class RepositoryWorkspace: ObservableObject {
               !workspace.isTornDown
         else { return }
         guard !retried.isEmpty else {
-            startAutoStartsNoLongerWaiting()
+            autoStartsMayNoLongerWait()
             return
         }
         let workspace = workspace
@@ -1417,9 +1462,19 @@ final class RepositoryWorkspace: ObservableObject {
         workspace.setCommandNamesBeingRestored(Self.commandNames(of: recordsBeingRestored()))
     }
 
-    /// Commands auto-start leaves to a saved tab that may still come back:
-    /// one being restored, or kept while a retry waits for its host.
+    /// Commands auto-start leaves to a saved tab that may still come back
+    /// in any window of the project (`commandNamesAutoStartWaitsForHere`).
     private func commandNamesAutoStartWaitsFor() -> Set<String> {
+        var names = commandNamesAutoStartWaitsForHere()
+        for other in windowRegistry?.otherRepositories(ofProjectOf: self) ?? [] {
+            names.formUnion(other.commandNamesAutoStartWaitsForHere())
+        }
+        return names
+    }
+
+    /// Commands whose saved tab in this window may still come back: one
+    /// being restored, or kept while a retry waits for its host.
+    func commandNamesAutoStartWaitsForHere() -> Set<String> {
         var names = Self.commandNames(of: recordsBeingRestored())
         if restoreRetry != nil {
             let retried = recordIDsToRetry()
@@ -1428,9 +1483,18 @@ final class RepositoryWorkspace: ObservableObject {
         return names
     }
 
+    /// A restore step answered here: auto-starts that waited for this
+    /// window's saved tabs may start, its own and those of the window that
+    /// opened the project (`ProjectWindowRegistry.restoreStepApplied`).
+    private func autoStartsMayNoLongerWait() {
+        startAutoStartsNoLongerWaiting()
+        windowRegistry?.restoreStepApplied(in: self)
+    }
+
     /// Starts the auto-start commands that waited for saved tabs which have
-    /// now come back, or will not during this run.
-    private func startAutoStartsNoLongerWaiting() {
+    /// now come back, or will not during this run, in any window of the
+    /// project.
+    func startAutoStartsNoLongerWaiting() {
         guard !autoStartsWaitingForRetry.isEmpty else { return }
         let names = commandNamesAutoStartWaitsFor()
         let ready = autoStartsWaitingForRetry.filter { !names.contains(AgentToolDefinition.normalizedName($0.name)) }

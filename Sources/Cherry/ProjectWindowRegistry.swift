@@ -315,6 +315,19 @@ final class ProjectWindowRegistry {
         launchWindowsOpenedWaiters.append(body)
     }
 
+    /// Runs `body` now, unless a launch window of `repository`'s project is
+    /// still to register (`pendingLaunchWindows`): then once the launch's
+    /// windows opened (`whenLaunchWindowsOpened`), when that window is
+    /// restoring its saved tabs. The project's auto-start waits for it.
+    func whenLaunchWindowsOpened(ofProjectOf repository: RepositoryWorkspace, _ body: @escaping @MainActor () -> Void) {
+        let root = repositoryRoot(for: repository.repositoryRoot)
+        guard isOpeningLaunchWindows, pendingLaunchWindows.contains(where: { key(for: $0).root == root }) else {
+            body()
+            return
+        }
+        launchWindowsOpenedWaiters.append(body)
+    }
+
     private func finishOpeningLaunchWindows() {
         guard isOpeningLaunchWindows else { return }
         isOpeningLaunchWindows = false
@@ -578,6 +591,40 @@ final class ProjectWindowRegistry {
         workspace.select(session)
         entry.chromeState?.selectTerminal()
         return true
+    }
+
+    // MARK: Commands across a project's windows
+
+    /// The workspaces of the other open windows of `repository`'s project,
+    /// the most recently active first: a project's commands run in one tab
+    /// across its windows (`TerminalWorkspace.otherProjectWindows`).
+    func otherWorkspaces(ofProjectOf repository: RepositoryWorkspace) -> [TerminalWorkspace] {
+        otherEntries(ofProjectOf: repository).compactMap(\.shownWorkspace).filter { !$0.isTornDown }
+    }
+
+    /// The repositories of the other open windows of `repository`'s
+    /// project, the most recently active first: what the project's
+    /// auto-start waits for (`RepositoryWorkspace.commandNamesAutoStartWaitsFor`).
+    func otherRepositories(ofProjectOf repository: RepositoryWorkspace) -> [RepositoryWorkspace] {
+        otherEntries(ofProjectOf: repository).compactMap(\.repository).filter { !$0.isTearingDown }
+    }
+
+    /// Another window of the project applied a restore step: the
+    /// auto-starts that waited for its saved tabs may start
+    /// (`RepositoryWorkspace.startAutoStartsNoLongerWaiting`).
+    func restoreStepApplied(in repository: RepositoryWorkspace) {
+        otherRepositories(ofProjectOf: repository).forEach { $0.startAutoStartsNoLongerWaiting() }
+    }
+
+    /// The entries of `repository`'s project's windows other than its own,
+    /// the most recently active first; none while it is not registered.
+    private func otherEntries(ofProjectOf repository: RepositoryWorkspace) -> [WindowEntry] {
+        pruneStaleWindows()
+        guard let root = entries.first(where: { $0.value.repository === repository })?.key.root else { return [] }
+        return windowsMostRecentFirst().compactMap { key in
+            guard key.root == root, let entry = entries[key], entry.repository !== repository else { return nil }
+            return entry
+        }
     }
 
     // MARK: Background sessions
@@ -910,6 +957,9 @@ final class ProjectWindowRegistry {
         // for bigger windows).
         window.isRestorable = false
         if isNewClaim {
+            // The window that opens its project starts the project's
+            // auto-start commands; another window of it does not.
+            repository?.opensProject = !entries.contains { $0.key.root == key.root && $0.key != key && $0.value.window != nil }
             // Newly claimed: it takes the frame this window last had, and a
             // launch window no longer waits to register.
             pendingLaunchWindows.removeAll { self.key(for: $0) == key }

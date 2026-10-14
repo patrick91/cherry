@@ -887,21 +887,26 @@ final class CherryControlServer: @unchecked Sendable {
             let (session, sentBytes) = try await spawnProcess(request, workspace: workspace)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
             return .init(result: .spawnProcess(.init(
-                process: processInfo(for: session, workspace: workspace),
+                process: processInfo(for: session, workspace: owningWorkspace(of: session, from: workspace)),
                 sentBytes: sentBytes,
                 output: output,
                 task: tasks.latestTask(forWorker: session.id)
                     .flatMap { $0.device == Self.remoteDevice ? tasks.info(for: $0) : nil }
             )))
         case .startProcess(let request):
+            // A command's tab can be another window's of the project: it is
+            // described as that window shows it.
             let session = try await startProcess(request, workspace: workspace)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
-            return .init(result: .startProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
+            return .init(result: .startProcess(.init(
+                process: processInfo(for: session, workspace: owningWorkspace(of: session, from: workspace)),
+                output: output
+            )))
         case .stopProcess(let request):
-            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            let (session, sessionWorkspace) = try resolveProcessWithWorkspace(workspace: workspace, processID: request.processID, processName: request.processName)
             stopProcess(session)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
-            return .init(result: .stopProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
+            return .init(result: .stopProcess(.init(process: processInfo(for: session, workspace: sessionWorkspace), output: output)))
         case .restartProcess(let request):
             // Restart and close act on the window that owns the process, which
             // an id can name from any window.
@@ -914,9 +919,9 @@ final class CherryControlServer: @unchecked Sendable {
             try closeFromControl(session, workspace: sessionWorkspace, agentClosePolicy: request.agentClosePolicy)
             return .init(result: .closeProcess(.init(processID: session.id.uuidString, closed: true)))
         case .renameProcess(let request):
-            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            let (session, sessionWorkspace) = try resolveProcessWithWorkspace(workspace: workspace, processID: request.processID, processName: request.processName)
             session.rename(to: request.title)
-            return .init(result: .renameProcess(.init(process: processInfo(for: session, workspace: workspace))))
+            return .init(result: .renameProcess(.init(process: processInfo(for: session, workspace: sessionWorkspace))))
         case .selectProcess(let request):
             // Selected in the window that has it (an id can name another
             // window's tab), which stays where it is.
@@ -941,7 +946,12 @@ final class CherryControlServer: @unchecked Sendable {
             }
             return .init(result: .startAllCommands(try listProcesses(workspace: workspace, kind: nil)))
         case .stopAllCommands(let request):
-            workspace.commandSessions.filter { callerReaches($0, in: workspace) }.forEach { $0.stopManagedCommand() }
+            // The project's commands, in every one of its windows.
+            for commandWorkspace in [workspace] + workspace.otherProjectWindows() {
+                commandWorkspace.commandSessions
+                    .filter { callerReaches($0, in: commandWorkspace) }
+                    .forEach { $0.stopManagedCommand() }
+            }
             if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {
                 try? await Task.sleep(for: .milliseconds(min(max(waitMilliseconds, 0), 5_000)))
             }
@@ -1472,6 +1482,14 @@ final class CherryControlServer: @unchecked Sendable {
                 || session.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedName
         }
         guard let session = matches.first else {
+            // A project command runs in one tab across the project's
+            // windows: its name finds that tab in another window too.
+            for other in workspace.otherProjectWindows() {
+                if let tab = other.commandSession(named: requestedName), callerReaches(tab, in: other) {
+                    mcpControlDebugLog("resolved process selector=name:\(requestedName) session=\(tab.id.uuidString) kind=\(tab.kind.rawValue) name=\(self.processName(for: tab)) in another window")
+                    return (tab, other)
+                }
+            }
             throw CherryControlError(code: "process_not_found", message: "No Cherry process exists with name \(requestedName).")
         }
         guard matches.count == 1 else {
@@ -1536,8 +1554,9 @@ final class CherryControlServer: @unchecked Sendable {
                 throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
             }
             let command = try findProjectCommand(named: request.name ?? "", projectRoot: projectRoot)
-            // A restore under way may bring back this command's tab: use it
-            // rather than start a second copy.
+            // A restore under way (in any window of the project) may bring
+            // back this command's tab: use it rather than start a second
+            // copy. Another window's tab is returned as it is.
             await workspace.waitUntilRestored(commandNamed: command.name)
             session = workspace.addCommandSession(command: command, projectRoot: projectRoot, select: false)
             agent = nil
@@ -2135,9 +2154,17 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     private func restartAllCommands(workspace: TerminalWorkspace) async throws {
         let sessions = try await startAllCommands(workspace: workspace)
-        for session in sessions where callerReaches(session, in: workspace) {
+        for session in sessions where callerReaches(session, in: owningWorkspace(of: session, from: workspace)) {
             session.restart()
         }
+    }
+
+    /// The window of `workspace`'s project that has `session`: a command's
+    /// tab can be another window's (`TerminalWorkspace.addCommandSession`).
+    /// `workspace` when none has it.
+    @MainActor
+    private func owningWorkspace(of session: TerminalSession, from workspace: TerminalWorkspace) -> TerminalWorkspace {
+        ([workspace] + workspace.otherProjectWindows()).first { $0.sessions.contains { $0 === session } } ?? workspace
     }
 
     @MainActor

@@ -1546,8 +1546,9 @@ private struct ProjectWorkspaceView: View {
             ProjectWindowRegistry.shared.activeTodoStore = todoStore
             ProjectWindowRegistry.shared.activeChromeState = chromeState
             agentSettings.markProjectOpened(workspace.projectRoot)
-            // Waits for the window's saved tabs to be restored, so a restored
-            // command tab is not started twice.
+            // Waits for the window to claim its project and for its saved
+            // tabs to be restored, so a restored command tab is not started
+            // twice; only the window that opened the project starts them.
             repository.autoStartInitialCommandsIfNeeded()
             openPendingDeepLinks()
             Task {

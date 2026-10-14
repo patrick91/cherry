@@ -6,8 +6,9 @@ import Testing
 // Cherry MCP with several windows of one project (#22): a scoped request
 // goes to the caller's own window, else the active one, else the project's
 // most recently active; what a request finds by id it acts on in the window
-// that has it. The server is given its windows through its providers, as
-// the app's registry gives them; its tabs run /bin/cat.
+// that has it, and a project command's name finds its one tab in any of the
+// project's windows. The server is given its windows through its
+// providers, as the app's registry gives them; its tabs run /bin/cat.
 
 /// Which window is active, which the project's most recently active, and
 /// which tab is the caller: the server's providers read them.
@@ -19,7 +20,7 @@ private final class Routing {
 }
 
 /// A control server for two windows of one project, its primary and
-/// another, that share the project's to-dos.
+/// another, that share the project's to-dos and commands.
 @MainActor
 private final class TwoProjectWindows {
     let defaultsName = "CherryTests.ControlProjectWindows.\(UUID().uuidString)"
@@ -51,6 +52,10 @@ private final class TwoProjectWindows {
         second = TerminalWorkspace(
             projectRoot: project.path, createInitialSession: false, launchBackend: .hostManaged, windowID: UUID()
         )
+        // As each window's repository sets it once the window claimed the
+        // project.
+        primary.otherProjectWindows = { [weak second] in second.map { [$0] } ?? [] }
+        second.otherProjectWindows = { [weak primary] in primary.map { [$0] } ?? [] }
         let todos = ProjectTodoStore.shared(projectRoot: project.path, storageDirectory: todosRoot)
         self.todos = todos
         let root = project.path
@@ -84,6 +89,13 @@ private final class TwoProjectWindows {
 
     func agent(in workspace: TerminalWorkspace, title: String) -> TerminalSession {
         workspace.addAgentSession(agent: echo, projectRoot: project.path, title: title, select: false)
+    }
+
+    /// A project command (running /bin/cat), configured for the project.
+    func command(_ name: String) throws -> ProjectCommandDefinition {
+        let command = ProjectCommandDefinition(name: name, command: "/bin/cat")
+        try settings.upsertCommand(command, for: project.path)
+        return command
     }
 
     func send(_ request: CherryControlRequest) async throws -> CherryControlResponse {
@@ -250,4 +262,99 @@ private final class TwoProjectWindows {
     #expect(windows.secondChrome.selectedTodoID == nil)
     #expect(windows.primaryChrome.selectedTodoID == todo.id)
     #expect(windows.todos.todos.isEmpty)
+}
+
+// MARK: - Commands
+
+/// start_process and spawn_process of a command that another window of the
+/// project runs return that tab, described as its window shows it: nothing
+/// starts in the caller's window.
+@Test @MainActor func mcpStartProcessReturnsTheCommandTabAnotherWindowRuns() async throws {
+    let windows = try TwoProjectWindows()
+    defer { windows.stop() }
+    let server = try windows.command("server")
+    let tab = windows.primary.addCommandSession(command: server, projectRoot: windows.project.path, select: false)
+    windows.primary.select(tab)
+    windows.routing.caller = windows.agent(in: windows.second, title: "Orchestrator")
+    windows.server.start()
+    #expect(await eventually { tab.isRunning })
+
+    let started = try await windows.send(windows.scoped(.startProcess(.init(processName: "server", kind: "command"))))
+    guard case .startProcess(let result)? = started.result else {
+        Issue.record("Expected startProcess result, got \(String(describing: started))")
+        return
+    }
+    #expect(result.process.id == tab.id.uuidString)
+    // Selected in the window that has it.
+    #expect(result.process.selected)
+    #expect(windows.second.commandSessions.isEmpty)
+
+    let spawned = try await windows.send(windows.scoped(.spawnProcess(.init(kind: "command", name: "Server"))))
+    guard case .spawnProcess(let spawnResult)? = spawned.result else {
+        Issue.record("Expected spawnProcess result, got \(String(describing: spawned))")
+        return
+    }
+    #expect(spawnResult.process.id == tab.id.uuidString)
+    #expect(spawnResult.process.selected)
+    #expect(windows.second.commandSessions.isEmpty)
+    #expect(windows.primary.commandSessions.map(\.id) == [tab.id])
+}
+
+/// A command's name finds its tab in any window of the project (rename,
+/// input, stop); another window's other tabs are not found by name.
+@Test @MainActor func aCommandNameResolvesToItsTabInAnyWindowOfTheProject() async throws {
+    let windows = try TwoProjectWindows()
+    defer { windows.stop() }
+    let server = try windows.command("server")
+    let tab = windows.primary.addCommandSession(command: server, projectRoot: windows.project.path, select: false)
+    _ = windows.agent(in: windows.primary, title: "Lead")
+    windows.routing.caller = windows.agent(in: windows.second, title: "Orchestrator")
+    windows.server.start()
+    #expect(await eventually { tab.isRunning })
+
+    let renamed = try await windows.send(windows.scoped(.renameProcess(.init(processName: "server", title: "API"))))
+    #expect(renamed.error == nil)
+    #expect(tab.title == "API")
+    let input = try await windows.send(windows.scoped(.sendProcessInput(.init(processName: "server", text: "ping", submit: true))))
+    guard case .sendProcessInput(let sent)? = input.result else {
+        Issue.record("Expected sendProcessInput result, got \(String(describing: input))")
+        return
+    }
+    #expect(sent.processID == tab.id.uuidString)
+    #expect(sent.sentBytes > 0)
+    let stopped = try await windows.send(windows.scoped(.stopProcess(.init(processName: "server"))))
+    guard case .stopProcess(let stopResult)? = stopped.result else {
+        Issue.record("Expected stopProcess result, got \(String(describing: stopped))")
+        return
+    }
+    #expect(stopResult.process.id == tab.id.uuidString)
+    #expect(await eventually { !tab.isRunning })
+
+    // The primary's agent is that window's alone.
+    let lead = try await windows.send(windows.scoped(.stopProcess(.init(processName: "Lead"))))
+    #expect(lead.error?.code == "process_not_found")
+}
+
+/// stop_all_commands stops the project's commands in every one of its
+/// windows; its listing is the caller's window's.
+@Test @MainActor func stopAllCommandsStopsTheProjectsCommandsInEveryWindow() async throws {
+    let windows = try TwoProjectWindows()
+    defer { windows.stop() }
+    let web = windows.primary.addCommandSession(command: try windows.command("web"), projectRoot: windows.project.path, select: false)
+    let worker = windows.second.addCommandSession(
+        command: try windows.command("worker"), projectRoot: windows.project.path, select: false
+    )
+    windows.routing.caller = windows.agent(in: windows.second, title: "Orchestrator")
+    windows.server.start()
+    #expect(await eventually { web.isRunning && worker.isRunning })
+
+    let response = try await windows.send(windows.scoped(.stopAllCommands(.init())))
+    guard case .stopAllCommands(let listed)? = response.result else {
+        Issue.record("Expected stopAllCommands result, got \(String(describing: response))")
+        return
+    }
+    #expect(await eventually { !web.isRunning && !worker.isRunning })
+    let listedIDs = Set(listed.processes.map(\.id))
+    #expect(listedIDs.contains(worker.id.uuidString))
+    #expect(!listedIDs.contains(web.id.uuidString))
 }

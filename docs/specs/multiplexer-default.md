@@ -1584,10 +1584,13 @@ differs from the design above.
   groups, split groups (with their weights), display order and selection are
   restored. Kept tabs that come back later (the retry) are added after the
   tabs opened meanwhile, as saves order them.
-- **Commands.** A command has one tab per workspace.
-  - Auto-start runs after the restore of its window. It never adds a
-    second tab for a command a restored tab runs (running or ended). An
-    auto-start command whose tab is still being restored (a host that
+- **Commands.** A command has one tab per project, across the project's
+  windows.
+  - Auto-start runs in the window that opened the project, after its
+    restore (at launch, once the project's other launch windows
+    registered). It never adds a second tab for a command a restored tab of
+    any of the project's windows runs (running or ended). An auto-start
+    command whose tab is still being restored in any of them (a host that
     answers late) or was kept because the local host was unreachable (or its
     holders were pending) waits for that tab to come back during this run.
     Until then it does not start at all, which avoids two copies of a
@@ -1599,8 +1602,9 @@ differs from the design above.
     restart policy (new session, the ended one removed).
   - Sidebar starts and MCP `spawn_process`, `start_process`,
     `start_all_commands` and `restart_all_commands` wait (at most 10 s) for
-    a restore under way that may bring back the command's tab, then use that
-    tab instead of starting a second copy.
+    a restore under way in any of the project's windows that may bring back
+    the command's tab, then use that tab, in whichever window it is, instead
+    of starting a second copy.
   - If a command tab was opened anyway (the wait ran out, or while the local
     host was unreachable), the tab whose program runs keeps the command: a
     restored tab whose program runs replaces an open tab whose program ended
@@ -1608,7 +1612,9 @@ differs from the design above.
     and if its program runs, its record is set aside and stays saved (its
     session keeps running, in Background Sessions and the Persistent
     Sessions sheet), so
-    nothing is orphaned without a record.
+    nothing is orphaned without a record. This is decided within the
+    restoring window: a restored command tab whose command a tab of another
+    of the project's windows runs is restored beside it.
 - **Deviation (ended tabs).** Ended persistent terminal and agent tabs show
   "Session ended (exit N)" with **Restart** and **Close**; Close removes the
   ended session, so there is no separate Remove. A terminal whose shell

@@ -1074,6 +1074,13 @@ final class TerminalWorkspace: ObservableObject {
     var closeTabAfterCleanExit: @MainActor (TerminalWorkspace, TerminalSession) -> Void = { workspace, session in
         workspace.close(session, intent: .programExited)
     }
+    /// The workspaces of the project's other open windows, the most
+    /// recently active first (`ProjectWindowRegistry.otherWorkspaces(ofProjectOf:)`):
+    /// a project's commands run in one tab across its windows
+    /// (`projectCommandSession(named:)`). Set by its repository once its
+    /// window claimed the project; none before (tests, a window that never
+    /// claimed).
+    var otherProjectWindows: @MainActor () -> [TerminalWorkspace] = { [] }
 
     init(
         projectRoot: String? = nil,
@@ -2041,20 +2048,45 @@ final class TerminalWorkspace: ObservableObject {
         resumeCommandRestoreWaiters()
     }
 
-    /// Whether a restore under way may bring back a tab for the named
-    /// command (nil: for any command).
+    /// Whether a restore under way, in this window or another window of
+    /// the project, may bring back a tab for the named command (nil: for
+    /// any command).
     func isRestoringCommand(named name: String?) -> Bool {
+        isRestoringCommandHere(named: name)
+            || otherProjectWindows().contains { !$0.isTornDown && $0.isRestoringCommandHere(named: name) }
+    }
+
+    /// Whether this window's restore under way may bring back a tab for
+    /// the named command.
+    private func isRestoringCommandHere(named name: String?) -> Bool {
         guard let name else { return !commandNamesBeingRestored.isEmpty }
         return commandNamesBeingRestored.contains(AgentToolDefinition.normalizedName(name))
     }
 
-    /// Returns once no restore under way may bring back a tab for the named
-    /// command (nil: for any command), or after `timeout`. Sidebar and MCP
-    /// command starts wait here, then find the restored tab
-    /// (`addCommandSession` returns it) instead of starting a second copy.
+    /// Returns once no restore under way in any window of the project may
+    /// bring back a tab for the named command (nil: for any command), or
+    /// after `timeout`. Sidebar and MCP command starts wait here, then find
+    /// the restored tab (`addCommandSession` returns it, in whichever window
+    /// it came back) instead of starting a second copy.
     func waitUntilRestored(commandNamed name: String?, timeout: Duration = TerminalWorkspace.commandRestoreWaitLimit) async {
         let deadline = ContinuousClock.now + timeout
-        while isRestoringCommand(named: name), !isTornDown, ContinuousClock.now < deadline {
+        while !isTornDown, ContinuousClock.now < deadline {
+            if isRestoringCommandHere(named: name) {
+                await waitUntilRestoredHere(commandNamed: name, until: deadline)
+            } else if let other = otherProjectWindows().first(where: {
+                !$0.isTornDown && $0.isRestoringCommandHere(named: name)
+            }) {
+                await other.waitUntilRestoredHere(commandNamed: name, until: deadline)
+            } else {
+                return
+            }
+        }
+    }
+
+    /// Returns once this window's restore may no longer bring back a tab
+    /// for the named command, or at `deadline`.
+    private func waitUntilRestoredHere(commandNamed name: String?, until deadline: ContinuousClock.Instant) async {
+        while isRestoringCommandHere(named: name), !isTornDown, ContinuousClock.now < deadline {
             let id = UUID()
             let timer = Task { @MainActor [weak self] in
                 try? await Task.sleep(until: deadline, clock: .continuous)
@@ -2120,6 +2152,10 @@ final class TerminalWorkspace: ObservableObject {
         )
     }
 
+    /// The command's tab: this window's, else another window's of the
+    /// project (a command runs in one tab across a project's windows),
+    /// else a new tab here. Another window's tab is returned as it is, not
+    /// added here and not selected: its caller shows it in its own window.
     @discardableResult
     func addCommandSession(
         id: UUID = UUID(),
@@ -2133,6 +2169,9 @@ final class TerminalWorkspace: ObservableObject {
             if select {
                 self.select(session)
             }
+            return session
+        }
+        if let session = projectCommandSession(named: command.name) {
             return session
         }
 
@@ -2152,6 +2191,9 @@ final class TerminalWorkspace: ObservableObject {
         return session
     }
 
+    /// This window's tab of the named command: what its sidebar row shows
+    /// (`projectCommandSession(named:)` looks in the project's other
+    /// windows too).
     func commandSession(named name: String) -> TerminalSession? {
         let normalizedName = AgentToolDefinition.normalizedName(name)
         return commandSessions.first {
@@ -2168,13 +2210,24 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
 
+    /// The named command's tab in this window (a restored one too), else in
+    /// another window of the project (`otherProjectWindows`).
+    func projectCommandSession(named name: String) -> TerminalSession? {
+        commandSession(named: name) ?? restoredSession(forCommandNamed: name)
+            ?? otherProjectWindows().lazy.compactMap {
+                $0.commandSession(named: name) ?? $0.restoredSession(forCommandNamed: name)
+            }.first
+    }
+
+    /// An edited command reaches the one tab it runs in, whichever window
+    /// of the project that is.
     func updateCommandSession(
         named originalName: String?,
         with command: ProjectCommandDefinition,
         projectRoot: String
     ) {
         let lookupName = originalName?.nilIfEmpty ?? command.name
-        guard let session = commandSession(named: lookupName) else { return }
+        guard let session = projectCommandSession(named: lookupName) else { return }
         session.updateManagedCommand(
             command,
             workingDirectory: command.resolvedWorkingDirectory(projectRoot: projectRoot)
@@ -2632,8 +2685,9 @@ final class TerminalWorkspace: ObservableObject {
     /// owns it (a tab only attached to it leaves it to come back as the
     /// closed tab's own). Nil when the session is gone, being ended, or
     /// another tab owns it, when its command runs in another tab now (a
-    /// command runs in one tab per workspace: it was started again), or
-    /// when the workspace was torn down. Not selected.
+    /// command runs in one tab across the project's windows: it was
+    /// started again, here or in another window), or when the workspace was
+    /// torn down. Not selected.
     func reopenClosedTab(_ closed: ClosedTab) -> TerminalSession? {
         guard !isTornDown else { return nil }
         /// A tab here shows the session as the closed tab did.
@@ -2650,7 +2704,7 @@ final class TerminalWorkspace: ObservableObject {
             return open
         }
         if closed.record.kind == .command, let name = closed.record.commandName,
-           commandSession(named: name) ?? restoredSession(forCommandNamed: name) != nil {
+           projectCommandSession(named: name) != nil {
             return nil
         }
         let tab: TerminalSession

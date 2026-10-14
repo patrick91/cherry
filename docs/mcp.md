@@ -53,7 +53,11 @@ old direct HTTP MCP endpoint has been removed.
   `CHERRY_PROJECT_ROOT`) goes to the caller's own window when the project
   has several windows, else to the active window when it is the project's,
   else to the project's most recently active window. Listings and counts
-  are that window's; a `process_id` finds its tab in any window. The
+  are that window's; a `process_id` finds its tab in any window. A project
+  command runs in one tab across the project's windows: its `process_name`
+  finds that tab in any of them, starting it (`start_process`,
+  `spawn_process`, `start_all_commands`) uses that tab where it is, and
+  `stop_all_commands` stops the project's commands in every window. The
   project's to-dos are one list for all its windows; `select_todo` selects
   in the request's window.
 

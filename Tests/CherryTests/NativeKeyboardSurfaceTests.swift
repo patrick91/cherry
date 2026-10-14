@@ -71,17 +71,18 @@ private let latinLetterKeys = [UInt16(8), 38].allSatisfy { keyCode in
 /// `keyCode` with `modifiers` as the keyboard sends it: the characters AppKit
 /// translates a hardware event to on this Mac's layout, and the side bit of
 /// each modifier (NX_DEVICELSHIFTKEYMASK 0x2, NX_DEVICELCTLKEYMASK 0x1,
-/// NX_DEVICELALTKEYMASK 0x20). `extra`: flags AppKit adds for the key
-/// (`.numericPad` for the keypad and arrows, `.function` for arrows and
-/// function keys).
+/// NX_DEVICELALTKEYMASK 0x20, or NX_DEVICERALTKEYMASK 0x40 for
+/// `rightOption`). `extra`: flags AppKit adds for the key (`.numericPad`
+/// for the keypad and arrows, `.function` for arrows and function keys).
 private func hardwareKey(
-    _ name: String, keyCode: UInt16, _ modifiers: NSEvent.ModifierFlags = [], extra: NSEvent.ModifierFlags = []
+    _ name: String, keyCode: UInt16, _ modifiers: NSEvent.ModifierFlags = [], extra: NSEvent.ModifierFlags = [],
+    rightOption: Bool = false
 ) throws -> TypedKey {
     var flags = CGEventFlags()
     var sides: UInt = 0
     if modifiers.contains(.shift) { flags.insert(.maskShift); sides |= 0x2 }
     if modifiers.contains(.control) { flags.insert(.maskControl); sides |= 0x1 }
-    if modifiers.contains(.option) { flags.insert(.maskAlternate); sides |= 0x20 }
+    if modifiers.contains(.option) { flags.insert(.maskAlternate); sides |= rightOption ? 0x40 : 0x20 }
     let translated = try #require(translatedEvent(keyCode: keyCode, flags: flags))
     return TypedKey(
         name: name, characters: translated.characters ?? "",
@@ -375,6 +376,22 @@ private func expectKeys(
         notAlt, configuration: TerminalSettings.parseUserGhosttyKeyboardConfig("macos-option-as-alt = false"),
         label: "option-not-alt", stage: stage, in: directory
     )
+    // Only the left Option as Alt: the right one composes, as Ghostty
+    // tells them apart by the event's side bits.
+    let leftOptionC = try hardwareKey("Left Option+C", keyCode: 8, .option)
+    let rightOptionC = try hardwareKey("Right Option+C", keyCode: 8, .option, rightOption: true)
+    let letterC = try #require(leftOptionC.charactersIgnoringModifiers.unicodeScalars.first?.value)
+    try await expectKeys(
+        [
+            KeyCase(key: leftOptionC, expected: [
+                "\u{1B}" + leftOptionC.charactersIgnoringModifiers, csi("\(letterC);3u"), csi("\(letterC);3u"),
+                csi("27;3;\(letterC)~"),
+            ]),
+            KeyCase(key: rightOptionC, expected: Array(repeating: rightOptionC.characters, count: 4)),
+        ],
+        configuration: TerminalSettings.parseUserGhosttyKeyboardConfig("macos-option-as-alt = left"),
+        label: "left-option-as-alt", stage: stage, in: directory
+    )
     // Without Cherry's configuration: Ghostty's Shift+Tab, `CSI 9;2u` under
     // the kitty protocol (not a bare tab) and `CSI 27;2;9~` under
     // modifyOtherKeys 2, which the host types as `CSI Z`. Without
@@ -430,6 +447,27 @@ private func keyEvent(_ key: TypedKey) throws -> NSEvent {
         let event = try keyEvent(key)
         #expect(event.filteredCharacters == text, "\(key)")
         #expect(HostRoutedKeyEncoder.surfaceText(for: event, optionAsAlt: .both) == text, "\(key)")
+    }
+
+    // Each modifier's side, as Ghostty's macOS app tells Ghostty
+    // (`Ghostty.ghosttyMods`): `macos-option-as-alt = left` needs it.
+    for (flags, expected) in [
+        (UInt(0x20), TerminalInputModifiers.alt),
+        (0x40, [.alt, .altRight]),
+        (0x2, .shift),
+        (0x4, [.shift, .shiftRight]),
+        (0x1, .ctrl),
+        (0x2000, [.ctrl, .ctrlRight]),
+        (0x8, .super_),
+        (0x10, [.super_, .superRight]),
+    ] {
+        let side: NSEvent.ModifierFlags = switch flags {
+        case 0x20, 0x40: .option
+        case 0x2, 0x4: .shift
+        case 0x1, 0x2000: .control
+        default: .command
+        }
+        #expect(TerminalInputModifiers(from: NSEvent.ModifierFlags(rawValue: side.rawValue | flags)) == expected, "\(flags)")
     }
 
     // A lone control character while an input method composes is the

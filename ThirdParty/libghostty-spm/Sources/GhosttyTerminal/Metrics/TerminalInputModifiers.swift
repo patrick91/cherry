@@ -59,6 +59,14 @@ public struct TerminalInputModifiers: OptionSet, Sendable {
             // and it is no Num Lock (a Mac keyboard has none). As Num Lock the
             // kitty keyboard protocol sent Up as `CSI 1;129A`; Ghostty's own
             // macOS app leaves it out too.
+            // The right-hand keys, from the event's device flags, as Ghostty's
+            // macOS app tells Ghostty (`Ghostty.ghosttyMods`):
+            // `macos-option-as-alt = left` or `right` needs to know the side.
+            let raw = flags.rawValue
+            if raw & UInt(NX_DEVICERSHIFTKEYMASK) != 0 { mods.insert(.shiftRight) }
+            if raw & UInt(NX_DEVICERCTLKEYMASK) != 0 { mods.insert(.ctrlRight) }
+            if raw & UInt(NX_DEVICERALTKEYMASK) != 0 { mods.insert(.altRight) }
+            if raw & UInt(NX_DEVICERCMDKEYMASK) != 0 { mods.insert(.superRight) }
             self = mods
         }
     #endif

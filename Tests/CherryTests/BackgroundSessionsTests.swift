@@ -166,7 +166,7 @@ private func openProject(
     )
     _ = registry.register(
         window: window, projectRoot: root.path, workspace: repository.workspace, repository: repository,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        todoStore: nil, chromeState: chromeState
     )
     repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
     return repository
@@ -1014,7 +1014,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     let window = testWindow()
     _ = registry.register(
         window: window, projectRoot: harness.project.path, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        todoStore: nil, chromeState: nil
     )
     defer {
         background.stop()
@@ -1387,7 +1387,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     }
     #expect(registry.register(
         window: window, projectRoot: project, workspace: repository.workspace, repository: repository,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        todoStore: nil, chromeState: nil
     ))
     let workspace = repository.workspace
     #expect(await harness.fake.wait { harness.creates().count == 1 })
@@ -1487,7 +1487,7 @@ private func registerWindow(
     let workspace = TerminalWorkspace(projectRoot: root, createInitialSession: false)
     #expect(registry.register(
         window: window, projectRoot: root, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        todoStore: nil, chromeState: chromeState
     ))
     return workspace
 }
@@ -1858,7 +1858,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     let chromeState = quietChromeState()
     #expect(registry.register(
         window: window, projectRoot: harness.project.path, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        todoStore: nil, chromeState: chromeState
     ))
     defer {
         model.stop()

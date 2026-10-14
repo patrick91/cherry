@@ -1536,7 +1536,6 @@ private struct StopMeasureContentHost: View {
     @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    let noteStore: ProjectNoteStore
     let todoStore: ProjectTodoStore
     @State private var storedSidebarWidth = 320.0
 
@@ -1545,7 +1544,6 @@ private struct StopMeasureContentHost: View {
             repository: repository,
             workspace: workspace,
             chromeState: chromeState,
-            noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: workspace.projectRoot,
             openProject: { _ in },
@@ -1577,11 +1575,10 @@ private struct StopMeasureContentHost: View {
     let workspace = host.workspace()
     let repository = RepositoryWorkspace(projectRoot: root, autoStartCommands: { _ in [] })
     let chromeState = ProjectWindowChromeState()
-    let notes = host.home.appendingPathComponent(".notes", isDirectory: true)
+    let stores = host.home.appendingPathComponent(".stores", isDirectory: true)
     let hostingView = NSHostingView(rootView: StopMeasureContentHost(
         repository: repository, workspace: workspace, chromeState: chromeState,
-        noteStore: ProjectNoteStore(projectRoot: root, storageDirectory: notes),
-        todoStore: ProjectTodoStore(projectRoot: root, storageDirectory: notes)
+        todoStore: ProjectTodoStore(projectRoot: root, storageDirectory: stores)
     ))
     hostingView.frame = NSRect(x: 0, y: 0, width: 1100, height: 700)
     let window = NSWindow(contentRect: hostingView.frame, styleMask: [.titled, .resizable], backing: .buffered, defer: false)

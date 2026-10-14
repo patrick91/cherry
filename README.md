@@ -95,7 +95,7 @@ as long as its notice ("Closed <name>", with **Undo**) would stay: about 6
 seconds, longer while the pointer rests on it or the window is in the
 background (a minute at most for a closed tab, whose program keeps running
 meanwhile). A closed tab's program stops only once that has passed (or when
-its window closes or Cherry quits). In a text field or the notes editor,
+its window closes or Cherry quits). In a text field or a to-do's editor,
 Cmd-Z undoes typing as usual. Quitting Cherry
 or closing a project window with local sessions still running asks once:
 **Keep Running** (the default) leaves them running and brings their tabs back
@@ -435,7 +435,7 @@ claude mcp add --transport stdio --scope user cherry -- /Applications/Cherry.app
 Run the Cherry app first. The helper forwards MCP tool calls to Cherry's
 instance-scoped Unix control socket under `/tmp/cherry-$UID/`. The MCP server
 exposes process-first tools for terminals, agents, configured project commands,
-output reads, idle waiting, service readiness, notes, and todos. Agents on
+output reads, idle waiting, service readiness, and todos. Agents on
 your other Macs reach it through **Set Up Cherry MCP on <Mac>…** (see
 Devices above). See
 [docs/mcp.md](docs/mcp.md) for the tool guide and recommended agent workflows.

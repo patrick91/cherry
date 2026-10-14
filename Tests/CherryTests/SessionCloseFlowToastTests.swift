@@ -77,7 +77,7 @@ private func openRepositoryWindow(
     )
     #expect(registry.register(
         window: window, projectRoot: root, workspace: repository.workspace, repository: repository,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        todoStore: nil, chromeState: chromeState
     ))
     return repository
 }
@@ -275,7 +275,7 @@ private let persistentSessionsLine = "Attach to it again from File › Persisten
     }
     #expect(registry.register(
         window: window, projectRoot: project, workspace: repository.workspace, repository: repository,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        todoStore: nil, chromeState: chromeState
     ))
     let workspace = repository.workspace
     // The window's default shell.
@@ -415,12 +415,12 @@ private let persistentSessionsLine = "Attach to it again from File › Persisten
     }
     #expect(registry.register(
         window: window, projectRoot: harness.project.path, workspace: closing,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        todoStore: nil, chromeState: chromeState
     ))
     for index in others.indices {
         #expect(registry.register(
             window: otherWindows[index], projectRoot: otherRoots[index].path, workspace: others[index],
-            noteStore: nil, todoStore: nil, chromeState: otherChromeStates[index]
+            todoStore: nil, chromeState: otherChromeStates[index]
         ))
     }
     /// `other` was active, then the closing window.
@@ -429,7 +429,7 @@ private let persistentSessionsLine = "Attach to it again from File › Persisten
             (otherRoots[other].path, others[other], otherChromeStates[other]),
             (harness.project.path, closing, chromeState),
         ] {
-            registry.activateWindow(projectRoot: root, workspace: workspace, noteStore: nil, todoStore: nil, chromeState: state)
+            registry.activateWindow(projectRoot: root, workspace: workspace, todoStore: nil, chromeState: state)
         }
     }
     /// Opens an agent as the closing window's last tab and detaches it with ⌘D.
@@ -1085,7 +1085,7 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
     let otherChromeState = quietChromeState()
     #expect(registry.register(
         window: otherWindow, projectRoot: otherRoot.path, workspace: other,
-        noteStore: nil, todoStore: nil, chromeState: otherChromeState
+        todoStore: nil, chromeState: otherChromeState
     ))
     // Window A, this project, closes with its last tab, then opens again
     // when asked (as the app's `openWindow`).
@@ -1138,7 +1138,7 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
             workspace.close(shell, intent: .windowClosedEndingSessions)
         }
         #expect(workspace.sessions.map(\.id) == [tab.id])
-        registry.activateWindow(projectRoot: otherRoot.path, workspace: other, noteStore: nil, todoStore: nil, chromeState: otherChromeState)
+        registry.activateWindow(projectRoot: otherRoot.path, workspace: other, todoStore: nil, chromeState: otherChromeState)
         let (window, _) = try #require(windows.last)
         SessionCloseCoordinator.detachSelectedTabOrWindow(
             workspace: workspace, repository: repository, chromeState: nil, window: window, registry: registry

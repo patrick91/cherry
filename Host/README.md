@@ -837,7 +837,7 @@ is dismissed, times out or is acted on.
 A terminal tab whose shell exits with status 0 closes by itself and its
 ended session is removed (`exit` ends the shell with the last command's
 status, so after a failed command the tab stays); on a window's last tab the
-window closes too, as with Cmd-W, unless a note is shown there (**Settings ›
+window closes too, as with Cmd-W (**Settings ›
 Sessions › Close a tab when its shell exits**, on by default). A shell that fails or is killed, a shell that ends
 within its first second, command and agent tabs, and tabs attached to a
 session they do not own stay open and show how the program ended. Such a

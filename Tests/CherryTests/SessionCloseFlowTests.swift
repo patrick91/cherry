@@ -761,22 +761,9 @@ private func sessionID(of tab: TerminalSession) throws -> String {
     #expect(window.closeRequests == 0)
     #expect(harness.fake.requests("remove").isEmpty)
 
-    // Nor while the window shows a note: ⌘W would close the note, not the
-    // window, so the window does not vanish under it.
-    window.presentedSheet = nil
-    let chromeState = ProjectWindowChromeState()
-    chromeState.selectedNoteID = UUID()
-    SessionCloseCoordinator.closeTabAfterCleanExit(
-        tab, in: workspace, chromeState: chromeState, window: window
-    )
-    #expect(workspace.sessions.map(\.id) == [tab.id])
-    #expect(window.closeRequests == 0)
-
     // Otherwise the tab closes, and then its window, as ⌘W closes them.
-    chromeState.selectedNoteID = nil
-    SessionCloseCoordinator.closeTabAfterCleanExit(
-        tab, in: workspace, chromeState: chromeState, window: window
-    )
+    window.presentedSheet = nil
+    SessionCloseCoordinator.closeTabAfterCleanExit(tab, in: workspace, window: window)
     #expect(workspace.sessions.isEmpty)
     #expect(window.closeRequests == 1)
     #expect(await harness.fake.wait { harness.requestIDs("remove").contains(tabSession) })

@@ -159,11 +159,9 @@ final class ParityControlServer {
             .appendingPathComponent("control.sock")
         server = CherryControlServer(
             workspaceProvider: { active },
-            noteStoreProvider: { nil },
             todoStoreProvider: { nil },
             chromeStateProvider: { nil },
             workspaceForProjectRootProvider: { root in workspaces.first { $0.projectRoot == root } },
-            noteStoreForProjectRootProvider: { _ in nil },
             todoStoreForProjectRootProvider: { _ in nil },
             chromeStateForProjectRootProvider: { _ in nil },
             openProjectRootsProvider: { workspaces.compactMap(\.projectRoot) },

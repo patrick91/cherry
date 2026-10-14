@@ -73,8 +73,8 @@ public struct CherryAppIdentity: Equatable, Sendable {
     }
 
     /// `~/Library/Application Support/<applicationSupportName>`: where an
-    /// identity keeps its data (`instance.lock`, `Workspaces/`, `Notes/`,
-    /// `Todos/`, `devices.json`, …).
+    /// identity keeps its data (`instance.lock`, `Workspaces/`, `Todos/`,
+    /// `devices.json`, …).
     public static func applicationSupportDirectory(
         applicationSupportName: String = CherryAppIdentity.current.applicationSupportName,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
@@ -86,8 +86,8 @@ public struct CherryAppIdentity: Equatable, Sendable {
     }
 
     /// The name of a project's file in a folder of per-project files
-    /// (`Workspaces/`, `Notes/`, `Todos/`): the SHA-256 of its root (or
-    /// key), in hex, and `.json`.
+    /// (`Workspaces/`, `Todos/`): the SHA-256 of its root (or key), in hex,
+    /// and `.json`.
     public static func projectFileName(for projectRoot: String) -> String {
         sha256Hex(projectRoot) + ".json"
     }

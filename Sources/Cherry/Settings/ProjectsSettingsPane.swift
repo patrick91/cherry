@@ -266,7 +266,6 @@ private struct ProjectFeatureControls: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
-                Toggle("Notes", isOn: featureBinding(\.notesEnabled))
                 Toggle("Todos", isOn: featureBinding(\.todosEnabled))
 
                 Spacer()

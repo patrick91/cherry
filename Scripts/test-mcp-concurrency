@@ -16,7 +16,7 @@ fast (a pinned actor would stall them and let far fewer through).
 Usage: Scripts/test-mcp-concurrency
 
 Builds Cherry (release) and runs it apart from the user's own Cherry: a private
-HOME (saved workspaces, notes, todos), and its control socket and session-host
+HOME (saved workspaces, todos), and its control socket and session-host
 socket (CHERRY_CONTROL_SOCKET, CHERRY_HOST_SOCKET) in a private (0700)
 directory. Local tabs are persistent sessions by default, so the test's tabs run
 on a daemon of its own, never the user's. At the end every session there is

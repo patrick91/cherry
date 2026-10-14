@@ -147,7 +147,7 @@ private struct OptimisticWindow {
     }
     #expect(registry.register(
         window: nsWindow, projectRoot: restored.root.path, workspace: restored.workspace,
-        repository: restored.repository, noteStore: nil, todoStore: nil, chromeState: nil
+        repository: restored.repository, todoStore: nil, chromeState: nil
     ))
     #expect(nsWindow.alphaValue == 0)
 
@@ -527,7 +527,7 @@ private struct OptimisticWindow {
                               backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         windows.append(window)
-        _ = registry.register(window: window, projectRoot: root, workspace: workspace, noteStore: nil,
+        _ = registry.register(window: window, projectRoot: root, workspace: workspace,
                               todoStore: nil, chromeState: nil)
     }
     var allOpened = false
@@ -894,7 +894,7 @@ private final class HeldHostLists: @unchecked Sendable {
                               backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         windows.append(window)
-        _ = registry.register(window: window, projectRoot: root, workspace: workspace, noteStore: nil,
+        _ = registry.register(window: window, projectRoot: root, workspace: workspace,
                               todoStore: nil, chromeState: nil)
     }
     #expect(await eventually { proceed != nil })

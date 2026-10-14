@@ -2,7 +2,7 @@
 """Run a matched Cherry app-soak and Ghostty workload, then compare their reports.
 
 Cherry runs apart from the user's own copy: a private HOME (saved workspaces,
-notes, todos) and private control and session-host sockets
+todos) and private control and session-host sockets
 (CHERRY_CONTROL_SOCKET, CHERRY_HOST_SOCKET) in a private (0700) directory.
 With --sessions persistent (the app's default) its tabs are persistent sessions
 on a cherry-host of its own; with --sessions native they are native tabs.

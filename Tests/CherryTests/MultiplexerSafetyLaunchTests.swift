@@ -163,7 +163,7 @@ private func window() -> NSWindow {
     // A project window SwiftUI restored before launch finished.
     #expect(registry.register(
         window: projectWindow, projectRoot: root.path, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        todoStore: nil, chromeState: nil
     ))
 
     let shown = ShownNotices()

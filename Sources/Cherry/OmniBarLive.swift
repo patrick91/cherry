@@ -387,7 +387,7 @@ enum OmniBarGathering {
         context.hasProject = settings.resolvedProject(for: window.projectRoot).validProjectRoot != nil
         context.isSidebarHidden = chromeState.isSidebarHidden
         context.detachTitle = inSplit ? "Detach Pane" : "Detach Tab"
-        context.closeTitle = chromeState.selectedNoteID != nil ? "Close Note" : (inSplit ? "Close Pane" : "Close Tab")
+        context.closeTitle = inSplit ? "Close Pane" : "Close Tab"
         return context
     }
 }

@@ -106,7 +106,7 @@ private func remote(
     }
     #expect(registry.register(
         window: window, projectRoot: root.path, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        todoStore: nil, chromeState: nil
     ))
     let key = registry.canonicalProjectRoot(for: root.path)
     #expect(recency.lastOpened(key) != nil)

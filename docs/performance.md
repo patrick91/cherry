@@ -18,7 +18,6 @@ synthetic suite measures it.
   - Rebuilding an evicted surface from a styled replay (`renderedReplayOutput`).
   - Ghostty bridge/session churn across many sessions, and detached surfaces
     kept warm up to the live-surface cap (see below).
-  - The sidebar switching workspaces with a large note collection.
 - App soak (`Scripts/perf-app-soak`): RSS and CPU of Cherry's processes (the
   app, its attach adapters and control helper, its session host's daemon and
   holders) under real workloads, and the runtime counters from
@@ -302,7 +301,7 @@ This writes a paired-run manifest plus the Cherry, Ghostty, and comparison
 reports under `.build/perf/`.
 
 The launcher runs Cherry apart from your own copy: a private `HOME` (saved
-workspaces, notes, todos) and private control and session-host sockets
+workspaces, todos) and private control and session-host sockets
 (`CHERRY_CONTROL_SOCKET`, `CHERRY_HOST_SOCKET`) in a private 0700 directory,
 with a `cherry-host` of its own. By default it builds with
 `swift build --product Cherry` and runs the built executable; `--cherry-command`

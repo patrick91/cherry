@@ -105,14 +105,12 @@ private struct ContentViewTestHost: View {
     @StateObject private var repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var todoStore: ProjectTodoStore
     @State private var storedSidebarWidth = 320.0
 
     init(
         workspace: TerminalWorkspace,
         chromeState: ProjectWindowChromeState,
-        noteStore: ProjectNoteStore,
         todoStore: ProjectTodoStore
     ) {
         _repository = StateObject(wrappedValue: RepositoryWorkspace(
@@ -120,7 +118,6 @@ private struct ContentViewTestHost: View {
         ))
         self.workspace = workspace
         self.chromeState = chromeState
-        self.noteStore = noteStore
         self.todoStore = todoStore
     }
 
@@ -129,7 +126,6 @@ private struct ContentViewTestHost: View {
             repository: repository,
             workspace: workspace,
             chromeState: chromeState,
-            noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: workspace.projectRoot,
             openProject: { _ in },
@@ -158,10 +154,6 @@ private func makeHostedContentViewWindow(
     // Cmd+S into the floating swap or keeps a revealed sidebar up. Tests
     // that need the cursor over the sidebar set their own probe.
     chromeState.cursorOverSidebarProbeForTesting = { _ in false }
-    let noteStore = ProjectNoteStore(
-        projectRoot: projectDirectory.path,
-        storageDirectory: storageDirectory.appendingPathComponent("notes", isDirectory: true)
-    )
     let todoStore = ProjectTodoStore(
         projectRoot: projectDirectory.path,
         storageDirectory: storageDirectory.appendingPathComponent("todos", isDirectory: true)
@@ -183,7 +175,6 @@ private func makeHostedContentViewWindow(
     let rootView = ContentViewTestHost(
         workspace: workspace,
         chromeState: chromeState,
-        noteStore: noteStore,
         todoStore: todoStore
     )
     let hostingView = NSHostingView(rootView: rootView)
@@ -1182,7 +1173,7 @@ private struct MCPWhoamiPayload: Decodable {
 @Test func scopedCherryControlRequestRoundTrips() async throws {
     let request = CherryControlRequest.scoped(.init(
         projectRoot: "/tmp/project-b",
-        request: .createNote(.init(title: "Scoped", markdown: "Project B"))
+        request: .createTodo(.init(title: "Scoped", markdown: "Project B"))
     ))
 
     let data = try JSONEncoder().encode(request)
@@ -1200,7 +1191,7 @@ private struct MCPWhoamiPayload: Decodable {
       "name": "cherry",
       "active": true,
       "open": true,
-      "features": {"notesEnabled": true, "todosEnabled": false}
+      "features": {"notesEnabled": false, "todosEnabled": false}
     }
     """.utf8)
     let withWorktrees = Data("""
@@ -1222,7 +1213,7 @@ private struct MCPWhoamiPayload: Decodable {
         name: "cherry",
         active: true,
         open: true,
-        features: .init(notesEnabled: true, todosEnabled: false)
+        features: .init(todosEnabled: false)
     )
 
     for payload in [current, withWorktrees] {
@@ -1233,36 +1224,22 @@ private struct MCPWhoamiPayload: Decodable {
 
 @Test func cherryDeepLinksRoundTrip() throws {
     let projectRoot = "/tmp/Cherry Project"
-    let noteID = UUID()
-    let link = CherryDeepLink(projectRoot: projectRoot, kind: .note, targetID: noteID.uuidString)
+    let todoID = UUID()
+    let link = CherryDeepLink(projectRoot: projectRoot, kind: .todo, targetID: todoID.uuidString)
     let parsed = try CherryDeepLink.parse(link.absoluteString)
 
     #expect(parsed == link)
-    #expect(parsed.absoluteString == "cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/note/\(noteID.uuidString)")
+    #expect(parsed.absoluteString == "cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/todo/\(todoID.uuidString)")
 
     #expect(throws: CherryControlError(code: "invalid_deep_link", message: "Cherry link must start with cherry://project/.")) {
         try CherryDeepLink.parse("https://example.com")
     }
-    #expect(throws: CherryControlError(code: "invalid_deep_link_kind", message: "Cherry link kind must be note, todo, or terminal.")) {
-        try CherryDeepLink.parse("cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/project/\(noteID.uuidString)")
+    #expect(throws: CherryControlError(code: "invalid_deep_link_kind", message: "Cherry link kind must be todo or terminal.")) {
+        try CherryDeepLink.parse("cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/project/\(todoID.uuidString)")
     }
-}
-
-@Test func cherryControlNoteRequestsRoundTrip() async throws {
-    let noteID = UUID().uuidString
-    let create = CherryControlRequest.createNote(.init(title: "Review", markdown: "# Review"))
-    let update = CherryControlRequest.updateNote(.init(noteID: noteID, title: "Updated", markdown: "- item"))
-    let append = CherryControlRequest.appendNote(.init(noteID: noteID, markdown: "- more"))
-    let rename = CherryControlRequest.renameNote(.init(noteID: noteID, title: "Renamed"))
-    let search = CherryControlRequest.searchNotes(.init(query: "Review", caseSensitive: false, maxMatches: 10))
-    let get = CherryControlRequest.getNote(.init(noteID: noteID))
-    let delete = CherryControlRequest.deleteNote(.init(noteID: noteID))
-    let select = CherryControlRequest.selectNote(.init(noteID: noteID))
-
-    for request in [create, update, append, rename, search, get, delete, select] {
-        let data = try JSONEncoder().encode(request)
-        let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
-        #expect(decoded == request)
+    // A note's link, from before notes were removed.
+    #expect(throws: CherryControlError(code: "notes_removed", message: "Cherry no longer has notes; this is a link to a note.")) {
+        try CherryDeepLink.parse("cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/note/\(UUID().uuidString)")
     }
 }
 
@@ -1647,96 +1624,6 @@ private struct MCPWhoamiPayload: Decodable {
 
     let explicitOutput = try captureEnvironment(environment: ["NO_COLOR": "1"])
     #expect(explicitOutput.contains("NO_COLOR=1"), Comment(rawValue: explicitOutput))
-}
-
-@MainActor
-@Test func projectNoteStorePersistsProjectNotes() async throws {
-    let projectRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-    let storageRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryNotes-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(at: projectRoot)
-        try? FileManager.default.removeItem(at: storageRoot)
-    }
-
-    let store = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
-    let note = try store.create(title: " Review ", markdown: "# Review")
-    _ = try store.update(id: note.id, title: "Updated", markdown: "- done")
-
-    let reloaded = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
-    #expect(reloaded.notes.count == 1)
-    #expect(reloaded.notes[0].id == note.id)
-    #expect(reloaded.notes[0].title == "Updated")
-    #expect(reloaded.notes[0].markdown == "- done")
-
-    try reloaded.delete(id: note.id)
-    #expect(ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot).notes.isEmpty)
-}
-
-@MainActor
-@Test func projectNoteEditorAutosavePersistsAfterBackgroundFlush() async throws {
-    let projectRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-    let storageRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryNotes-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(at: projectRoot)
-        try? FileManager.default.removeItem(at: storageRoot)
-    }
-
-    let store = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
-    let note = try store.create(title: "Draft", markdown: "Before")
-    _ = try store.updateFromEditor(id: note.id, title: "Draft", markdown: "After")
-    store.flushPendingWrites()
-
-    let reloaded = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
-    #expect(reloaded.notes.first?.markdown == "After")
-}
-
-@MainActor
-@Test func projectNoteStoreCanLoadLargeCollectionsOffTheMainActor() async throws {
-    let projectRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-    let storageRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryNotes-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
-    try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(at: projectRoot)
-        try? FileManager.default.removeItem(at: storageRoot)
-    }
-
-    let now = Date()
-    let notes = (0..<1_000).map { index in
-        ProjectNote(
-            id: UUID(),
-            projectRoot: projectRoot.path,
-            title: "Note \(index)",
-            markdown: String(repeating: "Body \(index)\n", count: 32),
-            createdAt: now.addingTimeInterval(-Double(index)),
-            updatedAt: now.addingTimeInterval(-Double(index))
-        )
-    }
-    let encoder = JSONEncoder()
-    encoder.dateEncodingStrategy = .iso8601
-    let fileURL = storageRoot.appendingPathComponent(
-        ProjectNoteStore.projectStorageName(projectRoot: projectRoot.path)
-    )
-    try encoder.encode(notes).write(to: fileURL)
-
-    let store = ProjectNoteStore(
-        projectRoot: projectRoot.path,
-        storageDirectory: storageRoot,
-        loadsInBackground: true
-    )
-    #expect(store.isLoading)
-    #expect(store.notes.isEmpty)
-    #expect(await eventually(timeout: 5) { !store.isLoading })
-    #expect(store.notes.count == notes.count)
-    #expect(store.notes.first?.id == notes.first?.id)
 }
 
 @MainActor
@@ -2620,6 +2507,34 @@ private struct MCPWhoamiPayload: Decodable {
     })
 }
 
+@Test func mcpNoteToolsAreGone() async throws {
+    let noteToolNames: Set<String> = [
+        "list_notes",
+        "create_note",
+        "get_note",
+        "update_note",
+        "append_note",
+        "rename_note",
+        "search_notes",
+        "delete_note",
+        "select_note"
+    ]
+    #expect(Set(CherryMCPTools.all.map(\.name)).isDisjoint(with: noteToolNames))
+
+    // An agent whose tool list predates their removal gets a clean error.
+    let result = await CherryMCPTools.call(
+        name: "create_note",
+        arguments: ["title": .string("Review"), "markdown": .string("# Review")]
+    )
+    #expect(result.isError == true)
+    #expect(result.content.contains { content in
+        if case .text(let text, _, _) = content {
+            return text.contains("unknown_tool")
+        }
+        return false
+    })
+}
+
 @MainActor
 @Test func mcpAgentCreationWithoutCallerDoesNotUseLatestRootAgent() async throws {
     let harness = try ControlServerHarness()
@@ -3493,7 +3408,6 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(harness.workspace.selectedSessionID == terminalID)
     #expect(harness.chromeState.isShowingTerminalContent == true)
     #expect(harness.chromeState.selectedTodoID == nil)
-    #expect(harness.chromeState.selectedNoteID == nil)
 }
 
 @MainActor
@@ -3523,112 +3437,12 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func controlServerManagesProjectNotes() async throws {
-    let harness = try ControlServerHarness()
-    defer {
-        harness.stop()
-    }
-    harness.server.start()
-
-    let createResponse = try await harness.send(.createNote(.init(
-        title: "Review Notes",
-        markdown: "# Findings"
-    )))
-    guard case .createNote(let created)? = createResponse.result else {
-        Issue.record("Expected createNote result, got \(String(describing: createResponse))")
-        return
-    }
-
-    #expect(createResponse.error == nil)
-    #expect(created.note.title == "Review Notes")
-    #expect(created.note.markdown == "# Findings")
-    #expect(created.selected == false)
-
-    let selectResponse = try await harness.send(.selectNote(.init(noteID: created.note.id.uuidString)))
-    #expect(selectResponse.error == nil)
-    #expect(harness.chromeState.selectedNoteID == created.note.id)
-
-    let listResponse = try await harness.send(.listNotes)
-    guard case .listNotes(let list)? = listResponse.result else {
-        Issue.record("Expected listNotes result, got \(String(describing: listResponse))")
-        return
-    }
-    #expect(list.activeProjectRoot == harness.projectRoot.path)
-    #expect(list.notes.map(\.id) == [created.note.id.uuidString])
-    #expect(list.selectedNoteID == created.note.id.uuidString)
-
-    let updateResponse = try await harness.send(.updateNote(.init(
-        noteID: created.note.id.uuidString,
-        title: "Updated",
-        markdown: "- done"
-    )))
-    guard case .updateNote(let updated)? = updateResponse.result else {
-        Issue.record("Expected updateNote result, got \(String(describing: updateResponse))")
-        return
-    }
-    #expect(updated.note.title == "Updated")
-    #expect(updated.note.markdown == "- done")
-    #expect(updated.selected == true)
-
-    let appendResponse = try await harness.send(.appendNote(.init(
-        noteID: created.note.id.uuidString,
-        markdown: "- appended"
-    )))
-    guard case .appendNote(let appended)? = appendResponse.result else {
-        Issue.record("Expected appendNote result, got \(String(describing: appendResponse))")
-        return
-    }
-    #expect(appended.note.markdown == "- done\n- appended")
-
-    let renameResponse = try await harness.send(.renameNote(.init(
-        noteID: created.note.id.uuidString,
-        title: "Renamed"
-    )))
-    guard case .renameNote(let renamed)? = renameResponse.result else {
-        Issue.record("Expected renameNote result, got \(String(describing: renameResponse))")
-        return
-    }
-    #expect(renamed.note.title == "Renamed")
-
-    let searchResponse = try await harness.send(.searchNotes(.init(query: "appended")))
-    guard case .searchNotes(let search)? = searchResponse.result else {
-        Issue.record("Expected searchNotes result, got \(String(describing: searchResponse))")
-        return
-    }
-    #expect(search.matches.map(\.noteID) == [created.note.id.uuidString])
-    #expect(search.matches.first?.lineNumber == 1)
-
-    let getResponse = try await harness.send(.getNote(.init(noteID: created.note.id.uuidString)))
-    guard case .getNote(let fetched)? = getResponse.result else {
-        Issue.record("Expected getNote result, got \(String(describing: getResponse))")
-        return
-    }
-    #expect(fetched.note == renamed.note)
-
-    let deleteResponse = try await harness.send(.deleteNote(.init(noteID: created.note.id.uuidString)))
-    guard case .deleteNote(let deleted)? = deleteResponse.result else {
-        Issue.record("Expected deleteNote result, got \(String(describing: deleteResponse))")
-        return
-    }
-    #expect(deleted.deleted == true)
-    #expect(harness.noteStore.notes.isEmpty)
-    #expect(harness.chromeState.selectedNoteID == nil)
-}
-
-@MainActor
-@Test func controlServerRejectsDisabledProjectNoteAndTodoTools() async throws {
+@Test func controlServerRejectsDisabledProjectTodoTools() async throws {
     let harness = try ControlServerHarness(enableProjectFeatures: false)
     defer {
         harness.stop()
     }
     harness.server.start()
-
-    let noteResponse = try await harness.send(.createNote(.init(
-        title: "Disabled Note",
-        markdown: "No write"
-    )))
-    #expect(noteResponse.error?.code == "feature_disabled")
-    #expect(harness.noteStore.notes.isEmpty)
 
     let todoResponse = try await harness.send(.createTodo(.init(
         title: "Disabled Todo",
@@ -3642,9 +3456,129 @@ private struct MCPWhoamiPayload: Decodable {
         Issue.record("Expected getProjectStatus result, got \(String(describing: statusResponse))")
         return
     }
-    #expect(status.features == ProjectFeatureAvailability(notesEnabled: false, todosEnabled: false))
-    #expect(status.noteCount == nil)
+    #expect(status.features == ProjectFeatureAvailability(todosEnabled: false))
     #expect(status.todoCount == nil)
+}
+
+/// A CherryMCP from before notes were removed (an agent's helper an update
+/// kept running, a build on another Mac) still sends their requests: each
+/// gets a clean error and changes nothing.
+@MainActor
+@Test func controlServerAnswersAnOlderHelpersNoteRequestsWithAnError() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    // As such a helper encodes them: today's requests of the same shape,
+    // renamed.
+    func renamed(_ data: Data, _ names: [(String, String)]) -> String {
+        names.reduce(String(decoding: data, as: UTF8.self)) { text, name in
+            text.replacingOccurrences(of: "\"\(name.0)\"", with: "\"\(name.1)\"")
+        }
+    }
+    let encoder = JSONEncoder()
+    let requests = [
+        renamed(try encoder.encode(CherryControlRequest.createTodo(.init(title: "T", markdown: "M"))), [("createTodo", "createNote")]),
+        renamed(try encoder.encode(CherryControlRequest.listTodos), [("listTodos", "listNotes")]),
+        renamed(try encoder.encode(CherryControlRequest.scoped(.init(
+            projectRoot: harness.projectRoot.path,
+            request: .listTodos
+        ))), [("listTodos", "listNotes")]),
+        renamed(try encoder.encode(CherryControlEnvelope(
+            cherryAuth: .init(token: "t", processID: UUID().uuidString),
+            request: .deleteTodo(.init(todoID: UUID().uuidString))
+        )), [("deleteTodo", "deleteNote"), ("todoID", "noteID")]),
+    ]
+    let sessionsBefore = harness.workspace.sessions.count
+    for request in requests {
+        #expect(request.contains("Note"), Comment(rawValue: request))
+        let response = await harness.server.handleRequestData(Data(request.utf8), peerPID: nil)
+        #expect(response.result == nil, Comment(rawValue: request))
+        #expect(response.error?.code == "notes_removed", Comment(rawValue: request))
+    }
+    #expect(harness.todoStore.todos.isEmpty)
+    #expect(harness.workspace.sessions.count == sessionsBefore)
+
+    // Anything else that does not decode stays an invalid request.
+    let unknown = await harness.server.handleRequestData(Data(#"{"createWidget":{}}"#.utf8), peerPID: nil)
+    #expect(unknown.error?.code == "invalid_request")
+}
+
+/// What an older CherryMCP decodes `ProjectFeatureAvailability` as: it
+/// requires `notesEnabled`.
+private struct ProjectFeatureAvailabilityBeforeNotesWereRemoved: Decodable {
+    let notesEnabled: Bool
+    let todosEnabled: Bool
+}
+
+@Test func projectFeatureAvailabilityStillCarriesNotesEnabledForOlderHelpers() throws {
+    let features = ProjectFeatureAvailability(todosEnabled: true)
+    let old = try JSONDecoder().decode(
+        ProjectFeatureAvailabilityBeforeNotesWereRemoved.self,
+        from: JSONEncoder().encode(features)
+    )
+    #expect(old.notesEnabled == false)
+    #expect(old.todosEnabled == true)
+
+    // Inside the answers of list_projects and get_project_status too.
+    struct OldPayload: Decodable { let features: ProjectFeatureAvailabilityBeforeNotesWereRemoved }
+    let project = ProjectInfo(root: "/tmp/cherry", name: "cherry", active: true, open: true, features: features)
+    #expect(try JSONDecoder().decode(OldPayload.self, from: JSONEncoder().encode(project)).features.todosEnabled)
+    let status = ProjectStatusResult(
+        projectRoot: "/tmp/cherry",
+        processCounts: ProcessCounts(total: 0, terminals: 0, agents: 0, commands: 0),
+        todoCount: 0,
+        features: features,
+        selectedProcessID: nil,
+        selectedProcessName: nil,
+        health: "ok"
+    )
+    #expect(try JSONDecoder().decode(OldPayload.self, from: JSONEncoder().encode(status)).features.todosEnabled)
+
+    // Decoding takes payloads with or without the key.
+    #expect(try JSONDecoder().decode(ProjectFeatureAvailability.self, from: Data(#"{"todosEnabled":true}"#.utf8)) == features)
+    #expect(try JSONDecoder().decode(
+        ProjectFeatureAvailability.self,
+        from: Data(#"{"notesEnabled":true,"todosEnabled":true}"#.utf8)
+    ) == features)
+}
+
+/// Agents never see `notesEnabled`: CherryMCP's answers leave it out, in
+/// their text and in their structured content.
+@MainActor
+@Test func mcpProjectAnswersLeaveOutNotesEnabled() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
+    defer {
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
+    }
+    harness.server.start()
+
+    for name in ["list_projects", "get_project_status"] {
+        let result = await CherryMCPTools.call(name: name, arguments: [:])
+        let text = result.content.compactMap { content -> String? in
+            if case .text(let text, _, _) = content {
+                return text
+            }
+            return nil
+        }.joined()
+        #expect(result.isError != true, Comment(rawValue: text))
+        #expect(text.contains("todos_enabled"), Comment(rawValue: text))
+        #expect(!text.contains("notes_enabled"), Comment(rawValue: text))
+
+        let structured = String(decoding: try JSONEncoder().encode(try #require(result.structuredContent)), as: UTF8.self)
+        #expect(structured.contains("todosEnabled"), Comment(rawValue: structured))
+        #expect(!structured.contains("notesEnabled"), Comment(rawValue: structured))
+    }
 }
 
 @MainActor
@@ -3724,7 +3658,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func controlServerScopesNotesToRequestedProject() async throws {
+@Test func controlServerScopesTodosToRequestedProject() async throws {
     let defaultsName = "CherryTests.ScopedControlServer.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: defaultsName))
     let settings = AgentSettings(defaults: defaults)
@@ -3733,8 +3667,6 @@ private struct MCPWhoamiPayload: Decodable {
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
     let projectRootB = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
-    let notesRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryScopedNotes-\(UUID().uuidString)", isDirectory: true)
     let todosRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("CherryScopedTodos-\(UUID().uuidString)", isDirectory: true)
     let socketDirectory = URL(
@@ -3747,35 +3679,29 @@ private struct MCPWhoamiPayload: Decodable {
     try FileManager.default.createDirectory(at: projectRootB, withIntermediateDirectories: true)
     _ = settings.addProject(path: projectRootA.path)
     _ = settings.addProject(path: projectRootB.path)
-    try settings.setProjectFeatures(.init(notesEnabled: true, todosEnabled: true), for: projectRootA.path, storage: .local)
-    try settings.setProjectFeatures(.init(notesEnabled: true, todosEnabled: true), for: projectRootB.path, storage: .local)
+    try settings.setProjectFeatures(.init(todosEnabled: true), for: projectRootA.path, storage: .local)
+    try settings.setProjectFeatures(.init(todosEnabled: true), for: projectRootB.path, storage: .local)
 
     let workspaceA = TerminalWorkspace(projectRoot: projectRootA.path, launchBackend: .hostManaged)
     let workspaceB = TerminalWorkspace(projectRoot: projectRootB.path, launchBackend: .hostManaged)
-    let noteStoreA = ProjectNoteStore(projectRoot: projectRootA.path, storageDirectory: notesRoot)
-    let noteStoreB = ProjectNoteStore(projectRoot: projectRootB.path, storageDirectory: notesRoot)
     let todoStoreA = ProjectTodoStore(projectRoot: projectRootA.path, storageDirectory: todosRoot)
     let todoStoreB = ProjectTodoStore(projectRoot: projectRootB.path, storageDirectory: todosRoot)
     let chromeStateA = ProjectWindowChromeState()
     let chromeStateB = ProjectWindowChromeState()
 
     let activeWorkspace = workspaceA
-    let activeNoteStore = noteStoreA
     let activeTodoStore = todoStoreA
     let activeChromeState = chromeStateA
     let workspaces = [projectRootA.path: workspaceA, projectRootB.path: workspaceB]
-    let noteStores = [projectRootA.path: noteStoreA, projectRootB.path: noteStoreB]
     let todoStores = [projectRootA.path: todoStoreA, projectRootB.path: todoStoreB]
     let chromeStates = [projectRootA.path: chromeStateA, projectRootB.path: chromeStateB]
     let openProjectRoots = [projectRootA.path, projectRootB.path]
 
     let server = CherryControlServer(
         workspaceProvider: { activeWorkspace },
-        noteStoreProvider: { activeNoteStore },
         todoStoreProvider: { activeTodoStore },
         chromeStateProvider: { activeChromeState },
         workspaceForProjectRootProvider: { workspaces[$0] },
-        noteStoreForProjectRootProvider: { noteStores[$0] },
         todoStoreForProjectRootProvider: { todoStores[$0] },
         chromeStateForProjectRootProvider: { chromeStates[$0] },
         openProjectRootsProvider: { openProjectRoots },
@@ -3789,7 +3715,6 @@ private struct MCPWhoamiPayload: Decodable {
         defaults.removePersistentDomain(forName: defaultsName)
         try? FileManager.default.removeItem(at: projectRootA)
         try? FileManager.default.removeItem(at: projectRootB)
-        try? FileManager.default.removeItem(at: notesRoot)
         try? FileManager.default.removeItem(at: todosRoot)
         try? FileManager.default.removeItem(at: socketDirectory)
     }
@@ -3808,39 +3733,38 @@ private struct MCPWhoamiPayload: Decodable {
         }
     }
 
-    let unscopedResponse = try await send(.createNote(.init(title: "Active A", markdown: "A")))
+    let unscopedResponse = try await send(.createTodo(.init(title: "Active A", markdown: "A")))
     #expect(unscopedResponse.error?.code == "project_scope_required")
-    #expect(noteStoreA.notes.isEmpty)
-    #expect(noteStoreB.notes.isEmpty)
+    #expect(todoStoreA.todos.isEmpty)
+    #expect(todoStoreB.todos.isEmpty)
 
     let scopedResponse = try await send(.scoped(.init(
         projectRoot: projectRootB.path,
-        request: .createNote(.init(title: "Scoped B", markdown: "B"))
+        request: .createTodo(.init(title: "Scoped B", markdown: "B"))
     )))
     #expect(scopedResponse.error == nil)
 
-    #expect(noteStoreA.notes.isEmpty)
-    #expect(noteStoreB.notes.map(\.title) == ["Scoped B"])
+    #expect(todoStoreA.todos.isEmpty)
+    #expect(todoStoreB.todos.map(\.title) == ["Scoped B"])
     #expect(activeWorkspace === workspaceA)
-    #expect(activeNoteStore === noteStoreA)
     #expect(activeTodoStore === todoStoreA)
     #expect(activeChromeState === chromeStateA)
 
-    let listResponse = try await send(.scoped(.init(projectRoot: projectRootB.path, request: .listNotes)))
-    guard case .listNotes(let list)? = listResponse.result else {
-        Issue.record("Expected scoped listNotes result, got \(String(describing: listResponse))")
+    let listResponse = try await send(.scoped(.init(projectRoot: projectRootB.path, request: .listTodos)))
+    guard case .listTodos(let list)? = listResponse.result else {
+        Issue.record("Expected scoped listTodos result, got \(String(describing: listResponse))")
         return
     }
     #expect(list.activeProjectRoot == projectRootB.path)
-    #expect(list.notes.map(\.title) == ["Scoped B"])
+    #expect(list.todos.map(\.title) == ["Scoped B"])
 
     let scopedSubdirectoryResponse = try await send(.scoped(.init(
         projectRoot: projectRootB.appendingPathComponent("Sources").path,
-        request: .createNote(.init(title: "Scoped B Subdir", markdown: "B subdir"))
+        request: .createTodo(.init(title: "Scoped B Subdir", markdown: "B subdir"))
     )))
     #expect(scopedSubdirectoryResponse.error == nil)
-    #expect(noteStoreA.notes.isEmpty)
-    #expect(Set(noteStoreB.notes.map(\.title)) == ["Scoped B", "Scoped B Subdir"])
+    #expect(todoStoreA.todos.isEmpty)
+    #expect(Set(todoStoreB.todos.map(\.title)) == ["Scoped B", "Scoped B Subdir"])
 }
 
 @MainActor
@@ -4021,26 +3945,12 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func controlServerDoesNotSelectNotesOrTodosByDefault() async throws {
+@Test func controlServerDoesNotSelectTodosByDefault() async throws {
     let harness = try ControlServerHarness()
     defer {
         harness.stop()
     }
     harness.server.start()
-
-    let noteResponse = try await harness.send(.createNote(.init(
-        title: "Quiet Note",
-        markdown: "No focus change"
-    )))
-    guard case .createNote(let createdNote)? = noteResponse.result else {
-        Issue.record("Expected createNote result, got \(String(describing: noteResponse))")
-        return
-    }
-
-    #expect(noteResponse.error == nil)
-    #expect(createdNote.selected == false)
-    #expect(harness.chromeState.selectedNoteID == nil)
-    #expect(harness.chromeState.isShowingTerminalContent == true)
 
     let todoResponse = try await harness.send(.createTodo(.init(
         title: "Quiet Todo",
@@ -4069,14 +3979,6 @@ private struct MCPWhoamiPayload: Decodable {
 
     let initialSessionID = try #require(harness.workspace.selectedSessionID)
 
-    let noteResponse = try await harness.send(.createNote(.init(title: "Link Note", markdown: "note body")))
-    guard case .createNote(let createdNote)? = noteResponse.result,
-          let noteLink = createdNote.link
-    else {
-        Issue.record("Expected createNote result with link, got \(String(describing: noteResponse))")
-        return
-    }
-
     let todoResponse = try await harness.send(.createTodo(.init(title: "Link Todo", markdown: "todo body")))
     guard case .createTodo(let createdTodo)? = todoResponse.result,
           let todoLink = createdTodo.link
@@ -4087,23 +3989,13 @@ private struct MCPWhoamiPayload: Decodable {
 
     let terminalLink = CherryDeepLink.terminalURL(projectRoot: harness.projectRoot.path, terminalID: initialSessionID)
 
-    let noteResolveResponse = try await harness.send(.resolveLink(.init(link: noteLink)))
-    guard case .resolveLink(let noteResult)? = noteResolveResponse.result else {
-        Issue.record("Expected resolveLink note result, got \(String(describing: noteResolveResponse))")
-        return
-    }
-    #expect(noteResult.found == true)
-    #expect(noteResult.projectRoot == harness.projectRoot.path)
-    #expect(noteResult.kind == .note)
-    #expect(noteResult.note?.id == createdNote.note.id)
-    #expect(noteResult.noteLink == noteLink)
-
     let todoResolveResponse = try await harness.send(.resolveLink(.init(link: todoLink)))
     guard case .resolveLink(let todoResult)? = todoResolveResponse.result else {
         Issue.record("Expected resolveLink todo result, got \(String(describing: todoResolveResponse))")
         return
     }
     #expect(todoResult.found == true)
+    #expect(todoResult.projectRoot == harness.projectRoot.path)
     #expect(todoResult.kind == .todo)
     #expect(todoResult.todo?.id == createdTodo.todo.id)
     #expect(todoResult.todoLink == todoLink)
@@ -4133,8 +4025,13 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(staleResult.found == false)
     #expect(staleResult.projectRoot == harness.projectRoot.path)
 
+    // A note's link, from before notes were removed.
+    let noteLink = "\(CherryDeepLink.scheme)://project/\(CherryDeepLink.projectKey(forProjectRoot: harness.projectRoot.path))/note/\(UUID().uuidString)"
+    let noteResponse = try await harness.send(.resolveLink(.init(link: noteLink)))
+    #expect(noteResponse.result == nil)
+    #expect(noteResponse.error?.code == "notes_removed")
+
     #expect(harness.workspace.selectedSessionID == initialSessionID)
-    #expect(harness.chromeState.selectedNoteID == nil)
     #expect(harness.chromeState.selectedTodoID == nil)
     #expect(harness.chromeState.isShowingTerminalContent == true)
 }
@@ -4167,7 +4064,6 @@ private struct MCPWhoamiPayload: Decodable {
     }
     #expect(status.projectRoot == harness.projectRoot.path)
     #expect(status.processCounts.terminals == 1)
-    #expect(status.noteCount == 0)
     #expect(status.todoCount == 0)
 
     let rawData = Data("perf-diagnostics\r\n".utf8)
@@ -5794,7 +5690,6 @@ private struct QuitCountWindowTestHost: View {
                 projectRoot: repository.repositoryRoot,
                 workspace: repository.workspace,
                 repository: repository,
-                noteStore: nil,
                 todoStore: nil,
                 chromeState: nil
             ))
@@ -8241,79 +8136,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 }
 
 @MainActor
-@Test func appShortcutMonitorCommandWClosesSelectedNoteBeforeSession() async throws {
-    let projectDirectory = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryShortcutNoteClose-\(UUID().uuidString)", isDirectory: true)
-    let storageDirectory = projectDirectory.appendingPathComponent("stores", isDirectory: true)
-    try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
-
-    let workspace = TerminalWorkspace(projectRoot: projectDirectory.path, launchBackend: .hostManaged)
-    let chromeState = ProjectWindowChromeState()
-    let noteStore = ProjectNoteStore(
-        projectRoot: projectDirectory.path,
-        storageDirectory: storageDirectory.appendingPathComponent("notes", isDirectory: true)
-    )
-    let todoStore = ProjectTodoStore(
-        projectRoot: projectDirectory.path,
-        storageDirectory: storageDirectory.appendingPathComponent("todos", isDirectory: true)
-    )
-    let secondSession = workspace.addSession(title: "Keep Me")
-    let note = try noteStore.create(title: "Active Note", markdown: "draft")
-    chromeState.selectNote(id: note.id)
-
-    let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.orderFrontRegardless()
-
-    let coordinator = AppShortcutMonitor.Coordinator(
-        workspace: workspace,
-        chromeState: chromeState,
-        noteStore: noteStore,
-        todoStore: todoStore,
-        projectRoot: projectDirectory.path,
-        visibleCommands: [],
-        projectFeatures: ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
-        openSettings: {}
-    )
-    coordinator.window = window
-
-    defer {
-        _ = coordinator
-        for session in workspace.sessions {
-            session.releaseGhosttyBridge()
-            session.stop()
-        }
-        window.close()
-        try? FileManager.default.removeItem(at: projectDirectory)
-    }
-
-    let event = try #require(NSEvent.keyEvent(
-        with: .keyDown,
-        location: .zero,
-        modifierFlags: [.command],
-        timestamp: 1,
-        windowNumber: window.windowNumber,
-        context: nil,
-        characters: "w",
-        charactersIgnoringModifiers: "w",
-        isARepeat: false,
-        keyCode: 13
-    ))
-
-    NSApp.sendEvent(event)
-    try await Task.sleep(for: .milliseconds(20))
-
-    #expect(chromeState.selectedNoteID == nil)
-    #expect(workspace.sessions.contains { $0.id == secondSession.id })
-    #expect(workspace.sessions.count == 2)
-}
-
-@MainActor
 @Test func appShortcutMonitorCommandWClosesActiveSplitPane() async throws {
     let projectDirectory = FileManager.default.temporaryDirectory
         .appendingPathComponent("CherryShortcutSplitClose-\(UUID().uuidString)", isDirectory: true)
@@ -8323,10 +8145,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     let workspace = TerminalWorkspace(projectRoot: projectDirectory.path, launchBackend: .hostManaged)
     workspace.updateTerminalDetailWidth(1_200)
     let chromeState = ProjectWindowChromeState()
-    let noteStore = ProjectNoteStore(
-        projectRoot: projectDirectory.path,
-        storageDirectory: storageDirectory.appendingPathComponent("notes", isDirectory: true)
-    )
     let todoStore = ProjectTodoStore(
         projectRoot: projectDirectory.path,
         storageDirectory: storageDirectory.appendingPathComponent("todos", isDirectory: true)
@@ -8348,11 +8166,10 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     let coordinator = AppShortcutMonitor.Coordinator(
         workspace: workspace,
         chromeState: chromeState,
-        noteStore: noteStore,
         todoStore: todoStore,
         projectRoot: projectDirectory.path,
         visibleCommands: [],
-        projectFeatures: ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
+        projectFeatures: ProjectFeatureSettings(todosEnabled: true),
         openSettings: {}
     )
     coordinator.window = window
@@ -8671,17 +8488,52 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     let settings = AgentSettings(defaults: defaults)
     settings.addProject(path: directory.path)
 
-    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: false))
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(todosEnabled: false))
 
-    try CherryProjectFile.writeFeatureSettings(.init(notesEnabled: true, todosEnabled: false), projectRoot: directory.path)
-    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: true, todosEnabled: false))
+    try CherryProjectFile.writeFeatureSettings(.init(todosEnabled: true), projectRoot: directory.path)
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(todosEnabled: true))
 
-    try settings.setProjectFeatures(.init(notesEnabled: false, todosEnabled: true), for: directory.path, storage: .local)
-    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: true))
-    #expect(AgentSettings(defaults: defaults).projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: true))
+    try settings.setProjectFeatures(.init(todosEnabled: false), for: directory.path, storage: .local)
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(todosEnabled: false))
+    #expect(AgentSettings(defaults: defaults).projectFeatures(for: directory.path) == ProjectFeatureSettings(todosEnabled: false))
 
     settings.clearLocalProjectFeatureOverrides(for: directory.path)
-    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: true, todosEnabled: false))
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(todosEnabled: true))
+}
+
+/// Local feature settings saved before notes were removed name
+/// `notesEnabled` too: they still load, and one that named only notes is
+/// no override.
+@MainActor
+@Test func projectFeatureOverridesSavedBeforeNotesWereRemovedStillLoad() async throws {
+    let defaultsName = "CherryTests.ProjectFeaturesBeforeNotes.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let notesOnly = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: notesOnly, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+        try? FileManager.default.removeItem(at: notesOnly)
+    }
+
+    let saved: [String: [String: Bool]] = [
+        directory.path: ["notesEnabled": true, "todosEnabled": true],
+        notesOnly.path: ["notesEnabled": true],
+    ]
+    defaults.set(try JSONEncoder().encode(saved), forKey: "features.byProject")
+
+    let settings = AgentSettings(defaults: defaults)
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(todosEnabled: true))
+    #expect(!settings.projectFeatureOverrides(for: directory.path).isEmpty)
+    #expect(settings.projectFeatures(for: notesOnly.path) == ProjectFeatureSettings(todosEnabled: false))
+    #expect(settings.projectFeatureOverrides(for: notesOnly.path).isEmpty)
 }
 
 @MainActor
@@ -8731,21 +8583,52 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    try CherryProjectFile.writeFeatureSettings(.init(notesEnabled: true, todosEnabled: false), projectRoot: directory.path)
+    try CherryProjectFile.writeFeatureSettings(.init(todosEnabled: false), projectRoot: directory.path)
     try CherryProjectFile.upsertCommand(
         ProjectCommandDefinition(name: "Web", command: "npm", arguments: "run dev"),
         projectRoot: directory.path
     )
-    try CherryProjectFile.writeFeatureSettings(.init(notesEnabled: false, todosEnabled: true), projectRoot: directory.path)
+    try CherryProjectFile.writeFeatureSettings(.init(todosEnabled: true), projectRoot: directory.path)
 
     let contents = try String(contentsOf: CherryProjectFile.fileURL(projectRoot: directory.path), encoding: .utf8)
     #expect(contents.contains("[features]"))
-    #expect(contents.contains("notes = false"))
     #expect(contents.contains("todos = true"))
+    #expect(!contents.contains("todos = false"))
+    #expect(!contents.contains("notes"))
     #expect(contents.contains("# BEGIN CHERRY COMMANDS"))
     #expect(contents.contains("[[commands]]"))
-    #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: true))
+    #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(todosEnabled: true))
     #expect(CherryProjectFile.loadCommands(projectRoot: directory.path).map(\.name) == ["Web"])
+}
+
+/// A cherry.toml's `[features]` keeps what Cherry no longer reads (a
+/// `notes = true` that builds from before notes were removed read, a
+/// comment) when Cherry saves its to-dos setting there.
+@MainActor
+@Test func cherryTomlFeatureSettingsKeepTheSectionsOtherLines() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+    let url = CherryProjectFile.fileURL(projectRoot: directory.path)
+    try "[features]\n# shared with the team\nnotes = true\ntodos = false\n\n[appearance]\ncolor = \"blue\"\n"
+        .write(to: url, atomically: true, encoding: .utf8)
+
+    try CherryProjectFile.writeFeatureSettings(.init(todosEnabled: true), projectRoot: directory.path)
+
+    let contents = try String(contentsOf: url, encoding: .utf8)
+    #expect(contents.hasPrefix("[features]\n# shared with the team\nnotes = true\ntodos = true\n"), Comment(rawValue: contents))
+    #expect(!contents.contains("todos = false"), Comment(rawValue: contents))
+    #expect(contents.contains("[appearance]\ncolor = \"blue\""), Comment(rawValue: contents))
+    #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(todosEnabled: true))
+    #expect(CherryProjectFile.loadAppearanceSettings(projectRoot: directory.path) == ProjectAppearanceSettings(color: .blue))
+
+    // A section without the line gets it.
+    try "[features]\nnotes = true\n".write(to: url, atomically: true, encoding: .utf8)
+    try CherryProjectFile.writeFeatureSettings(.init(todosEnabled: false), projectRoot: directory.path)
+    #expect(try String(contentsOf: url, encoding: .utf8) == "[features]\nnotes = true\ntodos = false\n")
 }
 
 @MainActor
@@ -8792,7 +8675,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    try CherryProjectFile.writeFeatureSettings(.init(notesEnabled: true, todosEnabled: false), projectRoot: directory.path)
+    try CherryProjectFile.writeFeatureSettings(.init(todosEnabled: true), projectRoot: directory.path)
     try CherryProjectFile.upsertCommand(
         ProjectCommandDefinition(name: "Web", command: "npm", arguments: "run dev"),
         projectRoot: directory.path
@@ -8804,7 +8687,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     #expect(contents.contains("[appearance]"))
     #expect(contents.contains("color = \"teal\""))
     #expect(contents.contains("# BEGIN CHERRY COMMANDS"))
-    #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(notesEnabled: true, todosEnabled: false))
+    #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(todosEnabled: true))
     #expect(CherryProjectFile.loadAppearanceSettings(projectRoot: directory.path) == ProjectAppearanceSettings(color: .teal))
     #expect(CherryProjectFile.loadCommands(projectRoot: directory.path).map(\.name) == ["Web"])
 
@@ -9389,10 +9272,8 @@ final class ControlServerHarness {
     let defaults: UserDefaults
     let settings: AgentSettings
     let projectRoot: URL
-    let notesRoot: URL
     let todosRoot: URL
     let workspace: TerminalWorkspace
-    let noteStore: ProjectNoteStore
     let todoStore: ProjectTodoStore
     let chromeState: ProjectWindowChromeState
     let socketURL: URL
@@ -9405,8 +9286,6 @@ final class ControlServerHarness {
         projectRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
-        notesRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("CherryControlNotes-\(UUID().uuidString)", isDirectory: true)
         todosRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("CherryControlTodos-\(UUID().uuidString)", isDirectory: true)
 
@@ -9420,18 +9299,16 @@ final class ControlServerHarness {
         _ = settings.addProject(path: projectRoot.path)
         if enableProjectFeatures {
             try settings.setProjectFeatures(
-                ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
+                ProjectFeatureSettings(todosEnabled: true),
                 for: projectRoot.path,
                 storage: .local
             )
         }
         workspace = TerminalWorkspace(projectRoot: projectRoot.path, launchBackend: .hostManaged)
-        noteStore = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: notesRoot)
         todoStore = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: todosRoot)
         chromeState = ProjectWindowChromeState()
         server = CherryControlServer(
             workspace: workspace,
-            noteStore: noteStore,
             todoStore: todoStore,
             chromeState: chromeState,
             socketURL: socketURL,
@@ -9449,7 +9326,6 @@ final class ControlServerHarness {
         workspace.sessions.forEach { $0.stop() }
         defaults.removePersistentDomain(forName: defaultsName)
         try? FileManager.default.removeItem(at: projectRoot)
-        try? FileManager.default.removeItem(at: notesRoot)
         try? FileManager.default.removeItem(at: todosRoot)
         try? FileManager.default.removeItem(at: socketURL.deletingLastPathComponent())
     }
@@ -10125,88 +10001,6 @@ private func serviceRecord(
 }
 
 @MainActor
-@Test func markdownInlineCodeChipUsesFontMetricsInsteadOfLineFragmentHeight() {
-    let text = "- `frontend/src/hooks/useAppLogs.ts`"
-    let textStorage = NSTextStorage(string: text)
-    let layoutManager = MarkdownLayoutManager()
-    let textContainer = NSTextContainer(containerSize: NSSize(width: 716, height: 1_000))
-    layoutManager.addTextContainer(textContainer)
-    textStorage.addLayoutManager(layoutManager)
-
-    let paragraph = NSMutableParagraphStyle()
-    paragraph.lineHeightMultiple = 1.4
-    paragraph.paragraphSpacing = 7
-    paragraph.firstLineHeadIndent = NoteEditorStyle.document.textGutter
-    paragraph.headIndent = NoteEditorStyle.document.textGutter
-
-    let bodyFont = NSFont.systemFont(ofSize: 15)
-    let codeFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-    textStorage.setAttributes(
-        [.font: bodyFont, .paragraphStyle: paragraph],
-        range: NSRange(location: 0, length: textStorage.length)
-    )
-    let codeRange = (text as NSString).range(of: "`frontend/src/hooks/useAppLogs.ts`")
-    textStorage.addAttribute(.font, value: codeFont, range: codeRange)
-
-    layoutManager.ensureLayout(for: textContainer)
-    let glyphRange = layoutManager.glyphRange(forCharacterRange: codeRange, actualCharacterRange: nil)
-    let glyphBounds = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-    guard let chipRect = layoutManager.inlineCodeChipRect(
-        forGlyphBounds: glyphBounds,
-        glyphIndex: glyphRange.location
-    ) else {
-        Issue.record("Expected inline-code chip geometry")
-        return
-    }
-
-    let lineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphRange.location, effectiveRange: nil)
-    let baselineY = lineRect.minY + layoutManager.location(forGlyphAt: glyphRange.location).y
-
-    #expect(chipRect.minY > glyphBounds.minY)
-    #expect(chipRect.height < glyphBounds.height)
-    #expect(abs((baselineY - chipRect.minY) - (codeFont.ascender + 1)) < 0.001)
-    #expect(abs((chipRect.maxY - baselineY) - (-codeFont.descender + 1)) < 0.001)
-    #expect(abs(chipRect.minX - (glyphBounds.minX - 2)) < 0.001)
-    #expect(abs(chipRect.maxX - (glyphBounds.maxX + 2)) < 0.001)
-}
-
-@MainActor
-@Test func markdownCodeBlockUsesAvailableDocumentWidth() {
-    let code = "bootstrap: userId ? { data }"
-    let markdown = "```ts\n\(code)\n```"
-    let textStorage = NSTextStorage()
-    let layoutManager = NSLayoutManager()
-    let textContainer = NSTextContainer(containerSize: NSSize(width: 716, height: 1_000))
-    layoutManager.addTextContainer(textContainer)
-    textStorage.addLayoutManager(layoutManager)
-    let textView = NSTextView(
-        frame: NSRect(x: 0, y: 0, width: 716, height: 1_000),
-        textContainer: textContainer
-    )
-
-    let coordinator = MarkdownSourceEditor.Coordinator(
-        text: .constant(""),
-        themeColors: nil,
-        style: .document
-    )
-    textView.string = markdown
-    coordinator.applyHighlighting(to: textView)
-
-    layoutManager.ensureLayout(for: textContainer)
-    let codeRange = (markdown as NSString).range(of: code)
-    let glyphRange = layoutManager.glyphRange(forCharacterRange: codeRange, actualCharacterRange: nil)
-    var lineFragmentCount = 0
-    var lineFragmentWidth: CGFloat = 0
-    layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { rect, _, _, _, _ in
-        lineFragmentCount += 1
-        lineFragmentWidth = rect.width
-    }
-
-    #expect(lineFragmentCount == 1)
-    #expect(lineFragmentWidth > 600)
-}
-
-@MainActor
 @Test func markdownFencedCodeKeepsMarkdownLikeLinesInsideOneBlock() {
     let markdown = """
     ```sh
@@ -10221,7 +10015,7 @@ private func serviceRecord(
     # Actual heading
     """
     let textStorage = NSTextStorage()
-    let layoutManager = MarkdownLayoutManager()
+    let layoutManager = NSLayoutManager()
     let textContainer = NSTextContainer(containerSize: NSSize(width: 716, height: 1_000))
     layoutManager.addTextContainer(textContainer)
     textStorage.addLayoutManager(layoutManager)
@@ -10229,43 +10023,31 @@ private func serviceRecord(
         frame: NSRect(x: 0, y: 0, width: 716, height: 1_000),
         textContainer: textContainer
     )
-    let coordinator = MarkdownSourceEditor.Coordinator(
-        text: .constant(""),
-        themeColors: nil,
-        style: .document
-    )
+    let coordinator = MarkdownSourceEditor.Coordinator(text: .constant(""), themeColors: nil)
     textView.string = markdown
     coordinator.applyHighlighting(to: textView)
 
     let nsMarkdown = markdown as NSString
+    let codeFontName = NSFont.monospacedSystemFont(ofSize: 15, weight: .regular).fontName
+    func font(at text: String) -> NSFont? {
+        textStorage.attribute(.font, at: nsMarkdown.range(of: text).location, effectiveRange: nil) as? NSFont
+    }
     for line in [
         "# This is a shell comment, not a heading.",
         "> this is code, not a quote",
         "1. this is code, not a list",
+        "`literal backticks`",
     ] {
-        let range = nsMarkdown.range(of: line)
-        let paragraph = textStorage.attribute(
-            .paragraphStyle,
-            at: range.location,
-            effectiveRange: nil
-        ) as? NSParagraphStyle
-        #expect(paragraph?.textBlocks.isEmpty == false)
+        #expect(font(at: line)?.fontName == codeFontName, Comment(rawValue: line))
+        #expect(font(at: line)?.pointSize == 15, Comment(rawValue: line))
     }
-
-    let inlineCodeRange = nsMarkdown.range(of: "`literal backticks`")
     #expect(textStorage.attribute(
-        MarkdownLayoutManager.chipAttribute,
-        at: inlineCodeRange.location,
+        .obliqueness,
+        at: nsMarkdown.range(of: "> this is code, not a quote").location,
         effectiveRange: nil
     ) == nil)
 
-    let headingRange = nsMarkdown.range(of: "# Actual heading")
-    let headingParagraph = textStorage.attribute(
-        .paragraphStyle,
-        at: headingRange.location,
-        effectiveRange: nil
-    ) as? NSParagraphStyle
-    #expect(headingParagraph?.textBlocks.isEmpty == true)
+    #expect((font(at: "# Actual heading")?.pointSize ?? 0) > 15)
 }
 
 @MainActor
@@ -10278,7 +10060,7 @@ private func serviceRecord(
     ```
     """
     let textStorage = NSTextStorage()
-    let layoutManager = MarkdownLayoutManager()
+    let layoutManager = NSLayoutManager()
     let textContainer = NSTextContainer(containerSize: NSSize(width: 716, height: 1_000))
     layoutManager.addTextContainer(textContainer)
     textStorage.addLayoutManager(layoutManager)
@@ -10286,11 +10068,7 @@ private func serviceRecord(
         frame: NSRect(x: 0, y: 0, width: 716, height: 1_000),
         textContainer: textContainer
     )
-    let coordinator = MarkdownSourceEditor.Coordinator(
-        text: .constant(""),
-        themeColors: nil,
-        style: .document
-    )
+    let coordinator = MarkdownSourceEditor.Coordinator(text: .constant(""), themeColors: nil)
     textView.string = markdown
     coordinator.applyHighlighting(to: textView)
 

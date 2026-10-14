@@ -69,7 +69,7 @@ private final class ClosingWindow: NSWindow {
     #expect(harness.fake.sessions.contains { $0.id == rightSession && $0.isRunning })
 }
 
-@Test @MainActor func commandDDoesNothingForANativeTabOrWhileTheWindowShowsANote() async throws {
+@Test @MainActor func commandDDoesNothingForANativeTabOrWhileTheWindowShowsTheTodoBoard() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()
     defer {
@@ -95,11 +95,11 @@ private final class ClosingWindow: NSWindow {
     #expect(window.closeRequests == 0)
     #expect(chromeState.toasts.current == nil)
 
-    // A persistent tab hidden behind a note: ⌘D does not reach it.
+    // A persistent tab hidden behind the todo board: ⌘D does not reach it.
     let tab = workspace.addSession(title: "Persistent")
     #expect(await harness.waitUntilAttached(tab))
     #expect(SessionCloseCoordinator.canDetach(tab))
-    chromeState.selectNote(id: UUID())
+    chromeState.selectTodo(id: nil)
     commandD()
     #expect(workspace.session(withID: tab.id) != nil)
     // Shown again: it detaches.

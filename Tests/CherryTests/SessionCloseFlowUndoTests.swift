@@ -674,7 +674,7 @@ private func syntheticTab(_ name: String) -> ClosedTab {
     let window = ClosingWindow()
     let chromeState = windowChrome()
     #expect(registry.register(
-        window: window, projectRoot: root, workspace: workspace, noteStore: nil, todoStore: nil, chromeState: chromeState
+        window: window, projectRoot: root, workspace: workspace, todoStore: nil, chromeState: chromeState
     ))
     let model = BackgroundSessionsModel(localSessions: harness.hosting, registry: registry)
     var opened: RepositoryWorkspace?
@@ -785,7 +785,7 @@ private func quitSteps(_ harness: PersistentHarness, events: Recorder<[String]>)
     }
     #expect(registry.register(
         window: window, projectRoot: harness.project.path, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        todoStore: nil, chromeState: chromeState
     ))
     let kept = workspace.addSession(title: "Kept")
     let closed = workspace.addSession(title: "Closed")

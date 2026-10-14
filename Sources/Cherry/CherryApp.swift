@@ -1083,8 +1083,6 @@ struct CherryApp: App {
                     guard controlServer == nil else { return }
                     let server = CherryControlServer(workspaceProvider: {
                         ProjectWindowRegistry.shared.activeWorkspace
-                    }, noteStoreProvider: {
-                        ProjectWindowRegistry.shared.activeNoteStore
                     }, todoStoreProvider: {
                         ProjectWindowRegistry.shared.activeTodoStore
                     }, chromeStateProvider: {
@@ -1216,7 +1214,7 @@ struct CherryApp: App {
                 .keyboardShortcut("d")
                 .disabled(!canDetachFocusedTab)
 
-                Button(focusedChromeState?.selectedNoteID == nil ? closeTabTitle : "Close Note") {
+                Button(closeTabTitle) {
                     guard let workspace = keyWindowWorkspace else { return }
                     SessionCloseCoordinator.closeSelectedTabOrWindow(
                         workspace: workspace,
@@ -1416,7 +1414,6 @@ private struct ProjectWorkspaceView: View {
     @ObservedObject private var agentSettings = AgentSettings.shared
     @StateObject private var repository: RepositoryWorkspace
     @StateObject private var chromeState = ProjectWindowChromeState()
-    @StateObject private var noteStore: ProjectNoteStore
     @StateObject private var todoStore: ProjectTodoStore
     /// Saved per project (`ProjectSidebarWidthStore`), not as scene storage,
     /// which needs AppKit's window restoration.
@@ -1454,10 +1451,6 @@ private struct ProjectWorkspaceView: View {
             // wait for that Mac.
             showsSavedTabsBeforeHostAnswers: hosting.profile.isThisMac
         ))
-        _noteStore = StateObject(wrappedValue: ProjectNoteStore(
-            projectRoot: projectRoot,
-            loadsInBackground: true
-        ))
         _todoStore = StateObject(wrappedValue: ProjectTodoStore(projectRoot: projectRoot))
     }
 
@@ -1475,7 +1468,6 @@ private struct ProjectWorkspaceView: View {
             repository: repository,
             workspace: workspace,
             chromeState: chromeState,
-            noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: workspace.projectRoot,
             openProject: openProject,
@@ -1498,7 +1490,6 @@ private struct ProjectWorkspaceView: View {
             projectRoot: repository.repositoryRoot,
             workspace: workspace,
             repository: repository,
-            noteStore: noteStore,
             todoStore: todoStore,
             chromeState: chromeState
         ))
@@ -1519,7 +1510,6 @@ private struct ProjectWorkspaceView: View {
         .focusedValue(\.projectWindowChromeState, chromeState)
         .onAppear {
             ProjectWindowRegistry.shared.activeWorkspace = workspace
-            ProjectWindowRegistry.shared.activeNoteStore = noteStore
             ProjectWindowRegistry.shared.activeTodoStore = todoStore
             ProjectWindowRegistry.shared.activeChromeState = chromeState
             agentSettings.markProjectOpened(workspace.projectRoot)
@@ -1534,11 +1524,6 @@ private struct ProjectWorkspaceView: View {
         .onChange(of: storedSidebarWidth) { _, width in
             ProjectSidebarWidthStore().setWidth(width, projectRoot: sidebarWidthProjectRoot)
         }
-        .onChange(of: noteStore.isLoading) { _, isLoading in
-            if !isLoading {
-                openPendingDeepLinks()
-            }
-        }
     }
 
     private func openProject(_ project: CherryProject) {
@@ -1548,7 +1533,6 @@ private struct ProjectWorkspaceView: View {
     }
 
     private func openPendingDeepLinks() {
-        guard !noteStore.isLoading else { return }
         guard let projectRoot = workspace.projectRoot else { return }
         var links = CherryDeepLinkOpenQueue.shared.consume(projectRoot: projectRoot)
         if repository.repositoryRoot != projectRoot {
@@ -1569,20 +1553,6 @@ private struct ProjectWorkspaceView: View {
     @discardableResult
     private func selectDeepLink(_ link: CherryDeepLink) -> Bool {
         switch link.kind {
-        case .note:
-            let projectRoot = repository.repositoryRoot
-            guard CherryDeepLink.projectKey(forProjectRoot: projectRoot) == link.projectKey,
-                  agentSettings.projectFeatures(for: projectRoot).notesEnabled
-            else {
-                return false
-            }
-            guard let noteID = UUID(uuidString: link.targetID),
-                  noteStore.notes.contains(where: { $0.id == noteID })
-            else {
-                return false
-            }
-            chromeState.selectNote(id: noteID)
-            return true
         case .todo:
             let projectRoot = repository.repositoryRoot
             guard CherryDeepLink.projectKey(forProjectRoot: projectRoot) == link.projectKey,

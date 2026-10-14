@@ -17,6 +17,10 @@ struct CherryMCPStdioMain {
         if arguments.first == "--call" {
             await callOnce(Array(arguments.dropFirst()))
         }
+        // Temporary keyboard diagnostics; remove once the Shift+Enter/Shift+Tab report is understood.
+        if arguments.first == "--key-echo" {
+            KeyEcho.run(arguments: Array(arguments.dropFirst()))
+        }
 
         let toolContext = CherryMCPToolContext.bound(
             callerProcessID: await CherryMCPTools.callerProcessID(processPID: getpid())

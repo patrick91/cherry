@@ -434,7 +434,7 @@ fn a_resize_leaves_a_client_that_keeps_up_all_of_its_queued_output() {
     // write, a title and a kitty image sent in two chunks, around a query,
     // which goes to the client that typed, apart from the output.
     let session = host.create(shell(
-        "stty -echo; IFS= read -r go; stty raw; dd if=/dev/zero bs=65536 count=16 2>/dev/null | tr '\\0' x; printf '\\033]52;c;Q0xJUA==\\007\\033[?6n\\033]2;TITLE\\007\\033_Ga=T,f=24,s=1,v=1,m=1;AAAA\\033\\\\\\033_Gm=0;AAAA\\033\\\\\\r\\nFLOOD_DONE\\r\\n'; exec sleep 60",
+        "stty -echo; IFS= read -r go; stty raw; dd if=/dev/zero bs=65536 count=16 2>/dev/null | tr '\\0' x; printf '\\033]52;c;Q0xJUA==\\007\\033[13t\\033]2;TITLE\\007\\033_Ga=T,f=24,s=1,v=1,m=1;AAAA\\033\\\\\\033_Gm=0;AAAA\\033\\\\\\r\\nFLOOD_DONE\\r\\n'; exec sleep 60",
     ));
     let (mut slow, _, start, snapshot) = host.attach(&session.id, 80, 24);
     let mut slow_screen = Screen::new(80, 24, start, &snapshot);
@@ -485,7 +485,7 @@ fn a_resize_leaves_a_client_that_keeps_up_all_of_its_queued_output() {
             .iter()
             .map(|(_, data)| &data[..])
             .collect::<Vec<_>>(),
-        [b"\x1b[?6n"]
+        [b"\x1b[13t"]
     );
     // Where it stood in the output: right after the clipboard write.
     let clipboard = all

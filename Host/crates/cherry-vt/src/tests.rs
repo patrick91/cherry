@@ -2703,8 +2703,18 @@ fn clearing_a_prompt_before_the_reflow_keeps_an_unfinished_sequence() {
 #[test]
 fn program_status_reports_become_records() {
     let mut terminal = term(40, 5);
-    // The support query is answered with the same body.
-    assert_eq!(terminal.feed(b"\x1b]7501;?\x1b\\"), b"\x1b]7501;?\x1b\\");
+    // The support query is answered with `?`, which is all Claude Code and
+    // Pi look for, and since revision 0.4 the states and kinds it takes, in
+    // one string to its terminator.
+    let reply = terminal.feed(b"\x1b]7501;?\x1b\\");
+    let pairs = reply
+        .strip_prefix(b"\x1b]7501;?")
+        .and_then(|rest| rest.strip_suffix(b"\x1b\\"));
+    assert!(
+        pairs.is_some_and(|pairs| !pairs.iter().any(|&b| b == 0x1b || b == 0x07)),
+        "{:?}",
+        String::from_utf8_lossy(&reply)
+    );
     // Claude Code 2.1.295's reports.
     assert!(terminal
         .feed(b"\x1b]7501;state=idle:app=claude-code\x1b\\")

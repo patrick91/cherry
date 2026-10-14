@@ -1577,7 +1577,8 @@ A program reports what it is doing with the program status protocol (OSC
 `error`, with an optional progress, title and one-line message. Claude Code
 and Pi report only after their terminal answers the support query
 (`OSC 7501 ; ?`). The holder's terminal answers it (libghostty-vt answers
-while its program status callback is set) and keeps the records by the
+while its program status callback is set, with `?` and, since revision 0.4 of
+the specification, the states and kinds it takes) and keeps the records by the
 specification's rules (`cherry-vt` `program_status.rs`): a report replaces
 its record whole; `clear` removes a record and every record beneath it
 (`build` takes `build/test`), or all of them; at most 64, the record updated
@@ -1838,9 +1839,9 @@ primary-screen frame left it. This also holds inside tmux.
 Each terminal query has one responder: the host or one attached client. The
 host's terminal answers a fixed set whether or not a client is attached, and
 removes those queries from what renderers receive: device attributes, status
-and cursor reports (`CSI 5n`, `CSI 6n`), the colour-scheme report, DEC private
+and cursor reports (`CSI 5n`, `CSI 6n`, `CSI ?6n`), the colour-scheme report, DEC private
 mode reports, XTVERSION, DECRQSS, the kitty keyboard, graphics, and clipboard
-(OSC 5522) queries, size reports (`CSI 14/16/18 t`), XTGETTCAP names it knows,
+(OSC 5522) queries, size reports (`CSI 14/16/18/19 t`), XTGETTCAP names it knows,
 and colour queries for the palette, foreground, background, and cursor (OSC 4,
 10–12, 21). It also keeps the report modes it answers itself, in-band resize
 (2048) and 2033, away from renderers: neither live output, snapshots, nor
@@ -1862,7 +1863,7 @@ changes nothing. Colour replies (OSC 10, 11 and 12) and the colour-scheme report
 Mac app passes its terminal theme for the appearance it shows), or light
 grey on black and dark without them. Kitty graphics reach renderers
 with `q=2`, so only the host replies (see [kitty graphics](#kitty-graphics)). Other queries (status reports such as
-`CSI ?6n`, OSC 5 and 13–19 colour queries, `CSI 11/13/15/19–21 t` and size
+`CSI ?15n`, OSC 5 and 13–19 colour queries, `CSI 11/13/15/20/21 t` and size
 reports with extra parameters, ANSI mode requests, DECREQTPARM, DECRQPSR,
 DECRQTSR, DECRQUPSS, DECRQCRA, XTREPORTSGR, XTQMODKEYS, XTSMGRAPHICS, OSC 52
 clipboard reads, OSC 22 pointer-shape and OSC 99 capability queries, ENQ, and

@@ -23,7 +23,8 @@ private let programStatusRealHostEnabled = ProcessInfo.processInfo.environment["
     try """
     stty raw -echo
     printf '\\033]7501;?\\033\\\\'
-    dd bs=1 count=10 2>/dev/null > '\(reply.path)'
+    : > '\(reply.path)'
+    until [ "$(tail -c 2 '\(reply.path)')" = "$(printf '\\033\\\\')" ]; do dd bs=1 count=1 2>/dev/null >> '\(reply.path)'; done
     printf 'ASKED\\r\\n\\033]7501;state=idle:app=fake\\033\\\\'
     while [ ! -e '\(go.path)1' ]; do sleep 0.05; done
     printf '\\033]7501;state=working:app=fake:msg=V3JpdGluZyBub3Rlcy50eHQ=\\033\\\\'
@@ -41,8 +42,16 @@ private let programStatusRealHostEnabled = ProcessInfo.processInfo.environment["
             tab.persistentSession != nil && tab.state == .live && !tab.readsContentFromHost
         }
         try await host.waitFor("the program to ask") { host.screen(tab).contains("ASKED") }
-        // Answered once, by the holder, with the same body.
-        #expect(try Data(contentsOf: reply) == Data("\u{1B}]7501;?\u{1B}\\".utf8))
+        // Answered by the holder: `?`, which is all Claude Code and Pi look
+        // for, and since revision 0.4 the states and kinds it takes, in one
+        // string to its terminator.
+        let answer = try Data(contentsOf: reply)
+        let prefix = Data("\u{1B}]7501;?".utf8), terminator = Data("\u{1B}\\".utf8)
+        #expect(
+            answer.starts(with: prefix) && answer.suffix(2) == terminator,
+            "\(String(decoding: answer, as: UTF8.self).debugDescription)"
+        )
+        #expect(!answer.dropFirst(prefix.count).dropLast(2).contains { $0 == 0x1B || $0 == 0x07 })
         try await host.waitFor("its idle report") { tab.agentActivityState == .idle }
         #expect(tab.programStatus == [ProgramStatus(state: .idle, app: "fake")])
         #expect(!host.screen(tab).contains("7501"))
@@ -89,11 +98,13 @@ private let programStatusRealHostEnabled = ProcessInfo.processInfo.environment["
         notifiesProgramState: { $0 == .blocked }
     )
     let go = host.root.appendingPathComponent("go")
+    let reply = host.root.appendingPathComponent("reply")
     let script = host.root.appendingPathComponent("reports.sh")
     try """
     stty raw -echo
     printf '\\033]7501;?\\033\\\\'
-    dd bs=1 count=10 2>/dev/null > /dev/null
+    : > '\(reply.path)'
+    until [ "$(tail -c 2 '\(reply.path)')" = "$(printf '\\033\\\\')" ]; do dd bs=1 count=1 2>/dev/null >> '\(reply.path)'; done
     printf 'ASKED\\r\\n\\033]7501;state=working:app=fake\\033\\\\'
     while [ ! -e '\(go.path)1' ]; do sleep 0.05; done
     printf '\\033]7501;state=blocked:app=fake:kind=permission:msg=YXBwcm92ZSBCYXNoOiBscw==\\033\\\\'

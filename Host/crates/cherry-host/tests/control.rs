@@ -878,7 +878,8 @@ fn program_status_reports_become_session_records_until_the_program_ends() {
     let session = host.create(shell(&format!(
         r#"stty raw -echo
 printf '\033]7501;?\033\\'
-dd bs=1 count=10 2>/dev/null > '{reply}'
+: > '{reply}'
+until [ "$(tail -c 2 '{reply}')" = "$(printf '\033\\')" ]; do dd bs=1 count=1 2>/dev/null >> '{reply}'; done
 printf '\033]7501;state=working:app=claude-code:msg=V3JpdGluZyBub3Rlcy50eHQ=\033\\'
 printf '\033]7501;id=lint:state=done:app=claude-code\033\\'
 while [ ! -e '{blocked}' ]; do sleep 0.02; done
@@ -899,8 +900,18 @@ exit 0"#,
     hear(&mut control, "working", &|records| {
         records.len() == 2 && records[0].state == ProgramStatusState::Working
     });
-    // The host answered the support query, once, with the same body.
-    assert_eq!(fs::read(&reply).unwrap(), b"\x1b]7501;?\x1b\\");
+    // The host answered the support query: `?`, which is all Claude Code
+    // and Pi look for, and since revision 0.4 the states and kinds it takes,
+    // in one string to its terminator.
+    let answer = fs::read(&reply).unwrap();
+    let pairs = answer
+        .strip_prefix(b"\x1b]7501;?")
+        .and_then(|rest| rest.strip_suffix(b"\x1b\\"));
+    assert!(
+        pairs.is_some_and(|pairs| !pairs.iter().any(|&b| b == 0x1b || b == 0x07)),
+        "{:?}",
+        String::from_utf8_lossy(&answer)
+    );
     assert_eq!(
         host.session(&id).program_status,
         [

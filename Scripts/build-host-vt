@@ -2,7 +2,7 @@
 # Build the pinned, GUI-free Ghostty C library used by the Rust host.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-revision=a4aacd918ba9e79929ff608034c60a4341773ef0
+revision=291fd050b9e9c293c8adb6a140742649b7e42d3a
 zig_version=0.16.0
 # The host parses untrusted output from every session in one daemon, so the
 # library keeps Zig's runtime safety checks (bounds, overflow, unreachable).

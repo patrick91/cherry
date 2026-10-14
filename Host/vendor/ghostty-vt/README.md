@@ -4,7 +4,7 @@ Cherry's host uses the upstream, headless `libghostty-vt` C API. It does not
 depend on AppKit, GhosttyTerminal's Swift wrapper, a display server, or a GPU.
 
 - Source: https://github.com/ghostty-org/ghostty
-- Revision: `a4aacd918ba9e79929ff608034c60a4341773ef0`
+- Revision: `291fd050b9e9c293c8adb6a140742649b7e42d3a`
 - Zig: `0.16.0`; official download SHA256 values are pinned in `Scripts/build-host-vt`.
 - Source patches: none.
 - License: MIT; see `LICENSE`. The upstream build also bundles third-party

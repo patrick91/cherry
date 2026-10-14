@@ -20,7 +20,7 @@ fn main() {
     };
     assert_eq!(
         stamp("SOURCE_REVISION"),
-        "a4aacd918ba9e79929ff608034c60a4341773ef0",
+        "291fd050b9e9c293c8adb6a140742649b7e42d3a",
         "VT archive must match Cherry's pinned C ABI; run Scripts/build-host-vt"
     );
     // The daemon parses untrusted output from every session with this

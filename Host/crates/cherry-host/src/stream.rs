@@ -4,7 +4,7 @@
 //!
 //! The host terminal answers a fixed set of queries whether or not a client
 //! is attached; those are removed from the renderers' stream. Every other
-//! query (`CSI ?6n`, an OSC 52 read, OSC 13–19 colour queries, `CSI 19–21
+//! query (`CSI ?15n`, an OSC 52 read, OSC 13–19 colour queries, `CSI 20/21
 //! t`, ANSI `$p`, an XTGETTCAP name the host does not know, …) is split out
 //! of it too, into `Batch::queries`: the session sends those to one attached
 //! renderer (`ServerMessage::Query`), whose terminal answers. They are not
@@ -676,17 +676,18 @@ fn route_csi(token: &[u8]) -> Route {
     let host = match (last, prefix, intermediates) {
         // Device attributes (primary, secondary, tertiary).
         (b'c', None | Some(b'>' | b'='), b"") => true,
-        // Status and cursor reports, and the colour-scheme report.
+        // Status and cursor reports, the extended cursor report (DECXCPR)
+        // and the colour-scheme report.
         (b'n', None, b"") => matches!(params, b"5" | b"6"),
-        (b'n', Some(b'?'), b"") => params == b"996",
+        (b'n', Some(b'?'), b"") => matches!(params, b"6" | b"996"),
         // Mode reports (DECRQM), DEC private and ANSI.
         (b'p', Some(b'?') | None, b"$") => true,
         // XTVERSION.
         (b'q', Some(b'>'), b"") => true,
         // Kitty keyboard flags, whatever the parameters.
         (b'u', Some(b'?'), b"") => true,
-        // Text area and cell size reports.
-        (b't', None, b"") => matches!(params, b"14" | b"16" | b"18"),
+        // Text area, cell and screen size reports.
+        (b't', None, b"") => matches!(params, b"14" | b"16" | b"18" | b"19"),
         _ => false,
     };
     if host {
@@ -703,8 +704,8 @@ fn route_csi(token: &[u8]) -> Route {
 fn csi_query(last: u8, prefix: Option<u8>, params: &[u8], intermediates: &[u8]) -> bool {
     let first = params.split(|&b| b == b';').next().unwrap_or_default();
     match (last, prefix, intermediates) {
-        // Status reports (DSR, DECXCPR and the other DEC reports); `CSI > n`
-        // sets key modifier options instead.
+        // Status reports (DSR and the other DEC reports); `CSI > n` sets key
+        // modifier options instead.
         (b'n', None | Some(b'?'), b"") => true,
         // Window and title reports (XTWINOPS); not the window operations or
         // the title stack.
@@ -1286,18 +1287,18 @@ mod tests {
     #[test]
     fn queries_keep_their_place_in_the_stream() {
         let mut stream = DisplayStream::default();
-        let mut batch = stream.feed(b"ab\x1b[?6n\x1b]13;?\x07cd\x1b[?");
+        let mut batch = stream.feed(b"ab\x1b[?15n\x1b]13;?\x07cd\x1b[?");
         assert_eq!(batch.display, b"abcd");
         // Adjacent queries travel together.
-        assert_eq!(batch.queries, [(2, b"\x1b[?6n\x1b]13;?\x07".to_vec())]);
+        assert_eq!(batch.queries, [(2, b"\x1b[?15n\x1b]13;?\x07".to_vec())]);
         // A query completed by a later read, and one interrupting UTF-8.
-        batch.append(stream.feed(b"15nef\xe2\x05\x82\xac"));
+        batch.append(stream.feed(b"53nef\xe2\x05\x82\xac"));
         assert_eq!(batch.display, b"abcdef\xe2\x82\xac");
         assert_eq!(
             batch.queries,
             [
-                (2, b"\x1b[?6n\x1b]13;?\x07".to_vec()),
-                (4, b"\x1b[?15n".to_vec()),
+                (2, b"\x1b[?15n\x1b]13;?\x07".to_vec()),
+                (4, b"\x1b[?53n".to_vec()),
                 (7, b"\x05".to_vec()),
             ]
         );
@@ -1708,7 +1709,7 @@ mod tests {
             (b"\x1b]11;?\x07", true),
             (b"\x1b_Ga=t,q=0;AAAA\x1b\\", true),
             // Only a client answers these.
-            (b"\x1b[?6n\x1b]13;?\x07\x05", false),
+            (b"\x1b[?15n\x1b]13;?\x07\x05", false),
             (b"\x1b]2;title\x07\x1b[?1049h", false),
         ] {
             assert_eq!(

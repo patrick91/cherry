@@ -510,7 +510,9 @@ private func sessionID(of tab: TerminalSession) throws -> String {
         #"{"outcome":"exited","exit_code":null,"signal":null,"message":null}"#, to: try harness.statusFile(of: call)
     )
     unknown.ingestNativeChildExit(exitCode: 0)
-    #expect(unknown.state == .exited(1))
+    // The host still lists it running: the adapter's report is taken once
+    // the host said nothing more (`adapterExitHostReportWait`).
+    #expect(await harness.fake.wait { unknown.state == .exited(1) })
     try await Task.sleep(for: .milliseconds(200))
     #expect(workspace.sessions.contains { $0 === unknown })
 }

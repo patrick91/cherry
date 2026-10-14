@@ -94,6 +94,7 @@ final class PersistentHarness {
         configuration.terminationTimeout = .seconds(3)
         configuration.restartExitTimeout = .seconds(3)
         configuration.reconnectDelay = (0.05, 0.2)
+        configuration.adapterExitHostReportWait = 0.2
         configuration.lostCreateChecks = [.milliseconds(200), .milliseconds(800)]
         return configuration
     }()
@@ -438,11 +439,13 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     #expect(session.isRunning)
     #expect(session.acceptsInput)
 
-    // The adapter's outcome says the program ended: that is the exit.
+    // The adapter's outcome says the program ended: that is the exit, once
+    // the host, which still lists the session running, has not said more
+    // within `adapterExitHostReportWait`.
     try Data(#"{"outcome":"exited","exit_code":5,"signal":null,"message":null}"#.utf8)
         .write(to: try harness.statusFile(of: harness.attachCalls[3]))
     session.ingestNativeChildExit(exitCode: 0)
-    #expect(session.state == .exited(5))
+    #expect(await harness.fake.wait { session.state == .exited(5) })
     #expect(!session.isRunning)
     try await Task.sleep(for: .milliseconds(300))
     #expect(harness.attachCalls.count == 4)

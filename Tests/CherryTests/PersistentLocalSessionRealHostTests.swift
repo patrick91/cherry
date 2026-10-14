@@ -42,6 +42,22 @@ final class RealLocalHost {
         var value = 0
     }
 
+    /// Pids recorded from the helpers' launcher, which runs off the main
+    /// thread.
+    final class ProcessIDs: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pids: [pid_t] = []
+
+        var values: [pid_t] { lock.withLock { pids } }
+
+        func append(_ pid: pid_t) { lock.withLock { pids.append(pid) } }
+    }
+
+    /// The pids of `control`'s helpers (`cherry control`, the tabs' control
+    /// connection), in the order they started.
+    var controlHelperProcessIDs: [pid_t] { controlHelpers.values }
+    private let controlHelpers: ProcessIDs
+
     /// `shellPath`: the shell tabs run (the user's own startup files are
     /// never read: HOME is private). `adapterTerminalStartsAt`: each attach
     /// adapter finds its terminal at this size (rows, columns) when it
@@ -130,7 +146,7 @@ final class RealLocalHost {
         daemonExecutable = binaries.appendingPathComponent("cherry-host")
         host = try RealHostTestDaemon(executable: daemonExecutable, environment: daemonEnvironment, socket: socket)
 
-        func makeControl() throws -> HostControl {
+        func makeControl(recordingHelpersIn helpers: ProcessIDs? = nil) throws -> HostControl {
             HostControl(
                 host: .local,
                 clientProvider: {
@@ -138,10 +154,13 @@ final class RealLocalHost {
                 },
                 hostStore: HostedSessionHostStore(defaults: try #require(UserDefaults(suiteName: "CherryTests.RealLocal.\(UUID().uuidString)"))),
                 masters: disabledSSHMasters,
+                launcher: { launch in try HostControlChannel.process(launch) { helpers?.append($0) } },
                 localHostUnavailableReason: nil
             )
         }
-        control = try makeControl()
+        let controlHelpers = ProcessIDs()
+        self.controlHelpers = controlHelpers
+        control = try makeControl(recordingHelpersIn: controlHelpers)
         observer = try makeControl()
         let control = control
         let home = home
@@ -1353,6 +1372,61 @@ private func parentProcess(of pid: pid_t) throws -> (pid: pid_t, command: String
             kill(program, 0) != 0 && errno == ESRCH
         }
     } catch {
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostAHolderThatDiesSaysTheHostCrashedWhenItsAdapterHearsFirst() async throws {
+    // Long enough that only the host's report ends the tab's wait here.
+    var configuration = PersistentLocalSessions.Configuration()
+    configuration.adapterExitHostReportWait = 30
+    let host = try await RealLocalHost(configuration: configuration)
+    let workspace = host.workspace()
+    var stoppedHelper: pid_t?
+    do {
+        let anchor = workspace.addSession(title: "Anchor")
+        let tab = workspace.addSession(title: "Shell 1")
+        host.show(tab)
+        try await host.waitFor("the tabs to attach") {
+            anchor.persistentSession != nil && anchor.state == .live && tab.persistentSession != nil && tab.state == .live
+        }
+        let sessionID = try #require(tab.persistentSession?.sessionID)
+        let info = try #require(try await host.hostSession(sessionID))
+        let program = try #require(info.pid.map { pid_t(bitPattern: $0) })
+        let holder = try parentProcess(of: program)
+        try #require(
+            holder.command.contains("cherry-host") && holder.command.contains("hold"), Comment(rawValue: holder.command)
+        )
+
+        // The tabs' control helper is stopped, so the host's `exited` event
+        // (the only report that says its holder died) waits in its socket
+        // while the adapter hears of the end and exits: the order a busy
+        // Mac sometimes takes.
+        let helper = try #require(host.controlHelperProcessIDs.last)
+        #expect(kill(helper, SIGSTOP) == 0)
+        stoppedHelper = helper
+        #expect(kill(holder.pid, SIGKILL) == 0)
+        try await host.waitFor("the adapter to report the end") {
+            tab.keyboardInputGoesThroughHost || !tab.isRunning
+        }
+        // The host still lists the session running: the tab waits for it.
+        #expect(tab.isRunning)
+        #expect(tab.hostSessionEnd == nil)
+
+        #expect(kill(helper, SIGCONT) == 0)
+        stoppedHelper = nil
+        try await host.waitFor("the tab to say its host crashed", timeout: 20) {
+            tab.hostSessionEnd?.isHolderLost == true && !tab.isRunning
+        }
+        #expect(tab.persistentSessionEndedMessage?.hasPrefix("The session host crashed") == true)
+        #expect(tab.state == .exited(1))
+    } catch {
+        if let stoppedHelper { kill(stoppedHelper, SIGCONT) }
         workspace.closeAllSessions(intent: .windowClosed)
         await host.tearDown()
         throw error

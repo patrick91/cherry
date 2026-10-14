@@ -43,13 +43,16 @@ final class HostControlChannel: @unchecked Sendable {
 
     /// Starts the real helper. Closing its standard input asks it to stop;
     /// one that is still running a second later is terminated, then killed.
-    static func process(_ launch: HostControlLaunch) throws -> HostControlChannel {
+    /// `spawned` is told the helper's pid (tests stop it to hold the host's
+    /// events back).
+    static func process(_ launch: HostControlLaunch, spawned: (pid_t) -> Void = { _ in }) throws -> HostControlChannel {
         let process = try HostSpawnedProcess.spawn(
             executable: launch.executableURL.path,
             arguments: launch.arguments,
             environment: launch.environment,
             input: true, output: true, errors: true
         )
+        spawned(process.pid)
         let errors = HostProcessErrorTail()
         errors.drain(process.errors)
         let child = HostSignallableProcess(pid: process.pid)

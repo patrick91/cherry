@@ -6276,7 +6276,17 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         if case .exited(let code, let signal) = outcome {
             // An exit without a status is never taken for a clean one.
-            finishPersistentProgram(status: code ?? signal.map { 128 + $0 } ?? 1, launchID: launchID)
+            let status = code ?? signal.map { 128 + $0 } ?? 1
+            // The adapter can report the end before the host's event does,
+            // and only the host says whether its holder died (the tab then
+            // says the host crashed, and a command is not restarted): while
+            // its connection still lists the session running, the tab waits
+            // a moment for that report (`awaitHostReportedExit`).
+            if case .running = persistentHosting.programState(of: binding) {
+                awaitHostReportedExit(status: status, launchID: launchID, binding: binding, hosting: persistentHosting)
+                return
+            }
+            finishPersistentProgram(status: status, launchID: launchID)
             return
         }
         // The host's title and directory are the current ones until an
@@ -6342,6 +6352,32 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         persistentReconnect = item
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    /// The adapter reported the program's exit (`status`) before the host
+    /// did: the tab finishes with the host's report when it comes
+    /// (`persistentProgramDidExit`, whose `finishPersistentProgram` cancels
+    /// this), else with the adapter's status after
+    /// `adapterExitHostReportWait`. It reconnects meanwhile: input goes
+    /// through the host.
+    private func awaitHostReportedExit(
+        status: Int32,
+        launchID: UUID,
+        binding: HostedSessionAttachment,
+        hosting: PersistentLocalSessions
+    ) {
+        persistentReconnect?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.activeLaunchID == launchID,
+                  self.persistentPhase == .reconnecting,
+                  self.persistentSession == binding
+            else { return }
+            self.persistentReconnect = nil
+            self.finishPersistentProgram(status: status, launchID: launchID)
+        }
+        persistentReconnect = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + hosting.configuration.adapterExitHostReportWait, execute: item)
     }
 
     private func cancelPersistentReconnect() {

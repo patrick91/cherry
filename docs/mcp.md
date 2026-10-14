@@ -47,6 +47,19 @@ old direct HTTP MCP endpoint has been removed.
   process tools can omit `process_id` unless they pass `process_name`.
 - `select_process` is the process-level UI selection tool. It is intentionally
   explicit; other process tools do not change the visible Cherry selection.
+  It selects the tab in the window that has it, which it does not bring
+  forward.
+- A request scoped to a project (CherryMCP scopes its requests to
+  `CHERRY_PROJECT_ROOT`) goes to the caller's own window when the project
+  has several windows, else to the active window when it is the project's,
+  else to the project's most recently active window. Listings and counts
+  are that window's; a `process_id` finds its tab in any window. A project
+  command runs in one tab across the project's windows: its `process_name`
+  finds that tab in any of them, starting it (`start_process`,
+  `spawn_process`, `start_all_commands`) uses that tab where it is, and
+  `stop_all_commands` stops the project's commands in every window. The
+  project's to-dos are one list for all its windows; `select_todo` selects
+  in the request's window.
 
 Agent creation stays nested under the bound caller agent when the stdio helper
 is running inside a Cherry agent. If there is no bound caller, new agents are
@@ -74,7 +87,9 @@ same tools as a local agent in that window, bounded to that Mac:
   program restarts (each launch gets a new one); it keeps working after
   Cherry relaunches and restores the tab. This Mac's own callers are
   still identified by their process.
-- Unscoped requests go to the tab's window. A `project_root` is an
+- Unscoped requests go to the tab's window, and a scoped one to the
+  tab's window too when it is a window of that project (else to the
+  project's most recently active window there). A `project_root` is an
   absolute path on that Mac (`CHERRY_PROJECT_ROOT` is the path there) or a
   `device:` key of that Mac; one with `.` or `..` components is refused
   (`invalid_project_root`), another Mac's key too (`outside_caller_mac`).
@@ -125,8 +140,9 @@ checks without an MCP client.
 
 - `list_projects` lists the saved and open projects: each one's root, name,
   whether it is active or open, and its to-dos feature.
-- `open_project` focuses a project's window by absolute `project_root`,
-  opening it when the project is saved in Cherry but its window is closed.
+- `open_project` focuses the project's most recently active window by
+  absolute `project_root`, opening it when the project is saved in Cherry
+  but none of its windows is open.
 
 Cherry has no Git worktree support: a worktree is a folder, opened as a
 project like any other.

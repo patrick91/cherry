@@ -275,10 +275,17 @@ What exists (`Sources/Cherry/RemoteDevices.swift`, `RemoteDeviceCheck.swift`,
   (`isRemote`: no git, no auto-start commands; the sidebar
   hides project commands; Open in an editor is hidden), marks the hosting
   in use while open, holds a lease on the device's control connection
-  while the window has tabs, and starts `HostedReconnects` wake/network
-  monitoring. The sidebar header reads "<project> @ <Mac>" on one line,
-  the Mac's name in its colour (`RemoteDeviceHeaderAddress`), dimmed while
-  its control reconnects and grey with a warning when the user has to act
+  while the window has tabs (from the tab a window with no saved tabs
+  opens with), and starts `HostedReconnects` wake/network monitoring. A
+  device's project can have several windows (File › New Window, ⌘N, from
+  the window's own key, never This Mac's last project): they share the
+  device's hosting, each marks it in use and holds its own lease, and
+  closing one leaves the others' connection up; a window of a device the
+  store no longer knows has no New Window
+  (`RepositoryWorkspace.allowsAnotherWindow`). The sidebar header reads
+  "<project> @ <Mac>" on one line, the Mac's name in its colour
+  (`RemoteDeviceHeaderAddress`), dimmed while its control reconnects and
+  grey with a warning when the user has to act
   (`RemoteDeviceHeaderStatus`); the window title is the same. Tab rows do
   not repeat the Mac (every tab of the window runs there). The restore
   routes records of the window's own host (`localSessions.profile.host`,
@@ -973,8 +980,9 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
     `device:` key of its Mac, refused with `invalid_project_root` when it
     has a `.` or `..` component (in the raw key too) or is not absolute, and
     with `outside_caller_mac` when it is another device's key; the window
-    is the device window with that path, or the one whose path contains it;
-    never through `standardizedProjectRoot`;
+    is a window of that device with that path (the caller's own when it is
+    one, else the one active most recently), or one whose path contains
+    it; never through `standardizedProjectRoot`;
   - Open Project (`open_project`) opens only a known key of its Mac,
     matched exactly;
   - the one choke point, `requireOnRemoteDevice`, at the top of

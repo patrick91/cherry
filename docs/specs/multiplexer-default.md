@@ -180,7 +180,19 @@ question also says where the kept sessions are until the project opens again
 ("Until then, open or end them from Background Sessions in the Cherry menu
 bar icon"), and those sessions are ones the user knows about: the launch
 notice below never names them, nor those of a window closed while *on quit*
-is Keep Running, nor a detached tab's.
+is Keep Running, nor a detached tab's. A window closed while another window
+of its project stays open (or is still to open at launch) says instead that
+its kept sessions go to Background Sessions, and its saved tabs are
+forgotten (a primary's file is written empty, another window's removed with
+its frame); its running command tabs go on, with their sessions, in the
+project's most recently active window instead
+(`ProjectWindowRegistry.commandTabsHandedOver`): a project's command runs in
+one tab across its windows. The project's last window keeps its tabs for the
+next time the project opens, another window's becoming the primary's
+(`ProjectWindowRegistry.windowDidClose`). A quit keeps every window's, and so
+does a second copy of the app. While the question of a project's last
+window is up, or that window closes, File › New Window opens no other window
+of its project.
 **Don't ask
 again** stores Keep Running or End Sessions as *on quit*; Cancel stores
 nothing. With *on quit* Keep Running or End Sessions, or with no running
@@ -250,7 +262,8 @@ The Cherry menu bar icon's panel lists them under **Background sessions**,
 below the agents and in the same scrolling list: the command's or agent's
 name (or the session's), the project, and `idle`, the foreground program of a
 busy terminal, `running`, `attached` or `exit N`. Clicking a row shows it in a
-tab: its project's window opens (or is focused), and that window's restore
+tab: its project's most recently active window is focused (or its primary
+window, opened again, when none is open), and that window's restore
 brings a closed window's session back with its sibling tabs and layout; a
 session no saved tab names is adopted into that window as the tab it was
 started for (same tab id, kind, agent and command), or attached when another
@@ -276,8 +289,9 @@ command, or a terminal whose host reports a foreground job; never an idle
 shell) that it has not told about: "3 sessions are still running in the
 background", "From tabs or windows you closed (<projects>). Open or end them
 from Background Sessions in the Cherry menu bar icon.", with **Reopen**
-(each session back in a tab of its project's window, as Background Sessions
-→ Open does), **End…** (the End Background Sessions confirmation for those
+(each session back in a tab of its project's most recently active window,
+or of its primary one, opened again, as Background Sessions → Open does),
+**End…** (the End Background Sessions confirmation for those
 sessions only) and dismiss. Its time runs only while that window is key in
 the active app, and it takes turns with a closed tab's toast: it waits for
 one on screen to go, and one shown over it sets it aside until that one
@@ -913,7 +927,9 @@ differs from the design above.
   `GHOSTTY_SURFACE_ID`, `XPC_*` or `NO_COLOR`; stable staged paths; and the
   host adds `CHERRY_SESSION_ID`.
 - Create tags: `cherry.tab`, `cherry.kind`, `cherry.agent`, `cherry.command`,
-  `cherry.project` and `cherry.launch` (the Create request id). The app uses
+  `cherry.project`, `cherry.launch` (the Create request id) and, for a tab
+  of a window other than its project's primary one, `cherry.window` (that
+  window's id, as the Create goes out; never rewritten). The app uses
   the session's `request_id` (or else `cherry.launch`) to end a session whose
   Create answer was lost, and to find the session of a record saved before
   its Create answered. The owner is `CherryAppIdentity.applicationSupportName`.
@@ -1164,11 +1180,13 @@ differs from the design above.
   **Undo** instead (see Undo below); a native tab's close shows nothing.
   While ⌘Z can still undo it, Reopen is that undo; after that, Reopen brings a session back where its tab was: this
   app's own session the way Background Sessions → Open does
-  (`ProjectWindowRegistry.showBackgroundSession`: its project's window,
+  (`ProjectWindowRegistry.showBackgroundSession`: its project's most
+  recently active window (its primary, opened again, when none is open),
   adopted with its tab id, kind, agent and command), and a session the tab
-  did not own attached again in the project window it was closed from
-  (`ProjectWindowRegistry.workspaceOpeningWindow`); either opens that
-  project's window again when it closed with its last tab. A session of
+  did not own attached again in its project's most recently active window
+  (`ProjectWindowRegistry.workspaceOpeningWindow`), the project's primary
+  window opened again when none is open; either tab is then shown in the
+  window that has it (`revealSession(id:)`). A session of
   This Mac that is gone brings nothing back. On a window's last tab the
   window closes too, and the toast goes on the project window that was
   active last and is on screen (not minimized), when there is one. A window
@@ -1347,11 +1365,25 @@ differs from the design above.
   running session of this app names no copy (it was created before the
   tag), nothing is removed.
 
-- `WorkspaceStateStore` keeps one JSON file per repository (version 1). It
+- `WorkspaceStateStore` keeps one JSON file per project window (version 1):
+  a project's primary window's named by the SHA-256 of its root, as before,
+  another window's by that of its root, a NUL and its id (`windowID` in the
+  record; `open-windows.json` lists `windows` beside `projectRoots`). It
   saves 500 ms after changes, except that a newly opened persistent tab is
   saved at once (its record carries the Create's request id,
-  `launchRequestID`); it never saves during teardown, and quit flushes it
-  first. Records gained optional `owned` and `launchRequestID` fields (older
+  `launchRequestID`), and a window other than a project's primary is saved
+  as it claims its project; it never saves during teardown, and quit
+  flushes it first. A closed window's file is forgotten or moved to the
+  primary's name as the close question above says. The launch's saved
+  windows that cannot open (their folder is missing) or never register stay
+  in `open-windows.json` until a later launch reopens them. Once the
+  launch's windows opened (a few seconds after a launch that reopens none),
+  files of This Mac's windows other than primaries that the saved list did
+  not name and that were written before the launch read it (a crash during a
+  close, an older build's run) are removed in the background, reading only
+  each file's header; one of a project that list does not name, whose
+  primary file has no tabs, becomes the primary's instead. A launch that
+  read no list it could use (none, or one moved aside) removes none. Records gained optional `owned` and `launchRequestID` fields (older
   builds ignore them). A state file (or `open-windows.json`) of another
   version, one that does not decode, or one for another root is moved aside
   as `<file>.<vN|unreadable|other-root>-<UTC yyyyMMddTHHmmssZ>.bak` in the
@@ -1515,9 +1547,17 @@ differs from the design above.
   modification time) is the lower bound, and the tabs it named come back
   whenever they were created, until this version saves a file for the
   project. With no file of any version ever saved, any of the project's
-  sessions from before this run are adopted. Each window is scanned once
-  per run: at window open, again once the host is reachable, and after a
-  restarted daemon's holders have registered.
+  sessions from before this run are adopted. Of a project's several
+  windows, each adopts only the sessions tagged with its own id
+  (`cherry.window`), the primary only untagged ones, and none that a saved
+  tab of another window names while that window may still restore it (one
+  of the launch's windows still to open, or restoring:
+  `sessionRecordsAwaitingRestore`), since an untagged session can be in
+  another window's file (a command handed over at a close, or one opened
+  there from Background Sessions); a window other than the primary with no
+  saved state (opened this run) looks for none.
+  Each window is scanned once per run: at window open, again once the host
+  is reachable, and after a restarted daemon's holders have registered.
   Sessions recorded to be ended (below) are never adopted. With *close on
   exit* on, a terminal (its `cherry.kind` tag) whose shell exited with status
   0 is removed instead of adopted.
@@ -1566,12 +1606,16 @@ differs from the design above.
   groups, split groups (with their weights), display order and selection are
   restored. Kept tabs that come back later (the retry) are added after the
   tabs opened meanwhile, as saves order them.
-- **Commands.** A command has one tab per workspace.
-  - Auto-start runs after the restore of its window. It never adds a
-    second tab for a command a restored tab runs (running or ended). An
-    auto-start command whose tab is still being restored (a host that
-    answers late) or was kept because the local host was unreachable (or its
-    holders were pending) waits for that tab to come back during this run.
+- **Commands.** A command has one tab per project, across the project's
+  windows.
+  - Auto-start runs in the window that opened the project, after its
+    restore (at launch, once the project's other launch windows
+    registered). It never adds a second tab for a command a restored tab of
+    any of the project's windows runs (running or ended). An auto-start
+    command whose tab is still being restored in any of them (a host that
+    answers late, a tab shown before the host answered included) or was kept
+    because the local host was unreachable (or its holders were pending)
+    waits for that tab to come back during this run.
     Until then it does not start at all, which avoids two copies of a
     server.
   - Auto-start also restarts a restored auto-start command whose session
@@ -1581,8 +1625,9 @@ differs from the design above.
     restart policy (new session, the ended one removed).
   - Sidebar starts and MCP `spawn_process`, `start_process`,
     `start_all_commands` and `restart_all_commands` wait (at most 10 s) for
-    a restore under way that may bring back the command's tab, then use that
-    tab instead of starting a second copy.
+    a restore under way in any of the project's windows that may bring back
+    the command's tab, then use that tab, in whichever window it is, instead
+    of starting a second copy.
   - If a command tab was opened anyway (the wait ran out, or while the local
     host was unreachable), the tab whose program runs keeps the command: a
     restored tab whose program runs replaces an open tab whose program ended
@@ -1590,7 +1635,9 @@ differs from the design above.
     and if its program runs, its record is set aside and stays saved (its
     session keeps running, in Background Sessions and the Persistent
     Sessions sheet), so
-    nothing is orphaned without a record.
+    nothing is orphaned without a record. This is decided within the
+    restoring window: a restored command tab whose command a tab of another
+    of the project's windows runs is restored beside it.
 - **Deviation (ended tabs).** Ended persistent terminal and agent tabs show
   "Session ended (exit N)" with **Restart** and **Close**; Close removes the
   ended session, so there is no separate Remove. A terminal whose shell
@@ -1749,8 +1796,8 @@ differs from the design above.
 - End Sessions on quit ends the sessions of saved tabs no open tab shows
   only if the host lists them before the quit's wait ends; otherwise they
   are recorded in `sessions-to-end.json` and ended when the next launch
-  opens the project's window, after its restore (which may bring such a tab
-  back first).
+  opens a window of the project, after its restore (which may bring such a
+  tab back first).
 - Test gaps: bringing the quit sheet's window on screen is not unit-tested
   (it would take focus from the user's apps), nor is the quit's reply to
   AppKit after the sessions question (what it does is: `SessionQuitPlan`,

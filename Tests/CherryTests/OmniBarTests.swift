@@ -74,7 +74,7 @@ private func fixture(extraProjects: Int = 0) -> OmniSources {
     ]
     sources.window = OmniWindowContext(
         hasSelectedTab: true, canSplit: true, canDetach: true, canReopenClosedTab: true,
-        hasProject: true
+        canOpenAnotherWindow: true, hasProject: true
     )
     sources.listedLocalProjects = ["/Users/me/code/cherry", "/Users/me/code/pix"]
     sources.editorsByProjectKey = ["/Users/me/code/cherry": OmniEditor(id: "zed", name: "Zed")]
@@ -390,6 +390,7 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     let rows = controller.rows.map(\.item)
     let shortcuts = Dictionary(rows.map { ($0.title, $0.detail) }, uniquingKeysWith: { first, _ in first })
     #expect(shortcuts["New Tab"] == "⌘T")
+    #expect(shortcuts["New Window"] == "⌘N")
     #expect(shortcuts["Split Right"] == "⌘⇧D")
     #expect(shortcuts["Detach Tab"] == "⌘D")
     #expect(shortcuts["Close Tab"] == "⌘W")
@@ -404,6 +405,11 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
         #expect(shortcuts[title] != nil, "missing \(title)")
     }
     #expect(rows.first { $0.title == "New Tab" }?.primary == .menu(.newTab))
+    // New Window (another window of the window's project) after New Tab.
+    let commandTitles = OmniProviders.commands(fixture()).map(\.title)
+    #expect(commandTitles.prefix(2) == ["New Tab", "New Window"])
+    #expect(rows.first { $0.title == "New Window" }?.primary == .menu(.newWindow))
+    #expect(rows.first { $0.title == "New Window" }?.id == "command:newWindow")
     #expect(rows.first { $0.title == "New Claude Code agent" }?.primary == .launchAgent(id: "claude"))
     // Commands have no ⌘K actions.
     #expect(rows.filter { $0.kind == .command }.allSatisfy { $0.actions.isEmpty })
@@ -427,7 +433,8 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     bare.editors = []
     bare.canModifyDevices = false
     let limited = OmniProviders.commands(bare).map(\.title)
-    for title in ["Split Right", "Detach Tab", "Close Tab", "Reopen Closed Tab", "Clear Scrollback",
+    // New Window: not in a window of a device Cherry no longer knows.
+    for title in ["New Window", "Split Right", "Detach Tab", "Close Tab", "Reopen Closed Tab", "Clear Scrollback",
                   "End Background Sessions…", "Add Mac…", "New Agent", "Open in Zed"] {
         #expect(!limited.contains(title), "offered \(title)")
     }
@@ -679,6 +686,111 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     // A tab no window has: nothing happens.
     performer.perform(.closeTab(UUID()))
     #expect(workspace.sessions.isEmpty)
+}
+
+/// Closing a tab of another window from the bar goes as ⌘W in that window
+/// goes: its own chrome asks, and its window is the one that closes after
+/// its last tab, never the bar's, though both are the project's.
+@Test @MainActor func closingATabOfAnotherWindowUsesThatWindowsChrome() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-omni-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let barChrome = ProjectWindowChromeState()
+    let tabChrome = ProjectWindowChromeState()
+    let repository = RepositoryWorkspace(projectRoot: root.path)
+    let tabWorkspace = TerminalWorkspace(projectRoot: root.path, createInitialSession: false, launchBackend: .hostManaged)
+    let windows = (0..<2).map { _ in
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 200), styleMask: [.titled], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        return window
+    }
+    let registry = ProjectWindowRegistry()
+    registry.bringWindowForward = { _ in }
+    defer {
+        windows.forEach { registry.unregister(window: $0, projectRoot: root.path) }
+        repository.closeAllSessions(intent: .windowClosed)
+        tabWorkspace.closeAllSessions(intent: .windowClosed)
+        try? FileManager.default.removeItem(at: root)
+    }
+    // The bar's window, the project's primary and active last; the tab is
+    // in the project's other window, its only tab.
+    #expect(registry.register(
+        window: windows[0], projectRoot: root.path, workspace: repository.workspace, repository: repository,
+        todoStore: nil, chromeState: barChrome
+    ))
+    #expect(registry.register(
+        window: windows[1], projectRoot: root.path, windowID: UUID(), workspace: tabWorkspace,
+        todoStore: nil, chromeState: tabChrome
+    ))
+    let agent = tabWorkspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Claude", command: "/bin/cat"), projectRoot: root.path
+    )
+    #expect(await eventually { agent.isProgramRunning })
+    let performer = OmniBarPerformer(
+        window: OmniBarWindow(projectRoot: root.path, repository: repository, workspace: repository.workspace, chromeState: barChrome),
+        settings: .shared,
+        registry: registry,
+        backgroundSessionsModel: { preconditionFailure("not asked in this test") },
+        switcher: ProjectSwitcherActions(settings: .shared, chromeState: barChrome, openProject: { _ in }),
+        editorDiscovery: ExternalEditorDiscovery(appURLResolver: { _ in nil }),
+        projects: { ProjectSwitcherModel(machines: [], locations: []) },
+        openSettings: {},
+        toggleAppearance: {}
+    )
+    // Its program is at work: "Close “Claude”?" goes up in its window,
+    // which closes after it.
+    performer.perform(.closeTab(agent.id))
+    let request = try #require(tabChrome.pendingTabClose)
+    #expect(request.sessionID == agent.id)
+    #expect(request.closingWindow === windows[1])
+    #expect(barChrome.pendingTabClose == nil)
+    #expect(tabWorkspace.sessions.map(\.id) == [agent.id])
+}
+
+/// The bar's New Window opens another window of the project of the window
+/// the bar is open in, though another project's window was active last.
+@Test @MainActor func newWindowFromTheOmniBarOpensAnotherWindowOfItsOwnWindowsProject() throws {
+    let root = try canonicalTemporaryDirectory("cherry-omni-new-window")
+    let elsewhere = try canonicalTemporaryDirectory("cherry-omni-new-window-elsewhere")
+    let barChrome = ProjectWindowChromeState()
+    let otherChrome = ProjectWindowChromeState()
+    let repository = RepositoryWorkspace(projectRoot: root.path)
+    let otherWorkspace = TerminalWorkspace(projectRoot: elsewhere.path, createInitialSession: false)
+    let windows = [testWindow(), testWindow()]
+    let registry = ProjectWindowRegistry()
+    registry.bringWindowForward = { _ in }
+    var opened: [ProjectWindowValue] = []
+    registry.newProjectWindowOpener = { opened.append($0) }
+    defer {
+        registry.unregister(window: windows[0], projectRoot: root.path)
+        registry.unregister(window: windows[1], projectRoot: elsewhere.path)
+        repository.closeAllSessions(intent: .windowClosed)
+        for directory in [root, elsewhere] { try? FileManager.default.removeItem(at: directory) }
+    }
+    #expect(registry.register(
+        window: windows[0], projectRoot: root.path, workspace: repository.workspace, repository: repository,
+        todoStore: nil, chromeState: barChrome
+    ))
+    #expect(registry.register(
+        window: windows[1], projectRoot: elsewhere.path, workspace: otherWorkspace, todoStore: nil, chromeState: otherChrome
+    ))
+    registry.activateWindow(windows[1], workspace: otherWorkspace, todoStore: nil, chromeState: otherChrome)
+    let barWindow = OmniBarWindow(projectRoot: root.path, repository: repository, workspace: repository.workspace, chromeState: barChrome)
+    #expect(OmniBarGathering.context(for: barWindow, settings: .shared).canOpenAnotherWindow)
+    let performer = OmniBarPerformer(
+        window: barWindow,
+        settings: .shared,
+        registry: registry,
+        backgroundSessionsModel: { preconditionFailure("not asked in this test") },
+        switcher: ProjectSwitcherActions(settings: .shared, chromeState: barChrome, openProject: { _ in }),
+        editorDiscovery: ExternalEditorDiscovery(appURLResolver: { _ in nil }),
+        projects: { ProjectSwitcherModel(machines: [], locations: []) },
+        openSettings: {},
+        toggleAppearance: {}
+    )
+
+    performer.perform(.menu(.newWindow))
+    #expect(opened.map(\.projectRoot) == [repository.repositoryRoot])
+    #expect(opened.first?.windowID != nil)
 }
 
 // MARK: - Editor icons

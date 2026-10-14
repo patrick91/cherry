@@ -214,7 +214,7 @@ final class MenuBarAgentsModel: ObservableObject {
 
         struct Project: Equatable {
             let root: String
-            let agents: [Agent]
+            var agents: [Agent]
         }
 
         var projects: [Project] = []
@@ -223,10 +223,9 @@ final class MenuBarAgentsModel: ObservableObject {
 
     func refresh() {
         var inputs = Inputs()
+        // One group per project: its windows' agents, window after window.
         for (root, workspace) in registry.workspacesByProjectRoot() {
-            let agents = workspace.runningAgentSessions
-            guard !agents.isEmpty else { continue }
-            inputs.projects.append(Inputs.Project(root: root, agents: agents.map { session in
+            let agents = workspace.runningAgentSessions.map { session in
                 Inputs.Agent(
                     id: session.id,
                     title: session.title,
@@ -235,7 +234,13 @@ final class MenuBarAgentsModel: ObservableObject {
                     subtitle: session.subtitle,
                     activity: session.agentActivityState
                 )
-            }))
+            }
+            guard !agents.isEmpty else { continue }
+            if let index = inputs.projects.firstIndex(where: { $0.root == root }) {
+                inputs.projects[index].agents += agents
+            } else {
+                inputs.projects.append(Inputs.Project(root: root, agents: agents))
+            }
         }
         inputs.background = ([background] + background.devices).flatMap { list in
             list.sessions.compactMap { session in
@@ -277,8 +282,9 @@ final class MenuBarAgentsModel: ObservableObject {
         MenuBarShimmerModel.shared.setWorkingAgentsActive(aggregate == .working)
     }
 
+    /// Shows the agent's tab in the window that has it.
     func reveal(_ item: MenuBarAgentItem) {
-        registry.revealSession(id: item.id, projectRoot: item.projectRoot)
+        registry.revealSession(id: item.id)
     }
 }
 

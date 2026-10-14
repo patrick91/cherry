@@ -17,6 +17,12 @@ final class CherryControlServer: @unchecked Sendable {
     private let todoStoreForProjectRootProvider: @MainActor (String) -> ProjectTodoStore?
     private let chromeStateForProjectRootProvider: @MainActor (String) -> ProjectWindowChromeState?
     private let openProjectRootsProvider: @MainActor () -> [String]
+    /// Every open project window's workspace, a project's several windows
+    /// each (`openWorkspaces`).
+    private let openWorkspacesProvider: @MainActor () -> [TerminalWorkspace]
+    /// The chrome state of the window that shows a workspace, never another
+    /// window of its project.
+    private let chromeStateForWorkspaceProvider: @MainActor (TerminalWorkspace) -> ProjectWindowChromeState?
     private let openProjectProvider: @MainActor (String) -> Void
     private let agentSettings: AgentSettings
     private let serviceDetector: any ServiceDetecting
@@ -56,6 +62,8 @@ final class CherryControlServer: @unchecked Sendable {
             openProjectRootsProvider: {
                 workspace.projectRoot.map { [$0] } ?? []
             },
+            openWorkspacesProvider: { [workspace] },
+            chromeStateForWorkspaceProvider: { $0 === workspace ? chromeState : nil },
             openProjectProvider: { _ in },
             socketURL: socketURL,
             agentSettings: agentSettings,
@@ -87,6 +95,12 @@ final class CherryControlServer: @unchecked Sendable {
         openProjectRootsProvider: @escaping @MainActor () -> [String] = {
             ProjectWindowRegistry.shared.knownProjectRoots
         },
+        openWorkspacesProvider: @escaping @MainActor () -> [TerminalWorkspace] = {
+            ProjectWindowRegistry.shared.allWorkspaces()
+        },
+        chromeStateForWorkspaceProvider: @escaping @MainActor (TerminalWorkspace) -> ProjectWindowChromeState? = {
+            ProjectWindowRegistry.shared.chromeState(for: $0)
+        },
         openProjectProvider: @escaping @MainActor (String) -> Void = { _ in },
         socketURL: URL = CherryControl.socketURL,
         agentSettings: AgentSettings = .shared,
@@ -104,6 +118,8 @@ final class CherryControlServer: @unchecked Sendable {
         self.todoStoreForProjectRootProvider = todoStoreForProjectRootProvider
         self.chromeStateForProjectRootProvider = chromeStateForProjectRootProvider
         self.openProjectRootsProvider = openProjectRootsProvider
+        self.openWorkspacesProvider = openWorkspacesProvider
+        self.chromeStateForWorkspaceProvider = chromeStateForWorkspaceProvider
         self.openProjectProvider = openProjectProvider
         self.agentSettings = agentSettings
         self.serviceDetector = serviceDetector
@@ -497,9 +513,9 @@ final class CherryControlServer: @unchecked Sendable {
             message: "Cherry refused this Cherry MCP token: it does not belong to an open tab of this Mac's Cherry (the tab was closed, or it was started by another copy of Cherry)."
         )
         guard let tabID = UUID(uuidString: credentials.processID) else { throw refused }
-        let workspaces = openProjectRootsProvider().compactMap { workspaceForProjectRootProvider($0) }
-            + [workspaceProvider()].compactMap { $0 }
-        for candidate in workspaces {
+        // Every window: a tab of a project's second window is as much its
+        // device's as one of the first.
+        for candidate in openWorkspaces() {
             guard let session = candidate.sessions.first(where: { $0.id == tabID }),
                   let key = candidate.projectRoot,
                   let deviceID = ProjectLocation(key: key).deviceID
@@ -620,7 +636,7 @@ final class CherryControlServer: @unchecked Sendable {
     private func handle(_ request: CherryControlRequest, remoteCaller caller: RemoteCaller) async throws -> CherryControlResponse {
         switch request {
         case .scoped(let scopedRequest):
-            let workspace = try remoteWorkspace(projectRoot: scopedRequest.projectRoot, deviceID: caller.deviceID)
+            let workspace = try remoteWorkspace(projectRoot: scopedRequest.projectRoot, deviceID: caller.deviceID, caller: caller)
             return try await handleUnscoped(scopedRequest.request, workspace: workspace, isProjectScoped: true)
         case .openProject(let open):
             return .init(result: .openProject(try openRemoteProject(open, caller: caller)))
@@ -659,16 +675,16 @@ final class CherryControlServer: @unchecked Sendable {
 
     /// The open window of the device's project at `projectRoot` (or of the
     /// project containing it), matched by location: the same device and the path, never through
-    /// `standardizedProjectRoot`.
+    /// `standardizedProjectRoot`. Of a project's several windows, the
+    /// caller's own, else the one active most recently.
     @MainActor
-    private func remoteWorkspace(projectRoot: String, deviceID: UUID) throws -> TerminalWorkspace {
+    private func remoteWorkspace(projectRoot: String, deviceID: UUID, caller: RemoteCaller) throws -> TerminalWorkspace {
         let location = try Self.remoteProjectLocation(projectRoot, deviceID: deviceID)
         let path = location.path
-        let workspaces = (openProjectRootsProvider().compactMap { workspaceForProjectRootProvider($0) }
-            + [workspaceProvider()].compactMap { $0 })
-            .filter { Self.isOnDevice($0.projectRoot, deviceID) }
-        if let exact = workspaces.first(where: { $0.projectRoot.map { ProjectLocation(key: $0).path } == path }) {
-            return exact
+        let workspaces = openWorkspaces().filter { Self.isOnDevice($0.projectRoot, deviceID) }
+        let exact = workspaces.filter { $0.projectRoot.map { ProjectLocation(key: $0).path } == path }
+        if let window = preferredWindow(among: exact, caller: caller.workspace) {
+            return window
         }
         let containing = workspaces
             .compactMap { candidate -> (TerminalWorkspace, String)? in
@@ -677,11 +693,25 @@ final class CherryControlServer: @unchecked Sendable {
                 else { return nil }
                 return (candidate, root)
             }
-            .max { $0.1.count < $1.1.count }
-        guard let containing else {
+        guard let longest = containing.map(\.1.count).max(),
+              let window = preferredWindow(among: containing.filter { $0.1.count == longest }.map(\.0), caller: caller.workspace)
+        else {
             throw CherryControlError(code: "project_unavailable", message: "Cherry project is not open for scoped request: \(projectRoot).")
         }
-        return containing.0
+        return window
+    }
+
+    /// Of `windows`, the windows of one project: `caller`'s own when it is
+    /// one of them, else the project's most recently active
+    /// (`workspaceForProjectRootProvider`), else the first.
+    @MainActor
+    private func preferredWindow(among windows: [TerminalWorkspace], caller: TerminalWorkspace?) -> TerminalWorkspace? {
+        if let caller, windows.contains(where: { $0 === caller }) { return caller }
+        if let root = windows.first?.projectRoot, let recent = workspaceForProjectRootProvider(root),
+           windows.contains(where: { $0 === recent }) {
+            return recent
+        }
+        return windows.first
     }
 
     /// Open Project for a caller on another Mac: only a project of its Mac
@@ -706,7 +736,7 @@ final class CherryControlServer: @unchecked Sendable {
         guard let peerPID else { return nil }
         let ancestry = Set(CherryControl.processAncestry(of: peerPID))
         guard !ancestry.isEmpty else { return nil }
-        let workspaces = openProjectRootsProvider().compactMap { workspaceForProjectRootProvider($0) }
+        let workspaces = openWorkspaces()
         // The tab that runs the caller's program first: a tab attached to
         // the same session of This Mac (another window's view of it)
         // routes only when no window runs it. A persistent tab's program
@@ -722,6 +752,19 @@ final class CherryControlServer: @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    /// Every open project window's workspace, each once: the windows'
+    /// (`openWorkspacesProvider`, a project's several windows each), each
+    /// open project's (`workspaceForProjectRootProvider`), and the active
+    /// one.
+    @MainActor
+    func openWorkspaces() -> [TerminalWorkspace] {
+        var seen = Set<ObjectIdentifier>()
+        return (openWorkspacesProvider()
+            + openProjectRootsProvider().compactMap { workspaceForProjectRootProvider($0) }
+            + [workspaceProvider()].compactMap { $0 })
+            .filter { seen.insert(ObjectIdentifier($0)).inserted }
     }
 
     /// PID of the process on the other end of a connected unix-domain socket.
@@ -844,21 +887,26 @@ final class CherryControlServer: @unchecked Sendable {
             let (session, sentBytes) = try await spawnProcess(request, workspace: workspace)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
             return .init(result: .spawnProcess(.init(
-                process: processInfo(for: session, workspace: workspace),
+                process: processInfo(for: session, workspace: owningWorkspace(of: session, from: workspace)),
                 sentBytes: sentBytes,
                 output: output,
                 task: tasks.latestTask(forWorker: session.id)
                     .flatMap { $0.device == Self.remoteDevice ? tasks.info(for: $0) : nil }
             )))
         case .startProcess(let request):
+            // A command's tab can be another window's of the project: it is
+            // described as that window shows it.
             let session = try await startProcess(request, workspace: workspace)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
-            return .init(result: .startProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
+            return .init(result: .startProcess(.init(
+                process: processInfo(for: session, workspace: owningWorkspace(of: session, from: workspace)),
+                output: output
+            )))
         case .stopProcess(let request):
-            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            let (session, sessionWorkspace) = try resolveProcessWithWorkspace(workspace: workspace, processID: request.processID, processName: request.processName)
             stopProcess(session)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
-            return .init(result: .stopProcess(.init(process: processInfo(for: session, workspace: workspace), output: output)))
+            return .init(result: .stopProcess(.init(process: processInfo(for: session, workspace: sessionWorkspace), output: output)))
         case .restartProcess(let request):
             // Restart and close act on the window that owns the process, which
             // an id can name from any window.
@@ -871,14 +919,16 @@ final class CherryControlServer: @unchecked Sendable {
             try closeFromControl(session, workspace: sessionWorkspace, agentClosePolicy: request.agentClosePolicy)
             return .init(result: .closeProcess(.init(processID: session.id.uuidString, closed: true)))
         case .renameProcess(let request):
-            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            let (session, sessionWorkspace) = try resolveProcessWithWorkspace(workspace: workspace, processID: request.processID, processName: request.processName)
             session.rename(to: request.title)
-            return .init(result: .renameProcess(.init(process: processInfo(for: session, workspace: workspace))))
+            return .init(result: .renameProcess(.init(process: processInfo(for: session, workspace: sessionWorkspace))))
         case .selectProcess(let request):
-            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
-            workspace.select(session)
-            chromeState(for: workspace)?.selectTerminal()
-            return .init(result: .selectProcess(.init(process: processInfo(for: session, workspace: workspace))))
+            // Selected in the window that has it (an id can name another
+            // window's tab), which stays where it is.
+            let (session, sessionWorkspace) = try resolveProcessWithWorkspace(workspace: workspace, processID: request.processID, processName: request.processName)
+            sessionWorkspace.select(session)
+            chromeState(for: sessionWorkspace)?.selectTerminal()
+            return .init(result: .selectProcess(.init(process: processInfo(for: session, workspace: sessionWorkspace))))
         case .sendProcessInput(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
             let sentBytes = try await sendControlInput(
@@ -896,7 +946,12 @@ final class CherryControlServer: @unchecked Sendable {
             }
             return .init(result: .startAllCommands(try listProcesses(workspace: workspace, kind: nil)))
         case .stopAllCommands(let request):
-            workspace.commandSessions.filter { callerReaches($0, in: workspace) }.forEach { $0.stopManagedCommand() }
+            // The project's commands, in every one of its windows.
+            for commandWorkspace in [workspace] + workspace.otherProjectWindows() {
+                commandWorkspace.commandSessions
+                    .filter { callerReaches($0, in: commandWorkspace) }
+                    .forEach { $0.stopManagedCommand() }
+            }
             if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {
                 try? await Task.sleep(for: .milliseconds(min(max(waitMilliseconds, 0), 5_000)))
             }
@@ -913,7 +968,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .listAgents(listAgents(workspace: workspace)))
         case .listTodos:
             let todoStore = try activeTodoStore(for: workspace)
-            return .init(result: .listTodos(listTodos(todoStore: todoStore)))
+            return .init(result: .listTodos(listTodos(todoStore: todoStore, workspace: workspace)))
         case .createTodo(let request):
             let todoStore = try activeTodoStore(for: workspace)
             let todo = try todoStore.create(
@@ -1121,7 +1176,8 @@ final class CherryControlServer: @unchecked Sendable {
         if let store = ProjectWindowRegistry.shared.todoStore(for: projectRoot) {
             return store
         }
-        return ProjectTodoStore(projectRoot: projectRoot)
+        // Shared with a window of the project that opens meanwhile.
+        return ProjectTodoStore.shared(projectRoot: projectRoot)
     }
 
     @MainActor
@@ -1426,6 +1482,14 @@ final class CherryControlServer: @unchecked Sendable {
                 || session.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedName
         }
         guard let session = matches.first else {
+            // A project command runs in one tab across the project's
+            // windows: its name finds that tab in another window too.
+            for other in workspace.otherProjectWindows() {
+                if let tab = other.commandSession(named: requestedName), callerReaches(tab, in: other) {
+                    mcpControlDebugLog("resolved process selector=name:\(requestedName) session=\(tab.id.uuidString) kind=\(tab.kind.rawValue) name=\(self.processName(for: tab)) in another window")
+                    return (tab, other)
+                }
+            }
             throw CherryControlError(code: "process_not_found", message: "No Cherry process exists with name \(requestedName).")
         }
         guard matches.count == 1 else {
@@ -1490,8 +1554,9 @@ final class CherryControlServer: @unchecked Sendable {
                 throw CherryControlError(code: "project_unavailable", message: "The active Cherry workspace has no project.")
             }
             let command = try findProjectCommand(named: request.name ?? "", projectRoot: projectRoot)
-            // A restore under way may bring back this command's tab: use it
-            // rather than start a second copy.
+            // A restore under way (in any window of the project) may bring
+            // back this command's tab: use it rather than start a second
+            // copy. Another window's tab is returned as it is.
             await workspace.waitUntilRestored(commandNamed: command.name)
             session = workspace.addCommandSession(command: command, projectRoot: projectRoot, select: false)
             agent = nil
@@ -2089,9 +2154,17 @@ final class CherryControlServer: @unchecked Sendable {
     @MainActor
     private func restartAllCommands(workspace: TerminalWorkspace) async throws {
         let sessions = try await startAllCommands(workspace: workspace)
-        for session in sessions where callerReaches(session, in: workspace) {
+        for session in sessions where callerReaches(session, in: owningWorkspace(of: session, from: workspace)) {
             session.restart()
         }
+    }
+
+    /// The window of `workspace`'s project that has `session`: a command's
+    /// tab can be another window's (`TerminalWorkspace.addCommandSession`).
+    /// `workspace` when none has it.
+    @MainActor
+    private func owningWorkspace(of session: TerminalSession, from workspace: TerminalWorkspace) -> TerminalWorkspace {
+        ([workspace] + workspace.otherProjectWindows()).first { $0.sessions.contains { $0 === session } } ?? workspace
     }
 
     @MainActor
@@ -2148,12 +2221,13 @@ final class CherryControlServer: @unchecked Sendable {
         }
     }
 
+    /// The project's to-dos, and the one `workspace`'s window selects.
     @MainActor
-    private func listTodos(todoStore: ProjectTodoStore) -> ListTodosResult {
+    private func listTodos(todoStore: ProjectTodoStore, workspace: TerminalWorkspace) -> ListTodosResult {
         ListTodosResult(
             activeProjectRoot: todoStore.projectRoot,
             todos: todoStore.todos.map(todoInfo),
-            selectedTodoID: chromeState(forProjectRoot: todoStore.projectRoot)?.selectedTodoID?.uuidString
+            selectedTodoID: chromeState(for: workspace)?.selectedTodoID?.uuidString
         )
     }
 
@@ -2205,7 +2279,11 @@ final class CherryControlServer: @unchecked Sendable {
            device.map({ Self.isSession(session, in: workspace, onDevice: $0) }) ?? true {
             return (session, workspace)
         }
-        for (_, openWorkspace) in ProjectWindowRegistry.shared.workspacesByProjectRoot()
+        // Every window the server is given (`openWorkspacesProvider`, a
+        // project's several windows each), then the app's registry's (a
+        // test's server for one window still finds them).
+        let candidates = openWorkspacesProvider() + ProjectWindowRegistry.shared.workspacesByProjectRoot().map(\.workspace)
+        for openWorkspace in candidates
         where openWorkspace !== workspace && (device.map { Self.isOnDevice(openWorkspace.projectRoot, $0) } ?? true) {
             if let session = openWorkspace.session(id: terminalID),
                device.map({ Self.isSession(session, in: openWorkspace, onDevice: $0) }) ?? true {
@@ -2215,9 +2293,17 @@ final class CherryControlServer: @unchecked Sendable {
         throw CherryControlError(code: "terminal_not_found", message: "No Cherry terminal exists with id \(terminalID).")
     }
 
+    /// The window a request scoped to `rawProjectRoot` goes to: of a
+    /// project's several windows, the caller's own (`verifiedCallerSession`);
+    /// else the active window when it is the project's, else the project's
+    /// most recently active one, else that of the open project containing
+    /// it.
     @MainActor
     private func scopedWorkspace(projectRoot rawProjectRoot: String) throws -> TerminalWorkspace {
         let projectRoot = CherryControl.standardizedProjectRoot(rawProjectRoot)
+        if let callersWindow = callersWindow(ofProjectAt: projectRoot) {
+            return callersWindow
+        }
         if let activeWorkspace = workspaceProvider(),
            activeWorkspace.projectRoot.map(CherryControl.standardizedProjectRoot) == projectRoot {
             return activeWorkspace
@@ -2235,6 +2321,23 @@ final class CherryControlServer: @unchecked Sendable {
             code: "project_unavailable",
             message: "Cherry project is not open for scoped request: \(rawProjectRoot)."
         )
+    }
+
+    /// The caller's own window, when the project at `projectRoot` (or the
+    /// open project containing it) has several and the caller is a tab of
+    /// one of them. A project with one window looks up no caller.
+    @MainActor
+    private func callersWindow(ofProjectAt projectRoot: String) -> TerminalWorkspace? {
+        let open = openWorkspaces()
+        func windowsOfProject(at root: String) -> [TerminalWorkspace] {
+            open.filter { $0.projectRoot.map(CherryControl.standardizedProjectRoot) == root }
+        }
+        var windows = windowsOfProject(at: projectRoot)
+        if windows.isEmpty, let containing = containingOpenProjectRoot(for: projectRoot) {
+            windows = windowsOfProject(at: containing)
+        }
+        guard windows.count > 1, let caller = verifiedCallerSession() else { return nil }
+        return windows.first { $0.sessions.contains { $0 === caller } }
     }
 
     @MainActor
@@ -2287,8 +2390,15 @@ final class CherryControlServer: @unchecked Sendable {
         return nil
     }
 
+    /// The chrome state of the window that shows `workspace`
+    /// (`chromeStateForWorkspaceProvider`, by identity: never another
+    /// window of its project's); else, for a server told only its
+    /// projects' chrome (tests), its project's.
     @MainActor
     private func chromeState(for workspace: TerminalWorkspace) -> ProjectWindowChromeState? {
+        if let state = chromeStateForWorkspaceProvider(workspace) {
+            return state
+        }
         guard let projectRoot = workspace.projectRoot else {
             return nil
         }

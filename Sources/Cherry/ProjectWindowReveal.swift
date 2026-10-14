@@ -600,19 +600,21 @@ struct WindowRestoringBar: View {
 /// The order the launch opens its saved windows in
 /// (`ProjectWindowRegistry.openLaunchWindows`).
 enum LaunchWindowOrder {
-    /// The project most recently active first (`lastOpened`, the project
-    /// switcher's record), then the others in their saved order. Without
-    /// any record, the saved order.
-    static func frontFirst(_ roots: [String], lastOpened: (String) -> Date?) -> [String] {
+    /// The window of the project most recently active first (`lastOpened`,
+    /// the project switcher's record, per project: of a project's windows,
+    /// which share its date, the first in saved order, its most recently
+    /// active), then the others in their saved order. Without any record,
+    /// the saved order.
+    static func frontFirst<Window>(_ windows: [Window], lastOpened: (Window) -> Date?) -> [Window] {
         var front: (index: Int, date: Date)?
-        for (index, root) in roots.enumerated() {
-            guard let date = lastOpened(root) else { continue }
+        for (index, window) in windows.enumerated() {
+            guard let date = lastOpened(window) else { continue }
             if front.map({ date > $0.date }) ?? true { front = (index, date) }
         }
-        guard let front else { return roots }
-        var ordered = roots
-        let root = ordered.remove(at: front.index)
-        return [root] + ordered
+        guard let front else { return windows }
+        var ordered = windows
+        let window = ordered.remove(at: front.index)
+        return [window] + ordered
     }
 }
 

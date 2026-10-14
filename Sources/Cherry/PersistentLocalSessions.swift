@@ -20,6 +20,10 @@ struct PersistentSessionRequest: Equatable, Sendable {
     /// saved with it), so a relaunch can find the session a Create whose
     /// answer was lost started (`HostedSessionInfo.requestID`).
     var requestID = UUID()
+    /// The project window the session is created for (`cherry.window`),
+    /// as its tab's workspace says when the Create goes out; nil for a
+    /// project's primary window.
+    var windowID: UUID? = nil
 }
 
 /// A session the local host runs for a tab, and how the tab's attach
@@ -107,6 +111,12 @@ enum PersistentSessionTag {
     /// The staged Ghostty resources copy the session reads
     /// (`HostedLaunchSpec.resourcesCopy`), kept while any session names it.
     static let resources = "cherry.resources"
+    /// The project window a session was created for
+    /// (`ProjectWindowValue.windowID`, uppercase); none for a project's
+    /// primary window's. A window's look for orphaned sessions adopts only
+    /// its own (`OrphanedSessionCriteria.windowID`). Never rewritten: a
+    /// session shown in another window later keeps it.
+    static let window = "cherry.window"
     /// Each value is cut to this many bytes, far inside the host's 16 KiB.
     static let maxValueBytes = 1_024
 }
@@ -1838,7 +1848,14 @@ final class PersistentHostSessions {
         if let commandName = request.commandName?.nilIfEmpty { tags[PersistentSessionTag.command] = commandName }
         if let projectRoot = request.projectRoot?.nilIfEmpty { tags[PersistentSessionTag.project] = projectRoot }
         if let resourcesCopy = resourcesCopy?.nilIfEmpty { tags[PersistentSessionTag.resources] = resourcesCopy }
+        if let windowID = request.windowID { tags[PersistentSessionTag.window] = windowID.uuidString }
         return tags.mapValues { truncated($0, toBytes: PersistentSessionTag.maxValueBytes) }
+    }
+
+    /// The project window a session was created for, from its
+    /// `cherry.window` tag; nil for a project's primary window's (no tag).
+    nonisolated static func windowID(of info: HostedSessionInfo) -> UUID? {
+        info.tags[PersistentSessionTag.window].flatMap(UUID.init(uuidString:))
     }
 
     /// The tab id a session of this app's was started for, from its tags.

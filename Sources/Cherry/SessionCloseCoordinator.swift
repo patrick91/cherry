@@ -601,12 +601,13 @@ enum SessionCloseCoordinator {
     /// A toast's Reopen: shows a closed tab's session in a tab again where
     /// that tab was, and returns the tab. This app's own session goes the
     /// way Background Sessions → Open takes it
-    /// (`ProjectWindowRegistry.showBackgroundSession`: its project's
-    /// window, opened again when it closed with its last tab, adopted with
-    /// its tab id, kind, agent and command); a session the tab did not own
-    /// is attached again in the project window it was closed from, its
-    /// window opened again likewise
-    /// (`ProjectWindowRegistry.workspaceOpeningWindow`). `workspace` (the
+    /// (`ProjectWindowRegistry.showBackgroundSession`: its project's most
+    /// recently active window, or its primary opened again when it closed
+    /// with its last tab, adopted with its tab id, kind, agent and
+    /// command); a session the tab did not own is attached again in its
+    /// project's most recently active window, its window opened again
+    /// likewise (`ProjectWindowRegistry.workspaceOpeningWindow`). Either
+    /// tab is then shown in the window that has it. `workspace` (the
     /// toast's window's) takes a session whose project no window shows.
     /// Nothing when a session of This Mac is gone; an SSH host's is not
     /// asked.
@@ -630,9 +631,7 @@ enum SessionCloseCoordinator {
             }
             guard let destination, !destination.isTornDown else { return nil }
             let tab = destination.attachHostedSession(attachment)
-            if let root = registry.projectRoot(containing: tab.id) {
-                registry.revealSession(id: tab.id, projectRoot: root)
-            } else {
+            if !registry.revealSession(id: tab.id) {
                 chromeState?.selectTerminal()
             }
             return tab
@@ -1160,6 +1159,20 @@ struct SessionTeardownQuestion {
     let summary: SessionTeardownSummary
     /// The window's project, for a window close.
     let projectName: String?
+    /// For a window close: whether the window's tabs come back when its
+    /// project opens again. They do from the project's last window
+    /// (`ProjectWindowRegistry.isLastWindowOfProject`); a window closed
+    /// while another of its project stays open forgets them, and its kept
+    /// sessions are only in Background Sessions (its running commands go on
+    /// in that other window, `ProjectWindowRegistry.commandTabsHandedOver`).
+    let tabsComeBack: Bool
+
+    init(teardown: SessionTeardown, summary: SessionTeardownSummary, projectName: String?, tabsComeBack: Bool = true) {
+        self.teardown = teardown
+        self.summary = summary
+        self.projectName = projectName
+        self.tabsComeBack = tabsComeBack
+    }
 
     /// How many sessions the question lists by name; the rest are counted.
     static let listedSessionLimit = 5
@@ -1196,20 +1209,28 @@ struct SessionTeardownQuestion {
     var informativeText: String {
         let single = summary.runningSessions.count == 1
         let project = projectName ?? "this project"
-        let keeping = switch (teardown, single) {
-        case (.quit, true):
+        let keeping = switch (teardown, single, tabsComeBack) {
+        case (.quit, true, _):
             "It keeps running after Cherry quits, and its tab comes back when you open Cherry again. "
                 + "End Sessions stops its program."
-        case (.quit, false):
+        case (.quit, false, _):
             "They keep running after Cherry quits, and their tabs come back when you open Cherry again. "
                 + "End Sessions stops their programs."
-        case (.windowClose, true):
+        case (.windowClose, true, true):
             "It keeps running after this window closes, and its tab comes back when you open \(project) again. "
                 + "Until then, open or end it from Background Sessions in the Cherry menu bar icon. "
                 + "End Sessions stops its program."
-        case (.windowClose, false):
+        case (.windowClose, false, true):
             "They keep running after this window closes, and their tabs come back when you open \(project) again. "
                 + "Until then, open or end them from Background Sessions in the Cherry menu bar icon. "
+                + "End Sessions stops their programs."
+        case (.windowClose, true, false):
+            "It keeps running after this window closes. "
+                + "Open or end it from Background Sessions in the Cherry menu bar icon. "
+                + "End Sessions stops its program."
+        case (.windowClose, false, false):
+            "They keep running after this window closes. "
+                + "Open or end them from Background Sessions in the Cherry menu bar icon. "
                 + "End Sessions stops their programs."
         }
         let stopped = summary.stoppedWhenKeeping

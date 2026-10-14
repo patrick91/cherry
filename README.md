@@ -50,6 +50,12 @@ own: open a worktree's folder as a project (the Omni bar completes paths
 typed with `~/` or `/`). Tabs saved by a build that had worktree spaces come
 back in their project's window.
 
+**File › New Window** (**Cmd-N**) opens another window of the front window's
+project, with its own tabs, splits and selection and one new terminal in the
+project's folder; its to-dos and commands are the project's, shared by its
+windows, and every window comes back when Cherry opens again. A project on
+another Mac can have several windows too.
+
 ### Pasting images
 
 A terminal takes text only. Pasting (**Cmd-V**) an image with no text on the
@@ -130,7 +136,8 @@ host and `cherry doctor` checks it for problems and says how to fix them.
 
 Sessions of windows or tabs you closed that keep running are listed under
 **Background sessions** in the Cherry menu bar icon: click one to show it in a
-tab (its project's window opens again with its other tabs), or hover and click
+tab (in its project's window, which opens again with its other tabs when you
+had closed it), or hover and click
 **End** twice to stop it (**Remove** for one that already ended). **Cherry →
 End Background Sessions…**, **End All…** in that list and **Settings ›
 Sessions › Background Sessions** end them all after asking. When Cherry opens

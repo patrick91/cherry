@@ -20,6 +20,9 @@ struct RepositoryStateRecord: Codable, Equatable, Sendable {
     var activeWorktreeRoot: String?
     var worktrees: [WorktreeStateRecord]
     var savedAt: Date?
+    /// Another window's id (`ProjectWindowValue.windowID`); nil, and left
+    /// out, in a primary's file. `load` checks it with `repositoryRoot`.
+    var windowID: UUID? = nil
 
     var hasSessions: Bool {
         worktrees.contains { !$0.sessions.isEmpty }
@@ -373,13 +376,35 @@ extension WorkspaceSplitGroupRecord {
     }
 }
 
+/// A project window as `open-windows.json` lists it: its project as
+/// `RepositoryWorkspace.repositoryRoot` names it (the standardized folder,
+/// or a `device:<uuid>:/path` key) and, for every window but the project's
+/// primary one, its own id. The primary window keeps the file and keys a
+/// project's one window had before windows had ids (#22).
+struct ProjectWindowValue: Codable, Hashable, Sendable {
+    var projectRoot: String
+    var windowID: UUID?
+
+    static func primary(_ projectRoot: String) -> ProjectWindowValue {
+        ProjectWindowValue(projectRoot: projectRoot, windowID: nil)
+    }
+
+    var isPrimary: Bool { windowID == nil }
+}
+
 /// Project windows open when Cherry last saved them (at quit, or when a
-/// window opened or closed), by repository root.
+/// window opened or closed).
 struct OpenProjectWindowsRecord: Codable, Equatable, Sendable {
     static let currentVersion = 1
 
     var version: Int = OpenProjectWindowsRecord.currentVersion
+    /// The windows' projects: what builds before #22 read (they reopen each
+    /// one's primary window when its file has tabs).
     var projectRoots: [String]
+    /// Every window, in the order they were saved in (a primary has no
+    /// `windowID`). Nil in a file of a build before #22: its
+    /// `projectRoots` are primaries.
+    var windows: [ProjectWindowValue]? = nil
 }
 
 /// Saved tabs no open tab showed whose sessions of This Mac are still to be
@@ -495,17 +520,19 @@ struct SetAsideStateSummary: Equatable, Sendable {
 
 // MARK: - Store
 
-/// Saves each project's tabs as JSON under
-/// `Application Support/<app>/Workspaces/<sha256(repository root)>.json`,
-/// replacing the file atomically, owner-only, with the open windows
-/// (`open-windows.json`) and the sessions of forgotten tabs still to end
-/// (`sessions-to-end.json`, `SessionsToEndRecord`) beside them. Writes run on
-/// one serial queue, so a synchronous save or load sees every earlier write.
+/// Saves each project window's tabs as JSON under
+/// `Application Support/<app>/Workspaces/<sha256(repository root)>.json`
+/// (a project's primary window) or `<sha256(root, NUL, window id)>.json`
+/// (another window of it), replacing the file atomically, owner-only, with
+/// the open windows (`open-windows.json`) and the sessions of forgotten tabs
+/// still to end (`sessions-to-end.json`, `SessionsToEndRecord`) beside them.
+/// Writes run on one serial queue, so a synchronous save or load sees every
+/// earlier write.
 ///
 /// A file that is there but cannot be used (another version, one that does
-/// not decode, or another root's) is never written over: it is moved aside
-/// first, to `<name>.<v2|unreadable|other-root>-<UTC time>.bak` beside it,
-/// so a build of another version can still be pointed at it.
+/// not decode, or another root's or window's) is never written over: it is
+/// moved aside first, to `<name>.<v2|unreadable|other-root>-<UTC time>.bak`
+/// beside it, so a build of another version can still be pointed at it.
 ///
 /// With an `instanceLock` (the app's store), the store is used only while
 /// this copy of the app holds that lock: another copy with the same identity
@@ -536,18 +563,26 @@ final class WorkspaceStateStore: @unchecked Sendable {
             .appendingPathComponent("Workspaces", isDirectory: true)
     }
 
-    static func stateFileName(repositoryRoot: String) -> String {
-        CherryAppIdentity.projectFileName(for: repositoryRoot)
+    /// A project window's state file: the primary's (`windowID` nil) is
+    /// named by its root, as a project's one window was before windows had
+    /// ids; another window's by its root, a NUL and its id, so builds before
+    /// #22 never load it but still read it as a state file.
+    static func stateFileName(repositoryRoot: String, windowID: UUID? = nil) -> String {
+        let key = windowID.map { "\(repositoryRoot)\u{0}\($0.uuidString)" } ?? repositoryRoot
+        return CherryAppIdentity.projectFileName(for: key)
     }
 
-    /// A project's state file (`stateFileName`), not a set-aside copy or
-    /// another record.
+    /// A project window's state file (`stateFileName`), not a set-aside
+    /// copy or another record.
     private static func isStateFileName(_ name: String) -> Bool {
         name.count == 69 && name.hasSuffix(".json") && name.dropLast(5).allSatisfy({ $0.isHexDigit })
     }
 
-    func stateFileURL(repositoryRoot: String) -> URL {
-        directory.appendingPathComponent(Self.stateFileName(repositoryRoot: repositoryRoot), isDirectory: false)
+    func stateFileURL(repositoryRoot: String, windowID: UUID? = nil) -> URL {
+        directory.appendingPathComponent(
+            Self.stateFileName(repositoryRoot: repositoryRoot, windowID: windowID),
+            isDirectory: false
+        )
     }
 
     var openProjectWindowsFileURL: URL {
@@ -577,16 +612,18 @@ final class WorkspaceStateStore: @unchecked Sendable {
         instanceLock?.markQuitting()
     }
 
-    /// Nil when nothing was saved, when the store is disabled (another copy
-    /// of the app holds the instance lock), or when the file cannot be used:
-    /// unreadable, another version, or for another root (a hash collision).
-    /// Such a file is moved aside, never written over.
-    func load(repositoryRoot: String) -> RepositoryStateRecord? {
+    /// The tabs a project window saved (`windowID` nil: the project's
+    /// primary window). Nil when nothing was saved, when the store is
+    /// disabled (another copy of the app holds the instance lock), or when
+    /// the file cannot be used: unreadable, another version, or for another
+    /// root or window (a hash collision). Such a file is moved aside, never
+    /// written over.
+    func load(repositoryRoot: String, windowID: UUID? = nil) -> RepositoryStateRecord? {
         guard isEnabled else { return nil }
-        let fileURL = stateFileURL(repositoryRoot: repositoryRoot)
+        let fileURL = stateFileURL(repositoryRoot: repositoryRoot, windowID: windowID)
         return queue.sync { () -> RepositoryStateRecord? in
             guard let state = readVersionedLocked(RepositoryStateRecord.self, from: fileURL) else { return nil }
-            guard state.repositoryRoot == repositoryRoot else {
+            guard state.repositoryRoot == repositoryRoot, state.windowID == windowID else {
                 setAsideLocked(fileURL, label: "other-root")
                 return nil
             }
@@ -594,9 +631,10 @@ final class WorkspaceStateStore: @unchecked Sendable {
         }
     }
 
+    /// Writes the file of the window `state` names (`repositoryRoot`, `windowID`).
     func save(_ state: RepositoryStateRecord) {
         guard isEnabled else { return }
-        let fileURL = stateFileURL(repositoryRoot: state.repositoryRoot)
+        let fileURL = stateFileURL(repositoryRoot: state.repositoryRoot, windowID: state.windowID)
         queue.async {
             self.writeLocked(state, to: fileURL)
         }
@@ -604,9 +642,9 @@ final class WorkspaceStateStore: @unchecked Sendable {
 
     func saveSynchronously(_ state: RepositoryStateRecord) {
         guard isEnabled else { return }
-        let fileURL = stateFileURL(repositoryRoot: state.repositoryRoot)
+        let fileURL = stateFileURL(repositoryRoot: state.repositoryRoot, windowID: state.windowID)
         queue.sync {
-            writeLocked(state, to: fileURL)
+            _ = writeLocked(state, to: fileURL)
         }
     }
 
@@ -615,66 +653,282 @@ final class WorkspaceStateStore: @unchecked Sendable {
         queue.sync {}
     }
 
-    func hasSavedTabs(repositoryRoot: String) -> Bool {
-        load(repositoryRoot: repositoryRoot)?.hasSessions == true
+    func hasSavedTabs(repositoryRoot: String, windowID: UUID? = nil) -> Bool {
+        load(repositoryRoot: repositoryRoot, windowID: windowID)?.hasSessions == true
     }
 
+    /// The saved windows in their saved order; a file of a build before
+    /// #22 lists primaries only (its `projectRoots`).
+    func loadOpenProjectWindows() -> [ProjectWindowValue] {
+        loadSavedOpenProjectWindows() ?? []
+    }
+
+    /// The saved windows as `loadOpenProjectWindows` reads them, or nil when
+    /// there is no list this version can use: none was saved, or the file
+    /// was moved aside (unreadable, or of another version).
+    func loadSavedOpenProjectWindows() -> [ProjectWindowValue]? {
+        loadOpenProjectWindowsRecord().map { $0.windows ?? $0.projectRoots.map(ProjectWindowValue.primary) }
+    }
+
+    /// Saves `windows` in their order, with their projects, once each and
+    /// sorted, as `projectRoots` for builds before #22.
+    func saveOpenProjectWindows(_ windows: [ProjectWindowValue], synchronously: Bool = false) {
+        saveOpenProjectWindowsRecord(
+            OpenProjectWindowsRecord(projectRoots: Array(Set(windows.map(\.projectRoot))).sorted(), windows: windows),
+            synchronously: synchronously
+        )
+    }
+
+    /// The saved windows' projects as builds before #22 read them (`projectRoots`).
     func loadOpenProjectWindowRoots() -> [String] {
-        guard isEnabled else { return [] }
+        loadOpenProjectWindowsRecord()?.projectRoots ?? []
+    }
+
+    /// Saves each of `projectRoots`' primary window, and `projectRoots` as given.
+    func saveOpenProjectWindowRoots(_ projectRoots: [String], synchronously: Bool = false) {
+        saveOpenProjectWindowsRecord(
+            OpenProjectWindowsRecord(projectRoots: projectRoots, windows: projectRoots.map(ProjectWindowValue.primary)),
+            synchronously: synchronously
+        )
+    }
+
+    private func loadOpenProjectWindowsRecord() -> OpenProjectWindowsRecord? {
+        guard isEnabled else { return nil }
         let fileURL = openProjectWindowsFileURL
         return queue.sync {
-            readVersionedLocked(OpenProjectWindowsRecord.self, from: fileURL)?.projectRoots ?? []
+            readVersionedLocked(OpenProjectWindowsRecord.self, from: fileURL)
         }
     }
 
-    func saveOpenProjectWindowRoots(_ projectRoots: [String], synchronously: Bool = false) {
+    private func saveOpenProjectWindowsRecord(_ record: OpenProjectWindowsRecord, synchronously: Bool) {
         guard isEnabled else { return }
-        let record = OpenProjectWindowsRecord(projectRoots: projectRoots)
         let fileURL = openProjectWindowsFileURL
         if synchronously {
-            queue.sync { writeLocked(record, to: fileURL) }
+            queue.sync { _ = writeLocked(record, to: fileURL) }
         } else {
             queue.async { self.writeLocked(record, to: fileURL) }
         }
     }
 
-    /// Windows to reopen at launch: saved ones whose directory still exists
-    /// and whose workspace had tabs. A project on another Mac (a
-    /// `ProjectLocation` key) is never looked for on this Mac's disk: it is
-    /// reopened while its device is still known (`remoteProjectIsKnown`).
-    func projectWindowRootsToReopen(remoteProjectIsKnown: (String) -> Bool = { _ in false }) -> [String] {
-        var seen = Set<String>()
-        return loadOpenProjectWindowRoots().filter { root in
-            guard seen.insert(root).inserted else { return false }
+    /// Windows to reopen at launch, with the tabs each saved: each saved
+    /// window (`saved`, else `loadOpenProjectWindows()`) once, in saved
+    /// order, whose directory still exists and whose own file has tabs. A
+    /// project on another Mac (a `ProjectLocation` key) is never looked for
+    /// on this Mac's disk: it is reopened while its device is still known
+    /// (`remoteProjectIsKnown`).
+    func projectWindowsToReopen(
+        _ saved: [ProjectWindowValue]? = nil,
+        remoteProjectIsKnown: (String) -> Bool = { _ in false }
+    ) -> [(window: ProjectWindowValue, state: RepositoryStateRecord)] {
+        var seen = Set<ProjectWindowValue>()
+        return (saved ?? loadOpenProjectWindows()).compactMap { window in
+            guard seen.insert(window).inserted else { return nil }
+            let root = window.projectRoot
             if ProjectLocation.isRemoteKey(root) {
-                return remoteProjectIsKnown(root) && hasSavedTabs(repositoryRoot: root)
+                guard remoteProjectIsKnown(root) else { return nil }
+            } else {
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: root, isDirectory: &isDirectory),
+                      isDirectory.boolValue
+                else { return nil }
             }
-            var isDirectory: ObjCBool = false
-            return FileManager.default.fileExists(atPath: root, isDirectory: &isDirectory)
-                && isDirectory.boolValue
-                && hasSavedTabs(repositoryRoot: root)
+            guard let state = load(repositoryRoot: root, windowID: window.windowID), state.hasSessions else { return nil }
+            return (window, state)
         }
     }
 
-    /// What the state file of `repositoryRoot` that this version could not
-    /// use said: the one still there (it could not be moved aside), else
-    /// the newest one moved aside, while no usable file replaced it. Nil
-    /// when a usable file is there, when none was ever set aside, or when
-    /// the store is disabled.
-    func setAsideState(repositoryRoot: String) -> SetAsideStateSummary? {
+    /// The saved windows of This Mac (`saved`) with saved tabs whose folder
+    /// is missing (an unmounted volume), once each, in saved order:
+    /// `projectWindowsToReopen` skips them, and they stay saved as open
+    /// until it can reopen them (`ProjectWindowRegistry`).
+    func projectWindowsAwaitingTheirFolder(_ saved: [ProjectWindowValue]) -> [ProjectWindowValue] {
+        var seen = Set<ProjectWindowValue>()
+        return saved.filter { window in
+            guard seen.insert(window).inserted, !ProjectLocation.isRemoteKey(window.projectRoot) else { return false }
+            var isDirectory: ObjCBool = false
+            guard !FileManager.default.fileExists(atPath: window.projectRoot, isDirectory: &isDirectory)
+                    || !isDirectory.boolValue
+            else { return false }
+            return load(repositoryRoot: window.projectRoot, windowID: window.windowID)?.hasSessions == true
+        }
+    }
+
+    /// The projects of the windows to reopen at launch (`projectWindowsToReopen`).
+    func projectWindowRootsToReopen(remoteProjectIsKnown: (String) -> Bool = { _ in false }) -> [String] {
+        projectWindowsToReopen(remoteProjectIsKnown: remoteProjectIsKnown).map(\.window.projectRoot)
+    }
+
+    // MARK: Closed windows (#22)
+
+    /// A window the user closed while another window of its project stays
+    /// open (or is still to open at launch): its saved tabs are forgotten.
+    /// The primary's file (`windowID` nil) is written as an empty record
+    /// (no tabs, `savedAt` now), never removed: with no file the next
+    /// primary window's orphan scan would take every session kept on
+    /// purpose for its own (`OrphanedSessionCriteria`). Another window's
+    /// file is removed. Queued behind the window's last save and the ends
+    /// its close recorded; a protected file is left alone.
+    func forgetWindowState(repositoryRoot: String, windowID: UUID?) {
+        guard isEnabled else { return }
+        let fileURL = stateFileURL(repositoryRoot: repositoryRoot, windowID: windowID)
+        let now = Date()
+        queue.async {
+            guard windowID == nil else {
+                guard !self.protectedFiles.contains(fileURL.path) else { return }
+                unlink(fileURL.path)
+                return
+            }
+            self.writeLocked(RepositoryStateRecord(repositoryRoot: repositoryRoot, worktrees: [], savedAt: now), to: fileURL)
+        }
+    }
+
+    /// The project's last window closed, and it is not the primary: its
+    /// saved tabs become the primary's, for the next time the project
+    /// opens. Its record (checked to be its root's and window's) is written
+    /// under the primary's name without `windowID`, a primary file this
+    /// version cannot use (or of another root or window) moved aside first,
+    /// as `load` does; its own file is removed only once that write
+    /// succeeded, so nothing is lost when it fails. Queued as
+    /// `forgetWindowState` is.
+    func moveWindowStateToPrimary(repositoryRoot: String, windowID: UUID) {
+        guard isEnabled else { return }
+        queue.async {
+            self.moveWindowStateToPrimaryLocked(repositoryRoot: repositoryRoot, windowID: windowID)
+        }
+    }
+
+    /// `moveWindowStateToPrimary`'s work, on `queue`: true once the record
+    /// is the primary's and its own file is gone.
+    @discardableResult
+    private func moveWindowStateToPrimaryLocked(repositoryRoot: String, windowID: UUID) -> Bool {
+        let fileURL = stateFileURL(repositoryRoot: repositoryRoot, windowID: windowID)
+        let primaryURL = stateFileURL(repositoryRoot: repositoryRoot)
+        guard var state = readVersionedLocked(RepositoryStateRecord.self, from: fileURL),
+              state.repositoryRoot == repositoryRoot, state.windowID == windowID
+        else { return false }
+        if let primary = readVersionedLocked(RepositoryStateRecord.self, from: primaryURL),
+           primary.repositoryRoot != repositoryRoot || primary.windowID != nil {
+            setAsideLocked(primaryURL, label: "other-root")
+        }
+        state.windowID = nil
+        guard writeLocked(state, to: primaryURL) else { return false }
+        return unlink(fileURL.path) == 0
+    }
+
+    /// What the launch's sweep did with the state files of windows no list
+    /// named (`removeAbandonedWindowStates`).
+    struct AbandonedWindowStates: Sendable {
+        /// Removed: their frames go too.
+        var removed: [ProjectWindowValue] = []
+        /// Moved to their project's primary file: their frames go to the
+        /// primary's keys.
+        var movedToPrimary: [ProjectWindowValue] = []
+    }
+
+    /// What `removeAbandonedWindowStates` reads of a state file: never its
+    /// tabs.
+    private struct StateFileHeader: Decodable {
+        var version: Int
+        var repositoryRoot: String
+        var windowID: UUID?
+    }
+
+    /// In the background: removes the state files of This Mac's windows
+    /// other than primaries (a `windowID`, a root that is no device's key)
+    /// that `listed` (the windows the launch read as open, from a list it
+    /// could use) does not name and that were last written before `cutoff`
+    /// (when it read them), then gives `completion` what it did, on the
+    /// main queue. They are no window's: every window open this run was
+    /// listed or has saved since, a window the launch could not reopen
+    /// stays listed, and a window closed while its project stayed open
+    /// removed its own file. A crash between such a close's save and its
+    /// removal leaves one, and so does an older build, which reopens
+    /// primaries only and drops the others from the list. One of a project
+    /// no window of which is listed, whose primary file has no tabs, is
+    /// moved to the primary's file instead, the newest first, as the
+    /// project's last window's close would have (`moveWindowStateToPrimary`,
+    /// which may have failed); with a primary file this version cannot use,
+    /// it is left. Never a primary's file, a device project's (its device
+    /// may be unknown now, and its stand-in window keeps its tabs as
+    /// saved), a protected or unusable one, one under another window's
+    /// name, or any while the store is disabled. Reads only each file's
+    /// header (`StateFileHeader`), not its tabs.
+    func removeAbandonedWindowStates(
+        listed: Set<ProjectWindowValue>,
+        modifiedBefore cutoff: Date,
+        completion: @escaping @MainActor @Sendable (AbandonedWindowStates) -> Void
+    ) {
+        guard isEnabled else { return }
+        let directory = directory
+        let listedRoots = Set(listed.map(\.projectRoot))
+        queue.async {
+            let manager = FileManager.default
+            var abandoned: [(url: URL, modified: Date, window: ProjectWindowValue)] = []
+            for name in (try? manager.contentsOfDirectory(atPath: directory.path)) ?? [] where Self.isStateFileName(name) {
+                let url = directory.appendingPathComponent(name, isDirectory: false)
+                guard !self.protectedFiles.contains(url.path),
+                      let modified = (try? manager.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+                      modified < cutoff,
+                      case .usable(let header) = Self.readFile(StateFileHeader.self, from: url),
+                      header.version == RepositoryStateRecord.currentVersion,
+                      let windowID = header.windowID,
+                      !ProjectLocation.isRemoteKey(header.repositoryRoot),
+                      name == Self.stateFileName(repositoryRoot: header.repositoryRoot, windowID: windowID)
+                else { continue }
+                let window = ProjectWindowValue(projectRoot: header.repositoryRoot, windowID: windowID)
+                if !listed.contains(window) {
+                    abandoned.append((url, modified, window))
+                }
+            }
+            var result = AbandonedWindowStates()
+            for file in abandoned.sorted(by: { $0.modified > $1.modified }) {
+                let root = file.window.projectRoot
+                if !listedRoots.contains(root) {
+                    switch Self.readFile(RepositoryStateRecord.self, from: self.stateFileURL(repositoryRoot: root)) {
+                    case .usable(let primary)
+                        where primary.version == RepositoryStateRecord.currentVersion
+                            && primary.repositoryRoot == root && primary.windowID == nil && primary.hasSessions:
+                        break
+                    case .missing, .usable:
+                        if let windowID = file.window.windowID,
+                           self.moveWindowStateToPrimaryLocked(repositoryRoot: root, windowID: windowID) {
+                            result.movedToPrimary.append(file.window)
+                        }
+                        continue
+                    case .unusable:
+                        continue
+                    }
+                }
+                if unlink(file.url.path) == 0 {
+                    result.removed.append(file.window)
+                }
+            }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { completion(result) }
+            }
+        }
+    }
+
+    /// What the state file of a project window (`windowID` nil: its
+    /// primary) that this version could not use said: the one still there
+    /// (it could not be moved aside), else the newest one moved aside, while
+    /// no usable file replaced it. Nil when a usable file is there, when
+    /// none was ever set aside, or when the store is disabled.
+    func setAsideState(repositoryRoot: String, windowID: UUID? = nil) -> SetAsideStateSummary? {
         guard isEnabled else { return nil }
-        let fileURL = stateFileURL(repositoryRoot: repositoryRoot)
+        let fileURL = stateFileURL(repositoryRoot: repositoryRoot, windowID: windowID)
         let directory = directory
         return queue.sync { () -> SetAsideStateSummary? in
             let manager = FileManager.default
             if manager.fileExists(atPath: fileURL.path) {
                 if case .usable(let state) = Self.readFile(RepositoryStateRecord.self, from: fileURL),
                    state.version == RepositoryStateRecord.currentVersion,
-                   state.repositoryRoot == repositoryRoot {
+                   state.repositoryRoot == repositoryRoot,
+                   state.windowID == windowID {
                     return nil
                 }
                 let modified = (try? manager.attributesOfItem(atPath: fileURL.path))?[.modificationDate] as? Date
-                return Self.summary(of: fileURL, modified: modified, repositoryRoot: repositoryRoot)
+                return Self.summary(of: fileURL, modified: modified, repositoryRoot: repositoryRoot, windowID: windowID)
             }
             let prefix = fileURL.lastPathComponent + "."
             guard let names = try? manager.contentsOfDirectory(atPath: directory.path) else { return nil }
@@ -687,17 +941,25 @@ final class WorkspaceStateStore: @unchecked Sendable {
                     newest = (url, modified)
                 }
             }
-            return newest.flatMap { Self.summary(of: $0.url, modified: $0.modified, repositoryRoot: repositoryRoot) }
+            return newest.flatMap {
+                Self.summary(of: $0.url, modified: $0.modified, repositoryRoot: repositoryRoot, windowID: windowID)
+            }
         }
     }
 
     /// Reads what it can of a state file of any version: nil when it names
-    /// another repository.
-    private static func summary(of url: URL, modified: Date?, repositoryRoot: String) -> SetAsideStateSummary? {
+    /// another repository or another window.
+    private static func summary(
+        of url: URL,
+        modified: Date?,
+        repositoryRoot: String,
+        windowID: UUID?
+    ) -> SetAsideStateSummary? {
         guard let data = try? Data(contentsOf: url),
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return SetAsideStateSummary(savedAt: modified) }
         if let root = object["repositoryRoot"] as? String, root != repositoryRoot { return nil }
+        if (object["windowID"] as? String).flatMap(UUID.init(uuidString:)) != windowID { return nil }
         let savedAt = (object["savedAt"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
         var summary = SetAsideStateSummary(savedAt: savedAt ?? modified)
         let worktrees = (object["worktrees"] as? [Any] ?? []).compactMap { $0 as? [String: Any] }
@@ -1104,16 +1366,19 @@ final class WorkspaceStateStore: @unchecked Sendable {
         }
     }
 
-    /// Only on `queue`.
-    private func writeLocked<Value: Encodable>(_ value: Value, to fileURL: URL) {
+    /// Only on `queue`. True once `value` is written.
+    @discardableResult
+    private func writeLocked<Value: Encodable>(_ value: Value, to fileURL: URL) -> Bool {
         guard !protectedFiles.contains(fileURL.path) else {
             fputs("Cherry: not saving \(fileURL.lastPathComponent): a file this version cannot use is still there\n", stderr)
-            return
+            return false
         }
         do {
             try Self.write(value, to: fileURL)
+            return true
         } catch {
             fputs("Cherry: could not save \(fileURL.lastPathComponent): \(error)\n", stderr)
+            return false
         }
     }
 
@@ -1365,7 +1630,9 @@ final class WorkspaceRestoreCancellation {
 /// this run belongs to this run's tabs) and after the saved state it would
 /// be missing from (`createdSince`, the last save, to the second): a
 /// session created before that save and missing from it was left running on
-/// purpose (a detached tab).
+/// purpose (a detached tab). Of a project's windows (#22), each adopts only
+/// the sessions created for it (`windowID`, the `cherry.window` tag), the
+/// project's primary window only those with no window tag.
 ///
 /// Without a usable state file:
 /// - When this version moved one aside (another version's, or one that
@@ -1386,6 +1653,9 @@ struct OrphanedSessionCriteria: Sendable {
     let recoveredTabIDs: Set<UUID>
     let recoveredSessionIDs: Set<String>
     let recoveredLaunchIDs: Set<String>
+    /// The window whose orphans these are (`ProjectWindowValue.windowID`);
+    /// nil for a project's primary window.
+    let windowID: UUID?
 
     init(
         owner: String,
@@ -1393,10 +1663,12 @@ struct OrphanedSessionCriteria: Sendable {
         setAside: SetAsideStateSummary? = nil,
         sessionsToEnd: [WorkspaceSessionRecord] = [],
         createdBefore: Date,
-        host: HostedSessionHost = .local
+        host: HostedSessionHost = .local,
+        windowID: UUID? = nil
     ) {
         self.owner = owner
         self.createdBefore = createdBefore
+        self.windowID = windowID
         let records = savedState?.worktrees.flatMap(\.sessions) ?? []
         let recovered = savedState == nil ? setAside : nil
         if let savedState {
@@ -1423,6 +1695,7 @@ struct OrphanedSessionCriteria: Sendable {
         guard info.owner == owner,
               let tabID = PersistentLocalSessions.tabID(of: info, owner: owner),
               info.tags[PersistentSessionTag.project]?.isEmpty == false,
+              isCreatedForThisWindow(info),
               !namedTabIDs.contains(tabID),
               !namedSessionIDs.contains(info.id),
               !(launchID.map(namedLaunchIDs.contains) ?? false),
@@ -1439,6 +1712,14 @@ struct OrphanedSessionCriteria: Sendable {
             return nil
         }
         return created < createdBefore ? tabID : nil
+    }
+
+    /// Whether `info` was created for this window: tagged with its id, or,
+    /// for a project's primary window, with no window tag (a tag no id
+    /// reads is no window's).
+    private func isCreatedForThisWindow(_ info: HostedSessionInfo) -> Bool {
+        guard info.tags[PersistentSessionTag.window] != nil else { return windowID == nil }
+        return windowID != nil && PersistentLocalSessions.windowID(of: info) == windowID
     }
 
     /// The project folder `info` was started in, as its tab saw it.

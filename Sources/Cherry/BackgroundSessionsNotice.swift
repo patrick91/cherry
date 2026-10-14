@@ -103,15 +103,15 @@ final class BackgroundSessionsNotice {
         BackgroundSessionsNotice(model: .shared, registry: registry)
     }
 
-    /// The launch asked for its windows (`projectRoots`: the ones it
-    /// reopens): once they have opened and restored their tabs, it checks,
-    /// once per run.
-    func launchWindowsOpened(expecting projectRoots: [String] = []) {
+    /// The launch asked for its windows (`windows`: the ones it reopens):
+    /// once each of them has opened (another window of its project is not
+    /// it) and restored its tabs, it checks, once per run.
+    func launchWindowsOpened(expecting windows: [ProjectWindowValue] = []) {
         guard phase == .idle else { return }
         phase = .checking
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let content = await self.check(expecting: projectRoots)
+            let content = await self.check(expecting: windows)
             self.checked(content)
         }
     }
@@ -131,10 +131,10 @@ final class BackgroundSessionsNotice {
 
     /// What to say, if anything: the background sessions at work of a
     /// complete list that it has not told about.
-    private func check(expecting projectRoots: [String]) async -> Content? {
+    private func check(expecting windows: [ProjectWindowValue]) async -> Content? {
         try? await Task.sleep(for: settleDelay)
         let deadline = ContinuousClock.now + restoreWait
-        while projectRoots.contains(where: { !registry.hasWindow(for: $0) }), ContinuousClock.now < deadline {
+        while windows.contains(where: { !registry.hasWindow($0) }), ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(50))
         }
         for repository in registry.allRepositories {

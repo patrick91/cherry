@@ -957,10 +957,11 @@ private struct DetailPaneView: View {
         guard command.isLaunchable,
               let root = agentSettings.resolvedProject(for: projectRoot).validProjectRoot
         else { return }
-        if waitingForRestore, workspace.commandSession(named: command.name) == nil,
+        if waitingForRestore, workspace.projectCommandSession(named: command.name) == nil,
            workspace.isRestoringCommand(named: command.name) {
-            // Its saved tab may still come back: start (or show) it once
-            // the restore answered, never as a second copy.
+            // Its saved tab may still come back (in any window of the
+            // project): start (or show) it once the restore answered, never
+            // as a second copy.
             let workspace = workspace
             Task { @MainActor in
                 await workspace.waitUntilRestored(commandNamed: command.name)
@@ -968,13 +969,26 @@ private struct DetailPaneView: View {
             }
             return
         }
-        chromeState.selectTerminal()
-        if let existingSession = workspace.commandSession(named: command.name) {
+        // A command runs in one tab across the project's windows: another
+        // window's tab is shown there.
+        if let existingSession = workspace.projectCommandSession(named: command.name) {
             existingSession.restartManagedCommandIfNeeded()
-            workspace.select(existingSession)
+            show(existingSession)
         } else {
+            chromeState.selectTerminal()
             workspace.addCommandSession(command: command, projectRoot: root)
         }
+    }
+
+    /// Shows a command's tab: here when it is this window's, else in the
+    /// window of the project that has it (`revealSession(id:)`).
+    private func show(_ session: TerminalSession) {
+        guard workspace.session(withID: session.id) === session else {
+            ProjectWindowRegistry.shared.revealSession(id: session.id)
+            return
+        }
+        chromeState.selectTerminal()
+        workspace.select(session)
     }
 }
 
@@ -3643,9 +3657,13 @@ private struct SidebarCommandSection: View {
         waitingForRestore: Bool = true
     ) {
         guard command.isLaunchable, let root = settings.resolvedProject(for: projectRoot).validProjectRoot else { return }
+        // A command runs in one tab across the project's windows: a row
+        // with no tab here starts (and shows) another window's.
+        let existingSession = existingSession ?? workspace.projectCommandSession(named: command.name)
         if waitingForRestore, existingSession == nil, workspace.isRestoringCommand(named: command.name) {
-            // Its saved tab may still come back: start (or show) it once
-            // the restore answered, never as a second copy.
+            // Its saved tab may still come back (in any window of the
+            // project): start (or show) it once the restore answered, never
+            // as a second copy.
             let workspace = workspace
             Task { @MainActor in
                 await workspace.waitUntilRestored(commandNamed: command.name)
@@ -3657,12 +3675,22 @@ private struct SidebarCommandSection: View {
             if !existingSession.isRunningCommand {
                 existingSession.restart()
             }
-            chromeState.selectTerminal()
-            workspace.select(existingSession)
+            show(existingSession)
         } else {
             chromeState.selectTerminal()
             workspace.addCommandSession(command: command, projectRoot: root)
         }
+    }
+
+    /// Shows a command's tab: here when it is this window's, else in the
+    /// window of the project that has it (`revealSession(id:)`).
+    private func show(_ session: TerminalSession) {
+        guard workspace.session(withID: session.id) === session else {
+            ProjectWindowRegistry.shared.revealSession(id: session.id)
+            return
+        }
+        chromeState.selectTerminal()
+        workspace.select(session)
     }
 
     private func restart(_ command: ProjectCommandDefinition, existingSession: TerminalSession?) {

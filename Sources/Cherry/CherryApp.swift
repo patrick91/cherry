@@ -5,7 +5,8 @@ import UserNotifications
 
 final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     var openDefaultProjectWindow: (@MainActor @Sendable () -> Void)?
-    var openProjectWindow: (@MainActor @Sendable (String) -> Void)?
+    /// Opens a saved project window (the launch's), unless it is open.
+    var openProjectWindow: (@MainActor @Sendable (ProjectWindowValue) -> Void)?
     private var isQuitConfirmed = false
     /// Whether the latest quit to ask to terminate came with a quit Apple
     /// event naming a log out, restart or shut down (`kAEQuitReason`), not
@@ -715,14 +716,14 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         let open: @MainActor (LaunchWindowPlan) -> Void = { plan in
             LaunchTimeline.mark({
                 switch plan {
-                case .reopen(let roots): "window plan: reopen \(roots.count)"
+                case .reopen(let windows): "window plan: reopen \(windows.count)"
                 case .openDefault: "window plan: default window"
                 case .nothing: "window plan: nothing"
                 }
             }())
-            var reopened: [String] = []
+            var reopened: [ProjectWindowValue] = []
             switch plan {
-            case .reopen(let projectRoots):
+            case .reopen(let windows):
                 if let openProjectWindow {
                     // Off screen from the moment AppKit orders them in until
                     // their saved tabs are back (`ProjectWindowReveal`); the
@@ -735,7 +736,7 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                     // Tabs no window shows attach once the windows are up.
                     RestoredTabLaunchQueue.shared.holdBackgroundTabs(atMost: 3)
                     registry.openLaunchWindows(
-                        LaunchWindowOrder.frontFirst(projectRoots) { recency?.lastOpened($0) },
+                        LaunchWindowOrder.frontFirst(windows) { recency?.lastOpened($0.projectRoot) },
                         beforeLaterWindows: { proceed in
                             // Building the others holds the main thread,
                             // which the connection to This Mac's host needs
@@ -746,13 +747,13 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                                 waitingAtMost: .milliseconds(200), proceed
                             )
                         }
-                    ) { root in
-                        openProjectWindow(root)
+                    ) { window in
+                        openProjectWindow(window)
                     }
                     registry.whenLaunchWindowsOpened {
                         RestoredTabLaunchQueue.shared.releaseBackgroundTabs()
                     }
-                    reopened = projectRoots
+                    reopened = windows
                 } else {
                     openDefaultProjectWindow?()
                 }
@@ -768,6 +769,9 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                 MenuBarStatusItem.shared.installSoon()
             }
             Self.startUpdaterOnceLaunchWindowsOpened(registry: .shared)
+            // Saved tabs of windows no list names any more (a crash during
+            // a close, an older build), in the background.
+            ProjectWindowRegistry.shared.removeAbandonedWindowStatesOnceLaunchWindowsOpened()
         }
 
         // Windows that had tabs come back from the app's own list (AppKit
@@ -983,6 +987,9 @@ struct CherryApp: App {
         // Before anything reads the defaults: a release build's first launch
         // takes the settings of the local builds before it, once.
         LegacyDefaultsImport.runIfNeeded()
+        // A project's windows (File › New Window) are windows of their own,
+        // never AppKit tabs, not even with "Prefer tabs" or in full screen.
+        NSWindow.allowsAutomaticWindowTabbing = false
         // Decides only whether this copy may update itself; Sparkle starts
         // once the launch's windows opened (`startUpdaterOnceLaunchWindowsOpened`).
         _ = AppUpdater.shared
@@ -1001,6 +1008,9 @@ struct CherryApp: App {
         ProjectWindowRegistry.shared.remoteProjectIsKnown = { key in
             RemoteDeviceStore.shared.device(forProjectKey: key) != nil
         }
+        // File › New Window opens nothing while the launch waits for the
+        // instance lock, as a Dock click does not.
+        ProjectWindowRegistry.shared.launchAwaitsInstanceLock = { !AppInstanceLock.shared.isResolved }
         // The saved state (`configureWorkspacePersistence`) is read once the
         // instance lock is resolved, off this thread (`applicationDidFinishLaunching`):
         // reading it here would take the lock on the main thread, blocking
@@ -1076,8 +1086,11 @@ struct CherryApp: App {
     var body: some Scene {
         let _ = configureDefaultWindowOpener()
 
-        WindowGroup("Cherry", id: Self.projectWindowSceneID, for: String.self) { projectRoot in
-            ProjectWindowView(projectRoot: projectRoot.wrappedValue)
+        // A window's value names its project and, for every window but the
+        // project's primary one, its id (`ProjectWindowValue`): an open
+        // value only brings its window forward.
+        WindowGroup("Cherry", id: Self.projectWindowSceneID, for: ProjectWindowValue.self) { value in
+            ProjectWindowView(value: value.wrappedValue)
                 .preferredColorScheme(terminalSettings.appearance.preferredColorScheme)
                 .onAppear {
                     guard controlServer == nil else { return }
@@ -1121,6 +1134,18 @@ struct CherryApp: App {
                     BackgroundSessionsModel.shared.confirmEndAll()
                 }
                 .disabled(backgroundSessions.count == 0)
+            }
+            // In place of SwiftUI's New Cherry Window, whose window had no
+            // project of its own.
+            CommandGroup(replacing: .newItem) {
+                // Always enabled (the menu cannot observe the registry): a
+                // window it cannot open beeps.
+                Button("New Window") {
+                    if !ProjectWindowRegistry.shared.openAnotherWindow(from: NSApp.keyWindow) {
+                        NSSound.beep()
+                    }
+                }
+                .keyboardShortcut("n")
             }
             CommandGroup(after: .newItem) {
                 Button("Open Project…") {
@@ -1289,9 +1314,9 @@ struct CherryApp: App {
     }
 
     private func configureDefaultWindowOpener() {
-        appDelegate.openProjectWindow = { projectRoot in
-            guard !ProjectWindowRegistry.shared.hasWindow(for: projectRoot) else { return }
-            openWindow(id: Self.projectWindowSceneID, value: projectRoot)
+        appDelegate.openProjectWindow = { window in
+            guard !ProjectWindowRegistry.shared.hasWindow(window) else { return }
+            openWindow(id: Self.projectWindowSceneID, value: window)
         }
         let openDefaultProjectWindow: @MainActor @Sendable () -> Void = {
             if let projectRoot = agentSettings.projectRoot(for: nil) {
@@ -1301,6 +1326,10 @@ struct CherryApp: App {
             }
         }
         appDelegate.openDefaultProjectWindow = openDefaultProjectWindow
+        // File › New Window: another window of a project.
+        ProjectWindowRegistry.shared.newProjectWindowOpener = { window in
+            openWindow(id: Self.projectWindowSceneID, value: window)
+        }
         // Background Sessions → Open, for a project whose window is closed.
         ProjectWindowRegistry.shared.projectWindowOpener = { projectRoot in
             guard let projectRoot else {
@@ -1311,11 +1340,12 @@ struct CherryApp: App {
         }
     }
 
-    /// Brings the window of `projectRoot` forward, or opens one.
+    /// Brings `projectRoot`'s project's most recently active window
+    /// forward, or opens its primary window.
     private func showProject(_ projectRoot: String) {
         agentSettings.markProjectOpened(projectRoot)
         guard !ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) else { return }
-        openWindow(id: Self.projectWindowSceneID, value: projectRoot)
+        openWindow(id: Self.projectWindowSceneID, value: ProjectWindowValue.primary(projectRoot))
     }
 }
 
@@ -1324,17 +1354,19 @@ private struct ProjectWindowView: View {
     @ObservedObject private var agentSettings = AgentSettings.shared
     @State private var lockedProjectRoot: String?
 
-    let requestedProjectRoot: String?
+    /// The window the scene was opened for; nil for a window SwiftUI
+    /// opened by itself, a URL event's or onboarding's.
+    let requested: ProjectWindowValue?
 
-    init(projectRoot: String?) {
-        requestedProjectRoot = projectRoot
+    init(value: ProjectWindowValue?) {
+        requested = value
     }
 
     var body: some View {
         Group {
             if let projectRoot {
-                ProjectWorkspaceView(projectRoot: projectRoot)
-                    .id(projectRoot)
+                ProjectWorkspaceView(projectRoot: projectRoot, windowID: windowID, implicit: isImplicit)
+                    .id(ProjectWindowValue(projectRoot: projectRoot, windowID: windowID))
             } else {
                 ProjectOnboardingView { project in
                     lockedProjectRoot = project.root
@@ -1348,7 +1380,19 @@ private struct ProjectWindowView: View {
     }
 
     private var projectRoot: String? {
-        lockedProjectRoot ?? agentSettings.projectRoot(for: requestedProjectRoot)
+        lockedProjectRoot ?? agentSettings.projectRoot(for: requested?.projectRoot)
+    }
+
+    /// The window the value names, when its project is the one this shows.
+    private var windowID: UUID? {
+        requested.flatMap { $0.projectRoot == projectRoot ? $0.windowID : nil }
+    }
+
+    /// Opened with no value, or its value's project could not be opened:
+    /// it claims its project's primary window only while none of the
+    /// project's windows is open.
+    private var isImplicit: Bool {
+        requested.map { $0.projectRoot != projectRoot } ?? true
     }
 
     private func lockProjectRootIfNeeded() {
@@ -1364,13 +1408,23 @@ private struct ProjectWindowView: View {
         }
 
         agentSettings.markProjectOpened(projectRoot)
-        if ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) {
-            if !ProjectWindowRegistry.shared.select(deepLink, projectRoot: projectRoot) {
-                CherryDeepLinkOpenQueue.shared.enqueue(deepLink, projectRoot: projectRoot)
+        // A terminal link's tab is in the window that has it; a to-do's in
+        // the project's most recently active window.
+        let registry = ProjectWindowRegistry.shared
+        if registry.hasWindow(for: projectRoot) {
+            // Not queued: only a window being opened takes queued links
+            // (as it appears), and the next one would be another window of
+            // the project, opened later for something else.
+            if !registry.select(deepLink, projectRoot: projectRoot) {
+                _ = registry.focus(projectRoot: projectRoot)
             }
         } else {
+            // For the window that opens the project: one the launch still
+            // opens (`focus` waits for it), else its primary.
             CherryDeepLinkOpenQueue.shared.enqueue(deepLink, projectRoot: projectRoot)
-            openWindow(value: projectRoot)
+            if !registry.focus(projectRoot: projectRoot) {
+                openWindow(value: ProjectWindowValue.primary(projectRoot))
+            }
         }
     }
 }
@@ -1419,9 +1473,15 @@ private struct ProjectWorkspaceView: View {
     /// which needs AppKit's window restoration.
     @State private var storedSidebarWidth: Double
     private let sidebarWidthProjectRoot: String
+    /// Which of the project's windows this is (`ProjectWindowValue.windowID`).
+    private let windowID: UUID?
+    /// Opened with no value of its own (`ProjectWindowRegistry.register`).
+    private let isImplicit: Bool
 
-    init(projectRoot: String) {
+    init(projectRoot: String, windowID: UUID? = nil, implicit: Bool = false) {
         sidebarWidthProjectRoot = projectRoot
+        self.windowID = windowID
+        isImplicit = implicit
         _storedSidebarWidth = State(initialValue: ProjectSidebarWidthStore().width(projectRoot: projectRoot))
         // A project on another Mac runs its tabs on that Mac's host
         // (docs/specs/remote-devices.md); a device Cherry no longer knows
@@ -1439,6 +1499,7 @@ private struct ProjectWorkspaceView: View {
         }
         _repository = StateObject(wrappedValue: RepositoryWorkspace(
             projectRoot: projectRoot,
+            windowID: windowID,
             backendPolicy: hosting.profile.isThisMac ? .userSettings : .remote(hosting, windowGridWait: .standard),
             stateStore: .shared,
             // An unknown device's saved tabs stay saved as they are.
@@ -1451,7 +1512,8 @@ private struct ProjectWorkspaceView: View {
             // wait for that Mac.
             showsSavedTabsBeforeHostAnswers: hosting.profile.isThisMac
         ))
-        _todoStore = StateObject(wrappedValue: ProjectTodoStore(projectRoot: projectRoot))
+        // The project's to-dos, which all its windows share.
+        _todoStore = StateObject(wrappedValue: ProjectTodoStore.shared(projectRoot: projectRoot))
     }
 
     /// Folder name of the project, or "Cherry" for a project-less window.
@@ -1488,6 +1550,8 @@ private struct ProjectWorkspaceView: View {
         }
         .background(ProjectWindowBinder(
             projectRoot: repository.repositoryRoot,
+            windowID: windowID,
+            implicit: isImplicit,
             workspace: workspace,
             repository: repository,
             todoStore: todoStore,
@@ -1513,8 +1577,9 @@ private struct ProjectWorkspaceView: View {
             ProjectWindowRegistry.shared.activeTodoStore = todoStore
             ProjectWindowRegistry.shared.activeChromeState = chromeState
             agentSettings.markProjectOpened(workspace.projectRoot)
-            // Waits for the window's saved tabs to be restored, so a restored
-            // command tab is not started twice.
+            // Waits for the window to claim its project and for its saved
+            // tabs to be restored, so a restored command tab is not started
+            // twice; only the window that opened the project starts them.
             repository.autoStartInitialCommandsIfNeeded()
             openPendingDeepLinks()
             Task {
@@ -1526,10 +1591,11 @@ private struct ProjectWorkspaceView: View {
         }
     }
 
+    /// The project's most recently active window, else its primary one.
     private func openProject(_ project: CherryProject) {
         agentSettings.markProjectOpened(project.root)
         guard !ProjectWindowRegistry.shared.focus(projectRoot: project.root) else { return }
-        openWindow(value: project.root)
+        openWindow(value: ProjectWindowValue.primary(project.root))
     }
 
     private func openPendingDeepLinks() {

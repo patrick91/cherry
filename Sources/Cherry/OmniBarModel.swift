@@ -86,6 +86,7 @@ enum OmniScope: Hashable {
 /// (`OmniBarPerformer`).
 enum OmniMenuCommand: String, CaseIterable {
     case newTab
+    case newWindow
     case splitRight
     case detachTab
     case closeTab
@@ -496,6 +497,9 @@ struct OmniWindowContext: Equatable {
     var canSplit = false
     var canDetach = false
     var canReopenClosedTab = false
+    /// File › New Window opens another window of the window's project
+    /// (`RepositoryWorkspace.allowsAnotherWindow`).
+    var canOpenAnotherWindow = false
     var hasProject = false
     var isSidebarHidden = false
     var detachTitle = "Detach Tab"
@@ -823,6 +827,9 @@ enum OmniProviders {
     static func commands(_ sources: OmniSources) -> [OmniItem] {
         let window = sources.window
         var items: [OmniItem] = [command(.newTab, title: "New Tab", shortcut: "⌘T", symbol: "plus.rectangle")]
+        if window.canOpenAnotherWindow {
+            items.append(command(.newWindow, title: "New Window", shortcut: "⌘N", symbol: "macwindow.badge.plus"))
+        }
         if window.hasProject, !sources.agents.isEmpty {
             items.append(OmniItem(
                 id: "command:agents",

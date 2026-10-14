@@ -269,13 +269,14 @@ final class RepositoryWorkspace: ObservableObject {
         }
     }
 
-    /// A device's window: follows whether it has tabs (`updateRemoteLease`).
+    /// A device's window: follows whether it has tabs (`updateRemoteLease`),
+    /// from the tabs it opens with on (a window with no saved tabs, File ›
+    /// New Window's too, has its first one already).
     private func observeRemoteTabs() {
         guard isRemote else { return }
         remoteLeaseSubscription = workspace.$sessions
-            .dropFirst()
             .sink { [weak self] _ in
-                // `$sessions` fires before the change.
+                // `$sessions` fires now, and then before each change.
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated { self?.updateRemoteLease() }
                 }
@@ -326,6 +327,14 @@ final class RepositoryWorkspace: ObservableObject {
     /// no connection).
     var remoteHosting: PersistentHostSessions? {
         deviceHosting.flatMap { $0.profile.isKnownDevice ? $0 : nil }
+    }
+
+    /// Whether File › New Window can open another window of this project
+    /// (`ProjectWindowRegistry.openAnotherWindow`): not for a device Cherry
+    /// no longer knows, whose tabs cannot start and whose window keeps its
+    /// saved tabs exactly as saved.
+    var allowsAnotherWindow: Bool {
+        !isRemote || remoteHosting != nil
     }
 
     /// A device window's hosting, known device or not (its bar says why

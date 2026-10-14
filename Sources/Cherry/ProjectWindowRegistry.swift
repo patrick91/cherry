@@ -116,6 +116,13 @@ final class ProjectWindowRegistry {
     /// Sessions → Open reopens a closed window's project. The app sets it
     /// (SwiftUI's `openWindow`); tests give their own.
     var projectWindowOpener: (@MainActor (String?) -> Void)?
+    /// Opens the project window a value names (SwiftUI's
+    /// `openWindow(id:value:)`): File › New Window's (`openAnotherWindow`).
+    /// The app sets it; tests give their own.
+    var newProjectWindowOpener: (@MainActor (ProjectWindowValue) -> Void)?
+    /// The window each window File › New Window opens came from, by the new
+    /// window's id: it opens cascaded from it (`adoptSavedFrame`).
+    private var cascadeSources: [UUID: WeakReference<NSWindow>] = [:]
     /// Brings a project window forward (`focus`). Tests replace it, so no
     /// test window comes on screen or takes focus from the user's apps.
     var bringWindowForward: @MainActor (NSWindow) -> Void = { window in
@@ -1079,24 +1086,55 @@ final class ProjectWindowRegistry {
     }
 
     /// Gives a newly claimed project window the frame saved for it (by its
-    /// key: a project's primary window's or another one's), and saves the
-    /// frame from then on. True when the window was in full screen when it
-    /// was saved and is not now: the caller puts it back.
+    /// key: a project's primary window's or another one's), or, for a window
+    /// File › New Window opened, a frame cascaded from the window it came
+    /// from, and saves the frame from then on. True when the window was in
+    /// full screen when it was saved and is not now: the caller puts it
+    /// back.
     @discardableResult
     private func adoptSavedFrame(of window: NSWindow, key: ProjectWindowKey) -> Bool {
         windowFrameSavers.removeValue(forKey: key)
+        let cascadeSource = key.windowID.flatMap { cascadeSources.removeValue(forKey: $0)?.object }
+        let restored = windowFrameStore?.restore(window, projectRoot: key.root, windowID: key.windowID) ?? false
+        let cascaded = !restored && cascadeSource.map { cascade(window, from: $0) } == true
         guard let windowFrameStore else { return false }
-        windowFrameStore.restore(window, projectRoot: key.root, windowID: key.windowID)
         let restoresFullScreen = windowFrameStore.isFullScreen(projectRoot: key.root, windowID: key.windowID)
             && !window.styleMask.contains(.fullScreen)
-        windowFrameSavers[key] = ProjectWindowFrameSaver(
+        let saver = ProjectWindowFrameSaver(
             window: window,
             projectRoot: key.root,
             windowID: key.windowID,
             store: windowFrameStore,
             isTerminating: { [weak self] in self?.isTerminating ?? false }
         )
+        windowFrameSavers[key] = saver
+        // Where it opened is where it comes back, moved or not.
+        if cascaded { saver.saveNow() }
         return restoresFullScreen
+    }
+
+    /// Puts a window File › New Window opened one step down and to the
+    /// right of `source` at its size (AppKit keeps it on screen), windowed:
+    /// a source in full screen gives the frame it goes back to, when one
+    /// was saved. False, leaving the window where AppKit put it, when there
+    /// is none. The source never moves.
+    private func cascade(_ window: NSWindow, from source: NSWindow) -> Bool {
+        let sourceKey = key(of: source)
+        let sourceIsFullScreen = source.styleMask.contains(.fullScreen)
+            || sourceKey.map { windowFrameStore?.isFullScreen(projectRoot: $0.root, windowID: $0.windowID) == true } == true
+        if sourceIsFullScreen {
+            // Its frame is the screen's.
+            guard let sourceKey,
+                  let descriptor = windowFrameStore?.frameDescriptor(projectRoot: sourceKey.root, windowID: sourceKey.windowID)
+            else { return false }
+            window.setFrame(from: descriptor)
+        } else {
+            window.setFrame(source.frame, display: false)
+        }
+        // The first call keeps it at the source's top left (on screen) and
+        // returns the next step, where the second puts it.
+        window.cascadeTopLeft(from: window.cascadeTopLeft(from: NSPoint(x: window.frame.minX, y: window.frame.maxY)))
+        return true
     }
 
     /// Forgets `window`, registered for `projectRoot`'s project (by
@@ -1114,6 +1152,59 @@ final class ProjectWindowRegistry {
                 ProjectWindowRegistry.shared.refreshActiveWindow()
             }
         }
+    }
+
+    // MARK: New Window
+
+    /// File › New Window (⌘N, the Omni bar): opens another window of the
+    /// project of `source`, or of the project window active last when
+    /// `source` is none, cascaded from it (`adoptSavedFrame`). The new window
+    /// has a fresh id, so it restores nothing and looks for no orphans: it
+    /// opens one new terminal tab in the project's folder, and is saved as
+    /// it claims its key. Its project is the window's own
+    /// (`RepositoryWorkspace.repositoryRoot`), never
+    /// `AgentSettings.projectRoot(for:)`, which never names another Mac's
+    /// project. With no project window open, the default project's window
+    /// (`projectWindowOpener(nil)`, as a Dock click does). False, opening
+    /// nothing, for a window of a device Cherry no longer knows
+    /// (`RepositoryWorkspace.allowsAnotherWindow`), and while the app quits.
+    @discardableResult
+    func openAnotherWindow(from source: NSWindow?) -> Bool {
+        pruneStaleWindows()
+        guard !isTerminating else { return false }
+        guard let key = anotherWindowSource(source) else {
+            guard let projectWindowOpener else { return false }
+            projectWindowOpener(nil)
+            return true
+        }
+        guard let entry = entries[key], let repository = entry.repository, repository.allowsAnotherWindow,
+              let newProjectWindowOpener
+        else { return false }
+        let windowID = UUID()
+        cascadeSources = cascadeSources.filter { $0.value.object != nil }
+        if let window = entry.window {
+            cascadeSources[windowID] = WeakReference(window)
+        }
+        // Transparent from AppKit's first placement until it registers at
+        // its cascaded frame, never shown at the default one first; keys
+        // typed meanwhile wait for it.
+        launchWindowCover?.expect(1)
+        newProjectWindowOpener(ProjectWindowValue(projectRoot: repository.repositoryRoot, windowID: windowID))
+        return true
+    }
+
+    /// Whether File › New Window opens a window now (`openAnotherWindow`).
+    func canOpenAnotherWindow(from source: NSWindow?) -> Bool {
+        pruneStaleWindows()
+        guard !isTerminating else { return false }
+        guard let key = anotherWindowSource(source) else { return projectWindowOpener != nil }
+        return entries[key]?.repository?.allowsAnotherWindow == true && newProjectWindowOpener != nil
+    }
+
+    /// The window File › New Window opens another window of the project of:
+    /// `source`, or the project window active last.
+    private func anotherWindowSource(_ source: NSWindow?) -> ProjectWindowKey? {
+        key(of: source) ?? windowsMostRecentFirst().first
     }
 
     // MARK: Closing a window

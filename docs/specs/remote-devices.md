@@ -275,10 +275,17 @@ What exists (`Sources/Cherry/RemoteDevices.swift`, `RemoteDeviceCheck.swift`,
   (`isRemote`: no git, no auto-start commands; the sidebar
   hides project commands; Open in an editor is hidden), marks the hosting
   in use while open, holds a lease on the device's control connection
-  while the window has tabs, and starts `HostedReconnects` wake/network
-  monitoring. The sidebar header reads "<project> @ <Mac>" on one line,
-  the Mac's name in its colour (`RemoteDeviceHeaderAddress`), dimmed while
-  its control reconnects and grey with a warning when the user has to act
+  while the window has tabs (from the tab a window with no saved tabs
+  opens with), and starts `HostedReconnects` wake/network monitoring. A
+  device's project can have several windows (File › New Window, ⌘N, from
+  the window's own key, never This Mac's last project): they share the
+  device's hosting, each marks it in use and holds its own lease, and
+  closing one leaves the others' connection up; a window of a device the
+  store no longer knows has no New Window
+  (`RepositoryWorkspace.allowsAnotherWindow`). The sidebar header reads
+  "<project> @ <Mac>" on one line, the Mac's name in its colour
+  (`RemoteDeviceHeaderAddress`), dimmed while its control reconnects and
+  grey with a warning when the user has to act
   (`RemoteDeviceHeaderStatus`); the window title is the same. Tab rows do
   not repeat the Mac (every tab of the window runs there). The restore
   routes records of the window's own host (`localSessions.profile.host`,

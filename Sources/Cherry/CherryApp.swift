@@ -987,6 +987,9 @@ struct CherryApp: App {
         // Before anything reads the defaults: a release build's first launch
         // takes the settings of the local builds before it, once.
         LegacyDefaultsImport.runIfNeeded()
+        // A project's windows (File › New Window) are windows of their own,
+        // never AppKit tabs, not even with "Prefer tabs" or in full screen.
+        NSWindow.allowsAutomaticWindowTabbing = false
         // Decides only whether this copy may update itself; Sparkle starts
         // once the launch's windows opened (`startUpdaterOnceLaunchWindowsOpened`).
         _ = AppUpdater.shared
@@ -1128,6 +1131,18 @@ struct CherryApp: App {
                     BackgroundSessionsModel.shared.confirmEndAll()
                 }
                 .disabled(backgroundSessions.count == 0)
+            }
+            // In place of SwiftUI's New Cherry Window, whose window had no
+            // project of its own.
+            CommandGroup(replacing: .newItem) {
+                // Always enabled (the menu cannot observe the registry): a
+                // window it cannot open beeps.
+                Button("New Window") {
+                    if !ProjectWindowRegistry.shared.openAnotherWindow(from: NSApp.keyWindow) {
+                        NSSound.beep()
+                    }
+                }
+                .keyboardShortcut("n")
             }
             CommandGroup(after: .newItem) {
                 Button("Open Project…") {
@@ -1308,6 +1323,10 @@ struct CherryApp: App {
             }
         }
         appDelegate.openDefaultProjectWindow = openDefaultProjectWindow
+        // File › New Window: another window of a project.
+        ProjectWindowRegistry.shared.newProjectWindowOpener = { window in
+            openWindow(id: Self.projectWindowSceneID, value: window)
+        }
         // Background Sessions → Open, for a project whose window is closed.
         ProjectWindowRegistry.shared.projectWindowOpener = { projectRoot in
             guard let projectRoot else {

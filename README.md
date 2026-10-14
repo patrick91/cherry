@@ -50,6 +50,12 @@ own: open a worktree's folder as a project (the Omni bar completes paths
 typed with `~/` or `/`). Tabs saved by a build that had worktree spaces come
 back in their project's window.
 
+**File › New Window** (**Cmd-N**) opens another window of the front window's
+project, with its own tabs, splits and selection and one new terminal in the
+project's folder; its to-dos and commands are the project's, shared by its
+windows, and every window comes back when Cherry opens again. A project on
+another Mac can have several windows too.
+
 ### Pasting images
 
 A terminal takes text only. Pasting (**Cmd-V**) an image with no text on the

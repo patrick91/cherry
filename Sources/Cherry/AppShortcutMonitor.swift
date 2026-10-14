@@ -26,6 +26,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
         case toggleOmniBarActions
         case toggleSidebar
         case addSession
+        case openAnotherWindow
         case splitDuplicate
         case focusPreviousPane
         case focusNextPane
@@ -39,15 +40,17 @@ struct AppShortcutMonitor: NSViewRepresentable {
     /// The app shortcut a key press in a project window is, taken here so
     /// that the terminal never sees it (Ghostty's own ⌘D and ⌘⇧D split its
     /// surface). `charactersIgnoringModifiers` keeps Shift: ⌘⇧D arrives as
-    /// "D". ⌘Z brings back the window's latest closed or detached tab
-    /// (`ClosedTabHistory`) unless a text view has the keyboard
-    /// (`textHasKeyboard`: a to-do's editor, a search or name field), whose
-    /// own undo it is then; the terminal program never gets it. Caps Lock,
-    /// and the keypad and function flags AppKit adds to some keys, are not
-    /// held modifiers: with Caps Lock on, ⌘D is still Detach Tab. ⌘P opens
-    /// or closes the Omni bar and ⌘O opens it on Projects; ⌘K is the Omni
-    /// bar's action list only while it is open (`omniBarIsOpen`), else it
-    /// is left to the menu (Clear Scrollback) and the terminal.
+    /// "D". ⌘N is New Window (`ProjectWindowRegistry.openAnotherWindow`),
+    /// never Ghostty's own new window. ⌘Z brings back the window's latest
+    /// closed or detached tab (`ClosedTabHistory`) unless a text view has
+    /// the keyboard (`textHasKeyboard`: a to-do's editor, a search or name
+    /// field), whose own undo it is then; the terminal program never gets
+    /// it. Caps Lock, and the keypad and function flags AppKit adds to some
+    /// keys, are not held modifiers: with Caps Lock on, ⌘D is still Detach
+    /// Tab. ⌘P opens or closes the Omni bar and ⌘O opens it on Projects; ⌘K
+    /// is the Omni bar's action list only while it is open
+    /// (`omniBarIsOpen`), else it is left to the menu (Clear Scrollback) and
+    /// the terminal.
     nonisolated static func shortcutAction(
         charactersIgnoringModifiers: String?,
         modifiers: NSEvent.ModifierFlags,
@@ -79,6 +82,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
             return .toggleSidebar
         case "t":
             return .addSession
+        case "n":
+            return .openAnotherWindow
         case "d":
             return .detachSelectedSessionOrWindow
         case "[":
@@ -246,6 +251,10 @@ struct AppShortcutMonitor: NSViewRepresentable {
                 chromeState?.toggleSidebar()
             case .addSession:
                 workspace?.addSession()
+            case .openAnotherWindow:
+                if !ProjectWindowRegistry.shared.openAnotherWindow(from: window) {
+                    NSSound.beep()
+                }
             case .splitDuplicate:
                 workspace?.splitDuplicateActiveTerminal()
             case .focusPreviousPane:

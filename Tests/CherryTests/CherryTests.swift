@@ -8126,6 +8126,15 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         charactersIgnoringModifiers: "w",
         modifiers: [.command]
     ) == .closeSelectedSessionOrWindow)
+    // ⌘N is New Window, never the terminal's; ⌘⇧N is not Cherry's.
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "n",
+        modifiers: [.command]
+    ) == .openAnotherWindow)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "N",
+        modifiers: [.command, .shift]
+    ) == nil)
     #expect(AppShortcutMonitor.shortcutAction(
         charactersIgnoringModifiers: "D",
         modifiers: [.command, .shift, .option]

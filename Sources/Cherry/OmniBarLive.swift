@@ -384,6 +384,7 @@ enum OmniBarGathering {
         context.canSplit = selected.map { $0.kind == .terminal && workspace.canAddSplitPane(to: $0.id) } ?? false
         context.canDetach = chromeState.isShowingTerminalContent && selected.map(SessionCloseCoordinator.canDetach) == true
         context.canReopenClosedTab = !chromeState.closedTabs.entries.isEmpty
+        context.canOpenAnotherWindow = window.repository.allowsAnotherWindow
         context.hasProject = settings.resolvedProject(for: window.projectRoot).validProjectRoot != nil
         context.isSidebarHidden = chromeState.isSidebarHidden
         context.detachTitle = inSplit ? "Detach Pane" : "Detach Tab"
@@ -510,6 +511,9 @@ struct OmniBarPerformer {
         case .newTab:
             chromeState.selectTerminal()
             workspace.addSession()
+        case .newWindow:
+            // This window's project, never the project window active last.
+            guard let appWindow, registry.openAnotherWindow(from: appWindow) else { return NSSound.beep() }
         case .splitRight:
             _ = workspace.splitDuplicateActiveTerminal()
         case .detachTab:

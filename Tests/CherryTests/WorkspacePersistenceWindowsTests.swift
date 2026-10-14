@@ -1006,3 +1006,243 @@ private final class TestWindows {
     #expect(registry.chromeState(for: second.window) === chromes[1])
     #expect(registry.chromeState(for: root.path) === chromes[1])
 }
+
+// MARK: - File › New Window
+
+/// File › New Window (⌘N, the menu, the Omni bar) opens another window of
+/// the project of the window it is chosen in: a fresh id, and the project
+/// as that window names it (`repositoryRoot`, here the link it was opened
+/// through), whichever project window was active last. Chosen with no
+/// project window key, it opens one of the project window active last;
+/// with none open, the default project's window. The window it opens
+/// restores nothing, looks for no orphans and starts no auto-start command:
+/// one new terminal tab in the project's folder, saved as it claims its
+/// key. A window of a device Cherry no longer knows opens none, nor does a
+/// quitting app.
+@Test @MainActor func newWindowOpensAnotherWindowOfTheKeyWindowsProjectWithOneNewTerminal() async throws {
+    let harness = try PersistentHarness()
+    harness.fake.pendingHolders = 0
+    let root = try canonicalTemporaryDirectory("cherry-new-window")
+    let elsewhere = try canonicalTemporaryDirectory("cherry-new-window-elsewhere")
+    let links = try canonicalTemporaryDirectory("cherry-new-window-links")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-new-window-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let link = links.appendingPathComponent("app")
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: root)
+    let registry = ProjectWindowRegistry()
+    registry.bringWindowForward = { _ in }
+    registry.configureWorkspacePersistence(store: store)
+    var opened: [ProjectWindowValue] = []
+    var defaultWindowsOpened = 0
+    registry.newProjectWindowOpener = { opened.append($0) }
+    registry.projectWindowOpener = { projectRoot in
+        #expect(projectRoot == nil)
+        defaultWindowsOpened += 1
+    }
+    var restored: [String] = []
+    var autoStarted: [String] = []
+    func repository(_ projectRoot: String, windowID: UUID? = nil, name: String) -> RepositoryWorkspace {
+        RepositoryWorkspace(
+            projectRoot: projectRoot,
+            windowID: windowID,
+            backendPolicy: harness.policy,
+            stateStore: store,
+            sessionRestorer: { request in
+                restored.append(name)
+                return await harness.restorer(request)
+            },
+            autoStartCommands: { _ in
+                autoStarted.append(name)
+                return []
+            },
+            restoredTabLaunchQueue: RestoredTabLaunchQueue()
+        )
+    }
+    var registered: [(window: NSWindow, repository: RepositoryWorkspace)] = []
+    func claim(_ repository: RepositoryWorkspace, window: NSWindow = testWindow()) -> NSWindow {
+        #expect(registry.register(
+            window: window, projectRoot: repository.repositoryRoot, windowID: repository.windowID,
+            workspace: repository.workspace, repository: repository, todoStore: nil, chromeState: nil
+        ))
+        registered.append((window, repository))
+        // Its view asks for auto-start as it appears; its binder claims it.
+        repository.autoStartInitialCommandsIfNeeded()
+        repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
+        return window
+    }
+    defer {
+        for (window, repository) in registered {
+            registry.unregister(window: window, projectRoot: repository.repositoryRoot)
+            repository.closeAllSessions(intent: .windowClosed)
+        }
+        harness.cleanUp()
+        for directory in [root, elsewhere, links, storeDirectory] { try? FileManager.default.removeItem(at: directory) }
+    }
+
+    // No project window is open: the default project's window, as a Dock
+    // click opens it.
+    #expect(registry.canOpenAnotherWindow(from: nil))
+    #expect(registry.openAnotherWindow(from: nil))
+    #expect(defaultWindowsOpened == 1)
+    #expect(opened.isEmpty)
+
+    // The project's window (it opened the project: its auto-start ran),
+    // then another project's, active last.
+    let primary = repository(link.path, name: "primary")
+    let primaryWindow = claim(primary)
+    let other = repository(elsewhere.path, name: "elsewhere")
+    let otherWindow = claim(other)
+    registry.activateWindow(otherWindow, workspace: other.workspace, todoStore: nil, chromeState: nil)
+    #expect(await eventually { Set(autoStarted) == ["primary", "elsewhere"] })
+
+    // Chosen in the project's window: another window of its project, a
+    // fresh id each time.
+    #expect(registry.canOpenAnotherWindow(from: primaryWindow))
+    #expect(registry.openAnotherWindow(from: primaryWindow))
+    #expect(registry.openAnotherWindow(from: primaryWindow))
+    #expect(opened.map(\.projectRoot) == [primary.repositoryRoot, primary.repositoryRoot])
+    #expect(primary.repositoryRoot == repositoryKey(link))
+    #expect(opened.allSatisfy { $0.windowID != nil })
+    #expect(opened[0].windowID != opened[1].windowID)
+    // Chosen with no project window key (Settings, no window at all): the
+    // project window active last.
+    #expect(registry.openAnotherWindow(from: testWindow()))
+    #expect(registry.openAnotherWindow(from: nil))
+    #expect(opened.dropFirst(2).map(\.projectRoot) == [other.repositoryRoot, other.repositoryRoot])
+    #expect(defaultWindowsOpened == 1)
+
+    // The window its scene builds for the first value: the scene resolves
+    // the value's project to itself, so the window keeps its id. A session
+    // tagged with its id is no tab's of it: it looks for none.
+    let value = opened[0]
+    let windowID = try #require(value.windowID)
+    #expect(AgentSettings.shared.projectRoot(for: value.projectRoot) == value.projectRoot)
+    harness.fake.sessions = [HostedSessionInfo(
+        id: "s-tagged", name: "Orphan", cwd: root.path, pid: 300, owner: "CherryTests",
+        tags: [
+            PersistentSessionTag.tab: UUID().uuidString,
+            PersistentSessionTag.kind: "terminal",
+            PersistentSessionTag.project: root.path,
+            PersistentSessionTag.window: windowID.uuidString,
+        ],
+        createdAt: 1_000_000
+    )]
+    let window = repository(value.projectRoot, windowID: windowID, name: "new")
+    _ = claim(window)
+    #expect(!window.opensProject)
+    #expect(!window.isAwaitingInitialRestore)
+    #expect(!window.isRestoringSessions)
+    // One new terminal tab, in the project's folder.
+    let tab = try #require(window.workspace.sessions.first)
+    #expect(window.workspace.sessions.count == 1)
+    #expect(tab.kind == .terminal)
+    #expect(tab.workingDirectory == root.path)
+    #expect(await harness.waitUntilAttached(tab))
+    // Saved as it claimed: its own file, and the open window list.
+    store.flush()
+    let saved = try #require(store.load(repositoryRoot: primary.repositoryRoot, windowID: windowID))
+    #expect(saved.worktree(root: root.path)?.sessions.map(\.id) == [tab.id])
+    #expect(store.loadOpenProjectWindows().contains(value))
+    // Nothing restored, adopted or auto-started.
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(!restored.contains("new"))
+    #expect(harness.hosting.owningTab(of: "s-tagged") == nil)
+    #expect(window.workspace.sessions.map(\.id) == [tab.id])
+    #expect(!autoStarted.contains("new"))
+
+    // A window of a device Cherry no longer knows opens none.
+    let unknownKey = ProjectLocation.remote(deviceID: UUID(), path: "/Users/me/app").key
+    let unknown = RepositoryWorkspace(
+        projectRoot: unknownKey,
+        backendPolicy: .remote(
+            RemoteDeviceStore.unavailableHosting(for: unknownKey, reason: "Not among your devices.", instanceLock: nil),
+            settings: { .native }, hostReconnects: nil
+        ),
+        sessionRestorer: RemoteDeviceStore.keepingRestorer,
+        autoStartCommands: { _ in [] }
+    )
+    let unknownWindow = claim(unknown)
+    let openedBefore = opened.count
+    #expect(!unknown.allowsAnotherWindow)
+    #expect(!registry.canOpenAnotherWindow(from: unknownWindow))
+    #expect(!registry.openAnotherWindow(from: unknownWindow))
+    #expect(opened.count == openedBefore)
+
+    // Nor does a quitting app.
+    registry.prepareForTermination()
+    #expect(!registry.canOpenAnotherWindow(from: primaryWindow))
+    #expect(!registry.openAnotherWindow(from: primaryWindow))
+    #expect(opened.count == openedBefore)
+    registry.cancelTermination()
+}
+
+/// A window File › New Window opens comes one step down and to the right
+/// of the window it came from, at its size, and windowed: from a window in
+/// full screen, at the frame that window goes back to. Its frame is saved
+/// under its own key as it opens; the window it came from never moves.
+@Test @MainActor func aNewWindowCascadesFromTheWindowItCameFrom() throws {
+    let suite = "CherryTests.NewWindowCascade.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    let root = try canonicalTemporaryDirectory("cherry-new-window-cascade")
+    defer {
+        defaults.removePersistentDomain(forName: suite)
+        try? FileManager.default.removeItem(at: root)
+    }
+    let frames = ProjectWindowFrameStore(defaults: defaults)
+    let windows = TestWindows()
+    defer { windows.closeAll() }
+    let registry = windows.registry
+    registry.configureWindowFrames(frames)
+    var enteredFullScreen = 0
+    registry.enterFullScreen = { _, done in
+        enteredFullScreen += 1
+        done()
+    }
+    var opened: [ProjectWindowValue] = []
+    registry.newProjectWindowOpener = { opened.append($0) }
+    let repository = RepositoryWorkspace(projectRoot: root.path)
+    defer { repository.closeAllSessions(intent: .windowClosed) }
+    let sourceFrame = NSRect(x: 220, y: 240, width: 720, height: 460)
+    let source = makeResizableWindow(sourceFrame)
+    #expect(registry.register(
+        window: source, projectRoot: root.path, workspace: repository.workspace, repository: repository,
+        todoStore: nil, chromeState: nil
+    ))
+    defer { registry.unregister(window: source, projectRoot: root.path) }
+
+    /// Opens a window for the value the last New Window asked for, as its
+    /// scene does.
+    func openNewWindow() throws -> (window: NSWindow, value: ProjectWindowValue) {
+        let value = try #require(opened.last)
+        let window = makeResizableWindow(NSRect(x: 0, y: 0, width: 320, height: 200))
+        #expect(windows.open(value, window: window).claimed)
+        return (window, value)
+    }
+    func expectCascaded(_ window: NSWindow, from frame: NSRect, _ comment: Comment) {
+        #expect(window.frame.size == frame.size, comment)
+        #expect(window.frame.minX > frame.minX && window.frame.minX < frame.minX + 64, comment)
+        #expect(window.frame.maxY < frame.maxY && window.frame.maxY > frame.maxY - 64, comment)
+    }
+
+    #expect(registry.openAnotherWindow(from: source))
+    let first = try openNewWindow()
+    expectCascaded(first.window, from: sourceFrame, "from a window")
+    #expect(source.frame == sourceFrame)
+    #expect(frames.frameDescriptor(projectRoot: root.path, windowID: first.value.windowID) == first.window.frameDescriptor)
+    #expect(!frames.isFullScreen(projectRoot: root.path, windowID: first.value.windowID))
+
+    // The window it came from is in full screen: its frame is the screen's,
+    // and the frame it goes back to is the one saved.
+    let windowed = NSRect(x: 160, y: 180, width: 640, height: 420)
+    let restore = makeResizableWindow(windowed)
+    defaults.set(restore.frameDescriptor, forKey: ProjectWindowFrameStore.key(projectRoot: root.path))
+    restore.close()
+    frames.setFullScreen(true, projectRoot: root.path)
+    #expect(registry.openAnotherWindow(from: source))
+    let second = try openNewWindow()
+    expectCascaded(second.window, from: windowed, "from a window in full screen")
+    #expect(!second.window.styleMask.contains(.fullScreen))
+    #expect(!frames.isFullScreen(projectRoot: root.path, windowID: second.value.windowID))
+    #expect(enteredFullScreen == 0)
+    #expect(source.frame == sourceFrame)
+}

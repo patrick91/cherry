@@ -130,7 +130,8 @@ host and `cherry doctor` checks it for problems and says how to fix them.
 
 Sessions of windows or tabs you closed that keep running are listed under
 **Background sessions** in the Cherry menu bar icon: click one to show it in a
-tab (its project's window opens again with its other tabs), or hover and click
+tab (in its project's window, which opens again with its other tabs when you
+had closed it), or hover and click
 **End** twice to stop it (**Remove** for one that already ended). **Cherry →
 End Background Sessions…**, **End All…** in that list and **Settings ›
 Sessions › Background Sessions** end them all after asking. When Cherry opens

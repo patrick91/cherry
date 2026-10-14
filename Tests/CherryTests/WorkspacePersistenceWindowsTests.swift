@@ -406,6 +406,91 @@ private func makeResizableWindow(_ frame: NSRect) -> NSWindow {
     #expect(primaryState.worktree(root: root.path)?.sessions.map(\.id) == [savedPrimary.id, primaryTab.id])
 }
 
+// MARK: - Abandoned files
+
+/// Once the launch's windows opened, the saved tabs of This Mac's windows
+/// other than primaries that the launch did not read as open and that were
+/// written before it (a crash between a close's save and its removal, a run
+/// of an older build) are removed, with their frames. Never before (their
+/// windows load on the store's queue), and never a listed window's, one
+/// written since, a primary's, a device project's or one this version
+/// cannot use.
+@Test @MainActor func abandonedFilesOfOtherWindowsAreRemovedOnceTheLaunchsWindowsOpened() async throws {
+    let root = try canonicalTemporaryDirectory("cherry-abandoned-windows")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-abandoned-windows-store")
+    let suite = "CherryTests.AbandonedWindowFrames.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: storeDirectory)
+        defaults.removePersistentDomain(forName: suite)
+    }
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let frames = ProjectWindowFrameStore(defaults: defaults)
+    let key = repositoryKey(root)
+    let device = ProjectLocation.remote(deviceID: UUID(), path: "/Users/me/app").key
+    let listed = ProjectWindowValue(projectRoot: key, windowID: UUID())
+    let abandoned = ProjectWindowValue(projectRoot: key, windowID: UUID())
+    let unusable = ProjectWindowValue(projectRoot: key, windowID: UUID())
+    let deviceWindow = ProjectWindowValue(projectRoot: device, windowID: UUID())
+    let newer = ProjectWindowValue(projectRoot: key, windowID: UUID())
+    func fileURL(_ window: ProjectWindowValue) -> URL {
+        store.stateFileURL(repositoryRoot: window.projectRoot, windowID: window.windowID)
+    }
+    // The last run's files, from an hour before this launch.
+    let saved: [ProjectWindowValue] = [.primary(key), listed, abandoned, unusable, deviceWindow]
+    for (index, window) in saved.enumerated() {
+        var record = state(window.projectRoot, windowID: window.windowID, sessions: [boundRecord(sessionID: "s-\(index)")])
+        if window == unusable { record.version = RepositoryStateRecord.currentVersion + 1 }
+        try WorkspaceStateStore.write(record, to: fileURL(window))
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-3_600)], ofItemAtPath: fileURL(window).path)
+    }
+    for window in [listed, abandoned] {
+        let windowID = try #require(window.windowID)
+        defaults.set("0 0 640 400 0 0 1440 900 ", forKey: ProjectWindowFrameStore.key(projectRoot: root.path, windowID: windowID))
+        frames.setFullScreen(true, projectRoot: root.path, windowID: windowID)
+    }
+    // The list it read names the primary and one other window.
+    store.saveOpenProjectWindows([listed, .primary(key)], synchronously: true)
+
+    let windows = TestWindows()
+    defer { windows.closeAll() }
+    let registry = windows.registry
+    registry.windowRevealMaximumWait = .seconds(60)
+    registry.configureWindowFrames(frames)
+    registry.configureWorkspacePersistence(store: store)
+    // A window opened since (File › New Window) saved as it claimed.
+    store.saveSynchronously(state(key, windowID: newer.windowID, sessions: [boundRecord(sessionID: "s-newer")]))
+    let reopened = registry.takeProjectWindowsToReopen()
+    #expect(reopened == [listed, .primary(key)])
+
+    registry.openLaunchWindows([listed]) { _ in }
+    registry.removeAbandonedWindowStatesOnceLaunchWindowsOpened()
+    try await Task.sleep(for: .milliseconds(200))
+    store.flush()
+    #expect(FileManager.default.fileExists(atPath: fileURL(abandoned).path))
+
+    // The launch's window registers and shows: the launch's windows opened.
+    windows.open(listed)
+    #expect(await eventually {
+        defaults.object(forKey: ProjectWindowFrameStore.fullScreenKey(projectRoot: root.path, windowID: abandoned.windowID)) == nil
+    })
+    #expect(!FileManager.default.fileExists(atPath: fileURL(abandoned).path))
+    #expect(frames.frameDescriptor(projectRoot: root.path, windowID: abandoned.windowID) == nil)
+    for window in [ProjectWindowValue.primary(key), listed, unusable, deviceWindow, newer] {
+        #expect(FileManager.default.fileExists(atPath: fileURL(window).path), "\(window)")
+    }
+    #expect(frames.frameDescriptor(projectRoot: root.path, windowID: listed.windowID) != nil)
+    #expect(frames.isFullScreen(projectRoot: root.path, windowID: listed.windowID))
+
+    // Once per run.
+    try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-3_600)], ofItemAtPath: fileURL(newer).path)
+    registry.removeAbandonedWindowStatesOnceLaunchWindowsOpened()
+    try await Task.sleep(for: .milliseconds(200))
+    store.flush()
+    #expect(FileManager.default.fileExists(atPath: fileURL(newer).path))
+}
+
 // MARK: - The registry
 
 /// The session the fake host lists for a saved tab.

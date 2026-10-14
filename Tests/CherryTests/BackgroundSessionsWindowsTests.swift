@@ -11,7 +11,12 @@ import Testing
 // MARK: - Helpers
 
 @MainActor
-private func makeModel(_ harness: PersistentHarness, registry: ProjectWindowRegistry) -> BackgroundSessionsModel {
+private func makeModel(
+    _ harness: PersistentHarness,
+    registry: ProjectWindowRegistry,
+    endedSessionGrace: TimeInterval = BackgroundSessionsModel.defaultEndedSessionGrace,
+    now: @escaping @MainActor () -> Date = { Date() }
+) -> BackgroundSessionsModel {
     BackgroundSessionsModel(
         localSessions: harness.hosting,
         registry: registry,
@@ -20,6 +25,8 @@ private func makeModel(_ harness: PersistentHarness, registry: ProjectWindowRegi
         presentAlert: { _, _, _ in Issue.record("Nothing asks in these tests") },
         postNotification: { _ in },
         notifiesProgramState: { _ in false },
+        endedSessionGrace: endedSessionGrace,
+        now: now,
         isAppActive: { true }
     )
 }
@@ -233,4 +240,139 @@ private func register(
     #expect(await eventually { registry.pendingLaunchWindows.isEmpty })
     model.refresh()
     #expect(model.sessions.contains { $0.id == "s-other" })
+}
+
+// MARK: - Closing one of a project's windows
+
+/// A window closed while another of its project stays open forgets its
+/// saved tabs: the sessions its close kept running are in the background,
+/// and Open shows each in the project's window still open, as its own tab.
+@Test @MainActor func sessionsKeptByClosingOneOfTwoWindowsAreListedAndOpenIntoTheOther() async throws {
+    let harness = try PersistentHarness()
+    let root = try canonicalTemporaryDirectory("cherry-background-closed-window")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-closed-window-store")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    let registry = ProjectWindowRegistry()
+    registry.bringWindowForward = { _ in }
+    registry.windowRevealMaximumWait = nil
+    registry.setWorkspaceStateStoreForTesting(store)
+    let model = makeModel(harness, registry: registry)
+    let repositories = [nil, UUID()].map { windowID in
+        RepositoryWorkspace(
+            projectRoot: root.path,
+            windowID: windowID,
+            backendPolicy: harness.policy,
+            stateStore: store,
+            sessionRestorer: harness.restorer,
+            autoStartCommands: { _ in [] },
+            restoredTabLaunchQueue: RestoredTabLaunchQueue()
+        )
+    }
+    let windows = [testWindow(), testWindow()]
+    defer {
+        model.stop()
+        for (window, repository) in zip(windows, repositories) {
+            registry.unregister(window: window, projectRoot: root.path)
+            repository.closeAllSessions(intent: .windowClosed)
+        }
+        store.flush()
+        harness.cleanUp()
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(at: storeDirectory)
+    }
+    for (window, repository) in zip(windows, repositories) {
+        #expect(registry.register(
+            window: window, projectRoot: root.path, windowID: repository.windowID,
+            workspace: repository.workspace, repository: repository, todoStore: nil, chromeState: nil
+        ))
+        repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
+    }
+    let tab = try #require(repositories[1].workspace.sessions.first)
+    #expect(await harness.waitUntilAttached(try #require(repositories[0].workspace.sessions.first)))
+    #expect(await harness.waitUntilAttached(tab))
+    let sessionID = try #require(tab.persistentSession?.sessionID)
+    model.refresh()
+    #expect(model.sessions.isEmpty)
+
+    // The second window closes (nothing asked: it keeps its session).
+    let delegate = ProjectWindowCloseDelegate(window: windows[1])
+    delegate.projectRoot = root.path
+    delegate.workspace = repositories[1].workspace
+    delegate.repository = repositories[1]
+    delegate.windowWillClose(Notification(name: NSWindow.willCloseNotification, object: windows[1]))
+    let listed = try await harness.control.list()
+    let info = try #require(listed.sessions.first { $0.id == sessionID })
+    #expect(info.isRunning)
+    store.flush()
+    #expect(!store.savedTabsName(info, hostID: listed.hostID, owner: harness.hosting.owner))
+    #expect(await eventually {
+        model.refresh()
+        return model.sessions.map(\.id) == [sessionID]
+    })
+
+    let row = try #require(model.sessions.first)
+    await model.open(row)?.value
+    #expect(repositories[0].workspace.session(withID: tab.id) != nil)
+    #expect(harness.hosting.owningTab(of: sessionID)?.id == tab.id)
+    model.refresh()
+    #expect(model.sessions.isEmpty)
+}
+
+/// An ended session that another window's saved tabs name (that window is
+/// not open now) is kept for its restore, which shows how it ended, as one
+/// a project's primary window names is; once that window forgot its tabs
+/// (closed while its project stayed open), it goes after the grace period
+/// like any other.
+@Test @MainActor func endedSessionsOfAnotherWindowsSavedTabsAreNotRemoved() async throws {
+    let harness = try PersistentHarness()
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-other-window-ended")
+    let store = WorkspaceStateStore(directory: storeDirectory)
+    harness.hosting.endedSessionsStore = store
+    let clock = Recorder(Date())
+    let model = makeModel(harness, registry: ProjectWindowRegistry(), endedSessionGrace: 10, now: { clock.value })
+    defer {
+        model.stop()
+        harness.cleanUp()
+        try? FileManager.default.removeItem(at: storeDirectory)
+    }
+    /// Refreshes once a second (as the app's timer does) for `seconds`.
+    func pass(_ seconds: Int) {
+        for _ in 0..<seconds {
+            clock.value = clock.value.addingTimeInterval(1)
+            model.refresh()
+        }
+    }
+    let project = harness.project.path
+    let windowID = UUID()
+    let named = UUID()
+    let record = WorkspaceSessionRecord(
+        id: named, kind: .terminal, title: "Kept", titleSource: .system, workingDirectory: project, projectRoot: project,
+        hosted: HostedSessionBindingRecord(host: "local", hostID: "host-a", sessionID: "s-named", owned: true)
+    )
+    store.saveSynchronously(RepositoryStateRecord(
+        repositoryRoot: project, activeWorktreeRoot: project,
+        worktrees: [WorktreeStateRecord(root: project, sessions: [record])], windowID: windowID
+    ))
+    func ended(_ id: String, tab: UUID) -> HostedSessionInfo {
+        HostedSessionInfo(
+            id: id, name: id, cwd: project, pid: 300, owner: "CherryTests",
+            tags: [PersistentSessionTag.tab: tab.uuidString, PersistentSessionTag.kind: "terminal",
+                   PersistentSessionTag.project: project]
+        ).exited(code: 3, signal: nil)
+    }
+    harness.fake.sessions = [ended("s-named", tab: named), ended("s-unnamed", tab: UUID())]
+    _ = try await harness.control.list()
+    model.refresh()
+    #expect(Set(model.sessions.map(\.id)) == ["s-named", "s-unnamed"])
+
+    pass(11)
+    #expect(await harness.fake.wait { harness.requestIDs("remove") == ["s-unnamed"] })
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(harness.requestIDs("remove") == ["s-unnamed"])
+
+    // That window forgot its tabs.
+    store.forgetWindowState(repositoryRoot: project, windowID: windowID)
+    store.flush()
+    pass(11)
+    #expect(await harness.fake.wait { harness.requestIDs("remove") == ["s-unnamed", "s-named"] })
 }

@@ -79,6 +79,13 @@ final class ProjectWindowRegistry {
     /// (`openLaunchWindows`): windows that registered without becoming
     /// active rank by it (`windowsMostRecentFirst`).
     private var launchOrder: [ProjectWindowKey: Int] = [:]
+    /// The windows the launch read as open (`open-windows.json`), and when
+    /// it read them: the saved tabs of other windows that it did not list
+    /// and that were written before are no window's
+    /// (`removeAbandonedWindowStatesOnceLaunchWindowsOpened`).
+    private var launchSavedWindows: Set<ProjectWindowValue> = []
+    private var launchReadAt: Date?
+    private var didSweepAbandonedWindowStates = false
     /// Runs once a window came on screen (`whenLaunchWindowShown`).
     private var launchWindowShownWaiters: [ProjectWindowKey: [@MainActor () -> Void]] = [:]
     private var shownLaunchWindows: Set<ProjectWindowKey> = []
@@ -176,7 +183,11 @@ final class ProjectWindowRegistry {
     /// window changes to `store`.
     func configureWorkspacePersistence(store: WorkspaceStateStore) {
         guard workspaceStateStore == nil else { return }
-        let reopen = store.projectWindowsToReopen(remoteProjectIsKnown: remoteProjectIsKnown)
+        // Every window file this run writes is newer.
+        launchReadAt = Date()
+        let saved = store.loadOpenProjectWindows()
+        launchSavedWindows = Set(saved)
+        let reopen = store.projectWindowsToReopen(saved, remoteProjectIsKnown: remoteProjectIsKnown)
         projectWindowsToReopenAtLaunch = reopen.map(\.window)
         launchWindowRecords = Dictionary(uniqueKeysWithValues: reopen.map { ($0.window, $0.state.worktrees.flatMap(\.sessions)) })
         workspaceStateStore = store
@@ -480,6 +491,30 @@ final class ProjectWindowRegistry {
         }
         lastSavedOpenWindows = windows
         workspaceStateStore.saveOpenProjectWindows(windows, synchronously: synchronously)
+    }
+
+    /// Once per run, once the launch's windows opened: removes, in the
+    /// background, the saved tabs of This Mac's windows other than
+    /// primaries that the launch did not read as open and that were
+    /// written before it (`WorkspaceStateStore.removeAbandonedWindowStates`),
+    /// with their frames. Not before: the store's queue is the launch
+    /// windows' (each loads its file synchronously).
+    func removeAbandonedWindowStatesOnceLaunchWindowsOpened() {
+        guard !didSweepAbandonedWindowStates else { return }
+        didSweepAbandonedWindowStates = true
+        whenLaunchWindowsOpened { [weak self] in
+            guard let self, let workspaceStateStore, let launchReadAt else { return }
+            workspaceStateStore.removeAbandonedWindowStates(
+                listed: launchSavedWindows,
+                modifiedBefore: launchReadAt
+            ) { [weak self] removed in
+                guard let self, let windowFrameStore else { return }
+                for window in removed {
+                    guard let windowID = window.windowID else { continue }
+                    windowFrameStore.forgetFrame(projectRoot: repositoryRoot(for: window.projectRoot), windowID: windowID)
+                }
+            }
+        }
     }
 
     /// Offers `notice` every project window that registers from now on, and
@@ -1079,6 +1114,79 @@ final class ProjectWindowRegistry {
                 ProjectWindowRegistry.shared.refreshActiveWindow()
             }
         }
+    }
+
+    // MARK: Closing a window
+
+    /// Whether `window` is its project's last window: no other window of
+    /// the project is open, nor one of the launch's still to register
+    /// (`pendingLaunchWindows`). Only then do its tabs come back when the
+    /// project opens again (`closedWindowState`), which its close question
+    /// promises (`SessionTeardownQuestion.tabsComeBack`). True for a window
+    /// the registry does not know.
+    func isLastWindowOfProject(_ window: NSWindow) -> Bool {
+        pruneStaleWindows()
+        guard let key = key(of: window) else { return true }
+        return !projectHasOtherWindow(than: key)
+    }
+
+    /// What closing the window registered under `key` does to its saved
+    /// tabs and frame, asked while it is still registered. Changes nothing.
+    func closedWindowState(of key: ProjectWindowKey, repository: RepositoryWorkspace?) -> ClosedWindowState {
+        guard !isTerminating, workspaceStateStore != nil, let repository,
+              // A device Cherry no longer knows: its stand-in window keeps
+              // its saved tabs exactly as saved.
+              !repository.isRemote || repository.remoteHosting != nil
+        else { return .leftAsSaved }
+        if projectHasOtherWindow(than: key) { return .forgotten }
+        return key.windowID.map(ClosedWindowState.movedToPrimary) ?? .keptForTheProject
+    }
+
+    /// A project window closed (`ProjectWindowCloseDelegate.windowWillClose`,
+    /// after its last save and its teardown): its file and frame become what
+    /// `closedWindowState` says, and it is forgotten (`unregister`). The file
+    /// changes on the store's queue, behind that save and the ends its close
+    /// recorded, and before the open window list stops naming the window: a
+    /// crash in between leaves it listed, with its tabs (it reopens) or
+    /// without (it does not). Nothing for a window the registry does not
+    /// know (a duplicate it refused).
+    func windowDidClose(_ window: NSWindow, projectRoot: String?, repository: RepositoryWorkspace?) {
+        pruneStaleWindows()
+        guard let key = key(of: window) else { return }
+        let state = closedWindowState(of: key, repository: repository)
+        if let workspaceStateStore, let root = repository?.repositoryRoot {
+            switch state {
+            case .forgotten:
+                workspaceStateStore.forgetWindowState(repositoryRoot: root, windowID: key.windowID)
+            case .movedToPrimary(let windowID):
+                workspaceStateStore.moveWindowStateToPrimary(repositoryRoot: root, windowID: windowID)
+            case .keptForTheProject, .leftAsSaved:
+                break
+            }
+        }
+        // Saves its frame (under its own key) and the open window list.
+        unregister(window: window, projectRoot: projectRoot)
+        switch state {
+        case .forgotten:
+            // The primary's frame stays: it is where the project opens.
+            if let windowID = key.windowID {
+                windowFrameStore?.forgetFrame(projectRoot: key.root, windowID: windowID)
+            }
+        case .movedToPrimary(let windowID):
+            windowFrameStore?.moveFrameToPrimary(projectRoot: key.root, windowID: windowID)
+        case .keptForTheProject, .leftAsSaved:
+            break
+        }
+    }
+
+    /// Whether another window of `key`'s project is open, or is one of the
+    /// launch's still to register.
+    private func projectHasOtherWindow(than key: ProjectWindowKey) -> Bool {
+        entries.contains { $0.key.root == key.root && $0.key != key && $0.value.window != nil }
+            || pendingLaunchWindows.contains { window in
+                let pending = self.key(for: window)
+                return pending.root == key.root && pending != key && entries[pending]?.window == nil
+            }
     }
 
     /// Brings `projectRoot`'s project's most recently active window
@@ -2049,11 +2157,22 @@ final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
             let projectName = repository?.repositoryName
                 ?? workspace.projectRoot.map { URL(fileURLWithPath: $0).lastPathComponent }
             presentSessionsQuestion(
-                SessionTeardownQuestion(teardown: .windowClose, summary: summary, projectName: projectName),
+                SessionTeardownQuestion(
+                    teardown: .windowClose,
+                    summary: summary,
+                    projectName: projectName,
+                    tabsComeBack: registry.isLastWindowOfProject(sender)
+                ),
                 for: sender
             )
             return false
         }
+    }
+
+    /// The registry the window registered with: its repository's (a test's
+    /// own), else the app's.
+    private var registry: ProjectWindowRegistry {
+        repository?.windowRegistry ?? .shared
     }
 
     /// What Edit › Undo and ⌘Z act on: the window's closed tabs
@@ -2069,12 +2188,14 @@ final class ProjectWindowCloseDelegate: NSObject, NSWindowDelegate {
         return textUndoManager
     }
 
+    /// The window's tabs close (`closeWorkspaceIfNeeded`), then what it saved
+    /// goes the way of a closed window (`ProjectWindowRegistry.windowDidClose`).
     func windowWillClose(_ notification: Notification) {
         closeAfterSheetDetachesTask?.cancel()
         closeAfterSheetDetachesTask = nil
         if let window = notification.object as? NSWindow {
             closeWorkspaceIfNeeded()
-            ProjectWindowRegistry.shared.unregister(window: window, projectRoot: projectRoot)
+            registry.windowDidClose(window, projectRoot: projectRoot, repository: repository)
         }
 
         previousDelegate?.windowWillClose?(notification)
@@ -2264,6 +2385,24 @@ enum LaunchWindowPlan: Equatable {
     case nothing
 }
 
+/// What a project window's close does to its saved tabs and frame
+/// (`ProjectWindowRegistry.closedWindowState`).
+enum ClosedWindowState: Equatable {
+    /// Left exactly as saved: the app terminates (a quit keeps every
+    /// window's), nothing saves windows, or the window is of a device
+    /// Cherry no longer knows.
+    case leftAsSaved
+    /// The project's last window, its primary: kept for the next time the
+    /// project opens, as a project's one window's were.
+    case keptForTheProject
+    /// The project's last window, another one (this id): its tabs and frame
+    /// become the primary's.
+    case movedToPrimary(UUID)
+    /// Another window of the project stays open, or is still to open at
+    /// launch: forgotten, and its kept sessions are Background Sessions'.
+    case forgotten
+}
+
 /// A project window's frame, per window, in the app's defaults. Project
 /// windows are not restorable, which also turns off SwiftUI's frame
 /// autosave: without this, every window would open at the default size.
@@ -2331,6 +2470,24 @@ struct ProjectWindowFrameStore {
         guard let descriptor = frameDescriptor(projectRoot: projectRoot, windowID: windowID) else { return false }
         window.setFrame(from: descriptor)
         return true
+    }
+
+    /// Removes the frame and full screen saved for another window of
+    /// `projectRoot` (one closed while its project stays open).
+    func forgetFrame(projectRoot: String, windowID: UUID) {
+        defaults.removeObject(forKey: Self.key(projectRoot: projectRoot, windowID: windowID))
+        defaults.removeObject(forKey: Self.fullScreenKey(projectRoot: projectRoot, windowID: windowID))
+    }
+
+    /// Makes another window's frame (when one was saved) and full screen
+    /// the project's primary window's, then removes them: the project's
+    /// last window closed, and its tabs became the primary's.
+    func moveFrameToPrimary(projectRoot: String, windowID: UUID) {
+        if let descriptor = frameDescriptor(projectRoot: projectRoot, windowID: windowID) {
+            defaults.set(descriptor, forKey: Self.key(projectRoot: projectRoot))
+        }
+        setFullScreen(isFullScreen(projectRoot: projectRoot, windowID: windowID), projectRoot: projectRoot)
+        forgetFrame(projectRoot: projectRoot, windowID: windowID)
     }
 }
 

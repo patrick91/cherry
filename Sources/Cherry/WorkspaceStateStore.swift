@@ -644,7 +644,7 @@ final class WorkspaceStateStore: @unchecked Sendable {
         guard isEnabled else { return }
         let fileURL = stateFileURL(repositoryRoot: state.repositoryRoot, windowID: state.windowID)
         queue.sync {
-            writeLocked(state, to: fileURL)
+            _ = writeLocked(state, to: fileURL)
         }
     }
 
@@ -698,7 +698,7 @@ final class WorkspaceStateStore: @unchecked Sendable {
         guard isEnabled else { return }
         let fileURL = openProjectWindowsFileURL
         if synchronously {
-            queue.sync { writeLocked(record, to: fileURL) }
+            queue.sync { _ = writeLocked(record, to: fileURL) }
         } else {
             queue.async { self.writeLocked(record, to: fileURL) }
         }
@@ -734,6 +734,101 @@ final class WorkspaceStateStore: @unchecked Sendable {
     /// The projects of the windows to reopen at launch (`projectWindowsToReopen`).
     func projectWindowRootsToReopen(remoteProjectIsKnown: (String) -> Bool = { _ in false }) -> [String] {
         projectWindowsToReopen(remoteProjectIsKnown: remoteProjectIsKnown).map(\.window.projectRoot)
+    }
+
+    // MARK: Closed windows (#22)
+
+    /// A window the user closed while another window of its project stays
+    /// open (or is still to open at launch): its saved tabs are forgotten.
+    /// The primary's file (`windowID` nil) is written as an empty record
+    /// (no tabs, `savedAt` now), never removed: with no file the next
+    /// primary window's orphan scan would take every session kept on
+    /// purpose for its own (`OrphanedSessionCriteria`). Another window's
+    /// file is removed. Queued behind the window's last save and the ends
+    /// its close recorded; a protected file is left alone.
+    func forgetWindowState(repositoryRoot: String, windowID: UUID?) {
+        guard isEnabled else { return }
+        let fileURL = stateFileURL(repositoryRoot: repositoryRoot, windowID: windowID)
+        let now = Date()
+        queue.async {
+            guard windowID == nil else {
+                guard !self.protectedFiles.contains(fileURL.path) else { return }
+                unlink(fileURL.path)
+                return
+            }
+            self.writeLocked(RepositoryStateRecord(repositoryRoot: repositoryRoot, worktrees: [], savedAt: now), to: fileURL)
+        }
+    }
+
+    /// The project's last window closed, and it is not the primary: its
+    /// saved tabs become the primary's, for the next time the project
+    /// opens. Its record (checked to be its root's and window's) is written
+    /// under the primary's name without `windowID`, a primary file this
+    /// version cannot use (or of another root or window) moved aside first,
+    /// as `load` does; its own file is removed only once that write
+    /// succeeded, so nothing is lost when it fails. Queued as
+    /// `forgetWindowState` is.
+    func moveWindowStateToPrimary(repositoryRoot: String, windowID: UUID) {
+        guard isEnabled else { return }
+        let fileURL = stateFileURL(repositoryRoot: repositoryRoot, windowID: windowID)
+        let primaryURL = stateFileURL(repositoryRoot: repositoryRoot)
+        queue.async {
+            guard var state = self.readVersionedLocked(RepositoryStateRecord.self, from: fileURL),
+                  state.repositoryRoot == repositoryRoot, state.windowID == windowID
+            else { return }
+            if let primary = self.readVersionedLocked(RepositoryStateRecord.self, from: primaryURL),
+               primary.repositoryRoot != repositoryRoot || primary.windowID != nil {
+                self.setAsideLocked(primaryURL, label: "other-root")
+            }
+            state.windowID = nil
+            guard self.writeLocked(state, to: primaryURL) else { return }
+            unlink(fileURL.path)
+        }
+    }
+
+    /// In the background: removes the state files of This Mac's windows
+    /// other than primaries (a `windowID`, a root that is no device's key)
+    /// that `listed` (the windows the launch read as open) does not name
+    /// and that were last written before `cutoff` (when it read them), then
+    /// gives `completion` the windows removed, on the main queue. They are
+    /// no window's: every window open this run was listed or has saved
+    /// since, and a window closed while its project stayed open removed its
+    /// own file. A crash between such a close's save and its removal leaves
+    /// one, and so does an older build, which reopens primaries only and
+    /// drops the others from the list. Never a primary's file, a device
+    /// project's (its device may be unknown now, and its stand-in window
+    /// keeps its tabs as saved), a protected or unusable one, one under
+    /// another window's name, or any while the store is disabled.
+    func removeAbandonedWindowStates(
+        listed: Set<ProjectWindowValue>,
+        modifiedBefore cutoff: Date,
+        completion: @escaping @MainActor @Sendable ([ProjectWindowValue]) -> Void
+    ) {
+        guard isEnabled else { return }
+        let directory = directory
+        queue.async {
+            let manager = FileManager.default
+            var removed: [ProjectWindowValue] = []
+            for name in (try? manager.contentsOfDirectory(atPath: directory.path)) ?? [] where Self.isStateFileName(name) {
+                let url = directory.appendingPathComponent(name, isDirectory: false)
+                guard !self.protectedFiles.contains(url.path),
+                      let modified = (try? manager.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+                      modified < cutoff,
+                      case .usable(let state) = Self.readFile(RepositoryStateRecord.self, from: url),
+                      state.version == RepositoryStateRecord.currentVersion,
+                      let windowID = state.windowID,
+                      !ProjectLocation.isRemoteKey(state.repositoryRoot),
+                      name == Self.stateFileName(repositoryRoot: state.repositoryRoot, windowID: windowID)
+                else { continue }
+                let window = ProjectWindowValue(projectRoot: state.repositoryRoot, windowID: windowID)
+                if !listed.contains(window), unlink(url.path) == 0 {
+                    removed.append(window)
+                }
+            }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { completion(removed) }
+            }
+        }
     }
 
     /// What the state file of a project window (`windowID` nil: its
@@ -1193,16 +1288,19 @@ final class WorkspaceStateStore: @unchecked Sendable {
         }
     }
 
-    /// Only on `queue`.
-    private func writeLocked<Value: Encodable>(_ value: Value, to fileURL: URL) {
+    /// Only on `queue`. True once `value` is written.
+    @discardableResult
+    private func writeLocked<Value: Encodable>(_ value: Value, to fileURL: URL) -> Bool {
         guard !protectedFiles.contains(fileURL.path) else {
             fputs("Cherry: not saving \(fileURL.lastPathComponent): a file this version cannot use is still there\n", stderr)
-            return
+            return false
         }
         do {
             try Self.write(value, to: fileURL)
+            return true
         } catch {
             fputs("Cherry: could not save \(fileURL.lastPathComponent): \(error)\n", stderr)
+            return false
         }
     }
 

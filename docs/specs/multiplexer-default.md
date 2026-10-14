@@ -180,7 +180,13 @@ question also says where the kept sessions are until the project opens again
 ("Until then, open or end them from Background Sessions in the Cherry menu
 bar icon"), and those sessions are ones the user knows about: the launch
 notice below never names them, nor those of a window closed while *on quit*
-is Keep Running, nor a detached tab's.
+is Keep Running, nor a detached tab's. A window closed while another window
+of its project stays open (or is still to open at launch) says instead that
+its kept sessions go to Background Sessions, and its saved tabs are
+forgotten (a primary's file is written empty, another window's removed with
+its frame); the project's last window keeps its tabs for the next time the
+project opens, another window's becoming the primary's
+(`ProjectWindowRegistry.windowDidClose`). A quit keeps every window's.
 **Don't ask
 again** stores Keep Running or End Sessions as *on quit*; Cancel stores
 nothing. With *on quit* Keep Running or End Sessions, or with no running
@@ -1361,7 +1367,12 @@ differs from the design above.
   saved at once (its record carries the Create's request id,
   `launchRequestID`), and a window other than a project's primary is saved
   as it claims its project; it never saves during teardown, and quit
-  flushes it first. Records gained optional `owned` and `launchRequestID` fields (older
+  flushes it first. A closed window's file is forgotten or moved to the
+  primary's name as the close question above says; once the launch's
+  windows opened, files of This Mac's windows other than primaries that the
+  saved list did not name and that were written before the launch read it
+  (a crash during a close, an older build's run) are removed in the
+  background. Records gained optional `owned` and `launchRequestID` fields (older
   builds ignore them). A state file (or `open-windows.json`) of another
   version, one that does not decode, or one for another root is moved aside
   as `<file>.<vN|unreadable|other-root>-<UTC yyyyMMddTHHmmssZ>.bak` in the

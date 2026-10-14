@@ -769,6 +769,9 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                 MenuBarStatusItem.shared.installSoon()
             }
             Self.startUpdaterOnceLaunchWindowsOpened(registry: .shared)
+            // Saved tabs of windows no list names any more (a crash during
+            // a close, an older build), in the background.
+            ProjectWindowRegistry.shared.removeAbandonedWindowStatesOnceLaunchWindowsOpened()
         }
 
         // Windows that had tabs come back from the app's own list (AppKit

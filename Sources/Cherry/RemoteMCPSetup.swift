@@ -391,7 +391,7 @@ struct RemoteMCPSetupSheet: View {
 }
 
 /// Shows Set Up Cherry MCP… for a device as a sheet on the key window (the
-/// device menu, Settings › Sessions › Other Macs).
+/// device menu, Settings › Macs).
 @MainActor
 enum RemoteMCPSetupPresenter {
     static func present(deviceID: UUID, store: RemoteDeviceStore = .shared) {

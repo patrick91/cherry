@@ -7,8 +7,8 @@ commands are all Cherry processes with a `process_id`.
 
 ## Setup
 
-Start Cherry first, then register the helper shown in Settings > MCP with your
-agent harness. In a SwiftPM checkout, build the helper and install it like this:
+Start Cherry first, then register the helper shown in Settings › Agents & MCP
+with your agent harness. In a SwiftPM checkout, build the helper and install it like this:
 
 ```bash
 swift build --product CherryMCP
@@ -18,12 +18,15 @@ pi mcp add cherry --exposure direct -- "$(swift build --show-bin-path)/CherryMCP
 ```
 
 Pi needs `--exposure direct`: its default (`codemode`) hides an MCP
-server's tools behind a script tool. Settings › MCP shows the three
-commands; its **Add to Pi** button runs Pi's (only when clicked: Pi writes
-its own `mcp.json`, which Cherry only reads to say whether Cherry is
-registered there). Both use the environment of your login shell, as this
-run of Cherry captured it, so a `PI_CODING_AGENT_DIR` set there names the
-`mcp.json` Pi uses; Set Up Cherry MCP on another Mac passes that Mac's
+server's tools behind a script tool. Each agent's page in Settings › Agents
+& MCP shows its CLI's command, and **Add to Claude Code**, **Add to Codex**
+or **Add to Pi** runs it, only when clicked (each CLI writes its own
+settings; Cherry reads only Pi's `mcp.json`, to say whether Cherry is
+registered there, and never Claude Code's or Codex's, so theirs say "Not
+checked" until a click). **MCP server › Connect other agent CLIs** on
+Agents & MCP shows all three commands, with **Add to Pi**. They use the
+environment of your login shell, as this run of Cherry captured it, so a
+`PI_CODING_AGENT_DIR` set there names the `mcp.json` Pi uses; Set Up Cherry MCP on another Mac passes that Mac's
 login-shell `PI_CODING_AGENT_DIR` to `pi` too.
 
 The helper talks to Cherry through the instance-scoped Unix control socket; the
@@ -112,7 +115,7 @@ same tools as a local agent in that window, bounded to that Mac:
 
 Claude Code, Codex and Pi on that Mac read their MCP servers from their own
 configuration there. **Set Up Cherry MCP on <Mac>…** (the device's menu in
-the project picker, or Settings › Sessions › Other Macs) shows these
+the project picker, or Settings › Macs) shows these
 commands and runs them there only when you confirm; running it again gives
 the same result, and **Remove** takes the registrations away:
 
@@ -439,7 +442,8 @@ to their events and ends its turn; Cherry tells it when something happened.
   types it at most once per batch of events and once every 5 s. The line
   names only the subscription and event counts, never text a watched
   process controls (names, titles or output), so it cannot carry
-  instructions from a worker. Settings › MCP › Wake idle agents turns wake
+  instructions from a worker. Settings › Agents & MCP › Monitors › Wake
+  idle agents turns wake
   lines off; `wake: false` turns them off for one subscription. The result's
   `wake` and `wake_unavailable_reason` say whether this subscription gets
   them. A subscriber Cherry cannot confirm (a declared
@@ -539,7 +543,8 @@ Code, Codex and Pi.
   ```
 
   It carries the run id and counts only, never a worker's text. Settings ›
-  MCP › Wake idle agents turns it off with monitors' wake lines.
+  Agents & MCP › Monitors › Wake idle agents turns it off with monitors'
+  wake lines.
   Everything Cherry types into a tab (this line, a monitor's wake line,
   the nudge and a kickoff) goes through one lock per tab: each line's
   text, pause and Enter go together, so two lines never merge into one

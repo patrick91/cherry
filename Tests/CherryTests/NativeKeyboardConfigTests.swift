@@ -223,7 +223,7 @@ private func parsed(_ s: String) -> [String] {
 }
 
 /// A home directory of the test's own, never the real one.
-private func temporaryHome() throws -> URL {
+func temporaryHome() throws -> URL {
     let home = FileManager.default.temporaryDirectory
         .appendingPathComponent("GhosttyConfigHome-\(UUID().uuidString.prefix(8))", isDirectory: true)
     try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
@@ -407,4 +407,123 @@ private func write(_ text: String, to path: String, in home: URL) throws {
     #expect(TerminalController.rejectedLines(of: TerminalSettings.ghosttyConfiguration(
         fontSize: 13, cursorBlink: true, minimumContrast: 1
     )).isEmpty)
+}
+
+// MARK: - Where each line is, and why it is not applied
+
+@Test func ghosttyConfigLinesKeepTheirNumbersInTheFile() {
+    // Blank lines, comments, CRLF line ends and lines that are not settings
+    // count, as in Ghostty's own diagnostics.
+    let lines = TerminalSettings.ghosttyConfigNumberedLines("""
+    # keys\r
+    \r
+    keybind = ctrl+a=text:a\r
+    not a setting
+       \t
+    macos-option-as-alt = left
+    """)
+    #expect(lines.map(\.line) == [3, 6])
+    #expect(lines.map(\.key) == ["keybind", "macos-option-as-alt"])
+    #expect(lines.map(\.value) == ["ctrl+a=text:a", "left"])
+    // The lines without their numbers are the same ones.
+    #expect(TerminalSettings.ghosttyConfigLines("a = 1\n\n# b = 2\nc = 3\n").map { "\($0.key)=\($0.value)" } == ["a=1", "c=3"])
+}
+
+@MainActor
+@Test func ghosttyKeyboardLinesSayWhereTheyAreInTheirFiles() throws {
+    let home = try temporaryHome()
+    defer { try? FileManager.default.removeItem(at: home) }
+    let ghostty = home.appendingPathComponent(".config/ghostty")
+    try FileManager.default.createDirectory(at: ghostty, withIntermediateDirectories: true)
+    // A byte-order mark, and a line that is not UTF-8, keep the numbers.
+    var bytes = Data("\u{FEFF}# keys\n\nkeybind = ctrl+a=text:a\n".utf8)
+    bytes.append(contentsOf: [0x23, 0x20, 0xE9, 0x0A])
+    bytes.append(Data("config-file = keys.conf\nmacos-option-as-alt = left\n".utf8))
+    try bytes.write(to: ghostty.appendingPathComponent("config"))
+    try write("\n\nkeybind = ctrl+b=text:b\n", to: ".config/ghostty/keys.conf", in: home)
+
+    let configuration = TerminalSettings.ghosttyKeyboardConfig(home: home, environment: [:])
+    #expect(configuration.lines.map { "\($0.file.lastPathComponent):\($0.line)" } == ["config:3", "config:6", "keys.conf:3"])
+    // Where the file a config-file line named was named; the files Ghostty
+    // looks for itself were named by none.
+    let keys = ghostty.appendingPathComponent("keys.conf")
+    #expect(configuration.includedBy == [
+        keys.path: UserGhosttyKeyboardConfig.Inclusion(file: ghostty.appendingPathComponent("config"), line: 5),
+    ])
+    #expect(configuration.files == [ghostty.appendingPathComponent("config"), keys])
+}
+
+@MainActor
+@Test func ghosttyKeyboardLinesSayWhyTheyAreNotApplied() throws {
+    let home = try temporaryHome()
+    defer { try? FileManager.default.removeItem(at: home) }
+    try write("""
+    macos-option-as-alt = yes
+    keybind = super+t=new_tab
+    keybind = shift+enter=text:\\n
+    keybind = shift+enter=text:\\x1b\\r
+    keybind = ctrl+a=text:a
+    keybind = chain=text:b
+    keybind = clear
+    keybind = super+w=close_surface
+    keybind = chain=text:c
+    keybind = ctrl+j=text:j
+    keybind = chain=new_tab
+    keybind = ctrl+k>n=text:k
+    keybind = ctrl+k=unbind
+    macos-option-as-alt = left
+    macos-option-as-alt =
+    macos-option-as-alt = right
+    """, to: ".config/ghostty/config", in: home)
+
+    typealias Reason = UserGhosttyKeyboardConfig.NotAppliedReason
+    let configuration = TerminalSettings.ghosttyKeyboardConfig(home: home, environment: [:])
+    let lines = configuration.lines
+    #expect(lines.count == 16)
+    #expect(lines[0].rejection != nil)
+    // A line Ghostty rejects is never part of the parse: the others name
+    // their lines by their index among all the lines.
+    #expect(lines.map(\.notAppliedReason) == [
+        nil,
+        Reason.appAction,
+        .replaced(byLine: 3),
+        // `clear` drops every binding before it.
+        .cleared(byLine: 6),
+        .cleared(byLine: 6),
+        .cleared(byLine: 6),
+        nil,
+        .appAction,
+        .chainOfDropped,
+        nil,
+        .appAction,
+        .replaced(byLine: 12),
+        .appAction,
+        .cleared(byLine: 14),
+        nil,
+        nil,
+    ])
+    #expect(lines.map(\.isApplied) == [
+        false, false, false, false, false, false, false, false, false, true, false, false, false, false, false, true,
+    ])
+    // What the surfaces take does not change.
+    #expect(configuration.surfaceLines.map { "\($0.0) = \($0.1)" } == [
+        "keybind = ctrl+j=text:j",
+        "macos-option-as-alt = right",
+        "keybind = shift+tab=csi:Z",
+    ])
+}
+
+@MainActor
+@Test func ghosttyKeyboardConfigNamesTheLinesCherryAdds() throws {
+    let home = try temporaryHome()
+    defer { try? FileManager.default.removeItem(at: home) }
+    let nothing = TerminalSettings.ghosttyKeyboardConfig(home: home, environment: [:])
+    #expect(nothing.added.map { "\($0.0) = \($0.1)" } == ["keybind = shift+tab=csi:Z", "macos-option-as-alt = true"])
+    #expect(nothing.surfaceLines.map { "\($0.0) = \($0.1)" } == nothing.added.map { "\($0.0) = \($0.1)" })
+
+    // A binding of Shift+Tab, whatever it does, replaces Cherry's.
+    try write("keybind = shift+tab=previous_tab\nmacos-option-as-alt = false\n", to: ".config/ghostty/config", in: home)
+    let bound = TerminalSettings.ghosttyKeyboardConfig(home: home, environment: [:])
+    #expect(bound.added.isEmpty)
+    #expect(bound.surfaceLines.map { "\($0.0) = \($0.1)" } == ["macos-option-as-alt = false"])
 }

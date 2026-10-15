@@ -176,6 +176,71 @@ extension AgentToolDefinition {
     }
 }
 
+extension AgentToolDefinition {
+    /// The flags that let an agent CLI run tools without asking first:
+    /// Claude Code's, and Codex's in its short and long form.
+    static let permissionSkippingFlags: Set<String> = [
+        "--dangerously-skip-permissions",
+        "--yolo",
+        "--dangerously-bypass-approvals-and-sandbox",
+    ]
+
+    /// Whether the agent runs without permission prompts (Settings' "Skips
+    /// permission prompts" tag): a word of its command line, quoted or not,
+    /// is one of `permissionSkippingFlags`.
+    var skipsPermissionPrompts: Bool {
+        commandLine.split(whereSeparator: \.isWhitespace).contains { word in
+            Self.permissionSkippingFlags.contains(word.trimmingCharacters(in: CharacterSet(charactersIn: "\"'")))
+        }
+    }
+}
+
+/// Whether an agent CLI reports its state to Cherry (program status, OSC
+/// 7501, docs/mcp.md): from which version, not at all, or not known. One
+/// that does not report is followed by its output going quiet.
+enum ProgramStatusSupport: Equatable, Sendable {
+    case reports(minimumVersion: String)
+    case doesNotReport
+    case unknown
+}
+
+extension AgentToolBrand {
+    /// The CLI's own name, as its agent's page says it: "Claude Code".
+    var productName: String {
+        switch self {
+        case .amp: "Amp"
+        case .claude: "Claude Code"
+        case .codex: "Codex"
+        case .gemini: "Gemini CLI"
+        case .openCode: "OpenCode"
+        case .pi: "Pi"
+        }
+    }
+
+    /// Whether the CLI reports its state (docs/mcp.md › program status):
+    /// Claude Code from 2.1.295 and Pi from 1.1.0; Codex and Amp do not;
+    /// Gemini CLI and OpenCode are not known either way.
+    var programStatusSupport: ProgramStatusSupport {
+        switch self {
+        case .claude: .reports(minimumVersion: "2.1.295")
+        case .pi: .reports(minimumVersion: "1.1.0")
+        case .codex, .amp: .doesNotReport
+        case .gemini, .openCode: .unknown
+        }
+    }
+
+    /// The CLI whose `mcp add` connects it to Cherry's MCP helper; nil for
+    /// one Cherry has no command for.
+    var mcpHarness: MCPHarness? {
+        switch self {
+        case .claude: .claude
+        case .codex: .codex
+        case .pi: .pi
+        case .gemini, .openCode, .amp: nil
+        }
+    }
+}
+
 struct ProjectCommandDefinition: Codable, Equatable, Identifiable {
     var name: String
     var command: String
@@ -429,6 +494,29 @@ enum ProjectSettingStorage {
     case local
 }
 
+/// Where a project's value comes from (its row's badge in Settings,
+/// `SettingSource(_:)`): this Mac's value wins over the project's
+/// cherry.toml, which wins over the default.
+enum ProjectValueSource: Equatable, Sendable {
+    /// Neither sets it: the default.
+    case none
+    /// Only the project's cherry.toml sets it.
+    case projectFile
+    /// This Mac's value replaces the one cherry.toml sets.
+    case overridesProjectFile
+    /// Only this Mac sets it.
+    case thisMacOnly
+
+    init(thisMac: Bool, projectFile: Bool) {
+        switch (thisMac, projectFile) {
+        case (true, true): self = .overridesProjectFile
+        case (true, false): self = .thisMacOnly
+        case (false, true): self = .projectFile
+        case (false, false): self = .none
+        }
+    }
+}
+
 enum ProjectIdentityColor: String, CaseIterable, Codable, Equatable, Identifiable {
     case red
     case orange
@@ -548,6 +636,8 @@ enum AgentConfigurationError: LocalizedError, Equatable {
     case missingName
     case missingCommand(name: String)
     case duplicateName(String)
+    /// No agent has the name an edit names (it was removed meanwhile).
+    case unknownAgent(String)
 
     var errorDescription: String? {
         switch self {
@@ -557,6 +647,8 @@ enum AgentConfigurationError: LocalizedError, Equatable {
             "Agent '\(name)' is missing a command."
         case .duplicateName(let name):
             "Duplicate agent name: \(name)."
+        case .unknownAgent(let name):
+            "There is no agent named '\(name)'."
         }
     }
 }
@@ -845,6 +937,33 @@ final class AgentSettings: ObservableObject {
         saveAppearanceOverrides()
     }
 
+    /// Where a project's Todos value comes from: this Mac's override, its
+    /// cherry.toml's `[features]` (which sets it, off without a `todos`
+    /// line), both or neither.
+    func todosSource(for root: String) -> ProjectValueSource {
+        ProjectValueSource(
+            thisMac: projectFeatureOverrides(for: root).todosEnabled != nil,
+            projectFile: projectFileConfiguresFeatures(for: root)
+        )
+    }
+
+    /// Where a project's color comes from: this Mac's override (an explicit
+    /// None is one), its cherry.toml's `[appearance]`, both or neither.
+    func colorSource(for root: String) -> ProjectValueSource {
+        ProjectValueSource(
+            thisMac: !projectAppearanceOverrides(for: root).isEmpty,
+            projectFile: projectFileConfiguresAppearance(for: root)
+        )
+    }
+
+    /// Drops this Mac's Todos and Color overrides of a project, so its
+    /// cherry.toml (else the default) applies again. Its commands keep
+    /// theirs (`removeLocalCommand`), and cherry.toml is left alone.
+    func revertProjectToProjectFile(_ root: String) {
+        clearLocalProjectFeatureOverrides(for: root)
+        clearLocalProjectAppearanceOverrides(for: root)
+    }
+
     @discardableResult
     func addProject(path: String) -> CherryProject? {
         guard let root = Self.validDirectory(path) else { return nil }
@@ -873,6 +992,14 @@ final class AgentSettings: ObservableObject {
         saveCommands()
         saveFeatureOverrides()
         saveAppearanceOverrides()
+    }
+
+    /// Forgets that the user removed `root` from Projects (Offer Again): the
+    /// Omni bar offers the folder as "Not added yet" again. It does not add
+    /// it.
+    func forgetRemovedProjectRoot(_ root: String) {
+        guard removedProjectRoots.remove(root) != nil else { return }
+        saveRemovedProjectRoots()
     }
 
     func markProjectOpened(_ projectRoot: String?) {
@@ -917,6 +1044,73 @@ final class AgentSettings: ObservableObject {
         let normalizedName = AgentToolDefinition.normalizedName(name)
         let nextAgents = agents.filter { $0.normalizedName != normalizedName }
         try? setAgents(nextAgents)
+    }
+
+    /// `name`, trimmed, when no agent has it (names are compared without
+    /// case), else the first of "<name> 2", "<name> 3"… that none has. A
+    /// taken name that ends in a number counts on from it: "Claude 2" gives
+    /// "Claude 3", not "Claude 2 2".
+    func availableAgentName(for name: String) -> String {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let taken = Set(agents.map(\.normalizedName))
+        guard taken.contains(AgentToolDefinition.normalizedName(name)) else { return name }
+        var base = name
+        var number = 2
+        if let space = name.lastIndex(of: " "),
+           case let digits = name[name.index(after: space)...],
+           digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+           let last = Int(digits), last > 0,
+           !name[..<space].trimmingCharacters(in: .whitespaces).isEmpty {
+            base = String(name[..<space])
+            number = last + 1
+        }
+        while taken.contains(AgentToolDefinition.normalizedName("\(base) \(number)")) {
+            number += 1
+        }
+        return "\(base) \(number)"
+    }
+
+    /// Adds `agent` after the others under a name no agent has
+    /// (`availableAgentName`): unlike `upsertAgent`, it never replaces
+    /// one. Returns the agent as stored.
+    @discardableResult
+    func addAgent(_ agent: AgentToolDefinition) throws -> AgentToolDefinition {
+        var added = agent
+        added.name = availableAgentName(for: agent.name)
+        try setAgents(agents + [added])
+        return agents[agents.count - 1]
+    }
+
+    /// Replaces the agent named `name` with `agent` where it is, so the
+    /// Agents menu, the sidebar and MCP's list keep their order
+    /// (`upsertAgent` moves it to the end). `agent` may rename it, but not
+    /// to another agent's name (`duplicateName`).
+    func updateAgent(named name: String, with agent: AgentToolDefinition) throws {
+        let index = try agentIndex(named: name)
+        var nextAgents = agents
+        nextAgents[index] = agent
+        try setAgents(nextAgents)
+    }
+
+    /// Adds a copy of the agent named `name` right after it, under a name
+    /// no agent has ("Claude 2"). Returns the copy as stored.
+    @discardableResult
+    func duplicateAgent(named name: String) throws -> AgentToolDefinition {
+        let index = try agentIndex(named: name)
+        var copy = agents[index]
+        copy.name = availableAgentName(for: copy.name)
+        var nextAgents = agents
+        nextAgents.insert(copy, at: index + 1)
+        try setAgents(nextAgents)
+        return agents[index + 1]
+    }
+
+    private func agentIndex(named name: String) throws -> Int {
+        let normalizedName = AgentToolDefinition.normalizedName(name)
+        guard let index = agents.firstIndex(where: { $0.normalizedName == normalizedName }) else {
+            throw AgentConfigurationError.unknownAgent(name)
+        }
+        return index
     }
 
     func upsertCommand(
@@ -964,6 +1158,31 @@ final class AgentSettings: ObservableObject {
         let nextCommands = (commandsByProject[settingsRoot] ?? []).filter { $0.normalizedName != normalizedName }
         try? setCommands(nextCommands, for: settingsRoot)
         try? CherryProjectFile.removeCommand(named: name, projectRoot: checkoutRoot)
+    }
+
+    /// Where the command named `name` comes from: this Mac's copy replaces
+    /// cherry.toml's of the same name (`projectCommands(for:)`).
+    func commandSource(named name: String, for root: String) -> ProjectValueSource {
+        guard let checkoutRoot = Self.validDirectory(root) else { return .none }
+        let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
+        let normalizedName = AgentToolDefinition.normalizedName(name)
+        return ProjectValueSource(
+            thisMac: (commandsByProject[settingsRoot] ?? []).contains { $0.normalizedName == normalizedName },
+            projectFile: CherryProjectFile.loadCommands(projectRoot: checkoutRoot)
+                .contains { $0.normalizedName == normalizedName }
+        )
+    }
+
+    /// Removes this Mac's copy of the command named `name`, so cherry.toml's
+    /// applies again, if it has one. Unlike `removeCommand`, it leaves
+    /// cherry.toml alone.
+    func removeLocalCommand(named name: String, for root: String) {
+        guard let checkoutRoot = Self.validDirectory(root) else { return }
+        let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
+        let normalizedName = AgentToolDefinition.normalizedName(name)
+        let localCommands = commandsByProject[settingsRoot] ?? []
+        guard localCommands.contains(where: { $0.normalizedName == normalizedName }) else { return }
+        try? setCommands(localCommands.filter { $0.normalizedName != normalizedName }, for: settingsRoot)
     }
 
     private func setAgents(_ agents: [AgentToolDefinition]) throws {

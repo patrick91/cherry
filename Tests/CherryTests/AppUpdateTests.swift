@@ -6,8 +6,10 @@ import Testing
 // The updater without Sparkle (docs/releasing.md): who may update itself
 // (`AppUpdateEnablement`), Restart to Update and the quit it arms
 // (`AppUpdateModel`, `UpdateQuitRequest`), discarding a staged update
-// (`SparkleInstallerJobs`, `StagedUpdateWatch`), Settings › Updates, and
-// the delegate selectors Sparkle calls. Fakes only: nothing here touches
+// (`SparkleInstallerJobs`, `StagedUpdateWatch`), Settings › Updates (its
+// status card, `UpdatesHero`; the stored values it shows while the updater
+// isn't running, `AppUpdateStoredPreferences`; its resets), and the
+// delegate selectors Sparkle calls. Fakes only: nothing here touches
 // `AppUpdater.shared` or starts Sparkle.
 
 // MARK: - Fakes
@@ -855,16 +857,288 @@ private struct FeedUnreachable: Error {}
 
 // MARK: - Settings, configuration and Sparkle's selectors
 
-@Test func updatesSettingsPageIsFoundBySearch() {
+@Test @MainActor func updatesSettingsPageIsFoundBySearch() {
+    let defaults = privateDefaults("AppUpdateSettingsSearch")
+    let context = SettingsSearchContext(
+        terminal: TerminalSettings(defaults: defaults, launchArguments: [:]),
+        agents: AgentSettings(defaults: defaults),
+        updates: AppUpdateStatus(enablement: .disabled(.notAnApp)),
+        defaults: defaults
+    )
+    let rows = SettingsSearchIndex.rows(in: context)
     for query in ["update", "pre-release", "version", "Updates", "beta"] {
-        #expect(SettingsPage.filtered(by: query).contains(.updates), Comment(rawValue: query))
-    }
-    // The Sessions page's searches find only it.
-    for query in ["quitting", "exit", "shell", "close"] {
-        #expect(SettingsPage.filtered(by: query) == [.sessions], Comment(rawValue: query))
+        let updates = SettingsSearchIndex.groups(for: query, in: rows).first { $0.kind == .page(.updates) }
+        // The page's own result, first in its group.
+        let first = updates?.results.first?.row
+        #expect(first?.route == .page(.updates) && first?.opensPage == true, Comment(rawValue: query))
     }
     #expect(SettingsPage.allCases.last == .updates)
     #expect(SettingsPage.updates.title == "Updates")
+}
+
+/// A status that may update itself, in `phase`.
+@MainActor
+private func updatesStatus(
+    _ phase: AppUpdateStatus.Phase = .idle,
+    canCheck: Bool = true,
+    prereleases: Bool = false
+) -> AppUpdateStatus {
+    let status = AppUpdateStatus(enablement: .enabled, prereleases: prereleases)
+    status.applyPhase(phase)
+    status.applyCanCheckForUpdates(canCheck)
+    return status
+}
+
+@Test @MainActor func updatesStoredPreferencesReadTheStoredValueOverTheInfoPlist() {
+    let defaults = privateDefaults("AppUpdateStoredPreferences")
+    // Sparkle's own keys.
+    #expect(AppUpdateStoredPreferences.automaticChecksKey == "SUEnableAutomaticChecks")
+    #expect(AppUpdateStoredPreferences.automaticDownloadsKey == "SUAutomaticallyUpdate")
+
+    // A build that doesn't update itself: no Info.plist keys, nothing stored.
+    let none = AppUpdateStoredPreferences(defaults: defaults, info: [:], launchArguments: [:])
+    #expect(none.automaticChecks.value && none.automaticChecks.defaultValue)
+    #expect(none.automaticDownloads.value && none.automaticDownloads.defaultValue)
+    #expect(none.automaticChecks.source == .cherryDefault)
+    #expect(!none.prereleases && none.prereleasesSource == .cherryDefault)
+
+    // The Info.plist's value is the default.
+    let info: [String: Any] = ["SUEnableAutomaticChecks": true, "SUAutomaticallyUpdate": false]
+    var read = AppUpdateStoredPreferences(defaults: defaults, info: info, launchArguments: [:])
+    #expect(read.automaticChecks.value && read.automaticChecks.defaultValue)
+    #expect(!read.automaticDownloads.value && !read.automaticDownloads.defaultValue)
+    #expect(read.automaticDownloads.source == .cherryDefault)
+
+    // A stored value wins; one equal to the default shows no badge.
+    defaults.set(false, forKey: "SUEnableAutomaticChecks")
+    defaults.set(false, forKey: "SUAutomaticallyUpdate")
+    defaults.set(true, forKey: AppUpdateModel.prereleasesKey)
+    read = AppUpdateStoredPreferences(defaults: defaults, info: info, launchArguments: [:])
+    #expect(!read.automaticChecks.value && read.automaticChecks.value != read.automaticChecks.defaultValue)
+    #expect(read.automaticChecks.source == .setHere)
+    #expect(!read.automaticDownloads.value && read.automaticDownloads.value == read.automaticDownloads.defaultValue)
+    #expect(read.automaticDownloads.source == .cherryDefault)
+    #expect(read.prereleases && read.prereleasesSource == .setHere)
+    defaults.set(true, forKey: "SUAutomaticallyUpdate")
+    defaults.set(false, forKey: AppUpdateModel.prereleasesKey)
+    read = AppUpdateStoredPreferences(defaults: defaults, info: info, launchArguments: [:])
+    #expect(read.automaticDownloads.value && read.automaticDownloads.source == .setHere)
+    #expect(!read.prereleases && read.prereleasesSource == .cherryDefault)
+
+    // A launch argument wins over both, read as `bool(forKey:)` reads it
+    // ("NO" is off); one that is no value at all leaves the default in use.
+    read = AppUpdateStoredPreferences(
+        defaults: defaults,
+        info: info,
+        launchArguments: ["SUEnableAutomaticChecks": "NO", "SUAutomaticallyUpdate": ["on"], "updates.prereleases": true]
+    )
+    #expect(!read.automaticChecks.value && read.automaticChecks.source == .launchArgument(applied: true))
+    #expect(!read.automaticDownloads.value && read.automaticDownloads.source == .launchArgument(applied: false))
+    #expect(read.prereleases && read.prereleasesSource == .launchArgument(applied: true))
+
+    // A stored value that is no Boolean is the default's.
+    defaults.set(Date(), forKey: "SUEnableAutomaticChecks")
+    read = AppUpdateStoredPreferences(defaults: defaults, info: info, launchArguments: [:])
+    #expect(read.automaticChecks.value && read.automaticChecks.source == .cherryDefault)
+    #expect(AppUpdateStoredPreferences.bool("YES") == true)
+    #expect(AppUpdateStoredPreferences.bool("0") == false)
+    #expect(AppUpdateStoredPreferences.bool(NSNumber(value: 1)) == true)
+    #expect(AppUpdateStoredPreferences.bool(Date()) == nil)
+}
+
+@Test @MainActor func updatesHeroFollowsTheUpdatersPhase() throws {
+    // No card while updates are off: Automatic updates' caption gives the reason.
+    #expect(UpdatesHero(status: AppUpdateStatus(enablement: .disabled(.debugBuild))) == nil)
+
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let checkNow = UpdatesHero.Action(kind: .checkNow, title: "Check Now", isPrimary: false, isEnabled: true)
+
+    let idle = updatesStatus()
+    var hero = try #require(UpdatesHero(status: idle, now: now))
+    #expect(hero.tone == .idle && hero.title == "Not checked yet" && hero.subtitle == nil)
+    #expect(hero.actions == [checkNow])
+    idle.applyLastCheck(now.addingTimeInterval(-300))
+    hero = try #require(UpdatesHero(status: idle, now: now))
+    #expect(hero.title.hasPrefix("Up to date · checked ") && hero.title.count > "Up to date · checked ".count)
+    // A check that finished after `now` (the timeline's minute) was just now.
+    idle.applyLastCheck(now)
+    let justNow = UpdatesHero(status: idle, now: now)?.title
+    idle.applyLastCheck(now.addingTimeInterval(30))
+    #expect(UpdatesHero(status: idle, now: now)?.title == justNow)
+    idle.applyLastError("The feed could not be read.")
+    #expect(UpdatesHero(status: idle, now: now)?.title == "Last check failed")
+    idle.applyReplacedOnDisk(true)
+    hero = try #require(UpdatesHero(status: idle, now: now))
+    #expect(hero.title == "Another build of Cherry was installed")
+    #expect(hero.subtitle == "Quit and reopen Cherry to use it. Until then this copy installs no update.")
+    #expect(hero.actions.map(\.isEnabled) == [false])
+    // Check Now waits for Sparkle.
+    #expect(UpdatesHero(status: updatesStatus(canCheck: false))?.actions.map(\.isEnabled) == [false])
+
+    hero = try #require(UpdatesHero(status: updatesStatus(.available(version: "2026.10.15.1", channel: nil))))
+    #expect(hero.tone == .available && hero.title == "Cherry 2026.10.15.1 is available")
+    #expect(hero.actions == [
+        UpdatesHero.Action(kind: .install, title: "Install…", isPrimary: true, isEnabled: true),
+        checkNow,
+    ])
+
+    let ready = updatesStatus(.ready(version: "2026.10.15.1", channel: nil, throughSparkle: false))
+    hero = try #require(UpdatesHero(status: ready))
+    #expect(hero.tone == .ready && hero.tone.symbol == "arrow.down")
+    #expect(hero.title == "Cherry 2026.10.15.1 is ready")
+    #expect(hero.subtitle == "Restart to install it now; otherwise it installs when Cherry quits. Persistent sessions keep running.")
+    #expect(hero.actions == [
+        UpdatesHero.Action(kind: .discard, title: "Discard", label: "Discard Downloaded Update", isPrimary: false, isEnabled: true),
+        UpdatesHero.Action(kind: .restartToUpdate, title: "Restart to Update", isPrimary: true, isEnabled: true),
+    ])
+    let prerelease = updatesStatus(.ready(version: "2026.10.15.2", channel: "prerelease", throughSparkle: false))
+    #expect(UpdatesHero(status: prerelease)?.title == "Cherry 2026.10.15.2 (pre-release) is ready")
+
+    // Staged from Sparkle's window: Restart to Update resumes it, and there
+    // is no Discard.
+    hero = try #require(UpdatesHero(status: updatesStatus(.ready(version: "2026.10.15.1", channel: nil, throughSparkle: true))))
+    #expect(hero.subtitle == "Restart to Update shows it, to install it now or skip it; otherwise it installs when Cherry quits. Persistent sessions keep running.")
+    #expect(hero.actions.map(\.kind) == [.restartToUpdate])
+
+    ready.applyRestarting(true)
+    hero = try #require(UpdatesHero(status: ready))
+    #expect(hero.tone == .restarting && hero.tone.symbol == "arrow.clockwise")
+    #expect(hero.title == "Restarting…" && hero.subtitle == nil)
+    #expect(hero.actions.map(\.isEnabled) == [false, false])
+
+    // At most one prominent button in every state.
+    for status in [idle, ready, prerelease, updatesStatus(.available(version: "2026.10.15.1", channel: nil))] {
+        #expect((UpdatesHero(status: status)?.actions.filter(\.isPrimary).count ?? 0) <= 1)
+    }
+}
+
+@Test @MainActor func updatesPageShowsTheStoredValuesWhileTheUpdaterIsOff() {
+    let defaults = privateDefaults("AppUpdatePageOff")
+    let info: [String: Any] = ["SUEnableAutomaticChecks": true, "SUAutomaticallyUpdate": true]
+    defaults.set(false, forKey: "SUAutomaticallyUpdate")
+    let stored = AppUpdateStoredPreferences(defaults: defaults, info: info, launchArguments: [:])
+
+    // Before Sparkle starts (or never) the status says off; the page shows
+    // what is stored.
+    let off = AppUpdateStatus(enablement: .disabled(.pending), prereleases: true)
+    #expect(!off.automaticallyChecks && !off.automaticallyDownloads)
+    var shown = UpdatesSettingsPage.shownValues(status: off, stored: stored)
+    #expect(shown.checks && !shown.downloads && shown.prereleases)
+    #expect(off.enablement.reason?.explanation == "Updates start once Cherry has finished opening its windows.")
+
+    // While it runs, Sparkle's values.
+    let running = updatesStatus()
+    running.applyAutomaticallyChecks(false)
+    running.applyAutomaticallyDownloads(true)
+    shown = UpdatesSettingsPage.shownValues(status: running, stored: stored)
+    #expect(!shown.checks && shown.downloads && !shown.prereleases)
+
+    // Search says the same values.
+    let context = SettingsSearchContext(
+        terminal: TerminalSettings(defaults: defaults, launchArguments: [:]),
+        agents: AgentSettings(defaults: defaults),
+        updates: off,
+        defaults: defaults
+    )
+    let rows = UpdatesSettingsPage.searchRows(in: context, info: info)
+    #expect(rows.map(\.id) == [.updatesVersion, .updatesAutomaticChecks, .updatesAutomaticDownloads, .updatesPrereleases])
+    #expect(rows.dropFirst().map(\.value) == ["On", "Off", "On"])
+    #expect(rows.allSatisfy { $0.route == .page(.updates) })
+}
+
+@Test @MainActor func updatesPageResetsGoThroughTheUpdater() throws {
+    let defaults = privateDefaults("AppUpdatePageResets")
+    let info: [String: Any] = ["SUEnableAutomaticChecks": true, "SUAutomaticallyUpdate": true]
+    defaults.set(false, forKey: "SUEnableAutomaticChecks")
+    defaults.set(true, forKey: AppUpdateModel.prereleasesKey)
+    let stored = AppUpdateStoredPreferences(defaults: defaults, info: info, launchArguments: [:])
+    var checksSet: [Bool] = []
+    var prereleasesSet: [Bool] = []
+
+    // While the updater runs, ↺ sets the Info.plist's default through it and
+    // leaves Sparkle's key alone.
+    let checks = UpdatesSettingsPage.sparkleSwitchSource(stored.automaticChecks, isOn: false, updaterRuns: true) {
+        checksSet.append($0)
+    }
+    #expect(checks.badgeText == "Set here")
+    let reset = try #require(checks.rowReset)
+    #expect(reset.title == "Reset to default (On)")
+    reset.perform()
+    #expect(checksSet == [true])
+    #expect(defaults.object(forKey: "SUEnableAutomaticChecks") as? Bool == false)
+    // A value equal to its default has no badge and no ↺.
+    let downloads = UpdatesSettingsPage.sparkleSwitchSource(stored.automaticDownloads, isOn: true, updaterRuns: true) { _ in }
+    #expect(downloads.badgeText == nil && downloads.rowReset == nil)
+
+    // Get pre-release builds: off through the updater, then Cherry's key goes.
+    let prereleases = UpdatesSettingsPage.prereleasesSource(stored, isOn: true, updaterRuns: true, defaults: defaults) {
+        prereleasesSet.append($0)
+    }
+    #expect(prereleases.badgeText == "Set here")
+    let prereleasesReset = try #require(prereleases.rowReset)
+    #expect(prereleasesReset.title == "Reset to default (Off)")
+    prereleasesReset.perform()
+    #expect(prereleasesSet == [false])
+    #expect(defaults.object(forKey: AppUpdateModel.prereleasesKey) == nil)
+
+    // While it isn't running the badge stays, with nothing to press.
+    let offChecks = UpdatesSettingsPage.sparkleSwitchSource(stored.automaticChecks, isOn: false, updaterRuns: false) {
+        checksSet.append($0)
+    }
+    #expect(offChecks.badgeText == "Set here")
+    #expect(offChecks.rowReset == nil && offChecks.buttons.isEmpty)
+    let offPrereleases = UpdatesSettingsPage.prereleasesSource(stored, isOn: true, updaterRuns: false, defaults: defaults) {
+        prereleasesSet.append($0)
+    }
+    #expect(offPrereleases.rowReset == nil && offPrereleases.buttons.isEmpty)
+    #expect(checksSet == [true] && prereleasesSet == [false])
+
+    // A launch argument makes the switch read-only.
+    let scripted = AppUpdateStoredPreferences(
+        defaults: defaults,
+        info: info,
+        launchArguments: ["SUEnableAutomaticChecks": false]
+    )
+    let argument = UpdatesSettingsPage.sparkleSwitchSource(scripted.automaticChecks, isOn: false, updaterRuns: true) { _ in }
+    #expect(argument.badgeText == "This run only")
+    #expect(!argument.source.isEditable && argument.rowReset == nil)
+}
+
+@Test @MainActor func updatesPageOffersToDiscardADownloadedPrereleaseOnlyWhileTheyAreOff() {
+    let staged = AppUpdateStatus.Phase.ready(version: "2026.10.15.2", channel: "prerelease", throughSparkle: false)
+    #expect(UpdatesSettingsPage.downloadedPrereleaseWhileOff(status: updatesStatus(staged)) == "2026.10.15.2")
+    #expect(UpdatesSettingsPage.downloadedPrereleaseWhileOff(status: updatesStatus(staged, prereleases: true)) == nil)
+    #expect(UpdatesSettingsPage.downloadedPrereleaseWhileOff(status: updatesStatus(
+        .ready(version: "2026.10.15.2", channel: "prerelease", throughSparkle: true)
+    )) == nil)
+    #expect(UpdatesSettingsPage.downloadedPrereleaseWhileOff(status: updatesStatus(
+        .ready(version: "2026.10.15.1", channel: nil, throughSparkle: false)
+    )) == nil)
+    #expect(UpdatesSettingsPage.downloadedPrereleaseTitle("2026.10.15.2")
+        == "Cherry 2026.10.15.2 (pre-release) is downloaded and installs when Cherry quits.")
+}
+
+@Test @MainActor func updatesPageHeaderShowsTheVersionAndCopiesItInOneLine() throws {
+    let info: [String: Any] = ["CFBundleShortVersionString": "2026.10.14.5", "CFBundleVersion": "20261014120000.cdb92d6"]
+    let version = UpdatesSettingsPage.version(info: info)
+    #expect(UpdatesSettingsPage.versionLine(version: version.version, build: version.build)
+        == "Version 2026.10.14.5 · Build 20261014120000.cdb92d6")
+    #expect(UpdatesSettingsPage.copiedVersion(version: version.version, build: version.build)
+        == "2026.10.14.5 (20261014120000.cdb92d6)")
+    let unknown = UpdatesSettingsPage.version(info: [:])
+    #expect(unknown.version == "Unknown" && unknown.build == "Unknown")
+
+    // Search finds the version by its number.
+    let defaults = privateDefaults("AppUpdatePageVersion")
+    let context = SettingsSearchContext(
+        terminal: TerminalSettings(defaults: defaults, launchArguments: [:]),
+        agents: AgentSettings(defaults: defaults),
+        defaults: defaults
+    )
+    let rows = UpdatesSettingsPage.searchRows(in: context, info: info)
+    let found = try #require(SettingsSearchIndex.groups(for: "2026.10.14", in: rows).first)
+    #expect(found.results.map(\.row.id) == [.updatesVersion])
+    #expect(found.results.first?.row.detail == "2026.10.14.5 · Build 20261014120000.cdb92d6")
 }
 
 @Test func releaseBundleIdentifierMatchesPackagingReleaseConf() throws {

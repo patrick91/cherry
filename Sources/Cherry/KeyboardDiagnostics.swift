@@ -6,6 +6,11 @@
 // the front tab's and the key test tab's keyboard, and a key test tab
 // (`CherryMCP --key-echo`) whose log this window reads. Copy Report puts it
 // all on the pasteboard as text.
+//
+// Settings › Terminal's Ghostty config section and its Copy Report
+// (GhosttyConfigSettings.swift) use the same parts (`configFiles`, `masked`,
+// `Tab`, `newTabEnvironment`, `inputSourceID`, `Report`): they stay when the
+// window goes.
 
 import AppKit
 import Carbon.HIToolbox
@@ -369,6 +374,9 @@ enum KeyboardDiagnostics {
         var appliedKeyboardLines: [String] = []
         /// The selected tab of the front project window on This Mac.
         var frontTab: Tab?
+        /// Whether `text` has the key test's parts: Settings › Terminal's
+        /// Copy Report has no key test (`GhosttyConfigReport`).
+        var includesKeyTest = true
         var keyTestTab: Tab?
         var keyLog: [KeyLogRecord] = []
 
@@ -416,9 +424,11 @@ enum KeyboardDiagnostics {
             lines += appliedKeyboardLines.map { "  \($0)" }
             lines.append("")
             lines += frontTabLines
-            lines += keyTestTabLines
-            lines.append("Key test log:")
-            lines += keyLog.isEmpty ? ["  No keys yet."] : keyLog.map { "  \($0.line)" }
+            if includesKeyTest {
+                lines += keyTestTabLines
+                lines.append("Key test log:")
+                lines += keyLog.isEmpty ? ["  No keys yet."] : keyLog.map { "  \($0.line)" }
+            }
             return lines.joined(separator: "\n") + "\n"
         }
     }
@@ -442,40 +452,17 @@ final class KeyboardDiagnosticsModel: ObservableObject {
     /// Everything but the new tabs' TERM (`refreshTerminalEnvironments`),
     /// the tabs and the key log (`refreshLive`).
     func refresh() {
-        let info = Bundle.main.infoDictionary ?? [:]
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let environment = ProcessInfo.processInfo.environment
-        let status = PersistentSessionsStatus.shared
         var report = report
-        report.version = info["CFBundleShortVersionString"] as? String ?? "unknown"
-        report.build = info["CFBundleVersion"] as? String ?? "unknown"
-        report.macOS = ProcessInfo.processInfo.operatingSystemVersionString
-        report.inputSource = KeyboardDiagnostics.inputSourceID(TISCopyCurrentKeyboardInputSource()?.takeRetainedValue())
-        report.keyboardLayout = KeyboardDiagnostics.inputSourceID(TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue())
-        report.persistentSessions = TerminalSettings.shared.persistLocalSessions
-        report.persistentSessionsUnavailable = status.localSessionsUnavailableReason
-        report.lastSessionLaunchFailure = status.lastLaunchFailure
-        report.homeDirectory = home.path
-        report.appliedKeyboardLines = TerminalSettings.nativeUserKeyboardConfig.map { KeyboardDiagnostics.masked("\($0.0) = \($0.1)") }
-        report.configFiles = KeyboardDiagnostics.configFiles(
-            defaultPaths: TerminalSettings.ghosttyDefaultConfigPaths(home: home, environment: environment),
-            atLaunch: TerminalSettings.nativeUserKeyboardConfigReading,
-            now: TerminalSettings.ghosttyKeyboardConfig(home: home, environment: environment),
-            fileExists: { FileManager.default.fileExists(atPath: $0) }
-        )
+        GhosttyConfigReport.fill(&report, from: .app())
         self.report = report
     }
 
     func refreshTerminalEnvironments() async {
-        let environment = ProcessInfo.processInfo.environment
         var resources: GhosttyStagedResources?
         if report.persistentSessions { resources = try? await GhosttyResourceStager.shared.resolve() }
-        report.nativeTab = KeyboardDiagnostics.terminalVariables(
-            KeyboardDiagnostics.newTabEnvironment(persistent: false, resources: nil, processEnvironment: environment)
-        )
-        report.persistentTab = report.persistentSessions ? KeyboardDiagnostics.terminalVariables(
-            KeyboardDiagnostics.newTabEnvironment(persistent: true, resources: resources, processEnvironment: environment)
-        ) : nil
+        var report = report
+        GhosttyConfigReport.fillNewTabs(&report, resources: resources, environment: ProcessInfo.processInfo.environment)
+        self.report = report
     }
 
     /// The key log, the front tab and the key test tab, as they are now.

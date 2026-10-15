@@ -48,7 +48,7 @@ struct InstalledEditor: Identifiable, Equatable {
 /// Resolves which known editors are installed, via Launch Services.
 ///
 /// Discovery only runs inside `refresh()` — call it when a surface appears
-/// (Omni bar open, settings pane appear), never from a SwiftUI body.
+/// (Omni bar open, Settings › Projects appear), never from a SwiftUI body.
 @MainActor
 final class ExternalEditorDiscovery: ObservableObject {
     static let shared = ExternalEditorDiscovery()

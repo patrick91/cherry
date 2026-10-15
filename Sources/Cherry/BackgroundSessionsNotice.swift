@@ -20,7 +20,7 @@ import AppKit
 /// (`ProjectWindowToasts`): Reopen, End…, and dismiss. Nobody asked for it,
 /// so it is an unprompted toast: its time runs only while its window is key
 /// in the active app, and it takes turns with a closed tab's toast rather
-/// than replacing one or being replaced. Off in Settings › Sessions
+/// than replacing one or being replaced. Off in Settings › Notifications
 /// (`sessions.backgroundNoticeAtLaunch`).
 @MainActor
 final class BackgroundSessionsNotice {
@@ -65,7 +65,7 @@ final class BackgroundSessionsNotice {
     private let peeks: RemoteDevicePeeks
 
     /// - Parameters:
-    ///   - isEnabled: Settings › Sessions' "Tell me about background
+    ///   - isEnabled: Settings › Notifications' "Tell me about background
     ///     sessions when Cherry opens".
     ///   - defaults: where the sessions told about are kept.
     ///   - canPresent: whether a window can show it now (on screen).

@@ -36,6 +36,37 @@ final class TerminalNotificationCenter {
         }
     }
 
+    /// Whether macOS lets Cherry post notifications now (System Settings ›
+    /// Notifications), for Settings › Notifications' banner. Unavailable
+    /// without a notification-capable bundle (`swift run`, tests), where
+    /// `UNUserNotificationCenter` must not be touched.
+    func permission() async -> NotificationPermission {
+        guard canUseNativeNotifications else { return .unavailable }
+        return NotificationPermission(await Self.authorizationStatus())
+    }
+
+    /// Asks macOS now (Allow Notifications…) instead of before the first
+    /// post, and says what it allows then.
+    func requestAuthorizationNow() async -> NotificationPermission {
+        guard canUseNativeNotifications else { return .unavailable }
+        didRequestAuthorization = true
+        do {
+            _ = try await Self.requestAuthorization()
+        } catch {
+            fputs("[notification authorization] \(error.localizedDescription)\n", stderr)
+        }
+        return await permission()
+    }
+
+    // Off the main actor: the settings object never crosses to it.
+    nonisolated private static func authorizationStatus() async -> UNAuthorizationStatus {
+        await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+
+    nonisolated private static func requestAuthorization() async throws -> Bool {
+        try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+    }
+
     /// Posts `content` now, asking for permission first if this run has not.
     private func add(_ content: UNMutableNotificationContent, identifier: String) {
         requestAuthorizationIfNeeded()
@@ -171,6 +202,32 @@ final class TerminalNotificationCenter {
         guard !didReportUnavailableDelivery else { return }
         didReportUnavailableDelivery = true
         fputs("[notification delivery] skipped because the app has no notification-capable bundle identifier\n", stderr)
+    }
+}
+
+/// Whether macOS lets Cherry post notifications
+/// (`TerminalNotificationCenter.permission()`); Settings › Notifications
+/// shows a banner when it does not, or has not been asked.
+enum NotificationPermission: Equatable, Sendable {
+    /// No notification-capable bundle (`swift run`, tests): Cherry posts
+    /// nothing, and there is nothing to ask.
+    case unavailable
+    /// Cherry has not asked: it asks the first time it has one to post.
+    case notDetermined
+    /// Off for Cherry in System Settings.
+    case denied
+    case allowed
+
+    /// Authorized and provisional (quiet) delivery are allowed, and so is a
+    /// status macOS does not have today (an App Clip's ephemeral): no
+    /// banner for it.
+    init(_ status: UNAuthorizationStatus) {
+        switch status {
+        case .notDetermined: self = .notDetermined
+        case .denied: self = .denied
+        case .authorized, .provisional: self = .allowed
+        @unknown default: self = .allowed
+        }
     }
 }
 

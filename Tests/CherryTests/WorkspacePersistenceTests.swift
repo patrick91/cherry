@@ -746,8 +746,11 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     #expect(defaults.object(forKey: "sessions.onQuit") as? String == "end")
     #expect(defaults.object(forKey: "sessions.closeTabOnExit") as? Bool == false)
 
-    // Not part of the terminal appearance.
-    settings.resetTerminalAppearance()
+    // Not on a page that resets.
+    settings.reset(
+        TerminalSettings.Setting.interfacePage + TerminalSettings.Setting.themesPage
+            + TerminalSettings.Setting.terminalPage
+    )
     #expect(!settings.persistLocalSessions)
     #expect(settings.localSessionsOnQuit == .end)
     #expect(!settings.closeTabsOnCleanExit)
@@ -767,10 +770,16 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     #expect(LocalSessionsOnQuit.allCases.map(\.label) == ["Ask", "Keep Running", "End Sessions"])
     #expect(!SessionBackendPolicy(settings: { reloaded.sessionPersistenceSettings }).prefersPersistentLocalSessions)
     #expect(!SessionBackendPolicy.native.prefersPersistentLocalSessions)
-    #expect(SettingsPage.filtered(by: "quitting") == [.sessions])
-    // Close a tab when its shell exits.
-    for query in ["exit", "shell", "close"] {
-        #expect(SettingsPage.filtered(by: query) == [.sessions], Comment(rawValue: query))
+    // Search finds Sessions' rows: When quitting or closing a window, Close
+    // a tab when its shell exits.
+    let rows = SettingsSearchIndex.rows(in: SettingsSearchContext(
+        terminal: reloaded,
+        agents: AgentSettings(defaults: defaults),
+        defaults: defaults
+    ))
+    for query in ["quitting", "exit", "shell"] {
+        let sessions = SettingsSearchIndex.groups(for: query, in: rows).first { $0.kind == .page(.sessions) }
+        #expect(sessions?.results.contains { !$0.row.opensPage } == true, Comment(rawValue: query))
     }
     #expect(SettingsPage.sessions.title == "Sessions")
 }

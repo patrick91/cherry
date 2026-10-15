@@ -510,7 +510,7 @@ enum SessionCloseCoordinator {
         let toast = ProjectWindowToast(
             name: "Closed " + subject,
             predicate: "",
-            action: ProjectWindowToast.Action(title: "Undo", shortcut: "⌘Z") { [weak chromeState] in
+            action: ProjectWindowToast.Action(title: "Undo", shortcut: CherryShortcut.undoCloseTab.display) { [weak chromeState] in
                 chromeState?.closedTabs.undo(entry)
             },
             pausesWhileUnattended: true,
@@ -576,7 +576,7 @@ enum SessionCloseCoordinator {
         let hosting = policy.localSessions
         let targets = notice.reopen
         let action = targets.isEmpty && undoEntry == nil ? nil : ProjectWindowToast.Action(
-            title: "Reopen", shortcut: undoEntry == nil ? nil : "⌘Z"
+            title: "Reopen", shortcut: undoEntry == nil ? nil : CherryShortcut.undoCloseTab.display
         ) { [weak workspace, weak repository, weak chromeState] in
             if let undoEntry, chromeState?.closedTabs.undo(undoEntry) == true { return }
             Task { @MainActor in

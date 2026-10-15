@@ -757,15 +757,52 @@ enum RemoteDeviceAlerts {
 
     static func confirmRemove(_ id: UUID, store: RemoteDeviceStore) {
         guard store.canModify, let device = store.device(id: id) else { return }
+        guard makeRemoveAlert(device: device).runModal() == .alertFirstButtonReturn else { return }
+        store.remove(id)
+    }
+
+    /// Remove…'s question (Settings › Macs, the Omni bar, the title-bar
+    /// menu): Remove, which is destructive, and Cancel.
+    static func makeRemoveAlert(device: RemoteDevice) -> NSAlert {
         let alert = NSAlert()
         alert.messageText = "Remove \(device.name)?"
         alert.informativeText = device.createdHostEntry
             ? "Its sessions keep running on that Mac, and its saved SSH host and trusted identity are forgotten. Windows of its projects stop opening until you add it again."
             : "Its sessions keep running on that Mac, and your saved SSH host \(device.sshDestination) stays. Windows of its projects stop opening until you add it again."
-        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Remove").hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        store.remove(id)
+        return alert
+    }
+
+    /// Forget… of a saved SSH host no Mac uses (Settings › Macs › SSH
+    /// hosts): Forget, which is destructive, and Cancel.
+    static func forgetHostConfirmation(destination: String, forget: @escaping @MainActor () -> Void) -> SettingsConfirmation {
+        SettingsConfirmation(
+            title: "Forget \(destination)?",
+            message: "Its sessions keep running there. Cherry forgets the saved host and its trusted identity.",
+            choices: [
+                SettingsConfirmation.Choice("Forget", role: .destructive, perform: forget),
+                .cancel(),
+            ]
+        )
+    }
+
+    /// Remove… of a folder added on a Mac (Settings › Macs): the project
+    /// picker leaves it out from then on, and Show Again brings it back.
+    /// `path` as the row shows it ("~/code/api-server").
+    static func removeProjectConfirmation(
+        path: String,
+        deviceName: String,
+        remove: @escaping @MainActor () -> Void
+    ) -> SettingsConfirmation {
+        SettingsConfirmation(
+            title: "Remove \(path) from \(deviceName)'s projects?",
+            message: "It's hidden from the project picker; Show Again brings it back.",
+            choices: [
+                SettingsConfirmation.Choice("Remove", role: .destructive, perform: remove),
+                .cancel(),
+            ]
+        )
     }
 
     static func confirmTrustNewIdentity(of id: UUID, store: RemoteDeviceStore) {

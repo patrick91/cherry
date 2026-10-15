@@ -379,7 +379,7 @@ final class BackgroundSessionsModel: ObservableObject {
     static let endedCountMaximumGap: TimeInterval = 5
     private let postNotification: @MainActor (BackgroundSessionNotificationContent) -> Void
     /// Whether a program status change to this state posts a notification
-    /// (Settings › Sessions: `blocked`, and `done`/`error`).
+    /// (Settings › Notifications: `blocked`, and `done`/`error`).
     private let notifiesProgramState: @MainActor (ProgramStatus.State) -> Bool
     /// Removes the staged Ghostty resources no session uses any more, given
     /// the copies running sessions name (`cherry.resources`;
@@ -686,7 +686,7 @@ final class BackgroundSessionsModel: ObservableObject {
     /// for the user (`blocked`, or blocked on something else), finished
     /// (`done`) or failed (`error`) marks the session unread, as a bell
     /// does, and is posted as the app's notification when Settings ›
-    /// Sessions asks for it (`notifiesProgramState`: by default only
+    /// Notifications asks for it (`notifiesProgramState`: by default only
     /// `blocked`), at most every `notificationInterval` per session and
     /// `notificationLimit` a minute. The first look at a session only notes
     /// it: what its program reported before it went to the background, or
@@ -1186,11 +1186,11 @@ final class BackgroundSessionsModel: ObservableObject {
     }
 }
 
-/// Settings › Projects › Remove Project: a project removed from the library
-/// whose sessions run in the background (no open tab shows them) offers to
-/// end them first, since no window of it opens again by itself to show
-/// them. "Keep Running" removes the project and leaves them in Background
-/// Sessions.
+/// Remove… of a project (Settings › Projects, a project's page) always
+/// asks first. One whose sessions run in the background (no
+/// open tab shows them) offers to end them too, since no window of it
+/// opens again by itself to show them: Keep Them Running removes the
+/// project and leaves them in Background Sessions.
 @MainActor
 enum ProjectRemoval {
     /// Shows the question and reports which button answered it.
@@ -1231,9 +1231,9 @@ enum ProjectRemoval {
             .max { $0.count < $1.count }
     }
 
-    /// Removes `project` from `settings`, first asking whether to end its
-    /// background sessions when it has any: End Sessions ends them, Keep
-    /// Running keeps them, Cancel removes nothing.
+    /// Asks, then removes `project` from `settings`. With no background
+    /// session Remove removes it; with some, End Sessions and Remove ends
+    /// them too and Keep Them Running keeps them. Cancel removes nothing.
     static func remove(
         _ project: CherryProject,
         settings: AgentSettings,
@@ -1244,10 +1244,6 @@ enum ProjectRemoval {
         let listed = backgroundSessions(
             ofProject: project.root, in: background.sessions, projectRoots: settings.projects.map(\.root)
         ) { settings.repositoryRoot(for: $0) }
-        guard !listed.isEmpty else {
-            settings.removeProject(project)
-            return
-        }
         let ids = listed.map(\.id)
         let alert = makeAlert(
             projectName: project.name,
@@ -1259,7 +1255,7 @@ enum ProjectRemoval {
             case .alertFirstButtonReturn:
                 settings.removeProject(project)
                 background.endAll(ids)
-            case .alertSecondButtonReturn:
+            case .alertSecondButtonReturn where !ids.isEmpty:
                 settings.removeProject(project)
             default:
                 break
@@ -1267,27 +1263,44 @@ enum ProjectRemoval {
         }
     }
 
-    /// "End the N background sessions of <project>?" with End Sessions,
-    /// Keep Running and Cancel.
+    /// The question Remove… asks. No background session: "Remove “cherry”
+    /// from Cherry?", what goes and what stays, Remove and Cancel. Some:
+    /// "Remove “cherry”? Its 2 background sessions are still running."
+    /// (those whose program ended are told apart in the message), with End
+    /// Sessions and Remove, Keep Them Running and Cancel.
     static func makeAlert(projectName: String, running: Int, ended: Int) -> NSAlert {
         let alert = NSAlert()
         alert.alertStyle = .warning
         let count = running + ended
-        alert.messageText = count == 1
-            ? "End the background session of “\(projectName)”?"
-            : "End the \(count) background sessions of “\(projectName)”?"
-        let state: String
-        if running == 0 {
-            state = count == 1 ? "Its program already ended." : "Their programs already ended."
-        } else if ended == 0 {
-            state = count == 1 ? "Its program is still running." : "Their programs are still running."
-        } else {
-            state = "\(running) of them \(running == 1 ? "is" : "are") still running."
+        guard count > 0 else {
+            alert.messageText = "Remove “\(projectName)” from Cherry?"
+            alert.informativeText = "Its commands, features and color saved on this Mac are deleted. "
+                + "The folder and its cherry.toml stay."
+            alert.addButton(withTitle: "Remove").hasDestructiveAction = true
+            alert.addButton(withTitle: "Cancel")
+            return alert
         }
-        alert.informativeText = state
-            + " Removing the project does not stop them; Keep Running leaves them in Background Sessions."
-        alert.addButton(withTitle: "End Sessions").hasDestructiveAction = true
-        alert.addButton(withTitle: "Keep Running")
+        let sessions: String
+        var state: String?
+        if ended == 0 {
+            sessions = count == 1
+                ? "Its background session is still running."
+                : "Its \(count) background sessions are still running."
+        } else {
+            sessions = count == 1 ? "It has a background session." : "It has \(count) background sessions."
+            if running == 0 {
+                state = count == 1 ? "Its program already ended." : "Their programs already ended."
+            } else {
+                state = "\(running) of them \(running == 1 ? "is" : "are") still running."
+            }
+        }
+        alert.messageText = "Remove “\(projectName)”? " + sessions
+        let them = count == 1 ? "it" : "them"
+        var message = running == 0 ? "" : "Removing the project does not stop \(them); "
+        message += "Keep Them Running leaves \(them) in Background Sessions."
+        alert.informativeText = state.map { "\($0) \(message)" } ?? message
+        alert.addButton(withTitle: "End Sessions and Remove").hasDestructiveAction = true
+        alert.addButton(withTitle: "Keep Them Running")
         alert.addButton(withTitle: "Cancel")
         return alert
     }

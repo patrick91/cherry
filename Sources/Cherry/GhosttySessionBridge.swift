@@ -874,7 +874,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func terminalDidRingBell() {
         guard let session = proxy.session else {
-            NSSound.beep()
+            TerminalBell.ring()
             return
         }
         // A persistent tab's host may have rung this bell already.

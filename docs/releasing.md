@@ -316,8 +316,9 @@ once #2 is out and the sidebar shows **Restart to Update**, start a long
 command in a persistent tab and click it. The windows come back with the same
 program running, and `cherry status` shows the daemon at #2's build. Also
 check a quit without clicking (⌘Q with #2 downloaded; Cherry opens as #2),
-**Discard Downloaded Update**, and `Scripts/install-local-app` while an update
-is downloaded (the local build survives the quit).
+**Discard** in Settings › Updates (Discard Downloaded Update), and
+`Scripts/install-local-app` while an update is downloaded (the local build
+survives the quit).
 
 ### Secrets and variables
 
@@ -375,8 +376,8 @@ Sparkle never downgrades, so ship a fix forward at once, and meanwhile:
   adds it back, and it cannot be promoted.
 - Macs that already downloaded it drop it within about 2 hours (Cherry checks
   the feed every 2 hours while an update waits), or at once with **Settings ›
-  Updates › Discard Downloaded Update**; otherwise they install it at their
-  next quit.
+  Updates › Discard** (Discard Downloaded Update); otherwise they install it
+  at their next quit.
 - Macs that already installed it stay on it until the fix ships.
 - A build that cannot launch cannot update itself: its users install the disk
   image of a fixed release.
@@ -476,8 +477,8 @@ For a Mac that runs a local build from before releases
 3. **The daemon.** The new `cherry-host` was installed at the daemon's own
    path, so the new app's first `cherry control` hands the daemon over and
    the sessions carry on; `cherry status` shows the build. If it still shows
-   the old build, run `cherry restart` or Settings › Sessions › Session Host ›
-   Restart Host…. That happens when another copy or a `dev-…` build started
+   the old build, run `cherry restart` or Settings › Sessions › Restart
+   Host…. That happens when another copy or a `dev-…` build started
    the daemon, within an hour of a handover the old build won, or when an
    update's swap raced a daemon from before the host noticed swapped bundles.
 4. **Permissions.** macOS asks once more for notifications, local network (at
@@ -491,7 +492,8 @@ For a Mac that runs a local build from before releases
    remove `~/Applications/Cherry.app`, link `~/.local/bin/cherry` and
    `~/.local/bin/cherry-host` to the copies in
    `/Applications/Cherry.app/Contents/MacOS/` again, run the MCP install
-   commands again (Settings › MCP shows them), and run `cherry restart`.
+   commands again (each agent's page in Settings › Agents & MCP shows them),
+   and run `cherry restart`.
    Never keep both copies.
 
 ## Troubleshooting

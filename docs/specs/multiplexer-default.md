@@ -24,15 +24,16 @@ adapter.
 
 ## Behaviour
 
-Settings (Settings → Sessions, stored in `TerminalSettings`, never rebuild
-Ghostty config when they change):
+Settings (Settings › Sessions, the background notice on Settings ›
+Notifications; stored in `TerminalSettings`, never rebuild Ghostty config
+when they change):
 
-| Setting (as Settings › Sessions labels it) | Key | Default |
+| Setting (as Settings labels it) | Key | Default |
 |---|---|---|
 | Run local terminals as persistent sessions | `sessions.persistLocal` | on |
 | When quitting or closing a window (*on quit*: Ask, Keep Running, End Sessions) | `sessions.onQuit` (`ask`, `keep`, `end`) | `ask` |
 | Close a tab when its shell exits (*close on exit*) | `sessions.closeTabOnExit` | on |
-| Tell me about background sessions when Cherry opens (*background notice*) | `sessions.backgroundNoticeAtLaunch` | on |
+| Tell me about background sessions when Cherry opens (*background notice*; Settings › Notifications) | `sessions.backgroundNoticeAtLaunch` | on |
 
 The boolean keys are read with `object(forKey:) as? Bool`, so a launch
 argument must be a plist boolean: `-sessions.persistLocal '<false/>'` works,
@@ -274,7 +275,7 @@ double click on **End** is not a yes. A terminal whose shell exited with
 status 0 is removed instead of listed while *close on exit* is on (its tab
 would have closed, and its window's restore removes it too). **Cherry → End
 Background Sessions…** (disabled when there are none), the panel's **End
-All…** and Settings › Sessions' **Background Sessions** card end them all
+All…** and Settings › Sessions' **Background sessions** section end them all
 after "End N background sessions?" (**End Sessions**, destructive, and
 Cancel; "Remove N ended background sessions?" when none runs), shown on the
 Settings window when asked there, else where the quit confirmation goes,
@@ -325,7 +326,7 @@ followed the same way, against what Cherry saw when it last looked: a
 program that waits for the user (`blocked`, or blocked on something else
 than before), finishes (`done`) or fails (`error`) marks its session
 unread, as the spec's "the user has not seen it yet" asks. Settings ›
-Sessions › Background Sessions decides which are also posted, its own
+Notifications › Background sessions decides which are also posted, its own
 message as the text ("Waiting for your permission." and the like when it
 gave none), under the notifications' limits: *Notify me when a background
 program needs me* (on) and *… finishes* (off). What it reported before
@@ -342,9 +343,12 @@ or closed, and set-aside `.bak` copies) is removed by itself; one a closed
 window's saved tab names stays for that window's restore, which shows how
 it ended. One marked unread, or whose host crashed, is never removed by
 itself. Both removals are recorded as
-ends on purpose, like **End**. Settings › Projects › **Remove Project** for
-a project with background sessions asks "End the N background sessions of
-“<project>”?" (**End Sessions**, **Keep Running**, Cancel) first. A session
+ends on purpose, like **End**. Removing a project in Settings (Settings ›
+Projects' **Remove…**, a project page's **Remove Project…**) always asks
+first: "Remove “<project>” from Cherry?" (**Remove**, Cancel) when it has no
+background session, else "Remove “<project>”? Its N background sessions are
+still running." (**End Sessions and Remove**, **Keep Them Running**,
+Cancel). A session
 belongs to the registered project its folder is (or is the resolved folder of), else to the
 longest registered root that contains it, so a project nested in the one
 removed keeps its sessions.
@@ -943,11 +947,11 @@ differs from the design above.
   closed) sends it once bound. A failed `Update` is logged; the next rename
   sends it again.
 
-- **Session host diagnostics.** Settings › Sessions has a "Session Host"
-  card (`SessionHostDiagnostics`): the local host's status from `cherry
-  status --json` (running, build, uptime, sessions against the limit,
-  connections, sessions whose holder runs another build, pid), read when
-  the pane opens; Reveal Log (the daemon's `host.log` in the Finder); Copy
+- **Session host diagnostics.** Settings › Sessions shows the session host
+  at its top (`SessionHostDiagnostics`): the local host's status from
+  `cherry status --json` (running, build, uptime, sessions against the
+  limit, connections, sessions whose holder runs another build, pid), read
+  when the page opens; Reveal Log (the daemon's `host.log` in the Finder); Copy
   Diagnostics (the app's version, then what `cherry status` and `cherry
   doctor` print); and Restart Host… (`cherry restart`, after an alert that
   says running programs keep running and tabs reconnect). Where local
@@ -1789,7 +1793,7 @@ differs from the design above.
   and the unread marks are). Open for a session started in a
   folder no project names (a Git worktree's, say) opens a window for that
   folder. The menu bar panel, the
-  Settings card, the Cherry menu command and the sheets are not covered by
+  Settings section, the Cherry menu command and the sheets are not covered by
   tests (the model, classifier, copy, Open, End and the notice are); the
   Persistent Sessions sheet's Create still makes ownerless sessions, which
   are never in the background.
@@ -1873,7 +1877,7 @@ differs from the design above.
   file and manifests without locking; it cannot tell a PID file of a
   daemon that just started from a stale one in the moment before the daemon
   binds its socket. A handover the old build won is not tried again for an
-  hour, even when the old build's client is gone by then. The Settings card, its alert, and the waiting bar are
+  hour, even when the old build's client is gone by then. Settings › Sessions' host header, its alert, and the waiting bar are
   tested through their models (`SessionHostDiagnostics`,
   `SessionHostStatus`, `HostedReconnects`, `HostedConnectionBarState`), not
   as SwiftUI views; the wake notification and NWPathMonitor are tested

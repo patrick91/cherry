@@ -152,7 +152,9 @@ private func keyEchoName(_ text: String) -> String { KeyEcho.describe(utf8Bytes(
 
 // MARK: - Config files
 
-private struct TemporaryHome {
+/// A home directory of the test's own with Ghostty config files in it,
+/// never the real one (also SettingsWindowTerminalTests').
+struct TemporaryHome {
     let url: URL
 
     init() throws {

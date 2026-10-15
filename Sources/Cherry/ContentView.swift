@@ -3110,7 +3110,7 @@ struct TitlebarProjectPicker: View {
         .background(TitlebarProjectMenuAnchor())
         .help(help(device: device, status: status))
         .accessibilityLabel(accessibilityLabel(device: device, status: status))
-        .accessibilityHint("Opens the Omni bar on Projects (⌘O)")
+        .accessibilityHint("Opens the Omni bar on Projects (\(CherryShortcut.openProject.display))")
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.12)) {
                 isHovering = hovering
@@ -3366,8 +3366,8 @@ private struct AgentLaunchMenu: View {
 
             Divider()
 
-            Button("Edit Agents...") {
-                openSettings()
+            Button("Edit Agents…") {
+                SettingsOpening.editAgents(navigator: .shared, openSettings: openSettings)
             }
         } label: {
             Image(systemName: "plus")
@@ -3522,7 +3522,7 @@ private struct SidebarCommandSection: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(projectRoot == nil)
-                .help("Add command")
+                .help("Add Command")
             }
 
             if isIconDebugActive {

@@ -7401,8 +7401,9 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     settings.sidebarTerminalPathDisplayMode = .fullPath
     #expect(TerminalSettings(defaults: defaults).sidebarTerminalPathDisplayMode == .fullPath)
 
-    settings.resetTerminalAppearance()
+    settings.reset(TerminalSettings.Setting.interfacePage)
     #expect(settings.sidebarTerminalPathDisplayMode == .repoFocused)
+    #expect(defaults.object(forKey: "sidebar.terminalPathDisplayMode") == nil)
 }
 
 @MainActor
@@ -7419,8 +7420,9 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     settings.projectColorDisplayMode = .tinted
     #expect(TerminalSettings(defaults: defaults).projectColorDisplayMode == .tinted)
 
-    settings.resetTerminalAppearance()
+    settings.reset(TerminalSettings.Setting.interfacePage)
     #expect(settings.projectColorDisplayMode == .accent)
+    #expect(defaults.object(forKey: "sidebar.projectColorDisplayMode") == nil)
 }
 
 @MainActor

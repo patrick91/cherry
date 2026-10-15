@@ -343,7 +343,8 @@ final class AgentTaskRegistry {
     /// cursor in between names events the file lost (`cursor_reset`).
     private(set) var restoredThroughSeq: Int?
     private(set) var restoredSeqGapEnd: Int?
-    /// Settings › MCP › Wake idle agents (the server's monitors' setting).
+    /// Settings › Agents & MCP › Monitors › Wake idle agents (the server's
+    /// monitors' setting).
     var wakeLinesEnabled: @MainActor () -> Bool = { true }
 
     // Persistence (`AgentTaskPersistence.swift`): nil saves nothing (tests

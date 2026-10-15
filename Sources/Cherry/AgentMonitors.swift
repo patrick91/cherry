@@ -111,8 +111,11 @@ final class WatchedProcess {
 /// The monitors of one control server.
 @MainActor
 final class AgentMonitorRegistry {
-    /// Settings › MCP › Wake idle agents (default on).
+    /// Settings › Agents & MCP › Monitors › Wake idle agents.
     nonisolated static let wakeLinesDefaultsKey = "mcp.monitorWakeLines"
+    /// Whether wake lines are on while nothing is stored: the registry and
+    /// Settings read this one default.
+    nonisolated static let wakeLinesDefault = true
     static let maximumSubscriptionsPerCaller = 32
     static let maximumWatchedProcesses = 64
     static let maximumPendingEvents = 200
@@ -143,7 +146,7 @@ final class AgentMonitorRegistry {
     }
 
     var wakeLinesEnabled: Bool {
-        defaults.object(forKey: Self.wakeLinesDefaultsKey) as? Bool ?? true
+        defaults.object(forKey: Self.wakeLinesDefaultsKey) as? Bool ?? Self.wakeLinesDefault
     }
 
     func add(_ subscription: MonitorSubscription) {
@@ -717,7 +720,7 @@ extension CherryControlServer {
     @MainActor
     func info(for subscription: MonitorSubscription) -> SubscriptionInfo {
         let reason = subscription.wakeUnavailableReason
-            ?? (monitors.wakeLinesEnabled ? nil : "Wake lines are turned off in Cherry's Settings › MCP; poll with wait_for_events.")
+            ?? (monitors.wakeLinesEnabled ? nil : "Wake lines are turned off in Cherry's Settings › Agents & MCP › Monitors; poll with wait_for_events.")
         return SubscriptionInfo(
             subscriptionID: subscription.id,
             subscriberProcessID: subscription.subscriberID,

@@ -4,11 +4,11 @@ import SwiftUI
 
 // How a window on another Mac (a device window, `device:<uuid>:<path>`)
 // says so: each device's colour (`RemoteDeviceColor`, chosen in Settings ›
-// Sessions › Other Macs or derived from its id), "@ <Mac>" after the
-// sidebar header's project name (which also shows whether the Mac answers),
-// the Mac-name prefix of the tab header's path, and the window title
-// "<project> @ <Mac>". The Mac is named once per place: tab rows do not
-// repeat it. This Mac's windows show none of it.
+// Macs or derived from its id), "@ <Mac>" after the sidebar header's
+// project name (which also shows whether the Mac answers), the Mac-name
+// prefix of the tab header's path, and the window title "<project> @
+// <Mac>". The Mac is named once per place: tab rows do not repeat it.
+// This Mac's windows show none of it.
 
 /// A device's colour: a small palette that reads in light and dark and
 /// stays clear of the sidebar's selection purple (no violet or indigo).
@@ -334,50 +334,4 @@ private struct RemoteDeviceHeaderAnchor: NSViewRepresentable {
 
 extension NSUserInterfaceItemIdentifier {
     static let remoteDeviceHeaderAnchor = NSUserInterfaceItemIdentifier("Cherry.RemoteDeviceHeaderAnchor")
-}
-
-/// Settings › Sessions › Other Macs: a device's colour, Automatic or one
-/// of the palette's.
-struct RemoteDeviceColorPicker: View {
-    @Environment(\.colorScheme) private var colorScheme
-    let deviceID: UUID
-    let selection: RemoteDeviceColor?
-    let isEnabled: Bool
-    let choose: (RemoteDeviceColor?) -> Void
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Button { choose(nil) } label: {
-                HStack(spacing: 4) {
-                    swatch(RemoteDeviceColor.automatic(for: deviceID), selected: selection == nil)
-                    Text("Automatic").font(.callout)
-                }
-            }
-            .buttonStyle(.plain)
-            .help("Automatic: a colour picked from this Mac's identity")
-            .accessibilityLabel("Automatic colour")
-            .accessibilityAddTraits(selection == nil ? .isSelected : [])
-
-            Divider().frame(height: 14)
-
-            ForEach(RemoteDeviceColor.allCases) { color in
-                Button { choose(color) } label: { swatch(color, selected: selection == color) }
-                    .buttonStyle(.plain)
-                    .help(color.title)
-                    .accessibilityLabel(color.title)
-                    .accessibilityAddTraits(selection == color ? .isSelected : [])
-            }
-        }
-        .disabled(!isEnabled)
-        .opacity(isEnabled ? 1 : 0.5)
-    }
-
-    private func swatch(_ color: RemoteDeviceColor, selected: Bool) -> some View {
-        Circle()
-            .fill(color.color(for: colorScheme))
-            .frame(width: 12, height: 12)
-            .padding(2)
-            .overlay(Circle().strokeBorder(selected ? Color.primary.opacity(0.7) : .clear, lineWidth: 1.5))
-            .contentShape(Circle())
-    }
 }

@@ -1,131 +1,145 @@
 import AppKit
 import SwiftUI
 
+/// The Settings window: the sidebar with its search, and the page the
+/// navigator shows (`SettingsNavigator.shared`), with back and forward in
+/// the toolbar. 980 pt wide; it grows taller only. ⌘F, ⌘[ and ⌘] are the
+/// window's (`SettingsKeyMonitor`).
 struct SettingsView: View {
-    @StateObject private var terminalSettings = TerminalSettings.shared
-    @StateObject private var agentSettings = AgentSettings.shared
-    @State private var selection: SettingsSelection = .page(.general)
-    @State private var searchText = ""
+    /// Not observed here: the sidebar and the detail observe what they show,
+    /// so the shell is not built again for a page or a setting.
+    private let navigator: SettingsNavigator
+    private let agentSettings: AgentSettings
+    @Environment(\.openWindow) private var openWindow
+
+    init(navigator: SettingsNavigator = .shared, agentSettings: AgentSettings = .shared) {
+        self.navigator = navigator
+        self.agentSettings = agentSettings
+    }
 
     var body: some View {
-        SettingsNativeTabView(
-            selection: $selection,
-            searchText: $searchText,
-            terminalSettings: terminalSettings,
-            agentSettings: agentSettings,
-            pages: SettingsPage.filtered(by: searchText),
-            projects: CherryProject.filtered(agentSettings.projects, by: searchText)
-        )
-        .onChange(of: searchText) { _, _ in
-            keepSelectionVisible()
+        NavigationSplitView(columnVisibility: .constant(.all)) {
+            SettingsSidebar(
+                navigator: navigator,
+                agentSettings: agentSettings,
+                rowsChanged: SettingsSearchContext.liveChanges
+            )
+            .navigationSplitViewColumnWidth(min: 220, ideal: 240, max: 260)
+            .toolbar(removing: .sidebarToggle)
+        } detail: {
+            SettingsDetail(navigator: navigator)
         }
-        .onChange(of: agentSettings.projects) { _, _ in
-            keepSelectionVisible()
-        }
+        .environment(\.settingsRowHighlight, navigator.highlight)
+        .environment(\.settingsActions, .live(openWindow: openWindow))
+        .background(SettingsKeyMonitor(navigator: navigator))
+        .background(SettingsNativeWindowConfigurator {
+            SettingsHostStatusRefresh.refresh()
+        })
+        .frame(width: 980)
+        .frame(minHeight: 520, idealHeight: 680, maxHeight: .infinity)
+        .onReceive(agentSettings.$agents) { _ in scheduleReconcile() }
+        .onReceive(agentSettings.$projects) { _ in scheduleReconcile() }
     }
 
-    private func keepSelectionVisible() {
-        let visible = visibleSelections()
-        guard !visible.contains(selection) else { return }
-        selection = visible[0]
-    }
-
-    private func visibleSelections() -> [SettingsSelection] {
-        let visible = SettingsPage.filtered(by: searchText).map(SettingsSelection.page)
-            + CherryProject.filtered(agentSettings.projects, by: searchText).map { .project($0.root) }
-        return visible.isEmpty ? [.emptySearch] : visible
-    }
-}
-
-private enum SettingsSelection: Hashable {
-    case page(SettingsPage)
-    case project(String)
-    case emptySearch
-}
-
-private struct SettingsNativeTabView: View {
-    @Binding var selection: SettingsSelection
-    @Binding var searchText: String
-    @ObservedObject var terminalSettings: TerminalSettings
-    @ObservedObject var agentSettings: AgentSettings
-    let pages: [SettingsPage]
-    let projects: [CherryProject]
-
-    var body: some View {
-        TabView(selection: $selection) {
-            if pages.isEmpty, projects.isEmpty {
-                Tab("No Results", systemImage: "magnifyingglass", value: SettingsSelection.emptySearch) {
-                    SettingsEmptySearchPane(query: searchText)
-                }
-            } else {
-                if !pages.isEmpty {
-                    TabSection("Settings") {
-                        ForEach(pages) { page in
-                            Tab(page.title, systemImage: page.systemImage, value: SettingsSelection.page(page)) {
-                                pane(for: page)
-                            }
-                        }
-                    }
-                }
-
-                if !projects.isEmpty {
-                    TabSection("Projects") {
-                        ForEach(projects) { project in
-                            Tab(project.name, systemImage: "folder", value: SettingsSelection.project(project.root)) {
-                                ProjectDetailSettingsPane(project: project, settings: agentSettings)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        .tabViewStyle(.sidebarAdaptable)
-        .tabViewSidebarHeader {
-            SettingsSearchField(text: $searchText)
-                .padding(.top, 8)
-        }
-        .background(SettingsNativeWindowConfigurator())
-        .frame(width: 980, height: 680)
-    }
-
-    @ViewBuilder
-    private func pane(for page: SettingsPage) -> some View {
-        switch page {
-        case .general: GeneralSettingsPane(settings: terminalSettings)
-        case .terminal: TerminalSettingsPane(settings: terminalSettings)
-        case .sessions: SessionsSettingsPane(settings: terminalSettings)
-        case .projects: ProjectSettingsPane(settings: agentSettings)
-        case .agents: AgentSettingsPane(settings: agentSettings)
-        case .mcp: MCPSettingsPane()
-        case .updates: UpdatesSettingsPane(status: AppUpdater.shared.status)
-        }
-    }
-}
-
-private struct SettingsEmptySearchPane: View {
-    let query: String
-
-    var body: some View {
-        SettingsPaneScroll(
-            title: "No Results",
-            subtitle: query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? "No settings are available."
-                : "No settings match \"\(query)\"."
-        ) {
-            SettingsCard {
-                SettingsEmptyState(
-                    title: "No settings found",
-                    message: "Try searching for a section, project name, or folder path.",
-                    systemImage: "magnifyingglass"
+    /// Agents and projects that went (deleted, renamed, removed) leave the
+    /// history on the next turn, once `AgentSettings` changed: never from
+    /// a view update.
+    private func scheduleReconcile() {
+        DispatchQueue.main.async { [navigator, agentSettings] in
+            MainActor.assumeIsolated {
+                navigator.reconcile(
+                    agentIDs: Set(agentSettings.agents.map(\.id)),
+                    projectRoots: Set(SettingsProjectOrdering.listed(agentSettings.projects).map(\.root))
                 )
             }
         }
     }
 }
 
+/// The page of the route shown, from its top (`.id(route)`), under the
+/// toolbar's back and forward. While a search finds nothing it says so
+/// instead.
+private struct SettingsDetail: View {
+    @ObservedObject var navigator: SettingsNavigator
+
+    var body: some View {
+        page(for: navigator.route)
+            .id(navigator.route)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .overlay {
+                SettingsNoResults(search: navigator.search)
+            }
+            .toolbar {
+                ToolbarItem(placement: .navigation) {
+                    ControlGroup {
+                        Button {
+                            navigator.goBack()
+                        } label: {
+                            Label("Back", systemImage: "chevron.left")
+                        }
+                        .help("Back")
+                        .disabled(!navigator.canGoBack)
+
+                        Button {
+                            navigator.goForward()
+                        } label: {
+                            Label("Forward", systemImage: "chevron.right")
+                        }
+                        .help("Forward")
+                        .disabled(!navigator.canGoForward)
+                    }
+                    .controlGroupStyle(.navigation)
+                }
+            }
+    }
+
+    @ViewBuilder
+    private func page(for route: SettingsRoute) -> some View {
+        switch route {
+        case .page(.sessions): SessionsSettingsPage()
+        case .page(.interface): InterfaceSettingsPage()
+        case .page(.themes): ThemesSettingsPage()
+        case .page(.terminal): TerminalSettingsPage()
+        case .page(.shortcuts): ShortcutsSettingsPage()
+        case .page(.notifications): NotificationsSettingsPage()
+        case .page(.macs): MacsSettingsPage()
+        case .page(.agents): AgentsSettingsPage()
+        case .page(.projects): ProjectsSettingsPage()
+        case .page(.updates): UpdatesSettingsPage()
+        case .agent(let id): AgentSettingsPage(agentID: id)
+        case .project(let root): ProjectSettingsPage(projectRoot: root)
+        }
+    }
+}
+
+/// What the detail says while a search finds nothing (it observes only the
+/// search, so a keystroke does not rebuild the page under it).
+private struct SettingsNoResults: View {
+    @ObservedObject var search: SettingsSearchModel
+
+    var body: some View {
+        if search.hasNoResults {
+            SettingsEmptyState(
+                title: "No settings match “\(search.query)”",
+                message: "Search looks at setting names, descriptions and values, and at project names and paths.",
+                systemImage: "magnifyingglass"
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(SettingsDesign.Colors.window)
+        }
+    }
+}
+
+/// The window's chrome, which SwiftUI has no modifier for on a Settings
+/// scene: the title shown, a unified toolbar without a separator, content
+/// under the title bar. Tells `windowDidBecomeKey` when the window comes to
+/// the front.
 private struct SettingsNativeWindowConfigurator: NSViewRepresentable {
+    let windowDidBecomeKey: @MainActor () -> Void
+
     func makeNSView(context: Context) -> SettingsNativeWindowChromeView {
         let view = SettingsNativeWindowChromeView()
+        view.windowDidBecomeKey = windowDidBecomeKey
         DispatchQueue.main.async {
             view.configureWindowChrome()
         }
@@ -133,6 +147,7 @@ private struct SettingsNativeWindowConfigurator: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: SettingsNativeWindowChromeView, context: Context) {
+        nsView.windowDidBecomeKey = windowDidBecomeKey
         DispatchQueue.main.async {
             nsView.configureWindowChrome()
         }
@@ -140,9 +155,9 @@ private struct SettingsNativeWindowConfigurator: NSViewRepresentable {
 }
 
 private final class SettingsNativeWindowChromeView: NSView {
+    var windowDidBecomeKey: (@MainActor () -> Void)?
     private weak var attachedWindow: NSWindow?
     private var observers: [NSObjectProtocol] = []
-    private var sidebarCleanupGeneration = 0
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -167,7 +182,6 @@ private final class SettingsNativeWindowChromeView: NSView {
             toolbar.showsBaselineSeparator = false
         }
         removeSidebarToolbarItems()
-        scheduleSidebarToolbarCleanup()
     }
 
     private func registerWindowObservers() {
@@ -185,144 +199,43 @@ private final class SettingsNativeWindowChromeView: NSView {
                 forName: name,
                 object: window,
                 queue: .main
-            ) { [weak self] _ in
+            ) { [weak self] notification in
+                let becameKey = notification.name == NSWindow.didBecomeKeyNotification
                 Task { @MainActor in
                     self?.configureWindowChrome()
+                    if becameKey {
+                        self?.windowDidBecomeKey?()
+                    }
                 }
             }
         }
     }
 
+    /// The sidebar's toggle, should `.toolbar(removing: .sidebarToggle)`
+    /// leave it: the sidebar is always shown. The tracking separator stays,
+    /// since it keeps back and forward and the title over the detail.
+    /// Tooltips are not read: a page's own toolbar item may mention the
+    /// sidebar in one (an agent's Enabled switch).
     private func removeSidebarToolbarItems() {
         guard let toolbar = window?.toolbar else { return }
-        for index in toolbar.items.indices.reversed() {
-            if isSidebarToolbarItem(toolbar.items[index]) {
-                toolbar.removeItem(at: index)
-            }
-        }
-    }
-
-    private func scheduleSidebarToolbarCleanup() {
-        sidebarCleanupGeneration += 1
-        let generation = sidebarCleanupGeneration
-        let delays: [Duration] = [
-            .milliseconds(0),
-            .milliseconds(50),
-            .milliseconds(150),
-            .milliseconds(400)
-        ]
-
-        for delay in delays {
-            Task { @MainActor [weak self] in
-                if delay != .zero {
-                    try? await Task.sleep(for: delay)
-                }
-                guard let self, sidebarCleanupGeneration == generation else { return }
-                removeSidebarToolbarItems()
-            }
+        for index in toolbar.items.indices.reversed() where isSidebarToolbarItem(toolbar.items[index]) {
+            toolbar.removeItem(at: index)
         }
     }
 
     private func isSidebarToolbarItem(_ item: NSToolbarItem) -> Bool {
-        if item.itemIdentifier == .toggleSidebar || item.itemIdentifier == .sidebarTrackingSeparator {
-            return true
-        }
+        if item.itemIdentifier == .toggleSidebar { return true }
+        guard item.itemIdentifier != .sidebarTrackingSeparator else { return false }
 
         let fields = [
             item.itemIdentifier.rawValue,
             item.label,
-            item.paletteLabel,
-            item.toolTip ?? ""
+            item.paletteLabel
         ]
 
         return fields.contains {
             let value = $0.lowercased()
             return value.contains("sidebar") || value.contains("side bar")
-        }
-    }
-}
-
-private extension CherryProject {
-    var settingsSearchTokens: String {
-        "\(name) \(root) project projects workspace folder commands features appearance color"
-    }
-
-    static func filtered(_ projects: [CherryProject], by query: String) -> [CherryProject] {
-        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let filtered = trimmedQuery.isEmpty
-            ? projects
-            : projects.filter {
-                $0.settingsSearchTokens.localizedCaseInsensitiveContains(trimmedQuery)
-            }
-        return SettingsProjectOrdering.byName(filtered)
-    }
-}
-
-enum SettingsPage: String, CaseIterable, Identifiable {
-    case general
-    case terminal
-    case sessions
-    case projects
-    case agents
-    case mcp
-    case updates
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .general: "General"
-        case .terminal: "Terminal"
-        case .sessions: "Sessions"
-        case .projects: "Projects"
-        case .agents: "Agents"
-        case .mcp: "MCP"
-        case .updates: "Updates"
-        }
-    }
-
-    var subtitle: String {
-        switch self {
-        case .general: "App chrome, sidebar, and theme behavior"
-        case .terminal: "Terminal themes, text, cursor, and contrast"
-        case .sessions: "Persistent sessions, closing tabs and windows, quitting, and background sessions"
-        case .projects: "Workspaces, local features, and identity colors"
-        case .agents: "Agent tools and automatic summaries"
-        case .mcp: "Install commands and connection status"
-        case .updates: "Version, automatic updates, and pre-release builds"
-        }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .general: "gearshape.fill"
-        case .terminal: "terminal.fill"
-        case .sessions: "rectangle.stack.fill"
-        case .projects: "folder.fill"
-        case .agents: "sparkles"
-        case .mcp: "point.3.connected.trianglepath.dotted"
-        case .updates: "arrow.down.circle.fill"
-        }
-    }
-
-    /// Words a search finds the page by that its title and subtitle lack.
-    var searchKeywords: String {
-        switch self {
-        case .sessions: "close exit shell"
-        case .updates: "version build release upgrade restart prerelease pre-release beta sparkle"
-        case .general, .terminal, .projects, .agents, .mcp: ""
-        }
-    }
-
-    var searchTokens: String {
-        "\(title) \(subtitle) \(rawValue) \(searchKeywords)"
-    }
-
-    static func filtered(by query: String) -> [SettingsPage] {
-        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedQuery.isEmpty else { return allCases }
-        return allCases.filter {
-            $0.searchTokens.localizedCaseInsensitiveContains(trimmedQuery)
         }
     }
 }

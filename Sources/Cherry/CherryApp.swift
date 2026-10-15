@@ -1148,25 +1148,25 @@ struct CherryApp: App {
                         NSSound.beep()
                     }
                 }
-                .keyboardShortcut("n")
+                .keyboardShortcut(CherryShortcut.newWindow.keyboardShortcut)
             }
             CommandGroup(after: .newItem) {
                 Button("Open Project…") {
                     keyWindowChromeState?.showOmniBarProjects()
                 }
-                .keyboardShortcut("o")
+                .keyboardShortcut(CherryShortcut.openProject.keyboardShortcut)
                 .disabled(focusedChromeState == nil)
                 Button("Persistent Sessions…") {
                     keyWindowChromeState?.isHostedSessionsPresented = true
                 }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .keyboardShortcut(CherryShortcut.persistentSessions.keyboardShortcut)
                 .disabled(focusedWorkspace == nil)
             }
             CommandGroup(replacing: .printItem) {
                 Button("Omni Bar") {
                     keyWindowChromeState?.toggleOmniBar()
                 }
-                .keyboardShortcut("p")
+                .keyboardShortcut(CherryShortcut.omniBar.keyboardShortcut)
                 .disabled(focusedChromeState == nil)
             }
 
@@ -1176,26 +1176,26 @@ struct CherryApp: App {
                 Button("Find") {
                     keyWindowWorkspace?.selectedSession?.ghosttyBridge.startSearch()
                 }
-                .keyboardShortcut("f")
+                .keyboardShortcut(CherryShortcut.find.keyboardShortcut)
                 .disabled(focusedWorkspace?.selectedSession == nil || focusedChromeState == nil)
 
                 Button("Find Next") {
                     keyWindowWorkspace?.selectedSession?.ghosttyBridge.navigateSearch(next: true)
                 }
-                .keyboardShortcut("g")
+                .keyboardShortcut(CherryShortcut.findNext.keyboardShortcut)
                 .disabled(focusedWorkspace?.selectedSession == nil)
 
                 Button("Find Previous") {
                     keyWindowWorkspace?.selectedSession?.ghosttyBridge.navigateSearch(next: false)
                 }
-                .keyboardShortcut("g", modifiers: [.command, .shift])
+                .keyboardShortcut(CherryShortcut.findPrevious.keyboardShortcut)
                 .disabled(focusedWorkspace?.selectedSession == nil)
 
                 Button("Hide Find Bar") {
                     keyWindowWorkspace?.selectedSession?.ghosttyBridge.endSearch()
                     keyWindowChromeState?.dismissTerminalSearch()
                 }
-                .keyboardShortcut("f", modifiers: [.command, .shift])
+                .keyboardShortcut(CherryShortcut.hideFindBar.keyboardShortcut)
                 .disabled(focusedWorkspace?.selectedSession == nil || focusedChromeState == nil)
             }
 
@@ -1203,7 +1203,7 @@ struct CherryApp: App {
                 Button(focusedChromeState?.isSidebarHidden == true ? "Show Sidebar" : "Hide Sidebar") {
                     keyWindowChromeState?.toggleSidebar()
                 }
-                .keyboardShortcut("s")
+                .keyboardShortcut(CherryShortcut.hideSidebar.keyboardShortcut)
                 .disabled(focusedChromeState == nil)
 
                 Button(focusedChromeState?.isSidebarPlaygroundPresented == true ? "Hide Sidebar Icon Playground" : "Show Sidebar Icon Playground") {
@@ -1221,13 +1221,13 @@ struct CherryApp: App {
                 Button("New Tab") {
                     keyWindowWorkspace?.addSession()
                 }
-                .keyboardShortcut("t")
+                .keyboardShortcut(CherryShortcut.newTab.keyboardShortcut)
                 .disabled(focusedWorkspace == nil)
 
                 Button("Split Right") {
                     keyWindowWorkspace?.splitDuplicateActiveTerminal()
                 }
-                .keyboardShortcut("d", modifiers: [.command, .shift])
+                .keyboardShortcut(CherryShortcut.splitRight.keyboardShortcut)
                 .disabled(!canSplitFocusedTerminal)
 
                 Button(detachTabTitle) {
@@ -1239,7 +1239,7 @@ struct CherryApp: App {
                         window: NSApp.keyWindow
                     )
                 }
-                .keyboardShortcut("d")
+                .keyboardShortcut(CherryShortcut.detachTab.keyboardShortcut)
                 .disabled(!canDetachFocusedTab)
 
                 Button(closeTabTitle) {
@@ -1251,43 +1251,43 @@ struct CherryApp: App {
                         window: NSApp.keyWindow
                     )
                 }
-                .keyboardShortcut("w")
+                .keyboardShortcut(CherryShortcut.closeTab.keyboardShortcut)
                 .disabled(focusedWorkspace == nil)
 
                 Button("Previous Pane") {
                     keyWindowWorkspace?.focusPreviousPane()
                 }
-                .keyboardShortcut("[")
+                .keyboardShortcut(CherryShortcut.previousPane.keyboardShortcut)
                 .disabled(!focusedWorkspaceHasActiveSplit)
 
                 Button("Next Pane") {
                     keyWindowWorkspace?.focusNextPane()
                 }
-                .keyboardShortcut("]")
+                .keyboardShortcut(CherryShortcut.nextPane.keyboardShortcut)
                 .disabled(!focusedWorkspaceHasActiveSplit)
 
                 Button("Previous Tab") {
                     keyWindowWorkspace?.selectPreviousSession()
                 }
-                .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+                .keyboardShortcut(CherryShortcut.previousTab.keyboardShortcut)
                 .disabled(focusedWorkspace == nil)
 
                 Button("Next Tab") {
                     keyWindowWorkspace?.selectNextSession()
                 }
-                .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+                .keyboardShortcut(CherryShortcut.nextTab.keyboardShortcut)
                 .disabled(focusedWorkspace == nil)
 
                 Button("\(focusedWorkspace?.selectedSession?.restartActionTitle ?? "Restart") Active Tab") {
                     keyWindowWorkspace?.restartSelectedSession()
                 }
-                .keyboardShortcut("r")
+                .keyboardShortcut(CherryShortcut.restartTab.keyboardShortcut)
                 .disabled(focusedWorkspace == nil || focusedWorkspace?.selectedSession?.canRestart == false)
 
                 Button("Clear Scrollback") {
                     keyWindowWorkspace?.clearSelectedSessionScrollback()
                 }
-                .keyboardShortcut("k")
+                .keyboardShortcut(CherryShortcut.clearScrollback.keyboardShortcut)
                 .disabled(focusedWorkspace == nil)
             }
 
@@ -1321,6 +1321,8 @@ struct CherryApp: App {
             SettingsView()
                 .preferredColorScheme(terminalSettings.appearance.preferredColorScheme)
         }
+        // 980 pt wide; it grows taller only (`SettingsView`'s frame).
+        .windowResizability(.contentSize)
     }
 
     private func configureDefaultWindowOpener() {

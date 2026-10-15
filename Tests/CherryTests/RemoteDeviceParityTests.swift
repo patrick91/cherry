@@ -7,7 +7,7 @@ import Testing
 
 // Phase 3 of devices (docs/specs/remote-devices.md), without a real host:
 // project-info parsing and caps, the shell integration a device's tabs get,
-// editor links, `~` labels, Settings › Sessions' device rows, the quit
+// editor links, `~` labels, Settings › Macs' device cards, the quit
 // question, Background Sessions per device (against the in-process fake
 // `cherry control`), dropped files, and Ghostty's resources in the install.
 // Nothing here runs ssh.
@@ -489,7 +489,7 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     workspace.closeAllSessions(intent: .windowClosed)
 }
 
-// MARK: - Settings › Sessions
+// MARK: - Settings › Macs
 
 @Test @MainActor func RemoteDeviceSettingsListEachMacsStatusAndWhatToDo() throws {
     let device = RemoteDevice(
@@ -528,9 +528,10 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     defer { try? FileManager.default.removeItem(at: directory) }
     let suite = "CherryTests.RemoteSettings.\(UUID().uuidString)"
     defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+    let hostStore = HostedSessionHostStore(defaults: try #require(UserDefaults(suiteName: suite)))
     let store = RemoteDeviceStore(
         fileURL: directory.appendingPathComponent(RemoteDeviceStore.fileName),
-        hostStore: HostedSessionHostStore(defaults: try #require(UserDefaults(suiteName: suite))),
+        hostStore: hostStore,
         installationID: { UUID() },
         registry: PersistentHostingRegistry(local: PersistentHostSessions(installationUnavailableReason: { nil }, status: PersistentSessionsStatus())),
         remoteHostPaths: HostedRemoteHostPaths()
@@ -540,6 +541,7 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     var controls: [HostedSessionHost: HostControl] = [:]
     let model = RemoteDeviceSettingsModel(
         store: store,
+        hostStore: hostStore,
         control: { host in
             if let control = controls[host] { return control }
             let control = RemoteDeviceStore.inertControl(host: host, reason: "test")
@@ -550,8 +552,12 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     )
     #expect(model.rows.map(\.name) == ["Studio", "Mini"])
     #expect(model.rows.first?.statusText().hasSuffix("Update available") == true)
+    #expect(model.rows.first?.statusText(includingUpdate: false).hasSuffix("Update available") == false)
     #expect(model.rows.first?.id == added.id)
     #expect(controls.values.allSatisfy { $0.state == .idle })
+    // Their destinations are saved hosts, listed as Macs, not as SSH hosts.
+    #expect(hostStore.hosts.count == 2)
+    #expect(model.sshHostsNotAdded.isEmpty)
 }
 
 // MARK: - The quit question and End Sessions

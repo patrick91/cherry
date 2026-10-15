@@ -84,6 +84,14 @@ in Ghostty, to compare. **Copy Report** copies all of it as text, for an
 issue. It will be removed once the Shift+Enter and Shift+Tab reports are
 understood.
 
+Settings shows the same in two places. **Settings › Terminal › Ghostty
+config** lists the config files Cherry read when it opened (with **Open**
+and **Reveal in Finder**), the lines left out because Ghostty rejects them,
+and **Copy Report**. **Settings › Shortcuts** lists Cherry's own keys and
+the terminal key bindings from your Ghostty config, with whether Cherry's
+terminals apply each one and which ones a Cherry shortcut takes first. The
+key test also runs by hand: `CherryMCP --key-echo` in any tab.
+
 ## Persistent Sessions
 
 Local terminal, command and agent tabs run as persistent sessions by default.
@@ -145,8 +153,8 @@ delays, and at once when the Mac wakes or a network comes back. Tabs of a
 host that was unreachable when their window opened come back once it
 answers.
 
-**Settings › Sessions › Session Host** shows the local host's build, uptime
-and sessions, and offers **Reveal Log**, **Copy Diagnostics** (what `cherry
+**Settings › Sessions** shows the local host's build, uptime and sessions at
+its top, and offers **Reveal Log**, **Copy Diagnostics** (what `cherry
 status` and `cherry doctor` report, for a bug report) and **Restart Host…**
 (your programs keep running). In a terminal, `cherry status` describes the
 host and `cherry doctor` checks it for problems and says how to fix them.
@@ -156,23 +164,26 @@ Sessions of windows or tabs you closed that keep running are listed under
 tab (in its project's window, which opens again with its other tabs when you
 had closed it), or hover and click
 **End** twice to stop it (**Remove** for one that already ended). **Cherry →
-End Background Sessions…**, **End All…** in that list and **Settings ›
-Sessions › Background Sessions** end them all after asking. When Cherry opens
+End Background Sessions…**, **End All…** in that list and in **Settings ›
+Sessions** end them all after asking. When Cherry opens
 and agents, commands or busy terminals among them still run, a notice at the
 bottom of a window says so once, with **Reopen** and **End…** (its time runs
 only while that window is in front); sessions you kept running when you closed
 their tab or window, and idle shells, are not mentioned. Turn that off with
-**Tell me about background sessions when Cherry opens**. Only Cherry's own sessions are listed there; sessions made with the
+**Tell me about background sessions when Cherry opens** (Settings ›
+Notifications). Only Cherry's own sessions are listed there; sessions made with the
 `cherry` CLI or by another app are in Persistent Sessions. A bell or
 notification from a background session (an agent that finished or needs
 input) shows as a Cherry notification naming the session and its project
 (a shell's bell only once until you open it, and a few a minute at most);
-click it to open the session, whose tab then shows it unread. **Clear
+click it to open the session, whose tab then shows it unread. **Bell**
+(Settings › Notifications › Terminal bell) is Beep or Silent: Silent stops
+the sound of a tab's bell, and a background session's bell still notifies. **Clear
 Ended** in that list removes the sessions whose programs ended, and ended
 ones that no saved tab brings back are removed by themselves after they
 have been listed for 10 minutes while Cherry was in use (never one you have
-not seen, or one whose host crashed). Removing a project in **Settings › Projects** offers to end its
-background sessions first.
+not seen, or one whose host crashed). Removing a project in **Settings ›
+Projects** asks first, and offers to end its background sessions.
 
 Open **File → Persistent Sessions…** (`Cmd-Shift-R`) to see every session on
 **This Mac** or an SSH destination, and to create, attach to, or terminate
@@ -265,7 +276,7 @@ too, scoped to their window and never reaching beyond that Mac's projects
 and tabs: Cherry forwards its control socket to that Mac over the SSH
 connection and gives each tab a token of its own, renewed whenever its
 program restarts. **Set Up Cherry MCP on Studio…** (in its menu and in
-Settings › Sessions › Other Macs) shows the commands that register Cherry
+Settings › Macs) shows the commands that register Cherry
 MCP with Claude Code and Codex there and runs them only when you confirm;
 **Remove** takes them away again. While Cherry cannot be reached from there
 (it quit, or the connection is being made again) the tools say "Cherry on
@@ -273,8 +284,10 @@ MCP with Claude Code and Codex there and runs them only when you confirm;
 sessions no tab shows are listed under its name in Background Sessions
 (while Cherry is connected to it, or while the menu is open; looking at a
 Mac, there or in the project picker, never starts its session host), and
-**Settings › Sessions › Other Macs** shows how each Mac stands, with
-**Reconnect**, **Update Session Host…**, **Set Up Cherry MCP…** and **Remove…**. A tab that cannot
+**Settings › Macs** shows how each Mac stands, with
+**Reconnect**, **Update Session Host…**, **Set Up Cherry MCP…** and **Remove…**;
+there you also rename a Mac, see its projects and add one
+(**Add Project on Studio…**). A tab that cannot
 start there says so ("Couldn't start on Studio: …", with **Retry**), never
 running a shell on this Mac instead. **Not open here** in the sidebar lists
 that project's sessions on the Mac that no tab shows: **Reopen** for this
@@ -448,8 +461,11 @@ Inside the prototype:
 ## MCP Control
 
 Cherry installs a stdio MCP helper next to the app executable. Register it
-with your agent harness using the command **Settings › MCP** shows, which
-names this copy's path; for Cherry in `/Applications`:
+with your agent harness: each agent's page in **Settings › Agents & MCP**
+has **Add to Claude Code**, **Add to Codex** or **Add to Pi**, which runs
+that CLI's `mcp add` when you click it, and **MCP server › Connect other
+agent CLIs** there shows the command for each, with this copy's path; for
+Cherry in `/Applications`:
 
 ```bash
 codex mcp add cherry -- /Applications/Cherry.app/Contents/MacOS/CherryMCP

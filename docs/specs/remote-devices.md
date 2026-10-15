@@ -357,7 +357,7 @@ Deviations from the plan below: Add Mac… (connect and check) is in phase
 1; projects come from the device's session tags and added folders, not
 `AgentSettings.projects`, and "Open Folder on <Mac>…" is Open Home Folder
 plus Add Project on <Mac>… (no `ListDir`). The phase 1 leftovers (sidebar
-labels with the device's home, each device in Settings › Sessions, the
+labels with the device's home, each device in Settings › Macs, the
 quit question naming Macs, dropped files) were done in phase 3.
 
 ## Phase 2 as built
@@ -663,7 +663,7 @@ of `BackgroundSessions.swift`, `HostControlSSHMaster.swift`'s shards,
   keeps the told ids of a host that did not answer.
 - **Phase 1 leftovers.** Sidebar and context bar paths use the device's
   home for `~` (`TerminalSession.pathHomeDirectory`; not known: nothing is
-  shortened, never with This Mac's). Settings › Sessions › Other Macs lists
+  shortened, never with This Mac's). Settings › Macs lists
   each device (`RemoteDeviceSettingsRow`: connected, connecting, not
   connected, offline, needs attention, "Update available") with Reconnect
   (or Trust New Identity…), Update Session Host… and Remove…. The quit
@@ -716,7 +716,7 @@ Deviations from the plan below:
   protocol (`-O`), which any sshd serves.
 - Background Sessions per device, their notifications and unread marks, and
   the launch notice naming devices (phase 4 in the plan) are done here.
-- Settings › Sessions shows each device's connection state, not a
+- Settings › Macs shows each device's connection state, not a
   per-device `PersistentSessionsStatus`.
 
 ## Phase 4a as built
@@ -1037,7 +1037,7 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
   not run there. CherryMCP gained `--version` and `--call TOOL [JSON]` (one
   call, for checks and tests).
 - **Agent configuration there: "Set Up Cherry MCP on <Mac>…"** (the
-  device's menu, and Settings › Sessions › Other Macs), never done
+  device's menu, and Settings › Macs), never done
   silently. The sheet shows the exact commands and first runs only a check
   (`command -v claude`, `command -v codex` on the login PATH, CherryMCP
   `--version`; no agent CLI runs, no configuration is read). **Set Up**
@@ -1289,7 +1289,7 @@ the device.
 4. **Failure UI.** A failed remote tab shows a bar like
    `PersistentSessionFallbackBar`: "Couldn't start on <Mac>: <reason>" with
    **Retry** (`retryPersistentSession`), never "Not a persistent session".
-   Settings › Sessions shows each device's `PersistentSessionsStatus`.
+   Settings › Macs shows each device's `PersistentSessionsStatus`.
 5. **Records.** `WorkspaceSessionRecord` gains `hostKey` (the
    `HostedSessionHost.id` a record without a binding was being created on),
    so a remote tab saved while its Create was under way is looked for on

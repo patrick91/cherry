@@ -929,7 +929,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     #expect(model.unreadSessionIDs.contains("s-asks"))
 }
 
-/// Settings › Sessions: a finished or failed background program is posted
+/// Settings › Notifications: a finished or failed background program is posted
 /// too when asked for; a waiting one is not when that is off. Either way
 /// the session is marked.
 @Test @MainActor func backgroundProgramStatusNotificationsFollowTheSettings() async throws {
@@ -2013,7 +2013,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     #expect(await eventually { unreached.phase == .notNeeded })
     #expect(harness.fake.launches.isEmpty)
 
-    // Off in Settings › Sessions.
+    // Off in Settings › Notifications.
     _ = try await harness.control.list()
     let lists = harness.fake.requests("list").count
     let off = makeNotice(model: model, registry: registry, defaults: noticeDefaults.defaults, isEnabled: { false })
@@ -2449,20 +2449,23 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     // Cancel: nothing changes.
     ProjectRemoval.remove(project, settings: settings, background: model, present: present)
     let alert = try #require(asked.value.first)
-    #expect(alert.messageText == "End the 2 background sessions of “\(project.name)”?")
-    #expect(alert.buttons.map(\.title) == ["End Sessions", "Keep Running", "Cancel"])
+    #expect(alert.messageText == "Remove “\(project.name)”? It has 2 background sessions.")
+    #expect(alert.informativeText == "1 of them is still running. Removing the project does not stop them; "
+        + "Keep Them Running leaves them in Background Sessions.")
+    #expect(alert.buttons.map(\.title) == ["End Sessions and Remove", "Keep Them Running", "Cancel"])
+    #expect(alert.buttons.map(\.hasDestructiveAction) == [true, false, false])
     answers.value[0](.alertThirdButtonReturn)
     #expect(settings.projects.contains { $0.root == project.root })
     #expect(harness.fake.requests("kill").isEmpty)
 
-    // Keep Running: removed, the sessions stay.
+    // Keep Them Running: removed, the sessions stay.
     ProjectRemoval.remove(project, settings: settings, background: model, present: present)
     answers.value[1](.alertSecondButtonReturn)
     #expect(!settings.projects.contains { $0.root == project.root })
     try await Task.sleep(for: .milliseconds(100))
     #expect(harness.fake.requests("kill").isEmpty)
 
-    // End Sessions: its sessions end, never another project's.
+    // End Sessions and Remove: its sessions end, never another project's.
     _ = settings.addProject(path: project.root)
     ProjectRemoval.remove(project, settings: settings, background: model, present: present)
     answers.value[2](.alertFirstButtonReturn)
@@ -2470,13 +2473,62 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     #expect(await harness.fake.wait { Set(harness.requestIDs("remove")) == ["s-mine", "s-ended"] })
     #expect(harness.requestIDs("kill") == ["s-mine"])
 
-    // A project with no background session is removed without asking.
+    // A project with no background session asks too: Cancel keeps it,
+    // Remove removes it and ends nothing.
     let quiet = try #require(settings.addProject(path: other.path))
     harness.fake.sessions.removeAll { $0.id == "s-other" }
     _ = try await harness.control.list()
     ProjectRemoval.remove(quiet, settings: settings, background: model, present: present)
-    #expect(asked.value.count == 3)
+    #expect(asked.value.count == 4)
+    let plain = try #require(asked.value.last)
+    #expect(plain.messageText == "Remove “\(quiet.name)” from Cherry?")
+    #expect(plain.informativeText == "Its commands, features and color saved on this Mac are deleted. "
+        + "The folder and its cherry.toml stay.")
+    #expect(plain.buttons.map(\.title) == ["Remove", "Cancel"])
+    #expect(plain.buttons.map(\.hasDestructiveAction) == [true, false])
+    answers.value[3](.alertSecondButtonReturn)
+    #expect(settings.projects.contains { $0.root == quiet.root })
+    #expect(!settings.removedProjectRoots.contains(quiet.root))
+
+    ProjectRemoval.remove(quiet, settings: settings, background: model, present: present)
+    answers.value[4](.alertFirstButtonReturn)
     #expect(!settings.projects.contains { $0.root == quiet.root })
+    #expect(settings.removedProjectRoots.contains(quiet.root))
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(harness.requestIDs("kill") == ["s-mine"])
+}
+
+@Test @MainActor func theRemoveProjectQuestionSaysHowItsBackgroundSessionsStand() {
+    func texts(running: Int, ended: Int) -> [String] {
+        let alert = ProjectRemoval.makeAlert(projectName: "cherry", running: running, ended: ended)
+        return [alert.messageText, alert.informativeText]
+    }
+    let keepIt = "Keep Them Running leaves it in Background Sessions."
+    let keepThem = "Keep Them Running leaves them in Background Sessions."
+    #expect(texts(running: 0, ended: 0) == [
+        "Remove “cherry” from Cherry?",
+        "Its commands, features and color saved on this Mac are deleted. The folder and its cherry.toml stay."
+    ])
+    #expect(texts(running: 1, ended: 0) == [
+        "Remove “cherry”? Its background session is still running.",
+        "Removing the project does not stop it; " + keepIt
+    ])
+    #expect(texts(running: 2, ended: 0) == [
+        "Remove “cherry”? Its 2 background sessions are still running.",
+        "Removing the project does not stop them; " + keepThem
+    ])
+    #expect(texts(running: 0, ended: 1) == ["Remove “cherry”? It has a background session.", "Its program already ended. " + keepIt])
+    #expect(texts(running: 0, ended: 3) == [
+        "Remove “cherry”? It has 3 background sessions.",
+        "Their programs already ended. " + keepThem
+    ])
+    #expect(texts(running: 2, ended: 1) == [
+        "Remove “cherry”? It has 3 background sessions.",
+        "2 of them are still running. Removing the project does not stop them; " + keepThem
+    ])
+    let withSessions = ProjectRemoval.makeAlert(projectName: "cherry", running: 1, ended: 0)
+    #expect(withSessions.buttons.map(\.title) == ["End Sessions and Remove", "Keep Them Running", "Cancel"])
+    #expect(ProjectRemoval.makeAlert(projectName: "cherry", running: 0, ended: 0).buttons.map(\.title) == ["Remove", "Cancel"])
 }
 
 @Test func aBackgroundSessionWhoseHolderDiedSaysTheHostCrashed() {

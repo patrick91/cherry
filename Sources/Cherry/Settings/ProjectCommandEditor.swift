@@ -2,52 +2,24 @@ import CherryControl
 import AppKit
 import SwiftUI
 
-struct ProjectCommandRow: View {
-    let command: ProjectCommandDefinition
-    let onEdit: () -> Void
-    let onDelete: () -> Void
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: command.enabled ? "play.circle.fill" : "pause.circle")
-                .font(.system(size: 22, weight: .medium))
-                .foregroundStyle(command.enabled ? Color.accentColor : .secondary)
-                .frame(width: 28)
-
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Text(command.name)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(command.enabled ? .primary : .secondary)
-
-                    if !command.enabled {
-                        Text("Disabled")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                Text(command.commandLine)
-                    .font(.callout.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-
-            Spacer()
-
-            Button("Edit", action: onEdit)
-                .settingsGlassButtonStyle()
-        }
-        .settingsRowPadding()
-        .contextMenu {
-            Button("Delete", role: .destructive, action: onDelete)
-        }
-    }
-}
-
+/// The sheet that adds a project's command (Settings' Add Command…, the
+/// project window's) or edits one: its name, command line, working
+/// directory, environment, whether it is on and starts and restarts by
+/// itself, and where it is saved (the project's cherry.toml or this Mac).
+/// Delete… (only while editing) asks first, wherever the sheet is. Saving
+/// and deleting are the caller's (`onSave`, `onDelete`); `errorMessage`
+/// says why a save failed.
 struct ProjectCommandEditor: View {
+    static let enabledLabel = "Enabled"
+    static let enabledHelp = "Off hides it from the project's windows and never starts it."
+    static let projectFileOption = "Save to cherry.toml"
+    static let thisMacOption = "This Mac only"
+    static let thisMacOptionSubtitle = "Kept by Cherry on this Mac"
+
     @State private var draft: ProjectCommandDraft
+    @State private var confirmation: SettingsConfirmation?
+    /// The name the command is stored under, which Delete… names.
+    private let storedName: String
 
     let projectRoot: String
     let canDelete: Bool
@@ -72,6 +44,7 @@ struct ProjectCommandEditor: View {
             // A device project's commands are saved on this Mac only.
             storage: ProjectLocation.isRemoteKey(projectRoot) ? .local : storage
         ))
+        storedName = command.name
         self.projectRoot = projectRoot
         self.canDelete = canDelete
         self.errorMessage = errorMessage
@@ -80,10 +53,50 @@ struct ProjectCommandEditor: View {
         self.onCancel = onCancel
     }
 
+    /// "Add Command" while adding (no Delete…), else "Edit Command".
+    static func title(canDelete: Bool) -> String {
+        canDelete ? "Edit Command" : "Add Command"
+    }
+
+    /// Save to cherry.toml's line under it.
+    static func projectFileOptionSubtitle(fileExists: Bool) -> String {
+        fileExists ? "Shared with everyone who opens this folder" : "No cherry.toml yet: Cherry creates one"
+    }
+
+    /// What Delete… asks first (Settings' row menu asks the same): the
+    /// command's definition goes, from cherry.toml too when the file has it
+    /// (`AgentSettings.removeCommand`).
+    static func deleteConfirmation(
+        commandName: String,
+        inProjectFile: Bool,
+        delete: @escaping @MainActor () -> Void
+    ) -> SettingsConfirmation {
+        SettingsConfirmation(
+            title: "Delete the command “\(commandName)”?",
+            message: inProjectFile ? "It's removed from cherry.toml." : nil,
+            choices: [
+                SettingsConfirmation.Choice("Delete", role: .destructive, perform: delete),
+                .cancel(),
+            ]
+        )
+    }
+
+    /// Whether deleting the command named `name` removes it from the
+    /// project's cherry.toml too: never for a project on another Mac, whose
+    /// cherry.toml is read-only here.
+    @MainActor
+    static func projectFileHasCommand(named name: String, projectRoot: String) -> Bool {
+        guard !ProjectLocation.isRemoteKey(projectRoot), let root = AgentSettings.validDirectory(projectRoot) else {
+            return false
+        }
+        let normalizedName = AgentToolDefinition.normalizedName(name)
+        return CherryProjectFile.loadCommands(projectRoot: root).contains { $0.normalizedName == normalizedName }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack {
-                Text(canDelete ? "Edit command" : "Add command")
+                Text(Self.title(canDelete: canDelete))
                     .font(.title2.weight(.semibold))
                 Spacer()
                 Button(action: onCancel) {
@@ -144,6 +157,12 @@ struct ProjectCommandEditor: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Behavior")
                         .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Toggle(Self.enabledLabel, isOn: $draft.enabled)
+                        Text(Self.enabledHelp)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
                     Toggle("Auto-start when project starts", isOn: $draft.autoStart)
                     Toggle("Auto-restart if command exits", isOn: $draft.autoRestart)
                 }
@@ -166,10 +185,10 @@ struct ProjectCommandEditor: View {
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
                     ProjectCommandStorageOption(
-                        title: "Save to cherry.toml",
-                        subtitle: CherryProjectFile.exists(projectRoot: projectRoot)
-                            ? "Share this command through the project config"
-                            : "No cherry.toml found — Cherry will create one",
+                        title: Self.projectFileOption,
+                        subtitle: Self.projectFileOptionSubtitle(
+                            fileExists: CherryProjectFile.exists(projectRoot: projectRoot)
+                        ),
                         isSelected: draft.storage == .projectFile
                     ) {
                         draft.storage = .projectFile
@@ -177,8 +196,8 @@ struct ProjectCommandEditor: View {
                 }
 
                 ProjectCommandStorageOption(
-                    title: "Store locally only",
-                    subtitle: "Keep this command just for yourself on this machine",
+                    title: Self.thisMacOption,
+                    subtitle: Self.thisMacOptionSubtitle,
                     isSelected: draft.storage == .local
                 ) {
                     draft.storage = .local
@@ -192,12 +211,19 @@ struct ProjectCommandEditor: View {
 
             HStack {
                 if canDelete {
-                    Button("Delete", role: .destructive, action: onDelete)
+                    Button("Delete…", role: .destructive) {
+                        confirmation = Self.deleteConfirmation(
+                            commandName: storedName,
+                            inProjectFile: Self.projectFileHasCommand(named: storedName, projectRoot: projectRoot),
+                            delete: onDelete
+                        )
+                    }
                 }
 
                 Spacer()
 
                 Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
                 Button("Save") {
                     onSave(draft.definition, draft.storage)
                 }
@@ -206,6 +232,7 @@ struct ProjectCommandEditor: View {
         }
         .padding(24)
         .frame(width: 560)
+        .settingsConfirmation($confirmation)
     }
 
     private func chooseWorkingDirectory() {

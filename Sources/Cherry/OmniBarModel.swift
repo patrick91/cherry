@@ -823,12 +823,18 @@ enum OmniProviders {
     }
 
     /// The palette's commands and the main menu's actions this window can
-    /// run now, then an agent row for each launchable agent.
+    /// run now, with their keys as the menus have them (`CherryShortcut`),
+    /// then an agent row for each launchable agent.
     static func commands(_ sources: OmniSources) -> [OmniItem] {
         let window = sources.window
-        var items: [OmniItem] = [command(.newTab, title: "New Tab", shortcut: "⌘T", symbol: "plus.rectangle")]
+        var items: [OmniItem] = [
+            command(.newTab, title: "New Tab", shortcut: CherryShortcut.newTab.display, symbol: "plus.rectangle"),
+        ]
         if window.canOpenAnotherWindow {
-            items.append(command(.newWindow, title: "New Window", shortcut: "⌘N", symbol: "macwindow.badge.plus"))
+            items.append(command(
+                .newWindow, title: "New Window",
+                shortcut: CherryShortcut.newWindow.display, symbol: "macwindow.badge.plus"
+            ))
         }
         if window.hasProject, !sources.agents.isEmpty {
             items.append(OmniItem(
@@ -841,19 +847,34 @@ enum OmniProviders {
             ))
         }
         if window.canSplit {
-            items.append(command(.splitRight, title: "Split Right", shortcut: "⌘⇧D", symbol: "rectangle.split.2x1"))
+            items.append(command(
+                .splitRight, title: "Split Right",
+                shortcut: CherryShortcut.splitRight.display, symbol: "rectangle.split.2x1"
+            ))
         }
         if window.canDetach {
-            items.append(command(.detachTab, title: window.detachTitle, shortcut: "⌘D", symbol: "rectangle.portrait.and.arrow.right"))
+            items.append(command(
+                .detachTab, title: window.detachTitle,
+                shortcut: CherryShortcut.detachTab.display, symbol: "rectangle.portrait.and.arrow.right"
+            ))
         }
         if window.hasSelectedTab {
-            items.append(command(.closeTab, title: window.closeTitle, shortcut: "⌘W", symbol: "xmark.rectangle"))
+            items.append(command(
+                .closeTab, title: window.closeTitle,
+                shortcut: CherryShortcut.closeTab.display, symbol: "xmark.rectangle"
+            ))
         }
         if window.canReopenClosedTab {
-            items.append(command(.reopenClosedTab, title: "Reopen Closed Tab", shortcut: "⌘Z", symbol: "arrow.uturn.backward"))
+            items.append(command(
+                .reopenClosedTab, title: "Reopen Closed Tab",
+                shortcut: CherryShortcut.undoCloseTab.display, symbol: "arrow.uturn.backward"
+            ))
         }
         if window.hasSelectedTab {
-            items.append(command(.clearScrollback, title: "Clear Scrollback", shortcut: "⌘K", symbol: "clear"))
+            items.append(command(
+                .clearScrollback, title: "Clear Scrollback",
+                shortcut: CherryShortcut.clearScrollback.display, symbol: "clear"
+            ))
         }
         if let editor = sources.editors.first {
             items.append(OmniItem(
@@ -882,7 +903,7 @@ enum OmniProviders {
             id: "command:projects",
             kind: .command,
             title: "Projects",
-            detail: "⌘O",
+            detail: CherryShortcut.openProject.display,
             symbol: "folder",
             primaryLabel: "Show",
             primary: .drill(.projects)
@@ -896,7 +917,10 @@ enum OmniProviders {
             primaryLabel: "Show",
             primary: .drill(.agentPresets)
         ))
-        items.append(command(.persistentSessions, title: "Persistent Sessions…", shortcut: "⌘⇧R", symbol: "rectangle.stack"))
+        items.append(command(
+            .persistentSessions, title: "Persistent Sessions…",
+            shortcut: CherryShortcut.persistentSessions.display, symbol: "rectangle.stack"
+        ))
         if !sources.backgroundSessions.isEmpty {
             items.append(command(.endBackgroundSessions, title: "End Background Sessions…", symbol: "stop.circle"))
         }
@@ -905,13 +929,13 @@ enum OmniProviders {
         }
         items.append(command(
             .toggleSidebar, title: window.isSidebarHidden ? "Show Sidebar" : "Hide Sidebar",
-            shortcut: "⌘S", symbol: "sidebar.left"
+            shortcut: CherryShortcut.hideSidebar.display, symbol: "sidebar.left"
         ))
         items.append(command(
             .toggleAppearance, title: "Toggle Light/Dark Mode",
             symbol: "circle.lefthalf.filled", keywords: ["appearance", "theme"]
         ))
-        items.append(command(.settings, title: "Settings", shortcut: "⌘,", symbol: "gearshape"))
+        items.append(command(.settings, title: "Settings", shortcut: CherryShortcut.settings.display, symbol: "gearshape"))
         return items + agents(sources)
     }
 

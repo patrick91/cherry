@@ -391,12 +391,14 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     let shortcuts = Dictionary(rows.map { ($0.title, $0.detail) }, uniquingKeysWith: { first, _ in first })
     #expect(shortcuts["New Tab"] == "⌘T")
     #expect(shortcuts["New Window"] == "⌘N")
-    #expect(shortcuts["Split Right"] == "⌘⇧D")
+    #expect(shortcuts["Split Right"] == "⇧⌘D")
     #expect(shortcuts["Detach Tab"] == "⌘D")
     #expect(shortcuts["Close Tab"] == "⌘W")
     #expect(shortcuts["Reopen Closed Tab"] == "⌘Z")
     #expect(shortcuts["Clear Scrollback"] == "⌘K")
     #expect(shortcuts["Settings"] == "⌘,")
+    #expect(shortcuts["Persistent Sessions…"] == "⇧⌘R")
+    #expect(shortcuts["Projects"] == "⌘O")
     for title in [
         "Add Mac…", "End Background Sessions…", "New Agent", "Add Project…", "Projects",
         "Add Agent…", "Toggle Light/Dark Mode", "Open in Zed",

@@ -5,8 +5,8 @@ import os
 import Testing
 @testable import Cherry
 
-// Settings › Sessions' "Session Host" card (`SessionHostDiagnostics`, which
-// runs `cherry status`, `cherry doctor` and `cherry restart`) and the app's
+// Settings › Sessions' session host (`SessionHostDiagnostics`, which runs
+// `cherry status`, `cherry doctor` and `cherry restart`) and the app's
 // session diagnostics in the unified log (`SessionLog`).
 
 private let runningStatus = #"""
@@ -107,6 +107,98 @@ private final class ScriptedCherry: @unchecked Sendable {
     cherry.answer(["restart"], HostCommandOutput(status: 1, output: "", errors: "cherry: refusing to restart the host; it keeps running: no cherry-host to start\n"))
     await diagnostics.restartHost()
     #expect(diagnostics.restartFailure == "cherry: refusing to restart the host; it keeps running: no cherry-host to start")
+}
+
+@Test func HostControlStatusSummarizesSessionsForTheSessionsRow() throws {
+    let status = try #require(SessionHostStatus.parse(Data(runningStatus.utf8)))
+    // The socket and the log have rows of their own; the pid is in the
+    // diagnostics.
+    #expect(status.sessionsSummary == "3 sessions (2 running) of 128 · 5 of 1024 connections · 1 session runs in a holder of another build")
+
+    var single = status
+    single.sessions = 1
+    single.runningSessions = 1
+    single.otherHolderBuilds = 2
+    #expect(single.sessionsSummary == "1 session (1 running) of 128 · 5 of 1024 connections · 2 sessions run in holders of another build")
+
+    let stopped = try #require(SessionHostStatus.parse(Data(stoppedStatus.utf8)))
+    #expect(stopped.sessionsSummary == "It starts with the first persistent tab.")
+    #expect(stopped.socket == "/tmp/cherry-host-501/host.sock")
+}
+
+@Test @MainActor func HostControlDiagnosticsCopyTheSocketPathOnlyOnceItIsKnown() async throws {
+    let cherry = ScriptedCherry()
+    cherry.answer(["status", "--json"], HostCommandOutput(status: 0, output: stoppedStatus, errors: ""))
+    var copied: [String] = []
+    let diagnostics = SessionHostDiagnostics(
+        runner: cherry.runner,
+        unavailableReason: { nil },
+        revealInFinder: { _ in },
+        copyToPasteboard: { copied.append($0) }
+    )
+
+    // Nothing is known before the first status.
+    diagnostics.copySocketPath()
+    #expect(copied.isEmpty)
+
+    // A host that is not running still says where it would listen.
+    await diagnostics.refresh()
+    diagnostics.copySocketPath()
+    #expect(copied == ["/tmp/cherry-host-501/host.sock"])
+    #expect(cherry.calls == [["status", "--json"]])
+
+    // Where sessions cannot run there is no status, so no socket.
+    let unavailable = SessionHostDiagnostics(
+        runner: ScriptedCherry().runner,
+        unavailableReason: { "Cherry is running from a disk image." },
+        revealInFinder: { _ in },
+        copyToPasteboard: { copied.append($0) }
+    )
+    await unavailable.refresh()
+    unavailable.copySocketPath()
+    #expect(copied == ["/tmp/cherry-host-501/host.sock"])
+}
+
+@Test @MainActor func HostControlDiagnosticsHeroSaysHowTheHostIs() async throws {
+    let running = try #require(SessionHostStatus.parse(Data(runningStatus.utf8)))
+    let stopped = try #require(SessionHostStatus.parse(Data(stoppedStatus.utf8)))
+    func hero(
+        _ status: SessionHostStatus?,
+        problem: String? = nil,
+        isRestarting: Bool = false,
+        restartFailure: String? = nil
+    ) -> SessionHostHeroState {
+        SessionHostDiagnostics.heroState(
+            status: status, problem: problem, isRestarting: isRestarting, restartFailure: restartFailure
+        )
+    }
+
+    #expect(hero(nil) == SessionHostHeroState(tone: .yellow, title: "Checking…"))
+    #expect(hero(running) == SessionHostHeroState(tone: .green, title: "Running · build 20260927101500.abc1234 · up 2h 5m"))
+    #expect(hero(stopped) == SessionHostHeroState(tone: .gray, title: "Not running"))
+    #expect(hero(running, isRestarting: true) == SessionHostHeroState(tone: .yellow, title: "Restarting…"))
+    #expect(hero(running, restartFailure: "no cherry-host to start")
+        == SessionHostHeroState(tone: .red, title: "Restart failed: no cherry-host to start"))
+    // A status that could not be read after the failed restart says why.
+    #expect(hero(nil, problem: "cherry status failed (exit status 1).", restartFailure: "no cherry-host to start")
+        == SessionHostHeroState(
+            tone: .red, title: "Restart failed: no cherry-host to start", detail: "cherry status failed (exit status 1)."
+        ))
+    #expect(hero(nil, problem: "Cherry is running from a disk image.")
+        == SessionHostHeroState(tone: .red, title: "Unknown", detail: "Cherry is running from a disk image."))
+
+    // The diagnostics' own state, as `cherry status` answered.
+    let cherry = ScriptedCherry()
+    cherry.answer(["status", "--json"], HostCommandOutput(status: 0, output: runningStatus, errors: ""))
+    cherry.answer(["restart"], HostCommandOutput(status: 1, output: "", errors: "cherry: no cherry-host to start\n"))
+    let diagnostics = SessionHostDiagnostics(
+        runner: cherry.runner, unavailableReason: { nil }, revealInFinder: { _ in }, copyToPasteboard: { _ in }
+    )
+    #expect(diagnostics.heroState.title == "Checking…")
+    await diagnostics.refresh()
+    #expect(diagnostics.heroState == SessionHostHeroState(tone: .green, title: running.headline))
+    await diagnostics.restartHost()
+    #expect(diagnostics.heroState == SessionHostHeroState(tone: .red, title: "Restart failed: cherry: no cherry-host to start"))
 }
 
 @Test @MainActor func HostControlDiagnosticsRunNothingWhereSessionsCannotRun() async throws {

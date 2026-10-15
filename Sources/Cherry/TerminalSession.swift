@@ -3531,9 +3531,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var surfaceSignalsWhileFollowing: [(key: String, at: Date)] = []
     private static let notificationDeduplicationWindow: TimeInterval = 3
     private static let bellDeduplicationWindow: TimeInterval = 1
-    /// Plays the terminal bell (Ghostty's, or one the host reported).
-    /// Tests replace it.
-    var bellHandler: @MainActor (TerminalSession) -> Void = { _ in NSSound.beep() }
+    /// Plays the terminal bell (Ghostty's, or one the host reported), unless
+    /// Settings › Notifications › Terminal bell is Silent. Tests replace it.
+    var bellHandler: @MainActor (TerminalSession) -> Void = { _ in TerminalBell.ring() }
     /// The screen read from the host is in `nativeContentLines`, read at
     /// this time; nil when it came from the surface.
     private var hostContentReadAt: Date?

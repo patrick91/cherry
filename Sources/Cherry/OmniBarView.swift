@@ -98,7 +98,7 @@ struct OmniBarOverlay: View {
                 errorMessage: agentError,
                 onSave: { updated in
                     do {
-                        try AgentSettings.shared.upsertAgent(updated)
+                        try AgentSettings.shared.addAgent(updated)
                         agentError = nil
                         editingAgent = nil
                         dismiss()

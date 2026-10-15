@@ -813,7 +813,7 @@ back with its sibling tabs, and shows its tab; a session no saved tab names
 becomes a tab of that window with its kind and name. **End** (twice, for a
 running session) kills it, waits for its exit and removes it; an ended one is
 only removed. **Cherry → End Background Sessions…** and **End All…** (in that
-list and in **Settings › Sessions › Background Sessions**) end them all after
+list and in **Settings › Sessions**) end them all after
 asking, on a project window. Ending one does not change its window's saved
 tabs: that window's next restore finds the session gone and drops its tab.
 Sessions of the `cherry` CLI, of **Create & Attach** and of other apps (Cherry
@@ -826,7 +826,7 @@ are in the background that it has not told about, it says so once in a
 notice at the bottom of its first project window, with **Reopen** (each back
 in a tab of its project's window) and **End…** (asks, then ends those
 sessions); its time runs only while that window is in front, and it waits
-for a closed tab's notice to go. **Settings › Sessions › Tell me about
+for a closed tab's notice to go. **Settings › Notifications › Tell me about
 background sessions when Cherry opens**,
 `sessions.backgroundNoticeAtLaunch`, turns it off. Sessions
 kept on purpose are never named: a detached tab's, a window's closed with
@@ -954,7 +954,7 @@ local tabs run natively). It builds them with the app's CFBundleVersion as
 their build (`CHERRY_BUILD_ID`), so the updated app's helpers hand the
 running daemon over to the new build (see [Updates](#updates)).
 
-**Settings › Sessions › Session Host** shows the local daemon's status (what
+**Settings › Sessions** shows the local daemon's status at its top (what
 `cherry status` reports: build, uptime, sessions and connections, sessions
 whose holder runs another build) and offers **Reveal Log** (`host.log` in the
 Finder), **Copy Diagnostics** (Cherry's version and what `cherry status` and

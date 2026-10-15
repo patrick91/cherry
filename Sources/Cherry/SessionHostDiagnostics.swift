@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 
 /// The local session host as `cherry status --json` describes it
-/// (Settings › Sessions, "Session Host").
+/// (Settings › Sessions, its session host header).
 struct SessionHostStatus: Equatable, Sendable {
     var running: Bool
     var socket: String?
@@ -62,12 +62,28 @@ struct SessionHostStatus: Equatable, Sendable {
         return parts.joined(separator: " · ")
     }
 
-    /// "3 sessions (2 running) of 128 · 5 of 1024 connections · 1 holder of
-    /// an older build", or where the host would run.
+    /// "3 sessions (2 running) of 128 · 5 of 1024 connections · 1 session
+    /// runs in a holder of another build · pid 4242", or where the host
+    /// would run.
     var detail: String {
         guard running else {
             return "It starts with the first persistent tab. Socket: \(socket ?? "unknown")."
         }
+        var parts = sessionsParts
+        if let pid { parts.append("pid \(pid)") }
+        return parts.joined(separator: " · ")
+    }
+
+    /// The Sessions row under the host's header: "3 sessions (2 running) of
+    /// 128 · 5 of 1024 connections · 1 session runs in a holder of another
+    /// build"; while the host is not running, when it starts. The socket
+    /// and the log have rows of their own.
+    var sessionsSummary: String {
+        guard running else { return "It starts with the first persistent tab." }
+        return sessionsParts.joined(separator: " · ")
+    }
+
+    private var sessionsParts: [String] {
         var parts: [String] = []
         if let sessions {
             var text = sessions == 1 ? "1 session" : "\(sessions) sessions"
@@ -83,8 +99,7 @@ struct SessionHostStatus: Equatable, Sendable {
                 ? "1 session runs in a holder of another build"
                 : "\(otherHolderBuilds) sessions run in holders of another build")
         }
-        if let pid { parts.append("pid \(pid)") }
-        return parts.joined(separator: " · ")
+        return parts
     }
 
     /// `12s`, `4m 10s`, `2h 5m`, `3d 4h`, as `cherry status` prints it.
@@ -108,11 +123,21 @@ struct HostCommandOutput: Equatable, Sendable {
 /// Runs the bundled `cherry` with the given arguments.
 typealias HostCommandRunner = @Sendable ([String]) async throws -> HostCommandOutput
 
-/// Settings › Sessions' "Session Host" card: the local host's status
-/// (`cherry status --json`), Reveal Log, Copy Diagnostics (`cherry status`
-/// and `cherry doctor`) and Restart Host (`cherry restart`, after the card
-/// asked). It runs only commands that never start a host, except the
-/// restart it was asked for.
+/// The session host's header on Settings › Sessions: its dot and status
+/// line ("Running · build … · up 2h 5m") and, when the status could not be
+/// read, why.
+struct SessionHostHeroState: Equatable, Sendable {
+    var tone: SettingsStatusDot.Tone
+    var title: String
+    var detail: String?
+}
+
+/// Settings › Sessions' session host (its header and rows, and the
+/// sidebar's status item): the local host's status (`cherry status
+/// --json`), the socket's path to copy, Reveal Log, Copy Diagnostics
+/// (`cherry status` and `cherry doctor`) and Restart Host (`cherry
+/// restart`, after the page asked). It runs only commands that never start
+/// a host, except the restart it was asked for.
 @MainActor
 final class SessionHostDiagnostics: ObservableObject {
     static let shared = SessionHostDiagnostics()
@@ -192,6 +217,37 @@ final class SessionHostDiagnostics: ObservableObject {
 
     func copyDiagnostics() async {
         copyToPasteboard(await diagnostics())
+    }
+
+    /// Copies the host's socket path (the Socket row), as `cherry status`
+    /// last reported it; nothing while it is not known.
+    func copySocketPath() {
+        guard let socket = status?.socket else { return }
+        copyToPasteboard(socket)
+    }
+
+    /// The header's dot and status line, from what is known now.
+    var heroState: SessionHostHeroState {
+        Self.heroState(status: status, problem: problem, isRestarting: isRestarting, restartFailure: restartFailure)
+    }
+
+    /// Green while the host runs, gray when it does not, yellow while
+    /// Cherry checks or restarts it, red when a restart failed or the
+    /// status could not be read (`problem`, under the line, also after a
+    /// failed restart).
+    nonisolated static func heroState(
+        status: SessionHostStatus?,
+        problem: String?,
+        isRestarting: Bool,
+        restartFailure: String?
+    ) -> SessionHostHeroState {
+        if isRestarting { return SessionHostHeroState(tone: .yellow, title: "Restarting…") }
+        if let restartFailure {
+            return SessionHostHeroState(tone: .red, title: "Restart failed: \(restartFailure)", detail: problem)
+        }
+        if let problem { return SessionHostHeroState(tone: .red, title: "Unknown", detail: problem) }
+        guard let status else { return SessionHostHeroState(tone: .yellow, title: "Checking…") }
+        return SessionHostHeroState(tone: status.running ? .green : .gray, title: status.headline)
     }
 
     /// Shows the host's log in the Finder: the daemon's `host.log`, or

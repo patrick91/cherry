@@ -662,14 +662,14 @@ struct MenuBarAgentsPanel: View {
             }
 
             SettingsLink {
-                MenuBarActionLabel(title: "Settings…", shortcut: "⌘,")
+                MenuBarActionLabel(title: "Settings…", shortcut: CherryShortcut.settings.display)
             }
             .buttonStyle(.plain)
 
             Button {
                 NSApp.terminate(nil)
             } label: {
-                MenuBarActionLabel(title: "Quit Cherry", shortcut: "⌘Q")
+                MenuBarActionLabel(title: "Quit Cherry", shortcut: CherryShortcut.quit.display)
             }
             .buttonStyle(.plain)
         }

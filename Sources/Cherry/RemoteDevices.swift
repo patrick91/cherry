@@ -51,8 +51,8 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
     /// DARWIN_USER_TEMP_DIR`), from the check or the first Cherry MCP
     /// forward: where the forwarded control socket goes (phase 4b).
     var userTemporaryDirectory: String? = nil
-    /// The colour its windows show it in (Settings › Sessions › Other
-    /// Macs); nil: automatic, from its id (`effectiveColor`).
+    /// The colour its windows show it in (Settings › Macs); nil:
+    /// automatic, from its id (`effectiveColor`).
     var color: RemoteDeviceColor? = nil
     /// Its interactive login shell's PATH (and the few other variables
     /// `RemoteLoginEnvironment.isSent` allows), as Cherry last read it there

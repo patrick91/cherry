@@ -5,17 +5,18 @@
 #   Scripts/test-session-suites [--skip-build] real-host
 #
 # unit: runs each group below on its own (the session groups, AppUpdate:
-# Restart to Update's quit keeps sessions, and NativeKeyboard: the bytes a
-# native tab's program reads for its keys). Swift Testing matches --filter
-# against a test's ID, which includes its source file name, so a group selects
-# every test in the files named after it (WorkspaceRestore selects all of
-# WorkspaceRestoreTests.swift) as well as the tests named after it. Each group
-# must pass at least one test, so a filter that stops matching fails instead
-# of passing with nothing run. Real-host tests in these files are skipped.
-# Two guards keep a new suite from being left out of CI unnoticed: every test
-# file under Tests that uses the session types or fakes (see session_markers)
-# must be named after a group, and every test skipped here must be one that
-# real-host mode runs (RealHost in its name or its file's name).
+# Restart to Update's quit keeps sessions, NativeKeyboard: the bytes a native
+# tab's program reads for its keys, and SettingsWindow: the Settings window's
+# models). Swift Testing matches --filter against a test's ID, which includes
+# its source file name, so a group selects every test in the files named after
+# it (WorkspaceRestore selects all of WorkspaceRestoreTests.swift) as well as
+# the tests named after it. Each group must pass at least one test, so a
+# filter that stops matching fails instead of passing with nothing run.
+# Real-host tests in these files are skipped. Two guards keep a new suite from
+# being left out of CI unnoticed: every test file under Tests that uses the
+# session types or fakes (see session_markers) must be named after a group,
+# and every test skipped here must be one that real-host mode runs (RealHost
+# in its name or its file's name).
 #
 # real-host: sets CHERRY_TEST_HOST_INTEGRATION=1 and runs every test whose ID
 # contains RealHost (HostedSessionRealHost*, PersistentLocalRealHost*,
@@ -136,6 +137,7 @@ groups=(
   ProgramStatus         # ProgramStatusTests
   AppUpdate             # AppUpdateTests: restart to update keeps sessions
   NativeKeyboard        # NativeKeyboard{Config,Surface}Tests: keys and the user's Ghostty keybinds
+  SettingsWindow        # SettingsWindow*Tests: the Settings window's navigation, search, sources and page models
 )
 
 # What marks a test file as a session suite: the hosted and persistent session

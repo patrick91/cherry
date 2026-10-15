@@ -1321,7 +1321,7 @@ struct CherryApp: App {
             SettingsView()
                 .preferredColorScheme(terminalSettings.appearance.preferredColorScheme)
         }
-        // 980 pt wide; it grows taller only (`SettingsView`'s frame).
+        // Resizable from 800 by 520 pt, opening at 980 by 680 (`SettingsView`'s frame).
         .windowResizability(.contentSize)
     }
 

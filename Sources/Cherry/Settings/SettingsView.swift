@@ -3,7 +3,8 @@ import SwiftUI
 
 /// The Settings window: the sidebar with its search, and the page the
 /// navigator shows (`SettingsNavigator.shared`), with back and forward in
-/// the toolbar. 980 pt wide; it grows taller only. ⌘F, ⌘[ and ⌘] are the
+/// the toolbar. It opens 980 by 680 pt and resizes both ways, down to 800 by
+/// 520 pt; the page's column stays at most 640 pt wide. ⌘F, ⌘[ and ⌘] are the
 /// window's (`SettingsKeyMonitor`).
 struct SettingsView: View {
     /// Not observed here: the sidebar and the detail observe what they show,
@@ -35,8 +36,7 @@ struct SettingsView: View {
         .background(SettingsNativeWindowConfigurator {
             SettingsHostStatusRefresh.refresh()
         })
-        .frame(width: 980)
-        .frame(minHeight: 520, idealHeight: 680, maxHeight: .infinity)
+        .frame(minWidth: 800, idealWidth: 980, maxWidth: .infinity, minHeight: 520, idealHeight: 680, maxHeight: .infinity)
         .onReceive(agentSettings.$agents) { _ in scheduleReconcile() }
         .onReceive(agentSettings.$projects) { _ in scheduleReconcile() }
     }

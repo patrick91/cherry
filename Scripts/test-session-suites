@@ -7,8 +7,9 @@
 # unit: runs each group below on its own (the session groups, AppUpdate:
 # Restart to Update's quit keeps sessions, NativeKeyboard: the bytes a native
 # tab's program reads for its keys, SettingsWindow: the Settings window's
-# models, and AgentTitle: an agent's terminal title as its tab's task name).
-# Swift Testing matches --filter against a test's ID, which includes
+# models, ControlTool: the MCP tools and the control socket's tool requests,
+# and AgentTitle: an agent's terminal title as its tab's task name). Swift
+# Testing matches --filter against a test's ID, which includes
 # its source file name, so a group selects every test in the files named after
 # it (WorkspaceRestore selects all of WorkspaceRestoreTests.swift) as well as
 # the tests named after it. Each group must pass at least one test, so a
@@ -139,6 +140,7 @@ groups=(
   AppUpdate             # AppUpdateTests: restart to update keeps sessions
   NativeKeyboard        # NativeKeyboard{Config,Surface}Tests: keys and the user's Ghostty keybinds
   SettingsWindow        # SettingsWindow*Tests: the Settings window's navigation, search, sources and page models
+  ControlTool           # ControlTool*Tests: the MCP tool layer and catalog, the control socket's tool requests and identity, CherryMCP's pipe, agents' launch-time MCP, connecting agent CLIs
   AgentTitle            # AgentTitleTests: an agent's terminal title as its tab's task name
 )
 

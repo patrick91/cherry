@@ -35,9 +35,11 @@ final class PersistentHarness {
     let project: URL
     private let suite: String
 
+    /// `mcpHelperPath`: the CherryMCP the launch specs name (none by default).
     init(
         configuration: PersistentLocalSessions.Configuration = PersistentHarness.fastConfiguration,
-        controlConfiguration: HostControl.Configuration = .fastTests
+        controlConfiguration: HostControl.Configuration = .fastTests,
+        mcpHelperPath: String? = nil
     ) throws {
         fake = FakeControlHelper()
         cli = try HostedSessionFakeCLI()
@@ -80,7 +82,8 @@ final class PersistentHarness {
                     zshBootstrap: nil,
                     executableDirectory: nil,
                     terminalProgramVersion: nil,
-                    shellFeatures: ""
+                    shellFeatures: "",
+                    mcpHelperPath: mcpHelperPath
                 ))
             },
             status: status,

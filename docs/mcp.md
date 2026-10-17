@@ -1,68 +1,437 @@
 # Cherry MCP Guide
 
-Cherry exposes MCP through a stdio helper launched inside each agent harness.
-The helper talks to the running macOS app over Cherry's local control socket.
-The MCP surface is process-first: terminals, agents, and configured project
-commands are all Cherry processes with a `process_id`.
+Cherry exposes MCP through a stdio helper, CherryMCP, that each agent
+harness starts. The helper talks to the running macOS app over Cherry's
+local control socket, and the app runs the tools. The MCP surface is
+process-first: terminals, agents, and configured project commands are all
+Cherry processes with a `process_id`.
 
 ## Setup
 
-Start Cherry first, then register the helper shown in Settings › Agents & MCP
-with your agent harness. In a SwiftPM checkout, build the helper and install it like this:
+**Agents Cherry starts need nothing registered.** An agent tab Cherry starts
+with Claude Code 2.0.0 or later, Codex 0.162.0 or later, or Pi 0.99.2 or
+later, gets Cherry's server on its command line for that run, on This Mac
+and on your other Macs (below):
+
+- Claude Code: `--mcp-config '{"mcpServers":{"cherry":{"args":[],"command":"<…/Contents/MacOS/CherryMCP>","type":"stdio"}}}'`.
+- Codex: `-c 'mcp_servers.cherry={command="<…/CherryMCP>",args=["--client-tool-timeout","300"],env_vars=[…],startup_timeout_sec=30,tool_timeout_sec=300}'`,
+  where `env_vars` names the Cherry variables the launch sets
+  (`CHERRY_PROCESS_ID`, `CHERRY_AGENT_ID`, `CHERRY_PROJECT_ROOT` when the
+  tab has one, `CHERRY_CONTROL_SOCKET` when the app listens,
+  `CHERRY_MCP_HELPER`). Only names go on the line, never a value.
+- Pi: `-e '<…/Contents/Resources/Cherry_Cherry.bundle/cherry-pi-mcp.ts>'`,
+  Cherry's Pi extension (`PiMCPExtension`, plain JavaScript in the app's
+  sealed resources). It calls `pi.registerMcpServer` for that session with
+  the tab's `CHERRY_MCP_HELPER` as the command, `--client-tool-timeout 300`,
+  deferred exposure, `timeout: 300` and the description below, under the
+  name in `CHERRY_MCP_SERVER_NAME`, which every tab with `CHERRY_MCP_HELPER`
+  has. Pi passes its whole environment to the server, so nothing else goes
+  on the line. A Pi without MCP (before 0.99) loads it and does nothing.
+
+None of them writes the agent's configuration. The server has the name a
+registration has (the identity's URL scheme, `cherry` for releases), so for
+that run it replaces a registered Claude Code or Codex `cherry`: the agent
+sees one Cherry server, and Codex's inline table replaces the whole
+registered entry (an old `args`, `env_vars` or `enabled = false` included).
+A registration under another name is still listed too.
+
+**Pi is the other way round:** an entry of that name in Pi's `mcp.json`
+(a disabled one too; `-` and `_` count as the same) takes precedence over
+the extension's server, and Pi's `/mcp` lists the extension's as
+overridden. An entry naming this app's CherryMCP serves the agent as well;
+a stale, disabled or codemode one leaves it without Cherry's tools. The Pi
+row in Settings says so (Broken, Turned off in Pi, Tools hidden, below)
+and offers Re-register, and the launch logs `[mcp] Pi's mcp.json has its
+own cherry (…); Pi uses it instead of the launch-time server`; it changes
+nothing at launch.
+
+Cherry adds the flags only when all of these hold, and otherwise starts the
+agent exactly as its command says:
+
+- Settings › Agents & MCP › MCP server › **Connect agents Cherry starts** is
+  on (`mcp.connectAgentsAtLaunch`, on by default; one switch for every agent
+  and Mac; for one run, a launch argument turns it off as a property list,
+  `-mcp.connectAgentsAtLaunch '<false/>'`: `NO` is a string and is
+  ignored, as for Cherry's other switches).
+- The command is a plain command whose first word is `claude`, `codex` or
+  `pi` (a path to one too): one simple command of literal words, with no
+  pipe, list, redirection, expansion, glob, comment, `--` or leading
+  `NAME=value`.
+- It starts a session: not a subcommand such as `claude mcp`, `claude
+  doctor`, `claude attach`, `codex login`, `codex mcp`, `pi install`, `pi
+  mcp` or `pi config`. A prompt (`claude "fix it"`, `pi "fix it"`), `codex
+  exec` and `codex resume` are sessions. The lists
+  (`AgentMCPLaunch.CLI.subcommandsWithoutSession`) were checked against
+  `--help` of Claude Code 2.1.299 and Codex 0.162.1 and Pi 1.3.0's argument
+  parser; recheck them when a CLI adds subcommands.
+- It names no MCP configuration of its own (`--mcp-config`,
+  `--strict-mcp-config`, or a `-c` with `mcp_servers`), and a Pi turns off
+  neither its MCP nor its extensions (`--no-mcp`, `--no-extensions`, `-ne`:
+  nothing would connect the extension's server).
+- It does not end in an option that takes a value (`claude --model`, `pi
+  -e`; `AgentMCPLaunch.CLI.optionsTakingValue`): the option would take the
+  first word Cherry adds, and Claude Code and Pi would start a turn with the
+  next one as its prompt.
+- For Pi, the app's extension is there (a Cherry moved while it runs has
+  none, and its Pi agents start as before).
+- The CLI's version is known and at least the minimum (Claude Code 2.0.0,
+  checked with 2.1.299; Codex 0.162.0, checked with 0.162.1; Pi 0.99.2,
+  read from Pi 1.3.0's source: an extension's server takes a `description`
+  and a `timeout` from 0.99.2). On This Mac Cherry runs `<cli> --version`
+  once per run for each executable (found on the login shell's PATH, off
+  the main thread, at most 5 s, with no terminal; again when the file
+  changes) and asks the enabled agents' CLIs as the first window opens. It
+  reads the version from the standard output: Pi 0.62.0, with no terminal,
+  prints its version on standard error, so it counts as unknown and its
+  agents start as before (Settings reads standard error too, but only to
+  say Update Pi). A launch never waits for it: an agent started
+  before its version is known (usually a tab restored as Cherry starts)
+  runs without the flags until it is restarted. On another Mac the agent's
+  line checks the version itself.
+- The helper's path has no `'`, `\` or control character and the server
+  name is `[a-z0-9_-]+`, so the words read the same under sh, zsh, bash
+  and fish.
+
+The flags are decided for each launch and never saved with the tab (its
+command stays as you wrote it; a restart decides again). A shell alias or
+function named `claude`, `codex` or `pi` gets them too, although its
+version was read from the executable on PATH: turn the switch off if that
+breaks it. The session log (`SessionLog`, "[mcp]") says what was added, or
+why nothing was.
+
+**Agents you start yourself** (in a plain shell, outside Cherry, or a
+command Cherry does not extend), and agents Cherry starts while the switch
+is off, use what is registered with their CLI. Start Cherry first, then
+connect them with Connect Agents to Cherry… (below), or register the
+helper shown in Settings › Agents & MCP yourself. In a SwiftPM checkout,
+build the helper and install it like this:
 
 ```bash
 swift build --product CherryMCP
 codex mcp add cherry -- "$(swift build --show-bin-path)/CherryMCP"
 claude mcp add --transport stdio --scope user cherry -- "$(swift build --show-bin-path)/CherryMCP"
-pi mcp add cherry --exposure direct -- "$(swift build --show-bin-path)/CherryMCP"
+pi mcp add cherry --exposure deferred --description 'Cherry, the terminal app this Pi runs in: its tabs, agents, Cherry tasks (get_my_task, report_result), waits and ports. Load its tools with tool_search.' -- "$(swift build --show-bin-path)/CherryMCP"
 ```
 
-Pi needs `--exposure direct`: its default (`codemode`) hides an MCP
-server's tools behind a script tool. Each agent's page in Settings › Agents
-& MCP shows its CLI's command, and **Add to Claude Code**, **Add to Codex**
-or **Add to Pi** runs it, only when clicked (each CLI writes its own
-settings; Cherry reads only Pi's `mcp.json`, to say whether Cherry is
-registered there, and never Claude Code's or Codex's, so theirs say "Not
-checked" until a click). **MCP server › Connect other agent CLIs** on
-Agents & MCP shows all three commands, with **Add to Pi**. They use the
-environment of your login shell, as this run of Cherry captured it, so a
-`PI_CODING_AGENT_DIR` set there names the `mcp.json` Pi uses; Set Up Cherry MCP on another Mac passes that Mac's
-login-shell `PI_CODING_AGENT_DIR` to `pi` too.
+Pi's registration needs Pi 0.99.2 or later (MCP came in 0.99.0;
+`--description`, Pi's `mcp_servers` prompt section and deferred servers that
+no longer hold up the first prompt in 0.99.2), and the Pi agents Cherry
+starts use it instead of the extension's server (above). An older Pi has
+no `pi mcp` and takes `mcp add …` as prompts for its model, so Cherry runs
+`pi mcp` only after `pi --version` shows 0.99.2 or later, here and on your
+other Macs. `--exposure deferred` lets the model find Cherry's tools
+through Pi's tool search when it needs them; `direct` sends all of them
+with every request, and Pi's default (`codemode`) hides them behind a
+script tool. The description is the line Pi's prompt shows for the server.
+
+**Connect Agents to Cherry…** (the Omni bar, or Settings › Agents & MCP ›
+MCP server) shows Claude Code, Codex and Pi on this Mac: each one's
+version, whether it has Cherry MCP and what that means, the exact command
+that connects it (the CLI's path as found, first; only while the row has a
+button that runs it, so never for a version Cherry can't read or a Pi
+without MCP), and what the agents Cherry starts get. The CLIs it does not
+find are listed at its end ("Not found: …"). Each agent's page in
+Settings › Agents & MCP shows the same row for its CLI, from the same
+model, and the command to run yourself (Pi's only on a Pi with MCP, as in
+the sheet). Nothing writes an agent's settings until you confirm: every
+button that would (Connect, Connect Again, Re-register, Make Deferred and
+**Connect All**) first shows "Cherry will run:", the exact commands, the
+file the CLI writes and what it replaces, and only its **Connect** runs
+them, each as an argv with no shell in between, in your login shell's
+environment (each CLI writes its own settings; Cherry never edits them).
+
+Each CLI's state is read when a sheet or page shows and on Check Again
+(never as Cherry starts), with nothing that starts a server or writes a
+file:
+
+| CLI | Read | Never run |
+|---|---|---|
+| Claude Code | `claude --version`, then its settings file: `.config.json` in its config directory (`CLAUDE_CONFIG_DIR`, else `~/.claude`) when that legacy file exists, else `.claude.json` in `CLAUDE_CONFIG_DIR` when it is set, else in your home folder (as Claude Code 2.1.299 writes it); its top-level `mcpServers.cherry` (`type`, `command`, `args`; not `env`) | `claude mcp list`, `claude mcp get` (both start the server, and `get` rewrites the file) |
+| Codex | `codex --version`, then on Codex 0.162.0 or later `codex mcp get cherry --json` (`enabled`, `transport`; it starts no server and writes no settings), at most 10 s; an older Codex is "Not checked", with Connect still offered | `codex mcp list`; Cherry does not parse `config.toml` (profiles and project settings would be missed) |
+| Pi | `pi --version`, then on Pi 0.99.2 or later its `mcp.json` (below) | `pi mcp list`, which starts every server |
+
+Claude Code's and Codex's rows say:
+
+| Status | When | Button |
+|---|---|---|
+| Not installed | not found (the login shell's PATH, then `~/.local/bin`, `~/.claude/local`, `~/.bun/bin`, `/opt/homebrew/bin`, `/usr/local/bin`) | Check Again |
+| Unknown | `--version` printed no version, or did not answer | Check Again |
+| Not connected | no entry of this app's name | Connect |
+| Connected | this app's CherryMCP, with no arguments | Connect Again (in `⋯`) |
+| Turned off | Codex's `enabled = false` | Connect |
+| Another Cherry / Broken | another CherryMCP, which runs / is gone | Re-register |
+| Differs | this app's CherryMCP with arguments, or not a stdio server | Re-register |
+| Can't read | the file is not a JSON object, `CLAUDE_CONFIG_DIR` is not an absolute path (Claude Code refuses one too), or Codex's own error | Check Again |
+| Not checked | a Codex before 0.162.0 | Connect |
+
+Claude Code's Connect runs `claude mcp add --transport stdio --scope user
+cherry -- <CherryMCP>`; its Re-register and Connect Again run `claude mcp
+remove --scope user cherry` first, since its `add` refuses a name it has
+(what the remove said is shown only when the add fails). Codex's `codex
+mcp add cherry -- <CherryMCP>` and Pi's command replace an entry of the
+name, so theirs are one command. **Connect All** shows one confirmation
+with the commands of every CLI that is not connected, turned off, has its
+tools hidden (Pi) or names a CherryMCP that is gone; never one that is
+connected (Pi's direct one too), another Cherry's helper that runs, or one
+with other arguments: those are yours to change with their own buttons.
+After a run each row is read again and shows the CLI's own output; one
+that worked adds "Sessions already open read their MCP servers when they
+start: restart them." (Pi: "type /reload in them, or restart the tab.").
+
+**Connect This Agent to Cherry…** (the Omni bar, while the selected tab is
+a Claude Code, Codex or Pi agent) shows that CLI's row and how this tab
+started: with Cherry MCP for this session (for Claude Code and Codex their
+registration is then for sessions started elsewhere; Pi's own `cherry`
+entry still wins), or without it and why, with **Restart Tab** (as Restart
+Active Tab) when a launch now would get it: its version is known now, or
+the CLI was updated. It also says what this project's settings change, read
+only and with no button: for Pi a `cherry` entry in the `.pi/mcp.json` of
+the tab's directory (else its project root's) that turns it off, sets its
+exposure or runs a command of its own, which Pi uses once it trusts the
+project; for Claude Code, when this launch had no Cherry MCP, a local-scope
+entry (`projects["<project root>"].mcpServers.cherry` in its settings file),
+which it uses instead of the user one; for Codex nothing (its project
+settings are not read). After a Connect there, Restart Tab is offered for a
+Claude Code or Codex tab that started without Cherry MCP. For a tab on
+another Mac it reads nothing of This Mac's and offers Set Up Cherry MCP on
+<Mac>… (Agents On Another Mac).
+
+A Pi row (a Pi agent's page, the sheets, and Agents & MCP's Connect other
+agent CLIs) finds `pi` as above (the login shell's PATH, then the same
+directories), runs `pi --version` and nothing else (never `pi mcp list`,
+which starts every server), and on a Pi with MCP reads its `mcp.json`,
+never writing it. Its row then says:
+
+| Status | When | Button |
+|---|---|---|
+| Not installed | no `pi` found | Check Again |
+| Unknown Pi | `--version` printed no version on its standard output (and no version before 0.99.2 on its standard error), or did not answer | Check Again |
+| Update Pi | a Pi before 0.99.2: its standard output's version, else its standard error's (Pi 0.62.0 prints it there without a terminal) | Check Again |
+| Not connected | no entry of this app's name | Connect |
+| Connected | this app's CherryMCP, deferred | Connect Again (in `⋯`) |
+| Connected (direct) | this app's CherryMCP, direct | Make Deferred |
+| Tools hidden | this app's CherryMCP, `codemode` (also no `exposure`) or `hidden` | Make Deferred |
+| Turned off in Pi | `"enabled": false` | Connect |
+| Another Cherry / Broken | another CherryMCP, which runs / is gone | Re-register |
+| Differs | this app's CherryMCP with arguments, or no command | Re-register |
+| Can't read | `mcp.json` is not a JSON object | Check Again |
+
+Connect, Make Deferred, Re-register and Connect Again all run the command
+above (`pi mcp add` replaces an entry of the same name), only once you
+confirm it, and only after `pi --version`, run again then, says 0.99.2 or
+later (a version manager's shim stays the same file while its Pi changes;
+Check Again runs it again too). On any other answer nothing runs: a Pi
+before 0.99 has no `pi mcp` and would take `mcp add …` as prompts for its
+model. A refused one shows Pi's own words and is never retried another
+way. Only the entry's `enabled`, `command`, `args` and `exposure` are
+compared (its description, `env` and `timeout` are Pi's).
+
+**MCP server › Connect other agent CLIs** on Agents & MCP shows the three
+commands (Pi's only on a Pi with MCP), with Pi's row. Every CLI runs, and
+is read, in the environment of your login shell, as this run of Cherry
+captured it, so a `PI_CODING_AGENT_DIR`, `CODEX_HOME` or
+`CLAUDE_CONFIG_DIR` set there names the settings each uses; Set Up Cherry
+MCP on another Mac passes that Mac's login-shell `PI_CODING_AGENT_DIR` to
+`pi` too. The same section's **Control socket** row shows the socket this
+app's tabs name (below) and whether it listens.
 
 The helper talks to Cherry through the instance-scoped Unix control socket; the
 old direct HTTP MCP endpoint has been removed.
 
+## Versions
+
+The app answers three requests of control protocol 2 besides the typed
+requests every CherryMCP used before: `appInfo` (which app answers and its
+build), `listTools` (the tools for one client) and `callTool` (one tool
+run in the app as its caller). CherryMCP asks `appInfo` on its first
+`tools/list` or call:
+
+| CherryMCP | Cherry with control protocol 2 | An older Cherry (no `appInfo`) |
+|---|---|---|
+| this one | **pipe**: `tools/list` is the app's `listTools`, each `tools/call` one `callTool` | **legacy**: its own tool list, and it runs the tools itself over typed requests |
+| an older one | typed requests, answered as before; its own compiled list | as before |
+
+- In pipe mode every tool name goes to the app, so a tool of a newer app
+  works through a helper that does not know it, and a name the app does
+  not know is the app's `unknown_tool`. In legacy mode a name the helper
+  does not know is `unknown_tool` before anything is sent.
+- An app that cannot decode `appInfo` (`invalid_request`) makes the
+  session legacy for 60 s, then it asks again (an update may replace the
+  app while the agent runs). Any other failure (`cherry_unavailable`,
+  `cherry_unreachable`, `unauthorized`, `socket_not_private`) is returned as
+  the tool's error and never changes the mode. A `callTool` refused with
+  `invalid_request` by an app that still says protocol 2 is that tool's
+  error; one refused because an older app replaced it runs in the helper.
+- `appInfo` waits 2 s before a `tools/list` (the app answers it, and
+  `listTools`, before its task restore) and 10 s before a call. When no app
+  answers a `tools/list` in time, and in legacy mode, the helper lists its
+  own catalog (`CherryToolCatalog`, the same tools) as for a client it
+  knows nothing of: `wait_for_events` and `wait_for_tasks` say at most
+  50 s, an older app's limit, whatever the client allows (a pipe app that
+  answers later sends `list_changed` with the client's own limit); when
+  no app answers a call, the
+  call fails as before (`cherry_unavailable`, or `cherry_unreachable` from
+  another Mac), after the checks the helper can make itself (an unknown
+  tool, a missing argument).
+- Every `callTool` answer carries the digest of the app's list for that
+  client (`toolsDigest`). When it is not the list the client was served,
+  CherryMCP sends `notifications/tools/list_changed`, once per new digest
+  (its `initialize` answer says `listChanged: true`).
+- The server instructions are the helper's own build's, sent before the
+  app is asked anything.
+- `CherryMCP --version` prints
+  `{"build":"<build>","controlProtocol":2,"name":"CherryMCP","version":"<build>"}`:
+  the enclosing app's `CFBundleVersion`, a device install's build directory
+  name, else `dev`. Its `initialize` answer names the same build as the
+  server's version.
+- `get_status` always runs in the helper (it reports the helper's socket)
+  and asks `appInfo` again. It adds `helper_build`, and `app_build`,
+  `app_control_protocol` and `mode` (`pipe` or `legacy`; absent while no
+  app answers).
+
+### What changed for agents
+
+Against cda2728 (the last helper that ran every tool itself), on purpose:
+
+- Shorter tool and parameter descriptions; some parameters have none. The
+  52 tools' names and input schemas (property names, types, `required`)
+  are unchanged.
+- Every tool has annotations, `openWorldHint: false`. Read-only (24):
+  every `get_`, `list_`, `search_` and `wait_` tool but
+  `wait_for_bound_port`, `whoami`, `resolve_link`, `services_list` and
+  `bind_session_process`: bookkeeping counts as a read (`wait_for_events`
+  acknowledges events, `get_my_task` marks its task fetched,
+  `bind_session_process` binds only the MCP session), so Codex's approval
+  mode for writes prompts for none of them. `wait_for_bound_port` is not
+  one: with `probe_http` it forwards another Mac's port to This Mac's
+  loopback and sends the service a request.
+  Destructive (10): `cancel_tasks`, `stop_process`, `restart_process`,
+  `close_process`, `send_process_input`, `send_agent_message`,
+  `stop_all_commands`, `restart_all_commands`, `delete_todo`,
+  `delete_todo_comment`. The other 18 add or start something
+  (`destructiveHint: false`); of them `open_project`, `unsubscribe`,
+  `rename_process`, `select_process`, `select_todo`, `update_todo` and
+  `update_todo_comment` are idempotent.
+- `capabilities.tools.listChanged` is true, with `list_changed` as above.
+- `serverInfo.version` is the build, not `0.1.0`; `--version` as above.
+- `get_status`'s build and mode fields. Its `socket_path` and
+  `socket_exists` are left out when the caller has no socket of its own (a
+  `callTool` from another Mac, answered in the app).
+- `whoami.caller_process_id`, the default `process_id`, the default
+  `parent_agent_id` and `subscribe`'s subscriber come from the caller
+  Cherry verified (below), else from the caller's claim. They are what the
+  helper inferred whenever its inference worked; a subscriber whose
+  environment says another tab than its process tree now gets its wake
+  line in its own tab. A call made without an MCP session's context
+  (`CherryMCPTools.call` in tests) takes the environment's
+  `CHERRY_PROCESS_ID` as its claim for `whoami` and the default process
+  too, where only `subscribe` did before.
+- `wait_for_events` and `wait_for_tasks` accept the client's own limit
+  (Client Timeouts, below); their descriptions state it. Defaults are
+  unchanged.
+- CherryMCP no longer lists processes at startup to find its caller (the
+  app identifies it), so it starts faster; only a legacy session still
+  looks, once, at its first call.
+- Arguments travel as JSON: a whole number written with a zero fraction
+  (`5000.0`) is honored, and a string that looks like a data URL is the
+  string the client sent (the MCP SDK reads it as data, so CherryMCP keeps
+  the call's arguments as written for its handler; such an argument was
+  dropped before). Only `CherryMCPTools.call`, which takes the SDK's
+  values (tests), passes it as a base64 data URL of the same bytes,
+  `data:,hi` as `data:text/plain;base64,aGk=`.
+- The composite tools (`whoami`, `bind_session_process`, `spawn_agent`'s
+  parent check, `send_agent_message`) run in the app on one connection.
+- The helper's socket calls run on threads of their own, so parallel
+  waits no longer hold up each other.
+- The server instructions no longer give `wait_for_tasks`' limit (it
+  depends on the client); the rest of them is unchanged.
+- The identity checks below (`socket_not_private`, other accounts refused,
+  no takeover of a live socket) and the tab's `CHERRY_CONTROL_SOCKET`.
+- Launch-time MCP for the Claude Code, Codex and Pi agents Cherry starts
+  (Setup), and Pi's deferred registration, which Cherry runs only on Pi
+  0.99.2 or later.
+- Decoding errors (and requests for the removed notes) are answered before
+  the app's task restore, not after it.
+
 ## Scope And Identity
 
+- The app runs every tool (`callTool`) and identifies its caller itself:
+  on This Mac by its process, the tab whose program is the CherryMCP
+  process or one of its parents, as the process tree was when it
+  connected; on another Mac by its tab's token (below). What the helper
+  says of itself (`CHERRY_PROCESS_ID`, its bound process, its project and
+  directory) only supplies defaults when Cherry verified no caller; tasks,
+  wake lines, `sub_agents` and run ownership use only the verified caller.
 - `whoami` reports the caller process, active/effective project root,
   selected process, and bound process.
 - `CHERRY_PROCESS_ID` identifies the Cherry process that launched the helper.
   `CHERRY_AGENT_ID` is still exported for agent processes as a compatibility
   alias.
+- Every tab's environment names its app: `CHERRY_CONTROL_SOCKET` is the
+  socket that app's server listens on (on This Mac; a tab on another Mac
+  names the forward there), and `CHERRY_CLI` is the `cherry` command-line
+  tool of the Cherry build that started the tab (a device tab's names the
+  install's on that Mac, when it has Cherry MCP and Ghostty's resources
+  there). CherryMCP uses the tab's socket, so a helper of another build (a
+  hand-registered development build) reaches the tab's own app. A tab of a
+  Cherry whose server could not listen has `CHERRY_CONTROL_SOCKET` empty or
+  unset, and never names the socket of a Cherry that Cherry was started
+  from; whatever reads it treats an empty value as unset.
 - `CHERRY_MCP_HELPER` is the absolute path of the CherryMCP of the Cherry
   that started the tab (This Mac's tabs, native and persistent, and tabs on
   another Mac alike), so `"$CHERRY_MCP_HELPER" --call TOOL '{…}'` works from
   any tab's shell whatever its PATH.
 - If an MCP client strips Cherry environment variables when launching the stdio
-  helper, the helper falls back to matching its parent process ancestry against
+  helper, the app still finds the caller from its process; a legacy helper
+  (against an older app) matches its own parent process ancestry against
   Cherry's live process list.
+- The socket is private: the app's socket directory is this account's
+  (0700, `/tmp/cherry-$UID/<instance>/`, the shared `/tmp/cherry-$UID` not
+  writable by others), the socket 0600. CherryMCP connects only to a socket
+  this account owns, in a directory no other account may enter (a link in
+  such a directory is followed: a device's forward can be one), and only
+  while the process answering is this account's; otherwise it fails with
+  `socket_not_private`, saying why. A missing socket is still
+  `cherry_unavailable`. The app answers only this account's processes: a
+  peer of another uid gets `unauthorized`, on This Mac's socket and a
+  device's listener alike.
+- The caller's process and its parents are pinned when it connects, each
+  with when it started (root's processes too, such as a native tab's
+  login(1)), so a caller that exits mid-call never lends its tab to a
+  process that reuses its pid; a caller gone before it was pinned has no
+  verified tab.
+- A Cherry never takes over a live control socket; only a stale one,
+  whose server is gone, is replaced, and a server removes only the socket
+  file it bound itself. A Cherry started from a Cherry tab inherits that
+  tab's `CHERRY_CONTROL_SOCKET` and uses its own default path instead. A
+  second copy of the same Cherry (the same path) runs without a control
+  socket and logs why (`socket_in_use`); the helpers of its tabs reach the
+  first copy, which finds none of its own tabs to be the caller and
+  answers unscoped requests in its active window. To tell a live socket
+  from a stale one, Cherry connects, sends an empty line (an invalid
+  request to every Cherry) and waits for the answer or the close, at most
+  200 ms: a probe that left at once would leave the server a connection it
+  cannot guard against SIGPIPE, which a Cherry from before `MSG_NOSIGNAL`
+  would get answering it. The server writes its answers with
+  `MSG_NOSIGNAL`, so no caller that goes away mid-answer can stop the app.
 - `bind_session_process` binds the current MCP session to a process. Later
   process tools can omit `process_id` unless they pass `process_name`.
 - `select_process` is the process-level UI selection tool. It is intentionally
   explicit; other process tools do not change the visible Cherry selection.
   It selects the tab in the window that has it, which it does not bring
   forward.
-- A request scoped to a project (CherryMCP scopes its requests to
-  `CHERRY_PROJECT_ROOT`) goes to the caller's own window when the project
-  has several windows, else to the active window when it is the project's,
-  else to the project's most recently active window. Listings and counts
-  are that window's; a `process_id` finds its tab in any window. A project
-  command runs in one tab across the project's windows: its `process_name`
-  finds that tab in any of them, starting it (`start_process`,
-  `spawn_process`, `start_all_commands`) uses that tab where it is, and
-  `stop_all_commands` stops the project's commands in every window. The
-  project's to-dos are one list for all its windows; `select_todo` selects
-  in the request's window.
+- A request scoped to a project (a tool call is scoped to its
+  `project_root`, else the caller's `CHERRY_PROJECT_ROOT`, else the
+  innermost open project of its directory) goes to the caller's own window
+  when the project has several windows, else to the active window when it
+  is the project's, else to the project's most recently active window.
+  Listings and counts are that window's; a `process_id` finds its tab in
+  any window. A project command runs in one tab across the project's
+  windows: its `process_name` finds that tab in any of them, starting it
+  (`start_process`, `spawn_process`, `start_all_commands`) uses that tab
+  where it is, and `stop_all_commands` stops the project's commands in
+  every window. The project's to-dos are one list for all its windows;
+  `select_todo` selects in the request's window.
 
 Agent creation stays nested under the bound caller agent when the stdio helper
 is running inside a Cherry agent. If there is no bound caller, new agents are
@@ -107,17 +476,69 @@ same tools as a local agent in that window, bounded to that Mac:
   most 8 MiB, must arrive within 15 s, and at most 16 run at once
   (`request_too_large`, `request_timeout`, `too_many_connections`).
 - `CHERRY_MCP_HELPER` is the CherryMCP of the Cherry build that started the
-  tab, installed on that Mac with `cherry` and `cherry-host`.
+  tab, installed on that Mac with `cherry` and `cherry-host`, and
+  `CHERRY_CLI` that install's `cherry`.
 - When Cherry cannot be reached from there (it quit, the Mac slept, the SSH
   connection is being made again), tools fail with `cherry_unreachable`:
   "Cherry on <this Mac> is not reachable". The forward is made again when
   Cherry reconnects to that Mac.
+- The helper there is the install's build, older than this Cherry until
+  **Update Session Host…**: an install from before control protocol 2
+  sends typed requests, answered as before. A newer one is a pipe: its
+  tool calls run in the app as `callTool` over the forward, each of their
+  requests checked as a typed request is (the token again before each one,
+  the bounds above), and its `get_status` names the forward, never a path
+  of This Mac.
 
-Claude Code, Codex and Pi on that Mac read their MCP servers from their own
-configuration there. **Set Up Cherry MCP on <Mac>…** (the device's menu in
-the project picker, or Settings › Macs) shows these
-commands and runs them there only when you confirm; running it again gives
-the same result, and **Remove** takes the registrations away:
+**Agents Cherry starts there** get Cherry MCP on their command line, as on
+This Mac (Setup), with the install's CherryMCP (`<build>/CherryMCP` there)
+and the same server name (the tab's `CHERRY_MCP_SERVER_NAME`); Codex's
+`env_vars` also names `CHERRY_CONTROL_SOCKET`, `CHERRY_CONTROL_MACHINE`,
+`CHERRY_MCP_TOKEN` and `CHERRY_CLI` when the tab has them (only names: the
+token never goes on the line), and Pi gets the install's copy of Cherry's
+Pi extension, `<build>/cherry-pi-mcp.ts`, which Add Mac… and Update Session
+Host… copy with CherryMCP (Pi passes the token to the server with the rest
+of its environment). Cherry keeps no version of that Mac's CLIs, so the
+agent's line checks its CLI each time it starts:
+
+```sh
+if [ -x '<build>/CherryMCP' ] && cherry_v=$('claude' --version 2>/dev/null </dev/null) && printf '%s\n' "$cherry_v" | /usr/bin/awk '…at least 2.0.0…'; then exec claude … '--mcp-config' '{…}'; else exec claude …; fi
+if [ -x '<build>/CherryMCP' ] && [ -r '<build>/cherry-pi-mcp.ts' ] && cherry_v=$('pi' --version 2>/dev/null </dev/null) && printf '%s\n' "$cherry_v" | /usr/bin/awk '…at least 0.99.2…'; then exec pi … '-e' '<build>/cherry-pi-mcp.ts'; else exec pi …; fi
+```
+
+- Only for a plain `claude`, `codex` or `pi` command (Setup's rules), only
+  in a tab that has the forwarded socket and an install with CherryMCP (and,
+  for Pi, one whose device record has its resources: an install made before
+  Cherry had the extension fails the `-r` check and runs the line as before
+  until Update Session Host…), only under an sh-family login shell there
+  (zsh, bash, sh, ksh, mksh, dash, yash, oksh, loksh; fish, csh, tcsh and
+  others run the line as before), and only while Connect agents Cherry
+  starts is on.
+- Both branches `exec`, so the session's program is the agent itself, as
+  with the plain line: its ports, signals and foreground job. A `claude` or
+  `codex` shell function that the login startup files there define is
+  therefore not used: `exec` runs the executable on PATH. An install whose
+  CherryMCP is missing, an older CLI, or one whose version cannot be read
+  from its standard output (Pi 0.62.0 prints it on standard error), runs
+  the line as before (so a Set Up registration, whose launcher finds
+  another CherryMCP, still serves it), and a missing CLI still exits 127
+  with Cherry's "not on <Mac>'s login PATH" message. An executable written
+  `~user/…` fails the check and runs the line as before.
+- Each launch runs `<cli> --version` there once (for a Node CLI about
+  0.3–1 s before the agent starts); a `--version` that hangs delays the
+  agent, as Cherry sets no time limit there.
+- The log names the flags only, as on This Mac.
+
+Agents started there by hand, and agents Cherry starts there under another
+login shell or with an older CLI, read their MCP servers from their own
+configuration there (a Pi's own `cherry` entry wins over the extension's
+there too). **Set Up Cherry MCP on <Mac>…** (the device's menu in the
+project picker, Settings › Macs, or Connect This Agent to Cherry… for an
+agent tab of that Mac, which says "<agent> on <Mac> gets Cherry MCP at
+launch when <Mac>'s session host is this build or newer (Update Session
+Host…), with an sh-family login shell", for Pi "and Pi 0.99.2 or later")
+shows these commands and runs them there only when you confirm; running it
+again gives the same result, and **Remove** takes the registrations away:
 
 ```bash
 # the launcher: runs $CHERRY_MCP_HELPER (else the newest installed CherryMCP,
@@ -125,8 +546,20 @@ the same result, and **Remove** takes the registrations away:
 ~/Library/Application Support/cherry-host/mcp/cherry-mcp
 claude mcp add --scope user --transport stdio cherry -- "$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp"
 codex mcp add cherry -- "$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp"
-pi mcp add cherry --exposure direct -- "$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp"
+# only with Pi 0.99.2 or later: an older pi takes these words as prompts
+pi mcp add cherry --exposure deferred --description '…' -- "$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp"
 ```
+
+Each run asks `pi --version` there first (check, Set Up and Remove alike)
+and runs `pi mcp add` or `pi mcp remove` only on Pi 0.99.2 or later; any
+other Pi is reported as `pi_skipped` ("Pi <version> has no MCP (needs
+0.99.2 or later)"), not as a failure, and the sheet says "Pi <version>: no
+MCP, update Pi there". A Pi whose `--version` printed no version on its
+standard output is asked again for its standard error (`pi_version_errors`),
+which only names an older one there (Pi 0.62.0 prints its version on
+standard error without a terminal); for one that printed nothing else the
+sheet says "its --version did not answer: no MCP".
+A Mac whose only agent CLI is such a Pi has nothing to set up.
 
 Codex passes an MCP server only a few variables of its own environment, so
 Set Up also adds `env_vars = ["CHERRY_MCP_TOKEN", "CHERRY_CONTROL_SOCKET",
@@ -414,7 +847,8 @@ to their events and ends its turn; Cherry tells it when something happened.
   `matched_line` (at most 300 characters; the process's own output, data
   rather than instructions).
 - `wait_for_events` returns the events after `cursor`, waiting up to
-  `timeout_ms` (default and maximum 50000; 0 returns at once) for the first
+  `timeout_ms` (default 50000, at most 50000 or the client's limit, see
+  Client Timeouts; 0 returns at once) for the first
   one, plus `watching`: each watched process's status now (`working`,
   `idle`, `needs_input`, `permission`, `error`, `unknown`, `running` for
   other processes, `exited`, `disconnected`, `closed`). Passing `cursor`
@@ -514,8 +948,9 @@ Code, Codex and Pi.
   Cherry cannot read keeps its kickoff as typed.
 - `wait_for_tasks` with `run_id` or `task_ids` (default: the caller's own
   open runs), `until` (`any`, the default: a task settled or needs input;
-  `all`: every task settled), `cursor` and `timeout_ms` (at most and by
-  default 50000; 0 returns at once). It returns `events` after `cursor`
+  `all`: every task settled), `cursor` and `timeout_ms` (default 50000, at
+  most 50000 or the client's limit, see Client Timeouts; 0 returns at
+  once). It returns `events` after `cursor`
   (`queued`, `started`, `progress`, `needs_input`, `resumed`,
   `kickoff_retry`, `nudged`, `reported`, `failed`, `no_report`,
   `cancelled`, each with its `seq`), `completed` and `pending` tasks,
@@ -727,24 +1162,92 @@ input to it is checked as above.
 
 ## Client Timeouts
 
-The CherryMCP helper waits 10 s for Cherry's answer by default, longer for
-tools that wait on purpose:
+CherryMCP waits for each tool call's answer as long as the call can take
+(`CherryToolLayer.callTimeout`): 10 s by default, longer for tools that
+wait on purpose:
 
 - `spawn_process`, `spawn_agent` and `send_process_input`: `wait_ms` + 20 s,
   since a persistent tab's session may still be created and an agent's first
   input waits for it to be ready. `spawn_process` with kind `command` waits
   `wait_ms` + 30 s, because it first waits up to 10 s for a restore under way
-  that may bring back the command's tab.
+  that may bring back the command's tab. A new agent (`spawn_agent`, or
+  `spawn_process` with kind `agent`) waits 5 s more, for the check that
+  nests it under its caller.
 - `start_process`, `start_all_commands` and `restart_all_commands`:
   `wait_ms` + 20 s, as they also wait up to 10 s for such a restore.
-- `send_agent_message`: `timeout_ms` (default 40 s) + 5 s, at least 20 s.
+- `send_agent_message`: `timeout_ms` (default 40 s) + 25 s: the message
+  (20 s, as `send_process_input`) and then its wait, in one call.
 - `wait_for_process_idle` and `wait_for_bound_port`: `timeout_ms` + 5 s
   (`wait_for_process_idle` defaults to 50 s).
-- `wait_for_events` and `wait_for_tasks`: `timeout_ms` (at most 50 s) + 5 s.
+- `wait_for_events` and `wait_for_tasks`: `timeout_ms` (default 50 s, at
+  most the client's cap below) + 5 s.
 
-Your MCP client has its own limit per tool call: Codex (`tool_timeout_sec`)
-and Pi default to 60 s, Claude Code to much longer. Waits longer than the
-client's limit lose their answer, so keep `timeout_ms` under it.
+A legacy helper (against an older Cherry) sends each of a tool's typed
+requests on its own connection and waits for each as long as before
+(`CherryToolLayer.clientTimeout`; `send_agent_message`'s `timeout_ms` + 5 s,
+at least 20 s).
+
+Your MCP client has its own limit per tool call, and a wait longer than it
+loses its answer. `wait_for_events` and `wait_for_tasks` therefore accept
+up to what the client allows, by the name its `initialize` gives
+(`CherryToolCatalog.waitCap`), and say so in their descriptions:
+
+| Client | Its limit is known from | `timeout_ms` accepted up to |
+|---|---|---|
+| Claude Code (`claude-code`) | `MCP_TOOL_TIMEOUT` (ms) in CherryMCP's environment, else its long default | that limit less 10 s, between 50 s and 300 s; 300 s when it declares none |
+| Codex (`codex-mcp-client`) | `--client-tool-timeout <seconds>` among CherryMCP's arguments (Cherry passes 300 to the Codex it starts, with `tool_timeout_sec=300`) | that limit less 10 s, between 50 s and 300 s; 50 s when it declares none |
+| Pi (`pi`) | `--client-tool-timeout <seconds>` among CherryMCP's arguments (Cherry's Pi extension passes 300, with `timeout: 300`) | that limit less 10 s, between 50 s and 300 s; 50 s when it declares none |
+| any other (`--call`, unknown) | – | 50 s |
+
+Codex's documentation gives `tool_timeout_sec` a 60 s default, while
+Codex itself has defaulted to 300 s since mid-2026; a Codex you registered
+yourself tells CherryMCP nothing, so it keeps 50 s. A Pi registration
+(`pi mcp add` takes no timeout) allows Pi's default 60 s and tells
+CherryMCP nothing, so it keeps 50 s too, also in the Pi agents Cherry
+starts, which use it instead of the extension's server. Defaults stay 50 s
+for every client (`send_agent_message` 40 s); `wait_for_process_idle` and
+`send_agent_message` keep their 300 s maximum and `wait_for_bound_port`
+its 60 s. Typed requests from an older helper keep 50 s.
+
+## Control Socket
+
+Each connection carries one JSON line each way: a request, then its
+answer, `{"result":…}` or `{"error":{"code":…,"message":…}}` (a caller on
+another Mac wraps its request in `{"cherryAuth":{"token":…,"processID":…},"request":…}`).
+Besides the typed requests (`{"listTerminals":{}}` and the like, which
+older helpers send and which stay as they are), control protocol 2 has
+three:
+
+| Request | Answer |
+|---|---|
+| `{"appInfo":{}}` | `{"result":{"appInfo":{"_0":{"build":"…","bundleIdentifier":"dev.patrick.cherry","controlProtocol":2,"urlScheme":"cherry","version":"…"}}}}` |
+| `{"listTools":{"_0":{"profile":{"client":{"name":"claude-code","version":"2.1.299"}}}}}` | `{"result":{"listTools":{"_0":{"digest":"<16 hex>","instructions":"…","tools":[…]}}}}` |
+| `{"callTool":{"_0":{"name":"list_processes","arguments":{"kind":"agent"},"context":{…}}}}` | `{"result":{"callTool":{"_0":{"isError":false,"structured":{…},"text":"{…}","toolsDigest":"<16 hex>"}}}}` |
+
+- `tools` are MCP tool definitions (`name`, `description`, `inputSchema`,
+  `annotations`), and `digest` the first 16 hex digits of the SHA-256 of
+  their sorted-keys JSON. A profile's `toolTimeoutMilliseconds` is the
+  client's limit when known.
+- A call's `context` says what the caller says of itself:
+  `callerProcessID` (a claim), `boundProcessID`, `bindsSession`,
+  `projectRoot`, `workingDirectory`, `profile` and `interface` (`mcp`,
+  `call`). The app takes its defaults from the caller it verified first.
+- `text` is the tool's result as agents read it (snake_case keys, sorted),
+  `structured` the same payload with camelCase keys (MCP's
+  `structuredContent`), and `bindProcessID` the process an MCP session
+  binds to now (`bind_session_process`, `spawn_agent` with
+  `bind_session`). A tool's error is a result with `isError: true` and
+  `text` `{"error":{…}}`; a top-level `error` means the request itself
+  failed (`invalid_request` from an app that does not know it,
+  `unauthorized`, `request_too_large`, `request_timeout`,
+  `too_many_connections`, `server_unavailable`).
+- The three are never scoped: one inside `scoped` is refused with
+  `invalid_request` (a tool call names its project in its arguments). A
+  caller on another Mac sends them in its envelope too; its listener
+  answers `appInfo` and `listTools` only for a valid token, and checks the
+  token again before each of a call's requests.
+- `appInfo` and `listTools` are answered at once, before the app's task
+  restore; `callTool` waits for it, as every typed request does.
 
 ## Dev Server Readiness
 
@@ -769,6 +1272,70 @@ project-scoped and do not change visible UI selection unless the tool name start
 with `select_`.
 
 ## Testing The Control Server
+
+The MCP tools and the control socket's tool requests have a group of their
+own in `Scripts/test-session-suites unit` (and CI), **ControlTool**
+(`--filter ControlTool`):
+
+- `ControlToolCatalogTests`: the 52 tools in their order, the list encoded
+  byte for byte as `Fixtures/mcp-tools-list.json` (for a client Cherry
+  knows nothing of) and the schemas as `Fixtures/mcp-tool-schemas.json`,
+  the list's byte budget (28 000), the facts agents act on, the
+  annotations, the per-client caps and the descriptions that state them.
+  A deliberate change of a description or an annotation regenerates the
+  list fixture; the schema fixture never changes.
+- `ControlToolLayerTests`: the tool layer over a recording transport
+  (argument parsing, scoping, the composite tools, timeouts, the
+  encoding), and over a socket off the cooperative pool.
+- `ControlToolServerTests`: `appInfo`, `listTools` and `callTool` against
+  a private server, each read compared with the layer over typed requests,
+  the verified caller's defaults, the cap, scoped and device refusals.
+- `ControlToolIdentityTests`: the client's directory, socket and peer
+  checks, the server's directories, a live socket never taken over, the
+  caller chain pinned at accept, and probes and clients that leave at once
+  (no SIGPIPE).
+- `ControlToolPipeTests`: the real CherryMCP (`.build/debug/CherryMCP`)
+  as an MCP client sees it: pipe and legacy, no app, an app replaced by an
+  older one, `list_changed`, `--version`, `--call`'s exits.
+- `ControlToolLaunchTests`: launch-time MCP on This Mac (detection, the
+  arguments, quoting under sh, zsh, bash and fish, the version probe with
+  stand-in CLIs, the switch, launches native, persistent and restored, and
+  Pi's: its extension, its version gate, and the log of a Pi registration
+  Pi prefers).
+- `ControlToolPiExtensionTests`: Cherry's Pi extension, the bundle's own
+  copy run in JavaScriptCore against a stand-in for Pi's extension API: the
+  server it registers, and nothing (and no exception) without Pi's MCP, a
+  usable helper or name, or a `process`.
+- `ControlToolConnectTests`: Connect Agents to Cherry… and Connect This
+  Agent with stand-in claude, codex and pi in a private HOME (Claude Code's
+  settings file and its rules, `codex mcp get --json`'s answers, an old Pi
+  asked only its version): what each row says, that nothing but
+  `--version` and `codex mcp get` runs before a confirmed plan, Claude
+  Code's remove-then-add, Connect All's choice, the confirmation's texts,
+  Restart Tab, and the Omni bar's rows.
+
+Tests never use the default socket (every client gets its harness's).
+The ControlTool and device tests inject their environment
+(`CherryMCPSession(environment:)`, `SocketToolTransport(socketURL:)`) and
+never `setenv` it; the older `mcp` tests in CherryTests.swift still set
+the process environment around `CherryMCPTools.call`, which reads it.
+Tests never get launch-time flags or probe a CLI unless they build their
+own `AgentCLIVersions` (a test workspace's policy has no `agentMCPLaunch`,
+a test's `RemoteDeviceStore` connects no agents), find CLIs only on the
+PATH they give (no fallback directories, which include the real
+`/opt/homebrew/bin`), and never run a real `claude`, `codex` or `pi`.
+`SettingsWindowMCPInstallTests` (SettingsWindow group) has Pi's row and
+its gate: a stand-in old Pi that logs every call but `--version` is never
+asked anything else, from This Mac or from Set Up on another Mac
+(`RemoteDeviceMCPSetup…`). The device twins are in the RemoteDevice group:
+`RemoteDeviceMCPCallToolTests` (every boundary case of
+`RemoteDeviceMCPTests` through `callTool`) and
+`RemoteDeviceMCPLaunchTests` (the device line under the real shells, Pi's
+with its extension, its version check, and what never goes on the line).
+The older MCP suites (`CherryTests`' `mcp`, `controlServer` and
+`cherryControl` tests, `ControlAgentTask*`, `ControlAgentWait`,
+`ControlAgentMonitor`, `ControlActivity`, `ControlProjectWindows`,
+`CherryStdioTransportTests`) run locally with `--filter`.
 
 `Scripts/test-mcp-concurrency` checks that the control server stays responsive
 while service detection runs. It builds Cherry with

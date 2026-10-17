@@ -18,9 +18,13 @@ import Security
 //   CherryMCP sends with every request. The device's listener refuses a
 //   request without a valid one; This Mac's socket keeps identifying its
 //   callers by process.
-// - Setup: Claude Code and Codex on that Mac read their MCP servers from their
-//   own configuration there; "Set Up Cherry MCP on <Mac>…" registers a
-//   stable launcher there, only when the user confirms (`RemoteMCPSetup`).
+// - Setup: the Claude Code, Codex and Pi agents Cherry starts there get the
+//   install's CherryMCP on their command line (Pi through the install's
+//   copy of Cherry's Pi extension), gated on their version there
+//   (`RemoteAgentMCPLaunch`); agents started there by hand read their MCP
+//   servers from their own configuration, where "Set Up Cherry MCP on
+//   <Mac>…" registers a stable launcher, only when the user confirms
+//   (`RemoteMCPSetup`).
 
 // MARK: - Tokens
 
@@ -255,12 +259,32 @@ enum RemoteMCPPaths {
 
     /// CherryMCP's name in an install (next to cherry and cherry-host).
     static let helperName = "CherryMCP"
+    /// Cherry's Pi extension's name in an install, next to its CherryMCP.
+    static let piExtensionName = PiMCPExtension.fileName
+    /// The command-line tool's name in an install.
+    static let cliName = "cherry"
 
     /// The CherryMCP of the install a device's `remoteHostPath` names,
     /// under its home; nil when that is not one of ours.
     static func helperPath(remoteHostPath: String?, homeDirectory: String?) -> String? {
         RemoteLaunchSpec.Resources.of(remoteHostPath: remoteHostPath, homeDirectory: homeDirectory)
             .map { "\($0.root)/\(helperName)" }
+    }
+
+    /// The `cherry` of the install a device's `remoteHostPath` names (beside
+    /// its CherryMCP), under its home; nil when that is not one of ours.
+    static func cliPath(remoteHostPath: String?, homeDirectory: String?) -> String? {
+        RemoteLaunchSpec.Resources.of(remoteHostPath: remoteHostPath, homeDirectory: homeDirectory)
+            .map { "\($0.root)/\(cliName)" }
+    }
+
+    /// Cherry's Pi extension in the install a device's `remoteHostPath`
+    /// names (beside its CherryMCP), under its home; nil when that is not
+    /// one of ours. An install made before Cherry had it has none, which
+    /// its Pi agents' line checks (`RemoteAgentMCPLaunch`).
+    static func piExtensionPath(remoteHostPath: String?, homeDirectory: String?) -> String? {
+        RemoteLaunchSpec.Resources.of(remoteHostPath: remoteHostPath, homeDirectory: homeDirectory)
+            .map { "\($0.root)/\(piExtensionName)" }
     }
 }
 
@@ -271,12 +295,22 @@ struct RemoteMCPLaunch: Equatable, Sendable {
     var socketPath: String
     /// The install's CherryMCP there, when it has one.
     var helperPath: String?
+    /// The install's `cherry` there, the tab's `CHERRY_CLI` (never This
+    /// Mac's), when it has one.
+    var cliPath: String? = nil
+    /// Cherry's Pi extension in the install there, which its Pi agents get
+    /// with `-e` (`RemoteAgentMCPLaunch`), when it has the resources.
+    var piExtensionPath: String? = nil
+    /// The name Cherry's server has in the agents there (the identity's
+    /// scheme), the tab's `CHERRY_MCP_SERVER_NAME` beside its helper.
+    var serverName: String = CherryAppIdentity.current.urlScheme
     /// This Mac's name, for "Cherry on <Mac> is not reachable".
     var controlMachine: String
     var tokens: RemoteMCPTokens
 
     static func == (lhs: RemoteMCPLaunch, rhs: RemoteMCPLaunch) -> Bool {
         lhs.deviceID == rhs.deviceID && lhs.socketPath == rhs.socketPath && lhs.helperPath == rhs.helperPath
+            && lhs.cliPath == rhs.cliPath && lhs.piExtensionPath == rhs.piExtensionPath && lhs.serverName == rhs.serverName
             && lhs.controlMachine == rhs.controlMachine && lhs.tokens === rhs.tokens
     }
 
@@ -290,7 +324,11 @@ struct RemoteMCPLaunch: Equatable, Sendable {
             // Built for each Create (a start or restart): a new generation.
             environment[CherryControl.mcpTokenEnvironmentKey] = tokens.newGeneration(tabID: tabID, deviceID: deviceID)
         }
-        if let helperPath { environment[CherryControl.mcpHelperEnvironmentKey] = helperPath }
+        if let helperPath {
+            environment[CherryControl.mcpHelperEnvironmentKey] = helperPath
+            environment[CherryControl.mcpServerNameEnvironmentKey] = serverName
+        }
+        if let cliPath { environment[CherryControl.cliEnvironmentKey] = cliPath }
         return environment
     }
 

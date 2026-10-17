@@ -36,10 +36,15 @@ public enum CherryControl {
             return URL(fileURLWithPath: socketPath)
         }
 
-        let uid = getuid()
-        return URL(fileURLWithPath: "/tmp/cherry-\(uid)", isDirectory: true)
+        return sharedSocketRoot
             .appendingPathComponent(socketNamespace(environment: environment, executableURL: executableURL), isDirectory: true)
             .appendingPathComponent("control.sock", isDirectory: false)
+    }
+
+    /// The directory every derived socket path's namespace is in,
+    /// `/tmp/cherry-<uid>`: one per user, shared by the copies of Cherry.
+    public static var sharedSocketRoot: URL {
+        URL(fileURLWithPath: "/tmp/cherry-\(getuid())", isDirectory: true)
     }
 
     public static func socketNamespace(
@@ -173,6 +178,13 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case updateTodoComment(UpdateTodoCommentRequest)
     case deleteTodoComment(DeleteTodoCommentRequest)
     case clearOutput(TerminalIDRequest)
+    /// Control protocol 2 (`CherryToolProtocol.swift`): the app that
+    /// answers, its tools for a client, and one MCP tool run in the app as
+    /// its caller. Never inside `scoped`: a tool call names its project in
+    /// its arguments.
+    case appInfo
+    case listTools(ListToolsRequest)
+    case callTool(CallToolRequest)
 }
 
 public struct ScopedControlRequest: Codable, Equatable, Sendable {
@@ -672,6 +684,10 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case updateTodoComment(TodoDetailResult)
     case deleteTodoComment(TodoDetailResult)
     case clearOutput(ClearOutputResult)
+    /// Control protocol 2 (`CherryToolProtocol.swift`).
+    case appInfo(AppInfoResult)
+    case listTools(ListToolsResult)
+    case callTool(CallToolResult)
 }
 
 public struct CherryControlError: Codable, Equatable, Error, Sendable {

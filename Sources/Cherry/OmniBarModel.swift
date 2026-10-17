@@ -97,6 +97,8 @@ enum OmniMenuCommand: String, CaseIterable {
     case endBackgroundSessions
     case persistentSessions
     case toggleSidebar
+    case connectAgents
+    case connectThisAgent
     // Ids of the command palette's commands, kept so their usage carries
     // over (`OmniFrecencyStore`).
     case toggleAppearance
@@ -491,6 +493,13 @@ struct OmniAgent: Equatable {
     var commandLine: String
 }
 
+/// The selected tab's agent, when Cherry connects its CLI (Connect This
+/// Agent to Cherry…).
+struct OmniSelectedAgent: Equatable {
+    var harness: MCPHarness
+    var productName: String
+}
+
 /// What the window the bar is open in can do now (the commands offered).
 struct OmniWindowContext: Equatable {
     var hasSelectedTab = false
@@ -504,6 +513,9 @@ struct OmniWindowContext: Equatable {
     var isSidebarHidden = false
     var detachTitle = "Detach Tab"
     var closeTitle = "Close Tab"
+    /// The selected tab is a Claude Code, Codex or Pi agent
+    /// (`ConnectThisAgent.harness`).
+    var selectedAgent: OmniSelectedAgent?
 }
 
 /// Everything the bar lists, gathered from cached state (never by
@@ -926,6 +938,18 @@ enum OmniProviders {
         }
         if sources.canModifyDevices {
             items.append(command(.addMac, title: "Add Mac…", symbol: "desktopcomputer"))
+        }
+        items.append(command(
+            .connectAgents, title: "Connect Agents to Cherry…", symbol: "link",
+            keywords: ["mcp", "claude", "codex", "pi", "register"]
+        ))
+        if let agent = window.selectedAgent {
+            var item = command(
+                .connectThisAgent, title: "Connect This Agent to Cherry…", symbol: "link",
+                keywords: ["mcp", agent.harness.executableName, "register"]
+            )
+            item.detail = agent.productName
+            items.append(item)
         }
         items.append(command(
             .toggleSidebar, title: window.isSidebarHidden ? "Show Sidebar" : "Hide Sidebar",

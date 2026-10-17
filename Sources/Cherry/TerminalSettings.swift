@@ -188,6 +188,11 @@ struct SessionBackendPolicy {
     /// test's workspace, which no window shows) takes the grid the tab has
     /// at once.
     var windowGridWait: TerminalWindowGridWait?
+    /// Cherry MCP on the command line of the agents This Mac's tabs start
+    /// (`AgentMCPLaunch`). Only the app's This Mac windows have it; nil (a
+    /// test's workspace, `.native`, a device's window) starts every agent
+    /// as its command says, and asks no CLI its version.
+    var agentMCPLaunch: AgentMCPLaunchContext?
 
     static let native = SessionBackendPolicy(settings: { .native })
 
@@ -197,7 +202,8 @@ struct SessionBackendPolicy {
         rememberLocalSessionsOnQuit: { TerminalSettings.shared.localSessionsOnQuit = $0 },
         sessionDetached: { ProjectWindowRegistry.shared.backgroundSessionsNotice?.noteTold([$0]) },
         hostReconnects: .shared,
-        windowGridWait: .standard
+        windowGridWait: .standard,
+        agentMCPLaunch: .app
     )
 
     /// Whether new local tabs should be persistent sessions (the setting;

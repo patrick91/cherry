@@ -679,11 +679,7 @@ struct HostedAdapterProcess: Equatable, Sendable {
     /// When `pid` started, in the adapter's format; nil when it does not
     /// exist.
     static func startIdentity(of pid: Int32) -> String? {
-        guard pid > 0 else { return nil }
-        var info = proc_bsdinfo()
-        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
-        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
-        return "\(info.pbi_start_tvsec)." + String(format: "%06llu", UInt64(info.pbi_start_tvusec))
+        UnixIO.processStartIdentity(pid)
     }
 
     /// Whether `pid` is still the process that wrote the status: its start
@@ -1744,11 +1740,14 @@ final class HostedSessionLoginEnvironment: @unchecked Sendable {
     /// `HostedLaunchSpec` drops.
     private static let cherryTabKeys = CherryTabEnvironment.keys
 
-    /// Values that describe one terminal or one Cherry tab, never the user.
+    /// Values that describe one terminal or one Cherry tab, never the user:
+    /// also the control socket of the Cherry this one may have been started
+    /// from, which is not one of `CherryTabEnvironment.keys`.
     private static func isTabSpecific(_ key: String) -> Bool {
         let terminalKeys: Set<String> = [
             "PWD", "OLDPWD", "SHLVL", "_", "TERM", "COLORTERM", "TERM_PROGRAM",
-            "TERM_PROGRAM_VERSION", "TERM_SESSION_ID", "LINES", "COLUMNS", "ZDOTDIR"
+            "TERM_PROGRAM_VERSION", "TERM_SESSION_ID", "LINES", "COLUMNS", "ZDOTDIR",
+            CherryControl.socketEnvironmentKey
         ]
         return terminalKeys.contains(key) || cherryTabKeys.contains(key) || key.hasPrefix("GHOSTTY_")
     }

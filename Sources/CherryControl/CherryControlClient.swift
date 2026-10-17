@@ -118,15 +118,36 @@ public struct CherryControlClient: Sendable {
 
     private func connect(fileDescriptor fd: Int32) throws {
         let path = socketURL.path
+        let unavailable = CherryControlError(
+            code: "cherry_unavailable",
+            message: "Could not connect to Cherry at \(path). Make sure the Cherry app is running."
+        )
+        // Only a socket of this user's, in a directory no one else may
+        // enter (`UnixIO.verifyPrivateDirectory`): an answer from another
+        // account's socket would steer the agent. A missing one is Cherry
+        // not running, as before; one that is not private is never that
+        // (`socket_not_private`, not `cherry_unreachable`).
+        do {
+            try UnixIO.verifyPrivateDirectory(socketURL.deletingLastPathComponent().path)
+        } catch is POSIXError {
+            throw unavailable
+        }
+        try UnixIO.verifySocket(path)
+
         guard let result = UnixIO.withSocketAddress(path: path, { Darwin.connect(fd, $0, $1) }) else {
             throw CherryControlError(code: "socket_path_too_long", message: "Cherry control socket path is too long: \(path)")
         }
 
         guard result == 0 else {
-            throw CherryControlError(
-                code: "cherry_unavailable",
-                message: "Could not connect to Cherry at \(path). Make sure the Cherry app is running."
-            )
+            throw unavailable
+        }
+
+        // The process that answers must be this user's too.
+        guard let peer = UnixIO.peerUserID(fileDescriptor: fd) else {
+            throw UnixIO.socketNotPrivate("the process listening on \(path) could not be identified")
+        }
+        guard peer == geteuid() else {
+            throw UnixIO.socketNotPrivate("the process listening on \(path) is uid \(peer), not this user")
         }
     }
 

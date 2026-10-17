@@ -1,6 +1,7 @@
 import CherryControl
 import Darwin
 import Foundation
+import os
 
 private let mcpControlDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_MCP"] == "1"
 
@@ -28,10 +29,13 @@ final class CherryControlServer: @unchecked Sendable {
     private let serviceDetector: any ServiceDetecting
     /// Services of tabs of other Macs (docs/specs/remote-devices.md, phase 4a).
     private let remoteServiceDetector: DeviceServiceDetector
-    private let socketURL: URL
+    let socketURL: URL
     private let queue = DispatchQueue(label: "Cherry.ControlServer", qos: .userInitiated)
-    private var listenFileDescriptor: Int32 = -1
     private var acceptSource: DispatchSourceRead?
+    /// The socket file this server bound (nil while it does not listen):
+    /// only that file is ever removed, never another server's that took
+    /// the path.
+    private var boundSocket: UnixIO.FileIdentity?
 
     /// A server for one window and its stores (tests).
     @MainActor
@@ -39,7 +43,7 @@ final class CherryControlServer: @unchecked Sendable {
         workspace: TerminalWorkspace,
         todoStore: ProjectTodoStore? = nil,
         chromeState: ProjectWindowChromeState? = nil,
-        socketURL: URL = CherryControl.socketURL,
+        socketURL: URL = CherryControlServer.appSocketURL(),
         agentSettings: AgentSettings = .shared,
         serviceDetector: any ServiceDetecting = MacOSServiceDetector(),
         remoteServiceDetector: DeviceServiceDetector? = nil,
@@ -102,7 +106,7 @@ final class CherryControlServer: @unchecked Sendable {
             ProjectWindowRegistry.shared.chromeState(for: $0)
         },
         openProjectProvider: @escaping @MainActor (String) -> Void = { _ in },
-        socketURL: URL = CherryControl.socketURL,
+        socketURL: URL = CherryControlServer.appSocketURL(),
         agentSettings: AgentSettings = .shared,
         serviceDetector: any ServiceDetecting = MacOSServiceDetector(),
         remoteServiceDetector: DeviceServiceDetector? = nil,
@@ -132,6 +136,36 @@ final class CherryControlServer: @unchecked Sendable {
         stop()
     }
 
+    /// The socket the app's server binds: `CHERRY_CONTROL_SOCKET` when it
+    /// names a path no server answers (a private run's fresh path), else
+    /// the derived namespace path (`CherryControl.socketURL` with that
+    /// variable ignored). A Cherry started from a Cherry tab inherits that
+    /// tab's live socket and never takes it over. The probe runs only while
+    /// the variable is set, so a normal launch pays nothing.
+    nonisolated static func appSocketURL(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        executableURL: URL? = Bundle.main.executableURL
+    ) -> URL {
+        var derivedEnvironment = environment
+        derivedEnvironment[CherryControl.socketEnvironmentKey] = nil
+        let derived = CherryControl.socketURL(environment: derivedEnvironment, executableURL: executableURL)
+        guard let named = environment[CherryControl.socketEnvironmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        else { return derived }
+        return UnixIO.hasListener(atPath: named) ? derived : URL(fileURLWithPath: named)
+    }
+
+    /// The path the app's server binds, which its tabs name: `CherryApp.init`
+    /// sets it once from `appSocketURL()`, before any tab exists; `start()`
+    /// sets it back to nil when the server does not listen there. Nil in
+    /// tests.
+    static var appSocketPath: String? {
+        get { appSocketPathStorage.withLock { $0 } }
+        set { appSocketPathStorage.withLock { $0 = newValue } }
+    }
+
+    private static let appSocketPathStorage = OSAllocatedUnfairLock<String?>(initialState: nil)
+
     func start() {
         guard acceptSource == nil else { return }
 
@@ -139,7 +173,11 @@ final class CherryControlServer: @unchecked Sendable {
             try prepareSocketDirectory()
             try bindAndListen()
         } catch {
-            fputs("[control] failed to start: \(error.localizedDescription)\n", stderr)
+            let message = (error as? CherryControlError)?.message ?? error.localizedDescription
+            fputs("[control] failed to start: \(message)\n", stderr)
+            SessionLog.error("control socket: \(message)")
+            // Tabs name only a socket this app answers.
+            if Self.appSocketPath == socketURL.path { Self.appSocketPath = nil }
         }
     }
 
@@ -154,13 +192,17 @@ final class CherryControlServer: @unchecked Sendable {
             monitors.stopSampler()
             tasks.pruneTask?.cancel()
         }
+        // The source's cancel handler closes the listening descriptor
+        // (closing it before then would close whatever reused its number).
         acceptSource?.cancel()
         acceptSource = nil
-        if listenFileDescriptor >= 0 {
-            close(listenFileDescriptor)
-            listenFileDescriptor = -1
+        // Only the socket this server bound: one that did not listen (another
+        // copy of Cherry listens there, or a second server on the path) must
+        // leave the live server's socket in place.
+        if let boundSocket {
+            UnixIO.removeFile(atPath: socketURL.path, ifStill: boundSocket)
+            self.boundSocket = nil
         }
-        try? FileManager.default.removeItem(at: socketURL)
         for deviceID in listenerLock.withLock({ Array(deviceListeners.keys) }) {
             removeDeviceListener(deviceID: deviceID)
         }
@@ -182,6 +224,8 @@ final class CherryControlServer: @unchecked Sendable {
     private struct DeviceListener {
         var url: URL
         var source: DispatchSourceRead
+        /// The socket file it bound, the only one it removes.
+        var socket: UnixIO.FileIdentity?
     }
 
     private let listenerLock = NSLock()
@@ -247,35 +291,99 @@ final class CherryControlServer: @unchecked Sendable {
         if let existing = listenerLock.withLock({ deviceListeners[deviceID] }) { return existing.url }
         try prepareSocketDirectory(removingSocket: false)
         let url = deviceListenerURL(deviceID: deviceID)
-        try? FileManager.default.removeItem(at: url)
+        // Only a stale socket of this user's is replaced: another copy's
+        // live listener keeps its device's forward.
+        try Self.removeStaleSocket(at: url.path)
         let fd = try Self.bindListeningSocket(path: url.path)
         let source = makeAcceptSource(fileDescriptor: fd, origin: .device(deviceID))
-        listenerLock.withLock { deviceListeners[deviceID] = DeviceListener(url: url, source: source) }
+        let listener = DeviceListener(url: url, source: source, socket: UnixIO.FileIdentity(path: url.path))
+        listenerLock.withLock { deviceListeners[deviceID] = listener }
         source.resume()
         return url
     }
 
-    /// Stops listening for `deviceID`'s callers and removes its socket.
+    /// Stops listening for `deviceID`'s callers and removes its socket
+    /// (only while its path is still the socket it bound).
     func removeDeviceListener(deviceID: UUID) {
         guard let listener = listenerLock.withLock({ deviceListeners.removeValue(forKey: deviceID) }) else { return }
         listener.source.cancel()
-        try? FileManager.default.removeItem(at: listener.url)
+        if let socket = listener.socket {
+            UnixIO.removeFile(atPath: listener.url.path, ifStill: socket)
+        }
     }
 
+    /// The directory a derived socket path's namespaces share
+    /// (`CherryControl.sharedSocketRoot`), when `socketURL` is one; nil for
+    /// a path named explicitly (`CHERRY_CONTROL_SOCKET`, tests).
+    nonisolated static func sharedSocketRoot(of socketURL: URL) -> URL? {
+        let root = CherryControl.sharedSocketRoot
+        let namespace = socketURL.deletingLastPathComponent()
+        return namespace.deletingLastPathComponent().path == root.path ? root : nil
+    }
+
+    /// Makes the socket's directory, private (0700), and checks it is this
+    /// user's own; with `removingSocket`, replaces a stale socket file. A
+    /// directory of another owner, or a link, makes `start()` log and not
+    /// listen; so does a live socket at the path (another copy of Cherry
+    /// listens there: it is never taken over).
     private func prepareSocketDirectory(removingSocket: Bool = true) throws {
         let directoryURL = socketURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        chmod(directoryURL.path, S_IRWXU)
-        if removingSocket { try? FileManager.default.removeItem(at: socketURL) }
+        // The derived path's shared level too: another account can create
+        // that predictable directory in /tmp first, and as its owner rename
+        // the namespace directory away under this server.
+        if let root = Self.sharedSocketRoot(of: socketURL) {
+            if mkdir(root.path, S_IRWXU) != 0, errno != EEXIST {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            try Self.closeDirectory(root.path, forbiddenModeBits: S_IWGRP | S_IWOTH)
+        }
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try Self.closeDirectory(directoryURL.path)
+        if removingSocket { try Self.removeStaleSocket(at: socketURL.path) }
+    }
+
+    /// Throws `socket_not_private` unless `path` is a real directory of this
+    /// user's with none of `forbiddenModeBits` set (`UnixIO.directoryProblem`).
+    /// One of this user's with some of them set has them cleared first,
+    /// and is checked again (a failed chmod leaves it refused).
+    private nonisolated static func closeDirectory(_ path: String, forbiddenModeBits: mode_t = 0o077) throws {
+        var status = stat()
+        guard lstat(path, &status) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        if status.st_mode & S_IFMT == S_IFDIR, status.st_uid == geteuid(), status.st_mode & forbiddenModeBits != 0 {
+            _ = chmod(path, status.st_mode & 0o7777 & ~forbiddenModeBits)
+            guard lstat(path, &status) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        }
+        if let problem = UnixIO.directoryProblem(path, status: status, forbiddenModeBits: forbiddenModeBits) {
+            throw UnixIO.socketNotPrivate(problem)
+        }
+    }
+
+    /// Removes the socket file at `path` when nothing listens there; throws
+    /// when a server does (another copy of Cherry, never taken over) or the
+    /// file is not a socket of this user's (never removed).
+    private nonisolated static func removeStaleSocket(at path: String) throws {
+        var status = stat()
+        guard lstat(path, &status) == 0 else { return }
+        guard status.st_mode & S_IFMT == S_IFSOCK, status.st_uid == geteuid() else {
+            throw UnixIO.socketNotPrivate("\(path) is not a socket owned by this user")
+        }
+        guard !UnixIO.hasListener(atPath: path) else {
+            throw CherryControlError(
+                code: "socket_in_use",
+                message: "Another Cherry is listening on \(path); this one has no control socket"
+            )
+        }
+        unlink(path)
     }
 
     private func bindAndListen() throws {
         let fd = try Self.bindListeningSocket(path: socketURL.path)
-        listenFileDescriptor = fd
-        let source = makeAcceptSource(fileDescriptor: fd, origin: .thisMac, closesOnCancel: false)
-        source.setCancelHandler {
-            close(fd)
-        }
+        boundSocket = UnixIO.FileIdentity(path: socketURL.path)
+        let source = makeAcceptSource(fileDescriptor: fd, origin: .thisMac)
         acceptSource = source
         source.resume()
     }
@@ -312,15 +420,13 @@ final class CherryControlServer: @unchecked Sendable {
         return fd
     }
 
-    private func makeAcceptSource(fileDescriptor fd: Int32, origin: CallerOrigin, closesOnCancel: Bool = true) -> DispatchSourceRead {
+    private func makeAcceptSource(fileDescriptor fd: Int32, origin: CallerOrigin) -> DispatchSourceRead {
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in
             self?.acceptAvailableConnections(on: fd, origin: origin)
         }
-        if closesOnCancel {
-            source.setCancelHandler {
-                close(fd)
-            }
+        source.setCancelHandler {
+            close(fd)
         }
         return source
     }
@@ -373,12 +479,24 @@ final class CherryControlServer: @unchecked Sendable {
                 return
             }
 
-            // Peer PID of the connecting process (e.g. an agent's MCP server), used
-            // to route unscoped requests to the caller's own workspace when the
-            // agent CLI stripped CHERRY_PROJECT_ROOT from the MCP env. Never
-            // for a device's listener: its peer is This Mac's ssh, and its
-            // callers are another Mac's processes.
-            let peerPID = origin == .thisMac ? Self.peerProcessID(fileDescriptor: clientFD) : nil
+            // Only this account's processes, whichever socket they reached
+            // (a device's forward is This Mac's ssh, this account's too).
+            guard UnixIO.peerUserID(fileDescriptor: clientFD) == geteuid() else {
+                Self.writeResponse(.init(error: Self.otherAccountRefused), to: clientFD)
+                finish()
+                return
+            }
+
+            // The connecting process (e.g. an agent's MCP server) and its
+            // parents, pinned now with when each started: the caller's tab is
+            // the one whose program is among them (`verifiedCallerSession`,
+            // `callerWorkspace`), even once the caller exited and its pid went
+            // to another process. Never for a device's listener: its peer is
+            // This Mac's ssh, and its callers are another Mac's processes.
+            let callerChain = origin == .thisMac
+                ? Self.peerProcessID(fileDescriptor: clientFD).flatMap(CallerProcessChain.pinned(peer:))
+                : nil
+            self.acceptedCallerChainForTesting?(callerChain)
 
             let requestData: Data
             do {
@@ -392,7 +510,7 @@ final class CherryControlServer: @unchecked Sendable {
             Task { @MainActor [weak self] in
                 let response: CherryControlResponse
                 if let self {
-                    response = await self.handleRequestData(requestData, peerPID: peerPID, origin: origin)
+                    response = await self.handleRequestData(requestData, callerChain: callerChain, origin: origin)
                 } else {
                     response = .init(error: .init(code: "server_unavailable", message: "Cherry control server is unavailable."))
                 }
@@ -408,12 +526,26 @@ final class CherryControlServer: @unchecked Sendable {
         }
     }
 
+    /// A request of `peerPID`'s, its chain pinned now (tests, which hand
+    /// requests in without a connection).
     @MainActor
     func handleRequestData(_ data: Data, peerPID: Int32?, origin: CallerOrigin = .thisMac) async -> CherryControlResponse {
-        // The last run's tasks are read back first (at launch).
-        if let restoring = tasks.restoreTask { await restoring.value }
+        await handleRequestData(data, callerChain: peerPID.flatMap(CallerProcessChain.pinned(peer:)), origin: origin)
+    }
+
+    /// A request, as `callerChain` (This Mac's, pinned when it connected)
+    /// or a device's token makes it.
+    @MainActor
+    func handleRequestData(_ data: Data, callerChain: CallerProcessChain?, origin: CallerOrigin = .thisMac) async -> CherryControlResponse {
         do {
             let (credentials, request) = try CherryControlEnvelope.decode(data)
+            // appInfo and listTools never wait for the task restore below
+            // (`CherryControlTools.swift`).
+            if let answer = try toolRequestAnsweredAtOnce(request, credentials: credentials, origin: origin) {
+                return answer
+            }
+            // The last run's tasks are read back first (at launch).
+            if let restoring = tasks.restoreTask { await restoring.value }
             if let credentials {
                 let caller = try remoteCaller(credentials, origin: origin)
                 // Everything this request reaches is checked against the
@@ -421,18 +553,32 @@ final class CherryControlServer: @unchecked Sendable {
                 // point), however it was mapped.
                 return try await Self.$remoteDevice.withValue(caller.deviceID) {
                     try await Self.$remoteCallerSessionID.withValue(caller.session.id) {
-                        try await handle(request, remoteCaller: caller)
+                        guard case .callTool(let call) = request else {
+                            return try await handle(request, remoteCaller: caller)
+                        }
+                        // Each of a tool's requests is checked as when each
+                        // was a connection of its own: the token again (a tab
+                        // closed meanwhile is refused the rest), then the
+                        // device's choke point.
+                        return .init(result: .callTool(await handleToolCall(call) { request in
+                            let caller = try self.remoteCaller(credentials, origin: origin)
+                            return try await self.handle(request, remoteCaller: caller)
+                        }))
                     }
                 }
             }
-            guard origin == .thisMac else {
-                throw CherryControlError(
-                    code: "unauthorized",
-                    message: "This request came from another Mac without a Cherry MCP token. Run CherryMCP in a Cherry tab of that Mac."
-                )
-            }
-            return try await Self.$callerPeerPID.withValue(peerPID) {
-                try await handle(request, peerPID: peerPID)
+            guard origin == .thisMac else { throw Self.missingDeviceToken }
+            return try await Self.$callerProcessChain.withValue(callerChain) {
+                try await Self.$callerPeerPID.withValue(callerChain?.pids.first) {
+                    guard case .callTool(let call) = request else {
+                        return try await handle(request, callerChain: callerChain)
+                    }
+                    // Each of a tool's requests goes where the caller's own
+                    // typed request would: to its window, found from its process.
+                    return .init(result: .callTool(await handleToolCall(call) { request in
+                        try await self.handle(request, callerChain: callerChain)
+                    }))
+                }
             }
         } catch let error as CherryControlError {
             return .init(error: error)
@@ -441,6 +587,19 @@ final class CherryControlServer: @unchecked Sendable {
                 ?? .init(code: "invalid_request", message: error.localizedDescription))
         }
     }
+
+    /// A connection from a process of another account (or one whose
+    /// account cannot be read): refused before its request is read.
+    nonisolated static let otherAccountRefused = CherryControlError(
+        code: "unauthorized",
+        message: "Cherry's control socket answers only its own account's processes; this connection came from another account."
+    )
+
+    /// A request on a device's listener without a token.
+    static let missingDeviceToken = CherryControlError(
+        code: "unauthorized",
+        message: "This request came from another Mac without a Cherry MCP token. Run CherryMCP in a Cherry tab of that Mac."
+    )
 
     /// The requests of the notes Cherry no longer has, as a CherryMCP from
     /// before their removal still sends them (an agent's helper an update
@@ -474,17 +633,18 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func handle(_ request: CherryControlRequest, peerPID: Int32?) async throws -> CherryControlResponse {
+    private func handle(_ request: CherryControlRequest, callerChain: CallerProcessChain?) async throws -> CherryControlResponse {
         if case .scoped(let scopedRequest) = request {
             let workspace = try scopedWorkspace(projectRoot: scopedRequest.projectRoot)
             return try await handleUnscoped(scopedRequest.request, workspace: workspace, isProjectScoped: true)
         }
 
         // An unscoped request: prefer the caller's OWN workspace, resolved from the
-        // connecting process's ancestry, so an MCP whose agent CLI stripped
-        // CHERRY_PROJECT_ROOT still routes to its own project window instead of the
-        // frontmost one. Fall back to the active workspace.
-        if let callerWorkspace = callerWorkspace(peerPID: peerPID) {
+        // connecting process's ancestry (pinned when it connected), so an MCP
+        // whose agent CLI stripped CHERRY_PROJECT_ROOT still routes to its own
+        // project window instead of the frontmost one. Fall back to the active
+        // workspace.
+        if let callerWorkspace = callerWorkspace(callerChain: callerChain) {
             return try await handleUnscoped(request, workspace: callerWorkspace, isProjectScoped: true)
         }
 
@@ -507,7 +667,7 @@ final class CherryControlServer: @unchecked Sendable {
     /// tab's. Through a device's listener the device is the listener's; on
     /// This Mac's socket (never used by CherryMCP there) it is the tab's.
     @MainActor
-    private func remoteCaller(_ credentials: CherryControlCredentials, origin: CallerOrigin) throws -> RemoteCaller {
+    func remoteCaller(_ credentials: CherryControlCredentials, origin: CallerOrigin) throws -> RemoteCaller {
         let refused = CherryControlError(
             code: "unauthorized",
             message: "Cherry refused this Cherry MCP token: it does not belong to an open tab of this Mac's Cherry (the tab was closed, or it was started by another copy of Cherry)."
@@ -539,9 +699,74 @@ final class CherryControlServer: @unchecked Sendable {
     /// (its token's), nil for This Mac's callers.
     @TaskLocal static var remoteCallerSessionID: UUID?
 
+    /// The processes of the This Mac caller whose request is being handled
+    /// (its CherryMCP and its parents), pinned when it connected, for
+    /// `verifiedCallerSession` and `callerWorkspace`; nil for callers on
+    /// another Mac (no pid crosses machines).
+    @TaskLocal static var callerProcessChain: CallerProcessChain?
+
     /// The peer process of the This Mac caller whose request is being
-    /// handled (its CherryMCP), for `verifiedCallerSession`.
+    /// handled (`callerProcessChain`'s first): `callerSessionResolverForTesting`
+    /// gets it.
     @TaskLocal static var callerPeerPID: Int32?
+
+    /// A This Mac caller's process and its parents (`processAncestry`, up
+    /// to launchd), each with when it started (`UnixIO.processStartIdentity`),
+    /// as they were when it connected.
+    struct CallerProcessChain: Equatable, Sendable {
+        var pids: [Int32]
+        /// Each pid's start, nil when it could not be read.
+        var startIdentities: [String?]
+
+        /// `peer`'s chain, now; nil when the peer's own start cannot be read
+        /// (it exited already), since its pid could be another process's by
+        /// the time it is matched.
+        static func pinned(peer: Int32) -> CallerProcessChain? {
+            let pids = CherryControl.processAncestry(of: peer, maxDepth: 20)
+            let startIdentities = pids.map(UnixIO.processStartIdentity)
+            guard startIdentities.first.flatMap({ $0 }) != nil else { return nil }
+            return CallerProcessChain(pids: pids, startIdentities: startIdentities)
+        }
+
+        /// Whether `pid` is one of the chain's processes still: a pid whose
+        /// process started at another time than when the chain was pinned
+        /// went to another process since (the caller exited); when either
+        /// start is unknown, the pid stands.
+        func contains(_ pid: Int32, currentStartIdentity: (Int32) -> String? = UnixIO.processStartIdentity) -> Bool {
+            guard let index = pids.firstIndex(of: pid) else { return false }
+            guard index < startIdentities.count, let recorded = startIdentities[index],
+                  let current = currentStartIdentity(pid)
+            else { return true }
+            return recorded == current
+        }
+    }
+
+    /// The tab whose program is one of `chain`'s processes, and its window:
+    /// a tab that runs the program first; a tab attached to the same session
+    /// of This Mac (another window's view of it) only when no window runs
+    /// it. A persistent tab's program pid comes from This Mac's host; a tab
+    /// attached to another machine's session has none.
+    @MainActor
+    static func callerSession(
+        matching chain: CallerProcessChain,
+        in workspaces: [TerminalWorkspace]
+    ) -> (session: TerminalSession, workspace: TerminalWorkspace)? {
+        for attached in [false, true] {
+            for workspace in workspaces {
+                for session in workspace.sessions where (session.hostedAttachment != nil) == attached {
+                    if let pid = session.programProcessID, chain.contains(pid) {
+                        return (session, workspace)
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Tests: sees each connection's caller chain (nil on a device's
+    /// listener) as it is accepted, before its request is read. Set it
+    /// before `start()`.
+    var acceptedCallerChainForTesting: (@Sendable (CallerProcessChain?) -> Void)?
 
     /// Monitors (`subscribe`, `wait_for_events`, wake lines).
     let monitors: AgentMonitorRegistry
@@ -553,6 +778,17 @@ final class CherryControlServer: @unchecked Sendable {
 
     /// Tests: the caller's own tab, in place of the peer's process ancestry.
     @MainActor var callerSessionResolverForTesting: ((Int32?) -> TerminalSession?)?
+
+    /// Tests: false answers appInfo, listTools and callTool with
+    /// invalid_request, as an app from before control protocol 2 does.
+    @MainActor var answersToolRequests = true
+
+    /// Tests: the `toolsDigest` every callTool answers with, in place of the
+    /// catalog's (as when the app's tools changed under a running client).
+    @MainActor var toolsDigestOverrideForTesting: String?
+
+    /// Tests: sees each request of a tool call before it is dispatched.
+    @MainActor var toolDispatchWillSendForTesting: ((CherryControlRequest) -> Void)?
 
     static func refusedOutsideDevice(_ what: String) -> CherryControlError {
         CherryControlError(
@@ -729,29 +965,13 @@ final class CherryControlServer: @unchecked Sendable {
     }
 
     /// The workspace whose session process tree contains the connecting peer (the
-    /// agent's MCP server), found by walking the peer's process ancestry and
-    /// matching against each open workspace's session PIDs. nil if no match.
+    /// agent's MCP server): the window of the tab whose program is one of the
+    /// peer's processes pinned when it connected (`callerSession(matching:in:)`).
+    /// nil if no match.
     @MainActor
-    private func callerWorkspace(peerPID: Int32?) -> TerminalWorkspace? {
-        guard let peerPID else { return nil }
-        let ancestry = Set(CherryControl.processAncestry(of: peerPID))
-        guard !ancestry.isEmpty else { return nil }
-        let workspaces = openWorkspaces()
-        // The tab that runs the caller's program first: a tab attached to
-        // the same session of This Mac (another window's view of it)
-        // routes only when no window runs it. A persistent tab's program
-        // pid comes from This Mac's host; a tab attached to another
-        // machine's session has none.
-        for attached in [false, true] {
-            for workspace in workspaces {
-                for session in workspace.sessions where (session.hostedAttachment != nil) == attached {
-                    if let pid = session.programProcessID, ancestry.contains(pid) {
-                        return workspace
-                    }
-                }
-            }
-        }
-        return nil
+    private func callerWorkspace(callerChain: CallerProcessChain?) -> TerminalWorkspace? {
+        guard let callerChain else { return nil }
+        return Self.callerSession(matching: callerChain, in: openWorkspaces())?.workspace
     }
 
     /// Every open project window's workspace, each once: the windows'
@@ -1052,6 +1272,13 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .clearOutput(.init(
                 terminalID: session.id.uuidString, cleared: kept == nil, hostKeptHistory: kept
             )))
+        case .appInfo, .listTools, .callTool:
+            // `handleRequestData` answers these before any window is
+            // resolved: here they could only come nested in a scoped request.
+            throw CherryControlError(
+                code: "invalid_request",
+                message: "A tool call is never scoped: pass project_root in its arguments."
+            )
         }
     }
 
@@ -3160,7 +3387,11 @@ final class CherryControlServer: @unchecked Sendable {
             guard let baseAddress = rawBuffer.baseAddress else { return }
             var offset = 0
             while offset < data.count {
-                let written = write(fd, baseAddress.advanced(by: offset), data.count - offset)
+                // MSG_NOSIGNAL as well as SO_NOSIGPIPE: the kernel refuses
+                // that option on a connection its peer already closed (a
+                // client that connects and goes, as `UnixIO.hasListener`
+                // does), and the answer's EPIPE would raise SIGPIPE.
+                let written = send(fd, baseAddress.advanced(by: offset), data.count - offset, MSG_NOSIGNAL)
                 if written > 0 {
                     offset += written
                 } else if written < 0, errno == EINTR {

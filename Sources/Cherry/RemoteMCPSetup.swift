@@ -9,7 +9,9 @@ import SwiftUI
 // the exact commands, and runs them over SSH only when the user confirms:
 // it writes a stable launcher there (`RemoteMCPPaths.launcherRelativePath`)
 // and registers it with each agent CLI it finds, or removes the
-// registrations. Both are idempotent.
+// registrations. Both are idempotent. `pi mcp` runs only on a Pi whose
+// `--version` says it has MCP (`PiMCPRegistration.minimumVersion`): an
+// older Pi takes `mcp add …` as prompts for its model.
 
 enum RemoteMCPSetup {
     enum Mode: String, Sendable {
@@ -38,7 +40,11 @@ enum RemoteMCPSetup {
         "codex mcp remove \(name); codex mcp add \(name) -- \(launcherExpression)",
         "# Codex passes an MCP server only the variables it lists: adds",
         "#   env_vars = \(codexEnvVars) to [mcp_servers.\(name)] in ~/.codex/config.toml",
-        "pi mcp add \(name) --exposure direct -- \(launcherExpression)",
+        // Its own line: zsh, the default shell, keeps a `#` after a command
+        // as words unless interactive_comments is set, and Pi would then
+        // pass them to the launcher.
+        "# only with Pi \(PiMCPRegistration.minimumVersion) or later: an older pi takes these words as prompts",
+        "pi mcp add \(name) --exposure deferred --description \(ShellQuoting.singleQuoted(PiMCPRegistration.serverDescription)) -- \(launcherExpression)",
     ] }
 
     /// The variables Codex must pass to CherryMCP (its `env_vars`): Codex
@@ -123,6 +129,21 @@ enum RemoteMCPSetup {
             "  pd=$(\"${SHELL:-/bin/sh}\" -l -c 'printf \"cherry_pi_dir=%s\\n\" \"${PI_CODING_AGENT_DIR:-}\"' </dev/null 2>/dev/null | sed -n 's/^cherry_pi_dir=//p' | tail -n 1)",
             "  if [ -n \"$pd\" ]; then PI_CODING_AGENT_DIR=$pd; export PI_CODING_AGENT_DIR; fi",
             "fi",
+            // Pi's version first, in every mode: only a Pi with MCP is
+            // given `pi mcp` (pi_mcp).
+            "pi_mcp=",
+            "if [ -n \"$pi\" ]; then",
+            "  pv=$(\"$pi\" --version 2>/dev/null </dev/null | head -n 5 | tr '\\n' ' ' | cut -c1-200 | sed 's/ *$//')",
+            "  printf 'pi_version=%s\\n' \"$pv\"",
+            "  if printf '%s\\n' \"$pv\" | /usr/bin/awk \(RemoteDeviceProbe.singleQuoted(RemoteAgentMCPLaunch.versionCheck(minimum: PiMCPRegistration.minimumVersion))); then pi_mcp=1; echo pi_mcp=1",
+            // No version on its standard output: its standard error, only
+            // for the sheet's message (Pi 0.62.0 prints its version there
+            // without a terminal), never for pi_mcp.
+            "  elif ! printf '%s\\n' \"$pv\" | /usr/bin/awk \(RemoteDeviceProbe.singleQuoted(RemoteAgentMCPLaunch.versionCheck(minimum: AgentCLIVersion(major: 0, minor: 0, patch: 0)))); then",
+            "    pe=$(\"$pi\" --version 2>&1 >/dev/null </dev/null | head -n 5 | tr '\\n' ' ' | cut -c1-200 | sed 's/ *$//')",
+            "    printf 'pi_version_errors=%s\\n' \"$pe\"",
+            "  fi",
+            "fi",
             "if [ -n \"$helper\" ]; then",
             "  if [ -x \"$helper\" ]; then",
             "    if v=$(\"$helper\" --version 2>&1 </dev/null); then printf 'helper_version=%s\\n' \"$(printf '%s' \"$v\" | tr '\\n' ' ')\"; else printf 'helper_error=%s\\n' \"$(printf '%s' \"$v\" | tr '\\n' ' ' | cut -c1-300)\"; fi",
@@ -170,16 +191,19 @@ enum RemoteMCPSetup {
                 "  printf 'codex_result=%s\\n' \"$codex_result\"",
                 "fi",
                 // Pi replaces a server of the same name, and passes its
-                // whole environment to it.
-                "if [ -n \"$pi\" ]; then",
-                "  printf 'pi_result=%s\\n' \"$(result \"$pi\" mcp add \"$name\" --exposure direct -- \"$launcher\")\"",
-                "fi",
+                // whole environment to it. Deferred exposure: the model
+                // finds Cherry's tools through Pi's tool search.
+                "if [ -n \"$pi_mcp\" ]; then",
+                "  printf 'pi_result=%s\\n' \"$(result \"$pi\" mcp add \"$name\" --exposure deferred --description \(RemoteDeviceProbe.singleQuoted(PiMCPRegistration.serverDescription)) -- \"$launcher\")\"",
+                piSkipped,
             ]
         case .remove:
             lines += [
                 "if [ -n \"$claude\" ]; then printf 'claude_result=%s\\n' \"$(result \"$claude\" mcp remove --scope user \"$name\")\"; fi",
                 "if [ -n \"$codex\" ]; then printf 'codex_result=%s\\n' \"$(result \"$codex\" mcp remove \"$name\")\"; fi",
-                "if [ -n \"$pi\" ]; then printf 'pi_result=%s\\n' \"$(result \"$pi\" mcp remove \"$name\")\"; fi",
+                "if [ -n \"$pi_mcp\" ]; then",
+                "  printf 'pi_result=%s\\n' \"$(result \"$pi\" mcp remove \"$name\")\"",
+                piSkipped,
             ]
         }
         lines += [
@@ -189,11 +213,27 @@ enum RemoteMCPSetup {
         return lines.joined(separator: "\n") + "\n"
     }
 
+    /// A Pi without MCP: why nothing ran (`Report.piSkipped`), closing the
+    /// `if` its `pi mcp` line opens.
+    private static let piSkipped =
+        "elif [ -n \"$pi\" ]; then printf 'pi_skipped=%s\\n' \"Pi${pv:+ $pv} has no MCP (needs \(PiMCPRegistration.minimumVersion) or later)\"; fi"
+
     /// What a script found or did there.
     struct Report: Equatable, Sendable {
         var claude: String?
         var codex: String?
         var pi: String?
+        /// What `pi --version` printed there (its first lines).
+        var piVersion: String?
+        /// What it printed on its standard error, when its standard output
+        /// named no version: only for the sheet's message
+        /// (`RemoteMCPSetupModel.piWithoutMCP`), never for `piHasMCP`.
+        var piVersionErrors: String?
+        /// Pi's version is `PiMCPRegistration.minimumVersion` or later: the
+        /// script runs its `pi mcp`.
+        var piHasMCP = false
+        /// Why Pi's `pi mcp` did not run (a Pi without MCP): not a failure.
+        var piSkipped: String?
         var launcherInstalled = false
         var helperVersion: String?
         var helperError: String?
@@ -211,6 +251,10 @@ enum RemoteMCPSetup {
                 case "claude": claude = value.nilIfEmpty
                 case "codex": codex = value.nilIfEmpty
                 case "pi": pi = value.nilIfEmpty
+                case "pi_version": piVersion = value.nilIfEmpty
+                case "pi_version_errors": piVersionErrors = value.nilIfEmpty
+                case "pi_mcp": piHasMCP = true
+                case "pi_skipped": piSkipped = value.nilIfEmpty
                 case "launcher": launcherInstalled = true
                 case "helper_version": helperVersion = value.nilIfEmpty
                 case "helper_error": helperError = value.nilIfEmpty ?? "it did not run"
@@ -224,7 +268,8 @@ enum RemoteMCPSetup {
             }
         }
 
-        /// Why the whole did not work, if it did not.
+        /// Why the whole did not work, if it did not. A Pi without MCP
+        /// (`piSkipped`) is not a failure.
         var failures: [String] {
             var failures: [String] = []
             if launcherError { failures.append("The launcher could not be written.") }
@@ -312,7 +357,10 @@ final class RemoteMCPSetupModel: ObservableObject {
         var lines: [String] = []
         lines.append(report.claude.map { "Claude Code: \($0)" } ?? "Claude Code: not found on \(device.name)")
         lines.append(report.codex.map { "Codex: \($0)" } ?? "Codex: not found on \(device.name)")
-        lines.append(report.pi.map { "Pi: \($0)" } ?? "Pi: not found on \(device.name)")
+        let pi = report.pi.map {
+            "Pi: \($0)\(report.piHasMCP ? "" : " (\(Self.piWithoutMCP(report.piVersion, errorOutput: report.piVersionErrors)))")"
+        }
+        lines.append(pi ?? "Pi: not found on \(device.name)")
         if let version = report.helperVersion {
             lines.append("CherryMCP runs there (\(version)).")
         } else if let helperError = report.helperError {
@@ -323,9 +371,26 @@ final class RemoteMCPSetupModel: ObservableObject {
         return lines
     }
 
+    /// Why Pi there gets no Cherry MCP: "Pi 0.62.0: no MCP, update Pi
+    /// there", from what its `--version` printed. What it printed on its
+    /// standard error (`errorOutput`, when its standard output named no
+    /// version) only names a Pi older than `PiMCPRegistration.minimumVersion`.
+    static func piWithoutMCP(_ versionOutput: String?, errorOutput: String? = nil) -> String {
+        if let version = versionOutput.flatMap(AgentCLIVersion.init(versionOutput:)) {
+            return "Pi \(version): no MCP, update Pi there"
+        }
+        if let older = errorOutput.flatMap(AgentCLIVersion.init(versionOutput:)), older < PiMCPRegistration.minimumVersion {
+            return "Pi \(older): no MCP, update Pi there"
+        }
+        guard let output = versionOutput else { return "its --version did not answer: no MCP" }
+        return "--version printed “\(output)”: no MCP, update Pi there"
+    }
+
+    /// Set Up and Remove have something to run: a CLI there, Pi only with
+    /// MCP.
     var canSetUp: Bool {
         guard let report, !isRunning else { return false }
-        return report.claude != nil || report.codex != nil || report.pi != nil
+        return report.claude != nil || report.codex != nil || (report.pi != nil && report.piHasMCP)
     }
 }
 

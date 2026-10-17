@@ -442,7 +442,9 @@ final class ShellProcessController: @unchecked Sendable {
             shellIntegration: try? ShellIntegrationBootstrap.prepare(shellPath: configuration.shellPath),
             inheritedEnvironment: ProcessInfo.processInfo.environment,
             terminfoDirectories: Self.preferredTerminfo.additionalDirs,
-            mcpHelperPath: Self.appMCPHelperPath
+            mcpHelperPath: Self.appMCPHelperPath,
+            controlSocketPath: CherryControlServer.appSocketPath,
+            cliPath: Self.appCLIPath
         )
     }
 
@@ -456,18 +458,60 @@ final class ShellProcessController: @unchecked Sendable {
         return FileManager.default.isExecutableFile(atPath: helper) ? helper : nil
     }()
 
+    /// The `cherry` this app runs itself, resolved once: every tab's
+    /// `CHERRY_CLI`, nil when there is none. Device tabs get their
+    /// install's (`RemoteMCPLaunch`).
+    static let appCLIPath: String? = resolvedCLIPath(
+        environment: ProcessInfo.processInfo.environment,
+        runningExecutable: Bundle.main.executableURL,
+        bundleURL: Bundle.main.bundleURL
+    )
+
+    /// `HostedSessionClient.installed`'s helper (`CHERRY_CLI_PATH`, the one
+    /// beside the app, then a development build's), as a path. Never
+    /// `<executable directory>/cherry` unchecked: on a case-insensitive
+    /// volume `.build/debug/cherry` is the `Cherry` GUI itself, which
+    /// `"$CHERRY_CLI"` would start a second time (`isHelper`).
+    static func resolvedCLIPath(
+        environment: [String: String],
+        runningExecutable: URL?,
+        bundleURL: URL,
+        sourceRoot: URL = HostedSessionClient.developmentSourceRoot,
+        isDebugBuild: Bool = HostedSessionClient.isDebugBuild
+    ) -> String? {
+        let client = try? HostedSessionClient.installed(
+            environment: environment,
+            runningExecutable: runningExecutable,
+            bundleURL: bundleURL,
+            sourceRoot: sourceRoot,
+            isDebugBuild: isDebugBuild
+        )
+        return client?.executableURL.path
+    }
+
     /// `nativeExecLaunch(for:)` with its inputs explicit and no file I/O:
     /// the zsh bootstrap (nil for other shells, or when it could not be
     /// written), Cherry's own environment (read for ZDOTDIR,
-    /// CHERRY_BOOTSTRAP_ZDOTDIR and TERMINFO_DIRS) and the terminfo
-    /// directories to put first in TERMINFO_DIRS. `HostedLaunchSpec` builds
-    /// hosted sessions on it, so both launches share one set of rules.
+    /// CHERRY_BOOTSTRAP_ZDOTDIR, TERMINFO_DIRS and CHERRY_CONTROL_SOCKET)
+    /// and the terminfo directories to put first in TERMINFO_DIRS.
+    /// `HostedLaunchSpec` builds hosted sessions on it, so both launches
+    /// share one set of rules.
+    ///
+    /// `controlSocketPath` is the socket the app's control server answers
+    /// (`CherryControlServer.appSocketPath`), the tab's
+    /// `CHERRY_CONTROL_SOCKET`; `cliPath` its `CHERRY_CLI`; `mcpServerName`
+    /// the name Cherry's server has in its agents (the identity's scheme),
+    /// its `CHERRY_MCP_SERVER_NAME` beside `CHERRY_MCP_HELPER`, which
+    /// Cherry's Pi extension registers the helper as.
     static func nativeExecLaunch(
         for configuration: Configuration,
         shellIntegration: ShellIntegrationBootstrap?,
         inheritedEnvironment: [String: String],
         terminfoDirectories: String?,
-        mcpHelperPath: String? = appMCPHelperPath
+        mcpHelperPath: String? = appMCPHelperPath,
+        mcpServerName: String? = CherryAppIdentity.current.urlScheme,
+        controlSocketPath: String? = CherryControlServer.appSocketPath,
+        cliPath: String? = appCLIPath
     ) -> (command: String, environment: [String: String]) {
         let shellPath = configuration.shellPath
 
@@ -506,6 +550,21 @@ final class ShellProcessController: @unchecked Sendable {
         }
         if let mcpHelperPath, !mcpHelperPath.isEmpty {
             environment[CherryControl.mcpHelperEnvironmentKey] = mcpHelperPath
+            if let mcpServerName, !mcpServerName.isEmpty {
+                environment[CherryControl.mcpServerNameEnvironmentKey] = mcpServerName
+            }
+        }
+        if let controlSocketPath, !controlSocketPath.isEmpty {
+            environment[CherryControl.socketEnvironmentKey] = controlSocketPath
+        } else if inheritedEnvironment[CherryControl.socketEnvironmentKey] != nil {
+            // A Ghostty surface builds its child's environment over Cherry's
+            // own, where a key can be set but not removed: empty, which
+            // CherryControl.socketURL treats as unset, so a tab of a Cherry
+            // started from a Cherry tab never names the outer one's socket.
+            environment[CherryControl.socketEnvironmentKey] = ""
+        }
+        if let cliPath, !cliPath.isEmpty {
+            environment[CherryControl.cliEnvironmentKey] = cliPath
         }
 
         let command: String
@@ -839,14 +898,20 @@ final class ShellProcessController: @unchecked Sendable {
             terminfoDirectories: Self.preferredTerminfo.additionalDirs
         ).environment
         launchEnvironment["CHERRY_EMIT_OSC133"] = nil
+        // The empty CHERRY_CONTROL_SOCKET only hides Cherry's own from a
+        // Ghostty surface; this child's environment drops that one instead.
+        if launchEnvironment[CherryControl.socketEnvironmentKey]?.isEmpty == true {
+            launchEnvironment[CherryControl.socketEnvironmentKey] = nil
+        }
         // Over this process's environment without what a Cherry tab or an
         // agent CLI exports (the app clears them from itself at launch,
-        // `CherryTabEnvironment.removeFromProcess`) and NO_COLOR: Cherry is
-        // a color-capable terminal, so a launcher's or automation's NO_COLOR
-        // must not leak into interactive children.
+        // `CherryTabEnvironment.removeFromProcess`), the control socket
+        // Cherry inherited (the tab names the app's own) and NO_COLOR:
+        // Cherry is a color-capable terminal, so a launcher's or
+        // automation's NO_COLOR must not leak into interactive children.
         let removedKeys = CherryTabEnvironment.keys
             .union(CherryTabEnvironment.agentChildMarkers)
-            .union(["NO_COLOR"])
+            .union([CherryControl.socketEnvironmentKey, "NO_COLOR"])
         let childEnvironment = inheritedEnvironment
             .filter { !removedKeys.contains($0.key) }
             .merging(launchEnvironment) { _, launched in launched }

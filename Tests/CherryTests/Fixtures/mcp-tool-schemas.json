@@ -1,0 +1,881 @@
+[
+  {
+    "name": "get_status",
+    "properties": {},
+    "required": []
+  },
+  {
+    "name": "list_projects",
+    "properties": {},
+    "required": []
+  },
+  {
+    "name": "open_project",
+    "properties": {
+      "project_root": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "project_root"
+    ]
+  },
+  {
+    "name": "get_project_status",
+    "properties": {},
+    "required": []
+  },
+  {
+    "name": "whoami",
+    "properties": {
+      "project_root": {
+        "type": "string"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "resolve_link",
+    "properties": {
+      "include_output": {
+        "type": "boolean"
+      },
+      "line_limit": {
+        "type": "integer"
+      },
+      "link": {
+        "type": "string"
+      },
+      "start_line": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "link"
+    ]
+  },
+  {
+    "name": "list_processes",
+    "properties": {
+      "kind": {
+        "type": "string"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "get_process_status",
+    "properties": {
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "get_process_output",
+    "properties": {
+      "line_limit": {
+        "type": "integer"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      },
+      "start_line": {
+        "type": "integer"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "get_process_raw_output",
+    "properties": {
+      "max_bytes": {
+        "type": "integer"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "search_process_output",
+    "properties": {
+      "case_sensitive": {
+        "type": "boolean"
+      },
+      "max_matches": {
+        "type": "integer"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      },
+      "query": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "query"
+    ]
+  },
+  {
+    "name": "wait_for_process_idle",
+    "properties": {
+      "line_limit": {
+        "type": "integer"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      },
+      "quiet_ms": {
+        "type": "integer"
+      },
+      "require_new_output": {
+        "type": "boolean"
+      },
+      "since_output_version": {
+        "type": "integer"
+      },
+      "timeout_ms": {
+        "type": "integer"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "subscribe",
+    "properties": {
+      "events": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "output_pattern": {
+        "type": "string"
+      },
+      "process_ids": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "project_root": {
+        "type": "string"
+      },
+      "sub_agents": {
+        "type": "boolean"
+      },
+      "wake": {
+        "type": "boolean"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "wait_for_events",
+    "properties": {
+      "cursor": {
+        "type": "integer"
+      },
+      "max_events": {
+        "type": "integer"
+      },
+      "subscription_id": {
+        "type": "string"
+      },
+      "timeout_ms": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "subscription_id"
+    ]
+  },
+  {
+    "name": "unsubscribe",
+    "properties": {
+      "subscription_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "subscription_id"
+    ]
+  },
+  {
+    "name": "list_subscriptions",
+    "properties": {},
+    "required": []
+  },
+  {
+    "name": "get_my_task",
+    "properties": {},
+    "required": []
+  },
+  {
+    "name": "report_result",
+    "properties": {
+      "status": {
+        "type": "string"
+      },
+      "summary": {
+        "type": "string"
+      },
+      "value": {}
+    },
+    "required": []
+  },
+  {
+    "name": "report_progress",
+    "properties": {
+      "message": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "message"
+    ]
+  },
+  {
+    "name": "wait_for_tasks",
+    "properties": {
+      "cursor": {
+        "type": "integer"
+      },
+      "max_events": {
+        "type": "integer"
+      },
+      "run_id": {
+        "type": "string"
+      },
+      "task_ids": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "timeout_ms": {
+        "type": "integer"
+      },
+      "until": {
+        "type": "string"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "get_task",
+    "properties": {
+      "task_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "task_id"
+    ]
+  },
+  {
+    "name": "list_tasks",
+    "properties": {
+      "run_id": {
+        "type": "string"
+      },
+      "state": {
+        "type": "string"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "cancel_tasks",
+    "properties": {
+      "close": {
+        "type": "boolean"
+      },
+      "run_id": {
+        "type": "string"
+      },
+      "task_ids": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "get_process_ports",
+    "properties": {
+      "include_unattributed": {
+        "type": "boolean"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "services_list",
+    "properties": {
+      "include_unattributed": {
+        "type": "boolean"
+      },
+      "kind": {
+        "type": "string"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "wait_for_bound_port",
+    "properties": {
+      "include_unattributed": {
+        "type": "boolean"
+      },
+      "path": {
+        "type": "string"
+      },
+      "port": {
+        "type": "integer"
+      },
+      "probe_http": {
+        "type": "boolean"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      },
+      "timeout_ms": {
+        "type": "integer"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "spawn_process",
+    "properties": {
+      "effort": {
+        "type": "string"
+      },
+      "kind": {
+        "type": "string"
+      },
+      "line_limit": {
+        "type": "integer"
+      },
+      "model": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "parent_agent_id": {
+        "type": "string"
+      },
+      "raw_base64": {
+        "type": "string"
+      },
+      "submit": {
+        "type": "boolean"
+      },
+      "text": {
+        "type": "string"
+      },
+      "title": {
+        "type": "string"
+      },
+      "wait_ms": {
+        "type": "integer"
+      },
+      "working_directory": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "kind"
+    ]
+  },
+  {
+    "name": "spawn_agent",
+    "properties": {
+      "bind_session": {
+        "type": "boolean"
+      },
+      "effort": {
+        "type": "string"
+      },
+      "label": {
+        "type": "string"
+      },
+      "line_limit": {
+        "type": "integer"
+      },
+      "message": {
+        "type": "string"
+      },
+      "model": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "parent_agent_id": {
+        "type": "string"
+      },
+      "phase": {
+        "type": "string"
+      },
+      "result_schema": {
+        "type": "object"
+      },
+      "run_id": {
+        "type": "string"
+      },
+      "task": {
+        "type": "string"
+      },
+      "title": {
+        "type": "string"
+      },
+      "wait_ms": {
+        "type": "integer"
+      }
+    },
+    "required": [
+      "name"
+    ]
+  },
+  {
+    "name": "start_process",
+    "properties": {
+      "kind": {
+        "type": "string"
+      },
+      "line_limit": {
+        "type": "integer"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      },
+      "wait_ms": {
+        "type": "integer"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "stop_process",
+    "properties": {
+      "kind": {
+        "type": "string"
+      },
+      "line_limit": {
+        "type": "integer"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      },
+      "wait_ms": {
+        "type": "integer"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "restart_process",
+    "properties": {
+      "kind": {
+        "type": "string"
+      },
+      "line_limit": {
+        "type": "integer"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      },
+      "wait_ms": {
+        "type": "integer"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "close_process",
+    "properties": {
+      "agent_close_policy": {
+        "type": "string"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "rename_process",
+    "properties": {
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      },
+      "title": {
+        "type": "string"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "select_process",
+    "properties": {
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "send_process_input",
+    "properties": {
+      "line_limit": {
+        "type": "integer"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      },
+      "raw_base64": {
+        "type": "string"
+      },
+      "submit": {
+        "type": "boolean"
+      },
+      "text": {
+        "type": "string"
+      },
+      "wait_ms": {
+        "type": "integer"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "send_agent_message",
+    "properties": {
+      "line_limit": {
+        "type": "integer"
+      },
+      "message": {
+        "type": "string"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      },
+      "quiet_ms": {
+        "type": "integer"
+      },
+      "timeout_ms": {
+        "type": "integer"
+      },
+      "wait_for_idle": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "message"
+    ]
+  },
+  {
+    "name": "start_all_commands",
+    "properties": {
+      "wait_ms": {
+        "type": "integer"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "stop_all_commands",
+    "properties": {
+      "wait_ms": {
+        "type": "integer"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "restart_all_commands",
+    "properties": {
+      "wait_ms": {
+        "type": "integer"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "list_agents",
+    "properties": {},
+    "required": []
+  },
+  {
+    "name": "list_todos",
+    "properties": {
+      "project_root": {
+        "type": "string"
+      }
+    },
+    "required": []
+  },
+  {
+    "name": "create_todo",
+    "properties": {
+      "markdown": {
+        "type": "string"
+      },
+      "project_root": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      },
+      "tags": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "title": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "title"
+    ]
+  },
+  {
+    "name": "get_todo",
+    "properties": {
+      "project_root": {
+        "type": "string"
+      },
+      "todo_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "todo_id"
+    ]
+  },
+  {
+    "name": "update_todo",
+    "properties": {
+      "markdown": {
+        "type": "string"
+      },
+      "project_root": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      },
+      "tags": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "title": {
+        "type": "string"
+      },
+      "todo_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "todo_id"
+    ]
+  },
+  {
+    "name": "move_todo",
+    "properties": {
+      "after_todo_id": {
+        "type": "string"
+      },
+      "project_root": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      },
+      "todo_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "todo_id"
+    ]
+  },
+  {
+    "name": "delete_todo",
+    "properties": {
+      "project_root": {
+        "type": "string"
+      },
+      "todo_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "todo_id"
+    ]
+  },
+  {
+    "name": "select_todo",
+    "properties": {
+      "project_root": {
+        "type": "string"
+      },
+      "todo_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "todo_id"
+    ]
+  },
+  {
+    "name": "add_todo_comment",
+    "properties": {
+      "author": {
+        "type": "string"
+      },
+      "markdown": {
+        "type": "string"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "project_root": {
+        "type": "string"
+      },
+      "todo_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "todo_id",
+      "markdown"
+    ]
+  },
+  {
+    "name": "list_todo_comments",
+    "properties": {
+      "project_root": {
+        "type": "string"
+      },
+      "todo_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "todo_id"
+    ]
+  },
+  {
+    "name": "update_todo_comment",
+    "properties": {
+      "comment_id": {
+        "type": "string"
+      },
+      "markdown": {
+        "type": "string"
+      },
+      "project_root": {
+        "type": "string"
+      },
+      "todo_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "todo_id",
+      "comment_id",
+      "markdown"
+    ]
+  },
+  {
+    "name": "delete_todo_comment",
+    "properties": {
+      "comment_id": {
+        "type": "string"
+      },
+      "project_root": {
+        "type": "string"
+      },
+      "todo_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "todo_id",
+      "comment_id"
+    ]
+  },
+  {
+    "name": "bind_session_process",
+    "properties": {
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      }
+    },
+    "required": []
+  }
+]

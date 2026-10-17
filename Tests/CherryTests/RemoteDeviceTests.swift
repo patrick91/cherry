@@ -1058,15 +1058,24 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
         instanceLock: nil, terminalColors: { nil }, configuration: configuration
     )
     #expect(PersistentHostSessions.Configuration.remote.relaunchBatchSize == HostSSHMasterManager.Configuration().maxChannelsPerMaster)
-    var ran = 0
-    for _ in 0..<8 { hosting.enqueueAdapterRelaunch { ran += 1 } }
-    #expect(ran == 0)
-    try await Task.sleep(for: .milliseconds(60))
-    #expect(ran == 3)
-    #expect(hosting.pendingAdapterRelaunches == 5)
-    let deadline = Date().addingTimeInterval(5)
-    while ran < 8, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
-    #expect(ran == 8)
+    // Each relaunch notes how many still wait and when it ran. A batch runs
+    // in one turn, after it left the queue, so its relaunches see the same
+    // count, and the next batch comes an interval later, however late a
+    // loaded runner gets to it (a count after a fixed sleep was flaky).
+    var runs: [(pending: Int, at: UInt64)] = []
+    for _ in 0..<8 {
+        hosting.enqueueAdapterRelaunch {
+            runs.append((hosting.pendingAdapterRelaunches, DispatchTime.now().uptimeNanoseconds))
+        }
+    }
+    #expect(runs.isEmpty)
+    let deadline = Date().addingTimeInterval(10)
+    while runs.count < 8, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+    #expect(runs.map { $0.pending } == [5, 5, 5, 2, 2, 2, 0, 0])
+    try #require(runs.count == 8)
+    let interval = UInt64(configuration.relaunchBatchInterval * 1_000_000_000)
+    #expect(runs[3].at >= runs[2].at + interval)
+    #expect(runs[6].at >= runs[5].at + interval)
 }
 
 @Test @MainActor func aWindowOfAnUnknownMacNeitherConnectsNorRewritesItsSavedTabs() async throws {

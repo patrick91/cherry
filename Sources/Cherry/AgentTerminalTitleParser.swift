@@ -19,7 +19,11 @@ enum AgentTerminalTitleParser {
             candidate = codexTaskTitle(from: rawTitle, projectNames: normalizedProjectNames)
         case .claude:
             candidate = claudeTaskTitle(from: rawTitle)
-        case .amp, .gemini, .openCode, .pi:
+        case .pi:
+            candidate = piTaskTitle(from: rawTitle, agentName: agentName)
+        case .amp, .gemini, .openCode:
+            // Their title formats are not known yet: a title that is only the
+            // program's or the folder's name would replace the agent's name.
             candidate = nil
         }
 
@@ -80,6 +84,27 @@ enum AgentTerminalTitleParser {
         guard let title = normalizedDisplayValue(rawTitle) else { return nil }
         return droppingEdgeActivityGlyphs(title, brand: .claude)
     }
+
+    /// Pi's own title is `π - <session name> - <folder>`, or `π - <folder>`
+    /// while the session has no name (a Pi built under another app name puts
+    /// that name first: taken as such when it is the agent's name). An
+    /// extension can set any other title (`ctx.ui.setTitle`), which is taken
+    /// whole. A spinner extension's braille frame at the start is chrome.
+    private static func piTaskTitle(from rawTitle: String, agentName: String?) -> String? {
+        guard let title = droppingEdgeActivityGlyphs(rawTitle, brand: .pi) else { return nil }
+        let parts = title.components(separatedBy: " - ")
+        let prefixes = piTitlePrefixes.union([normalizedLookupValue(agentName)].compactMap { $0 })
+        guard let first = normalizedLookupValue(parts.first),
+              prefixes.contains(first)
+        else {
+            return title
+        }
+        // `π - <folder>`: the session has no name yet.
+        guard parts.count >= 3 else { return nil }
+        return normalizedDisplayValue(parts.dropFirst().dropLast().joined(separator: " - "))
+    }
+
+    private static let piTitlePrefixes: Set<String> = ["π", "pi"]
 
     private static func droppingEdgeActivityGlyphs(
         _ rawValue: String,

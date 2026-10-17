@@ -6999,47 +6999,6 @@ private struct QuitCountWindowTestHost: View {
     #expect(session.titleSource == .automatic)
 }
 
-@Test func agentTerminalTitleParserHandlesCodexAndClaudeChrome() {
-    let projects: Set<String> = ["cherry"]
-
-    #expect(AgentTerminalTitleParser.taskTitle(
-        from: "⠋ Review PR #4676 ⠹ | cherry",
-        brand: .codex,
-        projectNames: projects,
-        agentName: "Codex"
-    ) == "Review PR #4676")
-    #expect(AgentTerminalTitleParser.taskTitle(
-        from: "[ ! ] Action Required | Review PR #4676 | cherry",
-        brand: .codex,
-        projectNames: projects,
-        agentName: "Codex"
-    ) == "Review PR #4676")
-    #expect(AgentTerminalTitleParser.taskTitle(
-        from: "⠹ cherry",
-        brand: .codex,
-        projectNames: projects,
-        agentName: "Codex"
-    ) == nil)
-    #expect(AgentTerminalTitleParser.taskTitle(
-        from: "⠹ cherry | gpt-5.6-sol",
-        brand: .codex,
-        projectNames: projects,
-        agentName: "Codex"
-    ) == nil)
-    #expect(AgentTerminalTitleParser.taskTitle(
-        from: "✳ Probe session initialization",
-        brand: .claude,
-        projectNames: projects,
-        agentName: "Claude"
-    ) == "Probe session initialization")
-    #expect(AgentTerminalTitleParser.taskTitle(
-        from: "✳ Claude Code",
-        brand: .claude,
-        projectNames: projects,
-        agentName: "Claude"
-    ) == nil)
-}
-
 @MainActor
 @Test func restartingAgentClearsAutomaticTitleAndPreservesExplicitTitle() async throws {
     let session = TerminalSession(

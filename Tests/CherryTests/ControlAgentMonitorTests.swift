@@ -217,6 +217,36 @@ struct ControlAgentMonitorTests {
         #expect(again.events.isEmpty)
     }
 
+    /// Its report can be applied before its last frame is noticed (status
+    /// and screen come separately): idle, working, idle again is still one
+    /// turn, and one `done`.
+    @Test func aTurnsLastFrameNoticedAfterItsReportIsNoSecondDone() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.start()
+        let worker = try await harness.spawnAgent(named: "Claude")
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(150))
+        let subscribed = try await harness.subscribe(.init(processIDs: [worker.id.uuidString]))
+        let id = subscribed.subscription.subscriptionID
+
+        // The report first, then its last frame.
+        harness.report("state=done:app=claude-code", on: worker)
+        let first = try await harness.events(id)
+        #expect(first.events.map(\.type) == [.done])
+        harness.screen("⏺ Done.\n\n❯ \n", on: worker)
+        let none = try await harness.events(id, timeoutMilliseconds: 1_500)
+        #expect(none.events.isEmpty, "the same turn: \(none.events.map(\.type))")
+
+        // A turn it reports next is a `done` again.
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(150))
+        harness.report("state=done:app=claude-code", on: worker)
+        let next = try await harness.events(id)
+        #expect(next.events.map(\.type) == [.done])
+    }
+
     @Test func needsInputPermissionAndClosedEvents() async throws {
         let harness = try ControlAgentWaitHarness()
         defer { harness.stop() }

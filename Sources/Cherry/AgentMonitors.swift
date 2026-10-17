@@ -97,6 +97,12 @@ final class WatchedProcess {
     /// one, not after a later Enter that drew nothing (Return on an empty
     /// composer is a submit too, and Codex and Amp draw nothing for it).
     var quietTurnSubmittedAt: Date?
+    /// The agent's reported and submitted turn counts at its last turn
+    /// `done` (it reports its status): the same counts again are the same
+    /// turn, whose last frame was noticed after its report (screen and
+    /// status come separately), not another `done`.
+    var turnDoneReportedTurn: Int?
+    var turnDoneSubmittedTurn: Int?
     /// The worker's task, once seen: found by its id after the task
     /// followed its worker to a tab under another id (`locateWorker`).
     var taskID: String?
@@ -719,10 +725,23 @@ extension CherryControlServer {
         let task = watchedTask(watched, device: subscription.device)
 
         // Every turn an agent reports ended is a `done`, a task's worker's
-        // too: never left out because of its task.
+        // too: never left out because of its task. Once per turn: a report
+        // applied before its last frame was noticed reads idle, working
+        // (the frame), then idle again, with no new turn reported or
+        // submitted in between.
+        func tellTurnDone(initial: Bool) {
+            if let session, session.reportsProgramStatus,
+               watched.turnDoneReportedTurn == session.agentReportedTurnCount,
+               watched.turnDoneSubmittedTurn == session.agentSubmittedTurnCount {
+                return
+            }
+            watched.turnDoneReportedTurn = session?.agentReportedTurnCount
+            watched.turnDoneSubmittedTurn = session?.agentSubmittedTurnCount
+            monitors.append(.done, to: subscription, process: watched, session: session, initial: initial)
+        }
         if current == "idle", previous == "idle", let turn, let previousTurn, turn > previousTurn {
             // A whole turn between two samples.
-            monitors.append(.done, to: subscription, process: watched, session: session, initial: false)
+            tellTurnDone(initial: false)
         } else if current != previous {
             switch current {
             case "closed":
@@ -740,7 +759,7 @@ extension CherryControlServer {
                 // whose last turn completed. An agent never given a turn
                 // is not done with anything.
                 if !initial || session?.agentTurnState == .completed {
-                    monitors.append(.done, to: subscription, process: watched, session: session, initial: initial)
+                    tellTurnDone(initial: initial)
                 }
             case "needs_input":
                 monitors.append(.needsInput, to: subscription, process: watched, session: session, initial: initial)

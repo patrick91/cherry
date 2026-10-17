@@ -855,7 +855,9 @@ to their events and ends its turn; Cherry tells it when something happened.
   own sub-agents, including ones spawned later) and optionally `events`. The
   events are `done` (an agent finished a turn: it reports `done` or `idle`
   after working, its screen settled for 1.5 s and past the turn-start rule
-  above; a turn it began and finished between two looks counts too),
+  above; a turn it began and finished between two looks counts too; one
+  `done` per turn: its last frame noticed after its report is the same
+  turn, not another),
   `needs_input`, `permission`, `error`, `exited` (with `exit_code`), `closed`
   (the tab was closed; it is no longer watched), and `output_match` (a new
   line of output contains `output_pattern`, case-insensitive; lines already

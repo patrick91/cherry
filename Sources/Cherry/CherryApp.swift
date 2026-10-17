@@ -1000,6 +1000,10 @@ struct CherryApp: App {
         // not reach this app's tabs, whose adapters would refuse to attach
         // that tab's session as "from inside itself".
         CherryTabEnvironment.removeFromProcess()
+        // The control socket this app answers, decided before any tab
+        // launches (tabs name it): a live socket this copy inherited (from a
+        // Cherry tab, or another copy's) is never taken over.
+        CherryControlServer.appSocketPath = CherryControlServer.appSocketURL().path
         // Native surfaces take the user's own Ghostty keybinds (read when
         // the first one needs them; tests never read the user's files).
         TerminalSettings.readsUserGhosttyConfiguration = true
@@ -1097,6 +1101,10 @@ struct CherryApp: App {
                 .preferredColorScheme(terminalSettings.appearance.preferredColorScheme)
                 .onAppear {
                     guard controlServer == nil else { return }
+                    // The socket `init` chose (`appSocketPath`): the one this
+                    // run's tabs already name.
+                    let socketURL = CherryControlServer.appSocketPath.map { URL(fileURLWithPath: $0) }
+                        ?? CherryControlServer.appSocketURL()
                     let server = CherryControlServer(workspaceProvider: {
                         ProjectWindowRegistry.shared.activeWorkspace
                     }, todoStoreProvider: {
@@ -1105,11 +1113,14 @@ struct CherryApp: App {
                         ProjectWindowRegistry.shared.activeChromeState
                     }, openProjectProvider: { projectRoot in
                         showProject(projectRoot)
-                    })
+                    }, socketURL: socketURL)
                     // MCP tasks survive a relaunch: the last run's are read
                     // back (off this thread) before any request is handled.
                     server.configureTaskPersistence(store: .shared, hostings: .shared, stateStore: .shared)
                     server.start()
+                    // The run's agents find their CLIs' versions for Cherry
+                    // MCP on their command line (`AgentMCPLaunch`).
+                    SessionBackendPolicy.userSettings.agentMCPLaunch?.warmUp(agents: AgentSettings.shared.agents)
                     controlServer = server
                     // Devices' forwards reach its listeners (phase 4b).
                     RemoteMCPForwards.appServer = server

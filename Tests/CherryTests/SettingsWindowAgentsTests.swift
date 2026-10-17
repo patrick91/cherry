@@ -4,9 +4,10 @@ import Testing
 
 // Settings › Agents & MCP (AgentsSettingsPage.swift) and the agent editor
 // (AgentToolEditor.swift): the list's rows and tags, the presets and their
-// Add (a free name, never replacing an agent), Wake idle agents' source,
-// the MCP server's rows and the commands for other agent CLIs, and the
-// page's search rows. Private defaults and hand-built navigators only.
+// Add (a free name, never replacing an agent), Wake idle agents' and
+// Connect agents Cherry starts' sources, the MCP server's rows and the
+// commands for other agent CLIs, and the page's search rows. Private
+// defaults, injected socket paths and hand-built navigators only.
 
 private func preset(_ name: String) throws -> AgentToolDefinition {
     try #require(AgentConfiguration.presets.first { $0.name == name })
@@ -169,6 +170,56 @@ private func preset(_ name: String) throws -> AgentToolDefinition {
     #expect(AgentsSettingsPage.wakeLinesEnabled(defaults: defaults, launchArguments: [key: "NO"]))
 }
 
+/// Connect agents Cherry starts: on by default, as the launches read it
+/// (`AgentMCPLaunch.isEnabled`); Set here while off, ↺ removes the stored
+/// value; a launch argument makes it read-only.
+@Test @MainActor func settingsWindowAgentsConnectAgentsCherryStartsIsSetHereOnlyWhileOff() throws {
+    let key = AgentMCPLaunch.enabledDefaultsKey
+    #expect(key == "mcp.connectAgentsAtLaunch")
+    let defaults = privateDefaults("SettingsWindowAgentsConnect")
+    #expect(AgentsSettingsPage.connectAtLaunchTitle == "Connect agents Cherry starts")
+    #expect(AgentsSettingsPage.connectAtLaunchHelp
+        == "Claude Code 2.0.0 or later, Codex 0.162.0 or later and Pi 0.99.2 or later that Cherry starts, here and on your other Macs, get Cherry MCP on their command line. Off: they use what you registered.")
+    #expect(AgentsSettingsPage.otherCLIsIntro
+        == "Agents use Cherry's MCP server to see and drive your tabs. Agents you start yourself, and ones Cherry doesn't connect when it starts them, need it registered once with their CLI.")
+
+    // Nothing stored: on, Cherry's default.
+    var state = AgentsSettingsPage.connectAtLaunchSource(defaults: defaults, launchArguments: [:])
+    #expect(state.source == .cherryDefault)
+    #expect(AgentsSettingsPage.connectsAgentsAtLaunch(defaults: defaults, launchArguments: [:]))
+    #expect(AgentMCPLaunch.isEnabled(defaults))
+
+    // Off is Set here, and what launches read; ↺ removes the stored value.
+    defaults.set(false, forKey: key)
+    state = AgentsSettingsPage.connectAtLaunchSource(defaults: defaults, launchArguments: [:])
+    #expect(state.source == .setHere)
+    #expect(state.source.isEditable)
+    #expect(!AgentsSettingsPage.connectsAgentsAtLaunch(defaults: defaults, launchArguments: [:]))
+    #expect(!AgentMCPLaunch.isEnabled(defaults))
+    var shown = 0
+    state = AgentsSettingsPage.connectAtLaunchSource(defaults: defaults, launchArguments: [:]) { shown += 1 }
+    let reset = try #require(state.rowReset)
+    #expect(reset.title == "Reset to default (On)")
+    reset.perform()
+    #expect(shown == 1)
+    #expect(defaults.object(forKey: key) == nil)
+    #expect(AgentMCPLaunch.isEnabled(defaults))
+
+    // On, stored, is the default: no badge.
+    defaults.set(true, forKey: key)
+    #expect(AgentsSettingsPage.connectAtLaunchSource(defaults: defaults, launchArguments: [:]).source == .cherryDefault)
+
+    // A launch argument makes it This run only, and read-only; one that is
+    // no Bool leaves the default in use.
+    state = AgentsSettingsPage.connectAtLaunchSource(defaults: defaults, launchArguments: [key: false])
+    #expect(state.source == .launchArgument(applied: true))
+    #expect(!state.source.isEditable)
+    #expect(!AgentsSettingsPage.connectsAgentsAtLaunch(defaults: defaults, launchArguments: [key: false]))
+    state = AgentsSettingsPage.connectAtLaunchSource(defaults: defaults, launchArguments: [key: "NO"])
+    #expect(state.source == .launchArgument(applied: false))
+    #expect(AgentsSettingsPage.connectsAgentsAtLaunch(defaults: defaults, launchArguments: [key: "NO"]))
+}
+
 @Test @MainActor func settingsWindowAgentEditorSaysAddOrEditAndAsksBeforeDeleting() {
     #expect(AgentToolEditor.title(canDelete: false) == "Add Agent")
     #expect(AgentToolEditor.title(canDelete: true) == "Edit Agent")
@@ -204,12 +255,30 @@ private func preset(_ name: String) throws -> AgentToolDefinition {
     #expect(notListening.style == .warning)
     #expect(notListening.dot == .orange)
 
+    // The socket the app's server binds (`appSocketPath`), never the one
+    // `CherryControl.socketURL` derives, which in a Cherry started from a
+    // Cherry tab is that tab's app's: none in tests.
+    #expect(CherryControlServer.appSocketPath == nil)
+    #expect(AgentsSettingsPage.controlSocket() == AgentsSettingsPage.ControlSocket(path: nil, isListening: false))
+    let socket = "/tmp/cherry-test/Cherry-0123/control.sock"
+    var looked: [String] = []
+    #expect(AgentsSettingsPage.controlSocket(path: socket, fileExists: { looked.append($0); return true })
+        == AgentsSettingsPage.ControlSocket(path: socket, isListening: true))
+    #expect(looked == [socket])
+    #expect(AgentsSettingsPage.controlSocket(path: socket, fileExists: { _ in false })
+        == AgentsSettingsPage.ControlSocket(path: socket, isListening: false))
+    // The server did not listen there: no path, whatever is on disk.
+    #expect(AgentsSettingsPage.controlSocket(path: nil, fileExists: { _ in true })
+        == AgentsSettingsPage.ControlSocket(path: nil, isListening: false))
+
     let builder = MCPInstallCommandBuilder.commands()
     let commands = AgentsSettingsPage.otherCLICommands(builder)
     #expect(commands.map(\.harness) == [.claude, .codex, .pi])
     #expect(commands.map { $0.harness.productName } == ["Claude Code", "Codex", "Pi"])
-    // The commands are the builder's, whose own order stays.
+    // The commands are the builder's, whose own order stays; Pi's with its
+    // description, quoted.
     #expect(Set(commands.map(\.command)) == Set(builder.map(\.command)))
+    #expect(commands.last?.command.hasPrefix("pi mcp add cherry --exposure deferred --description 'Cherry, the terminal app this Pi runs in:") == true)
     #expect(builder.map(\.harness) == [.codex, .claude, .pi])
 }
 
@@ -232,14 +301,36 @@ private func preset(_ name: String) throws -> AgentToolDefinition {
     for query in ["claude mcp add", "codex mcp add", "pi mcp add", "install", "register"] {
         #expect(results(query).map(\.row.id).contains(.agentsOtherCLIs), "\(query)")
     }
+    // Connect Agents to Cherry…: its own row in MCP server, whose button
+    // opens the sheet (nothing runs until its confirmation).
+    #expect(SettingsRowID.agentsConnectAgents.rawValue == "agents.connectAgents")
+    #expect(AgentsSettingsPage.connectAgentsTitle == "Connect Agents to Cherry")
+    #expect(AgentsSettingsPage.connectAgentsHelp
+        == "Shows Claude Code, Codex and Pi on this Mac, whether each has Cherry MCP, and the command that connects it. Nothing runs until you confirm.")
+    for query in ["connect agents to cherry", "mcp add", "register", "claude", "codex", "pi"] {
+        #expect(results(query).map(\.row.id).contains(.agentsConnectAgents), "\(query)")
+    }
+    let connectAgents = try #require(results("connect agents to cherry").first { $0.row.id == .agentsConnectAgents })
+    #expect(connectAgents.row.title == "Connect Agents to Cherry")
+    #expect(connectAgents.row.detail == "MCP server")
     let wake = try #require(results("wake").first { $0.row.id == .agentsWakeLines })
     #expect(wake.row.value == "Off")
     #expect(wake.row.detail == "Monitors · Off")
     #expect(results("socket").map(\.row.id).contains(.agentsControlSocket))
     #expect(results("instance socket").map(\.row.id).contains(.agentsControlSocket))
-    #expect(results("yolo").map(\.row.id) == [.agentsPresets])
+    // Codex's preset line first; word starts in Connect agents Cherry
+    // starts' help ("your", "line", "Off") match it too, below.
+    #expect(results("yolo").map(\.row.id) == [.agentsPresets, .agentsConnectAtLaunch])
     #expect(results("other macs").map(\.row.id).contains(.agentsOtherMacs))
     #expect(results("stdio").map(\.row.id).contains(.agentsMCPServer))
+    for query in ["mcp-config", "connect agents", "launch"] {
+        #expect(results(query).map(\.row.id).contains(.agentsConnectAtLaunch), "\(query)")
+    }
+    let connect = try #require(results("mcp-config").first { $0.row.id == .agentsConnectAtLaunch })
+    #expect(connect.row.title == "Connect agents Cherry starts")
+    #expect(connect.row.detail == "MCP server · On")
+    defaults.set(false, forKey: AgentMCPLaunch.enabledDefaultsKey)
+    #expect(AgentsSettingsPage.searchRows(in: context).first { $0.id == .agentsConnectAtLaunch }?.value == "Off")
 
     func listValue() -> String? {
         AgentsSettingsPage.searchRows(in: context).first { $0.id == .agentsList }?.value

@@ -117,7 +117,10 @@ struct HostedLaunchSpec: Equatable, Sendable {
             shellIntegration: isZsh ? context.zshBootstrap : nil,
             inheritedEnvironment: context.processEnvironment,
             terminfoDirectories: resources?.terminfoDirectory,
-            mcpHelperPath: context.mcpHelperPath
+            mcpHelperPath: context.mcpHelperPath,
+            mcpServerName: context.mcpServerName,
+            controlSocketPath: context.controlSocketPath,
+            cliPath: context.cliPath
         )
         let command = if let resources {
             ghosttyShellIntegration(
@@ -132,6 +135,12 @@ struct HostedLaunchSpec: Equatable, Sendable {
 
         // Cherry's environment overrides everything, as Ghostty's env_override.
         environment.merge(cherry.environment) { _, cherry in cherry }
+        // An empty CHERRY_CONTROL_SOCKET hides Cherry's own from a Ghostty
+        // surface; the host's environment never had that one (see
+        // `inheritedTerminalKeys`).
+        if environment[CherryControl.socketEnvironmentKey]?.isEmpty == true {
+            environment[CherryControl.socketEnvironmentKey] = nil
+        }
         if resources == nil, environment["TERM"] == ShellProcessController.ghosttyTerm {
             environment["TERM"] = fallbackTerm
         }
@@ -157,6 +166,8 @@ struct HostedLaunchSpec: Equatable, Sendable {
         executableDirectory: String? = Bundle.main.executableURL?.deletingLastPathComponent().path,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         parentProcessID: pid_t = getppid(),
+        controlSocketPath: String? = CherryControlServer.appSocketPath,
+        cliPath: String? = ShellProcessController.appCLIPath,
         stager: GhosttyResourceStager = .shared
     ) async -> HostedLaunchSpec {
         let context = await HostedLaunchContext.prepare(
@@ -167,6 +178,8 @@ struct HostedLaunchSpec: Equatable, Sendable {
             executableDirectory: executableDirectory,
             homeDirectory: homeDirectory,
             parentProcessID: parentProcessID,
+            controlSocketPath: controlSocketPath,
+            cliPath: cliPath,
             stager: stager
         )
         return make(for: configuration, context: context)
@@ -262,7 +275,11 @@ struct HostedLaunchSpec: Equatable, Sendable {
         // Cherry is a colour terminal (the forkpty launch drops it too).
         "NO_COLOR",
         // Set explicitly from the login environment.
-        "SSH_AUTH_SOCK"
+        "SSH_AUTH_SOCK",
+        // The control socket of the Cherry (or the private run) that started
+        // this one: a tab names the socket this app answers, when it has one
+        // (`HostedLaunchContext.controlSocketPath`).
+        CherryControl.socketEnvironmentKey
     ])
 
     /// What Ghostty removes when Cherry runs from Xcode (it also drops
@@ -400,10 +417,19 @@ extension ShellProcessController {
 /// runs inside a Cherry tab, nothing may pass them on from its own
 /// environment as if they described a new session. `HostedLaunchSpec` and
 /// `HostedSessionLoginEnvironment` both drop exactly these.
+///
+/// `CHERRY_CONTROL_SOCKET` is a tab's too, but not one of them: a private
+/// run gives the app its socket that way, which must survive
+/// `removeFromProcess` (`CherryControlServer.appSocketURL` never takes over
+/// a live one). Both drop an inherited one as well, and the launches name
+/// the app's own.
 enum CherryTabEnvironment {
     static let keys: Set<String> = [
         CherryControl.projectRootEnvironmentKey, CherryControl.processIDEnvironmentKey,
         CherryControl.agentIDEnvironmentKey, CherryControl.mcpHelperEnvironmentKey,
+        CherryControl.mcpServerNameEnvironmentKey,
+        CherryControl.cliEnvironmentKey, CherryControl.mcpTokenEnvironmentKey,
+        CherryControl.controlMachineEnvironmentKey,
         "CHERRY_SESSION_ID", "CHERRY_BOOTSTRAP_ZDOTDIR",
         "CHERRY_ORIGINAL_ZDOTDIR", "CHERRY_STARTUP_COMMAND", "CHERRY_EMIT_OSC133",
         "CHERRY_TERM_PROGRAM", "INSIDE_CHERRY"
@@ -502,6 +528,17 @@ struct HostedLaunchContext: Equatable, Sendable {
     /// CHERRY_MCP_HELPER: the app's CherryMCP, when `executableDirectory`
     /// has one (as a native tab's, `ShellProcessController.appMCPHelperPath`).
     var mcpHelperPath: String? = nil
+    /// CHERRY_MCP_SERVER_NAME, set beside CHERRY_MCP_HELPER: the name
+    /// Cherry's server has in its agents (the identity's scheme), as a
+    /// native tab's.
+    var mcpServerName: String? = CherryAppIdentity.current.urlScheme
+    /// CHERRY_CONTROL_SOCKET: the socket the app's control server answers
+    /// (`CherryControlServer.appSocketPath`), never the one Cherry
+    /// inherited. Nil when it has none (tests, a server that did not listen).
+    var controlSocketPath: String? = nil
+    /// CHERRY_CLI: the `cherry` the app runs itself
+    /// (`ShellProcessController.appCLIPath`).
+    var cliPath: String? = nil
 
     /// Ghostty's defaults as Cherry configures it: cursor, path and title on;
     /// sudo, ssh-env and ssh-terminfo off. The cursor feature follows the
@@ -539,6 +576,8 @@ struct HostedLaunchContext: Equatable, Sendable {
         executableDirectory: String? = Bundle.main.executableURL?.deletingLastPathComponent().path,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         parentProcessID: pid_t = getppid(),
+        controlSocketPath: String? = CherryControlServer.appSocketPath,
+        cliPath: String? = ShellProcessController.appCLIPath,
         stager: GhosttyResourceStager = .shared
     ) async -> HostedLaunchContext {
         let shellPath = configuration.shellPath
@@ -563,7 +602,9 @@ struct HostedLaunchContext: Equatable, Sendable {
             executableDirectory: executableDirectory,
             terminalProgramVersion: embeddedGhosttyVersion,
             shellFeatures: ghosttyShellFeatures(cursorBlink: cursorBlink),
-            mcpHelperPath: mcpHelperPath
+            mcpHelperPath: mcpHelperPath,
+            controlSocketPath: controlSocketPath,
+            cliPath: cliPath
         )
     }
 }

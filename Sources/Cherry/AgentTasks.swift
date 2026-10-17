@@ -1059,15 +1059,15 @@ extension CherryControlServer {
 
     /// A task whose worker's tab is in no open window while its session
     /// runs on its host, when the caller (This Mac's) descends from that
-    /// session's program.
+    /// session's program (among its processes pinned when it connected,
+    /// `callerProcessChain`).
     @MainActor
     private func awayWorkerTaskOfCaller() -> AgentTask? {
-        guard Self.remoteDevice == nil, callerSessionResolverForTesting == nil, let peerPID = Self.callerPeerPID else { return nil }
-        let ancestry = Set(CherryControl.processAncestry(of: peerPID))
+        guard Self.remoteDevice == nil, callerSessionResolverForTesting == nil, let chain = Self.callerProcessChain else { return nil }
         for id in tasks.taskOrder.reversed() {
             guard let task = tasks.tasks[id], task.state != .cancelled, locateWorker(task) == nil,
                   let hosting = hosting(of: task), let sessionID = task.hostSessionID ?? task.workerSession?.sessionID,
-                  let pid = hosting.sessionInfo(sessionID)?.pid, ancestry.contains(Int32(bitPattern: pid))
+                  let pid = hosting.sessionInfo(sessionID)?.pid, chain.contains(Int32(bitPattern: pid))
             else { continue }
             return task
         }
@@ -1287,10 +1287,9 @@ extension CherryControlServer {
         }
         let selection = try taskSelection(runID: request.runID, taskIDs: request.taskIDs, defaultingToCallers: true)
         let callerID = verifiedCallerSession()?.id
-        let timeout = min(
-            max(request.timeoutMilliseconds ?? CherryControl.maximumTaskWaitMilliseconds, 0),
-            CherryControl.maximumTaskWaitMilliseconds
-        )
+        // A tool call's client may allow a longer wait than a typed
+        // request's (`callerWaitCapMilliseconds`); the default stays 50 s.
+        let timeout = Self.callerWaitMilliseconds(request.timeoutMilliseconds, typedMaximum: CherryControl.maximumTaskWaitMilliseconds)
         let maxEvents = min(max(request.maxEvents ?? 100, 1), 500)
         var after = max(request.cursor ?? 0, 0)
         // A cursor Cherry cannot go on from (it names events a relaunch

@@ -726,12 +726,23 @@ private extension ProcessInfo {
     do {
         let helpers = try RemoteHostHelpers.load(directory: mac.binaries, mcpHelper: .some(mcp))
         #expect(helpers.mcpHelper == mcp)
-        // CherryMCP is part of the resources' digest.
+        // Cherry's Pi extension comes with it: the bundle's copy.
+        let piExtension = try #require(PiMCPExtension.bundledURL)
+        #expect(helpers.piExtension == piExtension)
+        // Both are part of the resources' digest.
         let without = try RemoteHostHelpers.load(directory: mac.binaries, mcpHelper: .some(nil))
         #expect(without.mcpHelper == nil)
+        #expect(without.piExtension == nil)
         #expect(helpers.resourcesHash != nil && helpers.resourcesHash != without.resourcesHash)
-        #expect(RemoteHostInstaller.archiveArguments(helpers).suffix(3) == ["-C", mcp.deletingLastPathComponent().path, "CherryMCP"])
+        let withoutExtension = try RemoteHostHelpers.load(directory: mac.binaries, mcpHelper: .some(mcp), piExtension: .some(nil))
+        #expect(withoutExtension.piExtension == nil)
+        #expect(withoutExtension.resourcesHash != helpers.resourcesHash)
+        #expect(RemoteHostInstaller.archiveArguments(helpers).suffix(6) == [
+            "-C", mcp.deletingLastPathComponent().path, "CherryMCP",
+            "-C", piExtension.deletingLastPathComponent().path, "cherry-pi-mcp.ts",
+        ])
         #expect(!RemoteHostInstaller.archiveArguments(without).contains("CherryMCP"))
+        #expect(!RemoteHostInstaller.archiveArguments(without).contains("cherry-pi-mcp.ts"))
 
         let store = deviceStore(for: mac, directory: directory)
         let model = AddDeviceModel(
@@ -741,15 +752,17 @@ private extension ProcessInfo {
         await model.check()
         let device = try #require(await model.addInstallingIfNeeded(), "\(model.error ?? "")")
         let installed = mac.installRoot.appendingPathComponent(helpers.directoryName, isDirectory: true)
-        #expect(entries(installed) == ["CherryMCP", "Ghostty", "cherry", "cherry-host", "terminfo"])
+        #expect(entries(installed) == ["CherryMCP", "Ghostty", "cherry", "cherry-host", "cherry-pi-mcp.ts", "terminfo"])
         #expect(try RemoteHostHelpers.sha256(installed.appendingPathComponent("CherryMCP")) == RemoteHostHelpers.sha256(mcp))
+        #expect(try RemoteHostHelpers.sha256(installed.appendingPathComponent("cherry-pi-mcp.ts")) == RemoteHostHelpers.sha256(piExtension))
         #expect(device.installedResources)
         // It runs there.
         #expect(try runTool(installed.appendingPathComponent("CherryMCP").path, ["--version"]) == 0)
-        // The device's tabs name it.
+        // The device's tabs name them.
         #expect(store.launchDevice(id: device.id)?.mcp?.helperPath == installed.appendingPathComponent("CherryMCP").path)
-        // Checked again: the shell's digest counts CherryMCP too, so nothing
-        // is copied again.
+        #expect(store.launchDevice(id: device.id)?.mcp?.piExtensionPath == installed.appendingPathComponent("cherry-pi-mcp.ts").path)
+        // Checked again: the shell's digest counts CherryMCP and the
+        // extension too, so nothing is copied again.
         let update = UpdateDeviceHostModel(
             deviceID: device.id, store: store, shell: { mac.shell }, helpers: { .success(helpers) },
             masters: noMasters, reconnect: { _ in }

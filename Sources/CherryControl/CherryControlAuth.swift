@@ -16,6 +16,10 @@ extension CherryControl {
     /// The CherryMCP of the Cherry build that started the tab, on the Mac
     /// that runs it (the device), which the stable launcher runs.
     public static let mcpHelperEnvironmentKey = "CHERRY_MCP_HELPER"
+    /// The name Cherry's server has in the agents Cherry starts (the
+    /// identity's URL scheme), next to `CHERRY_MCP_HELPER` in every tab
+    /// that has it: what Cherry's Pi extension registers the helper as.
+    public static let mcpServerNameEnvironmentKey = "CHERRY_MCP_SERVER_NAME"
     /// The name of the Mac Cherry runs on, for "Cherry on <Mac> is not
     /// reachable".
     public static let controlMachineEnvironmentKey = "CHERRY_CONTROL_MACHINE"

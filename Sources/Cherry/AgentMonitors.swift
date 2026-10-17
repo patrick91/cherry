@@ -360,10 +360,9 @@ extension CherryControlServer {
             monitors.acknowledge(subscription, upTo: cursor)
         }
         let after = max(request.cursor ?? subscription.ackCursor, subscription.ackCursor)
-        let timeout = min(
-            max(request.timeoutMilliseconds ?? CherryControl.maximumEventWaitMilliseconds, 0),
-            CherryControl.maximumEventWaitMilliseconds
-        )
+        // A tool call's client may allow a longer wait than a typed
+        // request's (`callerWaitCapMilliseconds`); the default stays 50 s.
+        let timeout = Self.callerWaitMilliseconds(request.timeoutMilliseconds, typedMaximum: CherryControl.maximumEventWaitMilliseconds)
         let maxEvents = min(max(request.maxEvents ?? 50, 1), 200)
         let deadline = Date().addingTimeInterval(TimeInterval(timeout) / 1_000)
         subscription.activeWaits += 1
@@ -400,8 +399,10 @@ extension CherryControlServer {
     // MARK: Identity and scope
 
     /// The caller's own tab: the token's tab for a caller on another Mac;
-    /// for This Mac's, the tab whose program is an ancestor of the
-    /// connecting process (its CherryMCP). Nil when none is.
+    /// for This Mac's, the tab whose program is one of the connecting
+    /// process's (its CherryMCP's) ancestors, as they were when it
+    /// connected (`callerProcessChain`, `callerSession(matching:in:)`). Nil
+    /// when none is.
     @MainActor
     func verifiedCallerSession() -> TerminalSession? {
         let workspaces = allOpenWorkspaces()
@@ -412,18 +413,8 @@ extension CherryControlServer {
         if let resolver = callerSessionResolverForTesting {
             return resolver(Self.callerPeerPID)
         }
-        guard let peerPID = Self.callerPeerPID else { return nil }
-        let ancestry = Set(CherryControl.processAncestry(of: peerPID))
-        for attached in [false, true] {
-            for workspace in workspaces {
-                for session in workspace.sessions where (session.hostedAttachment != nil) == attached {
-                    if let pid = session.programProcessID, ancestry.contains(pid) {
-                        return session
-                    }
-                }
-            }
-        }
-        return nil
+        guard let chain = Self.callerProcessChain else { return nil }
+        return Self.callerSession(matching: chain, in: workspaces)?.session
     }
 
     @MainActor

@@ -35,7 +35,7 @@ func inertDeviceHosting(_ destination: String, name: String) -> PersistentHostSe
 /// the device's project (the caller's), one of another device's project,
 /// and a This Mac window whose "Echo" command is a live `/bin/cat`.
 @MainActor
-private final class DeviceMCPHarness {
+final class DeviceMCPHarness {
     let defaultsName = "CherryTests.RemoteMCP.\(UUID().uuidString)"
     let defaults: UserDefaults
     let settings: AgentSettings
@@ -733,6 +733,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     let mcp = RemoteMCPLaunch(
         deviceID: deviceID, socketPath: socket,
         helperPath: "/Users/them/Library/Application Support/cherry-host/bin/b1/CherryMCP",
+        cliPath: "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry",
         controlMachine: "Laptop", tokens: tokens
     )
     // This Mac's own values never travel.
@@ -743,6 +744,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         environment: [
             "CHERRY_CONTROL_SOCKET": "/tmp/cherry-501/x/control.sock",
             "CHERRY_MCP_TOKEN": "local", "CHERRY_MCP_HELPER": "/Applications/Cherry.app/x", "CHERRY_CONTROL_MACHINE": "x",
+            "CHERRY_CLI": "/Applications/Cherry.app/Contents/MacOS/cherry", "CHERRY_MCP_SERVER_NAME": "local",
         ],
         term: "xterm-ghostty", initialSize: TerminalViewportSize(columns: 80, rows: 24)
     )
@@ -750,18 +752,63 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     #expect(spec.environment["CHERRY_CONTROL_SOCKET"] == socket)
     #expect(spec.environment["CHERRY_MCP_TOKEN"] == tokens.currentToken(tabID: tab, deviceID: deviceID))
     #expect(spec.environment["CHERRY_MCP_HELPER"] == "/Users/them/Library/Application Support/cherry-host/bin/b1/CherryMCP")
+    // Beside it, the name Cherry's Pi extension registers it as.
+    #expect(spec.environment["CHERRY_MCP_SERVER_NAME"] == CherryAppIdentity.current.urlScheme)
     #expect(spec.environment["CHERRY_CONTROL_MACHINE"] == "Laptop")
+    // The install's own `cherry`, beside its CherryMCP.
+    #expect(spec.environment["CHERRY_CLI"] == "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry")
     #expect(spec.environment["CHERRY_PROCESS_ID"] == tab.uuidString)
     #expect(spec.environment["CHERRY_PROJECT_ROOT"] == "/Users/them/app")
     // Without Cherry MCP (a device store with no installation id): none of it.
     let plain = RemoteLaunchSpec.make(for: configuration, localeEnvironment: [:])
-    for key in ["CHERRY_CONTROL_SOCKET", "CHERRY_MCP_TOKEN", "CHERRY_MCP_HELPER", "CHERRY_CONTROL_MACHINE"] {
+    for key in ["CHERRY_CONTROL_SOCKET", "CHERRY_MCP_TOKEN", "CHERRY_MCP_HELPER", "CHERRY_CONTROL_MACHINE", "CHERRY_CLI", "CHERRY_MCP_SERVER_NAME"] {
         #expect(plain.environment[key] == nil)
     }
-    // The helper there is the install's.
+    // Without the install's CherryMCP, no name either.
+    var helperless = mcp
+    helperless.helperPath = nil
+    let unnamed = RemoteLaunchSpec.make(for: configuration, device: .init(mcp: helperless), localeEnvironment: [:])
+    #expect(unnamed.environment["CHERRY_MCP_SERVER_NAME"] == nil)
+    // The helper and the CLI there are the install's.
     #expect(RemoteMCPPaths.helperPath(remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host", homeDirectory: "/Users/them")
         == "/Users/them/Library/Application Support/cherry-host/bin/b1/CherryMCP")
     #expect(RemoteMCPPaths.helperPath(remoteHostPath: "/usr/local/bin/cherry-host", homeDirectory: "/Users/them") == nil)
+    #expect(RemoteMCPPaths.cliPath(remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host", homeDirectory: "/Users/them")
+        == "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry")
+    #expect(RemoteMCPPaths.cliPath(remoteHostPath: "/usr/local/bin/cherry-host", homeDirectory: "/Users/them") == nil)
+    #expect(RemoteMCPPaths.piExtensionPath(remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host", homeDirectory: "/Users/them")
+        == "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry-pi-mcp.ts")
+    #expect(RemoteMCPPaths.piExtensionPath(remoteHostPath: "/usr/local/bin/cherry-host", homeDirectory: "/Users/them") == nil)
+
+    // The device store names them for a device whose install has its
+    // resources (and so its CherryMCP), else neither.
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ch-mcpcli-\(UUID().uuidString.prefix(8))")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let suite = "CherryTests.RemoteMCPCLI.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let store = RemoteDeviceStore(
+        fileURL: directory.appendingPathComponent("devices.json"),
+        hostStore: HostedSessionHostStore(defaults: defaults),
+        installationID: { installation },
+        registry: PersistentHostingRegistry(local: PersistentHostSessions(installationUnavailableReason: { nil }, status: PersistentSessionsStatus())),
+        remoteHostPaths: HostedRemoteHostPaths()
+    )
+    let device = try store.add(
+        name: "Studio", sshDestination: "studio",
+        remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host",
+        homeDirectory: "/Users/them", installedBuild: "b1", installedResources: true,
+        userTemporaryDirectory: temporary
+    )
+    let stored = try #require(store.launchDevice(id: device.id)?.mcp)
+    #expect(stored.helperPath == "/Users/them/Library/Application Support/cherry-host/bin/b1/CherryMCP")
+    #expect(stored.cliPath == "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry")
+    #expect(stored.piExtensionPath == "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry-pi-mcp.ts")
+    #expect(stored.serverName == CherryAppIdentity.current.urlScheme)
+    store.update(device.id) { $0.installedResources = false }
+    let withoutResources = try #require(store.launchDevice(id: device.id)?.mcp)
+    #expect(withoutResources.helperPath == nil && withoutResources.cliPath == nil && withoutResources.piExtensionPath == nil)
 }
 
 @Test @MainActor func RemoteDeviceMCPDeviceStoreGivesItsTabsCherryMCP() throws {
@@ -852,6 +899,27 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
 
 // MARK: - Set Up Cherry MCP
 
+/// Runs Set Up's script for `mode` as `sh -s` there would, with a private
+/// HOME and `loginShell` as the user's shell (it names the stand-ins'
+/// PATH), and reads its report.
+private func runMCPSetupScript(_ mode: RemoteMCPSetup.Mode, home: URL, loginShell: URL, helperPath: String?) throws -> RemoteMCPSetup.Report {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-s"]
+    process.environment = ["HOME": home.path, "SHELL": loginShell.path, "PATH": "/usr/bin:/bin"]
+    let input = Pipe(), output = Pipe()
+    process.standardInput = input
+    process.standardOutput = output
+    process.standardError = FileHandle.nullDevice
+    try process.run()
+    input.fileHandleForWriting.write(Data(RemoteMCPSetup.script(mode: mode, name: "cherry", helperPath: helperPath).utf8))
+    try input.fileHandleForWriting.close()
+    let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    process.waitUntilExit()
+    let fields = try #require(RemoteHostInstaller.fields(.init(status: process.terminationStatus, standardOutput: text, standardError: "")))
+    return RemoteMCPSetup.Report(fields: fields)
+}
+
 @Test func RemoteDeviceMCPSetupRegistersTheLauncherIdempotentlyAndRemovesIt() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("ch-mcpsetup-\(UUID().uuidString.prefix(8))")
     let home = root.appendingPathComponent("home")
@@ -871,6 +939,10 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     chmod(realConfig.path, 0o640)
     try FileManager.default.createSymbolicLink(at: codexConfig, withDestinationURL: realConfig)
     for tool in ["claude", "codex", "pi"] {
+        // pi says its version (one with MCP), which is not logged.
+        let version = tool == "pi" ? """
+        if [ "$1" = --version ]; then echo 1.3.0; exit 0; fi
+        """ : ""
         let config = tool == "codex" ? """
           add) printf '\\n[mcp_servers.%s]\\ncommand = "%s"\\nenv_vars = [\\n  "OLD",\\n]\\nargs = []\\n' "$3" "$5" >> "$HOME/.codex/config.toml" ;;
         """ : ""
@@ -879,6 +951,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         """ : ""
         let script = """
         #!/bin/sh
+        \(version)
         printf '%s\\n' "$*" >> '\(root.path)/\(tool).log'
         printf '%s\\n' "${PI_CODING_AGENT_DIR:-}" > '\(root.path)/\(tool).pidir'
         case "$2" in
@@ -904,21 +977,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     try "#!/bin/sh\n[ \"$1\" = --version ] && { echo '{\"name\":\"CherryMCP\"}'; exit 0; }\necho \"ran $*\"\n".write(to: helper, atomically: true, encoding: .utf8)
     chmod(helper.path, 0o755)
     func run(_ mode: RemoteMCPSetup.Mode) throws -> RemoteMCPSetup.Report {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-s"]
-        process.environment = ["HOME": home.path, "SHELL": loginShell.path, "PATH": "/usr/bin:/bin"]
-        let input = Pipe(), output = Pipe()
-        process.standardInput = input
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        input.fileHandleForWriting.write(Data(RemoteMCPSetup.script(mode: mode, name: "cherry", helperPath: helper.path).utf8))
-        try input.fileHandleForWriting.close()
-        let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        process.waitUntilExit()
-        let fields = try #require(RemoteHostInstaller.fields(.init(status: process.terminationStatus, standardOutput: text, standardError: "")))
-        return RemoteMCPSetup.Report(fields: fields)
+        try runMCPSetupScript(mode, home: home, loginShell: loginShell, helperPath: helper.path)
     }
     let launcher = home.appendingPathComponent(RemoteMCPPaths.launcherRelativePath).path
     // The check reads no agent configuration and changes nothing.
@@ -926,6 +985,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     #expect(checked.claude == stubs.appendingPathComponent("claude").path)
     #expect(checked.codex == stubs.appendingPathComponent("codex").path)
     #expect(checked.pi == stubs.appendingPathComponent("pi").path)
+    #expect(checked.piVersion == "1.3.0" && checked.piHasMCP && checked.piSkipped == nil)
     #expect(checked.helperVersion == "{\"name\":\"CherryMCP\"}")
     #expect(!checked.launcherInstalled)
     #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("claude.log").path))
@@ -939,10 +999,11 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         let report = try run(.install)
         #expect(report.failures.isEmpty, "\(report.failures)")
         #expect(report.claudeResult == "ok" && report.codexResult == "ok" && report.piResult == "ok" && report.launcherInstalled)
-        // Pi: direct exposure, so the model sees Cherry's tools themselves,
-        // run with the agent directory the login shell names.
+        // Pi: deferred exposure, so the model finds Cherry's tools through
+        // Pi's tool search, with its description, run with the agent
+        // directory the login shell names.
         #expect(try String(contentsOf: root.appendingPathComponent("pi.registered"), encoding: .utf8)
-            == "mcp add cherry --exposure direct -- \(launcher)\n")
+            == "mcp add cherry --exposure deferred --description \(PiMCPRegistration.serverDescription) -- \(launcher)\n")
         #expect(try String(contentsOf: root.appendingPathComponent("pi.pidir"), encoding: .utf8) == piDirectory + "\n")
         #expect(try String(contentsOf: root.appendingPathComponent("claude.registered"), encoding: .utf8)
             == "mcp add --scope user --transport stdio cherry -- \(launcher)\n")
@@ -1007,6 +1068,169 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     #expect(RemoteMCPSetup.installCommands(name: "cherry").contains(
         "claude mcp remove --scope user cherry; claude mcp add --scope user --transport stdio cherry -- \"$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp\""
     ))
+    #expect(RemoteMCPSetup.installCommands(name: "cherry").contains(
+        "pi mcp add cherry --exposure deferred --description '\(PiMCPRegistration.serverDescription)' -- \"$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp\""
+    ))
+    // The version note is a line of its own: zsh without
+    // interactive_comments would give a trailing `# …` to Pi as the
+    // launcher's arguments.
+    let commands = RemoteMCPSetup.installCommands(name: "cherry")
+    let piLine = try #require(commands.firstIndex { $0.hasPrefix("pi mcp add ") })
+    #expect(commands[piLine - 1] == "# only with Pi 0.99.2 or later: an older pi takes these words as prompts")
+    #expect(!commands.contains { !$0.hasPrefix("#") && $0.contains("#") })
+    #expect(!RemoteMCPSetup.installCommands(name: "cherry").joined().contains("direct"))
+    // Pi ran one add and one remove (its --version is not logged).
+    #expect(try String(contentsOf: root.appendingPathComponent("pi.log"), encoding: .utf8)
+        == String(repeating: "mcp add cherry --exposure deferred --description \(PiMCPRegistration.serverDescription) -- \(launcher)\n", count: 2)
+        + "mcp remove cherry\n")
+}
+
+/// A Pi without MCP (0.62.0) takes `pi mcp …` as prompts for its model:
+/// Set Up's check, install and remove ask it only its version, say why
+/// they skipped it (not a failure), and offer nothing to set up when it is
+/// the only CLI there.
+@Test @MainActor func RemoteDeviceMCPSetupNeverRunsPiMCPOnAPiWithoutIt() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("ch-mcpsetup-old-\(UUID().uuidString.prefix(8))")
+    let home = root.appendingPathComponent("home")
+    let stubs = root.appendingPathComponent("stubs")
+    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: stubs, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    // Claude Code and Codex stand-ins too, so the script never finds a
+    // real one in /opt/homebrew/bin or /usr/local/bin.
+    for tool in ["claude", "codex", "pi"] {
+        let version = tool == "pi" ? "if [ \"$1\" = --version ]; then echo 0.62.0; exit 0; fi\n" : ""
+        let url = stubs.appendingPathComponent(tool)
+        try "#!/bin/sh\n\(version)printf '%s\\n' \"$*\" >> '\(root.path)/\(tool).log'\nexit 0\n".write(to: url, atomically: true, encoding: .utf8)
+        chmod(url.path, 0o755)
+    }
+    let loginShell = stubs.appendingPathComponent("login-shell")
+    try "#!/bin/sh\nprintf '%s' '\(stubs.path):/usr/bin:/bin'\n".write(to: loginShell, atomically: true, encoding: .utf8)
+    chmod(loginShell.path, 0o755)
+    let piLog = root.appendingPathComponent("pi.log")
+
+    let checked = try runMCPSetupScript(.check, home: home, loginShell: loginShell, helperPath: nil)
+    #expect(checked.pi == stubs.appendingPathComponent("pi").path)
+    #expect(checked.piVersion == "0.62.0")
+    #expect(!checked.piHasMCP && checked.piSkipped == nil && checked.piResult == nil)
+    for mode in [RemoteMCPSetup.Mode.install, .remove] {
+        let report = try runMCPSetupScript(mode, home: home, loginShell: loginShell, helperPath: nil)
+        #expect(report.piResult == nil, "\(mode)")
+        #expect(report.piSkipped == "Pi 0.62.0 has no MCP (needs 0.99.2 or later)", "\(mode)")
+        #expect(!report.failures.contains { $0.hasPrefix("pi:") }, "\(report.failures)")
+    }
+    #expect(!FileManager.default.fileExists(atPath: piLog.path), "pi ran nothing but --version")
+    #expect(try String(contentsOf: root.appendingPathComponent("claude.log"), encoding: .utf8).contains("mcp add"))
+
+    // The sheet says why, and with Pi the only CLI there, offers nothing.
+    let directory = root.appendingPathComponent("store")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let suite = "CherryTests.RemoteMCPSetupOldPi.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let store = RemoteDeviceStore(
+        fileURL: directory.appendingPathComponent("devices.json"),
+        hostStore: HostedSessionHostStore(defaults: defaults),
+        installationID: { UUID() },
+        registry: PersistentHostingRegistry(local: PersistentHostSessions(installationUnavailableReason: { nil }, status: PersistentSessionsStatus())),
+        remoteHostPaths: HostedRemoteHostPaths()
+    )
+    let device = try store.add(
+        name: "Studio", sshDestination: "studio",
+        remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host",
+        homeDirectory: "/Users/them", installedBuild: "b1"
+    )
+    func model(_ fields: [(key: String, value: String)]) async -> RemoteMCPSetupModel {
+        let model = RemoteMCPSetupModel(deviceID: device.id, store: store) { _, _ in .success(RemoteMCPSetup.Report(fields: fields)) }
+        await model.check()
+        return model
+    }
+    let onlyOldPi = await model([("pi", "/opt/homebrew/bin/pi"), ("pi_version", "0.62.0")])
+    #expect(onlyOldPi.findings.contains("Pi: /opt/homebrew/bin/pi (Pi 0.62.0: no MCP, update Pi there)"))
+    #expect(!onlyOldPi.canSetUp)
+    let oddPi = await model([("pi", "/x/pi"), ("pi_version", "garbage")])
+    #expect(oddPi.findings.contains("Pi: /x/pi (--version printed “garbage”: no MCP, update Pi there)"))
+    let newPi = await model([("pi", "/opt/homebrew/bin/pi"), ("pi_version", "1.3.0"), ("pi_mcp", "1")])
+    #expect(newPi.findings.contains("Pi: /opt/homebrew/bin/pi"))
+    #expect(newPi.canSetUp)
+    let oldPiAndClaude = await model([("claude", "/x/claude"), ("pi", "/x/pi"), ("pi_version", "0.62.0")])
+    #expect(oldPiAndClaude.canSetUp)
+}
+
+/// Pi 0.62.0 prints its version on standard error without a terminal: the
+/// script reads that only for the sheet's message ("Pi 0.62.0: no MCP,
+/// update Pi there"), and gates on standard output alone, so neither it
+/// nor a Pi that names 1.3.0 only there is given `pi mcp`.
+@Test @MainActor func RemoteDeviceMCPSetupReadsPisStandardErrorOnlyForItsMessage() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("ch-mcpsetup-stderr-\(UUID().uuidString.prefix(8))")
+    let home = root.appendingPathComponent("home")
+    let stubs = root.appendingPathComponent("stubs")
+    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: stubs, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let loginShell = stubs.appendingPathComponent("login-shell")
+    try "#!/bin/sh\nprintf '%s' '\(stubs.path):/usr/bin:/bin'\n".write(to: loginShell, atomically: true, encoding: .utf8)
+    chmod(loginShell.path, 0o755)
+    let piLog = root.appendingPathComponent("pi.log")
+    func standIns(piVersion: String) throws {
+        // Claude Code and Codex stand-ins too, so the script never finds a
+        // real one in /opt/homebrew/bin or /usr/local/bin.
+        for tool in ["claude", "codex", "pi"] {
+            let version = tool == "pi" ? "if [ \"$1\" = --version ]; then echo \(piVersion) >&2; exit 0; fi\n" : ""
+            let url = stubs.appendingPathComponent(tool)
+            try "#!/bin/sh\n\(version)printf '%s\\n' \"$*\" >> '\(root.path)/\(tool).log'\nexit 0\n".write(to: url, atomically: true, encoding: .utf8)
+            chmod(url.path, 0o755)
+        }
+    }
+
+    try standIns(piVersion: "0.62.0")
+    for mode in [RemoteMCPSetup.Mode.check, .install, .remove] {
+        let report = try runMCPSetupScript(mode, home: home, loginShell: loginShell, helperPath: nil)
+        #expect(report.pi == stubs.appendingPathComponent("pi").path, "\(mode)")
+        #expect(report.piVersion == nil && report.piVersionErrors == "0.62.0", "\(mode)")
+        #expect(!report.piHasMCP && report.piResult == nil, "\(mode)")
+        #expect(report.piSkipped == (mode == .check ? nil : "Pi has no MCP (needs 0.99.2 or later)"), "\(mode)")
+        #expect(!report.failures.contains { $0.hasPrefix("pi:") }, "\(report.failures)")
+    }
+    #expect(!FileManager.default.fileExists(atPath: piLog.path), "pi ran nothing but --version")
+
+    try standIns(piVersion: "1.3.0")
+    for mode in [RemoteMCPSetup.Mode.check, .install, .remove] {
+        let report = try runMCPSetupScript(mode, home: home, loginShell: loginShell, helperPath: nil)
+        #expect(report.piVersion == nil && report.piVersionErrors == "1.3.0", "\(mode)")
+        #expect(!report.piHasMCP && report.piResult == nil, "\(mode)")
+    }
+    #expect(!FileManager.default.fileExists(atPath: piLog.path), "pi ran nothing but --version")
+
+    // The sheet names the older one, and only the older one.
+    #expect(RemoteMCPSetupModel.piWithoutMCP(nil, errorOutput: "0.62.0") == "Pi 0.62.0: no MCP, update Pi there")
+    #expect(RemoteMCPSetupModel.piWithoutMCP(nil, errorOutput: "1.3.0") == "its --version did not answer: no MCP")
+    #expect(RemoteMCPSetupModel.piWithoutMCP("garbage", errorOutput: "0.62.0") == "Pi 0.62.0: no MCP, update Pi there")
+    #expect(RemoteMCPSetupModel.piWithoutMCP("garbage", errorOutput: "1.3.0") == "--version printed “garbage”: no MCP, update Pi there")
+    #expect(RemoteMCPSetupModel.piWithoutMCP("0.62.0", errorOutput: "0.1.0") == "Pi 0.62.0: no MCP, update Pi there")
+    let directory = root.appendingPathComponent("store")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let suite = "CherryTests.RemoteMCPSetupStderrPi.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let store = RemoteDeviceStore(
+        fileURL: directory.appendingPathComponent("devices.json"),
+        hostStore: HostedSessionHostStore(defaults: defaults),
+        installationID: { UUID() },
+        registry: PersistentHostingRegistry(local: PersistentHostSessions(installationUnavailableReason: { nil }, status: PersistentSessionsStatus())),
+        remoteHostPaths: HostedRemoteHostPaths()
+    )
+    let device = try store.add(
+        name: "Studio", sshDestination: "studio",
+        remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host",
+        homeDirectory: "/Users/them", installedBuild: "b1"
+    )
+    let model = RemoteMCPSetupModel(deviceID: device.id, store: store) { _, _ in
+        .success(RemoteMCPSetup.Report(fields: [("pi", "/opt/homebrew/bin/pi"), ("pi_version", ""), ("pi_version_errors", "0.62.0")]))
+    }
+    await model.check()
+    #expect(model.findings.contains("Pi: /opt/homebrew/bin/pi (Pi 0.62.0: no MCP, update Pi there)"))
+    #expect(!model.canSetUp)
 }
 
 @Test @MainActor func RemoteDeviceMCPSetupIsInTheDeviceMenu() throws {

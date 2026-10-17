@@ -936,7 +936,8 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
 - **Identity: per-tab capability tokens.** `RemoteLaunchSpec` gives every
   device tab `CHERRY_CONTROL_SOCKET` (the path there), `CHERRY_MCP_TOKEN`,
   `CHERRY_MCP_HELPER` (the install's CherryMCP, when the install has the
-  resources) and `CHERRY_CONTROL_MACHINE` (This Mac's name), next to
+  resources, with `CHERRY_MCP_SERVER_NAME`, the identity's scheme) and
+  `CHERRY_CONTROL_MACHINE` (This Mac's name), next to
   `CHERRY_PROCESS_ID`; This Mac's values of these are never sent
   (`localOnlyKeys`). The token is 64 hex digits: HMAC-SHA256 of
   `cherry-mcp-v2`, the device id, the tab id and the tab's launch
@@ -1028,9 +1029,13 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
 - **CherryMCP on the device.** The installer copies CherryMCP with the
   Ghostty resources (`RemoteHostHelpers.mcpHelper`: next to the app's
   helpers, else next to the running executable), as `<build>/CherryMCP`,
-  immutable per build. It is part of the resources digest
-  (`resources_hash` hashes it with the trees), so a build without it is
-  copied again, and `xattr -c` clears it. `Scripts/build-mcp-helper` builds
+  immutable per build, and with it Cherry's Pi extension
+  (`RemoteHostHelpers.piExtension`: the bundle's `cherry-pi-mcp.ts`, only
+  with a CherryMCP) as `<build>/cherry-pi-mcp.ts`. Both are part of the
+  resources digest (`resources_hash` hashes them with the trees, the
+  extension only when the directory has it, so an install made before
+  Cherry had it hashes as it did), so a build without them is copied
+  again, and `xattr -c` clears them. `Scripts/build-mcp-helper` builds
   it universal (one SwiftPM build per triple, joined with `lipo`);
   `install-local-app` and `package-dmg` check its architectures. It needs
   the macOS the package declares on that Mac too; Set Up says when it does
@@ -1058,6 +1063,46 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
   `claude mcp remove --scope user cherry` and `codex mcp remove cherry`
   (the launcher stays: another Cherry may use it). The server's name is
   the identity's URL scheme (`cherry`).
+- **Later: the app runs the tools, and agents Cherry starts need no Set
+  Up** (docs/mcp.md › Versions, Agents On Another Mac). A device install's
+  CherryMCP from control protocol 2 on is a pipe: its `tools/list` is the
+  app's `listTools` and each call one `callTool`, sent in the envelope
+  through the same listener. The app runs the tool layer with the token's
+  tab as the caller and dispatches each of the tool's requests through
+  `handle(_:remoteCaller:)`, checking the token again before each one, so
+  `requireOnRemoteDevice`, `callerSessions`, `callerReaches`, `probeURL`
+  and `unattributed_not_available` apply exactly as to typed requests (no
+  pid crosses machines: `callerProcessChain` is nil there); `appInfo` and
+  `listTools` need a valid token too, and `get_status` reports the
+  forward, never a path of This Mac. An older install's helper keeps
+  sending typed requests. Device tabs also get `CHERRY_CLI`, the install's
+  `cherry` (`RemoteMCPPaths.cliPath`, only with `installedResources` and
+  Cherry MCP). An agent tab's plain `claude`, `codex` or `pi` line, under
+  an sh-family login shell and with the forwarded socket and the install's
+  CherryMCP, is gated on its CLI's version there
+  (`RemoteAgentMCPLaunch`: `if [ -x <helper> ] && cherry_v=$(<cli>
+  --version …) && <awk: at least the minimum>; then exec <line> <flags>; else exec <line>; fi`,
+  and for Pi also `[ -r <build>/cherry-pi-mcp.ts ]` after the helper's
+  check): a new enough CLI gets `--mcp-config`/`-c mcp_servers.<scheme>=…`
+  naming `<build>/CherryMCP` (Codex's `env_vars` with the token's name,
+  never its value), or for Pi 0.99.2 or later `-e
+  <build>/cherry-pi-mcp.ts` (an install without the file, until Update
+  Session Host…, runs the line as before), both branches `exec` so the
+  session's program stays the agent (a shell function of that name is not
+  used), and fish, csh and tcsh keep today's line. It follows Settings ›
+  Agents & MCP › Connect agents Cherry starts through the app's store only
+  (`RemoteLaunchSpec.Device.connectsAgentsAtLaunch`); a test's store never
+  connects agents. Set Up stays for agents started there by hand; Pi's
+  registers with `--exposure deferred --description …` only after `pi
+  --version` there shows 0.99.2 or later on its standard output (no direct
+  fallback); any other Pi is skipped (`pi_skipped`), in Set Up and Remove
+  alike, since an older one would take `mcp add …` as prompts (Pi 0.62.0
+  prints its version on standard error, so it is skipped too; the script
+  reads that, `pi_version_errors`, only for the sheet's "Pi 0.62.0: no MCP,
+  update Pi there"). A Pi agent
+  Cherry starts there uses Set Up's registration instead of the
+  extension's server when Pi has one (its file entry wins); it names the
+  launcher, so it never goes stale.
 - **Offline.** When the forwarded socket does not answer (Cherry quit, the
   Mac slept, the master is being made again) or closes without an answer,
   CherryMCP's tools fail with `cherry_unreachable`: "Cherry on <This Mac>

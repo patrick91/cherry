@@ -1316,7 +1316,8 @@ private struct MCPWhoamiPayload: Decodable {
         fileURLWithPath: "/tmp/ct-\(UUID().uuidString.prefix(8))",
         isDirectory: true
     )
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    // Private, as the client requires of a socket's directory.
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     let socketURL = directory.appendingPathComponent("control.sock")
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     try #require(fd >= 0)
@@ -8080,7 +8081,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         ),
         MCPInstallCommand(
             harness: .pi,
-            command: "pi mcp add cherry --exposure direct -- \(helperCommand)"
+            command: "pi mcp add cherry --exposure deferred --description '\(PiMCPRegistration.serverDescription)' -- \(helperCommand)"
         )
     ])
 }

@@ -1,3 +1,4 @@
+import CherryControl
 import Darwin
 import Foundation
 import MCP
@@ -58,6 +59,9 @@ struct CherryStdioTransportTests {
         await transport.disconnect()
     }
 
+    /// What the tool-list transport answers for a provider's tools is what
+    /// the server's own handler answers for the same tools
+    /// (`CherryMCPSession.serve` gives both the session's list).
     @Test func toolListResponseIsTheServersResponse() async throws {
         let inputPipe = try TestPipe()
         let outputPipe = try TestPipe()
@@ -66,9 +70,10 @@ struct CherryStdioTransportTests {
             outputPipe.close()
         }
 
-        let server = Server(name: "cherry", version: "test", capabilities: .init(tools: .init(listChanged: false)))
+        let provider: @Sendable () async -> [CherryToolDefinition] = { CherryToolCatalog.tools(for: .unknown) }
+        let server = Server(name: "cherry", version: "test", capabilities: .init(tools: .init(listChanged: true)))
         await server.withMethodHandler(ListTools.self) { _ in
-            ListTools.Result(tools: CherryMCPTools.all)
+            ListTools.Result(tools: await provider().map(CherryMCPTools.sdkTool))
         }
         try await server.start(transport: CherryStdioTransport(
             inputFileDescriptor: inputPipe.read,
@@ -81,8 +86,11 @@ struct CherryStdioTransportTests {
         ] {
             try inputPipe.write(Data(request.utf8) + Data([0x0A]))
             let fromServer = try outputPipe.readLine(timeoutMilliseconds: 5_000)
+            let id = try #require(CherryMCPTools.listRequestID(in: Data(request.utf8)))
+            let answered = try #require(CherryMCPTools.listResponse(id: id, result: CherryToolCatalog.encodedListResult(await provider())))
+            #expect(try JSONDecoder().decode(Value.self, from: answered) == JSONDecoder().decode(Value.self, from: fromServer))
             let cached = try #require(CherryMCPTools.listResponse(answering: Data(request.utf8)))
-            #expect(try JSONDecoder().decode(Value.self, from: cached) == JSONDecoder().decode(Value.self, from: fromServer))
+            #expect(cached == answered)
         }
         await server.stop()
     }
@@ -95,10 +103,13 @@ struct CherryStdioTransportTests {
             outputPipe.close()
         }
 
-        let transport = CherryMCPToolListTransport(base: CherryStdioTransport(
-            inputFileDescriptor: inputPipe.read,
-            outputFileDescriptor: outputPipe.write
-        ))
+        let transport = CherryMCPToolListTransport(
+            base: CherryStdioTransport(
+                inputFileDescriptor: inputPipe.read,
+                outputFileDescriptor: outputPipe.write
+            ),
+            list: { CherryMCPTools.encodedListResult }
+        )
         try await transport.connect()
 
         let stream = await transport.receive()

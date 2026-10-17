@@ -1,14 +1,18 @@
-import CherryControl
 import SwiftUI
 
 /// Settings › Agents & MCP: the agents (each has a page of its own), the
-/// presets, monitors, and Cherry's MCP server with the commands that
-/// connect agent CLIs to it.
+/// presets, monitors, and Cherry's MCP server: whether the agents Cherry
+/// starts get it on their command line, Connect Agents to Cherry…, and the
+/// commands that connect agent CLIs to it.
 struct AgentsSettingsPage: View, SettingsPageContent {
     static let listCaption = "Each agent has its own page: its command and connecting it to Cherry."
     static let wakeLinesHelp = "When an agent that subscribed to other tabs is idle, Cherry types one line into its tab once their events are ready."
+    static let connectAtLaunchTitle = "Connect agents Cherry starts"
+    static let connectAtLaunchHelp = "Claude Code \(AgentMCPLaunch.CLI.claudeCode.minimumVersion) or later, Codex \(AgentMCPLaunch.CLI.codex.minimumVersion) or later and Pi \(AgentMCPLaunch.CLI.pi.minimumVersion) or later that Cherry starts, here and on your other Macs, get Cherry MCP on their command line. Off: they use what you registered."
+    static let connectAgentsTitle = "Connect Agents to Cherry"
+    static let connectAgentsHelp = "Shows Claude Code, Codex and Pi on this Mac, whether each has Cherry MCP, and the command that connects it. Nothing runs until you confirm."
     static let otherCLIsTitle = "Connect other agent CLIs"
-    static let otherCLIsIntro = "Agents use Cherry's MCP server to see and drive your tabs. Register it once with each agent CLI."
+    static let otherCLIsIntro = "Agents use Cherry's MCP server to see and drive your tabs. Agents you start yourself, and ones Cherry doesn't connect when it starts them, need it registered once with their CLI."
     static let helperHelp = "Inside Cherry's app. Agents run it over stdio."
     static let controlSocketHelp = "Where the MCP helper reaches this copy of Cherry."
     static let otherMacsHelp = "Set up Cherry MCP on each Mac from Macs."
@@ -44,7 +48,7 @@ struct AgentsSettingsPage: View, SettingsPageContent {
                 SettingsCaption(presetError, style: .error)
             }
             AgentsWakeLinesSection(defaults: defaults, search: navigator.search)
-            AgentsMCPServerSection(navigator: navigator, piRegistration: registrations.pi)
+            AgentsMCPServerSection(navigator: navigator, registrations: registrations, defaults: defaults)
         }
         .sheet(item: $editorDraft) { draft in
             AgentToolEditor(
@@ -149,6 +153,7 @@ struct AgentsSettingsPage: View, SettingsPageContent {
 
     static func searchRows(in context: SettingsSearchContext) -> [SettingsSearchRow] {
         let wakeLines = wakeLinesEnabled(defaults: context.defaults, launchArguments: context.launchArguments)
+        let connectsAtLaunch = connectsAgentsAtLaunch(defaults: context.defaults, launchArguments: context.launchArguments)
         return [
             SettingsSearchRow(
                 id: .agentsList,
@@ -185,6 +190,15 @@ struct AgentsSettingsPage: View, SettingsPageContent {
                 keywords: ["helper", "mcp helper", "stdio", "CherryMCP"]
             ),
             SettingsSearchRow(
+                id: .agentsConnectAtLaunch,
+                route: .page(.agents),
+                section: "MCP server",
+                title: connectAtLaunchTitle,
+                help: connectAtLaunchHelp,
+                keywords: ["mcp", "launch", "connect", "mcp-config", "register"],
+                value: SettingSource.onOff(connectsAtLaunch)
+            ),
+            SettingsSearchRow(
                 id: .agentsControlSocket,
                 route: .page(.agents),
                 section: "MCP server",
@@ -199,6 +213,14 @@ struct AgentsSettingsPage: View, SettingsPageContent {
                 title: "Agents on your other Macs",
                 help: otherMacsHelp,
                 keywords: ["mac", "remote", "device", "set up cherry mcp"]
+            ),
+            SettingsSearchRow(
+                id: .agentsConnectAgents,
+                route: .page(.agents),
+                section: "MCP server",
+                title: connectAgentsTitle,
+                help: connectAgentsHelp,
+                keywords: ["connect", "register", "claude", "codex", "pi", "mcp add"]
             ),
             SettingsSearchRow(
                 id: .agentsOtherCLIs,
@@ -374,6 +396,60 @@ extension AgentsSettingsPage {
         )
     }
 
+    /// Whether the agents Cherry starts get Cherry MCP on their command
+    /// line, as their launches read it (`AgentMCPLaunch.isEnabled`): a
+    /// launch argument first, then the stored value, then the default.
+    static func connectsAgentsAtLaunch(defaults: UserDefaults, launchArguments: [String: Any]) -> Bool {
+        let key = AgentMCPLaunch.enabledDefaultsKey
+        if let argument = launchArguments[key] {
+            return argument as? Bool ?? AgentMCPLaunch.enabledDefault
+        }
+        return AgentMCPLaunch.isEnabled(defaults)
+    }
+
+    /// Connect agents Cherry starts' badge: Set here while it is off; ↺
+    /// removes the stored value, as Wake idle agents' does
+    /// (`wakeLinesSource`).
+    static func connectAtLaunchSource(
+        defaults: UserDefaults,
+        launchArguments: [String: Any],
+        showDefault: @escaping @MainActor () -> Void = {}
+    ) -> SettingsSourceState {
+        let key = AgentMCPLaunch.enabledDefaultsKey
+        let isOn = connectsAgentsAtLaunch(defaults: defaults, launchArguments: launchArguments)
+        return .stored(
+            key: key,
+            defaults: defaults,
+            launchArguments: launchArguments,
+            value: SettingSource.onOff(isOn),
+            defaultValue: SettingSource.onOff(AgentMCPLaunch.enabledDefault),
+            parses: { $0 as? Bool != nil },
+            isDefault: { $0 as? Bool == AgentMCPLaunch.enabledDefault },
+            reset: {
+                showDefault()
+                defaults.removeObject(forKey: key)
+            }
+        )
+    }
+
+    /// The Control socket row: the socket this app's server binds, which
+    /// its tabs name (`CherryControlServer.appSocketPath`), and whether
+    /// its socket file is there. No path while the server does not listen
+    /// (another copy of Cherry answers there): never the socket a Cherry
+    /// started from a Cherry tab inherited.
+    struct ControlSocket: Equatable {
+        var path: String?
+        var isListening: Bool
+    }
+
+    /// The row for `path`, the app's socket unless a test names one.
+    static func controlSocket(
+        path: String? = CherryControlServer.appSocketPath,
+        fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> ControlSocket {
+        ControlSocket(path: path, isListening: path.map(fileExists) ?? false)
+    }
+
     /// The control socket's status: "Listening" while its socket file is
     /// there, else "Not listening".
     static func socketStatus(exists: Bool) -> (text: String, style: SettingsStatusText.Style, dot: SettingsStatusDot.Tone) {
@@ -395,8 +471,10 @@ extension AgentsSettingsPage {
 extension SettingsRowID {
     static let agentsPresets: Self = "agents.presets"
     static let agentsWakeLines: Self = "agents.wakeLines"
+    static let agentsConnectAtLaunch: Self = "agents.connectAtLaunch"
     static let agentsControlSocket: Self = "agents.controlSocket"
     static let agentsOtherMacs: Self = "agents.otherMacs"
+    static let agentsConnectAgents: Self = "agents.connectAgents"
     static let agentsOtherCLIs: Self = "agents.otherCLIs"
 }
 
@@ -456,21 +534,57 @@ private struct AgentsWakeLinesSection: View {
     }
 }
 
-/// MCP server: the helper agents run, the control socket it reaches this
-/// copy of Cherry through, other Macs, and the commands that connect each
-/// CLI (collapsed; a search result for it opens it). Pi's registration is
-/// the one a Pi agent's page shows (`MCPRegistrations.pi`).
+/// MCP server: Connect agents Cherry starts (a switch, as Wake idle
+/// agents), the helper agents run, the control socket it reaches this copy
+/// of Cherry through, other Macs, Connect Agents to Cherry… (the sheet), and
+/// the commands that connect each CLI (collapsed; a search result for it
+/// opens it). Pi's registration is the one a Pi agent's page shows
+/// (`MCPRegistrations.pi`).
 private struct AgentsMCPServerSection: View {
     let navigator: SettingsNavigator
-    let piRegistration: PiMCPRegistrationModel
+    let registrations: MCPRegistrations
+    let defaults: UserDefaults
+    @AppStorage private var connectsAtLaunch: Bool
 
-    @State private var socketExists = false
+    @State private var socket = AgentsSettingsPage.ControlSocket(path: nil, isListening: false)
     @State private var showsOtherCLIs = false
+
+    init(navigator: SettingsNavigator, registrations: MCPRegistrations, defaults: UserDefaults) {
+        self.navigator = navigator
+        self.registrations = registrations
+        self.defaults = defaults
+        _connectsAtLaunch = AppStorage(
+            wrappedValue: AgentMCPLaunch.enabledDefault,
+            AgentMCPLaunch.enabledDefaultsKey,
+            store: defaults
+        )
+    }
 
     var body: some View {
         let helperPath = MCPInstallCommandBuilder.helperPath ?? "CherryMCP"
-        let status = AgentsSettingsPage.socketStatus(exists: socketExists)
+        let status = AgentsSettingsPage.socketStatus(exists: socket.isListening)
+        let launchArguments = SettingSource.launchArguments(for: defaults)
+        let connectSource = AgentsSettingsPage.connectAtLaunchSource(defaults: defaults, launchArguments: launchArguments) {
+            connectsAtLaunch = AgentMCPLaunch.enabledDefault
+        }
+        let isEditable = connectSource.source.isEditable
         SettingsSection("MCP server", id: .agentsMCPServer) {
+            SettingsItem(
+                id: .agentsConnectAtLaunch,
+                AgentsSettingsPage.connectAtLaunchTitle,
+                help: AgentsSettingsPage.connectAtLaunchHelp,
+                source: connectSource
+            ) {
+                Toggle(
+                    AgentsSettingsPage.connectAtLaunchTitle,
+                    isOn: isEditable
+                        ? $connectsAtLaunch
+                        : .constant(AgentsSettingsPage.connectsAgentsAtLaunch(defaults: defaults, launchArguments: launchArguments))
+                )
+                .settingsSwitch()
+                .disabled(!isEditable)
+            }
+
             SettingsItem("MCP helper", help: AgentsSettingsPage.helperHelp) {
                 SettingsCopyButton(text: helperPath, label: "Copy MCP helper path")
             } detail: {
@@ -486,7 +600,9 @@ private struct AgentsMCPServerSection: View {
                     .settingsButton(.standard, size: .small)
                 }
             } detail: {
-                AgentsMonospacedPath(path: CherryControl.socketURL.path)
+                if let path = socket.path {
+                    AgentsMonospacedPath(path: path)
+                }
             }
 
             SettingsItem(id: .agentsOtherMacs, "Agents on your other Macs", help: AgentsSettingsPage.otherMacsHelp) {
@@ -496,12 +612,19 @@ private struct AgentsMCPServerSection: View {
                 .settingsButton(.standard, size: .small)
             }
 
+            SettingsItem(id: .agentsConnectAgents, AgentsSettingsPage.connectAgentsTitle, help: AgentsSettingsPage.connectAgentsHelp) {
+                Button("Connect…") {
+                    ConnectAgentsPresenter.present(registrations: registrations)
+                }
+                .settingsButton(.standard, size: .small)
+            }
+
             SettingsDisclosureHeader(AgentsSettingsPage.otherCLIsTitle, isExpanded: $showsOtherCLIs)
                 .settingsRow(.agentsOtherCLIs)
                 .expandsWhenFlashed(.agentsOtherCLIs, isExpanded: $showsOtherCLIs)
             if showsOtherCLIs {
                 SettingsSubItem {
-                    AgentsOtherCLIs(piRegistration: piRegistration)
+                    AgentsOtherCLIs(piRegistration: registrations.pi)
                 }
                 .settingsSeparatorAbove(false)
             }
@@ -509,10 +632,13 @@ private struct AgentsMCPServerSection: View {
         .onAppear {
             refreshSocket()
         }
+        .onChange(of: connectsAtLaunch) { _, _ in
+            navigator.search.scheduleRowsRefresh()
+        }
     }
 
     private func refreshSocket() {
-        socketExists = FileManager.default.fileExists(atPath: CherryControl.socketURL.path)
+        socket = AgentsSettingsPage.controlSocket()
     }
 }
 
@@ -530,9 +656,12 @@ private struct AgentsMonospacedPath: View {
     }
 }
 
-/// The command each CLI registers Cherry's MCP helper with, to copy, and
-/// Pi's registration: whether Pi's mcp.json has it (read only), and Add
-/// to Pi, which runs `pi mcp add` only when clicked.
+/// The command each CLI registers Cherry's MCP helper with, to copy (Pi's
+/// only on a Pi with MCP, `AgentSettingsPage.showsCommand`), and Pi's row
+/// (`AgentSettingsPage.piRow`, the one a Pi agent's page shows): Pi's
+/// version and what its mcp.json has (read only), and its button, which
+/// runs `pi mcp add` only once the user confirms it and only on a Pi with
+/// MCP.
 private struct AgentsOtherCLIs: View {
     @ObservedObject var piRegistration: PiMCPRegistrationModel
 
@@ -547,7 +676,9 @@ private struct AgentsOtherCLIs: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(installCommand.harness.productName)
                         .font(SettingsDesign.Fonts.rowTitle)
-                    SettingsCodeBlock(text: installCommand.command, copyLabel: "Copy the \(installCommand.harness.productName) command")
+                    if AgentSettingsPage.showsCommand(for: installCommand.harness, pi: piRegistration.state) {
+                        SettingsCodeBlock(text: installCommand.command, copyLabel: "Copy the \(installCommand.harness.productName) command")
+                    }
                     if installCommand.harness == .pi {
                         AgentsPiRegistration(model: piRegistration)
                     }
@@ -562,21 +693,25 @@ private struct AgentsOtherCLIs: View {
 
 private struct AgentsPiRegistration: View {
     @ObservedObject var model: PiMCPRegistrationModel
+    @State private var request: AgentConnectionRequest?
 
     var body: some View {
+        // No launch line here (the switch's row above says what launches
+        // get), so the switch's value does not matter.
+        let row = model.row(connectsAtLaunch: true)
         HStack(alignment: .top, spacing: 12) {
-            PiRegistrationStatus(model: model)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 4) {
+                SettingsStatusText(row.status, style: row.style, dot: row.dot)
+                AgentConnectionStatus(model: model, row: row)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            if model.isRunning {
-                ProgressView().controlSize(.small)
+            AgentConnectionActions(model: model, row: row, size: .small) {
+                request = AgentConnectionRequest(plans: [$0])
             }
-            Button(AgentSettingsPage.piAddTitle(status: model.status)) {
-                Task { await model.register() }
-            }
-            .settingsButton(.standard, size: .small)
-            .disabled(model.isRunning || model.helperPath == nil)
-            .help("Runs the command above (pi mcp add); Pi writes its own settings.")
+        }
+        .agentConnectionConfirmation($request) { plans in
+            for plan in plans { await model.perform(plan) }
         }
     }
 }

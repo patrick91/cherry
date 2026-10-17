@@ -153,7 +153,8 @@ final class RemoteDeviceStore: ObservableObject {
         // Only the app's store runs ssh by itself: a test's store marks
         // and reads nothing unless the test gives it its fake Mac's.
         markBuild: RemoteDeviceStore.markBuildOverSSH,
-        captureLoginEnvironment: RemoteDeviceStore.captureLoginEnvironmentOverSSH
+        captureLoginEnvironment: RemoteDeviceStore.captureLoginEnvironmentOverSSH,
+        connectsAgentsAtLaunch: { AgentMCPLaunch.isEnabled() }
     )
 
     /// Makes a device's hosting: its profile, and this installation's id
@@ -200,6 +201,12 @@ final class RemoteDeviceStore: ObservableObject {
     /// ends on purpose, and those its host reports lost, there, and
     /// finishes the ends it could not do while its device was offline.
     var endedSessionsStore: WorkspaceStateStore?
+    /// Whether the devices' agents get Cherry MCP on their command line
+    /// (`RemoteAgentMCPLaunch`), asked at each launch. The app's store
+    /// follows Settings › Agents & MCP › Connect agents Cherry starts; a
+    /// test's says no unless the test says otherwise, so no test's command
+    /// line changes.
+    private let connectsAgentsAtLaunch: @MainActor () -> Bool
 
     init(
         fileURL: URL,
@@ -212,7 +219,8 @@ final class RemoteDeviceStore: ObservableObject {
             PersistentHostSessions.remote(profile: profile, installationID: installationID)
         },
         markBuild: BuildMarker? = nil,
-        captureLoginEnvironment: LoginEnvironmentCapturer? = nil
+        captureLoginEnvironment: LoginEnvironmentCapturer? = nil,
+        connectsAgentsAtLaunch: @escaping @MainActor () -> Bool = { false }
     ) {
         self.fileURL = fileURL
         self.canWrite = canWrite
@@ -223,6 +231,7 @@ final class RemoteDeviceStore: ObservableObject {
         self.makeHosting = makeHosting
         self.markBuild = markBuild
         self.captureLoginEnvironment = captureLoginEnvironment
+        self.connectsAgentsAtLaunch = connectsAgentsAtLaunch
         devices = Self.load(from: fileURL)
         updateRemoteHostPaths()
     }
@@ -441,10 +450,12 @@ final class RemoteDeviceStore: ObservableObject {
     }
 
     /// What a launch of the device's tabs needs (`RemoteLaunchSpec.Device`),
-    /// with Cherry MCP's forwarded socket and tokens (phase 4b).
+    /// with Cherry MCP's forwarded socket and tokens (phase 4b), and whether
+    /// its agents get Cherry MCP on their command line.
     func launchDevice(id: UUID) -> RemoteLaunchSpec.Device? {
         guard let device = device(id: id) else { return nil }
         var launch = device.launchDevice
+        launch.connectsAgentsAtLaunch = connectsAgentsAtLaunch()
         if launch.loginEnvironment == nil {
             launch.loginEnvironmentProblem = loginEnvironmentProblems[id]
         }
@@ -461,6 +472,13 @@ final class RemoteDeviceStore: ObservableObject {
                 helperPath: device.installedResources
                     ? RemoteMCPPaths.helperPath(remoteHostPath: device.remoteHostPath, homeDirectory: device.homeDirectory)
                     : nil,
+                cliPath: device.installedResources
+                    ? RemoteMCPPaths.cliPath(remoteHostPath: device.remoteHostPath, homeDirectory: device.homeDirectory)
+                    : nil,
+                piExtensionPath: device.installedResources
+                    ? RemoteMCPPaths.piExtensionPath(remoteHostPath: device.remoteHostPath, homeDirectory: device.homeDirectory)
+                    : nil,
+                serverName: CherryAppIdentity.current.urlScheme,
                 controlMachine: RemoteMCPLaunch.thisMacName,
                 tokens: .shared
             )

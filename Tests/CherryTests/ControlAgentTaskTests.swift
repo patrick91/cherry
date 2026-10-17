@@ -168,17 +168,28 @@ private func json(_ text: String) throws -> JSONValue {
     #expect(throws: CherryControlError.self) { try CherryMCPTools.schemaArgument("bad", in: ["bad": .string("not json")]) }
 }
 
+@MainActor
 @Test func ControlAgentTaskToolsAreAdvertisedAndWaitsFitASixtySecondTimeout() async throws {
     let advertised = Set(CherryMCPTools.all.map(\.name))
     #expect(advertised.isSuperset(of: ["get_my_task", "report_result", "report_progress", "wait_for_tasks", "get_task", "list_tasks", "cancel_tasks"]))
     let wait = try #require(CherryMCPTools.clientTimeout(for: "wait_for_tasks", arguments: [:]))
     #expect(wait <= 55)
     #expect(CherryMCPTools.clientTimeout(for: "wait_for_tasks", arguments: ["timeout_ms": .int(300_000)]) == wait)
-    // task and message together are refused before anything is sent.
-    let both = await CherryMCPTools.call(name: "spawn_agent", arguments: [
+    // task and message together are refused before anything is sent: the
+    // app runs the tool (`callTool`), so it needs one.
+    let harness = try ControlAgentWaitHarness()
+    defer { harness.stop() }
+    harness.server.start()
+    var sent: [CherryControlRequest] = []
+    harness.server.toolDispatchWillSendForTesting = { sent.append($0) }
+    let session = CherryMCPSession(environment: [CherryControl.socketEnvironmentKey: harness.socketURL.path])
+    let both = await session.call(name: "spawn_agent", arguments: [
         "name": .string("Claude"), "task": .string("Review"), "message": .string("hi"),
     ])
-    #expect(both.isError == true)
+    #expect(both.isError)
+    #expect(both.structured?.objectValue?["error"]?.objectValue?["code"]?.stringValue == "invalid_argument", "\(both.text)")
+    #expect(both.toolsDigest != nil, "the app answered it")
+    #expect(sent.isEmpty)
     let spawnAgent = try #require(CherryMCPTools.all.first { $0.name == "spawn_agent" })
     let properties = spawnAgent.inputSchema.objectValue?["properties"]?.objectValue ?? [:]
     #expect(Set(properties.keys).isSuperset(of: ["task", "label", "phase", "run_id", "result_schema"]))

@@ -735,8 +735,10 @@ master (`ssh -O forward -R <DARWIN_USER_TEMP_DIR>/cherry-mcp-<hash>/control.sock
 directory is 0700 and this account's, and the socket a dead master left is
 removed first, since sshd's StreamLocalBindUnlink is off by default), and
 the tabs' Create carries `CHERRY_CONTROL_SOCKET` (that path),
-`CHERRY_MCP_TOKEN`, `CHERRY_MCP_HELPER` and `CHERRY_CONTROL_MACHINE` in
-its environment like any other variable. The holder does nothing with them.
+`CHERRY_MCP_TOKEN`, `CHERRY_MCP_HELPER`, `CHERRY_CLI` and
+`CHERRY_CONTROL_MACHINE` in its environment like any other variable (and an
+agent's command line may carry Cherry MCP's flags, behind a version check
+of its own). The holder does nothing with them.
 The server's sshd must allow remote forwards of Unix sockets:
 `AllowStreamLocalForwarding` and `AllowTcpForwarding` yes or remote (sshd
 denies one under `AllowTcpForwarding local`); both are yes by default.

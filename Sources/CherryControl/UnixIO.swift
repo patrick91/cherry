@@ -145,9 +145,12 @@ public enum UnixIO {
         "\(seconds)." + String(format: "%06lld", microseconds)
     }
 
-    /// Whether a server accepts connections at `path` now. A stale socket
-    /// file (its server gone) refuses at once; a listener costs up to
-    /// `timeout`, the time it gets to answer.
+    /// Whether a server accepts connections at `path` now. A listener costs
+    /// up to `timeout`, the time it gets to answer, and so does a stale
+    /// socket file (its server gone): a listener whose backlog is full
+    /// refuses a connection as a stale file does (ECONNREFUSED), so a
+    /// refusal is tried again until `timeout` (a busy server accepts the
+    /// connections queued meanwhile; a stale file refuses every time).
     ///
     /// The probe sends an empty line (an invalid request to every Cherry,
     /// with no effect) and stays until the answer or `timeout`: a peer that
@@ -155,28 +158,53 @@ public enum UnixIO {
     /// connection without SO_NOSIGPIPE (the kernel refuses the option), and
     /// a Cherry before MSG_NOSIGNAL would get SIGPIPE answering it.
     public static func hasListener(atPath path: String, timeout: Double = 0.2) -> Bool {
+        let deadline = DispatchTime.now().uptimeNanoseconds + UInt64(max(timeout, 0) * 1_000_000_000)
+        while true {
+            switch probeListener(atPath: path, deadline: deadline) {
+            case .listening:
+                return true
+            case .absent:
+                return false
+            case .refused:
+                let now = DispatchTime.now().uptimeNanoseconds
+                guard now < deadline else { return false }
+                usleep(UInt32(min(20_000, (deadline - now) / 1_000)))
+            }
+        }
+    }
+
+    private enum ListenerProbe {
+        case listening
+        case absent
+        /// ECONNREFUSED: no server, or one whose backlog is full.
+        case refused
+    }
+
+    private static func probeListener(atPath path: String, deadline: UInt64) -> ListenerProbe {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return false }
+        guard fd >= 0 else { return .absent }
         defer { close(fd) }
         setCloseOnExec(fd)
         setNoSigPipe(fd)
         let flags = fcntl(fd, F_GETFL)
         if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
-        let deadline = DispatchTime.now().uptimeNanoseconds + UInt64(max(timeout, 0) * 1_000_000_000)
         func remainingMilliseconds() -> Int32 {
             let now = DispatchTime.now().uptimeNanoseconds
             return now >= deadline ? 0 : Int32((deadline - now) / 1_000_000)
         }
 
-        guard let result = withSocketAddress(path: path, { Darwin.connect(fd, $0, $1) }) else { return false }
+        guard let result = withSocketAddress(path: path, { Darwin.connect(fd, $0, $1) }) else { return .absent }
         if result != 0 {
-            guard errno == EINPROGRESS || errno == EAGAIN else { return false }
+            if errno == ECONNREFUSED { return .refused }
+            guard errno == EINPROGRESS || errno == EAGAIN else { return .absent }
             var poller = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
             // A listener that does not complete the connection counts as one.
-            guard poll(&poller, 1, remainingMilliseconds()) > 0 else { return true }
+            guard poll(&poller, 1, remainingMilliseconds()) > 0 else { return .listening }
             var error: Int32 = 0
             var length = socklen_t(MemoryLayout<Int32>.size)
-            guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0, error == 0 else { return false }
+            guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) == 0 else { return .absent }
+            if error == ECONNREFUSED { return .refused }
+            guard error == 0 else { return .absent }
         }
 
         // Any answer, or the server closing, means it accepted.
@@ -185,7 +213,7 @@ public enum UnixIO {
         _ = shutdown(fd, SHUT_WR)
         var poller = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
         while poll(&poller, 1, remainingMilliseconds()) < 0, errno == EINTR {}
-        return true
+        return .listening
     }
 
     /// A file as the file system knows it, whatever its name: a server

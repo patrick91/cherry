@@ -347,6 +347,51 @@ private final class IdentityChainRecorder: @unchecked Sendable {
     #expect(await identityErrorCode(socketURL: socketURL) == nil)
 }
 
+/// A listener whose backlog is full refuses a connection as a stale socket
+/// file does (ECONNREFUSED): the probe tries again within its timeout, as a
+/// busy server accepts what waited, so it is never taken for a stale one.
+@Test func controlToolIdentityProbeWaitsOutAFullBacklog() throws {
+    let directory = try identityDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let path = directory.appendingPathComponent("busy.sock").path
+    let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+    try #require(listener >= 0)
+    defer { close(listener) }
+    try #require(UnixIO.withSocketAddress(path: path) { Darwin.bind(listener, $0, $1) } == 0)
+    try #require(listen(listener, 1) == 0)
+
+    // Fill its backlog until a connection is refused.
+    var queued: [Int32] = []
+    defer { queued.forEach { close($0) } }
+    var refused = false
+    for _ in 0..<8 where !refused {
+        let client = socket(AF_UNIX, SOCK_STREAM, 0)
+        try #require(client >= 0)
+        _ = fcntl(client, F_SETFL, fcntl(client, F_GETFL) | O_NONBLOCK)
+        if UnixIO.withSocketAddress(path: path, { Darwin.connect(client, $0, $1) }) == 0 {
+            queued.append(client)
+        } else {
+            refused = errno == ECONNREFUSED
+            close(client)
+        }
+    }
+    try #require(refused, "the backlog never filled")
+
+    // It accepts a moment later, as a busy server does.
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+        _ = fcntl(listener, F_SETFL, fcntl(listener, F_GETFL) | O_NONBLOCK)
+        let end = Date().addingTimeInterval(1)
+        while Date() < end {
+            let accepted = accept(listener, nil, nil)
+            if accepted >= 0 { close(accepted) } else { usleep(5_000) }
+        }
+        done.signal()
+    }
+    #expect(UnixIO.hasListener(atPath: path, timeout: 0.5))
+    done.wait()
+}
+
 /// The server makes its directory private: one of this user's that others
 /// may enter is closed first; a linked directory is refused, and nothing
 /// listens.

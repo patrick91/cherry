@@ -413,7 +413,9 @@ final class CherryControlServer: @unchecked Sendable {
 
         chmod(path, S_IRUSR | S_IWUSR)
 
-        guard listen(fd, 16) == 0 else {
+        // Room for bursts of clients (each MCP helper, probes): with a full
+        // backlog a connection is refused as by a stale socket.
+        guard listen(fd, SOMAXCONN) == 0 else {
             close(fd)
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }

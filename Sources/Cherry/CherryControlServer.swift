@@ -413,7 +413,9 @@ final class CherryControlServer: @unchecked Sendable {
 
         chmod(path, S_IRUSR | S_IWUSR)
 
-        guard listen(fd, 16) == 0 else {
+        // Room for bursts of clients (each MCP helper, probes): with a full
+        // backlog a connection is refused as by a stale socket.
+        guard listen(fd, SOMAXCONN) == 0 else {
             close(fd)
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
@@ -1104,14 +1106,15 @@ final class CherryControlServer: @unchecked Sendable {
             let service = try await waitForBoundPort(request, workspace: workspace)
             return .init(result: .waitForBoundPort(.init(service: service)))
         case .spawnProcess(let request):
-            let (session, sentBytes) = try await spawnProcess(request, workspace: workspace)
+            let (session, sentBytes, inputError) = try await spawnProcess(request, workspace: workspace)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
             return .init(result: .spawnProcess(.init(
                 process: processInfo(for: session, workspace: owningWorkspace(of: session, from: workspace)),
                 sentBytes: sentBytes,
                 output: output,
                 task: tasks.latestTask(forWorker: session.id)
-                    .flatMap { $0.device == Self.remoteDevice ? tasks.info(for: $0) : nil }
+                    .flatMap { $0.device == Self.remoteDevice ? tasks.info(for: $0) : nil },
+                inputError: inputError
             )))
         case .startProcess(let request):
             // A command's tab can be another window's of the project: it is
@@ -1726,8 +1729,14 @@ final class CherryControlServer: @unchecked Sendable {
         return (session, workspace)
     }
 
+    /// The new process, the bytes of its first input that reached it, and
+    /// why that input did not when it was refused or failed (the process
+    /// runs either way).
     @MainActor
-    private func spawnProcess(_ request: SpawnProcessRequest, workspace: TerminalWorkspace) async throws -> (TerminalSession, Int) {
+    private func spawnProcess(
+        _ request: SpawnProcessRequest,
+        workspace: TerminalWorkspace
+    ) async throws -> (session: TerminalSession, sentBytes: Int, inputError: CherryControlError?) {
         let kind = try requiredProcessKind(from: request.kind)
         let session: TerminalSession
         let agent: AgentToolDefinition?
@@ -1802,13 +1811,13 @@ final class CherryControlServer: @unchecked Sendable {
         }
 
         let sentBytes: Int
+        var inputError: CherryControlError?
         if session.kind == .agent, let agent {
             let input = try agentInputPayload(
                 text: text,
                 rawBase64: request.rawBase64,
                 submit: submit
             )
-            var inputError: CherryControlError?
             let typedSince = Date()
             if let input, !input.isEmpty {
                 // A task's kickoff goes under the tab's typing lock, as
@@ -1839,13 +1848,14 @@ final class CherryControlServer: @unchecked Sendable {
                     sentBytes = try await sendTerminalInput(input, submit: request.submit == true, to: session)
                 } catch {
                     mcpControlDebugLog("initial input not delivered session=\(session.id.uuidString): \(error)")
+                    inputError = error as? CherryControlError
                     sentBytes = 0
                 }
             } else {
                 sentBytes = 0
             }
         }
-        return (session, sentBytes)
+        return (session, sentBytes, inputError)
     }
 
     private func agentDefinition(

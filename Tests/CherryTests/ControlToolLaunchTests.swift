@@ -965,7 +965,7 @@ private final class LaunchHarness {
     ])
 
     // This app's own entry serves the agent as well: nothing to say.
-    try #"{"mcpServers":{"\#(name)":{"command":"\#(launchHelperPath)","exposure":"deferred"}}}"#
+    try #"{"mcpServers":{"\#(name)":{"command":"\#(launchHelperPath)","exposure":"deferred","description":"\#(PiMCPRegistration.serverDescription)"}}}"#
         .write(to: agentDirectory.appendingPathComponent("mcp.json"), atomically: true, encoding: .utf8)
     #expect(tab.restart())
     try await Task.sleep(for: .milliseconds(300))

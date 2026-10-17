@@ -8,7 +8,9 @@
 # Restart to Update's quit keeps sessions, NativeKeyboard: the bytes a native
 # tab's program reads for its keys, SettingsWindow: the Settings window's
 # models, ControlTool: the MCP tools and the control socket's tool requests,
-# and AgentTitle: an agent's terminal title as its tab's task name). Swift
+# AgentTitle: an agent's terminal title as its tab's task name, and
+# ControlAgentMonitor: MCP monitors' events, a task worker's settle and a
+# silent agent's quiet done among them). Swift
 # Testing matches --filter against a test's ID, which includes
 # its source file name, so a group selects every test in the files named after
 # it (WorkspaceRestore selects all of WorkspaceRestoreTests.swift) as well as
@@ -142,6 +144,7 @@ groups=(
   SettingsWindow        # SettingsWindow*Tests: the Settings window's navigation, search, sources and page models
   ControlTool           # ControlTool*Tests: the MCP tool layer and catalog, the control socket's tool requests and identity, CherryMCP's pipe, agents' launch-time MCP, connecting agent CLIs
   AgentTitle            # AgentTitleTests: an agent's terminal title as its tab's task name
+  ControlAgentMonitor   # ControlAgentMonitorTests: MCP monitors' events, task workers' settles, silent agents' quiet dones
 )
 
 # What marks a test file as a session suite: the hosted and persistent session

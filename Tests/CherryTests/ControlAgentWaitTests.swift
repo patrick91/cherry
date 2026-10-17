@@ -214,6 +214,43 @@ struct ControlAgentWaitTests {
         #expect(response.error?.message.contains("Which storage backend?") == true)
     }
 
+    /// A spawned agent whose first message is refused (it reports a
+    /// permission prompt) runs, and the spawn says why nothing was sent;
+    /// one whose message arrived says nothing.
+    @Test func spawnSaysWhyItsFirstMessageWasNotSent() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.start()
+        let script = harness.projectRoot.appendingPathComponent("blocked-agent.sh")
+        try """
+        #!/bin/sh
+        stty -echo 2>/dev/null
+        printf 'Run the migration?\\n\\033]7501;state=blocked:app=fake:kind=permission:msg=UnVuIHRoZSBtaWdyYXRpb24/\\033\\\\'
+        exec cat
+        """.write(to: script, atomically: true, encoding: .utf8)
+        chmod(script.path, 0o755)
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: script.path))
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "Worker", command: "/bin/cat"))
+
+        let refused = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Claude", text: "go ahead", submit: true)))
+        guard case .spawnProcess(let blocked)? = refused.result else {
+            Issue.record("Expected spawnProcess, got \(String(describing: refused))")
+            return
+        }
+        #expect(blocked.sentBytes == 0)
+        #expect(blocked.inputError?.code == "agent_awaiting_permission")
+        #expect(blocked.inputError?.message.contains("Run the migration?") == true, "\(String(describing: blocked.inputError))")
+        #expect(harness.workspace.session(id: blocked.process.id) != nil, "the agent runs either way")
+
+        let delivered = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Worker", text: "hello", submit: true)))
+        guard case .spawnProcess(let sent)? = delivered.result else {
+            Issue.record("Expected spawnProcess, got \(String(describing: delivered))")
+            return
+        }
+        #expect(sent.sentBytes > 0)
+        #expect(sent.inputError == nil)
+    }
+
     /// An agent that reports nothing: its screen is read for the menu.
     @Test func messageIsNotTypedIntoAQuestionMenu() async throws {
         let harness = try ControlAgentWaitHarness()

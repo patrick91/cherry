@@ -115,7 +115,7 @@ private func piModel(_ standIn: PiStandIn, versions: AgentCLIVersions, helperPat
     let description = PiMCPRegistration.serverDescription
     #expect(pi.command == "pi mcp add cherry-dev --exposure deferred --description '\(description)' -- \(MCPInstallCommandBuilder.helperCommand)")
     #expect(MCPHarness.pi.addCommand(serverName: "cherry", helperPath: "/Applications/Cherry.app/Contents/MacOS/CherryMCP")
-        == "pi mcp add cherry --exposure deferred --description 'Cherry, the terminal app this Pi runs in: its tabs, agents, Cherry tasks (get_my_task, report_result), waits and ports. Load its tools with tool_search.' -- '/Applications/Cherry.app/Contents/MacOS/CherryMCP'")
+        == "pi mcp add cherry --exposure deferred --description 'Cherry, the terminal app this Pi runs in: its tabs, agents, waits and ports. Workers: spawn_agent with task, then wait_for_tasks and get_task. Given a Cherry task: get_my_task, then report_result. Load its tools with tool_search.' -- '/Applications/Cherry.app/Contents/MacOS/CherryMCP'")
     #expect(MCPHarness.pi.name == "Pi")
     #expect(PiMCPRegistration.addArguments(serverName: "cherry", helperPath: "/A B/CherryMCP")
         == ["mcp", "add", "cherry", "--exposure", "deferred", "--description", description, "--", "/A B/CherryMCP"])
@@ -142,7 +142,7 @@ private func piModel(_ standIn: PiStandIn, versions: AgentCLIVersions, helperPat
 }
 
 /// What Pi's mcp.json has, read without writing it: its `enabled`,
-/// `command`, `args` and `exposure` only.
+/// `command`, `args`, `exposure` and, deferred, `description` only.
 @Test func settingsWindowMCPPiEntryStatusFixtures() throws {
     let agentDirectory = try temporaryDirectory("pi-agent")
     defer { try? FileManager.default.removeItem(at: agentDirectory) }
@@ -159,11 +159,13 @@ private func piModel(_ standIn: PiStandIn, versions: AgentCLIVersions, helperPat
         #"{"mcpServers":{"cherry":{"#+fields+#"}}}"#
     }
     let command = #""command":"/Applications/Cherry.app/Contents/MacOS/CherryMCP""#
+    // What `pi mcp add` writes for Cherry's Connect.
+    let described = #","description":""# + PiMCPRegistration.serverDescription + #"""#
 
     #expect(try status(nil) == .notRegistered)
     #expect(try status(#"{"mcpServers":{"other":{"command":"x"}}}"#) == .notRegistered)
     #expect(try status(#"{"autoEnableCodemode":true}"#) == .notRegistered)
-    #expect(try status(entry(command + #","exposure":"deferred""#)) == .connected(.deferred))
+    #expect(try status(entry(command + #","exposure":"deferred""# + described)) == .connected(.deferred))
     let before = try Data(contentsOf: file)
     #expect(try status(nil) == .notRegistered)
     try before.write(to: file)
@@ -177,7 +179,7 @@ private func piModel(_ standIn: PiStandIn, versions: AgentCLIVersions, helperPat
     #expect(try status(entry(command + #","exposure":"hidden""#)) == .toolsHidden(exposure: "hidden"))
     // Turned off comes before anything else.
     #expect(try status(entry(#""command":"/old/CherryMCP","enabled":false"#)) == .turnedOff)
-    #expect(try status(entry(command + #","exposure":"deferred","enabled":true"#)) == .connected(.deferred))
+    #expect(try status(entry(command + #","exposure":"deferred","enabled":true"# + described)) == .connected(.deferred))
     // Another helper: one that is gone, and one that runs.
     #expect(try status(entry(#""command":"/nonexistent/CherryMCP","exposure":"deferred""#))
         == .otherHelper(path: "/nonexistent/CherryMCP", runs: false))
@@ -188,9 +190,20 @@ private func piModel(_ standIn: PiStandIn, versions: AgentCLIVersions, helperPat
     #expect(try status(entry(command + #","args":["--debug","a b"],"exposure":"deferred""#))
         == .otherArguments(line: "/Applications/Cherry.app/Contents/MacOS/CherryMCP --debug 'a b'"))
     #expect(try status(entry(#""url":"https://example.com/mcp""#)) == .otherArguments(line: "https://example.com/mcp"))
-    // Its description, environment and timeout are Pi's business.
-    #expect(try status(entry(command + #","exposure":"deferred","description":"something else","env":{"A":"1"},"timeout":60,"args":[]"#))
+    // Its environment and timeout are Pi's business.
+    #expect(try status(entry(command + #","exposure":"deferred","env":{"A":"1"},"timeout":60,"args":[]"# + described))
         == .connected(.deferred))
+    // Deferred, its description is what Pi's prompt says of the server:
+    // an older Cherry's (no task tools in it), or none, is stale, as other
+    // arguments are; direct, Pi lists no description.
+    let shownHelper = "/Applications/Cherry.app/Contents/MacOS/CherryMCP"
+    let older = #","description":"Cherry, the terminal app this Pi runs in: its tabs, agents, Cherry tasks (get_my_task, report_result), waits and ports. Load its tools with tool_search.""#
+    #expect(try status(entry(command + #","exposure":"deferred""# + older)) == .otherArguments(line: shownHelper + " with another description"))
+    #expect(try status(entry(command + #","exposure":"deferred""#)) == .otherArguments(line: shownHelper + " with no description"))
+    #expect(try status(entry(command + #","exposure":"deferred","description":"  ""#)) == .otherArguments(line: shownHelper + " with no description"))
+    #expect(try status(entry(command + #","exposure":"direct""# + older)) == .connected(.direct))
+    #expect(try status(entry(command + #","exposure":"codemode""# + described)) == .toolsHidden(exposure: "codemode"))
+    #expect(AgentSettingsPage.piRow(for: .init(version: AgentCLIVersion(major: 1, minor: 3, patch: 0), entry: .otherArguments(line: shownHelper + " with another description")), serverName: "cherry").button == "Re-register")
     // A name Pi takes for the same server (`-` and `_` alike).
     #expect(PiMCPRegistration.status(serverName: "cherry_dev", helperPath: piHelper, agentDirectory: agentDirectory) == .notRegistered)
     try #"{"mcpServers":{"cherry-dev":{"command":"/x/CherryMCP","enabled":false}}}"#.write(to: file, atomically: true, encoding: .utf8)
@@ -207,7 +220,7 @@ private func piModel(_ standIn: PiStandIn, versions: AgentCLIVersions, helperPat
     }
     // A command under `~` is this user's home.
     let home = FileManager.default.homeDirectoryForCurrentUser.path
-    try entry(#""command":"~/Applications/Cherry.app/Contents/MacOS/CherryMCP","exposure":"deferred""#)
+    try entry(#""command":"~/Applications/Cherry.app/Contents/MacOS/CherryMCP","exposure":"deferred""# + described)
         .write(to: file, atomically: true, encoding: .utf8)
     #expect(PiMCPRegistration.status(serverName: "cherry", helperPath: "\(home)/Applications/Cherry.app/Contents/MacOS/CherryMCP", agentDirectory: agentDirectory)
         == .connected(.deferred))
@@ -477,7 +490,8 @@ private func piModel(_ standIn: PiStandIn, versions: AgentCLIVersions, helperPat
         onAdd: "printf '%s' \"$PI_CODING_AGENT_DIR\" > '\(seen.path)'\n" + PiStandIn.addsAsPiDoes
     )
     try FileManager.default.createDirectory(at: standIn.agentDirectory, withIntermediateDirectories: true)
-    try #"{"mcpServers":{"cherry":{"command":"/Applications/Cherry.app/Contents/MacOS/CherryMCP","exposure":"deferred"}}}"#
+    try (#"{"mcpServers":{"cherry":{"command":"/Applications/Cherry.app/Contents/MacOS/CherryMCP","exposure":"deferred","description":""#
+        + PiMCPRegistration.serverDescription + #""}}}"#)
         .write(to: standIn.agentDirectory.appendingPathComponent("mcp.json"), atomically: true, encoding: .utf8)
     let versions = AgentCLIVersions(environment: { [:] })
     let model = piModel(standIn, versions: versions)

@@ -442,7 +442,7 @@ private func piModel(_ standIns: ConnectStandIns) -> PiMCPRegistrationModel {
     try standIns.write("pi", """
     if [ "$1" = --version ]; then echo 1.3.0; exit 0; fi
     mkdir -p "$PI_CODING_AGENT_DIR"
-    printf '{"mcpServers":{"%s":{"command":"%s","exposure":"%s"}}}' "$3" "$9" "$5" > "$PI_CODING_AGENT_DIR/mcp.json"
+    printf '{"mcpServers":{"%s":{"command":"%s","exposure":"%s","description":"%s"}}}' "$3" "$9" "$5" "$7" > "$PI_CODING_AGENT_DIR/mcp.json"
     """)
     let agent = standIns.root.appendingPathComponent("agent")
     try FileManager.default.createDirectory(at: agent, withIntermediateDirectories: true)

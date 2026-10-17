@@ -267,7 +267,8 @@ public enum CherryToolLayer {
             previousBoundProcessID: shouldBind ? caller.boundProcessID : nil,
             taskID: spawned.task?.taskID,
             runID: spawned.task?.runID,
-            task: spawned.task
+            task: spawned.task,
+            inputError: spawned.inputError
         ))
         if shouldBind {
             result.bindProcessID = spawned.process.id
@@ -1195,6 +1196,8 @@ private struct MCPSpawnAgentPayload: Codable {
     let taskID: String?
     let runID: String?
     let task: AgentTaskInfo?
+    /// Why the message or kickoff did not arrive (`SpawnProcessResult.inputError`).
+    let inputError: CherryControlError?
 }
 
 private struct MCPSendAgentMessagePayload: Codable {

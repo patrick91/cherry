@@ -281,8 +281,10 @@ enum PiMCPRegistration {
     static let minimumVersion = AgentCLIVersion(major: 0, minor: 99, patch: 2)
 
     /// What Pi's `mcp_servers` prompt section says about Cherry's server
-    /// (Pi shows at most 250 characters of it).
-    static let serverDescription = "Cherry, the terminal app this Pi runs in: its tabs, agents, Cherry tasks (get_my_task, report_result), waits and ports. Load its tools with tool_search."
+    /// (Pi shows at most 250 characters of it), the same in Cherry's Pi
+    /// extension: it names the task tools, which Pi's tool search ranks
+    /// badly (the extension also declares them directly, `PiMCPExtension`).
+    static let serverDescription = "Cherry, the terminal app this Pi runs in: its tabs, agents, waits and ports. Workers: spawn_agent with task, then wait_for_tasks and get_task. Given a Cherry task: get_my_task, then report_result. Load its tools with tool_search."
 
     /// How Pi gives the model a server's tools (its entry's `exposure`), as
     /// the status reads them.
@@ -370,9 +372,9 @@ enum PiMCPRegistration {
 
     /// What Pi's `mcp.json` in `agentDirectory` has under `serverName` (or a
     /// name Pi takes for the same server: `-` and `_` alike), compared with
-    /// this app's helper: its `enabled`, `command`, `args` and `exposure`
-    /// (its `description`, `env` and `timeout` are not). Reads the file
-    /// only.
+    /// this app's helper: its `enabled`, `command`, `args`, `exposure` and,
+    /// when deferred, `description` (its `env` and `timeout` are not). Reads
+    /// the file only.
     static func status(serverName: String, helperPath: String, agentDirectory: URL) -> EntryStatus {
         let file = agentDirectory.appendingPathComponent("mcp.json", isDirectory: false)
         guard let data = FileManager.default.contents(atPath: file.path) else { return .notRegistered }
@@ -398,7 +400,17 @@ enum PiMCPRegistration {
             return .otherArguments(line: ([command] + arguments).map(MCPHarness.shownWord).joined(separator: " "))
         }
         switch server["exposure"] as? String ?? "codemode" {
-        case Exposure.deferred.rawValue: return .connected(.deferred)
+        case Exposure.deferred.rawValue:
+            // Pi's prompt lists a deferred server with its description,
+            // where the model learns of the task tools: an older Cherry's,
+            // or none, leaves them out (and the entry wins over the
+            // extension's server, which declares them).
+            let description = (server["description"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard description == serverDescription else {
+                let which = description.isEmpty ? "no description" : "another description"
+                return .otherArguments(line: "\(MCPHarness.shownWord(command)) with \(which)")
+            }
+            return .connected(.deferred)
         case Exposure.direct.rawValue: return .connected(.direct)
         case let exposure: return .toolsHidden(exposure: exposure)
         }

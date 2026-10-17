@@ -92,7 +92,7 @@ enum AgentScreenActivity {
         if showsKeyHintMenu(lines) {
             return true
         }
-        if agent == "amp", ampComposerBoxIndex(in: lines) != nil {
+        if agent == "amp", ampComposerBox(in: lines) != nil {
             return true
         }
 
@@ -152,7 +152,7 @@ enum AgentScreenActivity {
         case "pi":
             return trimmedLines.contains(where: isPiSpinnerStatus)
         case "amp":
-            return ampComposerBoxIndex(in: lines).map { ampStatusIsLive(trimmedLines[$0]) } ?? false
+            return ampComposerBox(in: lines).map { ampStatusIsLive(trimmedLines[$0.upperBound]) } ?? false
         case "claude":
             return claudeShowsLiveWork(trimmedLines)
         default:
@@ -258,17 +258,25 @@ enum AgentScreenActivity {
     // MARK: Amp
 
     /// Amp keeps a framed composer at the bottom of its screen (`╭─…─╮`,
-    /// `│ … │` rows, `╰ <status> ─…─╯`); returns the index in `lines` of its
-    /// bottom border.
-    private static func ampComposerBoxIndex(in lines: [String]) -> Int? {
+    /// `│ … │` rows, `╰ <status> ─…─╯`); returns the indices in `lines` from
+    /// its top border to its bottom border. Its rows have no prompt glyph:
+    /// what is typed shows between the borders. Its top border is the last
+    /// one among the last 12 non-blank lines or, in a taller box (a text
+    /// wrapped over many rows of a narrow tab), the nearest line above the
+    /// bottom border that is no `│` row, when that is a top border. The
+    /// verdicts (in their last `markerTailLineLimit` lines) and
+    /// `AgentTaskRegistry.kickoffPlacement` read the same box.
+    static func ampComposerBox(in lines: [String]) -> ClosedRange<Int>? {
         let nonBlank = lines.indices.filter { !lines[$0].trimmingCharacters(in: .whitespaces).isEmpty }
         func starts(_ index: Int, with prefix: String) -> Bool {
             lines[index].trimmingCharacters(in: .whitespaces).hasPrefix(prefix)
         }
-        guard let bottom = nonBlank.suffix(3).last(where: { starts($0, with: "╰") }),
-              nonBlank.suffix(12).contains(where: { starts($0, with: "╭") })
-        else { return nil }
-        return bottom
+        guard let bottom = nonBlank.suffix(3).last(where: { starts($0, with: "╰") }) else { return nil }
+        if let top = nonBlank.suffix(12).last(where: { $0 < bottom && starts($0, with: "╭") }) {
+            return top...bottom
+        }
+        guard let top = (0..<bottom).last(where: { !starts($0, with: "│") }), starts(top, with: "╭") else { return nil }
+        return top...bottom
     }
 
     /// Amp's composer border names what it is doing while a turn runs

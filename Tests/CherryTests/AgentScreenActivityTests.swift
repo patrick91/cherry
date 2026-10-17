@@ -196,6 +196,32 @@ struct AgentScreenActivityTests {
         #expect(verdict(screen, "amp") == .working)
     }
 
+    /// A box taller than the last 12 lines (a long text typed into a narrow
+    /// tab): its top border is found over its `│` rows, however many, and
+    /// the verdicts read it as a short one: at its composer, or working
+    /// when its border says so.
+    @Test func ampComposerBoxOfAnyHeight() {
+        let rows = (1...14).map { "│ row \($0)" + String(repeating: " ", count: 30) + "│" }
+        func tall(_ status: String = "") -> [String] {
+            ["Welcome to Amp", ""] + ["╭" + String(repeating: "─", count: 36) + "╮"] + rows
+                + ["╰ \(status)" + String(repeating: "─", count: 30) + "╯", ""]
+        }
+        #expect(AgentScreenActivity.ampComposerBox(in: tall()) == 2...17)
+        #expect(AgentScreenActivity.ampComposerBox(in: ["Welcome", ""] + ampBox("")) == 2...5)
+        #expect(verdict(tall(), "amp") == .prompt)
+        #expect(verdict(tall("∼ Thinking 27 tok "), "amp") == .working)
+        // A row that is no box row between them: no box.
+        var broken = tall()
+        broken[9] = "  row 7"
+        #expect(AgentScreenActivity.ampComposerBox(in: broken) == nil)
+        #expect(verdict(broken, "amp") == .none)
+        var gap = tall()
+        gap[9] = ""
+        #expect(AgentScreenActivity.ampComposerBox(in: gap) == nil)
+        // No top border at all.
+        #expect(AgentScreenActivity.ampComposerBox(in: Array(tall().dropFirst(3))) == nil)
+    }
+
     // MARK: Pickers and dialogs
 
     @Test func resumePickerFooterWaitsForInput() {

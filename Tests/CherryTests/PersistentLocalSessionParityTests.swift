@@ -884,6 +884,7 @@ final class ParityControlServer {
         return
     }
     #expect(result.sentBytes == 0)
+    #expect(result.inputError?.code == "input_not_delivered", "\(String(describing: result.inputError))")
     let sent = try await sending
     #expect(sent.error?.code == "input_not_delivered")
     #expect(harness.fake.requests("send_input").count == 2)

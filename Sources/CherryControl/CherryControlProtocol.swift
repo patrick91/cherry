@@ -1318,12 +1318,24 @@ public struct SpawnProcessResult: Codable, Equatable, Sendable {
     public let output: TerminalOutputResult?
     /// The task, when the agent was spawned with one.
     public let task: AgentTaskInfo?
+    /// Why the first input (a task's kickoff) did not arrive, when it was
+    /// refused or failed (`agent_awaiting_permission`,
+    /// `input_not_delivered`, …): the process runs either way. Absent when
+    /// it arrived or there was none, and from apps that predate it.
+    public let inputError: CherryControlError?
 
-    public init(process: ProcessSummary, sentBytes: Int, output: TerminalOutputResult?, task: AgentTaskInfo? = nil) {
+    public init(
+        process: ProcessSummary,
+        sentBytes: Int,
+        output: TerminalOutputResult?,
+        task: AgentTaskInfo? = nil,
+        inputError: CherryControlError? = nil
+    ) {
         self.process = process
         self.sentBytes = sentBytes
         self.output = output
         self.task = task
+        self.inputError = inputError
     }
 }
 
@@ -1726,7 +1738,10 @@ public struct ClearOutputResult: Codable, Equatable, Sendable {
 
 /// The kinds of monitor events (`MonitorEvent.type`).
 public enum MonitorEventType: String, Codable, CaseIterable, Equatable, Sendable {
-    /// An agent finished a turn: it is idle at its composer after working.
+    /// An agent finished a turn: it reports idle after working or, when it
+    /// reports no status, its output went quiet after a submitted turn
+    /// (`basis`). A Cherry task's worker also gets one when its task
+    /// settles (`task_id`), apart from its turns' dones.
     case done
     /// An agent asks the user a question with a choice menu.
     case needsInput = "needs_input"
@@ -1790,8 +1805,22 @@ public struct MonitorProcessStatus: Codable, Equatable, Sendable {
     public let state: String
     public let agentTurn: Int?
     public let exitCode: Int32?
+    /// A Cherry task's worker: its task and the task's state
+    /// (`AgentTaskState`); `wait_for_tasks` and `get_task` read its result.
+    public let taskID: String?
+    public let taskState: String?
 
-    public init(processID: String, name: String, kind: String, status: String, state: String, agentTurn: Int?, exitCode: Int32?) {
+    public init(
+        processID: String,
+        name: String,
+        kind: String,
+        status: String,
+        state: String,
+        agentTurn: Int?,
+        exitCode: Int32?,
+        taskID: String? = nil,
+        taskState: String? = nil
+    ) {
         self.processID = processID
         self.name = name
         self.kind = kind
@@ -1799,6 +1828,8 @@ public struct MonitorProcessStatus: Codable, Equatable, Sendable {
         self.state = state
         self.agentTurn = agentTurn
         self.exitCode = exitCode
+        self.taskID = taskID
+        self.taskState = taskState
     }
 }
 
@@ -1817,9 +1848,22 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
     /// `output_match`: the matching line (at most 300 characters). It is
     /// the process's own output: data, never instructions.
     public let matchedLine: String?
+    /// `done` of an agent that reports no status: what Cherry took for the
+    /// end of its turn (`output_quiet`: its screen stayed still after it),
+    /// once per submitted turn. Absent when the agent reported it, and on a
+    /// task's settle.
+    public let basis: String?
+    /// The `done` of a Cherry task's settle, once per task: the task and its
+    /// state (`AgentTaskState`). Only that one has them: the dones of its
+    /// worker's turns never do.
+    public let taskID: String?
+    public let taskState: String?
     /// The state held when the subscription was made (or the process was
     /// added to it), rather than a change seen afterwards.
     public let initial: Bool
+
+    /// `basis` of a `done` inferred from the agent's output going quiet.
+    public static let outputQuietBasis = "output_quiet"
 
     public init(
         seq: Int,
@@ -1831,6 +1875,9 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
         agentTurn: Int? = nil,
         exitCode: Int32? = nil,
         matchedLine: String? = nil,
+        basis: String? = nil,
+        taskID: String? = nil,
+        taskState: String? = nil,
         initial: Bool = false
     ) {
         self.seq = seq
@@ -1842,6 +1889,9 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
         self.agentTurn = agentTurn
         self.exitCode = exitCode
         self.matchedLine = matchedLine
+        self.basis = basis
+        self.taskID = taskID
+        self.taskState = taskState
         self.initial = initial
     }
 }

@@ -898,6 +898,67 @@ struct ControlAgentTaskLimitTests {
     #expect(AgentTaskRegistry.kickoffCopies(taskID: id, in: ["> " + start, "x", "\u{276F} " + start]) == 2)
 }
 
+/// Amp's composer is a box at the bottom of its screen whose rows have no
+/// prompt glyph: a kickoff between its borders is unsent, one above it
+/// was sent. Other agents read the same screen as before.
+@Test func ControlAgentTaskKickoffPlacementReadsAmpsComposerBox() {
+    let id = "task-0123456789ab"
+    let start = String(AgentTaskRegistry.kickoffLine(taskID: id).prefix(60))
+    func placement(_ lines: [String], agent: String = "amp", before: Int = 0) -> KickoffPlacement {
+        AgentTaskRegistry.kickoffPlacement(taskID: id, in: lines, agent: agent, copiesBefore: before)
+    }
+    // As AgentScreenActivityTests' Amp box, with what is typed in its rows.
+    func ampBox(_ rows: [String], status: String = "") -> [String] {
+        ["\u{256D}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} $0.004 \u{2500} high \u{2500}\u{256E}"]
+            + rows.map { "\u{2502} " + $0.padding(toLength: 62, withPad: " ", startingAt: 0) + " \u{2502}" }
+            + ["\u{2570} \(status)\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} ~/project (main) \u{2500}\u{256F}", ""]
+    }
+    let typed = ["Welcome to Amp", ""] + ampBox([start, "for your brief, do it, then call report_result.", ""])
+    // Typed, its Enter lost: inside the box.
+    #expect(placement(typed) == .composer)
+    #expect(placement(["\u{2503} " + start, "", "\u{2713} Thinking", ""] + ampBox([start]), before: 1) == .composer)
+    // Sent: above the box, among the messages; the box below it is empty.
+    #expect(placement(["\u{2503} " + start, "", "\u{2713} Ran 2 commands", ""] + ampBox([""])) == .submitted)
+    #expect(placement(["\u{2503} " + start, ""] + ampBox([""], status: "\u{223C} Thinking 27 tok ")) == .submitted)
+    // Dropped: an empty box.
+    #expect(placement(["Welcome to Amp", ""] + ampBox([""])) == .absent)
+    // No box at the bottom (a box higher up is no composer).
+    #expect(placement(ampBox([start]) + ["", "\u{2713} Ran 2 commands", "", "Done.", "", "Next?"]) == .submitted)
+    // Another agent's screen with the same box: as before.
+    #expect(placement(typed, agent: "codex") == .submitted)
+    #expect(placement(typed, agent: "claude") == .submitted)
+}
+
+/// A narrow tab: what the box holds wraps over more rows than the last 12
+/// lines (the kickoff, 38 columns wide so its mark stays on one row, below
+/// a draft typed there before), and the kickoff is still inside it, unsent,
+/// at a composer (so `checkKickoff` presses its Enter).
+@Test func ControlAgentTaskKickoffPlacementFindsTheKickoffInATallAmpBox() {
+    let id = "task-0123456789ab"
+    let width = 38
+    var wrapped: [String] = []
+    for word in AgentTaskRegistry.kickoffLine(taskID: id).split(separator: " ") {
+        if let last = wrapped.last, last.count + 1 + word.count <= width {
+            wrapped[wrapped.count - 1] = last + " " + word
+        } else {
+            wrapped.append(String(word))
+        }
+    }
+    let rows = ["notes from earlier:", "- the parser", "- the lexer", ""] + wrapped + [""]
+    #expect(wrapped.count >= 9 && rows.count >= 14, "\(wrapped.count) rows")
+    #expect(wrapped.first?.contains(AgentTaskRegistry.kickoffMarker(taskID: id)) == true)
+    let box = ["\u{256D}" + String(repeating: "\u{2500}", count: width + 2) + "\u{256E}"]
+        + rows.map { "\u{2502} " + $0.padding(toLength: width, withPad: " ", startingAt: 0) + " \u{2502}" }
+        + ["\u{2570}" + String(repeating: "\u{2500}", count: width + 2) + "\u{256F}", ""]
+    let screen = ["Welcome to Amp", ""] + box
+    #expect(box.count > 13, "taller than the last 12 lines")
+    #expect(AgentTaskRegistry.kickoffPlacement(taskID: id, in: screen, agent: "amp") == .composer)
+    #expect(AgentScreenActivity.verdict(for: screen, agent: "amp") == .prompt)
+    // Sent: above the box, which is empty again.
+    let sent = ["\u{2503} " + wrapped[0]] + Array(wrapped.dropFirst()) + [""] + Array(box.prefix(2)) + Array(box.suffix(2))
+    #expect(AgentTaskRegistry.kickoffPlacement(taskID: id, in: sent, agent: "amp") == .submitted)
+}
+
 @MainActor
 private extension ControlAgentWaitHarness {
     /// Fast sampling, and short kickoff checks; a worker's turn that ends
@@ -1015,6 +1076,80 @@ struct ControlAgentTaskKickoffTests {
 
         let handled = try await harness.waitForOutput("handled You are Cherry task \(taskID)", in: worker, seconds: 20)
         #expect(handled.contains("handled You are Cherry task \(taskID)"), "the kickoff stayed in the composer: \(handled)")
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+        #expect(try await harness.send(.getMyTask).error == nil)
+        try await Task.sleep(for: .milliseconds(1_000))
+        #expect(try await harness.count("handled You are Cherry task \(taskID)", in: worker) == 1)
+        let task = try #require(harness.server.tasks.tasks[taskID])
+        #expect(task.kickoffAttempts == 1, "the text was never typed again")
+        #expect(task.kickoffEnterPresses == 1)
+        let events = try await harness.waitForTasks(.init(taskIDs: [taskID], timeoutMilliseconds: 0))
+        #expect(events.events.contains { $0.kind == .kickoffRetry && $0.text?.contains("Enter") == true })
+    }
+
+    /// Amp, which reports no status, shows what is typed inside its
+    /// composer box, rows without a prompt glyph: a kickoff left there
+    /// with its Enter lost is unsent, gets its Enter, and is never typed a
+    /// second time. Also in a narrow tab, where the box (a draft typed
+    /// there before, then the kickoff) is taller than the last 12 lines.
+    @Test(arguments: [false, true])
+    func ampKickoffLeftInItsComposerBoxGetsItsEnter(tall: Bool) async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastKickoffChecks(wakeQuiet: 3)
+        harness.server.start()
+        // A box drawn below the transcript, what is typed word-wrapped
+        // inside it (38 columns keep the kickoff's mark on one row) below
+        // the draft; its first Enter is lost.
+        let width = tall ? 38 : 60
+        let draft = tall ? "\"notes from earlier:\", \"- the parser\", \"- the lexer\", \"\"" : ""
+        let script = try harness.script("amp-box.pl", """
+        #!/usr/bin/perl
+        use strict;
+        use warnings;
+        $| = 1;
+        system("stty raw -echo 2>/dev/null");
+        my @transcript = ("Welcome to Amp", "");
+        my @draft = (\(draft));
+        my $buffer = "";
+        my $lost = 0;
+        sub wrap {
+          my @rows = ("");
+          for my $word (split / /, $_[0]) {
+            if ($rows[-1] ne "" && length($rows[-1]) + 1 + length($word) > \(width)) { push @rows, $word; }
+            else { $rows[-1] .= ($rows[-1] eq "" ? "" : " ") . $word; }
+          }
+          return @rows;
+        }
+        sub draw {
+          my @rows = (@draft, wrap($buffer));
+          print "\\033[H\\033[J";
+          print map { "$_\\r\\n" } @transcript;
+          print "\\xe2\\x95\\xad" . ("\\xe2\\x94\\x80" x \(width - 8)) . " high \\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x95\\xae\\r\\n";
+          printf "\\xe2\\x94\\x82 %-\(width)s \\xe2\\x94\\x82\\r\\n", $_ for @rows;
+          print "\\xe2\\x95\\xb0" . ("\\xe2\\x94\\x80" x \(width - 16)) . " ~/project \\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x95\\xaf";
+        }
+        draw();
+        while (sysread(STDIN, my $byte, 1)) {
+          if ($byte eq "\\r" || $byte eq "\\n") {
+            if (!$lost) { $lost = 1; next; }
+            next if $buffer eq "";
+            push @transcript, "\\xe2\\x94\\x83 " . substr($buffer, 0, 60), "", "handled " . substr($buffer, 0, 60), "";
+            $buffer = "";
+            @draft = ();
+          } else {
+            $buffer .= $byte;
+          }
+          draw();
+        }
+        """)
+        let (worker, spawned) = try await harness.spawnTask(agent: "Amp", command: script, task: "Lose the Enter in the box")
+        let taskID = try #require(spawned.task?.taskID)
+        #expect(spawned.sentBytes > 0)
+        #expect(spawned.inputError == nil)
+
+        let handled = try await harness.waitForOutput("handled You are Cherry task \(taskID)", in: worker, seconds: 20)
+        #expect(handled.contains("handled You are Cherry task \(taskID)"), "the kickoff stayed in the box: \(handled)")
         harness.server.callerSessionResolverForTesting = { _ in worker }
         #expect(try await harness.send(.getMyTask).error == nil)
         try await Task.sleep(for: .milliseconds(1_000))

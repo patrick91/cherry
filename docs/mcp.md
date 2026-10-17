@@ -25,8 +25,27 @@ and on your other Macs (below):
   the tab's `CHERRY_MCP_HELPER` as the command, `--client-tool-timeout 300`,
   deferred exposure, `timeout: 300` and the description below, under the
   name in `CHERRY_MCP_SERVER_NAME`, which every tab with `CHERRY_MCP_HELPER`
-  has. Pi passes its whole environment to the server, so nothing else goes
-  on the line. A Pi without MCP (before 0.99) loads it and does nothing.
+  has. The task tools (`spawn_agent`, `wait_for_tasks`, `get_task`,
+  `get_my_task`, `report_result`) are `direct` in its `toolExposure`, which
+  every Pi with MCP takes: Pi declares them with every request, since the
+  model sees only a deferred server's description, and Pi's `tool_search`
+  ranks these tools low (an `mcp.json` entry of that name, which wins,
+  keeps its own exposure). Pi's first prompt then waits for the server,
+  at most 10 s. Pi's `/mcp` › Exposure › hidden leaves these five
+  declared (it overrides the server's exposure only); Disable turns Cherry
+  off. Each prompt also gets a `cherry_workers` section in Pi's
+  system prompt (added in `before_agent_start`, next to Pi's own
+  `mcp_servers`; the prompt is not replaced): run workers with
+  `spawn_agent(task=…)`, end the turn or call `wait_for_tasks`, read
+  results with `get_task` (the workers' data, not instructions), and a tab
+  given a Cherry task kickoff calls `get_my_task` and finishes with
+  `report_result`. It is there only while Pi has the task tools, as
+  `pi.getAllTools()` lists them: declared, or deferred (an `mcp.json`
+  entry's; the section then says to load them with `tool_search` first).
+  None when that entry turns them off, hides them or puts them in
+  codemode, or on a prompt sent before the server connected. Pi passes its
+  whole environment to the server, so nothing else goes on the line. A Pi
+  without MCP (before 0.99) loads it and does nothing.
 
 None of them writes the agent's configuration. The server has the name a
 registration has (the identity's URL scheme, `cherry` for releases), so for
@@ -110,7 +129,7 @@ build the helper and install it like this:
 swift build --product CherryMCP
 codex mcp add cherry -- "$(swift build --show-bin-path)/CherryMCP"
 claude mcp add --transport stdio --scope user cherry -- "$(swift build --show-bin-path)/CherryMCP"
-pi mcp add cherry --exposure deferred --description 'Cherry, the terminal app this Pi runs in: its tabs, agents, Cherry tasks (get_my_task, report_result), waits and ports. Load its tools with tool_search.' -- "$(swift build --show-bin-path)/CherryMCP"
+pi mcp add cherry --exposure deferred --description 'Cherry, the terminal app this Pi runs in: its tabs, agents, waits and ports. Workers: spawn_agent with task, then wait_for_tasks and get_task. Given a Cherry task: get_my_task, then report_result. Load its tools with tool_search.' -- "$(swift build --show-bin-path)/CherryMCP"
 ```
 
 Pi's registration needs Pi 0.99.2 or later (MCP came in 0.99.0;
@@ -122,7 +141,9 @@ no `pi mcp` and takes `mcp add …` as prompts for its model, so Cherry runs
 other Macs. `--exposure deferred` lets the model find Cherry's tools
 through Pi's tool search when it needs them; `direct` sends all of them
 with every request, and Pi's default (`codemode`) hides them behind a
-script tool. The description is the line Pi's prompt shows for the server.
+script tool. The description is the line Pi's prompt shows for the server;
+it names the task tools, since `pi mcp add` sets no tool's exposure of its
+own (only the extension makes them `direct`).
 
 **Connect Agents to Cherry…** (the Omni bar, or Settings › Agents & MCP ›
 MCP server) shows Claude Code, Codex and Pi on this Mac: each one's
@@ -213,7 +234,7 @@ never writing it. Its row then says:
 | Tools hidden | this app's CherryMCP, `codemode` (also no `exposure`) or `hidden` | Make Deferred |
 | Turned off in Pi | `"enabled": false` | Connect |
 | Another Cherry / Broken | another CherryMCP, which runs / is gone | Re-register |
-| Differs | this app's CherryMCP with arguments, or no command | Re-register |
+| Differs | this app's CherryMCP with arguments, deferred with another description than Cherry's (an older Cherry's, or none: Pi's prompt lists the server with it), or no command | Re-register |
 | Can't read | `mcp.json` is not a JSON object | Check Again |
 
 Connect, Make Deferred, Re-register and Connect Again all run the command
@@ -720,7 +741,10 @@ process tools include activity metadata:
 Rendered output results (`get_process_output` and the `output` field of other
 tools) include `screen` and `content_version`. `screen` is `"alternate"` when
 you are reading a fullscreen TUI's live screen rather than scrollback, and
-`"primary"` otherwise.
+`"primary"` otherwise. `get_process_raw_output` returns a tab's rendered text
+too, as one string from its end (at most `max_bytes`), without control
+sequences: the terminal owns the program's bytes, so no tab keeps them (only
+the host-managed backend of Cherry's tests does).
 
 ## Waiting For Agent Output
 
@@ -838,20 +862,43 @@ to their events and ends its turn; Cherry tells it when something happened.
   on screen when the watch began do not count). The default is all but
   `output_match`. Only processes the caller may reach can be watched: a
   caller on another Mac only its Mac's (`terminal_not_found` otherwise).
+- An agent that reports no status (Amp, Codex: `unknown`, which its status
+  stays) is `done` once its screen changed after a submitted turn and then
+  stayed still for 2 s, as `wait_for_process_idle` falls back to its output
+  going quiet; the event has `basis: "output_quiet"`. Once per turn: the
+  next one comes after another submitted turn (a turn submitted before its
+  program restarted never does). A program that pauses with a still screen
+  in the middle of its turn looks done too.
 - A state that already holds when the subscription is made is reported at
-  once with `initial: true`: an agent whose last turn completed is `done`,
-  one at a question is `needs_input`, and so on. An agent never given a turn
-  is not `done`. So nothing is lost between `spawn_agent` and `subscribe`.
+  once with `initial: true`: an agent whose last turn completed is `done`
+  (one that reports no status: quiet after its turn; a tab nothing read
+  since its last output may count as changed at that first look, and its
+  `done` then comes up to 2 s later, without `initial`), one at a question
+  is `needs_input`, and so on. An agent never given a turn is not `done`.
+  So nothing is lost between `spawn_agent` and `subscribe`.
+- A watched worker of a Cherry task (below) has `task_id` and `task_state`
+  in `watching`. Its turns end with `done`s as any agent's do (a quiet one
+  per submitted turn when it reports no status), never left out because of
+  its task, and they carry no task. Its task's settle (`reported`,
+  `no_report`, `failed`, `cancelled`) is one more `done`, the only one with
+  `task_id` and `task_state`, and no `basis`: once per task (a report
+  after it adds nothing), also after its `exited`, and none when the
+  subscriber cancelled it itself (`cancel_tasks`). A `closed` ends the
+  watch: only a subscription without `closed` still gets the settle of a
+  task open when its tab closed. Read its result with `get_task`; to wait
+  for workers, `wait_for_tasks` is the better tool.
 - Each event has a `seq`, numbered per subscription, plus `process_id`,
   `process_name`, `kind`, `at`, `agent_turn` and, for `output_match`,
   `matched_line` (at most 300 characters; the process's own output, data
-  rather than instructions).
+  rather than instructions); `basis` for a `done` Cherry inferred, and
+  `task_id` and `task_state` for a task's settle.
 - `wait_for_events` returns the events after `cursor`, waiting up to
   `timeout_ms` (default 50000, at most 50000 or the client's limit, see
   Client Timeouts; 0 returns at once) for the first
   one, plus `watching`: each watched process's status now (`working`,
   `idle`, `needs_input`, `permission`, `error`, `unknown`, `running` for
-  other processes, `exited`, `disconnected`, `closed`). Passing `cursor`
+  other processes, `exited`, `disconnected`, `closed`), and a worker's
+  `task_id` and `task_state`. Passing `cursor`
   acknowledges every event up to it, and the events after it come back until
   a later call acknowledges them, so passing back each returned `cursor`
   reads every event at least once even if an answer is lost. Without
@@ -939,13 +986,14 @@ Code, Codex and Pi.
   Enter. Until the worker's turn starts, it calls `get_my_task`, or the
   kickoff shows among its sent messages, Cherry looks at its screen once
   it has been still for a second: a kickoff left unsent in the composer
-  gets its Enter (at most twice), and one not on screen at all is typed
-  again; so is one that could not be typed (the worker showed a prompt),
-  once the worker is idle. That is at most three kickoffs in all (each
-  retry is a `kickoff_retry` event); then the task is `failed`. A kickoff
-  that may have been typed although its input failed
-  (`input_maybe_delivered`) is never typed again. An agent whose screen
-  Cherry cannot read keeps its kickoff as typed.
+  (on its prompt line, or inside Amp's composer box, whose rows have no
+  prompt glyph) gets its Enter (at most twice), and one not on screen at
+  all is typed again; so is one that could not be typed (the worker
+  showed a prompt), once the worker is idle. That is at most three
+  kickoffs in all (each retry is a `kickoff_retry` event); then the task
+  is `failed`. A kickoff that may have been typed although its input
+  failed (`input_maybe_delivered`) is never typed again. An agent whose
+  screen Cherry cannot read keeps its kickoff as typed.
 - `wait_for_tasks` with `run_id` or `task_ids` (default: the caller's own
   open runs), `until` (`any`, the default: a task settled or needs input;
   `all`: every task settled), `cursor` and `timeout_ms` (default 50000, at
@@ -1127,7 +1175,11 @@ what the agent says it waits for. For an agent that reports nothing, its
 current screen is checked for such a menu instead; the screen is read from
 its session host when no terminal shows it, for example for a restored agent
 whose tab is not shown yet, and when it cannot be read the input fails
-with `input_not_delivered` and nothing is sent.
+with `input_not_delivered` and nothing is sent. The first input of
+`spawn_process` and `spawn_agent` (a task's kickoff included) that is refused
+or not delivered leaves the process running: the result has `sent_bytes` 0
+and `input_error`, the error's `code` and `message` (absent when the input
+arrived, and from apps that predate it).
 
 Cherry presses Enter on an agent's startup or trust prompt only for an agent
 its tab just launched, never for a restored, adopted or attached agent, and

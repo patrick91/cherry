@@ -124,6 +124,9 @@ final class AgentTask {
     var startedAt: Date?
     var settledAt: Date?
     var reason: String?
+    /// The tab whose `cancel_tasks` cancelled it, when Cherry confirmed the
+    /// caller: its own monitors are not told (in memory only, as they are).
+    var cancelledBy: UUID?
     var result: AgentTaskResult?
     var progress: String?
     var progressAt: Date?
@@ -1385,10 +1388,12 @@ extension CherryControlServer {
         var cancelled: [String] = []
         var closed: [String] = []
         var alreadySettled: [String] = []
+        let callerID = verifiedCallerSession()?.id
         for task in selectedTasks(selection) {
             if task.state.isSettled {
                 alreadySettled.append(task.id)
             } else {
+                task.cancelledBy = callerID
                 tasks.update(task, to: .cancelled, event: .cancelled, text: "Cancelled by the orchestrator.", reason: "cancelled by the orchestrator")
                 cancelled.append(task.id)
             }
@@ -1401,7 +1406,7 @@ extension CherryControlServer {
             }
         }
         // Its owner ended it: it knows the run settled (no wake line).
-        if let callerID = verifiedCallerSession()?.id {
+        if let callerID {
             for run in involvedRuns(selection) where run.ownerID == callerID {
                 if let settledSeq = run.settledSeq { run.ownerReadSeq = max(run.ownerReadSeq, settledSeq) }
             }
@@ -2031,7 +2036,8 @@ extension CherryControlServer {
 
 /// Where the kickoff is on the worker's screen.
 enum KickoffPlacement: Equatable, Sendable {
-    /// On the composer's prompt line: typed, not sent.
+    /// On the composer's prompt line, or inside Amp's composer box: typed,
+    /// not sent.
     case composer
     /// Above the composer (among the sent messages), or on a screen with
     /// no composer.
@@ -2050,15 +2056,22 @@ extension AgentTaskRegistry {
     /// oldest first), when `copiesBefore` copies of it were there before it
     /// was typed: a copy on the composer's prompt line (the last prompt
     /// line on screen, `AgentScreenActivity.isInputPromptLine`, also inside
-    /// a framed composer `│ > …`) is unsent; one more copy than before
-    /// anywhere else (among the sent messages, or on a screen without a
-    /// composer) was sent; otherwise it is not there.
+    /// a framed composer `│ > …`), or for Amp between the borders of its
+    /// composer box (`AgentScreenActivity.ampComposerBox`, rows without a
+    /// prompt glyph, however many a kickoff wraps over), is unsent; one
+    /// more copy than before anywhere else
+    /// (among the sent messages, or on a screen without a composer) was
+    /// sent; otherwise it is not there.
     nonisolated static func kickoffPlacement(taskID: String, in lines: [String], agent: String, copiesBefore: Int = 0) -> KickoffPlacement {
         let marker = kickoffMarker(taskID: taskID)
         let copies = lines.indices.filter { lines[$0].contains(marker) }
         guard let markerLine = copies.last else { return .absent }
         if isComposerPromptLine(lines[markerLine], agent: agent),
            !lines[(markerLine + 1)...].contains(where: { isComposerPromptLine($0, agent: agent) }) {
+            return .composer
+        }
+        if agent == "amp", let box = AgentScreenActivity.ampComposerBox(in: lines),
+           box.lowerBound < markerLine, markerLine < box.upperBound {
             return .composer
         }
         return copies.count > copiesBefore ? .submitted : .absent

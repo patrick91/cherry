@@ -7724,7 +7724,8 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     /// For a loop that watches the tab for new output every 50 ms (MCP
-    /// `wait_for_process_idle`): advances the output and content counters
+    /// `wait_for_process_idle`; a monitor's samples, for an agent that
+    /// reports no status): advances the output and content counters
     /// as `lineCount` does, without reading a native surface's whole text
     /// (about a millisecond for a long history) on every pass. A tab no
     /// window shows gets no render signal, so a change shows only in what

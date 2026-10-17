@@ -83,9 +83,12 @@ public enum CherryToolCatalog {
                 ]),
                 annotations: readOnly
             ),
+            // The app's tabs, native and persistent, give their rendered
+            // text (`TerminalSession.rawOutput`); only a host-managed tab
+            // (tests') keeps the raw bytes, control sequences and all.
             tool(
                 "get_process_raw_output",
-                "A process's recent raw output, with control sequences.",
+                "A process's recent output as text, no control sequences.",
                 properties: processSelectorProperties([
                     "max_bytes": integer("Max 1048576.")
                 ]),
@@ -110,7 +113,7 @@ public enum CherryToolCatalog {
             ),
             tool(
                 "subscribe",
-                "Be told of changes instead of polling. Events: done (an agent's turn ended), needs_input, permission, error, exited (with exit_code), closed, output_match. A state already true is reported at once (initial: true). wait_for_events reads them. With wake, Cherry types one line into your own tab when events are ready and you are idle (the subscription and counts, never text of the watched processes), so you can end your turn; off in Settings › Agents & MCP › Monitors (the result's wake field). Only processes this session may reach.",
+                "Events instead of polling: done (a turn ended; status unknown: its output went quiet, basis output_quiet), needs_input, permission, error, exited (with exit_code), closed, output_match. A state already true comes at once (initial: true); wait_for_events reads them. Task workers: use wait_for_tasks, get_task. With wake, Cherry types one line into your own tab when events are ready and you are idle (counts only, never text of the watched processes); off in Settings › Agents & MCP › Monitors (the result's wake field). Only processes this session may reach.",
                 properties: projectScopedProperties([
                     "process_ids": stringArray(),
                     "sub_agents": boolean("Also your sub-agents, later ones too."),
@@ -122,7 +125,7 @@ public enum CherryToolCatalog {
             ),
             tool(
                 "wait_for_events",
-                "Read a subscription's events after cursor, waiting up to timeout_ms (at most \(maximumWait), default \(defaultWait); 0 returns at once), and acknowledge those up to it; pass the returned cursor next. watching: each process's status. timed_out is normal: call again, or end your turn and wait for the wake line.",
+                "Read a subscription's events after cursor, waiting up to timeout_ms (at most \(maximumWait), default \(defaultWait); 0 returns at once), and acknowledge those up to it; pass the returned cursor next. watching: each process's status, task_state. timed_out is normal: call again, or end your turn for the wake line.",
                 properties: [
                     "subscription_id": string(),
                     "cursor": integer("Default: after the last event read."),

@@ -533,6 +533,52 @@ private func controlToolLayerProcess(id: String = controlToolLayerAgentID, kind:
     }
 }
 
+/// A spawn whose first input did not arrive says why (input_error, in
+/// spawn_agent's payload and spawn_process's result alike); it is absent
+/// when the input arrived, and from an app that predates it.
+@Test func controlToolLayerSaysWhyASpawnsFirstInputDidNotArrive() async throws {
+    let process = controlToolLayerProcess(id: controlToolLayerOtherID)
+    let refusal = CherryControlError(
+        code: "agent_awaiting_permission",
+        message: "Agent 'Claude' is waiting for an answer to a permission prompt; nothing was sent."
+    )
+    func spawning(_ result: SpawnProcessResult) -> ControlToolLayerRecorder {
+        ControlToolLayerRecorder { _ in CherryControlResponse(result: .spawnProcess(result)) }
+    }
+    let arguments: [String: JSONValue] = ["name": .string("Claude"), "message": .string("hi"), "top_level": .bool(true)]
+
+    let refused = await CherryToolLayer.call(
+        name: "spawn_agent", arguments: arguments, caller: CherryToolCaller(),
+        transport: spawning(SpawnProcessResult(process: process, sentBytes: 0, output: nil, inputError: refusal))
+    )
+    #expect(!refused.isError, "the process exists: \(refused.text)")
+    #expect(refused.text.contains(#""input_error":{"code":"agent_awaiting_permission","message":"Agent 'Claude' is waiting for an answer to a permission prompt; nothing was sent."}"#), "\(refused.text)")
+    #expect(refused.text.contains(#""sent_bytes":0"#))
+    #expect(refused.structured?.objectValue?["inputError"]?.objectValue?["code"] == .string("agent_awaiting_permission"))
+
+    let spawnedProcess = await CherryToolLayer.call(
+        name: "spawn_process", arguments: ["kind": .string("terminal"), "text": .string("make\n")], caller: CherryToolCaller(),
+        transport: spawning(SpawnProcessResult(process: process, sentBytes: 0, output: nil, inputError: refusal))
+    )
+    #expect(spawnedProcess.text.contains(#""input_error":{"code":"agent_awaiting_permission""#), "\(spawnedProcess.text)")
+
+    let sent = await CherryToolLayer.call(
+        name: "spawn_agent", arguments: arguments, caller: CherryToolCaller(),
+        transport: spawning(SpawnProcessResult(process: process, sentBytes: 3, output: nil))
+    )
+    #expect(!sent.isError)
+    #expect(!sent.text.contains("input_error"), "\(sent.text)")
+    #expect(sent.structured?.objectValue?["inputError"] == nil)
+
+    // On the wire it is optional: an answer without it (an app that
+    // predates it) decodes, and one with it round-trips.
+    let delivered = try JSONEncoder().encode(SpawnProcessResult(process: process, sentBytes: 3, output: nil))
+    #expect(!String(decoding: delivered, as: UTF8.self).contains("inputError"))
+    #expect(try JSONDecoder().decode(SpawnProcessResult.self, from: delivered).inputError == nil)
+    let failed = try JSONEncoder().encode(SpawnProcessResult(process: process, sentBytes: 0, output: nil, inputError: refusal))
+    #expect(try JSONDecoder().decode(SpawnProcessResult.self, from: failed).inputError == refusal)
+}
+
 @Test func controlToolLayerSendsAnAgentMessageAsItsThreeRequests() async {
     let agent = controlToolLayerProcess()
     let output = TerminalOutputResult(terminalID: agent.id, startLine: 0, endLineExclusive: 1, totalLines: 1, lines: ["done"])

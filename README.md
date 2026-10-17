@@ -490,7 +490,7 @@ copy's path; for Cherry in `/Applications`:
 ```bash
 codex mcp add cherry -- /Applications/Cherry.app/Contents/MacOS/CherryMCP
 claude mcp add --transport stdio --scope user cherry -- /Applications/Cherry.app/Contents/MacOS/CherryMCP
-pi mcp add cherry --exposure deferred --description 'Cherry, the terminal app this Pi runs in: its tabs, agents, Cherry tasks (get_my_task, report_result), waits and ports. Load its tools with tool_search.' -- /Applications/Cherry.app/Contents/MacOS/CherryMCP
+pi mcp add cherry --exposure deferred --description 'Cherry, the terminal app this Pi runs in: its tabs, agents, waits and ports. Workers: spawn_agent with task, then wait_for_tasks and get_task. Given a Cherry task: get_my_task, then report_result. Load its tools with tool_search.' -- /Applications/Cherry.app/Contents/MacOS/CherryMCP
 ```
 
 Pi registers with deferred exposure (its tool search finds Cherry's tools

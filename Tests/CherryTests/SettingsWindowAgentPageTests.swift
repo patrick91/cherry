@@ -418,7 +418,8 @@ private func agentSettings(_ agents: [AgentToolDefinition]) throws -> AgentSetti
 
     let rows = AgentSettingsPage.searchRows(in: context)
     #expect(rows.map(\.id) == [
-        .agent("claude", "command"), .agent("claude", "arguments"), .agent("claude", "mcp"), .agent("claude", "statusReporting"),
+        .agent("claude", "command"), .agent("claude", "arguments"), .agent("claude", "mcp"),
+        .agent("claude", "interface"), .agent("claude", "approvals"), .agent("claude", "statusReporting"),
         .agent("reviewer", "command"), .agent("reviewer", "arguments"), .agent("reviewer", "mcp"), .agent("reviewer", "statusReporting"),
     ])
     #expect(rows.allSatisfy { if case .agent = $0.route { true } else { false } })
@@ -432,6 +433,10 @@ private func agentSettings(_ agents: [AgentToolDefinition]) throws -> AgentSetti
     #expect(byID[.agent("claude", "mcp")]?.help?.hasPrefix("Cherry starts Claude Code with Cherry MCP") == true)
     #expect(byID[.agent("claude", "statusReporting")]?.detail == "Status reporting · Supported")
     #expect(byID[.agent("reviewer", "statusReporting")]?.value == "Not known")
+    // How Cherry starts it: tests prepare no skill files, so Cherry MCP.
+    #expect(byID[.agent("claude", "interface")]?.section == "Starting Claude Code")
+    #expect(byID[.agent("claude", "interface")]?.value == "Cherry MCP")
+    #expect(byID[.agent("claude", "approvals")]?.value == "As configured")
 
     // Through the index: under the agents' group.
     let index = SettingsSearchIndex.rows(in: context)

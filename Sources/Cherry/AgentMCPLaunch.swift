@@ -220,17 +220,11 @@ enum AgentMCPLaunch {
         let cli: CLI
         let executableWord: String
         switch detection(commandLine: commandLine) {
-        case .notPlain:
-            return .skipped("not a plain claude, codex or pi command")
-        case .ownConfiguration(let cli):
-            return .skipped(cli == .pi ? "it turns off Pi's MCP or extensions" : "it names its own MCP configuration")
-        case .subcommand(let cli, let subcommand):
-            return .skipped("\(cli.executableName) \(subcommand) starts no session")
-        case .optionWithoutValue(_, let option):
-            return .skipped("its last word, \(option), is an option without its value")
         case .cli(let detected, let word):
             cli = detected
             executableWord = word
+        case let other:
+            return .skipped(skipReason(other) ?? "not a plain claude, codex or pi command")
         }
         if cli == .pi, piExtensionPath == nil { return .skipped("no Pi extension next to the app") }
         guard let arguments = arguments(
@@ -245,6 +239,23 @@ enum AgentMCPLaunch {
             return .skipped("the server name \(serverName) or CherryMCP's path \(helperPath) can't go on a command line")
         }
         return .flags(cli: cli, executableWord: executableWord, arguments: arguments)
+    }
+
+    /// Why a launch of a command `detection` describes appends nothing;
+    /// nil for a plain command of a CLI (`Detection.cli`).
+    static func skipReason(_ detection: Detection) -> String? {
+        switch detection {
+        case .cli:
+            nil
+        case .notPlain:
+            "not a plain claude, codex or pi command"
+        case .ownConfiguration(let cli):
+            cli == .pi ? "it turns off Pi's MCP or extensions" : "it names its own MCP configuration"
+        case .subcommand(let cli, let subcommand):
+            "\(cli.executableName) \(subcommand) starts no session"
+        case .optionWithoutValue(_, let option):
+            "its last word, \(option), is an option without its value"
+        }
     }
 
     /// What `plan` found.
@@ -398,7 +409,7 @@ enum AgentMCPLaunch {
 
     /// Whether `path` reads the same in every shell's single quotes: an
     /// absolute path with no `'`, `\` or control character.
-    private static func isLinePath(_ path: String) -> Bool {
+    static func isLinePath(_ path: String) -> Bool {
         path.hasPrefix("/") && !path.contains("'") && !path.contains("\\")
             && !path.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f })
     }
@@ -439,9 +450,19 @@ enum AgentMCPLaunch {
 
     /// What an agent's launch appends, or why it appends nothing.
     enum Outcome: Equatable {
-        /// The flags, as `shellSuffix` writes them.
+        /// Cherry MCP's flags (and Approvals' when chosen), as
+        /// `shellSuffix` writes them.
         case appended(String)
+        /// The `cherry` CLI's flags (`AgentCLILaunch`, and Approvals'):
+        /// the agent reaches Cherry with `cherry`, with no Cherry MCP.
+        case cli(String)
         case skipped(String)
+
+        /// Whether the agent was started to use the `cherry` CLI.
+        var usesCherryCLI: Bool {
+            if case .cli = self { return true }
+            return false
+        }
     }
 
     /// What a Pi launch's log says of what Pi's `mcp.json` has under the
@@ -470,11 +491,14 @@ enum AgentMCPLaunch {
     }
 }
 
-/// What a workspace's agent launches use for Cherry MCP on their command
-/// line (`SessionBackendPolicy.agentMCPLaunch`). Only the app's This Mac
-/// windows have one (`.userSettings`): nil (tests, `.native`, a device's
-/// window) means no flags and no version probe, so no test runs a real
-/// `claude`, `codex` or `pi` and no test's command changes.
+/// What a workspace's agent launches put on their command line to reach
+/// Cherry (`SessionBackendPolicy.agentMCPLaunch`): the `cherry` CLI's flags
+/// (`AgentCLILaunch`) when the context has the skill's directory and the
+/// agent can run `cherry`, else Cherry MCP's (`AgentMCPLaunch`), with
+/// Approvals' (`AgentApprovals`) on either. Only the app's This Mac windows
+/// have one (`.userSettings`): nil (tests, `.native`, a device's window)
+/// means no flags and no version probe, so no test runs a real `claude`,
+/// `codex` or `pi` and no test's command changes.
 @MainActor
 struct AgentMCPLaunchContext {
     /// Settings › Agents & MCP › Connect agents Cherry starts. The app's:
@@ -495,6 +519,20 @@ struct AgentMCPLaunchContext {
     /// environment's `PI_CODING_AGENT_DIR` as known now, never waited for,
     /// else `~/.pi/agent`; nil (tests) reads nothing.
     var piAgentDirectory: (@Sendable () -> URL)? = nil
+    /// The `cherry` skill's plugin directory (`AgentSkillDirectory.current`).
+    /// Nil, or a nil answer: every agent gets Cherry MCP's flags, as before
+    /// the CLI (tests that build no CLI context).
+    var cliPluginDirectory: (@MainActor () -> URL?)? = nil
+    /// The app's control socket, which Claude Code's sandbox may reach
+    /// (`CherryControlServer.appSocketPath`).
+    var controlSocketPath: @MainActor () -> String? = { nil }
+    /// Settings › Agents & MCP › Approvals, per CLI. The app's:
+    /// `AgentApprovals.current(for:)`.
+    var approvals: @MainActor (AgentMCPLaunch.CLI) -> AgentApprovals = { _ in .configured }
+    /// What Codex's files say (`CodexLaunchFactsCache`); nil while not
+    /// read yet: a Codex agent gets Cherry MCP then, unless Auto review is
+    /// chosen.
+    var codexFacts: @MainActor () -> CodexLaunchFacts? = { nil }
 
     /// The app's This Mac windows'.
     static let app = AgentMCPLaunchContext(
@@ -504,20 +542,103 @@ struct AgentMCPLaunchContext {
         piExtensionPath: PiMCPExtension.bundledPath,
         piAgentDirectory: {
             PiMCPRegistration.agentDirectory(environment: HostedSessionLoginEnvironment.shared.availableNow()?.environment ?? [:])
-        }
+        },
+        cliPluginDirectory: { AgentSkillDirectory.current },
+        controlSocketPath: { CherryControlServer.appSocketPath },
+        approvals: { AgentApprovals.current(for: $0) },
+        codexFacts: { CodexLaunchFactsCache.shared.current() }
     )
 
-    /// What an agent's launch of `commandLine` appends for Cherry MCP named
-    /// `serverName`, or why nothing: every rule of `AgentMCPLaunch` holds,
-    /// a Pi's extension is still there (an app moved while it runs has
-    /// none), and the CLI's version is known (never waited for: an unknown
-    /// one is asked in the background for a later launch) and at least its
-    /// minimum.
-    func outcome(commandLine: String, serverName: String, environmentKeys: [String]) -> AgentMCPLaunch.Outcome {
+    /// The oldest version a CLI launch is given to: Claude Code's
+    /// `--plugin-dir` and `--append-system-prompt` (checked with 2.1.303),
+    /// Pi's `--skill` and `--append-system-prompt` (both older than the Pi
+    /// that registers MCP servers, `PiMCPRegistration.minimumVersion`), and
+    /// Codex's `-c developer_instructions` and `--approve-for-me` (checked
+    /// with 0.162.1).
+    static func cliMinimumVersion(_ cli: AgentMCPLaunch.CLI) -> AgentCLIVersion {
+        switch cli {
+        case .claudeCode: AgentCLIVersion(major: 2, minor: 1, patch: 0)
+        case .codex: AgentCLIVersion(major: 0, minor: 162, patch: 0)
+        case .pi: PiMCPRegistration.minimumVersion
+        }
+    }
+
+    /// Why a CLI launch of `cli` with these `words` (its arguments) cannot
+    /// be used, nil when it can: Claude Code and Pi need the skill's
+    /// directory; Codex must be able to run `cherry` from its sandbox: one
+    /// that reaches sockets (the command's or its config's,
+    /// `CodexLaunchFacts.launchReachesSockets`), Cherry's rules file
+    /// (allowed commands run outside it) or Auto review (its reviewer
+    /// decides on running one outside).
+    func cliUnavailableReason(_ cli: AgentMCPLaunch.CLI, words: [String] = []) -> String? {
+        guard let cliPluginDirectory else { return "no CLI launch here" }
+        switch cli {
+        case .claudeCode, .pi:
+            return cliPluginDirectory() == nil ? "the cherry skill's files are not ready" : nil
+        case .codex:
+            if approvals(.codex) == .autoReview { return nil }
+            guard let facts = codexFacts() else {
+                // The command alone may say: a sandbox it turns off.
+                let unknown = CodexLaunchFacts(rulesInstalled: false, setsDeveloperInstructions: true)
+                return unknown.launchReachesSockets(words: words) ? nil : "Codex's settings are not read yet"
+            }
+            if facts.rulesInstalled || facts.launchReachesSockets(words: words) { return nil }
+            return "Codex's sandbox can't reach Cherry's socket: no Cherry rules for Codex, and Approvals is not Auto review"
+        }
+    }
+
+    /// Why a launch of `commandLine` (a plain claude, codex or pi command)
+    /// would not use the `cherry` CLI; nil when it would, for another
+    /// command, or in a context with no CLI launch. A Cherry MCP launch's
+    /// log and `TerminalSession.lastAgentLaunchNotCLIReason`.
+    func cliInterfaceReason(commandLine: String) -> String? {
+        guard cliPluginDirectory != nil,
+              case .cli(let cli, _) = AgentMCPLaunch.detection(commandLine: commandLine)
+        else { return nil }
+        return cliUnavailableReason(cli, words: Array((AgentMCPLaunch.plainWords(commandLine) ?? []).dropFirst()))
+    }
+
+    /// What an agent's launch of `commandLine` appends, or why nothing:
+    /// every rule of `AgentMCPLaunch` holds, and the CLI's version is known
+    /// (never waited for: an unknown one is asked in the background for a
+    /// later launch) and at least its minimum. The `cherry` CLI's flags
+    /// when it can be used (`cliUnavailableReason`), else Cherry MCP's
+    /// named `serverName` (a Pi's extension still there: an app moved while
+    /// it runs has none); Approvals' first on either. `processID` is the
+    /// tab's, which a CLI launch's instructions name.
+    func outcome(
+        commandLine: String, serverName: String, environmentKeys: [String], processID: String? = nil
+    ) -> AgentMCPLaunch.Outcome {
         guard isEnabled() else { return .skipped("turned off in Settings › Agents & MCP") }
+        let detection = AgentMCPLaunch.detection(commandLine: commandLine)
+        guard case .cli(let cli, let executableWord) = detection else {
+            return .skipped(AgentMCPLaunch.skipReason(detection) ?? "not a plain claude, codex or pi command")
+        }
+        let words = Array((AgentMCPLaunch.plainWords(commandLine) ?? []).dropFirst())
+        let approvalWords = approvals(cli) == .autoReview && !AgentApprovals.setsOwnApprovals(cli, words: words)
+            ? AgentApprovals.autoReviewArguments(for: cli) : []
+
+        if cliUnavailableReason(cli, words: words) == nil,
+           let arguments = AgentCLILaunch.arguments(
+               for: cli,
+               words: words,
+               pluginDirectory: cliPluginDirectory?(),
+               socketPath: controlSocketPath(),
+               processID: processID,
+               // A Codex whose config sets its own instructions keeps them.
+               addsInstructions: cli != .codex || codexFacts().map { !$0.setsDeveloperInstructions } ?? false
+           ) {
+            guard let version = versions.version(of: executableWord) else {
+                return .skipped("\(cli.executableName)'s version is not known yet")
+            }
+            let minimum = Self.cliMinimumVersion(cli)
+            guard version >= minimum else {
+                return .skipped("\(cli.executableName) \(version) is older than \(minimum)")
+            }
+            return .cli(AgentMCPLaunch.shellSuffix(approvalWords + arguments))
+        }
+
         guard let helperPath else { return .skipped("no CherryMCP next to the app") }
-        let cli: AgentMCPLaunch.CLI
-        let executableWord: String
         let arguments: [String]
         switch AgentMCPLaunch.plan(
             commandLine: commandLine, serverName: serverName, helperPath: helperPath, environmentKeys: environmentKeys,
@@ -525,8 +646,8 @@ struct AgentMCPLaunchContext {
         ) {
         case .skipped(let reason):
             return .skipped(reason)
-        case .flags(let planned, let word, let words):
-            (cli, executableWord, arguments) = (planned, word, words)
+        case .flags(_, _, let planned):
+            arguments = planned
         }
         guard let version = versions.version(of: executableWord) else {
             return .skipped("\(cli.executableName)'s version is not known yet")
@@ -534,14 +655,17 @@ struct AgentMCPLaunchContext {
         guard version >= cli.minimumVersion else {
             return .skipped("\(cli.executableName) \(version) is older than \(cli.minimumVersion)")
         }
-        return .appended(AgentMCPLaunch.shellSuffix(arguments))
+        // Approvals first: `--mcp-config` takes every word after it.
+        return .appended(AgentMCPLaunch.shellSuffix(approvalWords + arguments))
     }
 
-    /// Asks the versions of the CLIs of `agents` that would get Cherry MCP,
-    /// while it is on and the app has its CherryMCP: the app's windows do
-    /// as the first one opens, so the run's agents find them.
+    /// Asks the versions of the CLIs of `agents` that would get flags,
+    /// while it is on and the app has its CherryMCP or the skill (the app's
+    /// windows do as the first one opens, so the run's agents find them),
+    /// and reads Codex's files.
     func warmUp(agents: [AgentToolDefinition]) {
-        guard isEnabled(), helperPath != nil else { return }
+        guard isEnabled(), helperPath != nil || cliPluginDirectory?() != nil else { return }
         versions.warmUp(agents: agents)
+        _ = codexFacts()
     }
 }

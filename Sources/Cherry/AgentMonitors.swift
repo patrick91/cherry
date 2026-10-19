@@ -246,14 +246,19 @@ final class AgentMonitorRegistry {
 
     /// The wake line: the subscription and event counts only, never text a
     /// watched process controls (its name, title or output).
-    static func wakeLine(for subscription: MonitorSubscription, unread: [MonitorEvent]) -> String {
+    static func wakeLine(for subscription: MonitorSubscription, unread: [MonitorEvent], usesCLI: Bool = false) -> String {
         var counts: [MonitorEventType: Int] = [:]
         for event in unread { counts[event.type, default: 0] += 1 }
         let parts = MonitorEventType.allCases.compactMap { type in
             counts[type].map { "\($0) \(type.rawValue)" }
         }
         let noun = unread.count == 1 ? "event" : "events"
-        return "[cherry] Monitor \(subscription.id): \(unread.count) \(noun) ready (\(parts.joined(separator: ", "))). Call the cherry wait_for_events tool with subscription_id \"\(subscription.id)\" to read them."
+        let ready = "[cherry] Monitor \(subscription.id): \(unread.count) \(noun) ready (\(parts.joined(separator: ", ")))."
+        if usesCLI {
+            // A subscriber started to use the `cherry` CLI.
+            return ready + " Run cherry events \(subscription.id) to read them."
+        }
+        return ready + " Call the cherry wait_for_events tool with subscription_id \"\(subscription.id)\" to read them."
     }
 }
 
@@ -876,7 +881,7 @@ extension CherryControlServer {
         // (a run's wake line, a task's nudge or kickoff), and under the
         // tab's typing lock (`typeCherryLine`).
         guard !isTypingWakeLine(into: subscriber), subscriberTakesWakeLine(subscriber, now: now) else { return }
-        let line = AgentMonitorRegistry.wakeLine(for: subscription, unread: unread)
+        let line = AgentMonitorRegistry.wakeLine(for: subscription, unread: unread, usesCLI: subscriber.launchUsesCherryCLI)
         subscription.isWaking = true
         Task { @MainActor [weak self] in
             defer { subscription.isWaking = false }

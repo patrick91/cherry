@@ -115,9 +115,9 @@ selection, a name wins; workers and tasks in five lines) that ends with "run
 
 | Agent | Installed (Connect, confirmed) | One launch (agents Cherry starts) |
 |---|---|---|
-| Claude Code | `~/.claude/skills/cherry` (follows `CLAUDE_CONFIG_DIR`) | `--plugin-dir <bundle>/cherry-plugin` (its `skills/cherry`) |
+| Claude Code | `~/.claude/skills/cherry` (follows `CLAUDE_CONFIG_DIR`) | `--plugin-dir <agent-skill>/cherry-plugin` (its `skills/cherry`) |
 | Codex | `~/.agents/skills/cherry` | none: `-c developer_instructions=…` (only when the user sets none) |
-| Pi | `~/.agents/skills/cherry` | `--skill <bundle>/skills/cherry` |
+| Pi | `~/.agents/skills/cherry` | `--skill <agent-skill>/cherry-plugin/skills/cherry` |
 | OpenCode | `~/.agents/skills/cherry` | `OPENCODE_CONFIG_CONTENT` `skills` (check it merges) |
 | Amp | `~/.agents/skills/cherry` | none |
 
@@ -129,21 +129,41 @@ selection, a name wins; workers and tasks in five lines) that ends with "run
 - In the app, Connect Agents to Cherry… shows these rows and installs only
   after its confirmation, as today (Cherry writes no agent configuration
   otherwise).
-- A tab of an agent Cherry starts also gets two lines at launch (Claude Code
-  and Pi `--append-system-prompt`, Codex `developer_instructions`): it runs in
-  Cherry, its tab's ID, and to use the `cherry` skill. No session-start hooks:
-  Codex makes the user approve them (`/hooks`), Claude Code needs folder
-  trust, and the launch covers Cherry's tabs.
+- A tab of an agent Cherry starts also gets one line at launch (Claude Code
+  and Pi `--append-system-prompt`, Codex `developer_instructions`;
+  `AgentCLILaunch.instructionLine`): it runs in a Cherry tab (its
+  `CHERRY_PROCESS_ID`), `cherry` on its PATH reaches the others, and to load
+  the skill or run `cherry skill show` first. Never when the command sets its
+  own instructions (`--system-prompt*`, `--append-system-prompt*`, Codex's
+  `developer_instructions`/`model_instructions_file` on its line or in its
+  `config.toml`). No session-start hooks: Codex makes the user approve them
+  (`/hooks`), Claude Code needs folder trust, and the launch covers Cherry's
+  tabs.
+- `<agent-skill>` is `<identity's Application Support>/agent-skill`, which
+  the app writes at launch (the instance-lock holder; `AgentSkillDirectory`)
+  from `CherryAgentSkill`, the text `cherry skill show --skill-md` prints. It
+  is not a bundle resource: SwiftPM's `.process` flattens directories, and a
+  Claude Code plugin needs `.claude-plugin/plugin.json` beside `skills/`. So
+  install-local-app, package-release and the signing scripts are unchanged.
+- Pi started with the CLI gets no `-e` extension (it registers Cherry MCP);
+  its `cherry_workers` prompt section is MCP's, and the skill and the line
+  take its place.
+- Devices stay on Cherry MCP (`RemoteAgentMCPLaunch`): a device install
+  carries no skill files yet, and its gated line would need them checked
+  there as it checks the Pi extension. A later phase.
 
 ## Sandboxes and permissions
 
 | Agent | Socket blocked? | What Cherry does |
 |---|---|---|
-| Codex | yes (`workspace-write`, `read-only`) | Connect writes `~/.codex/rules/cherry.rules`: `prefix_rule(["cherry", [agent verbs]], "allow")` (an allowed command runs outside the sandbox) and `prefix_rule(["cherry","host"], "forbidden")`. Without it Codex tabs keep launch-time MCP. |
-| Claude Code | only with its sandbox on (off by default) | at launch, with the sandbox on: `--settings '{"sandbox":{"network":{"allowUnixSockets":["<socket dir>"]}}}'` (check it merges with the user's) |
+| Codex | yes (`workspace-write`, `read-only`; `danger-full-access` or workspace-write with `network_access = true` reach it: checked with `codex sandbox` and `nc -U` on 0.162.1) | Connect writes `~/.codex/rules/cherry.rules`: `prefix_rule(["cherry", [agent verbs]], "allow")` (an allowed command runs outside the sandbox) and `prefix_rule(["cherry","host"], "forbidden")`. See below for when a Codex tab gets the CLI. |
+| Claude Code | only with its sandbox on (off by default) | every CLI launch: `--settings '{"sandbox":{"network":{"allowUnixSockets":["<control socket>"]}}}'` (array settings merge across Claude Code's scopes and `--settings` is one, so the user's own list stays; it turns no sandbox on). Not when the command has its own `--settings` (it takes one). |
 | Pi, OpenCode, Amp | no sandbox | nothing |
 
-Approvals (Settings › Agents & MCP, per agent, for agents Cherry starts):
+Approvals (Settings › an agent's page › Starting …, stored per CLI as
+`agents.approvals.claudeCode` / `agents.approvals.codex`, `AgentApprovals`;
+applied with the CLI or Cherry MCP, before Cherry MCP's `--mcp-config`, and
+only while Connect agents Cherry starts is on):
 *As configured* (default) or *Auto review*: Claude Code
 `--permission-mode auto` (its classifier decides each action), Codex
 `--approve-for-me` (approval requests go to Codex's automatic reviewer, the
@@ -152,31 +172,64 @@ in that tab, not only `cherry`, so it is opt-in and the page says so. It is
 never added when the command already sets a mode (`--permission-mode`,
 `--dangerously-skip-permissions`, `--approve-for-me`, `-a`/`--ask-for-approval`,
 `--dangerously-bypass-approvals-and-sandbox`, `--full-auto`, `-s`/`--sandbox`
-for Codex; check each CLI's spelling).
+for Codex, or a `-c` of `approval_policy`, `approvals_reviewer`,
+`sandbox_mode`; Claude Code's `--allow-dangerously-skip-permissions` and
+`--permission-prompt-tool` too: `AgentApprovals.setsOwnApprovals`, from
+Claude Code 2.1.303's and Codex 0.162.1's `--help`).
 
-Codex gets the CLI when the rules file is installed (allowed `cherry` commands
-run outside the sandbox on the first try) or Auto review is on (a sandboxed
-`cherry` fails, the model asks to run it outside the sandbox and the reviewer
-decides: two tries per call; unverified until a real Codex run, which needs
-the owner's OK). Otherwise its tabs keep launch-time MCP.
+A Codex tab gets the CLI when any of these holds
+(`AgentMCPLaunchContext.cliUnavailableReason`), else launch-time MCP as
+before:
+
+1. Its sandbox reaches the socket (`CodexLaunchFacts.launchReachesSockets`):
+   the command's own choice (`--dangerously-bypass-approvals-and-sandbox`,
+   `-s`/`--sandbox danger-full-access`, `-c sandbox_mode="danger-full-access"`,
+   `-s workspace-write -c sandbox_workspace_write.network_access=true`) over
+   its `config.toml`'s (`${CODEX_HOME:-~/.codex}`: top-level `sandbox_mode =
+   "danger-full-access"`, or `"workspace-write"` with
+   `[sandbox_workspace_write] network_access = true`). A command with
+   `-p`/`--profile`, or a config that selects a `profile`, reads as one that
+   does not (profiles are not read).
+2. Cherry's rules file exists and starts with `# Written by Cherry: cherry's
+   agent commands run outside Codex's sandbox; cherry host is forbidden.`
+   (allowed `cherry` commands run outside the sandbox on the first try).
+3. Approvals is Auto review: a sandboxed `cherry` fails, the model asks to run
+   it outside the sandbox and the reviewer decides, so two tries per call.
+   Unverified until a real Codex run, which needs the owner's OK.
+
+Codex's files are read off the main thread (`CodexLaunchFactsCache`, again
+after each launch); a launch never waits for them: before the first reading
+only the command's own words count (1), and the line is left out (the config
+may set instructions). The reason a tab got Cherry MCP instead is
+`TerminalSession.lastAgentLaunchNotCLIReason`, logged with the launch and
+shown on the agent's page (Interface).
 
 ## Workers and orchestrators
 
 - The kickoff line, `get_my_task`'s rules, the nudge and the wake lines name
-  `cherry task mine`, `cherry task report <<'EOF'`, `cherry task wait`,
-  `cherry events` for a tab launched with the CLI, and the MCP tools for one
-  launched with MCP (`TerminalSession.lastAgentMCPLaunchOutcome` grows a
-  `cli` outcome).
+  `cherry task mine`, `cherry task report <<'EOF'`, `cherry task progress
+  --awaiting-approval`, `cherry task wait RUN`, `cherry task get`, `cherry
+  events SUB`, `cherry send` for a tab launched with the CLI
+  (`TerminalSession.launchUsesCherryCLI`: `lastAgentMCPLaunchOutcome` is
+  `.cli`), and the MCP tools (with CherryMCP's `--call` fallback) otherwise.
+  A task's kickoff is worded once its worker started and kept
+  (`AgentTask.kickoffUsesCLI`), so the kickoff Cherry looks for on the
+  screen is the one it typed. A session restored or adopted after a relaunch
+  has no launch outcome, so it gets the MCP texts, whose `--call` fallback
+  works in any shell.
 - Orchestrators: close workers they will not message again once their result
-  is read (`cherry task cancel --close`); never by default.
+  is read (`cherry task cancel TASK --close`); never by default (the guide
+  says so).
 
 ## MCP
 
 - Stays, unchanged, on the same layer: for sandboxed Codex without the rules
   file, for agents started by hand that are configured for it, and for anyone
   who prefers it.
-- Launch-time MCP (`mcp.connectAgentsAtLaunch`) is off by default for agents
-  that get the CLI; Settings › Agents & MCP shows which one each agent gets.
+- Connect agents Cherry starts (`mcp.connectAgentsAtLaunch`) covers both: an
+  agent that gets the CLI gets no Cherry MCP flags (a `.cli` outcome), one
+  that cannot gets them as before. Each agent's page shows which
+  (Interface) and why.
 
 ## Sidebar (with this work)
 
@@ -203,5 +256,5 @@ the owner's OK). Otherwise its tabs keep launch-time MCP.
 
 ## Open questions
 
-None: approvals are the setting above; Codex without the rules file or Auto
-review keeps launch-time MCP.
+None: approvals are the setting above; a Codex whose sandbox cannot reach
+the socket, without the rules file or Auto review, keeps launch-time MCP.

@@ -436,9 +436,16 @@ enum ConnectThisAgent {
             lines.launch = harness == .pi
                 ? "This tab started Pi with Cherry MCP, for this session; a \(serverName) entry in Pi's settings takes precedence over it."
                 : "This tab started \(product) with Cherry MCP, for this session: its own registration is for sessions started elsewhere."
+        case .cli?:
+            // It reaches Cherry with `cherry`: no registration matters.
+            appended = true
+            lines.launch = "This tab started \(product) with Cherry's cherry command and its skill, for this session; it needs no Cherry MCP."
         case .skipped(let reason)?:
             lines.launch = "This tab started \(product) without Cherry MCP: \(reason)."
-            if case .appended? = outcomeNow { lines.offersRestart = true }
+            switch outcomeNow {
+            case .appended?, .cli?: lines.offersRestart = true
+            case .skipped?, nil: break
+            }
         case nil:
             break
         }
@@ -556,7 +563,8 @@ final class ConnectThisAgentModel: ObservableObject {
                 projectRoot: session.projectRoot,
                 controlSocketPath: CherryControlServer.appSocketPath,
                 helperPath: context.helperPath
-            )
+            ),
+            processID: session.id.uuidString
         )
     }
 

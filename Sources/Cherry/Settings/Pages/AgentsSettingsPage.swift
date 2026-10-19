@@ -8,7 +8,7 @@ struct AgentsSettingsPage: View, SettingsPageContent {
     static let listCaption = "Each agent has its own page: its command and connecting it to Cherry."
     static let wakeLinesHelp = "When an agent that subscribed to other tabs is idle, Cherry types one line into its tab once their events are ready."
     static let connectAtLaunchTitle = "Connect agents Cherry starts"
-    static let connectAtLaunchHelp = "Claude Code \(AgentMCPLaunch.CLI.claudeCode.minimumVersion) or later, Codex \(AgentMCPLaunch.CLI.codex.minimumVersion) or later and Pi \(AgentMCPLaunch.CLI.pi.minimumVersion) or later that Cherry starts, here and on your other Macs, get Cherry MCP on their command line. Off: they use what you registered."
+    static let connectAtLaunchHelp = "Claude Code \(AgentMCPLaunch.CLI.claudeCode.minimumVersion) or later, Codex \(AgentMCPLaunch.CLI.codex.minimumVersion) or later and Pi \(AgentMCPLaunch.CLI.pi.minimumVersion) or later that Cherry starts, here and on your other Macs, get Cherry MCP on their command line, or on this Mac the cherry command and its skill (each agent's page says which). Off: they use what you registered."
     static let connectAgentsTitle = "Connect Agents to Cherry"
     static let connectAgentsHelp = "Shows Claude Code, Codex and Pi on this Mac, whether each has Cherry MCP, and the command that connects it. Nothing runs until you confirm."
     static let otherCLIsTitle = "Connect other agent CLIs"

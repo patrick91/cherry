@@ -6,7 +6,8 @@ import Foundation
 /// here, so an agent always reads the guide of the `cherry` it runs.
 public enum CherryCLIGuide {
     /// The skill an agent CLI loads (`cherry skill show --skill-md`;
-    /// `cherry skill setup` installs it).
+    /// `cherry skill setup` installs it; the app gives it to the agents it
+    /// starts, `AgentSkillDirectory`).
     public static var skillMarkdown: String { CherrySkill.markdown }
 
     /// The commands the guide lists one by one; it names the others.

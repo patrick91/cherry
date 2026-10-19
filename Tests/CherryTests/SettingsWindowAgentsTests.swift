@@ -179,7 +179,7 @@ private func preset(_ name: String) throws -> AgentToolDefinition {
     let defaults = privateDefaults("SettingsWindowAgentsConnect")
     #expect(AgentsSettingsPage.connectAtLaunchTitle == "Connect agents Cherry starts")
     #expect(AgentsSettingsPage.connectAtLaunchHelp
-        == "Claude Code 2.0.0 or later, Codex 0.162.0 or later and Pi 0.99.2 or later that Cherry starts, here and on your other Macs, get Cherry MCP on their command line. Off: they use what you registered.")
+        == "Claude Code 2.0.0 or later, Codex 0.162.0 or later and Pi 0.99.2 or later that Cherry starts, here and on your other Macs, get Cherry MCP on their command line, or on this Mac the cherry command and its skill (each agent's page says which). Off: they use what you registered.")
     #expect(AgentsSettingsPage.otherCLIsIntro
         == "Agents use Cherry's MCP server to see and drive your tabs. Agents you start yourself, and ones Cherry doesn't connect when it starts them, need it registered once with their CLI.")
 

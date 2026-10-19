@@ -3715,6 +3715,14 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// (a device's, an attached or adopted session's, a context-less
     /// workspace's). Never saved.
     private(set) var lastAgentMCPLaunchOutcome: AgentMCPLaunch.Outcome?
+    /// This launch started its agent to use the `cherry` CLI, not Cherry
+    /// MCP (`AgentMCPLaunch.Outcome.cli`): the lines Cherry types into it
+    /// (a task's kickoff, the nudge, wake lines) name `cherry` commands.
+    var launchUsesCherryCLI: Bool { lastAgentMCPLaunchOutcome?.usesCherryCLI ?? false }
+    /// Why a launch that got Cherry MCP's flags did not get the `cherry`
+    /// CLI's (`AgentMCPLaunchContext.cliInterfaceReason`: a Codex whose
+    /// sandbox cannot reach the socket, say). Never saved.
+    private(set) var lastAgentLaunchNotCLIReason: String?
     /// The workspace policy's `agentMCPLaunch`: nil adds nothing.
     private let agentMCPLaunch: AgentMCPLaunchContext?
     private(set) var launchEnvironment: [String: String]
@@ -5576,11 +5584,16 @@ final class TerminalSession: ObservableObject, Identifiable {
                 projectRoot: projectRoot,
                 controlSocketPath: CherryControlServer.appSocketPath,
                 helperPath: agentMCPLaunch.helperPath
-            )
+            ),
+            processID: id.uuidString
         )
         switch outcome {
+        case .cli(let suffix):
+            SessionLog.debug("[mcp] tab \(id.uuidString) starts its agent with the cherry CLI:\(suffix)")
+            return (launchCommand + suffix, outcome)
         case .appended(let suffix):
-            SessionLog.debug("[mcp] tab \(id.uuidString) starts its agent with Cherry MCP:\(suffix)")
+            let why = agentMCPLaunch.cliInterfaceReason(commandLine: launchCommand).map { " (not the cherry CLI: \($0))" } ?? ""
+            SessionLog.debug("[mcp] tab \(id.uuidString) starts its agent with Cherry MCP\(why):\(suffix)")
             if AgentMCPLaunch.detect(commandLine: launchCommand)?.cli == .pi {
                 logPiRegistrationPreferredToTheLaunch(agentMCPLaunch)
             }
@@ -5691,6 +5704,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         startedCurrentProgram = hostedAttachment == nil
             && (persistentHosting == nil || persistentSessionToAdopt == nil)
         (launchStartupCommand, lastAgentMCPLaunchOutcome) = startedCurrentProgram ? commandWithAgentMCP() : (nil, nil)
+        if case .appended? = lastAgentMCPLaunchOutcome, let launchCommand {
+            lastAgentLaunchNotCLIReason = agentMCPLaunch?.cliInterfaceReason(commandLine: launchCommand)
+        } else {
+            lastAgentLaunchNotCLIReason = nil
+        }
         cancelPersistentReconnect()
         if let hostedAttachment {
             hostedAttachmentStatus = .active

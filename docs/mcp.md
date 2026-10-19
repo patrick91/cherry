@@ -319,6 +319,35 @@ scoped and refused exactly as over MCP.
   device's commands and agents get their install's directory first on the
   login PATH their line sets; its interactive terminals keep `CHERRY_CLI`.
 
+### Agents Cherry starts with the command
+
+On This Mac an agent Cherry starts gets the `cherry` CLI instead of Cherry
+MCP's flags when it can use it (`AgentCLILaunch`,
+`AgentMCPLaunchContext.outcome` → `.cli`; docs/specs/agent-cli.md, Teaching
+agents and Sandboxes):
+
+- Claude Code 2.1.0 or later: `--plugin-dir <agent-skill>/cherry-plugin`
+  (the `cherry` skill, written by the app from `CherryAgentSkill`,
+  `AgentSkillDirectory`), `--append-system-prompt` with one line naming its
+  tab, and `--settings` letting its sandbox, when on, reach the control
+  socket.
+- Pi 0.99.2 or later: `--skill <agent-skill>/cherry-plugin/skills/cherry` and
+  the same line; no extension.
+- Codex 0.162.0 or later, only when it can run `cherry`: its sandbox (the
+  command's, else its `config.toml`'s) reaches sockets, Cherry's rules file
+  is installed, or Approvals is Auto review. Then `-c
+  developer_instructions=…` (unless its config sets instructions). Otherwise
+  Cherry MCP as above, and the reason is logged
+  (`TerminalSession.lastAgentLaunchNotCLIReason`).
+- Approvals (an agent's page › Starting …; `AgentApprovals`): As configured,
+  or Auto review (`--permission-mode auto`, `--approve-for-me`), never over
+  a mode the command sets, with the CLI or Cherry MCP.
+- The kickoff, the rules `get_my_task` returns, the nudge and the wake lines
+  of a tab started with the CLI name `cherry` commands
+  (`TerminalSession.launchUsesCherryCLI`).
+
+Devices keep Cherry MCP at launch.
+
 ## Versions
 
 The app answers three requests of control protocol 2 besides the typed
@@ -1514,6 +1543,9 @@ own in `Scripts/test-session-suites unit` (and CI), **ControlTool**
   stand-in CLIs, the switch, launches native, persistent and restored, and
   Pi's: its extension, its version gate, and the log of a Pi registration
   Pi prefers).
+- `ControlToolLaunchCLITests`: the `cherry` CLI at launch (each CLI's words,
+  Codex's sandbox and rules, Approvals, the skill's files, the worker texts,
+  a tab's outcome, the agent page's Interface line).
 - `ControlToolPiExtensionTests`: Cherry's Pi extension, the bundle's own
   copy run in JavaScriptCore against a stand-in for Pi's extension API: the
   server it registers, and nothing (and no exception) without Pi's MCP, a

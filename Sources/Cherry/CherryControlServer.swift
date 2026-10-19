@@ -1808,7 +1808,10 @@ final class CherryControlServer: @unchecked Sendable {
 
         mcpControlDebugLog("spawned process session=\(session.id.uuidString) kind=\(session.kind.rawValue) name=\(processName(for: session)) parent=\(session.parentAgentID?.uuidString ?? "nil") submit=\(String(describing: request.submit))")
 
-        let text = task?.kickoffLine ?? request.text
+        // A task's kickoff is worded once its worker started (after the
+        // readiness wait): it names the `cherry` commands for a worker
+        // whose launch got the CLI (`AgentTask.kickoffLine`).
+        let text = task != nil ? "" : request.text
         let submit = task != nil ? true : request.submit
         if (text != nil || request.rawBase64 != nil || submit == true), let agent {
             if task != nil {
@@ -1822,7 +1825,7 @@ final class CherryControlServer: @unchecked Sendable {
         var inputError: CherryControlError?
         if session.kind == .agent, let agent {
             let input = try agentInputPayload(
-                text: text,
+                text: task?.kickoffLine ?? text,
                 rawBase64: request.rawBase64,
                 submit: submit,
                 to: session

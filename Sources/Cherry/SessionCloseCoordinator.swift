@@ -646,6 +646,42 @@ enum SessionCloseCoordinator {
         }
     }
 
+    /// Close Finished Workers: closes `owner`'s sub-agents whose latest
+    /// task settled (`TerminalWorkspace.finishedWorkers`), together, so one
+    /// ⌘Z brings them back. Asks once (`confirm`) when one of them is busy
+    /// again (a turn running, or it waits for the user); returns how many
+    /// it closed.
+    @discardableResult
+    static func closeFinishedWorkers(
+        of owner: TerminalSession,
+        in workspace: TerminalWorkspace,
+        chromeState: ProjectWindowChromeState?,
+        summaries: [UUID: AgentWorkerSummary]? = nil,
+        confirm: @MainActor ([TerminalSession]) -> Bool = confirmClosingBusyWorkers
+    ) -> Int {
+        let workers = workspace.finishedWorkers(of: owner, summaries: summaries ?? AgentTaskBoard.shared.workerSummaries)
+        guard !workers.isEmpty else { return 0 }
+        let busy = workers.filter { [.working, .permission, .needsInput].contains($0.agentActivityState) }
+        if !busy.isEmpty, !confirm(busy) { return 0 }
+        closeTabs(workers, in: workspace, chromeState: chromeState, intent: .userClosedTab) {
+            for worker in workers { workspace.close(worker, intent: .userClosedTab) }
+        }
+        return workers.count
+    }
+
+    /// "Close finished workers?" for workers busy again.
+    static func confirmClosingBusyWorkers(_ busy: [TerminalSession]) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Close Finished Workers?"
+        alert.informativeText = busy.count == 1
+            ? "One of them is working again or waiting for you. Closing it stops it."
+            : "\(busy.count) of them are working again or waiting for you. Closing them stops them."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Close Workers")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
     /// Close Split Group…: asks (`splitGroupCloseAlert`), then closes the
     /// group's panes together (`closeTabs`), or, answered Detach Instead,
     /// detaches them together.

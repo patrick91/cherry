@@ -143,9 +143,22 @@ selection, a name wins; workers and tasks in five lines) that ends with "run
 | Claude Code | only with its sandbox on (off by default) | at launch, with the sandbox on: `--settings '{"sandbox":{"network":{"allowUnixSockets":["<socket dir>"]}}}'` (check it merges with the user's) |
 | Pi, OpenCode, Amp | no sandbox | nothing |
 
-Permission prompts: Claude Code asks for each new `cherry …` command unless
-allowed. Open question (below) whether Cherry passes
-`--allowedTools "Bash(cherry ls *)" …` for the agent verbs at launch.
+Approvals (Settings › Agents & MCP, per agent, for agents Cherry starts):
+*As configured* (default) or *Auto review*: Claude Code
+`--permission-mode auto` (its classifier decides each action), Codex
+`--approve-for-me` (approval requests go to Codex's automatic reviewer, the
+workspace-write sandbox stays). Auto review covers everything the agent does
+in that tab, not only `cherry`, so it is opt-in and the page says so. It is
+never added when the command already sets a mode (`--permission-mode`,
+`--dangerously-skip-permissions`, `--approve-for-me`, `-a`/`--ask-for-approval`,
+`--dangerously-bypass-approvals-and-sandbox`, `--full-auto`, `-s`/`--sandbox`
+for Codex; check each CLI's spelling).
+
+Codex gets the CLI when the rules file is installed (allowed `cherry` commands
+run outside the sandbox on the first try) or Auto review is on (a sandboxed
+`cherry` fails, the model asks to run it outside the sandbox and the reviewer
+decides: two tries per call; unverified until a real Codex run, which needs
+the owner's OK). Otherwise its tabs keep launch-time MCP.
 
 ## Workers and orchestrators
 
@@ -190,7 +203,5 @@ allowed. Open question (below) whether Cherry passes
 
 ## Open questions
 
-1. Should Cherry allow the agent verbs without prompts in agents it starts
-   (Claude Code `--allowedTools`, Codex's rules file already allows them)?
-2. Codex without the rules file: keep launch-time MCP for it (as planned), or
-   pass `-c sandbox_workspace_write.network_access=true` (all network)?
+None: approvals are the setting above; Codex without the rules file or Auto
+review keeps launch-time MCP.

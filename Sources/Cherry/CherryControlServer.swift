@@ -1816,7 +1816,8 @@ final class CherryControlServer: @unchecked Sendable {
             let input = try agentInputPayload(
                 text: text,
                 rawBase64: request.rawBase64,
-                submit: submit
+                submit: submit,
+                to: session
             )
             let typedSince = Date()
             if let input, !input.isEmpty {
@@ -2865,7 +2866,8 @@ final class CherryControlServer: @unchecked Sendable {
             let input = try agentInputPayload(
                 text: text,
                 rawBase64: rawBase64,
-                submit: submit
+                submit: submit,
+                to: session
             )
             guard let input, !input.isEmpty else { return 0 }
             return try await sendAgentInput(
@@ -2896,6 +2898,9 @@ final class CherryControlServer: @unchecked Sendable {
     private struct AgentInitialInput {
         let payload: Data
         let submit: Bool
+        /// A message of several lines in one paste: its Enter always goes
+        /// on its own, after the paste (`agentMessagePaste`).
+        var isPaste = false
 
         var isEmpty: Bool {
             payload.isEmpty && !submit
@@ -2924,7 +2929,7 @@ final class CherryControlServer: @unchecked Sendable {
         shouldDeferSubmit: Bool,
         source: String
     ) async throws -> Int {
-        if shouldDeferSubmit, input.submit {
+        if shouldDeferSubmit || input.isPaste, input.submit {
             // The text, then its Enter on its own (`terminalSubmitPause`).
             return try await sendTerminalInput(.init(payload: input.payload, isRaw: false), submit: true, to: session)
         }
@@ -3234,17 +3239,40 @@ final class CherryControlServer: @unchecked Sendable {
 
     /// An agent's input: text is submitted unless `submit` says otherwise,
     /// raw bytes only when it asks; never a second Enter after one the
-    /// input ends with.
+    /// input ends with. Text of several lines is one paste
+    /// (`agentMessagePaste`) and its Enter, so the agent gets one message
+    /// instead of one per line.
     @MainActor
     private func agentInputPayload(
         text: String?,
         rawBase64: String?,
-        submit: Bool?
+        submit: Bool?,
+        to session: TerminalSession
     ) throws -> AgentInitialInput? {
+        if let text, rawBase64 == nil,
+           let paste = Self.agentMessagePaste(text, bracketed: session.bracketsAgentMessage) {
+            return AgentInitialInput(payload: paste.payload, submit: (submit ?? true) || paste.endsWithNewline, isPaste: true)
+        }
         guard let input = try optionalTerminalInputPayload(text: text, rawBase64: rawBase64) else { return nil }
         let wantsSubmit = submit ?? !input.isRaw
         let shouldSubmit = wantsSubmit && input.payload.last != 0x0d && input.payload.last != 0x0a
         return AgentInitialInput(payload: input.payload, submit: shouldSubmit)
+    }
+
+    /// A message of several lines as an agent gets it: its lines in one
+    /// paste (bracketed unless the program has bracketed paste off, then
+    /// with LF between them, a newline in an agent's composer, not
+    /// Enter), without its trailing newlines, which `endsWithNewline`
+    /// keeps. Nil for a message of one line (trailing newlines aside),
+    /// which is typed as before.
+    nonisolated static func agentMessagePaste(_ text: String, bracketed: Bool) -> (payload: Data, endsWithNewline: Bool)? {
+        var body = Substring(text)
+        while let last = body.last, last == "\n" || last == "\r" || last == "\r\n" { body.removeLast() }
+        guard body.contains(where: { $0 == "\n" || $0 == "\r" || $0 == "\r\n" }) else { return nil }
+        return (
+            TerminalInputEncoder.pastedTextData(String(body), bracketedPasteMode: bracketed),
+            body.endIndex != text.endIndex
+        )
     }
 
     @MainActor

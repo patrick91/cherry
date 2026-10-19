@@ -840,7 +840,13 @@ control:
 
 For `send_process_input` and `spawn_process`, `text` is typed as terminal
 input. CR/LF line endings are encoded as carriage-return Enter, matching the
-plain Enter key path. Use `raw_base64` for bytes without that normalization;
+plain Enter key path, except in text for an agent: text of several lines
+(trailing newlines aside), for `send_agent_message`, `send_process_input`
+and the first input of `spawn_process` and `spawn_agent`, is one message,
+pasted as one bracketed paste with its newlines (LF between the lines when
+the agent's host reports bracketed paste off), then one Enter on its own
+after the paste (a trailing newline counts as `submit`), so the agent does
+not take each line as a message of its own. Use `raw_base64` for bytes without that normalization;
 raw bytes are not auto-submitted unless `submit: true` is provided. Key
 sequences in them may still be re-encoded for the program's key modes:
 unmodified arrow, Home and End keys follow its cursor key mode, whether its

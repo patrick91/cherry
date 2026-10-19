@@ -5705,7 +5705,7 @@ private struct SidebarTaskStateGlyph: View {
         switch state {
         case .reported: .green
         case .failed: .red
-        case .needsInput: .orange
+        case .needsInput, .awaitingApproval: .orange
         case .noReport: .yellow
         case .queued, .working, .cancelled: (isSelected ? palette.selectedText : palette.rowText).opacity(0.5)
         }

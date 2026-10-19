@@ -1160,6 +1160,8 @@ final class CherryControlServer: @unchecked Sendable {
                 submit: request.submit,
                 to: session
             )
+            // A message to a worker waiting for approval is the answer.
+            noteRequestInput(to: session)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
             return .init(result: .sendProcessInput(.init(processID: session.id.uuidString, sentBytes: sentBytes, output: output)))
         case .startAllCommands(let request):

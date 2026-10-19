@@ -248,7 +248,8 @@ public enum CherryToolLayer {
             label: stringArgument("label", in: arguments),
             phase: stringArgument("phase", in: arguments),
             runID: stringArgument("run_id", in: arguments),
-            resultSchema: try schemaArgument("result_schema", in: arguments)
+            resultSchema: try schemaArgument("result_schema", in: arguments),
+            allowSubagents: boolArgument("allow_subagents", in: arguments)
         ))
 
         let scoped = await scopedRequest(request, arguments: arguments, caller: caller, transport: transport)
@@ -532,7 +533,10 @@ public enum CherryToolLayer {
                 summary: stringArgument("summary", in: arguments)
             ))
         case "report_progress":
-            return .reportProgress(.init(message: try requiredString("message", in: arguments)))
+            return .reportProgress(.init(
+                message: try requiredString("message", in: arguments),
+                awaitingApproval: boolArgument("awaiting_approval", in: arguments)
+            ))
         case "wait_for_tasks":
             return .waitForTasks(.init(
                 runID: stringArgument("run_id", in: arguments),

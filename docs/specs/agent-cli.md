@@ -45,7 +45,8 @@ cherry task mine | report [-] | progress MSG [--awaiting-approval]
 cherry task get ID | list | wait RUN [--cursor C] | cancel …
 cherry subscribe …, cherry events SUB [--cursor C], cherry unsubscribe SUB
 cherry ports [ID], cherry services, cherry wait-port …
-cherry todo …, cherry note …, cherry project ls|open|show
+cherry todo ls|show|add|edit|move|rm|select|comment|comments, cherry project ls|open|show
+cherry commands start|stop|restart, cherry agents, cherry link LINK, cherry subscriptions
 cherry whoami
 cherry skill setup|status|show|remove [--agent A] [--dry-run] [--project] [--json]
 cherry tool NAME [JSON | -]                        any catalog tool, as MCP calls it
@@ -80,6 +81,12 @@ cherry host start|shutdown|restart|list|new|attach|kill|remove|control|status|do
   executable), so there is one `cherry` on PATH.
 - `cherry skill show` prints the guide, generated from `CherryToolCatalog`
   and the worker rules, so it always matches the running build.
+- As built (phase 1, Swift half): the commands' table is `CherryCLI.commands`
+  (`Sources/CherryMCP/CherryCLI.swift`); the catalog has no notes tools, so
+  there is no `cherry note`. `cherry send` to a tab that is not an agent
+  types the text as a line once the app refused `send_agent_message`
+  (`not_agent_process`, nothing sent). `cherry keys` takes named keys (`up`,
+  `enter`, `esc`, `shift-tab`, `ctrl-c`, F1–F4…) or single characters.
 
 ### PATH
 
@@ -89,6 +96,15 @@ path matches neither. Every tab gets a directory holding only `cherry` (a link
 to the bundle's) at the front of PATH: This Mac's under the identity's
 Application Support, a device's in its install's build directory (prepended
 in `lineSettingLoginPath`). `CHERRY_CLI` stays.
+
+As built: This Mac's tabs get `CHERRY_BIN_DIR` (`TabCLIDirectory`), first on
+PATH in native and hosted launches, and Cherry's zsh bootstrap puts it first
+again after the user's `.zshrc` (bash and fish keep it wherever their startup
+files leave it; path_helper keeps it, after the system directories). A
+device's commands and agents get the install's build directory first in
+`CHERRY_LOGIN_PATH`; that directory also holds the install's `cherry-host`
+and `CherryMCP`. A device's interactive terminals have no such line and keep
+`CHERRY_CLI` only.
 
 ## Teaching agents: the skill
 

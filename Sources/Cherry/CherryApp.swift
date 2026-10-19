@@ -51,6 +51,14 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
         MainActor.assumeIsolated {
             Self.finishLaunchingAfterInstanceLock(lock: .shared, store: .shared) {
                 LaunchTimeline.mark("instance lock resolved")
+                // `cherry` first on every tab's PATH (`TabCLIDirectory`): the
+                // lock holder makes the link, another copy uses it. Before
+                // the first tab, which reads it.
+                TabCLIDirectory.current = TabCLIDirectory.prepare(
+                    cliPath: ShellProcessController.appCLIPath,
+                    directory: TabCLIDirectory.directory(),
+                    canWrite: AppInstanceLock.shared.isHeld
+                )
                 // The windows to reopen, read before any window registers.
                 ProjectWindowRegistry.shared.configureWorkspacePersistence(store: .shared)
                 // Reach the local session host now, in the background, so

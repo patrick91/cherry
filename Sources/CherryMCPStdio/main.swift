@@ -15,6 +15,9 @@ struct CherryMCPStdioMain {
         if arguments.first == "--call" {
             await callOnce(Array(arguments.dropFirst()))
         }
+        if arguments.first == "cli" {
+            await runCLI(Array(arguments.dropFirst()))
+        }
         // Temporary keyboard diagnostics; remove once the Shift+Enter/Shift+Tab report is understood.
         if arguments.first == "--key-echo" {
             KeyEcho.run(arguments: Array(arguments.dropFirst()))
@@ -51,5 +54,19 @@ struct CherryMCPStdioMain {
         let result = await CherryMCPSession().call(name: name, arguments: toolArguments, interface: "call")
         print(result.text)
         exit(result.isError ? 1 : 0)
+    }
+
+    /// `CherryMCP cli ARGS…`: one `cherry` agent command (`CherryCLI`; the
+    /// Rust `cherry` hands its non-host commands here). Exit 0, 1 on the
+    /// tool's error, 2 on a usage error.
+    static func runCLI(_ arguments: [String]) async -> Never {
+        let invocation = CherryCLI.parse(arguments, input: .standard)
+        let session = CherryMCPSession()
+        let outcome = await CherryCLIRunner.run(invocation, isTerminal: isatty(STDOUT_FILENO) != 0) { name, arguments in
+            await session.call(name: name, arguments: arguments, interface: "cli")
+        }
+        FileHandle.standardOutput.write(Data(outcome.standardOutput.utf8))
+        FileHandle.standardError.write(Data(outcome.standardError.utf8))
+        exit(outcome.exitCode)
     }
 }

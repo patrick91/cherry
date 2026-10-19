@@ -90,6 +90,11 @@ struct ShellIntegrationBootstrap: Equatable, Sendable {
             fi
             unset _cherry_original_zdotdir
 
+            # `cherry` first on PATH, whatever the startup files did to it.
+            if [[ -n "${CHERRY_BIN_DIR-}" ]]; then
+              path=("$CHERRY_BIN_DIR" ${path:#${(b)CHERRY_BIN_DIR}})
+            fi
+
             export ZDOTDIR="${CHERRY_BOOTSTRAP_ZDOTDIR}"
             if [[ "${CHERRY_DISABLE_SHELL_INTEGRATION-}" != "1" ]]; then
               source "${CHERRY_BOOTSTRAP_ZDOTDIR}/cherry-integration.zsh"
@@ -499,7 +504,8 @@ final class ShellProcessController: @unchecked Sendable {
     ///
     /// `controlSocketPath` is the socket the app's control server answers
     /// (`CherryControlServer.appSocketPath`), the tab's
-    /// `CHERRY_CONTROL_SOCKET`; `cliPath` its `CHERRY_CLI`; `mcpServerName`
+    /// `CHERRY_CONTROL_SOCKET`; `cliPath` its `CHERRY_CLI`; `cliDirectory`
+    /// its `CHERRY_BIN_DIR`, first on its PATH (`TabCLIDirectory`); `mcpServerName`
     /// the name Cherry's server has in its agents (the identity's scheme),
     /// its `CHERRY_MCP_SERVER_NAME` beside `CHERRY_MCP_HELPER`, which
     /// Cherry's Pi extension registers the helper as.
@@ -511,7 +517,8 @@ final class ShellProcessController: @unchecked Sendable {
         mcpHelperPath: String? = appMCPHelperPath,
         mcpServerName: String? = CherryAppIdentity.current.urlScheme,
         controlSocketPath: String? = CherryControlServer.appSocketPath,
-        cliPath: String? = appCLIPath
+        cliPath: String? = appCLIPath,
+        cliDirectory: String? = TabCLIDirectory.current
     ) -> (command: String, environment: [String: String]) {
         let shellPath = configuration.shellPath
 
@@ -565,6 +572,15 @@ final class ShellProcessController: @unchecked Sendable {
         }
         if let cliPath, !cliPath.isEmpty {
             environment[CherryControl.cliEnvironmentKey] = cliPath
+        }
+        if let cliDirectory, !cliDirectory.isEmpty {
+            // `cherry` first on PATH (`TabCLIDirectory`); the zsh bootstrap
+            // puts it first again after the user's startup files.
+            environment[TabCLIDirectory.environmentKey] = cliDirectory
+            environment["PATH"] = TabCLIDirectory.prepending(
+                cliDirectory,
+                to: configuration.environment["PATH"] ?? inheritedEnvironment["PATH"]
+            )
         }
 
         let command: String

@@ -154,8 +154,15 @@ enum RemoteLaunchSpec {
             for (key, value) in login where RemoteLoginEnvironment.isSent(key) {
                 environment[key] = value
             }
-            if let path = environment["PATH"]?.nilIfEmpty, lineSettingLoginPath("", shell: shell) != nil {
-                // Set by the line itself, after the startup files.
+            if var path = environment["PATH"]?.nilIfEmpty, lineSettingLoginPath("", shell: shell) != nil {
+                // Set by the line itself, after the startup files, with the
+                // install's directory first so its programs run `cherry`
+                // (`TabCLIDirectory` on This Mac). The directory also holds
+                // the install's cherry-host and CherryMCP, which nothing
+                // there names otherwise.
+                if let cliPath = device.mcp?.cliPath?.nilIfEmpty {
+                    path = TabCLIDirectory.prepending((cliPath as NSString).deletingLastPathComponent, to: path)
+                }
                 environment["PATH"] = nil
                 environment[loginPathVariable] = path
                 loginPath = path

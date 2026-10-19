@@ -363,7 +363,9 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
     }
     if let Action::Doctor = cli.command {
         if cli.host.is_some() {
-            bail!("doctor is local only; run it on the remote machine (ssh HOST cherry host doctor)");
+            bail!(
+                "doctor is local only; run it on the remote machine (ssh HOST cherry host doctor)"
+            );
         }
         return diagnose::doctor(&transport::local_socket_path(cli.socket.as_deref())?);
     }

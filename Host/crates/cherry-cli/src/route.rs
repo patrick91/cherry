@@ -216,8 +216,8 @@ pub fn run_agent_command(arguments: &[OsString]) -> (u8, String) {
 
 /// `cherry`, `cherry --help`: the agent commands and `host`.
 pub const OVERVIEW: &str = "\
-Cherry from the command line: its tabs, agents, tasks, todos and notes, and
-its session host.
+Cherry from the command line: its tabs, agents, tasks and todos, and its
+session host.
 
 Usage: cherry <COMMAND> [ARGS]...
 

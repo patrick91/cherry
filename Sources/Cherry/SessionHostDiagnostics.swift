@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 
-/// The local session host as `cherry status --json` describes it
+/// The local session host as `cherry host status --json` describes it
 /// (Settings › Sessions, its session host header).
 struct SessionHostStatus: Equatable, Sendable {
     var running: Bool
@@ -22,7 +22,7 @@ struct SessionHostStatus: Equatable, Sendable {
     /// the code they started with until they end).
     var otherHolderBuilds = 0
 
-    /// Parses `cherry status --json` (running or not); nil for anything else.
+    /// Parses `cherry host status --json` (running or not); nil for anything else.
     static func parse(_ data: Data) -> SessionHostStatus? {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let running = object["running"] as? Bool
@@ -102,7 +102,7 @@ struct SessionHostStatus: Equatable, Sendable {
         return parts
     }
 
-    /// `12s`, `4m 10s`, `2h 5m`, `3d 4h`, as `cherry status` prints it.
+    /// `12s`, `4m 10s`, `2h 5m`, `3d 4h`, as `cherry host status` prints it.
     static func duration(_ interval: TimeInterval) -> String {
         let seconds = max(0, Int(interval))
         let (days, hours, minutes) = (seconds / 86_400, seconds / 3_600 % 24, seconds / 60 % 60)
@@ -133,9 +133,9 @@ struct SessionHostHeroState: Equatable, Sendable {
 }
 
 /// Settings › Sessions' session host (its header and rows, and the
-/// sidebar's status item): the local host's status (`cherry status
+/// sidebar's status item): the local host's status (`cherry host status
 /// --json`), the socket's path to copy, Reveal Log, Copy Diagnostics
-/// (`cherry status` and `cherry doctor`) and Restart Host (`cherry
+/// (`cherry host status` and `cherry host doctor`) and Restart Host (`cherry host
 /// restart`, after the page asked). It runs only commands that never start
 /// a host, except the restart it was asked for.
 @MainActor
@@ -169,7 +169,7 @@ final class SessionHostDiagnostics: ObservableObject {
         self.copyToPasteboard = copyToPasteboard
     }
 
-    /// Reads the host's status again (`cherry status --json`).
+    /// Reads the host's status again (`cherry host status --json`).
     func refresh() async {
         if let reason = unavailableReason() {
             problem = reason
@@ -177,13 +177,13 @@ final class SessionHostDiagnostics: ObservableObject {
             return
         }
         do {
-            let result = try await runner(["status", "--json"])
+            let result = try await runner(["host", "status", "--json"])
             if let parsed = SessionHostStatus.parse(Data(result.output.utf8)) {
                 status = parsed
                 problem = nil
             } else {
                 status = nil
-                problem = Self.failure(of: "cherry status", result)
+                problem = Self.failure(of: "cherry host status", result)
             }
         } catch {
             status = nil
@@ -191,7 +191,7 @@ final class SessionHostDiagnostics: ObservableObject {
         }
     }
 
-    /// `cherry status` and `cherry doctor`, as a report to paste into an
+    /// `cherry host status` and `cherry host doctor`, as a report to paste into an
     /// issue: the app's version first.
     func diagnostics() async -> String {
         let info = Bundle.main.infoDictionary ?? [:]
@@ -201,7 +201,7 @@ final class SessionHostDiagnostics: ObservableObject {
         if let reason = unavailableReason() {
             report += "Local sessions are unavailable: \(reason)\n"
         }
-        for arguments in [["status"], ["doctor"]] {
+        for arguments in [["host", "status"], ["host", "doctor"]] {
             report += "\n$ cherry \(arguments.joined(separator: " "))\n"
             do {
                 let result = try await runner(arguments)
@@ -219,7 +219,7 @@ final class SessionHostDiagnostics: ObservableObject {
         copyToPasteboard(await diagnostics())
     }
 
-    /// Copies the host's socket path (the Socket row), as `cherry status`
+    /// Copies the host's socket path (the Socket row), as `cherry host status`
     /// last reported it; nothing while it is not known.
     func copySocketPath() {
         guard let socket = status?.socket else { return }
@@ -257,16 +257,16 @@ final class SessionHostDiagnostics: ObservableObject {
         revealInFinder(URL(fileURLWithPath: path))
     }
 
-    /// Restarts the local host (`cherry restart`): its sessions carry on in
+    /// Restarts the local host (`cherry host restart`): its sessions carry on in
     /// their holders and tabs reconnect. The caller asked first.
     func restartHost() async {
         isRestarting = true
         restartFailure = nil
         defer { isRestarting = false }
         do {
-            let result = try await runner(["restart"])
+            let result = try await runner(["host", "restart"])
             if result.status != 0 {
-                restartFailure = Self.failure(of: "cherry restart", result)
+                restartFailure = Self.failure(of: "cherry host restart", result)
             }
         } catch {
             restartFailure = error.localizedDescription

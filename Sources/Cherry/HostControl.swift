@@ -331,7 +331,7 @@ final class HostControl: ObservableObject {
         var pendingHolderRelists = 20
         var pendingHolderSlowRelistInterval: Duration = .seconds(5)
         /// Whether connecting may start the host's daemon (or replace one
-        /// of an older protocol); false runs `cherry control --no-start`,
+        /// of an older protocol); false runs `cherry host control --no-start`,
         /// which fails when none of this version runs.
         var startsHost = true
     }
@@ -720,7 +720,7 @@ final class HostControl: ObservableObject {
             executableURL: client.executableURL,
             arguments: host.arguments(sshControlPath: controlPath)
                 + Self.expectedHostIDArguments(trusted)
-                + ["control"] + (configuration.startsHost ? [] : ["--no-start"]),
+                + ["host", "control"] + (configuration.startsHost ? [] : ["--no-start"]),
             environment: environment
         )
         let launcher = launcher
@@ -1604,7 +1604,7 @@ extension HostControl {
     /// How many leases hold the connection now (tests).
     var activeLeaseCount: Int { leaseCount }
 
-    /// The host's sessions from one `cherry list --json --no-start` (through
+    /// The host's sessions from one `cherry host list --json --no-start` (through
     /// the SSH master while it is up; a master that refuses the session is
     /// bypassed by the CLI itself): it never starts a daemon on the host,
     /// nor replaces one of an older protocol, and it leaves this control
@@ -1627,7 +1627,7 @@ extension HostControl {
         let trusted = hostStore.trustedHostID(for: host)
         let arguments = host.arguments(sshControlPath: controlPath)
             + Self.expectedHostIDArguments(trusted)
-            + ["list", "--json", "--no-start"]
+            + ["host", "list", "--json", "--no-start"]
         let executable = client.executableURL
         let output = await Task.detached(priority: .userInitiated) {
             Self.runCapturing(executable: executable, arguments: arguments, environment: environment, timeout: timeout)
@@ -1649,7 +1649,7 @@ extension HostControl {
         return (result.status, String(decoding: result.standardOutput, as: UTF8.self), String(decoding: result.standardError, as: UTF8.self))
     }
 
-    /// Reads what `cherry list --json --no-start` printed.
+    /// Reads what `cherry host list --json --no-start` printed.
     nonisolated static func peek(status: Int32, standardOutput: String, standardError: String, trusted: String?) -> HostSessionPeek {
         if status == 0, let list = try? JSONDecoder().decode(HostedSessionList.self, from: Data(standardOutput.utf8)) {
             if let trusted, UUID(uuidString: trusted) != nil, list.hostID != trusted {
@@ -1663,7 +1663,7 @@ extension HostControl {
         let lines = errors.components(separatedBy: .newlines)
             .map { $0.hasPrefix("cherry: ") ? String($0.dropFirst(8)) : $0 }
             .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        let message = lines.isEmpty ? "cherry list exited \(status)" : String(lines.joined(separator: " ").prefix(2_000))
+        let message = lines.isEmpty ? "cherry host list exited \(status)" : String(lines.joined(separator: " ").prefix(2_000))
         return .failed(.unavailable(message))
     }
 }

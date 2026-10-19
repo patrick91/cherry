@@ -232,7 +232,7 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     // The surface runs the attach adapter for that session.
     #expect(await harness.fake.wait { harness.attachCalls.count == 1 })
     let attach = try #require(harness.attachCalls.first)
-    #expect(attach.hasPrefix("--expected-host-id host-a attach \(sessionID) --detach-key none --client-id \(terminal.id.uuidString) --status-file "))
+    #expect(attach.hasPrefix("--expected-host-id host-a host attach \(sessionID) --detach-key none --client-id \(terminal.id.uuidString) --status-file "))
 
     // Agents and commands keep their kind, name and launch settings.
     let agent = workspace.addAgentSession(

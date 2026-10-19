@@ -342,7 +342,7 @@ struct SessionsSettingsPage: View, SettingsPageContent {
                 section: "",
                 title: "Session host",
                 help: hostCaption,
-                keywords: ["host", "daemon", "log", "diagnostics", "doctor", "restart", "cherry status", "socket"]
+                keywords: ["host", "daemon", "log", "diagnostics", "doctor", "restart", "cherry host status", "socket"]
             ),
             SettingsSearchRow(
                 id: .sessionsPersistLocal,

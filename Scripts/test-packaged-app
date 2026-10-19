@@ -174,18 +174,18 @@ def exercise_helpers(app, sandbox, environment, fixture):
     socket_path = state / "host.sock"
 
     def cherry(*arguments):
-        result = subprocess.run(sandbox + [str(cli), "--socket", str(socket_path), *arguments],
+        result = subprocess.run(sandbox + [str(cli), "--socket", str(socket_path), "host", *arguments],
                                 env=environment, cwd=fixture, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
-            raise RuntimeError(f"Bundled `cherry {' '.join(arguments)}` failed with status "
+            raise RuntimeError(f"Bundled `cherry host {' '.join(arguments)}` failed with status "
                                f"{result.returncode}: {result.stderr.strip()}")
         return result.stdout
 
     def session(session_id):
-        listing = json_object(cherry("list", "--json"), "`cherry list --json` output")
+        listing = json_object(cherry("list", "--json"), "`cherry host list --json` output")
         sessions = listing.get("sessions")
         if not isinstance(sessions, list) or not all(isinstance(item, dict) for item in sessions):
-            raise RuntimeError(f"`cherry list --json` has no list of session objects: {listing}")
+            raise RuntimeError(f"`cherry host list --json` has no list of session objects: {listing}")
         return next((item for item in sessions if item.get("id") == session_id), None)
 
     session_id = None
@@ -195,10 +195,10 @@ def exercise_helpers(app, sandbox, environment, fixture):
         lines = [line for line in cherry("new", "--name=packaged-helper-smoke", f"--cwd={fixture}",
                                          "--", "/bin/sh", "-c", "sleep 30").splitlines() if line.strip()]
         if not lines:
-            raise RuntimeError("Bundled `cherry new` printed no session")
-        created = json_object(lines[-1], "`cherry new` output")
+            raise RuntimeError("Bundled `cherry host new` printed no session")
+        created = json_object(lines[-1], "`cherry host new` output")
         if not isinstance(created.get("id"), str) or not created["id"]:
-            raise RuntimeError(f"Bundled `cherry new` printed no session id: {created}")
+            raise RuntimeError(f"Bundled `cherry host new` printed no session id: {created}")
         session_id = created["id"]
         if created.get("state") != "running":
             raise RuntimeError(f"Bundled helpers did not start the session: {created}")
@@ -219,7 +219,7 @@ def exercise_helpers(app, sandbox, environment, fixture):
     finally:
         if not stopped and host_reachable(socket_path):
             for arguments in ([["kill", session_id]] if session_id else []) + [["shutdown"]]:
-                subprocess.run(sandbox + [str(cli), "--socket", str(socket_path), *arguments],
+                subprocess.run(sandbox + [str(cli), "--socket", str(socket_path), "host", *arguments],
                                env=environment, capture_output=True, timeout=30)
             time.sleep(0.5)
             if host_reachable(socket_path):

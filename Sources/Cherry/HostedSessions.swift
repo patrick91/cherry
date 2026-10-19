@@ -558,7 +558,7 @@ struct HostedSessionAttachment: Equatable, Sendable {
         sizeFile: URL? = nil
     ) -> [String] {
         var arguments = host.arguments(sshControlPath: sshControlPath)
-            + ["--expected-host-id", hostID, "attach", sessionID]
+            + ["--expected-host-id", hostID, "host", "attach", sessionID]
         if takeover { arguments.append("--takeover") }
         arguments += ["--detach-key", "none"]
         if let clientID { arguments += ["--client-id", clientID] }

@@ -84,6 +84,9 @@ struct AgentRunRecord: Codable, Equatable, Sendable {
     var wokenSeq: Int
     var ownerReadSeq: Int
     var lastWakeAt: Date?
+    // Later additions: absent from older files.
+    var approvalWokenSeq: Int?
+    var approvalReadSeq: Int?
 }
 
 struct AgentTaskRecord: Codable, Equatable, Sendable {
@@ -117,6 +120,9 @@ struct AgentTaskRecord: Codable, Equatable, Sendable {
     var kickoffEnterPresses: Int
     var nudgedAt: Date?
     var lastNudgeAttemptAt: Date?
+    // Later additions: absent from older files.
+    var allowSubagents: Bool?
+    var awaitingApprovalSeq: Int?
 }
 
 /// Reads and writes `agent-tasks.json` (see above).
@@ -307,7 +313,9 @@ extension AgentTaskRegistry {
             settledAt: run.settledAt,
             wokenSeq: wokenSeq,
             ownerReadSeq: run.ownerReadSeq,
-            lastWakeAt: run.lastWakeAt
+            lastWakeAt: run.lastWakeAt,
+            approvalWokenSeq: run.approvalWokenSeq,
+            approvalReadSeq: run.approvalReadSeq
         )
     }
 
@@ -355,7 +363,9 @@ extension AgentTaskRegistry {
             lastKickoffAttemptAt: task.lastKickoffAttemptAt,
             kickoffEnterPresses: task.kickoffEnterPresses,
             nudgedAt: nudgedAt,
-            lastNudgeAttemptAt: task.lastNudgeAttemptAt
+            lastNudgeAttemptAt: task.lastNudgeAttemptAt,
+            allowSubagents: task.allowSubagents ? true : nil,
+            awaitingApprovalSeq: task.awaitingApprovalSeq
         )
     }
 
@@ -384,6 +394,8 @@ extension AgentTaskRegistry {
             run.wokenSeq = saved.wokenSeq
             run.ownerReadSeq = saved.ownerReadSeq
             run.lastWakeAt = saved.lastWakeAt
+            run.approvalWokenSeq = saved.approvalWokenSeq ?? 0
+            run.approvalReadSeq = saved.approvalReadSeq ?? 0
             if run.ownerWakes { run.restoredAt = now }
             highestSeq = max(highestSeq, run.events.last?.seq ?? 0, run.settledSeq ?? 0, run.droppedThroughSeq)
             insert(run)
@@ -392,7 +404,7 @@ extension AgentTaskRegistry {
             let task = AgentTask(
                 id: saved.id, runID: saved.runID, device: saved.device, workerID: saved.workerID,
                 worker: nil, workspace: nil, label: saved.label, phase: saved.phase, brief: saved.brief,
-                resultSchema: saved.resultSchema, createdAt: saved.createdAt
+                resultSchema: saved.resultSchema, allowSubagents: saved.allowSubagents ?? false, createdAt: saved.createdAt
             )
             task.workerSession = saved.workerSession
             task.workerIsPersistent = saved.workerIsPersistent
@@ -416,10 +428,11 @@ extension AgentTaskRegistry {
             task.kickoffEnterPresses = saved.kickoffEnterPresses
             task.nudgedAt = saved.nudgedAt
             task.lastNudgeAttemptAt = saved.lastNudgeAttemptAt
+            task.awaitingApprovalSeq = saved.awaitingApprovalSeq
             // Its turn is looked at again from when its tab is found.
             task.turnBaselineAt = nil
             if !task.state.isSettled { task.restoredAt = now }
-            highestSeq = max(highestSeq, task.settledSeq ?? 0, task.needsInputSeq ?? 0)
+            highestSeq = max(highestSeq, task.settledSeq ?? 0, task.needsInputSeq ?? 0, task.awaitingApprovalSeq ?? 0)
             insertRestored(task)
         }
         for run in orderedRuns {

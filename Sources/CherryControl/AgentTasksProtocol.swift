@@ -128,6 +128,10 @@ public enum AgentTaskState: String, Codable, CaseIterable, Equatable, Sendable {
     case working
     /// Its worker waits for the user: a permission prompt or a question.
     case needsInput = "needs_input"
+    /// Its worker asked its orchestrator for approval or an answer
+    /// (`report_progress` with `awaiting_approval`) and ended its turn:
+    /// open, never nudged, until input is sent to it or it reports again.
+    case awaitingApproval = "awaiting_approval"
     /// Its worker reported a result with status ok.
     case reported
     /// Its worker went idle without reporting, even after Cherry asked
@@ -143,7 +147,7 @@ public enum AgentTaskState: String, Codable, CaseIterable, Equatable, Sendable {
     /// result, except for a cancelled task).
     public var isSettled: Bool {
         switch self {
-        case .queued, .working, .needsInput: false
+        case .queued, .working, .needsInput, .awaitingApproval: false
         case .reported, .noReport, .failed, .cancelled: true
         }
     }
@@ -256,7 +260,10 @@ public enum AgentTaskEventKind: String, Codable, CaseIterable, Equatable, Sendab
     case started
     case progress
     case needsInput = "needs_input"
-    /// Back at work after `needs_input`.
+    /// The worker asks its orchestrator for approval or an answer (the
+    /// event's text is its question).
+    case awaitingApproval = "awaiting_approval"
+    /// Back at work after `needs_input` or `awaiting_approval`.
     case resumed
     /// Cherry asked the idle worker once to report.
     case nudged
@@ -270,8 +277,8 @@ public enum AgentTaskEventKind: String, Codable, CaseIterable, Equatable, Sendab
     case noReport = "no_report"
     case cancelled
 
-    /// A task settles with it (`until: any` returns on these and
-    /// `needs_input`).
+    /// A task settles with it (`until: any` returns on these,
+    /// `needs_input` and `awaiting_approval`).
     public var settles: Bool {
         switch self {
         case .reported, .failed, .noReport, .cancelled: true
@@ -332,12 +339,31 @@ public struct AgentRunCounts: Codable, Equatable, Sendable {
     public var queued = 0
     public var working = 0
     public var needsInput = 0
+    public var awaitingApproval = 0
     public var reported = 0
     public var noReport = 0
     public var failed = 0
     public var cancelled = 0
 
     public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case total, queued, working, needsInput, awaitingApproval, reported, noReport, failed, cancelled
+    }
+
+    // `awaitingApproval` came later: an older app's counts lack it.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        total = try container.decode(Int.self, forKey: .total)
+        queued = try container.decode(Int.self, forKey: .queued)
+        working = try container.decode(Int.self, forKey: .working)
+        needsInput = try container.decode(Int.self, forKey: .needsInput)
+        awaitingApproval = try container.decodeIfPresent(Int.self, forKey: .awaitingApproval) ?? 0
+        reported = try container.decode(Int.self, forKey: .reported)
+        noReport = try container.decode(Int.self, forKey: .noReport)
+        failed = try container.decode(Int.self, forKey: .failed)
+        cancelled = try container.decode(Int.self, forKey: .cancelled)
+    }
 
     public init(states: [AgentTaskState]) {
         for state in states { add(state) }
@@ -349,6 +375,7 @@ public struct AgentRunCounts: Codable, Equatable, Sendable {
         case .queued: queued += 1
         case .working: working += 1
         case .needsInput: needsInput += 1
+        case .awaitingApproval: awaitingApproval += 1
         case .reported: reported += 1
         case .noReport: noReport += 1
         case .failed: failed += 1
@@ -450,9 +477,14 @@ public struct ReportResultResult: Codable, Equatable, Sendable {
 
 public struct ReportProgressRequest: Codable, Equatable, Sendable {
     public let message: String
+    /// The worker asks its orchestrator for approval or an answer (the
+    /// message is its question) and ends its turn: the task waits
+    /// (`awaiting_approval`) instead of being asked to report.
+    public let awaitingApproval: Bool?
 
-    public init(message: String) {
+    public init(message: String, awaitingApproval: Bool? = nil) {
         self.message = message
+        self.awaitingApproval = awaitingApproval
     }
 }
 
@@ -462,11 +494,14 @@ public struct ReportProgressResult: Codable, Equatable, Sendable {
     public let recorded: Bool
     /// When not recorded: how long until the next one is.
     public let retryAfterMilliseconds: Int?
+    /// The task's state after it (absent from an older app).
+    public let state: AgentTaskState?
 
-    public init(taskID: String, recorded: Bool, retryAfterMilliseconds: Int? = nil) {
+    public init(taskID: String, recorded: Bool, retryAfterMilliseconds: Int? = nil, state: AgentTaskState? = nil) {
         self.taskID = taskID
         self.recorded = recorded
         self.retryAfterMilliseconds = retryAfterMilliseconds
+        self.state = state
     }
 }
 

@@ -35,7 +35,8 @@ private extension ControlAgentWaitHarness {
         phase: String? = nil,
         runID: String? = nil,
         resultSchema: JSONValue? = nil,
-        parentAgentID: String? = nil
+        parentAgentID: String? = nil,
+        allowSubagents: Bool? = nil
     ) async throws -> (session: TerminalSession, result: SpawnProcessResult) {
         try settings.upsertAgent(AgentToolDefinition(name: name, command: command))
         let response = try await send(.spawnProcess(.init(
@@ -46,7 +47,8 @@ private extension ControlAgentWaitHarness {
             label: label,
             phase: phase,
             runID: runID,
-            resultSchema: resultSchema
+            resultSchema: resultSchema,
+            allowSubagents: allowSubagents
         )))
         guard case .spawnProcess(let spawned)? = response.result else {
             throw CherryControlError(code: "spawn_failed", message: "Expected spawnProcess result, got \(String(describing: response))")
@@ -556,6 +558,112 @@ struct ControlAgentTaskTests {
         try await Task.sleep(for: .milliseconds(1_000))
         #expect(try await harness.output(of: orchestrator).components(separatedBy: "handled [cherry] Run").count - 1 == 1)
         #expect(harness.server.tasks.board.runProgress[orchestrator.id] == nil, "a settled run shows no progress")
+    }
+
+    // MARK: Approval
+
+    /// A worker that asks its orchestrator for approval and ends its turn
+    /// is neither nudged nor settled: its task awaits approval, wait_for_tasks
+    /// returns at once with its question, its idle orchestrator gets one
+    /// wake line (no worker text), and the orchestrator's message puts it
+    /// back to work, after which an idle worker is asked to report again.
+    @Test func workerAwaitingApprovalIsNotNudgedAndResumesOnItsAnswer() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastTaskSampling()
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        try await Task.sleep(for: .milliseconds(600))
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        let (worker, spawned) = try await harness.spawnTask(agent: "Fakeworker", command: script, task: "Plan, then wait for my OK")
+        let taskID = try #require(spawned.task?.taskID)
+        let runID = try #require(spawned.task?.runID)
+
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+        #expect(try await harness.send(.getMyTask).error == nil)
+        let asked = try await harness.send(.reportProgress(.init(message: "SECRET-PLAN: step 1, step 2. OK?", awaitingApproval: true)))
+        guard case .reportProgress(let progress)? = asked.result else {
+            Issue.record("Expected reportProgress, got \(asked)")
+            return
+        }
+        #expect(progress.recorded && progress.state == .awaitingApproval)
+        // Another one right away is not dropped by the progress interval.
+        let again = try await harness.send(.reportProgress(.init(message: "Still: OK?", awaitingApproval: true)))
+        guard case .reportProgress(let second)? = again.result else {
+            Issue.record("Expected reportProgress, got \(again)")
+            return
+        }
+        #expect(second.recorded)
+
+        // Its kickoff turn ends: no nudge, no no_report.
+        _ = try await harness.waitForOutput("handled You are Cherry task \(taskID)", in: worker, seconds: 10)
+        let woken = try await harness.waitForOutput("handled [cherry] Run \(runID)", in: orchestrator, seconds: 10)
+        #expect(woken.contains("[cherry] Run \(runID): 1 task awaits your approval."), "\(woken)")
+        #expect(!woken.contains("SECRET-PLAN"), "the wake line carries no worker text")
+        try await Task.sleep(for: .milliseconds(800))
+        #expect(!(try await harness.output(of: worker)).contains(AgentTaskRegistry.nudgeLine), "nudged while it awaits approval")
+        #expect(try await harness.task(taskID).task.state == .awaitingApproval)
+        #expect(try await harness.status(of: worker).taskState == "awaiting_approval")
+        // One wake line for that request.
+        #expect(try await harness.output(of: orchestrator).components(separatedBy: "handled [cherry] Run").count - 1 == 1)
+
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        let quick = Date()
+        let read = try await harness.waitForTasks(.init(runID: runID, timeoutMilliseconds: 5_000))
+        #expect(!read.timedOut && Date().timeIntervalSince(quick) < 2)
+        #expect(read.events.last { $0.kind == .awaitingApproval }?.text == "Still: OK?")
+        #expect(read.pending.first?.state == .awaitingApproval)
+        #expect(read.runs.first?.counts.awaitingApproval == 1 && read.runs.first?.settled == false)
+        let listed = try await harness.send(.listTasks(.init(runID: runID, state: "awaiting_approval")))
+        guard case .listTasks(let list)? = listed.result else {
+            Issue.record("Expected listTasks, got \(listed)")
+            return
+        }
+        #expect(list.tasks.map(\.taskID) == [taskID])
+
+        // The answer: back to work, and its next idle turn is asked to report.
+        #expect(try await harness.send(.sendProcessInput(.init(processID: worker.id.uuidString, text: "Approved", submit: true))).error == nil)
+        #expect(try await harness.task(taskID).task.state == .working)
+        let nudged = try await harness.waitForOutput("handled \(AgentTaskRegistry.nudgeLine)", in: worker, seconds: 15)
+        #expect(nudged.contains("handled Approved"), "\(nudged)")
+        let after = try await harness.waitForTasks(.init(taskIDs: [taskID], cursor: read.cursor, timeoutMilliseconds: 0))
+        #expect(after.events.map(\.kind).contains(.resumed))
+    }
+
+    /// allow_subagents changes the rules get_my_task gives, goes only with
+    /// a task, and still leaves the worker unable to hand out Cherry tasks.
+    @Test func allowSubagentsChangesTheWorkersRules() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.start()
+        let (plain, _) = try await harness.spawnTask(agent: "Worker", task: "A")
+        let (free, _) = try await harness.spawnTask(agent: "Worker", task: "B", allowSubagents: true)
+
+        harness.server.callerSessionResolverForTesting = { _ in plain }
+        guard case .getMyTask(let plainTask)? = try await harness.send(.getMyTask).result else {
+            Issue.record("Expected getMyTask")
+            return
+        }
+        #expect(plainTask.rules.first?.contains("Don't hand parts of it to other agents") == true)
+        #expect(plainTask.rules.contains { $0.contains("awaiting_approval true") })
+        #expect(!plainTask.rules.contains { $0.contains("rather than waiting for an answer") })
+
+        harness.server.callerSessionResolverForTesting = { _ in free }
+        guard case .getMyTask(let freeTask)? = try await harness.send(.getMyTask).result else {
+            Issue.record("Expected getMyTask")
+            return
+        }
+        #expect(freeTask.rules.first?.contains("You may use your own CLI's subagents") == true)
+        #expect(freeTask.rules.first?.contains("not spawn_agent with task") == true)
+        // Still one level deep.
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "Worker", command: "/bin/cat"))
+        let nested = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Worker", task: "C")))
+        #expect(nested.error?.code == "nested_task")
+
+        harness.server.callerSessionResolverForTesting = nil
+        let bare = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Worker", allowSubagents: true)))
+        #expect(bare.error?.code == "invalid_process_request")
     }
 
     // MARK: End to end

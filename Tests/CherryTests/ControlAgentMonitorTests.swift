@@ -799,6 +799,49 @@ struct ControlAgentMonitorTests {
         #expect(after.watching.first?.taskState == "reported")
     }
 
+    /// Once a worker's task settled and its settle was told, a turn it
+    /// begins by itself (nothing submitted to it: a finished tab's
+    /// background work) is no `done`; a message submitted to it makes its
+    /// next turn's end one again.
+    @Test func settledWorkersSelfStartedTurnIsNoDone() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.tasks.reportInterval = 0
+        harness.server.start()
+        let (worker, taskID) = try await harness.spawnTaskWorker(named: "Worker", task: "Review the parser")
+        harness.report("state=working:app=claude-code", on: worker)
+        let id = try await harness.subscribe(.init(processIDs: [worker.id.uuidString], wake: false)).subscription.subscriptionID
+        _ = try await harness.events(id, untilStatus: "working")
+
+        try await harness.reportResult("Two findings", from: worker)
+        harness.screen("⏺ Reported.\n\n❯ \n", on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
+        let settled = try await harness.events(id) { read in
+            read.contains { $0.taskID == taskID } && read.contains { $0.type == .done && $0.taskID == nil }
+        }
+        #expect(settled.filter { $0.type == .done }.count >= 2, "\(settled)")
+        try #require(worker.agentReportedTurnCount >= worker.agentSubmittedTurnCount, "the kickoff was submitted once")
+
+        // A turn it began by itself.
+        harness.report("state=working:app=claude-code", on: worker)
+        _ = try await harness.events(id, untilStatus: "working")
+        harness.screen("⏺ Background job finished.\n\n❯ \n", on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
+        let selfStarted = try await harness.events(id, timeoutMilliseconds: 1_500)
+        #expect(selfStarted.watching.first?.status == "idle")
+        #expect(!selfStarted.events.contains { $0.type == .done }, "\(selfStarted.events)")
+
+        // Its orchestrator's message: that turn's end is news.
+        _ = try await harness.send(.sendProcessInput(.init(processID: worker.id.uuidString, text: "also check the lexer", submit: true)))
+        harness.report("state=working:app=claude-code", on: worker)
+        _ = try await harness.events(id, untilStatus: "working")
+        harness.screen("⏺ Lexer checked.\n\n❯ \n", on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
+        let answered = try await harness.events(id) { $0.contains { $0.type == .done } }
+        #expect(answered.contains { $0.type == .done && $0.taskID == nil }, "\(answered)")
+    }
+
     /// A worker that reports no status: its turn's quiet `done` and its
     /// task's settle are each told, whichever comes first. A settle neither
     /// stands for the turn nor holds its quiet done back.

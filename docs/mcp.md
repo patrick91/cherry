@@ -891,7 +891,12 @@ to their events and ends its turn; Cherry tells it when something happened.
   `no_report`, `failed`, `cancelled`) is one more `done`, the only one with
   `task_id` and `task_state`, and no `basis`: once per task (a report
   after it adds nothing), also after its `exited`, and none when the
-  subscriber cancelled it itself (`cancel_tasks`). A `closed` ends the
+  subscriber cancelled it itself (`cancel_tasks`). Once its task settled
+  and that settle was told, only the turns submitted to it are news: a
+  turn it begins by itself (it reports more turns than were submitted,
+  none submitted since its last `done`: a finished tab's background work)
+  is no `done`, and a message submitted to it makes its next turn's end
+  one again. A `closed` ends the
   watch: only a subscription without `closed` still gets the settle of a
   task open when its tab closed. Read its result with `get_task`; to wait
   for workers, `wait_for_tasks` is the better tool.
@@ -972,7 +977,10 @@ Code, Codex and Pi.
   most 64,000 characters and 256 KiB), and optionally `label` (shown in the
   sidebar; defaults to `title`, else the brief's first words; cut at 80
   characters and 320 bytes), `phase` (60 characters, 240 bytes), `run_id`
-  and `result_schema`. The
+  and `result_schema`, and `allow_subagents` (default false: the worker's
+  rules tell it not to hand parts of the brief to other agents; true says
+  it may use its own CLI's subagents in its tab, never `spawn_agent` with
+  a task, which stays `nested_task`). The
   agent is the configured `name` with its usual command and options. The
   result has `task_id` and `run_id` (and `task`). Without `run_id` the task
   joins the caller's current run: one per orchestrator, a new one once all
@@ -1003,11 +1011,11 @@ Code, Codex and Pi.
   failed (`input_maybe_delivered`) is never typed again. An agent whose
   screen Cherry cannot read keeps its kickoff as typed.
 - `wait_for_tasks` with `run_id` or `task_ids` (default: the caller's own
-  open runs), `until` (`any`, the default: a task settled or needs input;
-  `all`: every task settled), `cursor` and `timeout_ms` (default 50000, at
-  most 50000 or the client's limit, see Client Timeouts; 0 returns at
-  once). It returns `events` after `cursor`
-  (`queued`, `started`, `progress`, `needs_input`, `resumed`,
+  open runs), `until` (`any`, the default: a task settled, needs input or
+  awaits approval; `all`: every task settled), `cursor` and `timeout_ms`
+  (default 50000, at most 50000 or the client's limit, see Client
+  Timeouts; 0 returns at once). It returns `events` after `cursor`
+  (`queued`, `started`, `progress`, `needs_input`, `awaiting_approval`, `resumed`,
   `kickoff_retry`, `nudged`, `reported`, `failed`, `no_report`,
   `cancelled`, each with its `seq`), `completed` and `pending` tasks,
   `cursor` (pass it back next time), `timed_out`, and the `runs` with
@@ -1033,7 +1041,15 @@ Code, Codex and Pi.
   [cherry] Run run-…: 3 tasks settled (2 reported, 1 failed). Call the cherry wait_for_tasks tool with run_id "run-…" to read them, and get_task for each result.
   ```
 
-  It carries the run id and counts only, never a worker's text. Settings ›
+  A run with a task awaiting approval (below) that the orchestrator has
+  not read with `wait_for_tasks` gets one line of its own, by the same
+  rules, once per new request:
+
+  ```text
+  [cherry] Run run-…: 1 task awaits your approval. Call the cherry wait_for_tasks tool with run_id "run-…" to read the questions, and answer each worker with send_agent_message.
+  ```
+
+  Both carry the run id and counts only, never a worker's text. Settings ›
   Agents & MCP › Monitors › Wake idle agents turns it off with monitors'
   wake lines.
   Everything Cherry types into a tab (this line, a monitor's wake line,
@@ -1082,7 +1098,24 @@ names); the tools take no selector, so no agent can report for another.
 - `report_progress` with a one-line `message` (at most 200 characters and
   800 UTF-8 bytes):
   at most one every 5 s is recorded (`recorded: false` and
-  `retry_after_milliseconds` otherwise).
+  `retry_after_milliseconds` otherwise); the answer has the task's `state`.
+- **Approval checkpoints.** A worker that needs its orchestrator's
+  approval or an answer before it goes on (a plan to approve, a question)
+  calls `report_progress` with `awaiting_approval: true` and its question
+  as `message` (never dropped by the 5 s limit), then ends its turn. Its
+  open task is `awaiting_approval` (the sidebar's "awaits approval"; an
+  `awaiting_approval` event with the question; `counts.awaiting_approval`):
+  not settled, never nudged and never `no_report`, and the run does not
+  settle. `wait_for_tasks` (`until: any`) returns for it, and the
+  orchestrator's wake line says so. The task is back at `working` (a
+  `resumed` event) once a message is submitted to the worker (the
+  orchestrator's `send_agent_message` or `send_process_input`, or the user
+  typing in its tab; Cherry's own lines are no answer), with a
+  `report_progress` without the flag, or settles with `report_result`.
+  Its next turn that ends without a report is asked once again. On a task
+  that already settled, the flag is ignored (a plain progress message).
+  `get_my_task`'s rules say all this, in place of the earlier "report
+  failed rather than waiting for an answer".
 
 **Result schemas** are a JSON Schema subset Cherry checks itself: `type`
 (a name or a list of them: `object`, `array`, `string`, `number`,
@@ -1100,6 +1133,8 @@ also watches each open task's worker:
 
 - It reports it waits for the user (a permission or a question): the task
   is `needs_input` (the sidebar's "needs you") until it goes on.
+- It asked its orchestrator for approval (above): the task waits, with no
+  nudge, until it is answered.
 - It finished its turn (idle at its composer after working, as a monitor's
   `done`) without reporting: Cherry types "Please call report_result with
   your result." once, when it is idle. Idle again after that turn without a
@@ -1127,8 +1162,8 @@ also watches each open task's worker:
 A report after `no_report` or `failed` still replaces the result.
 
 **The sidebar.** A worker's row shows its label and a small glyph for its
-task's state (queued, working, needs you, reported, no report, failed,
-cancelled); hovering shows the result's summary. While one of its runs is
+task's state (queued, working, needs you, awaits approval, reported, no
+report, failed, cancelled); hovering shows the result's summary. While one of its runs is
 open, the orchestrator's row shows how many of its tasks settled ("3/5").
 
 **Scope and lifetime.** Each task is tied to its worker's tab (by its id,
@@ -1343,7 +1378,9 @@ own in `Scripts/test-session-suites unit` (and CI), **ControlTool**
   the list's byte budget (28 000), the facts agents act on, the
   annotations, the per-client caps and the descriptions that state them.
   A deliberate change of a description or an annotation regenerates the
-  list fixture; the schema fixture never changes.
+  list fixture; the schema fixture changes only by an added optional
+  property (`report_progress`'s `awaiting_approval`, `spawn_agent`'s
+  `allow_subagents`), never a removed, renamed or newly required one.
 - `ControlToolLayerTests`: the tool layer over a recording transport
   (argument parsing, scoping, the composite tools, timeouts, the
   encoding), and over a socket off the cooperative pool.

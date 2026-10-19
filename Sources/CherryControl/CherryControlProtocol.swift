@@ -367,6 +367,9 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
     public let runID: String?
     /// The JSON Schema (`TaskResultSchema`'s subset) the result must match.
     public let resultSchema: JSONValue?
+    /// With `task`: the worker may use its own CLI's subagents in its tab
+    /// (it still cannot hand out Cherry tasks).
+    public let allowSubagents: Bool?
 
     public init(
         kind: String,
@@ -385,7 +388,8 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
         label: String? = nil,
         phase: String? = nil,
         runID: String? = nil,
-        resultSchema: JSONValue? = nil
+        resultSchema: JSONValue? = nil,
+        allowSubagents: Bool? = nil
     ) {
         self.kind = kind
         self.name = name
@@ -404,6 +408,7 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
         self.phase = phase
         self.runID = runID
         self.resultSchema = resultSchema
+        self.allowSubagents = allowSubagents
     }
 }
 

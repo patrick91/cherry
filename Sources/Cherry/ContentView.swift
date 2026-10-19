@@ -3341,6 +3341,13 @@ private struct SidebarAgentSessionSection: View {
                 chromeState: chromeState,
                 linkRoot: projectRoot
             )
+            let finished = workspace.finishedWorkers(of: session, summaries: AgentTaskBoard.shared.workerSummaries)
+            if !finished.isEmpty {
+                Divider()
+                Button("Close Finished Workers (\(finished.count))") {
+                    SessionCloseCoordinator.closeFinishedWorkers(of: session, in: workspace, chromeState: chromeState)
+                }
+            }
         }
     }
 }
@@ -5432,27 +5439,43 @@ private struct SidebarTabRow: View {
 
             Spacer(minLength: 8)
 
-            if rowState.agentActivityState == .permission {
+            // One mark: a Cherry task's worker shows its task's state
+            // (`SidebarRowMark`).
+            switch SidebarRowMark.resolve(
+                activity: rowState.agentActivityState,
+                hasUnseenResult: rowState.hasUnseenAgentResult,
+                isSelected: isSelected,
+                taskState: rowState.taskBadge?.state
+            ) {
+            case .none:
+                EmptyView()
+            case .permission:
                 SidebarAgentPermissionIndicator()
-            } else if rowState.agentActivityState == .needsInput {
+            case .question:
                 SidebarAgentQuestionIndicator()
-            } else if rowState.hasUnseenAgentResult, !isSelected {
-                SidebarAgentResultIndicator(failed: rowState.agentActivityState == .error)
-            } else if rowState.agentActivityState == .working {
+            case .result(let failed):
+                SidebarAgentResultIndicator(failed: failed)
+            case .working:
                 SidebarAgentWorkingIndicator(isSelected: isSelected, palette: palette)
+            case .task(let state, let emphasized):
+                SidebarTaskStateGlyph(state: state, emphasized: emphasized, isSelected: isSelected, palette: palette)
             }
 
-            // Cherry tasks (MCP spawn_agent with task): an orchestrator's
-            // open runs as settled/total, a worker's task state.
+            // Cherry tasks (spawn_agent with task): an orchestrator's open
+            // runs as settled/total; folded once they all settled, what
+            // its workers came to ("10 done").
             if let progress = rowState.runProgress {
                 Text(progress.text)
                     .font(.system(size: 10, weight: .semibold).monospacedDigit())
                     .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.6))
                     .accessibilityLabel("\(progress.settled) of \(progress.total) tasks settled")
-            }
-
-            if let badge = rowState.taskBadge {
-                SidebarTaskStateGlyph(state: badge.state, isSelected: isSelected, palette: palette)
+            } else if showsDisclosure, !isDisclosureExpanded,
+                      let summary = rowState.workerSummary, summary.allSettled {
+                Text(summary.text)
+                    .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                    .foregroundStyle((isSelected ? palette.selectedText : palette.rowText).opacity(0.6))
+                    .lineLimit(1)
+                    .accessibilityLabel("Workers: \(summary.text)")
             }
 
             if rowState.isShared {
@@ -5526,6 +5549,8 @@ private final class SidebarTabRowState: ObservableObject {
     @Published private(set) var taskBadge: AgentTaskBadge?
     /// Its open runs' progress, when it handed out tasks.
     @Published private(set) var runProgress: AgentRunProgress?
+    /// Its workers by their latest tasks, when it handed out tasks.
+    @Published private(set) var workerSummary: AgentWorkerSummary?
 
     private weak var session: TerminalSession?
     private var pathDisplayMode: SidebarTerminalPathDisplayMode
@@ -5570,6 +5595,8 @@ private final class SidebarTabRowState: ObservableObject {
         }
         if let runProgress {
             lines.append("Tasks: \(runProgress.settled) of \(runProgress.total) settled")
+        } else if let workerSummary, workerSummary.allSettled {
+            lines.append("Workers: \(workerSummary.text)")
         }
         return lines.joined(separator: "\n")
     }
@@ -5672,6 +5699,16 @@ private final class SidebarTabRowState: ObservableObject {
                 }
             }
             .store(in: &cancellables)
+
+        AgentTaskBoard.shared.$workerSummaries
+            .map { $0[sessionID] }
+            .removeDuplicates()
+            .sink { [weak self] summary in
+                Task { @MainActor [weak self] in
+                    self?.workerSummary = summary
+                }
+            }
+            .store(in: &cancellables)
     }
 
     private func refreshLabel() {
@@ -5691,14 +5728,21 @@ private final class SidebarTabRowState: ObservableObject {
 /// A Cherry task worker's state in its sidebar row (`AgentTaskState`).
 private struct SidebarTaskStateGlyph: View {
     let state: AgentTaskState
+    /// False dims it: a report the user has seen.
+    let emphasized: Bool
     let isSelected: Bool
     let palette: SidebarPalette
 
     var body: some View {
         Image(systemName: state.symbolName)
-            .font(.system(size: 10, weight: .semibold))
+            .font(.system(size: 12, weight: .semibold))
             .foregroundStyle(color)
-            .accessibilityLabel("Task: \(state.displayName)")
+            .opacity(emphasized ? 1 : 0.45)
+            .frame(width: 14, height: 18)
+            .help("Task: \(state.displayName)")
+            .accessibilityLabel(
+                SidebarRowMark.task(state, emphasized: emphasized).accessibilityLabel ?? "Task: \(state.displayName)"
+            )
     }
 
     private var color: Color {

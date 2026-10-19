@@ -795,8 +795,26 @@ final class AgentTaskRegistry {
             let current = progress[ownerID] ?? AgentRunProgress(settled: 0, total: 0)
             progress[ownerID] = AgentRunProgress(settled: current.settled + counts.settled, total: current.total + counts.total)
         }
-        board.update(badges: badges, runProgress: progress)
+        board.update(badges: badges, runProgress: progress, workerSummaries: workerSummaries())
         scheduleSave()
+    }
+
+    /// Each orchestrator's workers, by their latest task, over all its runs
+    /// still kept (a settled run is pruned after a while).
+    func workerSummaries() -> [UUID: AgentWorkerSummary] {
+        var latest: [UUID: AgentTask] = [:]
+        for id in taskOrder {
+            guard let task = tasks[id] else { continue }
+            latest[task.workerID] = task
+        }
+        var summaries: [UUID: AgentWorkerSummary] = [:]
+        for id in taskOrder {
+            guard let task = tasks[id], latest[task.workerID] === task,
+                  let ownerID = runs[task.runID]?.ownerID
+            else { continue }
+            summaries[ownerID, default: AgentWorkerSummary()].add(task.state, worker: task.workerID)
+        }
+        return summaries
     }
 }
 
@@ -817,6 +835,41 @@ struct AgentRunProgress: Equatable {
     var text: String { "\(settled)/\(total)" }
 }
 
+/// An orchestrator's workers, each by its latest task: what the sidebar
+/// shows on a collapsed orchestrator and what Close Finished Workers
+/// closes.
+struct AgentWorkerSummary: Equatable {
+    var reported = 0
+    /// Failed or settled without a report.
+    var failed = 0
+    var cancelled = 0
+    var open = 0
+    /// Workers whose latest task settled, in task order.
+    var finishedWorkerIDs: [UUID] = []
+
+    var total: Int { reported + failed + cancelled + open }
+    /// Every worker's task settled.
+    var allSettled: Bool { total > 0 && open == 0 }
+
+    mutating func add(_ state: AgentTaskState, worker: UUID) {
+        switch state {
+        case .reported: reported += 1
+        case .failed, .noReport: failed += 1
+        case .cancelled: cancelled += 1
+        case .queued, .working, .needsInput, .awaitingApproval: open += 1
+        }
+        if state.isSettled { finishedWorkerIDs.append(worker) }
+    }
+
+    /// "10 done", "8 done · 2 failed", "3 cancelled".
+    var text: String {
+        let parts = [(reported, "done"), (failed, "failed"), (cancelled, "cancelled")]
+            .filter { $0.0 > 0 }
+            .map { "\($0.0) \($0.1)" }
+        return parts.joined(separator: " · ")
+    }
+}
+
 /// What the sidebar shows of tasks: the app's control server writes it
 /// (tests give their servers their own).
 @MainActor
@@ -828,9 +881,17 @@ final class AgentTaskBoard: ObservableObject {
     /// By orchestrator tab, while one of its runs is open.
     @Published private(set) var runProgress: [UUID: AgentRunProgress] = [:]
 
-    func update(badges: [UUID: AgentTaskBadge], runProgress: [UUID: AgentRunProgress]) {
+    /// By orchestrator tab, for its workers' latest tasks, open or not.
+    @Published private(set) var workerSummaries: [UUID: AgentWorkerSummary] = [:]
+
+    func update(
+        badges: [UUID: AgentTaskBadge],
+        runProgress: [UUID: AgentRunProgress],
+        workerSummaries: [UUID: AgentWorkerSummary] = [:]
+    ) {
         if self.badges != badges { self.badges = badges }
         if self.runProgress != runProgress { self.runProgress = runProgress }
+        if self.workerSummaries != workerSummaries { self.workerSummaries = workerSummaries }
     }
 }
 

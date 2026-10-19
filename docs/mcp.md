@@ -1162,10 +1162,20 @@ also watches each open task's worker:
 
 A report after `no_report` or `failed` still replaces the result.
 
-**The sidebar.** A worker's row shows its label and a small glyph for its
-task's state (queued, working, needs you, awaits approval, reported, no
-report, failed, cancelled); hovering shows the result's summary. While one of its runs is
-open, the orchestrator's row shows how many of its tasks settled ("3/5").
+**The sidebar.** A worker's row shows its label and one mark: its
+task's state (queued, needs you, awaits approval, reported, no report,
+failed, cancelled; working is the spinner alone), unless its agent asks
+for permission or a question, which wins. A report is bright until its
+tab is seen, dim after; hovering shows the result's summary. While one of
+its runs is open, the orchestrator's row shows how many of its tasks
+settled ("3/5"). When the last of its workers' tasks settles, the sidebar
+folds the workers under it and the row reads what they came to ("10
+done", "8 done · 2 failed"); unfolded by hand, it stays so until a task
+settles again, and a group the sidebar folded unfolds when a new task
+opens. Close Finished Workers (the orchestrator's context menu, the Omni
+bar while it is the selected tab) closes the workers whose latest task
+settled, together, asking once only when one of them is working again or
+waiting for the user. Cherry never closes workers by itself.
 
 **Scope and lifetime.** Each task is tied to its worker's tab (by its id,
 or its persistent session). Tasks survive a relaunch of Cherry (quit,

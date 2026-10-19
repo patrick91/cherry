@@ -560,6 +560,56 @@ struct ControlAgentTaskTests {
         #expect(harness.server.tasks.board.runProgress[orchestrator.id] == nil, "a settled run shows no progress")
     }
 
+    // MARK: The sidebar
+
+    /// The board sums an orchestrator's workers by their latest tasks: its
+    /// collapsed row reads "1 done · 1 failed" once both settled, the
+    /// window folds the group on that settle, and Close Finished Workers
+    /// closes both workers together, the orchestrator staying.
+    @Test func settledWorkersAreSummedFoldedAndClosedTogether() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.start()
+        let orchestrator = try await harness.spawnAgent(named: "Lead")
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        let (workerA, _) = try await harness.spawnTask(agent: "Worker", task: "A", parentAgentID: orchestrator.id.uuidString)
+        let (workerB, _) = try await harness.spawnTask(agent: "Worker", task: "B", parentAgentID: orchestrator.id.uuidString)
+        let board = harness.server.tasks.board
+        let chromeState = ProjectWindowChromeState()
+        let sessionIDs = Set(harness.workspace.sessions.map(\.id))
+
+        let open = try #require(board.workerSummaries[orchestrator.id])
+        #expect(open.total == 2 && open.open == 2 && !open.allSettled)
+        #expect(harness.workspace.finishedWorkers(of: orchestrator, summaries: board.workerSummaries).isEmpty)
+        chromeState.applyWorkerSummaries(from: [:], to: board.workerSummaries, sessionIDs: sessionIDs)
+        #expect(chromeState.collapsedAgentGroupIDs.isEmpty)
+
+        let before = board.workerSummaries
+        harness.server.callerSessionResolverForTesting = { _ in workerA }
+        _ = try await harness.send(.reportResult(.init(value: .string("x"), summary: "A")))
+        harness.server.callerSessionResolverForTesting = { _ in workerB }
+        _ = try await harness.send(.reportResult(.init(value: .null, status: "failed", summary: "B")))
+        let settled = try #require(board.workerSummaries[orchestrator.id])
+        #expect(settled.allSettled && settled.text == "1 done · 1 failed")
+        #expect(Set(settled.finishedWorkerIDs) == [workerA.id, workerB.id])
+        chromeState.applyWorkerSummaries(from: before, to: board.workerSummaries, sessionIDs: sessionIDs)
+        #expect(chromeState.collapsedAgentGroupIDs == [orchestrator.id], "the settle folds the group")
+
+        var asked = false
+        let closed = SessionCloseCoordinator.closeFinishedWorkers(
+            of: orchestrator, in: harness.workspace, chromeState: chromeState,
+            summaries: board.workerSummaries, confirm: { _ in asked = true; return true }
+        )
+        #expect(closed == 2 && !asked, "idle workers close without asking")
+        #expect(harness.workspace.session(id: workerA.id.uuidString) == nil)
+        #expect(harness.workspace.session(id: workerB.id.uuidString) == nil)
+        #expect(harness.workspace.session(id: orchestrator.id.uuidString) != nil)
+        // (Native tabs never come back, so ⌘Z has nothing here; persistent
+        // workers go into one entry, as any closeTabs.)
+        #expect(chromeState.closedTabs.entries.count <= 1)
+        chromeState.closedTabs.endAll()
+    }
+
     // MARK: Approval
 
     /// A worker that asks its orchestrator for approval and ends its turn

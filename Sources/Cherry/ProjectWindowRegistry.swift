@@ -2023,7 +2023,27 @@ final class ProjectWindowChromeState: ObservableObject {
         focusedIdleCommandName = nil
     }
 
+    /// The worker groups the sidebar folded by itself (`AgentGroupAutoCollapse`).
+    private(set) var agentGroupAutoCollapse = AgentGroupAutoCollapse()
+
+    /// Folds the groups of `sessionIDs`' orchestrators whose tasks all
+    /// settled, and unfolds one it folded once a new task opens.
+    func applyWorkerSummaries(
+        from old: [UUID: AgentWorkerSummary],
+        to new: [UUID: AgentWorkerSummary],
+        sessionIDs: Set<UUID>
+    ) {
+        let change = agentGroupAutoCollapse.update(
+            from: old.filter { sessionIDs.contains($0.key) },
+            to: new.filter { sessionIDs.contains($0.key) },
+            collapsed: collapsedAgentGroupIDs
+        )
+        guard !change.collapse.isEmpty || !change.expand.isEmpty else { return }
+        collapsedAgentGroupIDs = collapsedAgentGroupIDs.union(change.collapse).subtracting(change.expand)
+    }
+
     func toggleAgentGroupCollapsed(_ id: UUID) {
+        agentGroupAutoCollapse.userToggled(id)
         if collapsedAgentGroupIDs.contains(id) {
             collapsedAgentGroupIDs.remove(id)
         } else {

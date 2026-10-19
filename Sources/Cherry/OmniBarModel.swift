@@ -99,6 +99,7 @@ enum OmniMenuCommand: String, CaseIterable {
     case toggleSidebar
     case connectAgents
     case connectThisAgent
+    case closeFinishedWorkers
     // Ids of the command palette's commands, kept so their usage carries
     // over (`OmniFrecencyStore`).
     case toggleAppearance
@@ -516,6 +517,9 @@ struct OmniWindowContext: Equatable {
     /// The selected tab is a Claude Code, Codex or Pi agent
     /// (`ConnectThisAgent.harness`).
     var selectedAgent: OmniSelectedAgent?
+    /// The selected tab's sub-agents whose task settled (Close Finished
+    /// Workers).
+    var finishedWorkerCount = 0
 }
 
 /// Everything the bar lists, gathered from cached state (never by
@@ -949,6 +953,14 @@ enum OmniProviders {
                 keywords: ["mcp", agent.harness.executableName, "register"]
             )
             item.detail = agent.productName
+            items.append(item)
+        }
+        if window.finishedWorkerCount > 0 {
+            var item = command(
+                .closeFinishedWorkers, title: "Close Finished Workers", symbol: "xmark.circle",
+                keywords: ["tasks", "workers", "agents", "done"]
+            )
+            item.detail = window.finishedWorkerCount == 1 ? "1 worker" : "\(window.finishedWorkerCount) workers"
             items.append(item)
         }
         items.append(command(

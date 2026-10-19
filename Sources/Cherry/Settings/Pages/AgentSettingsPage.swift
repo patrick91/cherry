@@ -74,6 +74,10 @@ struct AgentSettingsPage: View, SettingsPageContent {
 
             AgentCommandSection(agent: agent, settings: settings, drafts: $drafts, errors: $draftErrors)
 
+            if let skillAgent = CherrySkillConnection.agent(for: Self.brand(of: agent)) {
+                AgentSkillSection(agent: skillAgent, skills: registrations.skills)
+            }
+
             let connectsAtLaunch = AgentsSettingsPage.connectsAgentsAtLaunch(
                 defaults: defaults,
                 launchArguments: SettingSource.launchArguments(for: defaults)
@@ -85,6 +89,13 @@ struct AgentSettingsPage: View, SettingsPageContent {
                 registrations: registrations,
                 navigator: navigator
             )
+
+            if let cli = Self.launchCLI(of: agent) {
+                AgentLaunchSection(
+                    agentID: agent.id, commandLine: agent.commandLine, cli: cli,
+                    connectsAtLaunch: connectsAtLaunch, defaults: defaults
+                )
+            }
 
             SettingsSection("Status reporting", caption: Self.statusReportingCaption) {
                 SettingsItem(id: .agent(agent.id, Self.statusReportingRow), "Reports its state", help: reporting.help) {
@@ -199,6 +210,7 @@ struct AgentSettingsPage: View, SettingsPageContent {
                     help: connection.help,
                     keywords: connection.searchKeywords
                 ),
+            ] + launchSearchRows(for: agent, connectsAtLaunch: connectsAtLaunch, defaults: context.defaults) + [
                 SettingsSearchRow(
                     id: .agent(agent.id, statusReportingRow),
                     route: .agent(agent.id),
@@ -730,6 +742,30 @@ private struct AgentCommandSection: View {
     }
 }
 
+/// The `cherry` skill (and Codex's rules file) for this agent's CLI, read
+/// each time the page shows; Install and Update open the confirmation, and
+/// only its Install writes (`CherrySkillsModel`).
+private struct AgentSkillSection: View {
+    let agent: CherrySkillAgent
+    @ObservedObject var skills: CherrySkillsModel
+
+    var body: some View {
+        if !skills.items(for: agent).isEmpty {
+            SettingsSection("Cherry skill", caption: AgentSettingsPage.skillCaption) {
+                SettingsSubItem {
+                    CherrySkillRows(model: skills, agent: agent)
+                }
+            }
+        }
+        Color.clear.frame(height: 0)
+            .task { await skills.refresh() }
+    }
+}
+
+extension AgentSettingsPage {
+    static let skillCaption = "Teaches the agent the cherry command, for sessions you start yourself too."
+}
+
 /// Cherry MCP: the CLI's row (`AgentConnectionModel`: its state, read each
 /// time the page shows, and buttons that open the confirmation; only its
 /// Connect runs `mcp add`) and the command to run by hand (Pi's only on a
@@ -846,5 +882,179 @@ struct AgentRegistrationOutput: View {
             .textSelection(.enabled)
             .lineLimit(4)
             .padding(.top, 4)
+    }
+}
+
+// MARK: - Starting the agent
+
+extension AgentSettingsPage {
+    static let interfaceRow = "interface"
+    static let approvalsRow = "approvals"
+    static let approvalsHelp = "Auto review lets Claude Code's classifier, or Codex's automatic reviewer, decide "
+        + "what the agent may do instead of asking you. It covers everything the agent does in the tabs Cherry "
+        + "starts, not only cherry, and a command that sets its own mode keeps it."
+
+    /// The CLI Cherry starts with flags of its own (`AgentMCPLaunch.CLI`),
+    /// nil for any other agent.
+    static func launchCLI(of agent: AgentToolDefinition) -> AgentMCPLaunch.CLI? {
+        guard let brand = brand(of: agent) else { return nil }
+        return AgentMCPLaunch.CLI.allCases.first { $0.brand == brand }
+    }
+
+    /// The Interface line: how the agent Cherry starts reaches Cherry (the
+    /// `cherry` command or Cherry MCP) and why, as a launch decides it
+    /// (`AgentMCPLaunchContext.cliUnavailableReason`), from cached state
+    /// only (`AgentSkillDirectory.current`, `CodexLaunchFactsCache`'s last
+    /// reading).
+    struct Interface: Equatable {
+        var status: String
+        var help: String
+        var usesCLI: Bool
+    }
+
+    static func interface(
+        cli: AgentMCPLaunch.CLI,
+        commandLine: String,
+        connectsAtLaunch: Bool,
+        skillReady: Bool,
+        approvals: AgentApprovals,
+        codexFacts: CodexLaunchFacts?
+    ) -> Interface {
+        guard connectsAtLaunch else {
+            return Interface(
+                status: "Not connected at launch",
+                help: "Connect agents Cherry starts is off in Agents & MCP: it uses what its CLI has registered.",
+                usesCLI: false
+            )
+        }
+        let cliHelp = cli == .codex
+            ? "Cherry tells it, in each tab it starts, that the cherry command reaches Cherry; it needs no Cherry MCP."
+            : "Cherry gives it the cherry skill and a line about its tab, in each tab it starts; it needs no Cherry MCP."
+        func viaCLI(_ why: String = "") -> Interface {
+            Interface(status: "The cherry command", help: cliHelp + why, usesCLI: true)
+        }
+        func viaMCP(_ why: String) -> Interface {
+            Interface(status: "Cherry MCP", help: why + " So Cherry starts it with Cherry MCP.", usesCLI: false)
+        }
+        switch cli {
+        case .claudeCode, .pi:
+            return skillReady ? viaCLI() : viaMCP("The cherry skill's files aren't ready.")
+        case .codex:
+            if approvals == .autoReview {
+                return viaCLI(" Its sandbox blocks Cherry's socket, so a cherry command runs once Codex's reviewer lets it outside.")
+            }
+            let words = Array((AgentMCPLaunch.plainWords(commandLine) ?? []).dropFirst())
+            let facts = codexFacts ?? CodexLaunchFacts(rulesInstalled: false, setsDeveloperInstructions: true)
+            if facts.rulesInstalled { return viaCLI(" Cherry's rules for Codex run cherry outside its sandbox.") }
+            if facts.launchReachesSockets(words: words) { return viaCLI(" Its sandbox lets it reach Cherry's socket.") }
+            guard codexFacts != nil else { return viaMCP("Codex's settings aren't read yet.") }
+            return viaMCP("Codex's sandbox can't reach Cherry's socket, Cherry's rules for Codex aren't installed, and Approvals isn't Auto review.")
+        }
+    }
+
+    static func launchSearchRows(
+        for agent: AgentToolDefinition, connectsAtLaunch: Bool, defaults: UserDefaults
+    ) -> [SettingsSearchRow] {
+        guard let cli = launchCLI(of: agent) else { return [] }
+        let approvals = AgentApprovals.current(for: cli, defaults: defaults)
+        let interface = interface(
+            cli: cli,
+            commandLine: agent.commandLine,
+            connectsAtLaunch: connectsAtLaunch,
+            skillReady: AgentSkillDirectory.current != nil,
+            approvals: approvals,
+            codexFacts: CodexLaunchFactsCache.shared.facts
+        )
+        var rows = [
+            SettingsSearchRow(
+                id: .agent(agent.id, interfaceRow),
+                route: .agent(agent.id),
+                section: "Starting \(cli.brand.productName)",
+                title: "Interface",
+                help: interface.help,
+                keywords: ["cherry command", "cli", "skill", "mcp", "sandbox"],
+                value: interface.status
+            ),
+        ]
+        if AgentApprovals.isOffered(for: cli) {
+            rows.append(SettingsSearchRow(
+                id: .agent(agent.id, approvalsRow),
+                route: .agent(agent.id),
+                section: "Starting \(cli.brand.productName)",
+                title: "Approvals",
+                help: approvalsHelp,
+                keywords: ["auto review", "auto mode", "permission mode", "approve for me", "permissions"],
+                value: approvals.title
+            ))
+        }
+        return rows
+    }
+
+    /// Stores Approvals for `cli` (As configured removes the value).
+    static func setApprovals(_ value: AgentApprovals, for cli: AgentMCPLaunch.CLI, defaults: UserDefaults) {
+        if value == .configured {
+            defaults.removeObject(forKey: AgentApprovals.defaultsKey(for: cli))
+        } else {
+            defaults.set(value.rawValue, forKey: AgentApprovals.defaultsKey(for: cli))
+        }
+    }
+}
+
+/// How the agents Cherry starts of `cli` reach Cherry (Interface), and
+/// their Approvals (`AgentApprovals`, stored per CLI in `defaults`).
+private struct AgentLaunchSection: View {
+    let agentID: String
+    let commandLine: String
+    let cli: AgentMCPLaunch.CLI
+    let connectsAtLaunch: Bool
+    let defaults: UserDefaults
+
+    @State private var approvals: AgentApprovals?
+    @State private var codexFacts: CodexLaunchFacts?
+
+    var body: some View {
+        let approvals = approvals ?? AgentApprovals.current(for: cli, defaults: defaults)
+        let interface = AgentSettingsPage.interface(
+            cli: cli,
+            commandLine: commandLine,
+            connectsAtLaunch: connectsAtLaunch,
+            skillReady: AgentSkillDirectory.current != nil,
+            approvals: approvals,
+            codexFacts: codexFacts ?? CodexLaunchFactsCache.shared.facts
+        )
+        SettingsSection("Starting \(cli.brand.productName)") {
+            SettingsItem(id: .agent(agentID, AgentSettingsPage.interfaceRow), "Interface", help: interface.help) {
+                SettingsStatusText(interface.status, style: interface.usesCLI ? .ok : .neutral, dot: interface.usesCLI ? .green : .gray)
+            }
+            if AgentApprovals.isOffered(for: cli) {
+                SettingsItem(id: .agent(agentID, AgentSettingsPage.approvalsRow), "Approvals", help: AgentSettingsPage.approvalsHelp) {
+                    Picker("Approvals", selection: Binding(
+                        get: { approvals },
+                        set: { value in
+                            self.approvals = value
+                            AgentSettingsPage.setApprovals(value, for: cli, defaults: defaults)
+                        }
+                    )) {
+                        ForEach(AgentApprovals.allCases, id: \.self) { value in
+                            Text(value.title).tag(value)
+                        }
+                    }
+                    .settingsMenuPicker()
+                }
+            }
+        }
+        .task {
+            guard cli == .codex else { return }
+            // Codex's files are read off the main thread: show the reading
+            // once it is in.
+            CodexLaunchFactsCache.shared.refresh()
+            for _ in 0..<20 {
+                try? await Task.sleep(for: .milliseconds(100))
+                if let facts = CodexLaunchFactsCache.shared.facts {
+                    codexFacts = facts
+                    break
+                }
+            }
+        }
     }
 }

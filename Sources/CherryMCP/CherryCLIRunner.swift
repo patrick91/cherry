@@ -15,9 +15,12 @@ public enum CherryCLIRunner {
     public static func run(
         _ invocation: CherryCLIInvocation,
         isTerminal: Bool,
+        skillInstaller: (CherrySkillRequest) -> CherrySkillInstaller = installer(for:),
         call: (String, [String: JSONValue]) async -> CallToolResult
     ) async -> Outcome {
         switch invocation.action {
+        case .skill(let request):
+            return runSkill(request, installer: skillInstaller(request), json: invocation.json || !isTerminal)
         case .print(let text):
             return Outcome(standardOutput: text.hasSuffix("\n") ? text : text + "\n", standardError: "", exitCode: 0)
         case .usage(let message):

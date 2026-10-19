@@ -210,7 +210,10 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
     #expect(cliUsage(["read", "--lines", "many"])?.contains("whole number") == true)
     #expect(cliUsage(["ls", "extra"])?.contains("Unexpected argument") == true)
     #expect(cliUsage(["tool", "list_processes", "[1]"])?.contains("not a JSON object") == true)
-    #expect(cliUsage(["skill", "setup"])?.contains("not available yet") == true)
+    #expect(cliUsage(["skill", "setup", "--agent", "gemini"])?.contains("unknown agent") == true)
+    #expect(cliUsage(["skill", "remove", "--force"])?.contains("--force is for cherry skill setup") == true)
+    #expect(cliUsage(["skill", "status", "--everything"])?.contains("unknown option") == true)
+    #expect(cliUsage(["skill", "setup", "--agent"])?.contains("--agent needs a name") == true)
     guard case .print(let help) = CherryCLI.parse(["help"]).action else {
         Issue.record("help prints")
         return

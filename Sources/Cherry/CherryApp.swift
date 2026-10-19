@@ -59,6 +59,12 @@ final class CherryAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificati
                     directory: TabCLIDirectory.directory(),
                     canWrite: AppInstanceLock.shared.isHeld
                 )
+                // The `cherry` skill the agents Cherry starts get for their
+                // launch (`AgentSkillDirectory`), written by the lock holder.
+                AgentSkillDirectory.current = AgentSkillDirectory.prepare(
+                    plugin: AgentSkillDirectory.pluginDirectory(),
+                    canWrite: AppInstanceLock.shared.isHeld
+                )
                 // The windows to reopen, read before any window registers.
                 ProjectWindowRegistry.shared.configureWorkspacePersistence(store: .shared)
                 // Reach the local session host now, in the background, so

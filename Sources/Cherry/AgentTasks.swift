@@ -222,7 +222,16 @@ final class AgentTask {
         self.createdAt = createdAt
     }
 
-    var kickoffLine: String { AgentTaskRegistry.kickoffLine(taskID: id) }
+    /// Whether the kickoff names the `cherry` commands: decided at its
+    /// first use, from its worker's launch (`launchUsesCherryCLI`), and kept,
+    /// so the kickoff Cherry looks for on the screen is the one it typed.
+    var kickoffUsesCLI: Bool?
+
+    var kickoffLine: String {
+        let usesCLI = kickoffUsesCLI ?? (worker?.launchUsesCherryCLI ?? false)
+        kickoffUsesCLI = usesCLI
+        return AgentTaskRegistry.kickoffLine(taskID: id, usesCLI: usesCLI)
+    }
 }
 
 /// The tasks one orchestrator handed out together (main actor only).
@@ -353,6 +362,13 @@ final class AgentTaskRegistry {
     static let screenTailCharacters = 4_000
     /// Typed once into a worker that went idle without reporting.
     static let nudgeLine = "Please call report_result with your result."
+    /// The nudge for a worker started to use the `cherry` CLI
+    /// (`TerminalSession.launchUsesCherryCLI`).
+    static let cliNudgeLine = "Please run cherry task report with your result."
+
+    static func nudgeLine(usesCLI: Bool) -> String {
+        usesCLI ? cliNudgeLine : nudgeLine
+    }
 
     let board: AgentTaskBoard
     let typingLocks = TabTypingLocks()
@@ -461,45 +477,71 @@ final class AgentTaskRegistry {
         return (kept + ellipsis, true)
     }
 
-    /// One line, typed into the worker as its first message.
-    nonisolated static func kickoffLine(taskID: String) -> String {
-        "You are Cherry task \(taskID): call get_my_task (Cherry MCP) for your brief, do it, then call report_result. "
+    /// One line, typed into the worker as its first message. A worker
+    /// started to use the `cherry` CLI (`usesCLI`) is told its commands;
+    /// one with Cherry MCP its tools, and CherryMCP's `--call` without them.
+    nonisolated static func kickoffLine(taskID: String, usesCLI: Bool = false) -> String {
+        if usesCLI {
+            return "You are Cherry task \(taskID): run cherry task mine for your brief, do it, then report with cherry task report "
+                + "(a JSON object {\"value\":…,\"status\":\"ok\",\"summary\":\"…\"} on standard input, in a heredoc)."
+        }
+        return "You are Cherry task \(taskID): call get_my_task (Cherry MCP) for your brief, do it, then call report_result. "
             + "Without Cherry MCP tools, run \"$CHERRY_MCP_HELPER\" --call get_my_task, then "
             + "\"$CHERRY_MCP_HELPER\" --call report_result '{\"value\":{},\"status\":\"ok\",\"summary\":\"done\"}' "
             + "(one JSON object, your result as value)."
     }
 
     /// What `get_my_task` tells a worker: with `allowSubagents`, that it may
-    /// use its own CLI's subagents (never Cherry tasks of its own).
-    static func workerRules(allowSubagents: Bool) -> [String] {
-        [
+    /// use its own CLI's subagents (never Cherry tasks of its own); with
+    /// `usesCLI`, the `cherry` commands instead of the MCP tools.
+    static func workerRules(allowSubagents: Bool, usesCLI: Bool = false) -> [String] {
+        let spawn = usesCLI ? "cherry spawn agent with --task" : "spawn_agent with task"
+        let report = usesCLI ? "cherry task report" : "report_result"
+        let progress = usesCLI ? "cherry task progress" : "report_progress"
+        var rules = [
             allowSubagents
-                ? "Do the brief in this tab. You may use your own CLI's subagents for parts of it, but not spawn_agent with task: Cherry tasks are one level deep."
+                ? "Do the brief in this tab. You may use your own CLI's subagents for parts of it, but not \(spawn): Cherry tasks are one level deep."
                 : "Do the brief in this tab. Don't hand parts of it to other agents: Cherry tasks are one level deep.",
-            "Finish with report_result: value (matching result_schema when there is one), status ok or failed, and a summary of at most \(CherryControl.maximumTaskSummaryCharacters) characters.",
-            "If you need your orchestrator's approval or an answer before you go on (a plan to approve, a question), call report_progress with awaiting_approval true and your question as message, then end your turn: the task waits, and the answer comes as a message in this tab.",
+            "Finish with \(report): value (matching result_schema when there is one), status ok or failed, and a summary of at most \(CherryControl.maximumTaskSummaryCharacters) characters.",
+            usesCLI
+                ? "If you need your orchestrator's approval or an answer before you go on (a plan to approve, a question), run cherry task progress --awaiting-approval with your question, then end your turn: the task waits, and the answer comes as a message in this tab."
+                : "If you need your orchestrator's approval or an answer before you go on (a plan to approve, a question), call report_progress with awaiting_approval true and your question as message, then end your turn: the task waits, and the answer comes as a message in this tab.",
             "If you cannot finish otherwise, report status failed with the reason in summary.",
-            "For long work you may call report_progress with a short message (at most one every few seconds is kept).",
+            "For long work you may call \(progress) with a short message (at most one every few seconds is kept).",
             "If you get more instructions in this tab later, report again: the newest report replaces the earlier one.",
-            "Without Cherry MCP tools, run \"$CHERRY_MCP_HELPER\" --call get_my_task and \"$CHERRY_MCP_HELPER\" --call report_result '{\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}' in a shell: the second argument is one valid JSON object in single quotes (no placeholders such as …).",
         ]
+        rules.append(
+            usesCLI
+                ? "Report with a heredoc, so the JSON needs no shell quoting: cherry task report <<'EOF', then {\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}, then EOF (one valid JSON object, no placeholders such as …)."
+                : "Without Cherry MCP tools, run \"$CHERRY_MCP_HELPER\" --call get_my_task and \"$CHERRY_MCP_HELPER\" --call report_result '{\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}' in a shell: the second argument is one valid JSON object in single quotes (no placeholders such as …)."
+        )
+        return rules
     }
 
     /// The approval wake line: the run's id and how many of its tasks
-    /// await approval, never a worker's text.
-    static func approvalWakeLine(runID: String, counts: AgentRunCounts) -> String {
+    /// await approval, never a worker's text; the `cherry` commands for an
+    /// owner started to use them (`usesCLI`).
+    static func approvalWakeLine(runID: String, counts: AgentRunCounts, usesCLI: Bool = false) -> String {
         let noun = counts.awaitingApproval == 1 ? "task awaits" : "tasks await"
+        if usesCLI {
+            return "[cherry] Run \(runID): \(counts.awaitingApproval) \(noun) your approval. Run cherry task wait \(runID) to read the questions, and answer each worker with cherry send."
+        }
         return "[cherry] Run \(runID): \(counts.awaitingApproval) \(noun) your approval. Call the cherry wait_for_tasks tool with run_id \"\(runID)\" to read the questions, and answer each worker with send_agent_message."
     }
 
-    /// The run's wake line: its id and counts, never a worker's text.
-    static func wakeLine(runID: String, counts: AgentRunCounts) -> String {
+    /// The run's wake line: its id and counts, never a worker's text; the
+    /// `cherry` commands for an owner started to use them (`usesCLI`).
+    static func wakeLine(runID: String, counts: AgentRunCounts, usesCLI: Bool = false) -> String {
         let parts = [
             (counts.reported, "reported"), (counts.failed, "failed"),
             (counts.noReport, "no report"), (counts.cancelled, "cancelled"),
         ].filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
         let noun = counts.total == 1 ? "task" : "tasks"
-        return "[cherry] Run \(runID): \(counts.total) \(noun) settled (\(parts.joined(separator: ", "))). Call the cherry wait_for_tasks tool with run_id \"\(runID)\" to read them, and get_task for each result."
+        let settled = "[cherry] Run \(runID): \(counts.total) \(noun) settled (\(parts.joined(separator: ", ")))."
+        if usesCLI {
+            return settled + " Run cherry task wait \(runID) to read them, and cherry task get for each result."
+        }
+        return settled + " Call the cherry wait_for_tasks tool with run_id \"\(runID)\" to read them, and get_task for each result."
     }
 
     // MARK: Lookup
@@ -1210,7 +1252,9 @@ extension CherryControlServer {
             phase: task.phase,
             brief: task.brief,
             resultSchema: task.resultSchema,
-            rules: AgentTaskRegistry.workerRules(allowSubagents: task.allowSubagents),
+            rules: AgentTaskRegistry.workerRules(
+                allowSubagents: task.allowSubagents, usesCLI: task.worker?.launchUsesCherryCLI ?? false
+            ),
             state: task.state,
             resultVersion: task.result?.version ?? 0
         )
@@ -2163,7 +2207,7 @@ extension CherryControlServer {
             defer { task.typing = nil }
             guard let self else { return }
             do {
-                _ = try await self.typeCherryLine(AgentTaskRegistry.nudgeLine, into: worker)
+                _ = try await self.typeCherryLine(AgentTaskRegistry.nudgeLine(usesCLI: worker.launchUsesCherryCLI), into: worker)
             } catch {
                 guard Self.inputMayHaveBeenTyped(error) else {
                     SessionLog.debug("[task] nudge for \(task.id) not sent: \(error)")
@@ -2216,7 +2260,7 @@ extension CherryControlServer {
         if let last = run.lastWakeAt, now.timeIntervalSince(last) < monitors.wakeMinimumInterval { return }
         // One line at a time into a tab.
         guard !isTypingWakeLine(into: owner), subscriberTakesWakeLine(owner, now: now) else { return }
-        let line = AgentTaskRegistry.wakeLine(runID: run.id, counts: tasks.counts(of: run))
+        let line = AgentTaskRegistry.wakeLine(runID: run.id, counts: tasks.counts(of: run), usesCLI: owner.launchUsesCherryCLI)
         run.isWaking = true
         Task { @MainActor [weak self] in
             defer { run.isWaking = false }
@@ -2252,7 +2296,7 @@ extension CherryControlServer {
         if inRestoredGrace(run.relinkedAt, now: now) { return }
         if let last = run.lastWakeAt, now.timeIntervalSince(last) < monitors.wakeMinimumInterval { return }
         guard !isTypingWakeLine(into: owner), subscriberTakesWakeLine(owner, now: now) else { return }
-        let line = AgentTaskRegistry.approvalWakeLine(runID: run.id, counts: tasks.counts(of: run))
+        let line = AgentTaskRegistry.approvalWakeLine(runID: run.id, counts: tasks.counts(of: run), usesCLI: owner.launchUsesCherryCLI)
         run.isWaking = true
         Task { @MainActor [weak self] in
             defer { run.isWaking = false }

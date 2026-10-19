@@ -285,12 +285,68 @@ scoped and refused exactly as over MCP.
   standard error; a usage error exits 2.
 - `cherry skill show` prints the guide (`CherryCLIGuide.guide`, from the
   commands' table), `--skill-md` the `cherry` skill's SKILL.md.
+- `cherry skill setup|status|remove [--agent A]… [--dry-run] [--project]
+  [--force] [--json]` (`CherrySkillInstaller`, Sources/CherryControl) writes,
+  reports and removes the skill: `$CLAUDE_CONFIG_DIR` (else `~/.claude`)
+  `/skills/cherry` for Claude Code, `~/.agents/skills/cherry` for Codex, Pi,
+  OpenCode and Amp, and Codex's `${CODEX_HOME:-~/.codex}/rules/cherry.rules`;
+  with `--project` the repository's `.claude`, `.agents` and `.codex`.
+  A skill is Cherry's when a `.cherry-skill` file beside its SKILL.md
+  (`{"by":"Cherry","sha256":…}`) has its SKILL.md's hash, the rules file
+  when its first line is `CherrySkill.rulesFirstLine`. Status per item:
+  `current`, `outdated` (another build's), `missing`, `foreign` (not
+  Cherry's, or edited since; setup leaves it without `--force`, remove
+  always), `unreadable` (a link, a file where a folder goes, a relative
+  override; never written through) or `unsupported` (none of its agents
+  found: their settings folder or the program on PATH; `--agent` names one
+  anyway). Remove keeps `~/.agents/skills/cherry` while an agent found that
+  `--agent` did not name reads it, and a skill folder that holds other
+  files.
+- The rules file allows `cherry` with every agent command's first word but
+  `start`/`restart` (the host's without an ID) and `skill` (its setup writes
+  agent settings), so those run outside Codex's sandbox and reach the
+  socket, and forbids `cherry host` and the host commands' old names.
+- Connect Agents to Cherry… lists the skill's items first ("Cherry skill",
+  with Install or Update) and each agent's page its own
+  (`CherrySkillsModel`, `MCPRegistrations.skills`, read when they show,
+  never at launch); Install opens `CherrySkillConfirmation` with every
+  file's path and contents, and only its Install writes. `MCPRegistrations`
+  other than `shared` get a model that reads nothing.
 - Every This Mac tab has `cherry` first on its PATH: `CHERRY_BIN_DIR`, a
   directory holding only a link to the app's `cherry` (`TabCLIDirectory`,
   `<Application Support>/bin`, made by the instance-lock holder), which
   Cherry's zsh bootstrap puts first again after the user's `.zshrc`. A
   device's commands and agents get their install's directory first on the
   login PATH their line sets; its interactive terminals keep `CHERRY_CLI`.
+
+### Agents Cherry starts with the command
+
+On This Mac an agent Cherry starts gets the `cherry` CLI instead of Cherry
+MCP's flags when it can use it (`AgentCLILaunch`,
+`AgentMCPLaunchContext.outcome` → `.cli`; docs/specs/agent-cli.md, Teaching
+agents and Sandboxes):
+
+- Claude Code 2.1.0 or later: `--plugin-dir <agent-skill>/cherry-plugin`
+  (the `cherry` skill, written by the app from `CherryAgentSkill`,
+  `AgentSkillDirectory`), `--append-system-prompt` with one line naming its
+  tab, and `--settings` letting its sandbox, when on, reach the control
+  socket.
+- Pi 0.99.2 or later: `--skill <agent-skill>/cherry-plugin/skills/cherry` and
+  the same line; no extension.
+- Codex 0.162.0 or later, only when it can run `cherry`: its sandbox (the
+  command's, else its `config.toml`'s) reaches sockets, Cherry's rules file
+  is installed, or Approvals is Auto review. Then `-c
+  developer_instructions=…` (unless its config sets instructions). Otherwise
+  Cherry MCP as above, and the reason is logged
+  (`TerminalSession.lastAgentLaunchNotCLIReason`).
+- Approvals (an agent's page › Starting …; `AgentApprovals`): As configured,
+  or Auto review (`--permission-mode auto`, `--approve-for-me`), never over
+  a mode the command sets, with the CLI or Cherry MCP.
+- The kickoff, the rules `get_my_task` returns, the nudge and the wake lines
+  of a tab started with the CLI name `cherry` commands
+  (`TerminalSession.launchUsesCherryCLI`).
+
+Devices keep Cherry MCP at launch.
 
 ## Versions
 
@@ -1487,6 +1543,9 @@ own in `Scripts/test-session-suites unit` (and CI), **ControlTool**
   stand-in CLIs, the switch, launches native, persistent and restored, and
   Pi's: its extension, its version gate, and the log of a Pi registration
   Pi prefers).
+- `ControlToolLaunchCLITests`: the `cherry` CLI at launch (each CLI's words,
+  Codex's sandbox and rules, Approvals, the skill's files, the worker texts,
+  a tab's outcome, the agent page's Interface line).
 - `ControlToolPiExtensionTests`: Cherry's Pi extension, the bundle's own
   copy run in JavaScriptCore against a stand-in for Pi's extension API: the
   server it registers, and nothing (and no exception) without Pi's MCP, a

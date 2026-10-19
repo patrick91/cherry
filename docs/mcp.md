@@ -285,6 +285,33 @@ scoped and refused exactly as over MCP.
   standard error; a usage error exits 2.
 - `cherry skill show` prints the guide (`CherryCLIGuide.guide`, from the
   commands' table), `--skill-md` the `cherry` skill's SKILL.md.
+- `cherry skill setup|status|remove [--agent A]… [--dry-run] [--project]
+  [--force] [--json]` (`CherrySkillInstaller`, Sources/CherryControl) writes,
+  reports and removes the skill: `$CLAUDE_CONFIG_DIR` (else `~/.claude`)
+  `/skills/cherry` for Claude Code, `~/.agents/skills/cherry` for Codex, Pi,
+  OpenCode and Amp, and Codex's `${CODEX_HOME:-~/.codex}/rules/cherry.rules`;
+  with `--project` the repository's `.claude`, `.agents` and `.codex`.
+  A skill is Cherry's when a `.cherry-skill` file beside its SKILL.md
+  (`{"by":"Cherry","sha256":…}`) has its SKILL.md's hash, the rules file
+  when its first line is `CherrySkill.rulesFirstLine`. Status per item:
+  `current`, `outdated` (another build's), `missing`, `foreign` (not
+  Cherry's, or edited since; setup leaves it without `--force`, remove
+  always), `unreadable` (a link, a file where a folder goes, a relative
+  override; never written through) or `unsupported` (none of its agents
+  found: their settings folder or the program on PATH; `--agent` names one
+  anyway). Remove keeps `~/.agents/skills/cherry` while an agent found that
+  `--agent` did not name reads it, and a skill folder that holds other
+  files.
+- The rules file allows `cherry` with every agent command's first word but
+  `start`/`restart` (the host's without an ID) and `skill` (its setup writes
+  agent settings), so those run outside Codex's sandbox and reach the
+  socket, and forbids `cherry host` and the host commands' old names.
+- Connect Agents to Cherry… lists the skill's items first ("Cherry skill",
+  with Install or Update) and each agent's page its own
+  (`CherrySkillsModel`, `MCPRegistrations.skills`, read when they show,
+  never at launch); Install opens `CherrySkillConfirmation` with every
+  file's path and contents, and only its Install writes. `MCPRegistrations`
+  other than `shared` get a model that reads nothing.
 - Every This Mac tab has `cherry` first on its PATH: `CHERRY_BIN_DIR`, a
   directory holding only a link to the app's `cherry` (`TabCLIDirectory`,
   `<Application Support>/bin`, made by the instance-lock holder), which

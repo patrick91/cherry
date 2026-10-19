@@ -74,6 +74,10 @@ struct AgentSettingsPage: View, SettingsPageContent {
 
             AgentCommandSection(agent: agent, settings: settings, drafts: $drafts, errors: $draftErrors)
 
+            if let skillAgent = CherrySkillConnection.agent(for: Self.brand(of: agent)) {
+                AgentSkillSection(agent: skillAgent, skills: registrations.skills)
+            }
+
             let connectsAtLaunch = AgentsSettingsPage.connectsAgentsAtLaunch(
                 defaults: defaults,
                 launchArguments: SettingSource.launchArguments(for: defaults)
@@ -728,6 +732,30 @@ private struct AgentCommandSection: View {
             }
         }
     }
+}
+
+/// The `cherry` skill (and Codex's rules file) for this agent's CLI, read
+/// each time the page shows; Install and Update open the confirmation, and
+/// only its Install writes (`CherrySkillsModel`).
+private struct AgentSkillSection: View {
+    let agent: CherrySkillAgent
+    @ObservedObject var skills: CherrySkillsModel
+
+    var body: some View {
+        if !skills.items(for: agent).isEmpty {
+            SettingsSection("Cherry skill", caption: AgentSettingsPage.skillCaption) {
+                SettingsSubItem {
+                    CherrySkillRows(model: skills, agent: agent)
+                }
+            }
+        }
+        Color.clear.frame(height: 0)
+            .task { await skills.refresh() }
+    }
+}
+
+extension AgentSettingsPage {
+    static let skillCaption = "Teaches the agent the cherry command, for sessions you start yourself too."
 }
 
 /// Cherry MCP: the CLI's row (`AgentConnectionModel`: its state, read each

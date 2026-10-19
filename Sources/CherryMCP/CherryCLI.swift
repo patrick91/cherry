@@ -26,6 +26,25 @@ public enum CherryCLIAction: Equatable, Sendable {
     case print(String)
     /// Print `message` and a usage line on standard error, exit 2.
     case usage(String)
+    /// `cherry skill setup|status|remove`: the skill's files on this Mac.
+    case skill(CherrySkillRequest)
+}
+
+/// `cherry skill setup|status|remove [--agent A]… [--dry-run] [--project]
+/// [--force]`.
+public struct CherrySkillRequest: Equatable, Sendable {
+    public enum Operation: String, Sendable {
+        case setup
+        case status
+        case remove
+    }
+
+    public var operation: Operation
+    /// nil: every agent (setup: those found).
+    public var agents: [CherrySkillAgent]?
+    public var dryRun = false
+    public var project = false
+    public var force = false
 }
 
 public struct CherryCLIFallback: Equatable, Sendable {
@@ -556,14 +575,44 @@ public enum CherryCLI {
 
     // MARK: Skill and help
 
+    static let skillUsage = """
+    usage: cherry skill show [--skill-md]
+           cherry skill setup|status|remove [--agent claude|codex|pi|opencode|amp]… [--dry-run] [--project] [--force] [--json]
+    """
+
     static func skillAction(_ words: [String]) -> CherryCLIAction {
         switch words.first {
         case "show", nil:
             return .print(words.contains("--skill-md") ? CherryCLIGuide.skillMarkdown : CherryCLIGuide.guide)
         case "setup", "status", "remove":
-            return .usage("cherry skill \(words[0]) is not available yet. Run cherry skill show for the guide.")
+            let operation = CherrySkillRequest.Operation(rawValue: words[0])!
+            var request = CherrySkillRequest(operation: operation)
+            var rest = Array(words.dropFirst())
+            while !rest.isEmpty {
+                let word = rest.removeFirst()
+                switch word {
+                case "--dry-run": request.dryRun = true
+                case "--project": request.project = true
+                case "--force": request.force = true
+                case "--help", "-h": return .print(skillUsage)
+                case "--agent":
+                    guard let name = rest.first else { return .usage("--agent needs a name.\n" + skillUsage) }
+                    rest.removeFirst()
+                    guard let agent = CherrySkillAgent(rawValue: name) else {
+                        return .usage("cherry: unknown agent \(name.debugDescription): "
+                            + CherrySkillAgent.allCases.map(\.rawValue).joined(separator: ", ") + ".\n" + skillUsage)
+                    }
+                    request.agents = (request.agents ?? []) + [agent]
+                default:
+                    return .usage("cherry: unknown option \(word.debugDescription).\n" + skillUsage)
+                }
+            }
+            if request.force, operation != .setup {
+                return .usage("--force is for cherry skill setup.\n" + skillUsage)
+            }
+            return .skill(request)
         default:
-            return .usage("usage: cherry skill show [--skill-md]")
+            return .usage(skillUsage)
         }
     }
 

@@ -852,20 +852,25 @@ final class MCPCLIRegistrationModel: ObservableObject, AgentConnectionModel {
 /// it. Tests make their own, never `shared`.
 @MainActor
 final class MCPRegistrations {
-    static let shared = MCPRegistrations()
+    static let shared = MCPRegistrations(skills: .live())
 
     let claude: MCPCLIRegistrationModel
     let codex: MCPCLIRegistrationModel
     let pi: PiMCPRegistrationModel
+    /// The `cherry` skill and Codex's rules file (`CherrySkillsModel`):
+    /// the account's for `shared`, none (it reads nothing) otherwise.
+    let skills: CherrySkillsModel
 
     init(
         claude: MCPCLIRegistrationModel = MCPCLIRegistrationModel(harness: .claude),
         codex: MCPCLIRegistrationModel = MCPCLIRegistrationModel(harness: .codex),
-        pi: PiMCPRegistrationModel = PiMCPRegistrationModel()
+        pi: PiMCPRegistrationModel = PiMCPRegistrationModel(),
+        skills: CherrySkillsModel = CherrySkillsModel()
     ) {
         self.claude = claude
         self.codex = codex
         self.pi = pi
+        self.skills = skills
     }
 
     /// Claude Code's or Codex's; nil for Pi, whose model is `pi`.

@@ -125,7 +125,11 @@ selection, a name wins; workers and tasks in five lines) that ends with "run
   `missing`, `foreign`, `unreadable`, `unsupported`) and removes only
   Cherry's own files, honours `CLAUDE_CONFIG_DIR`/`CODEX_HOME`, `--dry-run`,
   `--project`, `--json`. A `cherry` skill Cherry did not write is `foreign`
-  and left alone without `--force`.
+  and left alone without `--force`. Done (phase 2): Cherry's skill has a
+  `.cherry-skill` marker with its SKILL.md's hash (an edit by hand makes it
+  `foreign`); the rules file starts with `CherrySkill.rulesFirstLine`, and
+  allows every agent command's first word but `start`, `restart` and
+  `skill` (docs/mcp.md › The `cherry` Command).
 - In the app, Connect Agents to Cherry… shows these rows and installs only
   after its confirmation, as today (Cherry writes no agent configuration
   otherwise).

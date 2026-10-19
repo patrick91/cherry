@@ -219,6 +219,7 @@ final class ConnectAgentsModel: ObservableObject {
         self.connectsAtLaunch = connectsAtLaunch
         for publisher in [
             registrations.claude.objectWillChange, registrations.codex.objectWillChange, registrations.pi.objectWillChange,
+            registrations.skills.objectWillChange,
         ] {
             subscriptions.append(publisher.sink { [weak self] _ in self?.objectWillChange.send() })
         }
@@ -242,7 +243,8 @@ final class ConnectAgentsModel: ObservableObject {
         async let claude: Void = registrations.claude.refresh(asksAgain: asksAgain)
         async let codex: Void = registrations.codex.refresh(asksAgain: asksAgain)
         async let pi: Void = registrations.pi.refresh(asksAgain: asksAgain)
-        _ = await (claude, codex, pi)
+        async let skills: Void = registrations.skills.refresh()
+        _ = await (claude, codex, pi, skills)
     }
 
     /// Asks about `plan` (one row's button).
@@ -269,6 +271,8 @@ final class ConnectAgentsModel: ObservableObject {
 struct ConnectAgentsSheet: View {
     static let title = "Connect Agents to Cherry"
     static let intro = "Agents Cherry starts get Cherry MCP when they start. Connecting adds it to an agent CLI's own settings, for sessions you start yourself. Nothing runs until you confirm."
+    static let skillHeading = "Cherry skill"
+    static let mcpHeading = "Cherry MCP"
 
     @StateObject var model: ConnectAgentsModel
     let close: () -> Void
@@ -288,6 +292,12 @@ struct ConnectAgentsSheet: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if !model.registrations.skills.items.isEmpty {
+                Text(Self.skillHeading).font(.headline)
+                CherrySkillRows(model: model.registrations.skills)
+                Divider()
+                Text(Self.mcpHeading).font(.headline)
+            }
             ForEach(rows.filter(\.isInstalled), id: \.harness) { row in
                 harnessRow(row.harness)
                 Divider()

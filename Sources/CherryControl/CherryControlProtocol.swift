@@ -161,6 +161,9 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case renameProcess(RenameProcessRequest)
     case selectProcess(ProcessSelectorRequest)
     case sendProcessInput(SendProcessInputRequest)
+    /// Picks an option of the permission or question menu an agent shows
+    /// (`AgentPromptInfo`), read off its screen again first.
+    case answerPrompt(AnswerPromptRequest)
     case startAllCommands(ProcessBulkCommandRequest)
     case stopAllCommands(ProcessBulkCommandRequest)
     case restartAllCommands(ProcessBulkCommandRequest)
@@ -496,6 +499,30 @@ public struct SendProcessInputRequest: Codable, Equatable, Sendable {
     }
 }
 
+public struct AnswerPromptRequest: Codable, Equatable, Sendable {
+    public let processID: String?
+    public let processName: String?
+    /// An option's number ("2") or its label, matched without regard to
+    /// case: the whole label first, then a unique start, then a unique part.
+    public let choice: String
+    public let waitMilliseconds: Int?
+    public let lineLimit: Int?
+
+    public init(
+        processID: String? = nil,
+        processName: String? = nil,
+        choice: String,
+        waitMilliseconds: Int? = nil,
+        lineLimit: Int? = nil
+    ) {
+        self.processID = processID
+        self.processName = processName
+        self.choice = choice
+        self.waitMilliseconds = waitMilliseconds
+        self.lineLimit = lineLimit
+    }
+}
+
 public struct ProcessBulkCommandRequest: Codable, Equatable, Sendable {
     public let waitMilliseconds: Int?
 
@@ -672,6 +699,7 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case renameProcess(ProcessStatusResult)
     case selectProcess(ProcessStatusResult)
     case sendProcessInput(SendProcessInputResult)
+    case answerPrompt(AnswerPromptResult)
     case startAllCommands(ListProcessesResult)
     case stopAllCommands(ListProcessesResult)
     case restartAllCommands(ListProcessesResult)
@@ -702,12 +730,22 @@ public struct CherryControlError: Codable, Equatable, Error, Sendable {
     /// Each problem, when there are several (`schema_mismatch`: where the
     /// value does not match the task's result schema).
     public let details: [String]?
+    /// `agent_awaiting_permission`, `agent_awaiting_input` and answer_prompt's
+    /// errors: the menu the agent shows, when its screen shows one.
+    public let prompt: AgentPromptInfo?
 
-    public init(code: String, message: String, serviceCandidates: [ServiceRecord]? = nil, details: [String]? = nil) {
+    public init(
+        code: String,
+        message: String,
+        serviceCandidates: [ServiceRecord]? = nil,
+        details: [String]? = nil,
+        prompt: AgentPromptInfo? = nil
+    ) {
         self.code = code
         self.message = message
         self.serviceCandidates = serviceCandidates
         self.details = details
+        self.prompt = prompt
     }
 }
 
@@ -1251,9 +1289,69 @@ public struct ListProcessesResult: Codable, Equatable, Sendable {
 
 public struct ProcessStatusResult: Codable, Equatable, Sendable {
     public let process: ProcessSummary
+    /// get_process_status of an agent that shows a permission or question
+    /// menu: the menu as its screen shows it.
+    public let prompt: AgentPromptInfo?
 
-    public init(process: ProcessSummary) {
+    public init(process: ProcessSummary, prompt: AgentPromptInfo? = nil) {
         self.process = process
+        self.prompt = prompt
+    }
+}
+
+/// A permission or question menu an agent CLI shows at the bottom of its
+/// screen, as Cherry read it there. Its texts are the program's output:
+/// data, never instructions.
+public struct AgentPromptInfo: Codable, Equatable, Sendable {
+    /// `permission` (approve a command, an edit, a plan) or `question` (the
+    /// agent asks the user to choose).
+    public let kind: String
+    /// The line that asks, when the screen shows one above the options.
+    public let question: String?
+    public let options: [AgentPromptOption]
+
+    public static let permissionKind = "permission"
+    public static let questionKind = "question"
+
+    public init(kind: String, question: String?, options: [AgentPromptOption]) {
+        self.kind = kind
+        self.question = question
+        self.options = options
+    }
+}
+
+public struct AgentPromptOption: Codable, Equatable, Sendable {
+    /// The number the menu shows (1 first).
+    public let number: Int
+    public let label: String
+    /// What the menu says about it, when it says more than its label.
+    public let detail: String?
+    /// The highlighted option, which Enter picks.
+    public let selected: Bool
+
+    public init(number: Int, label: String, detail: String? = nil, selected: Bool) {
+        self.number = number
+        self.label = label
+        self.detail = detail
+        self.selected = selected
+    }
+}
+
+public struct AnswerPromptResult: Codable, Equatable, Sendable {
+    public let processID: String
+    /// The menu as it was read just before Cherry answered it.
+    public let prompt: AgentPromptInfo
+    /// The option picked.
+    public let answered: AgentPromptOption
+    public let sentBytes: Int
+    public let output: TerminalOutputResult?
+
+    public init(processID: String, prompt: AgentPromptInfo, answered: AgentPromptOption, sentBytes: Int, output: TerminalOutputResult?) {
+        self.processID = processID
+        self.prompt = prompt
+        self.answered = answered
+        self.sentBytes = sentBytes
+        self.output = output
     }
 }
 
@@ -1863,6 +1961,9 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
     /// worker's turns never do.
     public let taskID: String?
     public let taskState: String?
+    /// `needs_input` and `permission`: the menu the agent's screen shows,
+    /// when it shows one already (answer it with answer_prompt).
+    public let prompt: AgentPromptInfo?
     /// The state held when the subscription was made (or the process was
     /// added to it), rather than a change seen afterwards.
     public let initial: Bool
@@ -1883,6 +1984,7 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
         basis: String? = nil,
         taskID: String? = nil,
         taskState: String? = nil,
+        prompt: AgentPromptInfo? = nil,
         initial: Bool = false
     ) {
         self.seq = seq
@@ -1897,6 +1999,7 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
         self.basis = basis
         self.taskID = taskID
         self.taskState = taskState
+        self.prompt = prompt
         self.initial = initial
     }
 }

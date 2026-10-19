@@ -779,3 +779,35 @@ private func controlToolLayerProcess(id: String = controlToolLayerAgentID, kind:
     #expect(unavailable.isError)
     #expect(unavailable.structured?.objectValue?["error"]?.objectValue?["code"] == .string("cherry_unavailable"))
 }
+
+/// answer_prompt: its choice as an option's number (a JSON number too) or
+/// label, sent as one typed request; no choice is refused before anything
+/// is sent. The prompt of a refusal comes through in its error.
+@Test func controlToolLayerAnswerPromptSendsTheChoice() async throws {
+    let id = controlToolLayerAgentID
+    #expect(await controlToolLayerRequest("answer_prompt", ["process_id": .string(id), "choice": .string("Yes")])
+        == .answerPrompt(.init(processID: id, choice: "Yes")))
+    #expect(await controlToolLayerRequest("answer_prompt", ["process_id": .string(id), "choice": .int(2)])
+        == .answerPrompt(.init(processID: id, choice: "2")))
+    #expect(await controlToolLayerRequest("answer_prompt", ["process_id": .string(id), "choice": .double(3)])
+        == .answerPrompt(.init(processID: id, choice: "3")))
+    let missing = await controlToolLayerRefusal("answer_prompt", ["process_id": .string(id)])
+    #expect(missing.code != nil)
+    #expect(!missing.sentRequests)
+
+    let prompt = AgentPromptInfo(kind: "permission", question: "Do you want to proceed?", options: [
+        AgentPromptOption(number: 1, label: "Yes", selected: true),
+        AgentPromptOption(number: 2, label: "No", selected: false),
+    ])
+    let recorder = ControlToolLayerRecorder { _ in
+        CherryControlResponse(error: CherryControlError(code: "unknown_choice", message: "No such option.", prompt: prompt))
+    }
+    let result = await CherryToolLayer.call(
+        name: "answer_prompt", arguments: ["process_id": .string(id), "choice": .string("maybe")],
+        caller: CherryToolCaller(), transport: recorder
+    )
+    #expect(result.isError)
+    let error = try #require(result.structured?.objectValue?["error"]?.objectValue)
+    #expect(error["prompt"]?.objectValue?["options"]?.arrayValue?.count == 2)
+    #expect(result.text.contains(#""question":"Do you want to proceed?""#))
+}

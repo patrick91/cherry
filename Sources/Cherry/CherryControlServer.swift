@@ -1041,7 +1041,10 @@ final class CherryControlServer: @unchecked Sendable {
             // throttled native-surface refresh.
             await session.refreshContentFromHostIfNeeded()
             _ = session.lineCount
-            return .init(result: .getProcessStatus(.init(process: processInfo(for: session, workspace: sessionWorkspace))))
+            return .init(result: .getProcessStatus(.init(
+                process: processInfo(for: session, workspace: sessionWorkspace),
+                prompt: await statusPrompt(of: session)
+            )))
         case .getProcessOutput(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
             await session.refreshContentFromHostIfNeeded()
@@ -1164,6 +1167,9 @@ final class CherryControlServer: @unchecked Sendable {
             noteRequestInput(to: session)
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
             return .init(result: .sendProcessInput(.init(processID: session.id.uuidString, sentBytes: sentBytes, output: output)))
+        case .answerPrompt(let request):
+            let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
+            return .init(result: .answerPrompt(try await answerPrompt(request, of: session)))
         case .startAllCommands(let request):
             _ = try await startAllCommands(workspace: workspace)
             if let waitMilliseconds = request.waitMilliseconds, waitMilliseconds > 0 {
@@ -2988,9 +2994,9 @@ final class CherryControlServer: @unchecked Sendable {
             guard !keysOnly else { return }
             switch session.agentActivityState {
             case .permission:
-                throw Self.awaitingPermission(session: session, name: name)
+                throw Self.awaitingPermission(session: session, name: name, prompt: Self.shownPrompt(of: session))
             case .needsInput:
-                throw Self.awaitingInput(session: session, name: name)
+                throw Self.awaitingInput(session: session, name: name, prompt: Self.shownPrompt(of: session))
             case .unknown, .idle, .working, .error:
                 return
             }
@@ -3003,30 +3009,195 @@ final class CherryControlServer: @unchecked Sendable {
         }
         guard !keysOnly else { return }
         if AgentPermissionPrompt.isShowing(in: lines) {
-            throw Self.awaitingPermission(session: session, name: name)
+            throw Self.awaitingPermission(session: session, name: name, prompt: AgentPromptMenu.read(from: lines))
         }
         if AgentQuestionPrompt.isShowing(in: lines) {
-            throw Self.awaitingInput(session: session, name: name)
+            throw Self.awaitingInput(session: session, name: name, prompt: AgentPromptMenu.read(from: lines))
         }
     }
 
     @MainActor
-    private static func awaitingPermission(session: TerminalSession, name: String) -> CherryControlError {
+    private static func awaitingPermission(session: TerminalSession, name: String, prompt: AgentPromptInfo?) -> CherryControlError {
         mcpControlDebugLog("agent input refused at permission prompt session=\(session.id.uuidString)")
         return CherryControlError(
             code: "agent_awaiting_permission",
-            message: "Agent '\(name)' is waiting for an answer to a permission prompt\(Self.programStatusDetail(of: session)); nothing was sent, so the prompt was not answered. Let the user answer it in Cherry, or send the answering keys deliberately with raw_base64 (without submit)."
+            message: "Agent '\(name)' is waiting for an answer to a permission prompt\(Self.programStatusDetail(of: session)); nothing was sent, so the prompt was not answered. Let the user answer it in Cherry, or pick one of its options with answer_prompt\(prompt == nil ? "" : " (they are in prompt)").",
+            prompt: prompt
         )
     }
 
     @MainActor
-    private static func awaitingInput(session: TerminalSession, name: String) -> CherryControlError {
+    private static func awaitingInput(session: TerminalSession, name: String, prompt: AgentPromptInfo?) -> CherryControlError {
         // Enter picks the highlighted option of a question menu.
         mcpControlDebugLog("agent input refused at question menu session=\(session.id.uuidString)")
         return CherryControlError(
             code: "agent_awaiting_input",
-            message: "Agent '\(name)' is asking the user a question\(Self.programStatusDetail(of: session)); nothing was sent, since Enter would pick the highlighted option. Read the question with get_process_output, then let the user answer it, or answer deliberately with raw_base64 keys (without submit), such as the option's digit."
+            message: "Agent '\(name)' is asking the user a question\(Self.programStatusDetail(of: session)); nothing was sent, since Enter would pick the highlighted option. Let the user answer it, or pick one of its options with answer_prompt\(prompt == nil ? "" : " (they are in prompt)").",
+            prompt: prompt
         )
+    }
+
+    // MARK: - answer_prompt
+
+    /// Between the arrow keys answer_prompt types, and before its Enter.
+    static let answerPromptKeyPause: Duration = .milliseconds(40)
+    /// How long answer_prompt waits for the menu to show the option it
+    /// moved to highlighted before it presses Enter.
+    static let answerPromptHighlightWait: TimeInterval = 2
+
+    /// Picks an option of the menu the agent shows: the menu is read off its
+    /// screen again now (never an earlier read), the option found by its
+    /// number or label, the highlight moved to it with arrow keys, and only
+    /// once the screen shows it highlighted, Enter. Under the tab's typing
+    /// lock, so no line Cherry types (a wake line, a nudge) goes between.
+    @MainActor
+    private func answerPrompt(_ request: AnswerPromptRequest, of session: TerminalSession) async throws -> AnswerPromptResult {
+        let name = processName(for: session)
+        guard session.kind == .agent else {
+            throw CherryControlError(
+                code: "not_agent_process",
+                message: "answer_prompt answers an agent's menu; \(name) is kind \(session.kind.rawValue)."
+            )
+        }
+        guard session.acceptsControlInput else {
+            throw Self.inputError(for: .notAccepting(state: session.state.label), processName: name, totalBytes: 0)
+        }
+        await tasks.typingLocks.acquire(session.id)
+        defer { tasks.typingLocks.release(session.id) }
+
+        let prompt = try await promptToAnswer(of: session, name: name)
+        let option: AgentPromptOption
+        switch AgentPromptMenu.match(request.choice, in: prompt) {
+        case .option(let found):
+            option = found
+        case .ambiguous(let found):
+            throw CherryControlError(
+                code: "ambiguous_choice",
+                message: "\"\(request.choice.prefix(80))\" names several options of \(name)'s menu (\(AgentPromptMenu.describe(found))); nothing was sent. Give its number.",
+                prompt: prompt
+            )
+        case .none:
+            throw CherryControlError(
+                code: "unknown_choice",
+                message: "\(name)'s menu has no option \"\(request.choice.prefix(80))\"; nothing was sent. Its options: \(AgentPromptMenu.describe(prompt.options)).",
+                prompt: prompt
+            )
+        }
+        guard let highlighted = prompt.options.firstIndex(where: \.selected),
+              let target = prompt.options.firstIndex(of: option)
+        else {
+            throw CherryControlError(
+                code: "prompt_unreadable",
+                message: "Cherry cannot tell which option of \(name)'s menu is highlighted, so it cannot move to \(option.number); nothing was sent. Send the keys with send_process_input (raw_base64, without submit), or let the user answer.",
+                prompt: prompt
+            )
+        }
+
+        var sent = 0
+        if target != highlighted {
+            let key = Data((target > highlighted ? "\u{1B}[B" : "\u{1B}[A").utf8)
+            for _ in 0..<abs(target - highlighted) {
+                try await deliver(key, raw: true, to: session, alreadySent: sent)
+                sent += key.count
+                try? await Task.sleep(for: Self.answerPromptKeyPause)
+            }
+            try await waitForHighlight(of: option, in: prompt, of: session, name: name)
+        }
+        let enter = TerminalInputEncoder.enterData
+        try await deliver(enter, raw: false, to: session, alreadySent: sent)
+        sent += enter.count
+        mcpControlDebugLog("answer_prompt session=\(session.id.uuidString) option=\(option.number) bytes=\(sent)")
+        let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
+        return AnswerPromptResult(processID: session.id.uuidString, prompt: prompt, answered: option, sentBytes: sent, output: output)
+    }
+
+    /// The menu answer_prompt answers, read now: from the agent's screen (its
+    /// host's when no surface shows it), and only while an agent that
+    /// reports its status says it waits on one.
+    @MainActor
+    private func promptToAnswer(of session: TerminalSession, name: String) async throws -> AgentPromptInfo {
+        if session.reportsProgramStatus {
+            switch session.agentActivityState {
+            case .permission, .needsInput:
+                break
+            case .unknown, .idle, .working, .error:
+                throw CherryControlError(
+                    code: "no_prompt",
+                    message: "Agent '\(name)' reports \(session.agentActivityState.rawValue), not a permission or a question; nothing was sent."
+                )
+            }
+        }
+        guard let lines = await session.programScreenLinesForInput() else {
+            throw CherryControlError(
+                code: "input_not_delivered",
+                message: "Cherry could not read agent '\(name)'s screen from its host, so it cannot see its menu; nothing was sent."
+            )
+        }
+        guard let prompt = AgentPromptMenu.read(from: lines) else {
+            throw CherryControlError(
+                code: "no_prompt",
+                message: "Agent '\(name)' shows no permission or question menu Cherry can read; nothing was sent. Read its screen with get_process_output."
+            )
+        }
+        return prompt
+    }
+
+    /// Waits until the agent's screen shows `option` highlighted in the same
+    /// menu; throws, with Enter not pressed, when the menu changed or the
+    /// highlight did not get there.
+    @MainActor
+    private func waitForHighlight(of option: AgentPromptOption, in prompt: AgentPromptInfo, of session: TerminalSession, name: String) async throws {
+        let deadline = Date().addingTimeInterval(Self.answerPromptHighlightWait)
+        var shown: AgentPromptInfo?
+        repeat {
+            try? await Task.sleep(for: .milliseconds(100))
+            if let lines = await session.programScreenLinesForInput() {
+                let read = AgentPromptMenu.read(from: lines)
+                guard let read, read.options.map(\.label) == prompt.options.map(\.label) else {
+                    throw CherryControlError(
+                        code: "prompt_changed",
+                        message: "\(name)'s menu changed while Cherry moved to option \(option.number); Enter was not pressed. Read its status again before answering.",
+                        prompt: read
+                    )
+                }
+                shown = read
+                if read.options.first(where: \.selected)?.number == option.number { return }
+            }
+        } while Date() < deadline
+        let highlighted = shown?.options.first(where: \.selected).map { "\($0.number)" } ?? "none"
+        throw CherryControlError(
+            code: "prompt_not_answered",
+            message: "Cherry moved \(name)'s highlight toward option \(option.number), but the menu shows \(highlighted) highlighted; Enter was not pressed. Read its status and try again.",
+            prompt: shown ?? prompt
+        )
+    }
+
+    /// get_process_status's menu: for an agent that reports it waits on a
+    /// permission or a question, its screen read now (its host's when no
+    /// surface shows it); for one that reports nothing, the menu its screen
+    /// shows as the tab last read it. None while an agent reports it waits
+    /// for nothing (a menu left on screen is no question then).
+    @MainActor
+    private func statusPrompt(of session: TerminalSession) async -> AgentPromptInfo? {
+        guard session.kind == .agent else { return nil }
+        guard session.reportsProgramStatus else { return Self.shownPrompt(of: session) }
+        switch session.agentActivityState {
+        case .permission, .needsInput:
+            return await session.programScreenLinesForInput().flatMap(AgentPromptMenu.read)
+        case .unknown, .idle, .working, .error:
+            return nil
+        }
+    }
+
+    /// The menu an agent's screen shows, as the tab last read it (no read
+    /// from its host): what events and status give, at no cost. Nil for a
+    /// tab that is no agent, or a screen that shows no menu (yet).
+    @MainActor
+    static func shownPrompt(of session: TerminalSession) -> AgentPromptInfo? {
+        guard session.kind == .agent else { return nil }
+        let lineCount = session.lineCount
+        guard lineCount > 0 else { return nil }
+        return AgentPromptMenu.read(from: session.snapshot(range: max(0, lineCount - 60)..<lineCount))
     }
 
     /// What the agent says it waits for (its program status message), quoted

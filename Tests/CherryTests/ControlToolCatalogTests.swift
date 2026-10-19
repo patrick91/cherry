@@ -20,7 +20,7 @@ private let controlToolCatalogNames = [
     "list_subscriptions", "get_my_task", "report_result", "report_progress", "wait_for_tasks", "get_task",
     "list_tasks", "cancel_tasks", "get_process_ports", "services_list", "wait_for_bound_port",
     "spawn_process", "spawn_agent", "start_process", "stop_process", "restart_process", "close_process",
-    "rename_process", "select_process", "send_process_input", "send_agent_message", "start_all_commands",
+    "rename_process", "select_process", "send_process_input", "send_agent_message", "answer_prompt", "start_all_commands",
     "stop_all_commands", "restart_all_commands", "list_agents", "list_todos", "create_todo", "get_todo",
     "update_todo", "move_todo", "delete_todo", "select_todo", "add_todo_comment", "list_todo_comments",
     "update_todo_comment", "delete_todo_comment", "bind_session_process",
@@ -44,7 +44,8 @@ private let controlToolCatalogAdditive: Set<String> = [
 ]
 private let controlToolCatalogDestructive: Set<String> = [
     "cancel_tasks", "stop_process", "restart_process", "close_process", "send_process_input",
-    "send_agent_message", "stop_all_commands", "restart_all_commands", "delete_todo", "delete_todo_comment",
+    "send_agent_message", "answer_prompt", "stop_all_commands", "restart_all_commands", "delete_todo",
+    "delete_todo_comment",
 ]
 private let controlToolCatalogIdempotent: Set<String> = [
     "open_project", "unsubscribe", "rename_process", "select_process", "select_todo", "update_todo",
@@ -69,8 +70,9 @@ private let controlToolCatalogFacts: [String: [String]] = [
     "send_process_input": [
         "never typed into a permission prompt", "process_not_accepting_input (", "agent_awaiting_permission (",
         "agent_awaiting_input (", "input_not_delivered (", "input_maybe_delivered (", "input_partially_delivered (",
-        "raw_base64 without submit", "default true for an agent's text, else false",
+        "raw_base64 without submit", "answer_prompt", "default true for an agent's text, else false",
     ],
+    "answer_prompt": ["permission or question menu", "(its prompt)", "presses Enter", "Number or label"],
     "send_agent_message": [
         "permission prompt (agent_awaiting_permission)", "a question (agent_awaiting_input)", "nothing is sent",
         "For long work, send with wait_for_idle false, subscribe and end your turn", "Default 40000, max 300000",
@@ -144,11 +146,11 @@ private func controlToolCatalogTool(_ name: String, for profile: ToolClientProfi
 
 private let controlToolCatalogClaude = ToolClientProfile(client: ToolClientInfo(name: "claude-code", version: "2.1.299"))
 
-@Test func controlToolCatalogListsTheFiftyTwoToolsInTodaysOrder() {
+@Test func controlToolCatalogListsTheFiftyThreeToolsInTodaysOrder() {
     let tools = CherryToolCatalog.tools(for: .unknown)
     #expect(tools.map(\.name) == controlToolCatalogNames)
     #expect(CherryToolCatalog.names == Set(controlToolCatalogNames))
-    #expect(CherryToolCatalog.names.count == 52)
+    #expect(CherryToolCatalog.names.count == 53)
 }
 
 @Test func controlToolCatalogEncodesTheFixtureByteForByte() throws {
@@ -166,7 +168,7 @@ private let controlToolCatalogClaude = ToolClientProfile(client: ToolClientInfo(
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     #expect(try encoder.encode(ListTools.Result(tools: CherryMCPTools.all)) == catalog)
     let json = String(decoding: catalog, as: UTF8.self)
-    #expect(json.components(separatedBy: #""annotations":{"#).count - 1 == 52)
+    #expect(json.components(separatedBy: #""annotations":{"#).count - 1 == 53)
 }
 
 @Test func controlToolCatalogSchemasMatchTheFixture() throws {
@@ -245,7 +247,7 @@ private let controlToolCatalogClaude = ToolClientProfile(client: ToolClientInfo(
     let tools = CherryToolCatalog.tools(for: .unknown)
     // The selector's default, said the same way everywhere it is.
     for tool in tools where tool.inputSchema.objectValue?["properties"]?.objectValue?["process_name"] != nil {
-        #expect(controlToolCatalogParameterDescriptions(tool)["process_id"] == "Cherry process UUID; defaults to the bound process.", "\(tool.name)")
+        #expect(controlToolCatalogParameterDescriptions(tool)["process_id"] == "Process UUID; default: the bound process.", "\(tool.name)")
     }
     // Facts said once: the ports' remote sentence is the same in both tools,
     // and only list_todos says what every todo tool requires.
@@ -269,7 +271,7 @@ private let controlToolCatalogClaude = ToolClientProfile(client: ToolClientInfo(
 @Test func controlToolCatalogAnnotatesEveryTool() throws {
     #expect(controlToolCatalogReadOnly.count == 24)
     #expect(controlToolCatalogAdditive.count == 18)
-    #expect(controlToolCatalogDestructive.count == 10)
+    #expect(controlToolCatalogDestructive.count == 11)
     #expect(controlToolCatalogReadOnly.union(controlToolCatalogAdditive).union(controlToolCatalogDestructive) == Set(controlToolCatalogNames))
     #expect(controlToolCatalogIdempotent.isSubset(of: controlToolCatalogAdditive))
 

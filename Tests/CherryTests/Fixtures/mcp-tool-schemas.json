@@ -637,6 +637,23 @@
     ]
   },
   {
+    "name": "answer_prompt",
+    "properties": {
+      "choice": {
+        "type": "string"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "choice"
+    ]
+  },
+  {
     "name": "start_all_commands",
     "properties": {
       "wait_ms": {

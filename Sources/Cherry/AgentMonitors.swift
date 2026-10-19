@@ -209,6 +209,7 @@ final class AgentMonitorRegistry {
         matchedLine: String? = nil,
         basis: String? = nil,
         task: AgentTask? = nil,
+        prompt: AgentPromptInfo? = nil,
         initial: Bool
     ) {
         guard subscription.events.contains(type) else { return }
@@ -225,6 +226,7 @@ final class AgentMonitorRegistry {
             basis: basis,
             taskID: task?.id,
             taskState: task?.state.rawValue,
+            prompt: prompt,
             initial: initial
         )
         subscription.nextSeq += 1
@@ -724,12 +726,27 @@ extension CherryControlServer {
         watched.lastTurn = turn
         let task = watchedTask(watched, device: subscription.device)
 
+        // A worker whose task settled (and whose settle was told): only the
+        // turns submitted to it are news. A turn it began by itself (more
+        // turns reported than submitted, none submitted since the last
+        // `done`: a finished tab's background work) is not; its own
+        // orchestrator's next message, or another task, is. An agent that
+        // reports no status is `done` only per submitted turn anyway.
+        let selfStartedTurnOfSettledWorker: Bool = {
+            guard let task, task.state.isSettled, watched.settledTaskIDs.contains(task.id),
+                  let session, session.reportsProgramStatus,
+                  watched.turnDoneSubmittedTurn == session.agentSubmittedTurnCount
+            else { return false }
+            return session.agentReportedTurnCount > session.agentSubmittedTurnCount
+        }()
+
         // Every turn an agent reports ended is a `done`, a task's worker's
-        // too: never left out because of its task. Once per turn: a report
-        // applied before its last frame was noticed reads idle, working
-        // (the frame), then idle again, with no new turn reported or
-        // submitted in between.
+        // too (but for a settled worker's self-started turns, above). Once
+        // per turn: a report applied before its last frame was noticed
+        // reads idle, working (the frame), then idle again, with no new
+        // turn reported or submitted in between.
         func tellTurnDone(initial: Bool) {
+            guard !selfStartedTurnOfSettledWorker else { return }
             if let session, session.reportsProgramStatus,
                watched.turnDoneReportedTurn == session.agentReportedTurnCount,
                watched.turnDoneSubmittedTurn == session.agentSubmittedTurnCount {
@@ -762,9 +779,15 @@ extension CherryControlServer {
                     tellTurnDone(initial: initial)
                 }
             case "needs_input":
-                monitors.append(.needsInput, to: subscription, process: watched, session: session, initial: initial)
+                monitors.append(
+                    .needsInput, to: subscription, process: watched, session: session,
+                    prompt: session.flatMap { Self.shownPrompt(of: $0) }, initial: initial
+                )
             case "permission":
-                monitors.append(.permission, to: subscription, process: watched, session: session, initial: initial)
+                monitors.append(
+                    .permission, to: subscription, process: watched, session: session,
+                    prompt: session.flatMap { Self.shownPrompt(of: $0) }, initial: initial
+                )
             case "error":
                 monitors.append(.error, to: subscription, process: watched, session: session, initial: initial)
             default:

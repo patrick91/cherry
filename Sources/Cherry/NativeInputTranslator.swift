@@ -25,6 +25,10 @@ import Foundation
 ///   Ghostty no text and no unshifted code point, so its kitty encoder drops
 ///   a Ctrl-letter and its legacy encoder types no printable key.
 ///
+/// A whole bracketed paste in text input (`ESC [200~` … `ESC [201~`, as MCP
+/// sends an agent a multi-line message) is pasted as one text, its newlines
+/// kept; in raw input its markers are bytes like any other sequence.
+///
 /// Raw input is otherwise re-encoded like text input: CR and LF are Enter,
 /// BS and DEL Backspace, a lone ESC (or one before a control character)
 /// Escape, and the arrow and navigation sequences their keys.
@@ -87,7 +91,14 @@ enum NativeInputTranslator {
             let b = bytes[i]
             switch b {
             case 0x1B: // ESC — start of a CSI/SS3 sequence, or a lone Escape
-                if let (op, length) = parseEscape(bytes, from: i) {
+                if !raw, let (text, length) = bracketedPaste(bytes, from: i) {
+                    // A whole bracketed paste (an agent's multi-line
+                    // message): Ghostty pastes its text, newlines and all,
+                    // bracketed as the program asks, as one paste.
+                    flush()
+                    if !text.isEmpty { ops.append(.text(text)) }
+                    i += length
+                } else if let (op, length) = parseEscape(bytes, from: i) {
                     flush()
                     ops.append(op)
                     i += length
@@ -166,6 +177,26 @@ enum NativeInputTranslator {
     /// The length of the complete CSI (`ESC [`, parameter and intermediate
     /// bytes, a final byte) or SS3 (`ESC O` and a final byte) sequence at
     /// `start` (`bytes[start] == 0x1B`); nil when there is none.
+    private static let pasteStart = Array("\u{1B}[200~".utf8)
+    private static let pasteEnd = Array("\u{1B}[201~".utf8)
+
+    /// The text of a bracketed paste (`ESC [200~` … `ESC [201~`) starting
+    /// at `start`, and the length of the whole paste; nil without both
+    /// markers.
+    private static func bracketedPaste(_ bytes: [UInt8], from start: Int) -> (String, Int)? {
+        guard bytes[start...].starts(with: pasteStart) else { return nil }
+        let textStart = start + pasteStart.count
+        var j = textStart
+        while j + pasteEnd.count <= bytes.count {
+            if bytes[j...].starts(with: pasteEnd) {
+                let text = String(decoding: bytes[textStart..<j], as: UTF8.self)
+                return (text, j + pasteEnd.count - start)
+            }
+            j += 1
+        }
+        return nil
+    }
+
     private static func completeSequenceLength(_ bytes: [UInt8], from start: Int) -> Int? {
         let n = bytes.count
         guard start + 2 < n else { return nil }

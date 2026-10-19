@@ -248,7 +248,8 @@ public enum CherryToolLayer {
             label: stringArgument("label", in: arguments),
             phase: stringArgument("phase", in: arguments),
             runID: stringArgument("run_id", in: arguments),
-            resultSchema: try schemaArgument("result_schema", in: arguments)
+            resultSchema: try schemaArgument("result_schema", in: arguments),
+            allowSubagents: boolArgument("allow_subagents", in: arguments)
         ))
 
         let scoped = await scopedRequest(request, arguments: arguments, caller: caller, transport: transport)
@@ -532,7 +533,10 @@ public enum CherryToolLayer {
                 summary: stringArgument("summary", in: arguments)
             ))
         case "report_progress":
-            return .reportProgress(.init(message: try requiredString("message", in: arguments)))
+            return .reportProgress(.init(
+                message: try requiredString("message", in: arguments),
+                awaitingApproval: boolArgument("awaiting_approval", in: arguments)
+            ))
         case "wait_for_tasks":
             return .waitForTasks(.init(
                 runID: stringArgument("run_id", in: arguments),
@@ -619,6 +623,23 @@ public enum CherryToolLayer {
                 text: stringArgument("text", in: arguments),
                 rawBase64: stringArgument("raw_base64", in: arguments),
                 submit: boolArgument("submit", in: arguments),
+                waitMilliseconds: intArgument("wait_ms", in: arguments),
+                lineLimit: intArgument("line_limit", in: arguments)
+            ))
+        case "answer_prompt":
+            let choice: String
+            switch arguments["choice"] {
+            case .int(let number)?:
+                choice = String(number)
+            case .double(let number)? where number == number.rounded() && abs(number) < 1_000:
+                choice = String(Int(number))
+            default:
+                choice = try requiredString("choice", in: arguments)
+            }
+            return .answerPrompt(.init(
+                processID: processIDArgument(in: arguments, caller: caller),
+                processName: stringArgument("process_name", in: arguments),
+                choice: choice,
                 waitMilliseconds: intArgument("wait_ms", in: arguments),
                 lineLimit: intArgument("line_limit", in: arguments)
             ))
@@ -751,6 +772,8 @@ public enum CherryToolLayer {
         case .selectProcess(let payload):
             return try encodedResult(payload)
         case .sendProcessInput(let payload):
+            return try encodedResult(payload)
+        case .answerPrompt(let payload):
             return try encodedResult(payload)
         case .startAllCommands(let payload):
             return try encodedResult(payload)
@@ -1084,6 +1107,11 @@ public enum CherryToolLayer {
     /// requests: nil for the client's default (10 s).
     public static func clientTimeout(for name: String, arguments: [String: JSONValue]) -> TimeInterval? {
         switch name {
+        case "answer_prompt":
+            // The menu read (up to 2 s from a host), the highlight's wait
+            // (2 s), then `wait_ms`.
+            let waitMilliseconds = min(max(intArgument("wait_ms", in: arguments) ?? 0, 0), 5_000)
+            return TimeInterval(waitMilliseconds) / 1_000 + 20
         case "spawn_agent", "spawn_process", "send_process_input":
             // Input waits until it reached the program: a persistent-session
             // tab's session may still be created (Cherry gives up after about

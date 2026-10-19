@@ -4214,6 +4214,15 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// program that did not, the markers arrive as input: `cat > file`
     /// writes them into the file, and a vi-mode line editor takes the ESC
     /// as a key. A single line is left as it is.
+    /// Whether MCP sends a multi-line message to this agent as one
+    /// bracketed paste: agent CLIs turn bracketed paste on, so unless the
+    /// host reports the program has it off. A native surface pastes the
+    /// paste's text as the program asks either way
+    /// (`NativeInputTranslator`).
+    var bracketsAgentMessage: Bool {
+        hostReportedSessionInfo?.bracketedPaste ?? true
+    }
+
     func bracketsPaste(_ text: String) -> Bool {
         guard persistentHosting != nil || hostedAttachment != nil else {
             return processor.usesBracketedPasteMode

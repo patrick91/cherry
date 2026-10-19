@@ -245,6 +245,9 @@
   {
     "name": "report_progress",
     "properties": {
+      "awaiting_approval": {
+        "type": "boolean"
+      },
       "message": {
         "type": "string"
       }
@@ -422,6 +425,9 @@
   {
     "name": "spawn_agent",
     "properties": {
+      "allow_subagents": {
+        "type": "boolean"
+      },
       "bind_session": {
         "type": "boolean"
       },
@@ -628,6 +634,23 @@
     },
     "required": [
       "message"
+    ]
+  },
+  {
+    "name": "answer_prompt",
+    "properties": {
+      "choice": {
+        "type": "string"
+      },
+      "process_id": {
+        "type": "string"
+      },
+      "process_name": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "choice"
     ]
   },
   {

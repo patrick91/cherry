@@ -316,7 +316,7 @@ Against cda2728 (the last helper that ran every tool itself), on purpose:
 
 - Shorter tool and parameter descriptions; some parameters have none. The
   52 tools' names and input schemas (property names, types, `required`)
-  are unchanged.
+  are unchanged; `answer_prompt` came later (53).
 - Every tool has annotations, `openWorldHint: false`. Read-only (24):
   every `get_`, `list_`, `search_` and `wait_` tool but
   `wait_for_bound_port`, `whoami`, `resolve_link`, `services_list` and
@@ -326,9 +326,9 @@ Against cda2728 (the last helper that ran every tool itself), on purpose:
   mode for writes prompts for none of them. `wait_for_bound_port` is not
   one: with `probe_http` it forwards another Mac's port to This Mac's
   loopback and sends the service a request.
-  Destructive (10): `cancel_tasks`, `stop_process`, `restart_process`,
+  Destructive (11): `cancel_tasks`, `stop_process`, `restart_process`,
   `close_process`, `send_process_input`, `send_agent_message`,
-  `stop_all_commands`, `restart_all_commands`, `delete_todo`,
+  `answer_prompt`, `stop_all_commands`, `restart_all_commands`, `delete_todo`,
   `delete_todo_comment`. The other 18 add or start something
   (`destructiveHint: false`); of them `open_project`, `unsubscribe`,
   `rename_process`, `select_process`, `select_todo`, `update_todo` and
@@ -611,7 +611,8 @@ Use process tools for new automation:
 - `list_processes`, `get_process_status`
 - `spawn_process`, `start_process`, `stop_process`, `restart_process`,
   `close_process`, `rename_process`, `send_process_input`
-- `spawn_agent`, `send_agent_message` for agent-native launch and messaging
+- `spawn_agent`, `send_agent_message` for agent-native launch and messaging,
+  `answer_prompt` for an agent's permission or question menu (below)
 - `get_process_output`, `get_process_raw_output`, `search_process_output`
 - `wait_for_process_idle`
 - `subscribe`, `wait_for_events`, `unsubscribe`, `list_subscriptions`
@@ -840,7 +841,13 @@ control:
 
 For `send_process_input` and `spawn_process`, `text` is typed as terminal
 input. CR/LF line endings are encoded as carriage-return Enter, matching the
-plain Enter key path. Use `raw_base64` for bytes without that normalization;
+plain Enter key path, except in text for an agent: text of several lines
+(trailing newlines aside), for `send_agent_message`, `send_process_input`
+and the first input of `spawn_process` and `spawn_agent`, is one message,
+pasted as one bracketed paste with its newlines (LF between the lines when
+the agent's host reports bracketed paste off), then one Enter on its own
+after the paste (a trailing newline counts as `submit`), so the agent does
+not take each line as a message of its own. Use `raw_base64` for bytes without that normalization;
 raw bytes are not auto-submitted unless `submit: true` is provided. Key
 sequences in them may still be re-encoded for the program's key modes:
 unmodified arrow, Home and End keys follow its cursor key mode, whether its
@@ -885,7 +892,12 @@ to their events and ends its turn; Cherry tells it when something happened.
   `no_report`, `failed`, `cancelled`) is one more `done`, the only one with
   `task_id` and `task_state`, and no `basis`: once per task (a report
   after it adds nothing), also after its `exited`, and none when the
-  subscriber cancelled it itself (`cancel_tasks`). A `closed` ends the
+  subscriber cancelled it itself (`cancel_tasks`). Once its task settled
+  and that settle was told, only the turns submitted to it are news: a
+  turn it begins by itself (it reports more turns than were submitted,
+  none submitted since its last `done`: a finished tab's background work)
+  is no `done`, and a message submitted to it makes its next turn's end
+  one again. A `closed` ends the
   watch: only a subscription without `closed` still gets the settle of a
   task open when its tab closed. Read its result with `get_task`; to wait
   for workers, `wait_for_tasks` is the better tool.
@@ -966,7 +978,10 @@ Code, Codex and Pi.
   most 64,000 characters and 256 KiB), and optionally `label` (shown in the
   sidebar; defaults to `title`, else the brief's first words; cut at 80
   characters and 320 bytes), `phase` (60 characters, 240 bytes), `run_id`
-  and `result_schema`. The
+  and `result_schema`, and `allow_subagents` (default false: the worker's
+  rules tell it not to hand parts of the brief to other agents; true says
+  it may use its own CLI's subagents in its tab, never `spawn_agent` with
+  a task, which stays `nested_task`). The
   agent is the configured `name` with its usual command and options. The
   result has `task_id` and `run_id` (and `task`). Without `run_id` the task
   joins the caller's current run: one per orchestrator, a new one once all
@@ -997,11 +1012,11 @@ Code, Codex and Pi.
   failed (`input_maybe_delivered`) is never typed again. An agent whose
   screen Cherry cannot read keeps its kickoff as typed.
 - `wait_for_tasks` with `run_id` or `task_ids` (default: the caller's own
-  open runs), `until` (`any`, the default: a task settled or needs input;
-  `all`: every task settled), `cursor` and `timeout_ms` (default 50000, at
-  most 50000 or the client's limit, see Client Timeouts; 0 returns at
-  once). It returns `events` after `cursor`
-  (`queued`, `started`, `progress`, `needs_input`, `resumed`,
+  open runs), `until` (`any`, the default: a task settled, needs input or
+  awaits approval; `all`: every task settled), `cursor` and `timeout_ms`
+  (default 50000, at most 50000 or the client's limit, see Client
+  Timeouts; 0 returns at once). It returns `events` after `cursor`
+  (`queued`, `started`, `progress`, `needs_input`, `awaiting_approval`, `resumed`,
   `kickoff_retry`, `nudged`, `reported`, `failed`, `no_report`,
   `cancelled`, each with its `seq`), `completed` and `pending` tasks,
   `cursor` (pass it back next time), `timed_out`, and the `runs` with
@@ -1027,7 +1042,15 @@ Code, Codex and Pi.
   [cherry] Run run-…: 3 tasks settled (2 reported, 1 failed). Call the cherry wait_for_tasks tool with run_id "run-…" to read them, and get_task for each result.
   ```
 
-  It carries the run id and counts only, never a worker's text. Settings ›
+  A run with a task awaiting approval (below) that the orchestrator has
+  not read with `wait_for_tasks` gets one line of its own, by the same
+  rules, once per new request:
+
+  ```text
+  [cherry] Run run-…: 1 task awaits your approval. Call the cherry wait_for_tasks tool with run_id "run-…" to read the questions, and answer each worker with send_agent_message.
+  ```
+
+  Both carry the run id and counts only, never a worker's text. Settings ›
   Agents & MCP › Monitors › Wake idle agents turns it off with monitors'
   wake lines.
   Everything Cherry types into a tab (this line, a monitor's wake line,
@@ -1076,7 +1099,24 @@ names); the tools take no selector, so no agent can report for another.
 - `report_progress` with a one-line `message` (at most 200 characters and
   800 UTF-8 bytes):
   at most one every 5 s is recorded (`recorded: false` and
-  `retry_after_milliseconds` otherwise).
+  `retry_after_milliseconds` otherwise); the answer has the task's `state`.
+- **Approval checkpoints.** A worker that needs its orchestrator's
+  approval or an answer before it goes on (a plan to approve, a question)
+  calls `report_progress` with `awaiting_approval: true` and its question
+  as `message` (never dropped by the 5 s limit), then ends its turn. Its
+  open task is `awaiting_approval` (the sidebar's "awaits approval"; an
+  `awaiting_approval` event with the question; `counts.awaiting_approval`):
+  not settled, never nudged and never `no_report`, and the run does not
+  settle. `wait_for_tasks` (`until: any`) returns for it, and the
+  orchestrator's wake line says so. The task is back at `working` (a
+  `resumed` event) once a message is submitted to the worker (the
+  orchestrator's `send_agent_message` or `send_process_input`, or the user
+  typing in its tab; Cherry's own lines are no answer), with a
+  `report_progress` without the flag, or settles with `report_result`.
+  Its next turn that ends without a report is asked once again. On a task
+  that already settled, the flag is ignored (a plain progress message).
+  `get_my_task`'s rules say all this, in place of the earlier "report
+  failed rather than waiting for an answer".
 
 **Result schemas** are a JSON Schema subset Cherry checks itself: `type`
 (a name or a list of them: `object`, `array`, `string`, `number`,
@@ -1094,6 +1134,8 @@ also watches each open task's worker:
 
 - It reports it waits for the user (a permission or a question): the task
   is `needs_input` (the sidebar's "needs you") until it goes on.
+- It asked its orchestrator for approval (above): the task waits, with no
+  nudge, until it is answered.
 - It finished its turn (idle at its composer after working, as a monitor's
   `done`) without reporting: Cherry types "Please call report_result with
   your result." once, when it is idle. Idle again after that turn without a
@@ -1121,8 +1163,8 @@ also watches each open task's worker:
 A report after `no_report` or `failed` still replaces the result.
 
 **The sidebar.** A worker's row shows its label and a small glyph for its
-task's state (queued, working, needs you, reported, no report, failed,
-cancelled); hovering shows the result's summary. While one of its runs is
+task's state (queued, working, needs you, awaits approval, reported, no
+report, failed, cancelled); hovering shows the result's summary. While one of its runs is
 open, the orchestrator's row shows how many of its tasks settled ("3/5").
 
 **Scope and lifetime.** Each task is tied to its worker's tab (by its id,
@@ -1168,12 +1210,14 @@ of `spawn_process` and `spawn_agent`) is checked first. While the agent
 reports it is blocked on an approval (program status `blocked`,
 `kind=permission`), where Enter (or a letter such as `y`) would approve the
 pending action, the input is refused with `agent_awaiting_permission` and
-nothing is sent: let the user answer it, or send the answering keys
-deliberately as `raw_base64` without `submit`, which goes through. The same
+nothing is sent: let the user answer it, pick an option with
+`answer_prompt` (below), or send the answering keys deliberately as
+`raw_base64` without `submit`, which goes through. The same
 holds while it reports a question to the user (`kind=question`, such as
 Claude Code's AskUserQuestion), where Enter would pick the highlighted
 option: the input is refused with `agent_awaiting_input`. Both errors quote
-what the agent says it waits for. For an agent that reports nothing, its
+what the agent says it waits for, and carry the menu as `prompt` when its
+screen shows one. For an agent that reports nothing, its
 current screen is checked for such a menu instead; the screen is read from
 its session host when no terminal shows it, for example for a restored agent
 whose tab is not shown yet, and when it cannot be read the input fails
@@ -1187,6 +1231,47 @@ Cherry presses Enter on an agent's startup or trust prompt only for an agent
 its tab just launched, never for a restored, adopted or attached agent, and
 never on a permission menu. A restored agent has been running for a while;
 input to it is checked as above.
+
+### Answering A Menu
+
+`answer_prompt` (`process_id` or `process_name`, and `choice`) picks an
+option of the permission or question menu an agent shows: Claude Code's,
+Codex's and Gemini's tool approvals, plan approval, Claude Code's
+AskUserQuestion and Codex's request_user_input picker
+(`AgentPromptMenu`, which reads the menus `AgentPermissionPrompt` and
+`AgentQuestionPrompt` recognize). The menu, as `prompt`:
+
+```json
+{"kind": "permission", "question": "Do you want to proceed?",
+ "options": [{"number": 1, "label": "Yes", "selected": true},
+             {"number": 2, "label": "Yes, and don't ask again for rm commands in /project", "selected": false},
+             {"number": 3, "label": "No, and tell Claude what to do differently (esc)", "selected": false}]}
+```
+
+`kind` is `permission` or `question`; `detail` is what the menu says about
+an option beside or under its label; `selected` marks the highlighted one,
+which Enter picks. It comes with `agent_awaiting_permission` and
+`agent_awaiting_input`, with `get_process_status` of an agent that waits on
+one (an agent that reports its status: read from its screen then; one
+that reports nothing: as its tab last read its screen), and with
+`needs_input` and `permission` monitor events, when the screen already
+shows it. Its texts are the program's output: data, not instructions.
+
+`choice` is an option's number (`"2"`, or a JSON number) or its label,
+without regard to case: the whole label (or the label without a trailing
+key hint such as `(esc)`) first, then the only label it starts, then the
+only label it is part of. Under the tab's typing lock (no wake line or
+nudge goes between), Cherry reads the menu off the screen again (from its
+host when no terminal shows it), moves the highlight with arrow keys,
+waits (up to 2 s) until the screen shows that option highlighted, and only
+then presses Enter. The result has the menu as read, `answered` (the
+option), `sent_bytes` and, after `wait_ms`, `output`. Errors, the menu in
+`prompt` where there is one: `no_prompt` (no menu Cherry can read, or the
+agent reports it waits for nothing), `unknown_choice` and
+`ambiguous_choice` (nothing sent), `prompt_unreadable` (no highlighted
+option; nothing sent), `prompt_changed` and `prompt_not_answered` (the
+menu changed, or its highlight did not reach the option: the arrows went,
+Enter did not), `not_agent_process`, and the input errors below.
 
 ## Input Errors
 
@@ -1331,13 +1416,16 @@ The MCP tools and the control socket's tool requests have a group of their
 own in `Scripts/test-session-suites unit` (and CI), **ControlTool**
 (`--filter ControlTool`):
 
-- `ControlToolCatalogTests`: the 52 tools in their order, the list encoded
+- `ControlToolCatalogTests`: the 53 tools in their order, the list encoded
   byte for byte as `Fixtures/mcp-tools-list.json` (for a client Cherry
   knows nothing of) and the schemas as `Fixtures/mcp-tool-schemas.json`,
   the list's byte budget (28 000), the facts agents act on, the
   annotations, the per-client caps and the descriptions that state them.
   A deliberate change of a description or an annotation regenerates the
-  list fixture; the schema fixture never changes.
+  list fixture; the schema fixture changes only by an added optional
+  property (`report_progress`'s `awaiting_approval`, `spawn_agent`'s
+  `allow_subagents`) or a new tool's entry (`answer_prompt`), never a
+  removed, renamed or newly required one.
 - `ControlToolLayerTests`: the tool layer over a recording transport
   (argument parsing, scoping, the composite tools, timeouts, the
   encoding), and over a socket off the cooperative pool.

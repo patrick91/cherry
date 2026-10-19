@@ -67,6 +67,7 @@ private func restoreAgent(
     into workspace: TerminalWorkspace,
     screen: String,
     programStatus: [ProgramStatus] = [],
+    bracketedPaste: Bool? = nil,
     owned: Bool = true
 ) async throws -> TerminalSession {
     let record = WorkspaceSessionRecord(
@@ -81,6 +82,7 @@ private func restoreAgent(
             PersistentSessionTag.kind: "agent",
             PersistentSessionTag.agent: "Claude"
         ],
+        bracketedPaste: bracketedPaste,
         programStatus: programStatus
     )]
     harness.fake.screenText = screen
@@ -107,6 +109,73 @@ private func typed(_ harness: PersistentHarness) -> [String] {
     harness.fake.requests("send_input").compactMap { request in
         request.string("data").flatMap { Data(base64Encoded: $0) }.map { String(decoding: $0, as: UTF8.self) }
     }
+}
+
+// MARK: - Messages of several lines
+
+/// A message of several lines reaches the agent as one message: its lines
+/// in one bracketed paste, then one Enter on its own, never an Enter per
+/// line (which sent the first paragraph and queued the rest).
+@Test @MainActor func aMessageOfSeveralLinesIsOnePasteAndOneEnter() async throws {
+    let harness = try PersistentHarness(configuration: safetyConfiguration())
+    let workspace = harness.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    defer {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let agent = try await restoreAgent(harness, into: workspace, screen: claudeComposerScreen)
+    let sent = try await control.send(.sendProcessInput(.init(
+        processID: agent.id.uuidString, text: "Review:\r\n1. fix a\n2. fix b\n", submit: true
+    )))
+    #expect(sent.error == nil)
+    #expect(typed(harness) == ["\u{1B}[200~Review:\n1. fix a\n2. fix b\u{1B}[201~", "\r"])
+
+    // A trailing newline submits it, as a one-line message's does; a
+    // message the caller does not submit is only pasted.
+    let unsubmitted = try await control.send(.sendProcessInput(.init(
+        processID: agent.id.uuidString, text: "draft\nmore", submit: false
+    )))
+    #expect(unsubmitted.error == nil)
+    #expect(typed(harness).last == "\u{1B}[200~draft\nmore\u{1B}[201~")
+    let trailing = try await control.send(.sendProcessInput(.init(
+        processID: agent.id.uuidString, text: "a\nb\n", submit: false
+    )))
+    #expect(trailing.error == nil)
+    #expect(Array(typed(harness).suffix(2)) == ["\u{1B}[200~a\nb\u{1B}[201~", "\r"])
+
+    // One line is typed as before.
+    let single = try await control.send(.sendProcessInput(.init(processID: agent.id.uuidString, text: "go on", submit: true)))
+    #expect(single.error == nil)
+    #expect(Array(typed(harness).suffix(2)) == ["go on", "\r"])
+}
+
+/// An agent whose host reports bracketed paste off gets the lines with LF
+/// between them (a newline in a composer, not Enter), then one Enter.
+@Test @MainActor func aMessageOfSeveralLinesToAnAgentWithoutBracketedPasteKeepsItsNewlines() async throws {
+    let harness = try PersistentHarness(configuration: safetyConfiguration())
+    let workspace = harness.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    defer {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let agent = try await restoreAgent(harness, into: workspace, screen: claudeComposerScreen, bracketedPaste: false)
+    let sent = try await control.send(.sendProcessInput(.init(
+        processID: agent.id.uuidString, text: "one\ntwo", submit: true
+    )))
+    #expect(sent.error == nil)
+    #expect(typed(harness) == ["one\ntwo", "\r"])
+}
+
+@Test func agentMessagePasteLeavesOneLineAloneAndStripsWhatWouldEndThePaste() throws {
+    #expect(CherryControlServer.agentMessagePaste("hello", bracketed: true) == nil)
+    #expect(CherryControlServer.agentMessagePaste("hello\n", bracketed: true) == nil)
+    let paste = try #require(CherryControlServer.agentMessagePaste("a\u{1B}[201~\nb\r\n", bracketed: true))
+    #expect(String(decoding: paste.payload, as: UTF8.self) == "\u{1B}[200~a [201~\nb\u{1B}[201~")
+    #expect(paste.endsWithNewline)
 }
 
 // MARK: - A restored agent at a permission prompt

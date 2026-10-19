@@ -137,6 +137,74 @@ struct ControlAgentTaskPersistenceTests {
         #expect(other.board.badges[workerB.id]?.label == "B")
     }
 
+    /// A task awaiting approval, its approval seq, a run's approval wake
+    /// and read seqs and a task's allow_subagents come back after a
+    /// relaunch; a file saved before they existed still reads.
+    @Test func approvalStateAndAllowSubagentsReadBack() async throws {
+        let directory = try privateDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = AgentTaskStore(directory: directory)
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.tasks.store = store
+        harness.server.start()
+        let lead = try await harness.spawnAgent(named: "Lead")
+        harness.server.callerSessionResolverForTesting = { _ in lead }
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "Worker", command: "/bin/cat"))
+        let response = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Worker", task: "Plan first", allowSubagents: true)))
+        guard case .spawnProcess(let spawned)? = response.result, let info = spawned.task else {
+            Issue.record("Expected a task spawn, got \(response)")
+            return
+        }
+        let worker = try #require(harness.workspace.session(id: spawned.process.id))
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+        #expect(try await harness.send(.reportProgress(.init(message: "OK to go?", awaitingApproval: true))).error == nil)
+        let original = try #require(harness.server.tasks.tasks[info.taskID])
+        #expect(original.state == .awaitingApproval && original.awaitingApprovalSeq != nil)
+        let run = try #require(harness.server.tasks.runs[info.runID])
+        run.approvalReadSeq = original.awaitingApprovalSeq ?? 0
+
+        harness.server.tasks.saveNow()
+        let saved = try #require(store.load())
+        let other = AgentTaskRegistry(board: AgentTaskBoard())
+        other.restore(from: saved)
+        let restored = try #require(other.tasks[info.taskID])
+        #expect(restored.state == .awaitingApproval)
+        #expect(restored.allowSubagents)
+        #expect(restored.awaitingApprovalSeq == original.awaitingApprovalSeq)
+        #expect(other.runs[info.runID]?.approvalReadSeq == run.approvalReadSeq)
+        #expect(other.info(for: try #require(other.runs[info.runID])).counts.awaitingApproval == 1)
+        // Seqs go on past the approval's.
+        #expect(other.nextSeq > (restored.awaitingApprovalSeq ?? 0))
+
+        // An older file: none of the new keys.
+        var json = try #require(try JSONSerialization.jsonObject(with: try JSONEncoder().encode(saved)) as? [String: Any])
+        json["tasks"] = (json["tasks"] as? [[String: Any]])?.map { task in
+            var task = task
+            task["allowSubagents"] = nil
+            task["awaitingApprovalSeq"] = nil
+            task["state"] = "working"
+            return task
+        }
+        json["runs"] = (json["runs"] as? [[String: Any]])?.map { run in
+            var run = run
+            run["approvalWokenSeq"] = nil
+            run["approvalReadSeq"] = nil
+            return run
+        }
+        let old = try JSONDecoder().decode(AgentTasksFileRecord.self, from: try JSONSerialization.data(withJSONObject: json))
+        let older = AgentTaskRegistry(board: AgentTaskBoard())
+        older.restore(from: old)
+        #expect(older.tasks[info.taskID]?.allowSubagents == false)
+        #expect(older.runs[info.runID]?.approvalReadSeq == 0)
+        // Counts from an app before awaiting_approval decode too.
+        let counts = try JSONDecoder().decode(
+            AgentRunCounts.self,
+            from: Data(#"{"total":1,"queued":0,"working":1,"needsInput":0,"reported":0,"noReport":0,"failed":0,"cancelled":0}"#.utf8)
+        )
+        #expect(counts.working == 1 && counts.awaitingApproval == 0)
+    }
+
     /// After a relaunch the worker's and orchestrator's tabs come back with
     /// their ids: the task's worker and the run's owner are those tabs
     /// again, and the orchestrator's own runs are its default selection.

@@ -5,6 +5,7 @@ mod guard;
 mod handover;
 mod input;
 mod passthrough;
+mod route;
 mod settle;
 mod status;
 mod stderr_relay;
@@ -46,7 +47,8 @@ const MAX_REMOTE_HOST_PATH_BYTES: usize = 1024;
 #[command(
     name = "cherry",
     version = cherry_protocol::VERSION,
-    about = "Persistent Cherry terminal sessions, locally or over SSH"
+    about = "Persistent Cherry terminal sessions, locally or over SSH (cherry host …; \
+             the commands also answer without `host`)"
 )]
 struct Cli {
     /// SSH host alias (uses your normal SSH configuration and authentication).
@@ -261,6 +263,18 @@ impl Cli {
 
 fn main() -> ExitCode {
     let arguments: Vec<OsString> = std::env::args_os().collect();
+    let arguments = match route::route(&arguments) {
+        route::Route::Host(arguments) => arguments,
+        route::Route::Agent(arguments) => {
+            let (code, message) = route::run_agent_command(&arguments);
+            eprintln!("{message}");
+            return ExitCode::from(code);
+        }
+        route::Route::Overview => {
+            print!("{}", route::OVERVIEW);
+            return ExitCode::SUCCESS;
+        }
+    };
     let cli = match Cli::try_parse_from(&arguments).and_then(Cli::validate) {
         Ok(cli) => cli,
         Err(error) => {
@@ -313,7 +327,7 @@ fn interruption_message(kind: Kind, signal: i32) -> String {
         Kind::Start => "; cherry-host may still be starting",
         Kind::Query => "",
         Kind::Mutation => {
-            "; the request may already have reached the host. Run `cherry list` to check its outcome"
+            "; the request may already have reached the host. Run `cherry host list` to check its outcome"
         }
         Kind::Attach => "; the host session was not terminated",
         Kind::Control => "",
@@ -349,7 +363,9 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
     }
     if let Action::Doctor = cli.command {
         if cli.host.is_some() {
-            bail!("doctor is local only; run it on the remote machine (ssh HOST cherry doctor)");
+            bail!(
+                "doctor is local only; run it on the remote machine (ssh HOST cherry host doctor)"
+            );
         }
         return diagnose::doctor(&transport::local_socket_path(cli.socket.as_deref())?);
     }

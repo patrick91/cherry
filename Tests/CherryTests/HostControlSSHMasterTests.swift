@@ -364,7 +364,7 @@ private struct FakeSSH {
     )
     _ = try await control.list()
     let path = try #require(manager.controlPathIfUp(for: "devbox"))
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "--ssh-control-path", path, "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "--ssh-control-path", path, "host", "control"])
     #expect(ssh.read("master-agent") == "/login/agent.sock")
     #expect(manager.status(of: "devbox")?.leases == 1)
     control.disconnect()
@@ -376,7 +376,7 @@ private struct FakeSSH {
     let lease = control.retain()
     defer { lease.release() }
     _ = try await control.list()
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "host", "control"])
     // The helper logged in on its own, so the master tries once more. It
     // still fails, and nothing retries it on a timer.
     #expect(await eventually { ssh.masterCalls.count == 3 && manager.status(of: "devbox")?.phase == .stopped })
@@ -389,11 +389,11 @@ private struct FakeSSH {
     let launches = fake.launches.count
     fake.dropAll()
     #expect(await eventually { fake.launches.count == launches + 1 && control.state == .connected })
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "host", "control"])
     #expect(await eventually { manager.status(of: "devbox")?.phase == .up })
     fake.dropAll()
     #expect(await eventually { fake.launches.count == launches + 2 && control.state == .connected })
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "--ssh-control-path", path, "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "--ssh-control-path", path, "host", "control"])
     control.disconnect()
 }
 
@@ -677,8 +677,8 @@ private func shardManager(
     let launch = try HostedAttachmentStatusFile.makeLaunchDirectory(in: ssh.directory)
     let statusFile = HostedAttachmentStatusFile.statusFileURL(in: launch)
     let arguments = attachment.launchArguments(statusFile: statusFile, masters: manager)
-    #expect(Array(arguments.prefix(8)) == [
-        "--host", "devbox", "--ssh-control-path", path, "--expected-host-id", "host-a", "attach", "s",
+    #expect(Array(arguments.prefix(9)) == [
+        "--host", "devbox", "--ssh-control-path", path, "--expected-host-id", "host-a", "host", "attach", "s",
     ])
     #expect(manager.status(of: "devbox")?.launches == 1)
     // Without a status file there is no launch to keep the master for.

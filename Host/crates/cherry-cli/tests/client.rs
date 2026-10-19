@@ -8131,7 +8131,7 @@ fn doctor_reports_stale_sockets_and_pid_files_and_holders_without_a_host() {
         )),
         "{report}"
     );
-    assert!(report.contains("fix: `cherry start`"), "{report}");
+    assert!(report.contains("fix: `cherry host start`"), "{report}");
     // The gone holder is only noted: the next host reports it as lost.
     assert!(
         report.contains("ok       1 session manifest names holders that are gone"),

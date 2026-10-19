@@ -259,6 +259,39 @@ app's tabs name (below) and whether it listens.
 The helper talks to Cherry through the instance-scoped Unix control socket; the
 old direct HTTP MCP endpoint has been removed.
 
+## The `cherry` Command
+
+Agents can also use the tools from a shell (docs/specs/agent-cli.md):
+`cherry ls`, `cherry send ID <<'EOF'`, `cherry task report`, … Each command
+is one catalog tool, run by `CherryMCP cli ARGS…` (the Rust `cherry` hands
+its non-host commands there) through the same session as an MCP call
+(`CherryMCPSession.call`, interface `cli`): the caller is identified,
+scoped and refused exactly as over MCP.
+
+- A command's words and positional arguments are in `CherryCLI.commands`
+  (`Sources/CherryMCP/CherryCLI.swift`); every other `--flag` is the tool's
+  parameter in kebab case, typed by its schema (`--no-x` sets a boolean
+  false, a list is `a,b`, an object is JSON, a file or `-`).
+  `cherry tool NAME [JSON | -]` calls any tool with its MCP arguments.
+- Long text (a brief, a message, a report, a schema) comes on standard
+  input: `-`, or nothing when standard input is a pipe or a file (never a
+  terminal or `/dev/null`).
+- `cherry send` to a tab that is not an agent types the text as a line
+  (`send_process_input` with submit), after the app refused
+  `send_agent_message` without sending anything.
+- Output is the tool's JSON when standard output is not a terminal (or with
+  `--json`), else a short form for `ls`, `show`, `read` and `task mine|list`.
+  A tool's error exits 1 with `code: message` (and its details as JSON) on
+  standard error; a usage error exits 2.
+- `cherry skill show` prints the guide (`CherryCLIGuide.guide`, from the
+  commands' table), `--skill-md` the `cherry` skill's SKILL.md.
+- Every This Mac tab has `cherry` first on its PATH: `CHERRY_BIN_DIR`, a
+  directory holding only a link to the app's `cherry` (`TabCLIDirectory`,
+  `<Application Support>/bin`, made by the instance-lock holder), which
+  Cherry's zsh bootstrap puts first again after the user's `.zshrc`. A
+  device's commands and agents get their install's directory first on the
+  login PATH their line sets; its interactive terminals keep `CHERRY_CLI`.
+
 ## Versions
 
 The app answers three requests of control protocol 2 besides the typed
@@ -1162,10 +1195,20 @@ also watches each open task's worker:
 
 A report after `no_report` or `failed` still replaces the result.
 
-**The sidebar.** A worker's row shows its label and a small glyph for its
-task's state (queued, working, needs you, awaits approval, reported, no
-report, failed, cancelled); hovering shows the result's summary. While one of its runs is
-open, the orchestrator's row shows how many of its tasks settled ("3/5").
+**The sidebar.** A worker's row shows its label and one mark: its
+task's state (queued, needs you, awaits approval, reported, no report,
+failed, cancelled; working is the spinner alone), unless its agent asks
+for permission or a question, which wins. A report is bright until its
+tab is seen, dim after; hovering shows the result's summary. While one of
+its runs is open, the orchestrator's row shows how many of its tasks
+settled ("3/5"). When the last of its workers' tasks settles, the sidebar
+folds the workers under it and the row reads what they came to ("10
+done", "8 done · 2 failed"); unfolded by hand, it stays so until a task
+settles again, and a group the sidebar folded unfolds when a new task
+opens. Close Finished Workers (the orchestrator's context menu, the Omni
+bar while it is the selected tab) closes the workers whose latest task
+settled, together, asking once only when one of them is working again or
+waiting for the user. Cherry never closes workers by itself.
 
 **Scope and lifetime.** Each task is tied to its worker's tab (by its id,
 or its persistent session). Tasks survive a relaunch of Cherry (quit,

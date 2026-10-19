@@ -392,6 +392,9 @@ enum OmniBarGathering {
         context.selectedAgent = selected.flatMap(ConnectThisAgent.harness(of:)).map {
             OmniSelectedAgent(harness: $0, productName: $0.productName)
         }
+        context.finishedWorkerCount = selected.map {
+            workspace.finishedWorkers(of: $0, summaries: AgentTaskBoard.shared.workerSummaries).count
+        } ?? 0
         return context
     }
 }
@@ -550,6 +553,10 @@ struct OmniBarPerformer {
                 return NSSound.beep()
             }
             ConnectThisAgentPresenter.present(session: session, repository: repository)
+        case .closeFinishedWorkers:
+            guard let session = workspace.selectedSession,
+                  SessionCloseCoordinator.closeFinishedWorkers(of: session, in: workspace, chromeState: chromeState) > 0
+            else { return NSSound.beep() }
         }
     }
 

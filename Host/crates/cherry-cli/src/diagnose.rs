@@ -203,7 +203,7 @@ fn status_text(
                 // On macOS, after an update installed in place, the daemon
                 // reports where it started from, which holds the new build.
                 let changed = if host.executable_changed {
-                    " (updated in place or removed since the host started; `cherry restart` runs the new one)"
+                    " (updated in place or removed since the host started; `cherry host restart` runs the new one)"
                 } else {
                     ""
                 };
@@ -470,7 +470,7 @@ fn check_socket(report: &mut Report, socket: &Path) -> Option<Answered> {
                 socket.display(),
                 meta.mode() & 0o777
             ),
-            "`cherry restart` binds it again with mode 0600",
+            "`cherry host restart` binds it again with mode 0600",
         );
     }
     let mut stream = match UnixStream::connect(socket) {
@@ -481,7 +481,7 @@ fn check_socket(report: &mut Report, socket: &Path) -> Option<Answered> {
                     "stale socket {}: nothing listens on it (its host ended without removing it)",
                     socket.display()
                 ),
-                "`cherry start` (or opening Cherry) replaces it with a new host; or remove it",
+                "`cherry host start` (or opening Cherry) replaces it with a new host; or remove it",
             );
             return None;
         }
@@ -508,7 +508,7 @@ fn check_socket(report: &mut Report, socket: &Path) -> Option<Answered> {
                     "a host is listening at {} but did not answer: {error}",
                     socket.display()
                 ),
-                "it may be busy or at its connection limit; if it stays so, `cherry restart` (sessions carry on)",
+                "it may be busy or at its connection limit; if it stays so, `cherry host restart` (sessions carry on)",
             );
             None
         }
@@ -577,7 +577,7 @@ fn check_daemon(report: &mut Report, daemon: &Answered) {
                     "the host speaks protocol {}, older than this cherry's {PROTOCOL_VERSION}",
                     daemon.version
                 ),
-                "`cherry list` (or opening Cherry) replaces it with this version; its sessions carry on",
+                "`cherry host list` (or opening Cherry) replaces it with this version; its sessions carry on",
             );
         } else {
             report.problem(
@@ -603,7 +603,7 @@ fn check_daemon(report: &mut Report, daemon: &Answered) {
         }
         Some(build) if cherry_protocol::build_is_newer(own_build(), build) => report.problem(
             format!("the host runs build {build}, older than this cherry's {own}"),
-            "`cherry restart` runs this build (sessions carry on); Cherry and `cherry list` do it themselves when they connect",
+            "`cherry host restart` runs this build (sessions carry on); Cherry and `cherry host list` do it themselves when they connect",
         ),
         Some(build) if cherry_protocol::build_is_newer(build, own_build()) => report.problem(
             format!("the host runs build {build}, newer than this cherry's {own}"),
@@ -611,11 +611,11 @@ fn check_daemon(report: &mut Report, daemon: &Answered) {
         ),
         Some(build) => report.problem(
             format!("the host runs build {build}, not this cherry's {own}"),
-            "`cherry restart` runs this cherry's cherry-host (sessions carry on)",
+            "`cherry host restart` runs this cherry's cherry-host (sessions carry on)",
         ),
         None => report.problem(
             "the host does not say its build: it is older than this cherry",
-            "`cherry restart` runs this cherry's cherry-host (sessions carry on)",
+            "`cherry host restart` runs this cherry's cherry-host (sessions carry on)",
         ),
     }
     let Some(status) = &daemon.status else {
@@ -634,7 +634,7 @@ fn check_daemon(report: &mut Report, daemon: &Answered) {
     match &status.executable {
         Some(executable) if !Path::new(executable).exists() => report.problem(
             format!("the host's executable {executable} is gone"),
-            "`cherry restart` (sessions carry on); new sessions cannot start until then",
+            "`cherry host restart` (sessions carry on); new sessions cannot start until then",
         ),
         // The daemon reports where it started from, which an update
         // installed in place filled with the new build; on macOS new holders
@@ -649,7 +649,7 @@ fn check_daemon(report: &mut Report, daemon: &Answered) {
                     ""
                 }
             ),
-            "`cherry restart` runs the new build (sessions carry on)",
+            "`cherry host restart` runs the new build (sessions carry on)",
         ),
         _ => {}
     }
@@ -660,7 +660,7 @@ fn check_daemon(report: &mut Report, daemon: &Answered) {
     {
         report.problem(
             format!("the host runs from a location that goes away: {reason}"),
-            "move Cherry to /Applications, open it from there, then `cherry restart`",
+            "move Cherry to /Applications, open it from there, then `cherry host restart`",
         );
     }
     if let Some(limit) = status.fd_limit {
@@ -671,7 +671,7 @@ fn check_daemon(report: &mut Report, daemon: &Answered) {
                     "the host's descriptor limit is {limit}, below the {needed} its {} connections need",
                     status.max_connections
                 ),
-                "raise the hard limit (`launchctl limit maxfiles`, or `ulimit -Hn` where the host starts), then `cherry restart`",
+                "raise the hard limit (`launchctl limit maxfiles`, or `ulimit -Hn` where the host starts), then `cherry host restart`",
             );
         } else {
             report.ok(format!("the host's descriptor limit is {limit}"));
@@ -683,7 +683,7 @@ fn check_daemon(report: &mut Report, daemon: &Answered) {
                 "the host is at its limit of {} sessions (exited ones included)",
                 status.max_sessions
             ),
-            "remove ended sessions (`cherry list`, then `cherry remove ID`)",
+            "remove ended sessions (`cherry host list`, then `cherry host remove ID`)",
         );
     }
     if u64::from(status.connections) * 10 >= u64::from(status.max_connections) * 9 {
@@ -692,7 +692,7 @@ fn check_daemon(report: &mut Report, daemon: &Answered) {
                 "the host serves {} of its {} connections",
                 status.connections, status.max_connections
             ),
-            "close clients that are left over (attached terminals, scripts), or `cherry restart`",
+            "close clients that are left over (attached terminals, scripts), or `cherry host restart`",
         );
     }
     let mut builds: BTreeMap<&str, usize> = BTreeMap::new();
@@ -762,7 +762,7 @@ fn check_state(report: &mut Report, state: &Path, daemon: Option<&Answered>) {
                         status.pid
                     ),
                     format!(
-                        "remove it (rm '{}'); `cherry restart` writes it again",
+                        "remove it (rm '{}'); `cherry host restart` writes it again",
                         pid_file.display()
                     ),
                 ),
@@ -771,7 +771,7 @@ fn check_state(report: &mut Report, state: &Path, daemon: Option<&Answered>) {
                         "PID file {} names pid {pid}, which runs, but no host answers at the socket",
                         pid_file.display()
                     ),
-                    format!("if pid {pid} is a cherry-host, it lost its socket: end it (kill {pid}; sessions carry on in their holders) and run `cherry start`"),
+                    format!("if pid {pid} is a cherry-host, it lost its socket: end it (kill {pid}; sessions carry on in their holders) and run `cherry host start`"),
                 ),
                 None if daemon.is_none() => report.problem(
                     format!(
@@ -806,7 +806,7 @@ fn check_state(report: &mut Report, state: &Path, daemon: Option<&Answered>) {
         if size > LARGE_LOG_BYTES {
             report.problem(
                 format!("{} is {} MiB", log.display(), size / (1024 * 1024)),
-                "look at its end for what repeats; it is moved aside to host.log.1 when the host next starts (`cherry restart`)",
+                "look at its end for what repeats; it is moved aside to host.log.1 when the host next starts (`cherry host restart`)",
             );
         } else {
             report.ok(format!("{} is {} KiB", log.display(), size.div_ceil(1024)));
@@ -846,7 +846,7 @@ fn check_state(report: &mut Report, state: &Path, daemon: Option<&Answered>) {
                 if held.len() == 1 { " is" } else { "s are" },
                 held.join(", ")
             ),
-            "`cherry start` (or opening Cherry) starts a host, and they register with it",
+            "`cherry host start` (or opening Cherry) starts a host, and they register with it",
         );
     }
     if !gone.is_empty() {
@@ -926,7 +926,7 @@ mod tests {
         assert!(
             report
                 .text
-                .contains("fix: `cherry restart` runs the new build (sessions carry on)"),
+                .contains("fix: `cherry host restart` runs the new build (sessions carry on)"),
             "{}",
             report.text
         );
@@ -939,7 +939,7 @@ mod tests {
         let changed = status_text(&greeting, Some(&host_status(&executable, true)), &[], 0);
         assert!(
             changed.contains(&format!(
-                "executable   {executable} (updated in place or removed since the host started; `cherry restart` runs the new one)\n"
+                "executable   {executable} (updated in place or removed since the host started; `cherry host restart` runs the new one)\n"
             )),
             "{changed}"
         );

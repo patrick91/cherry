@@ -72,10 +72,10 @@ private final class ScriptedCherry: @unchecked Sendable {
 
 @Test @MainActor func HostControlDiagnosticsShowCopyRevealAndRestart() async throws {
     let cherry = ScriptedCherry()
-    cherry.answer(["status", "--json"], HostCommandOutput(status: 0, output: runningStatus, errors: ""))
-    cherry.answer(["status"], HostCommandOutput(status: 0, output: "cherry-host 20260927101500.abc1234, protocol 7, pid 4242, up 2h 5m\n", errors: ""))
-    cherry.answer(["doctor"], HostCommandOutput(status: 1, output: "PROBLEM  stale PID file /state/host.pid\n         fix: remove it\n1 problem found.\n", errors: ""))
-    cherry.answer(["restart"], HostCommandOutput(status: 0, output: "", errors: ""))
+    cherry.answer(["host", "status", "--json"], HostCommandOutput(status: 0, output: runningStatus, errors: ""))
+    cherry.answer(["host", "status"], HostCommandOutput(status: 0, output: "cherry-host 20260927101500.abc1234, protocol 7, pid 4242, up 2h 5m\n", errors: ""))
+    cherry.answer(["host", "doctor"], HostCommandOutput(status: 1, output: "PROBLEM  stale PID file /state/host.pid\n         fix: remove it\n1 problem found.\n", errors: ""))
+    cherry.answer(["host", "restart"], HostCommandOutput(status: 0, output: "", errors: ""))
     var revealed: [URL] = []
     var copied: [String] = []
     let diagnostics = SessionHostDiagnostics(
@@ -93,18 +93,18 @@ private final class ScriptedCherry: @unchecked Sendable {
 
     await diagnostics.copyDiagnostics()
     let report = try #require(copied.last)
-    #expect(report.contains("$ cherry status\ncherry-host 20260927101500.abc1234, protocol 7, pid 4242, up 2h 5m\n"), "\(report)")
-    #expect(report.contains("$ cherry doctor\nPROBLEM  stale PID file /state/host.pid\n"), "\(report)")
+    #expect(report.contains("$ cherry host status\ncherry-host 20260927101500.abc1234, protocol 7, pid 4242, up 2h 5m\n"), "\(report)")
+    #expect(report.contains("$ cherry host doctor\nPROBLEM  stale PID file /state/host.pid\n"), "\(report)")
     #expect(report.contains("(exit status 1)"), "\(report)")
 
     await diagnostics.restartHost()
     #expect(diagnostics.restartFailure == nil)
     #expect(!diagnostics.isRestarting)
     // Only these commands ran: none of them starts a host by itself.
-    #expect(cherry.calls == [["status", "--json"], ["status"], ["doctor"], ["restart"], ["status", "--json"]])
+    #expect(cherry.calls == [["host", "status", "--json"], ["host", "status"], ["host", "doctor"], ["host", "restart"], ["host", "status", "--json"]])
 
     // A restart that fails says why.
-    cherry.answer(["restart"], HostCommandOutput(status: 1, output: "", errors: "cherry: refusing to restart the host; it keeps running: no cherry-host to start\n"))
+    cherry.answer(["host", "restart"], HostCommandOutput(status: 1, output: "", errors: "cherry: refusing to restart the host; it keeps running: no cherry-host to start\n"))
     await diagnostics.restartHost()
     #expect(diagnostics.restartFailure == "cherry: refusing to restart the host; it keeps running: no cherry-host to start")
 }
@@ -128,7 +128,7 @@ private final class ScriptedCherry: @unchecked Sendable {
 
 @Test @MainActor func HostControlDiagnosticsCopyTheSocketPathOnlyOnceItIsKnown() async throws {
     let cherry = ScriptedCherry()
-    cherry.answer(["status", "--json"], HostCommandOutput(status: 0, output: stoppedStatus, errors: ""))
+    cherry.answer(["host", "status", "--json"], HostCommandOutput(status: 0, output: stoppedStatus, errors: ""))
     var copied: [String] = []
     let diagnostics = SessionHostDiagnostics(
         runner: cherry.runner,
@@ -145,7 +145,7 @@ private final class ScriptedCherry: @unchecked Sendable {
     await diagnostics.refresh()
     diagnostics.copySocketPath()
     #expect(copied == ["/tmp/cherry-host-501/host.sock"])
-    #expect(cherry.calls == [["status", "--json"]])
+    #expect(cherry.calls == [["host", "status", "--json"]])
 
     // Where sessions cannot run there is no status, so no socket.
     let unavailable = SessionHostDiagnostics(
@@ -189,8 +189,8 @@ private final class ScriptedCherry: @unchecked Sendable {
 
     // The diagnostics' own state, as `cherry status` answered.
     let cherry = ScriptedCherry()
-    cherry.answer(["status", "--json"], HostCommandOutput(status: 0, output: runningStatus, errors: ""))
-    cherry.answer(["restart"], HostCommandOutput(status: 1, output: "", errors: "cherry: no cherry-host to start\n"))
+    cherry.answer(["host", "status", "--json"], HostCommandOutput(status: 0, output: runningStatus, errors: ""))
+    cherry.answer(["host", "restart"], HostCommandOutput(status: 1, output: "", errors: "cherry: no cherry-host to start\n"))
     let diagnostics = SessionHostDiagnostics(
         runner: cherry.runner, unavailableReason: { nil }, revealInFinder: { _ in }, copyToPasteboard: { _ in }
     )
@@ -220,7 +220,7 @@ private final class ScriptedCherry: @unchecked Sendable {
     )
     await broken.refresh()
     #expect(broken.status == nil)
-    #expect(broken.problem == "error: unexpected [\"status\", \"--json\"]")
+    #expect(broken.problem == "error: unexpected [\"host\", \"status\", \"--json\"]")
 }
 
 @Test @MainActor func HostControlSessionDiagnosticsGoToTheUnifiedLog() async throws {
@@ -342,7 +342,7 @@ private final class ScriptedCherry: @unchecked Sendable {
     #expect(status.maxSessions == 128)
 
     let report = await diagnostics.diagnostics()
-    #expect(report.contains("$ cherry status\ncherry-host \(status.build ?? "?"), protocol "), "\(report)")
+    #expect(report.contains("$ cherry host status\ncherry-host \(status.build ?? "?"), protocol "), "\(report)")
     #expect(report.contains("the host runs this cherry's build and protocol"), "\(report)")
 
     await diagnostics.restartHost()

@@ -1073,7 +1073,7 @@ struct RemoteHostInstaller: Sendable {
     private static func reportLines() -> [String] {
         [
             "if [ -x \"$dir/cherry\" ]; then",
-            "  printf 'status=%s\\n' \"$(\"$dir/cherry\" status --json 2>/dev/null | tr -d '\\n')\"",
+            "  printf 'status=%s\\n' \"$(\"$dir/cherry\" host status --json 2>/dev/null | tr -d '\\n')\"",
             "  printf 'hoststatus=%s\\n' \"$(\"$dir/cherry-host\" status --json 2>/dev/null | tr -d '\\n')\"",
             "fi",
             "for d in \"$root\"/*; do",
@@ -1100,7 +1100,7 @@ struct RemoteHostInstaller: Sendable {
     static func handOverScript(directoryName: String, pid: UInt32, executable: String, build: String) -> String {
         var lines = prelude(directoryName: directoryName)
         lines += [
-            "if restart=$(\"$dir/cherry\" restart --if-pid \(pid) --if-executable \(RemoteDeviceProbe.singleQuoted(executable)) --if-build \(RemoteDeviceProbe.singleQuoted(build)) 2>&1); then",
+            "if restart=$(\"$dir/cherry\" host restart --if-pid \(pid) --if-executable \(RemoteDeviceProbe.singleQuoted(executable)) --if-build \(RemoteDeviceProbe.singleQuoted(build)) 2>&1); then",
             "  echo restart=ok",
             "else",
             "  code=$?",

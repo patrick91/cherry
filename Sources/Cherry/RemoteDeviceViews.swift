@@ -542,7 +542,7 @@ final class UpdateDeviceHostModel: ObservableObject {
             case .sameProtocol(_, let newer):
                 lines.append(newer
                     ? "Its session host is a newer build and keeps running; this one relays to it."
-                    : "Its session host keeps its sessions. When it runs an older install of this Cherry's, it moves to this build (`cherry restart`), and its sessions carry on.")
+                    : "Its session host keeps its sessions. When it runs an older install of this Cherry's, it moves to this build (`cherry host restart`), and its sessions carry on.")
             case .olderProtocol(let version):
                 lines.append("Its session host speaks protocol \(version): the next connection replaces it, and its sessions carry on.")
             case .unknown(let reason):

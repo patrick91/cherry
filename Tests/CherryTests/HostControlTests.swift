@@ -50,7 +50,7 @@ private final class EventRecorder {
     // none of a Cherry tab's identity (the test may run inside a Cherry tab).
     let launch = try #require(fake.launches.first)
     #expect(launch.executableURL.path == "/fake/bin/cherry")
-    #expect(launch.arguments == ["control"])
+    #expect(launch.arguments == ["host", "control"])
     #expect(launch.environment["SSH_AUTH_SOCK"] == "/login/agent.sock")
     #expect(launch.environment["PATH"] == "/login/bin:/usr/bin")
     #expect(launch.environment["CHERRY_PROCESS_ID"] == nil)
@@ -69,7 +69,7 @@ private final class EventRecorder {
     let remote = makeFakeHostControl(fake, host: devbox, hostStore: store)
     defer { remote.disconnect() }
     _ = try await remote.list()
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "host", "control"])
     #expect(store.trustedHostID(for: devbox) == "host-a")
 }
 
@@ -668,7 +668,7 @@ private final class HeldRequests: @unchecked Sendable {
     let control = makeFakeHostControl(fake, host: devbox, hostStore: store)
     defer { control.disconnect() }
     _ = try await control.list()
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "--expected-host-id", trusted, "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "--expected-host-id", trusted, "host", "control"])
 
     // Another host answers for the destination. The helper refuses it before
     // using it (or replacing an older one), and the app reports a mismatch,
@@ -690,11 +690,11 @@ private final class HeldRequests: @unchecked Sendable {
 
     // Trusting the new identity is the user's decision: that helper expects none.
     try await control.trustNewIdentity()
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "host", "control"])
     #expect(store.trustedHostID(for: devbox) == other)
     control.disconnect()
     _ = try await control.list()
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "--expected-host-id", other, "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "--expected-host-id", other, "host", "control"])
 
     // Identities the helper would not accept are left to the app's own check.
     #expect(HostControl.expectedHostIDArguments("host-a").isEmpty)
@@ -789,7 +789,7 @@ private final class HeldRequests: @unchecked Sendable {
     #expect(list.hostID == "host-real")
     #expect(list.sessions.map(\.id) == ["real-1"])
     func read(_ name: String) -> String? { try? String(contentsOf: root.appendingPathComponent(name), encoding: .utf8) }
-    #expect(read("arguments") == "control\n")
+    #expect(read("arguments") == "host\ncontrol\n")
     #expect(read("agent") == "/login/agent.sock")
     #expect(read("tab") == "unset")
     try await control.sendInput("real-1", Data("hi".utf8))

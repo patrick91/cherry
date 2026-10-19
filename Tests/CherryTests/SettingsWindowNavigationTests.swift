@@ -390,8 +390,8 @@ private func keyDown(_ characters: String, modifiers: NSEvent.ModifierFlags = [.
     now += .seconds(1)
     await refresh.refresh(diagnostics)?.value
 
-    // `cherry status --json` only, which never starts a host.
-    #expect(calls.withLock { $0 } == [["status", "--json"], ["status", "--json"]])
+    // `cherry host status --json` only, which never starts a host.
+    #expect(calls.withLock { $0 } == [["host", "status", "--json"], ["host", "status", "--json"]])
 }
 
 // MARK: - Sidebar rows

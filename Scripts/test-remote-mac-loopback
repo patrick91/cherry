@@ -218,7 +218,7 @@ printf '%s\n' "$check" | grep -q '^version={"protocol":' || fail "cherry-host ve
 printf '%s\n' "$check" | grep -q '^status={"running":false' || fail "cherry-host status --json (no daemon yet): $check"
 pass "the Add Mac check through sh -s"
 
-cli() { "$binaries/cherry" --host loopback --socket "$socket" "$@"; }
+cli() { "$binaries/cherry" --host loopback --socket "$socket" host "$@"; }
 
 session=$(cli new --cwd "~" --name loopback-test --owner "Cherry@00000000-0000-0000-0000-000000000000" \
   --tag cherry.project="device:00000000-0000-0000-0000-000000000000:$dir/remote/home" -- /bin/sh -c 'sleep 600')
@@ -231,7 +231,7 @@ pass "a session created and listed through cherry --host (gateway, private daemo
   || fail "--remote-host-path"
 pass "--remote-host-path"
 
-cli kill "$id" >/dev/null || fail "cherry kill"
+cli kill "$id" >/dev/null || fail "cherry host kill"
 for _ in $(seq 1 50); do
   if ! cli list | grep "$id" | grep -q running; then break; fi
   sleep 0.1

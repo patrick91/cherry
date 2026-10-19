@@ -267,12 +267,12 @@ final class FakeRemoteMac {
         )
     }
 
-    /// `cherry status --json` for its daemon, as a process there would ask
+    /// `cherry host status --json` for its daemon, as a process there would ask
     /// (never through ssh, never starting one).
     func cliStatus() throws -> RemoteCLIStatusReport {
         let process = Process()
         process.executableURL = binaries.appendingPathComponent("cherry")
-        process.arguments = ["status", "--json"]
+        process.arguments = ["host", "status", "--json"]
         process.environment = daemonEnvironment.filter { $0.key != "CHERRY_HOST_TEST_BUILD" }
         let output = Pipe()
         process.standardOutput = output

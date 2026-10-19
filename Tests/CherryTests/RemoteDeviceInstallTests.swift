@@ -454,7 +454,7 @@ private enum MachOFixture {
     #expect(finish.contains("expected='h1 h2 '"))
     #expect(finish.contains("place 'b' || place 'b-h1h2'"))
     let handOver = RemoteHostInstaller.handOverScript(directoryName: "b", pid: 42, executable: "/x/it's/cherry-host", build: "b0")
-    #expect(handOver.contains(#""$dir/cherry" restart --if-pid 42 --if-executable '/x/it'\''s/cherry-host' --if-build 'b0'"#))
+    #expect(handOver.contains(#""$dir/cherry" host restart --if-pid 42 --if-executable '/x/it'\''s/cherry-host' --if-build 'b0'"#))
     #expect(handOver.contains("restart=changed"))
 }
 

@@ -1962,7 +1962,7 @@ fn status_and_doctor_describe_a_running_host() {
         )),
         "{report}"
     );
-    assert!(report.contains("fix: `cherry restart`"), "{report}");
+    assert!(report.contains("fix: `cherry host restart`"), "{report}");
 }
 
 /// A build older than `NEW_BUILD`, which the daemons of these tests report.

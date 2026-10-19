@@ -129,6 +129,10 @@ final class RepositoryWorkspace: ObservableObject {
     private var optimisticSelection: SelectionMark?
     private var chromeStateSubscription: AnyCancellable?
     private weak var chromeState: ProjectWindowChromeState?
+    /// The tasks the sidebar shows (the app's control server writes
+    /// `.shared`; tests give their own).
+    var taskBoard: AgentTaskBoard = .shared
+    private var workerSummariesSubscription: AnyCancellable?
     /// Agent groups a restore collapsed while the window had given no
     /// chrome state (tests): saved with the tabs.
     private var collapsedAgentGroupIDsWithoutChrome: Set<UUID> = []
@@ -604,6 +608,7 @@ final class RepositoryWorkspace: ObservableObject {
             chromeStateSubscription = stateStore == nil ? nil : chromeState.$collapsedAgentGroupIDs
                 .dropFirst()
                 .sink { [weak self] _ in self?.scheduleStateSave() }
+            observeWorkerSummaries(for: chromeState)
         }
         guard !didBeginRestore, !isTearingDown else { return }
         didBeginRestore = true
@@ -1510,6 +1515,19 @@ final class RepositoryWorkspace: ObservableObject {
         guard !ready.isEmpty else { return }
         autoStartsWaitingForRetry.removeAll { !names.contains(AgentToolDefinition.normalizedName($0.name)) }
         startAutoStartCommands(ready)
+    }
+
+    /// Folds an orchestrator's workers in the sidebar once all their tasks
+    /// settled (`ProjectWindowChromeState.applyWorkerSummaries`).
+    func observeWorkerSummaries(for chromeState: ProjectWindowChromeState) {
+        workerSummariesSubscription = taskBoard.$workerSummaries
+            .scan(([UUID: AgentWorkerSummary](), [UUID: AgentWorkerSummary]())) { ($0.1, $1) }
+            .sink { [weak self, weak chromeState] old, new in
+                guard let self, let chromeState else { return }
+                chromeState.applyWorkerSummaries(
+                    from: old, to: new, sessionIDs: Set(self.workspace.sessions.map(\.id))
+                )
+            }
     }
 
     private func applyCollapsedAgentGroupIDs(_ savedIDs: [UUID]) {

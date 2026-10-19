@@ -49,6 +49,8 @@ struct HostedSessionFakeCLI {
             --expected-host-id=*) expected=${1#*=} ;;
             --host|--socket|--ssh-control-path) takes_value "$1" "$2"; shift ;;
             --expected-host-id) takes_value "$1" "$2"; expected=$2; shift ;;
+            # `cherry host …`: the session-host commands, also without it.
+            host) ;;
             -*) fail "unexpected argument '$1' found" ;;
             *) break ;;
           esac

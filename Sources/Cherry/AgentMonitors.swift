@@ -209,6 +209,7 @@ final class AgentMonitorRegistry {
         matchedLine: String? = nil,
         basis: String? = nil,
         task: AgentTask? = nil,
+        prompt: AgentPromptInfo? = nil,
         initial: Bool
     ) {
         guard subscription.events.contains(type) else { return }
@@ -225,6 +226,7 @@ final class AgentMonitorRegistry {
             basis: basis,
             taskID: task?.id,
             taskState: task?.state.rawValue,
+            prompt: prompt,
             initial: initial
         )
         subscription.nextSeq += 1
@@ -762,9 +764,15 @@ extension CherryControlServer {
                     tellTurnDone(initial: initial)
                 }
             case "needs_input":
-                monitors.append(.needsInput, to: subscription, process: watched, session: session, initial: initial)
+                monitors.append(
+                    .needsInput, to: subscription, process: watched, session: session,
+                    prompt: session.flatMap { Self.shownPrompt(of: $0) }, initial: initial
+                )
             case "permission":
-                monitors.append(.permission, to: subscription, process: watched, session: session, initial: initial)
+                monitors.append(
+                    .permission, to: subscription, process: watched, session: session,
+                    prompt: session.flatMap { Self.shownPrompt(of: $0) }, initial: initial
+                )
             case "error":
                 monitors.append(.error, to: subscription, process: watched, session: session, initial: initial)
             default:

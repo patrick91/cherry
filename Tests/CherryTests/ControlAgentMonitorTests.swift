@@ -261,6 +261,16 @@ struct ControlAgentMonitorTests {
         harness.report("state=blocked:app=claude-code:kind=question", on: worker)
         let question = try await harness.events(id)
         #expect(question.events.map(\.type) == [.needsInput])
+        // The menu its screen shows, for answer_prompt.
+        #expect(question.events.first?.prompt?.kind == "question")
+        #expect(question.events.first?.prompt?.question == "Which storage backend should I use?")
+        #expect(question.events.first?.prompt?.options.map(\.label) == ["SQLite", "Postgres", "Type something.", "Chat about this"])
+        let status = try await harness.send(.getProcessStatus(.init(processID: worker.id.uuidString)))
+        guard case .getProcessStatus(let shown)? = status.result else {
+            Issue.record("Expected getProcessStatus, got \(String(describing: status))")
+            return
+        }
+        #expect(shown.prompt?.options.first?.selected == true)
 
         // "approve Bash: rm -rf build"
         harness.report("state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiBybSAtcmYgYnVpbGQ=", on: worker)

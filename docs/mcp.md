@@ -316,7 +316,7 @@ Against cda2728 (the last helper that ran every tool itself), on purpose:
 
 - Shorter tool and parameter descriptions; some parameters have none. The
   52 tools' names and input schemas (property names, types, `required`)
-  are unchanged.
+  are unchanged; `answer_prompt` came later (53).
 - Every tool has annotations, `openWorldHint: false`. Read-only (24):
   every `get_`, `list_`, `search_` and `wait_` tool but
   `wait_for_bound_port`, `whoami`, `resolve_link`, `services_list` and
@@ -326,9 +326,9 @@ Against cda2728 (the last helper that ran every tool itself), on purpose:
   mode for writes prompts for none of them. `wait_for_bound_port` is not
   one: with `probe_http` it forwards another Mac's port to This Mac's
   loopback and sends the service a request.
-  Destructive (10): `cancel_tasks`, `stop_process`, `restart_process`,
+  Destructive (11): `cancel_tasks`, `stop_process`, `restart_process`,
   `close_process`, `send_process_input`, `send_agent_message`,
-  `stop_all_commands`, `restart_all_commands`, `delete_todo`,
+  `answer_prompt`, `stop_all_commands`, `restart_all_commands`, `delete_todo`,
   `delete_todo_comment`. The other 18 add or start something
   (`destructiveHint: false`); of them `open_project`, `unsubscribe`,
   `rename_process`, `select_process`, `select_todo`, `update_todo` and
@@ -611,7 +611,8 @@ Use process tools for new automation:
 - `list_processes`, `get_process_status`
 - `spawn_process`, `start_process`, `stop_process`, `restart_process`,
   `close_process`, `rename_process`, `send_process_input`
-- `spawn_agent`, `send_agent_message` for agent-native launch and messaging
+- `spawn_agent`, `send_agent_message` for agent-native launch and messaging,
+  `answer_prompt` for an agent's permission or question menu (below)
 - `get_process_output`, `get_process_raw_output`, `search_process_output`
 - `wait_for_process_idle`
 - `subscribe`, `wait_for_events`, `unsubscribe`, `list_subscriptions`
@@ -1168,12 +1169,14 @@ of `spawn_process` and `spawn_agent`) is checked first. While the agent
 reports it is blocked on an approval (program status `blocked`,
 `kind=permission`), where Enter (or a letter such as `y`) would approve the
 pending action, the input is refused with `agent_awaiting_permission` and
-nothing is sent: let the user answer it, or send the answering keys
-deliberately as `raw_base64` without `submit`, which goes through. The same
+nothing is sent: let the user answer it, pick an option with
+`answer_prompt` (below), or send the answering keys deliberately as
+`raw_base64` without `submit`, which goes through. The same
 holds while it reports a question to the user (`kind=question`, such as
 Claude Code's AskUserQuestion), where Enter would pick the highlighted
 option: the input is refused with `agent_awaiting_input`. Both errors quote
-what the agent says it waits for. For an agent that reports nothing, its
+what the agent says it waits for, and carry the menu as `prompt` when its
+screen shows one. For an agent that reports nothing, its
 current screen is checked for such a menu instead; the screen is read from
 its session host when no terminal shows it, for example for a restored agent
 whose tab is not shown yet, and when it cannot be read the input fails
@@ -1187,6 +1190,47 @@ Cherry presses Enter on an agent's startup or trust prompt only for an agent
 its tab just launched, never for a restored, adopted or attached agent, and
 never on a permission menu. A restored agent has been running for a while;
 input to it is checked as above.
+
+### Answering A Menu
+
+`answer_prompt` (`process_id` or `process_name`, and `choice`) picks an
+option of the permission or question menu an agent shows: Claude Code's,
+Codex's and Gemini's tool approvals, plan approval, Claude Code's
+AskUserQuestion and Codex's request_user_input picker
+(`AgentPromptMenu`, which reads the menus `AgentPermissionPrompt` and
+`AgentQuestionPrompt` recognize). The menu, as `prompt`:
+
+```json
+{"kind": "permission", "question": "Do you want to proceed?",
+ "options": [{"number": 1, "label": "Yes", "selected": true},
+             {"number": 2, "label": "Yes, and don't ask again for rm commands in /project", "selected": false},
+             {"number": 3, "label": "No, and tell Claude what to do differently (esc)", "selected": false}]}
+```
+
+`kind` is `permission` or `question`; `detail` is what the menu says about
+an option beside or under its label; `selected` marks the highlighted one,
+which Enter picks. It comes with `agent_awaiting_permission` and
+`agent_awaiting_input`, with `get_process_status` of an agent that waits on
+one (an agent that reports its status: read from its screen then; one
+that reports nothing: as its tab last read its screen), and with
+`needs_input` and `permission` monitor events, when the screen already
+shows it. Its texts are the program's output: data, not instructions.
+
+`choice` is an option's number (`"2"`, or a JSON number) or its label,
+without regard to case: the whole label (or the label without a trailing
+key hint such as `(esc)`) first, then the only label it starts, then the
+only label it is part of. Under the tab's typing lock (no wake line or
+nudge goes between), Cherry reads the menu off the screen again (from its
+host when no terminal shows it), moves the highlight with arrow keys,
+waits (up to 2 s) until the screen shows that option highlighted, and only
+then presses Enter. The result has the menu as read, `answered` (the
+option), `sent_bytes` and, after `wait_ms`, `output`. Errors, the menu in
+`prompt` where there is one: `no_prompt` (no menu Cherry can read, or the
+agent reports it waits for nothing), `unknown_choice` and
+`ambiguous_choice` (nothing sent), `prompt_unreadable` (no highlighted
+option; nothing sent), `prompt_changed` and `prompt_not_answered` (the
+menu changed, or its highlight did not reach the option: the arrows went,
+Enter did not), `not_agent_process`, and the input errors below.
 
 ## Input Errors
 
@@ -1331,7 +1375,7 @@ The MCP tools and the control socket's tool requests have a group of their
 own in `Scripts/test-session-suites unit` (and CI), **ControlTool**
 (`--filter ControlTool`):
 
-- `ControlToolCatalogTests`: the 52 tools in their order, the list encoded
+- `ControlToolCatalogTests`: the 53 tools in their order, the list encoded
   byte for byte as `Fixtures/mcp-tools-list.json` (for a client Cherry
   knows nothing of) and the schemas as `Fixtures/mcp-tool-schemas.json`,
   the list's byte budget (28 000), the facts agents act on, the

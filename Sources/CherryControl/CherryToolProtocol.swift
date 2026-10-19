@@ -105,7 +105,8 @@ public struct ToolCallContext: Codable, Equatable, Sendable {
     /// a call that names none.
     public var workingDirectory: String?
     public var profile: ToolClientProfile?
-    /// Which interface made the call: "mcp", or "call" (`CherryMCP --call`).
+    /// Which interface made the call: "mcp", "call" (`CherryMCP --call`) or
+    /// "cli" (`cherry`'s agent commands, `CherryMCP cli`).
     public var interface: String?
 
     public init(

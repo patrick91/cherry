@@ -120,7 +120,8 @@ struct HostedLaunchSpec: Equatable, Sendable {
             mcpHelperPath: context.mcpHelperPath,
             mcpServerName: context.mcpServerName,
             controlSocketPath: context.controlSocketPath,
-            cliPath: context.cliPath
+            cliPath: context.cliPath,
+            cliDirectory: context.cliDirectory
         )
         let command = if let resources {
             ghosttyShellIntegration(
@@ -133,8 +134,14 @@ struct HostedLaunchSpec: Equatable, Sendable {
             cherry.command
         }
 
-        // Cherry's environment overrides everything, as Ghostty's env_override.
+        // Cherry's environment overrides everything, as Ghostty's env_override,
+        // but for PATH: the session's own (the login environment's), with
+        // `cherry`'s directory first (`TabCLIDirectory`).
+        let sessionPath = environment["PATH"]
         environment.merge(cherry.environment) { _, cherry in cherry }
+        if let cliDirectory = context.cliDirectory, !cliDirectory.isEmpty {
+            environment["PATH"] = TabCLIDirectory.prepending(cliDirectory, to: sessionPath)
+        }
         // An empty CHERRY_CONTROL_SOCKET hides Cherry's own from a Ghostty
         // surface; the host's environment never had that one (see
         // `inheritedTerminalKeys`).
@@ -168,6 +175,7 @@ struct HostedLaunchSpec: Equatable, Sendable {
         parentProcessID: pid_t = getppid(),
         controlSocketPath: String? = CherryControlServer.appSocketPath,
         cliPath: String? = ShellProcessController.appCLIPath,
+        cliDirectory: String? = TabCLIDirectory.current,
         stager: GhosttyResourceStager = .shared
     ) async -> HostedLaunchSpec {
         let context = await HostedLaunchContext.prepare(
@@ -180,6 +188,7 @@ struct HostedLaunchSpec: Equatable, Sendable {
             parentProcessID: parentProcessID,
             controlSocketPath: controlSocketPath,
             cliPath: cliPath,
+            cliDirectory: cliDirectory,
             stager: stager
         )
         return make(for: configuration, context: context)
@@ -432,7 +441,7 @@ enum CherryTabEnvironment {
         CherryControl.controlMachineEnvironmentKey,
         "CHERRY_SESSION_ID", "CHERRY_BOOTSTRAP_ZDOTDIR",
         "CHERRY_ORIGINAL_ZDOTDIR", "CHERRY_STARTUP_COMMAND", "CHERRY_EMIT_OSC133",
-        "CHERRY_TERM_PROGRAM", "INSIDE_CHERRY"
+        "CHERRY_TERM_PROGRAM", "INSIDE_CHERRY", TabCLIDirectory.environmentKey
     ]
 
     /// What an agent CLI sets for the programs it runs (Claude Code's Bash
@@ -539,6 +548,9 @@ struct HostedLaunchContext: Equatable, Sendable {
     /// CHERRY_CLI: the `cherry` the app runs itself
     /// (`ShellProcessController.appCLIPath`).
     var cliPath: String? = nil
+    /// CHERRY_BIN_DIR, first on PATH: the directory holding only a link to
+    /// it (`TabCLIDirectory.current`).
+    var cliDirectory: String? = nil
 
     /// Ghostty's defaults as Cherry configures it: cursor, path and title on;
     /// sudo, ssh-env and ssh-terminfo off. The cursor feature follows the
@@ -578,6 +590,7 @@ struct HostedLaunchContext: Equatable, Sendable {
         parentProcessID: pid_t = getppid(),
         controlSocketPath: String? = CherryControlServer.appSocketPath,
         cliPath: String? = ShellProcessController.appCLIPath,
+        cliDirectory: String? = TabCLIDirectory.current,
         stager: GhosttyResourceStager = .shared
     ) async -> HostedLaunchContext {
         let shellPath = configuration.shellPath
@@ -604,7 +617,8 @@ struct HostedLaunchContext: Equatable, Sendable {
             shellFeatures: ghosttyShellFeatures(cursorBlink: cursorBlink),
             mcpHelperPath: mcpHelperPath,
             controlSocketPath: controlSocketPath,
-            cliPath: cliPath
+            cliPath: cliPath,
+            cliDirectory: cliDirectory
         )
     }
 }

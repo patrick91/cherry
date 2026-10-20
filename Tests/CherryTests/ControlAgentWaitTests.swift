@@ -1,5 +1,4 @@
-import CherryControl
-@testable import CherryMCP
+@testable import CherryControl
 import Darwin
 import Foundation
 import Testing
@@ -288,14 +287,14 @@ struct ControlAgentWaitTests {
     /// Codex gives an MCP tool call 60 s by default: a wait with the
     /// default timeout must answer well before that.
     @Test func defaultWaitsFitInASixtySecondToolTimeout() throws {
-        let wait = try #require(CherryMCPTools.clientTimeout(for: "wait_for_process_idle", arguments: [:]))
+        let wait = try #require(CherryToolLayer.clientTimeout(for: "wait_for_process_idle", arguments: [:]))
         #expect(wait <= 55)
-        let message = try #require(CherryMCPTools.clientTimeout(for: "send_agent_message", arguments: [:]))
+        let message = try #require(CherryToolLayer.clientTimeout(for: "send_agent_message", arguments: [:]))
         #expect(message <= 55)
-        let events = try #require(CherryMCPTools.clientTimeout(for: "wait_for_events", arguments: [:]))
+        let events = try #require(CherryToolLayer.clientTimeout(for: "wait_for_events", arguments: [:]))
         #expect(events <= 55)
         // wait_for_events never waits longer, whatever it is asked.
-        #expect(CherryMCPTools.clientTimeout(for: "wait_for_events", arguments: ["timeout_ms": .int(300_000)]) == events)
+        #expect(CherryToolLayer.clientTimeout(for: "wait_for_events", arguments: ["timeout_ms": .int(300_000)]) == events)
         let advertised = Set(CherryToolCatalog.tools(for: .unknown).map(\.name))
         #expect(advertised.isSuperset(of: ["subscribe", "unsubscribe", "wait_for_events", "list_subscriptions"]))
     }

@@ -470,13 +470,9 @@ final class RemoteDeviceStore: ObservableObject {
             launch.mcp = RemoteMCPLaunch(
                 deviceID: id,
                 socketPath: socket,
-                helperPath: device.installedResources
-                    ? RemoteMCPPaths.helperPath(remoteHostPath: device.remoteHostPath, homeDirectory: device.homeDirectory)
-                    : nil,
                 cliPath: device.installedResources
                     ? RemoteMCPPaths.cliPath(remoteHostPath: device.remoteHostPath, homeDirectory: device.homeDirectory)
                     : nil,
-                serverName: CherryAppIdentity.current.urlScheme,
                 controlMachine: RemoteMCPLaunch.thisMacName,
                 tokens: .shared
             )

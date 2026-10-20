@@ -5,13 +5,28 @@ import Foundation
 // the command is the user's consent; `--dry-run` only says what it would do.
 
 extension CherryCLIRunner {
-    /// The installer for `request`: this process's environment, the
-    /// repository of the working directory with `--project`.
-    public static func installer(for request: CherrySkillRequest) -> CherrySkillInstaller {
+    /// The installer for `request` of a caller with `variables`
+    /// (`RunCommandRequest.environment`): its HOME and PATH, and with
+    /// `--project` the repository of `workingDirectory`, on `files` (the
+    /// caller's Mac). Nil without an absolute HOME.
+    public static func installer(
+        for request: CherrySkillRequest,
+        variables: [String: String],
+        workingDirectory: String?,
+        files: any CherrySkillFiles
+    ) -> CherrySkillInstaller? {
+        guard let home = variables["HOME"], home.hasPrefix("/") else { return nil }
+        let homeURL = URL(fileURLWithPath: home)
         let root = request.project
-            ? CherrySkillEnvironment.projectRoot(from: URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
+            ? CherrySkillEnvironment.projectRoot(from: URL(fileURLWithPath: workingDirectory ?? home), files: files)
             : nil
-        return CherrySkillInstaller(environment: .current(projectRoot: root))
+        return CherrySkillInstaller(environment: .caller(home: homeURL, variables: variables, projectRoot: root, files: files))
+    }
+
+    /// `cherry skill setup|status|remove` with no installer: the caller's
+    /// HOME is not known.
+    static func skillUnavailable(_ request: CherrySkillRequest) -> String {
+        "skill_unavailable: cherry skill \(request.operation.rawValue) needs HOME, an absolute path, to find the agents' folders."
     }
 
     /// Runs `request`: a table, or JSON (`{"items": …}` for status,

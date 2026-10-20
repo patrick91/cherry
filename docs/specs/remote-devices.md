@@ -879,8 +879,11 @@ Deviations from the plan below:
 > extension in the install and Set Up Cherry MCP on <Mac>… is history:
 > device agents now get the `cherry` CLI's flags, gated the same way
 > (`RemoteAgentLaunch`, docs/cli.md › Agents On Another Mac), and the
-> install carries CherryMCP (which `cherry` runs) but no Pi extension. The
-> forward, the tokens and every bound below are unchanged.
+> install carries no Pi extension. Since phase 7 of docs/specs/agent-cli.md
+> the install carries no CherryMCP either: its `cherry` sends each command
+> to the app over the forward itself (`runCommand`), and its tabs get no
+> `CHERRY_MCP_HELPER`. The forward, the tokens and every bound below are
+> unchanged.
 
 Cherry MCP for agents running in a device's tabs (Claude Code, Codex): the
 same tools as a local agent in that window, but bounded to that Mac: a

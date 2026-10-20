@@ -38,7 +38,7 @@ CONF="${CHERRY_RELEASE_CONF:-$ROOT/Packaging/release.conf}"
 case "$CONF" in /*) ;; *) CONF="$PWD/$CONF" ;; esac
 ENTITLEMENTS="$ROOT/Packaging/Cherry.entitlements"
 GUI_EXECUTABLE="CherryApp"
-HELPERS="cherry cherry-host CherryMCP"
+HELPERS="cherry cherry-host"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -242,17 +242,16 @@ step_build() {
   # The debug maps point at the per-triple object files, still on disk.
   log "==> Debug symbols into $out/dSYMs"
   mkdir -p "$out/dSYMs"
-  for binary in "$GUI_EXECUTABLE" CherryMCP; do
-    if ! output="$(dsymutil "$app/Contents/MacOS/$binary" -o "$out/dSYMs/$binary.dSYM" 2>&1)"; then
-      log "warning: dsymutil failed for $binary; no dSYM for it: $output"
-      rm -rf "$out/dSYMs/$binary.dSYM"
-    elif [[ "$output" == *"no debug symbols"* ]]; then
-      log "warning: $binary has no debug information; no dSYM for it"
-      rm -rf "$out/dSYMs/$binary.dSYM"
-    elif [ -n "$output" ]; then
-      log "$output"
-    fi
-  done
+  binary="$GUI_EXECUTABLE"
+  if ! output="$(dsymutil "$app/Contents/MacOS/$binary" -o "$out/dSYMs/$binary.dSYM" 2>&1)"; then
+    log "warning: dsymutil failed for $binary; no dSYM for it: $output"
+    rm -rf "$out/dSYMs/$binary.dSYM"
+  elif [[ "$output" == *"no debug symbols"* ]]; then
+    log "warning: $binary has no debug information; no dSYM for it"
+    rm -rf "$out/dSYMs/$binary.dSYM"
+  elif [ -n "$output" ]; then
+    log "$output"
+  fi
 
   log "==> Checking $app"
   expect_plist CFBundleIdentifier "$RELEASE_BUNDLE_ID"
@@ -265,7 +264,7 @@ step_build() {
   expect_plist SUVerifyUpdateBeforeExtraction true
 
   "$ROOT/Scripts/check-helper-archs" "$app/Contents/MacOS/$GUI_EXECUTABLE" "$app/Contents/MacOS/cherry" \
-    "$app/Contents/MacOS/cherry-host" "$app/Contents/MacOS/CherryMCP" \
+    "$app/Contents/MacOS/cherry-host" \
     || fail "$app is not universal (arm64 and x86_64); see the error above"
 
   for binary in cherry cherry-host; do

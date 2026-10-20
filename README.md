@@ -67,30 +67,18 @@ Images there are removed a week later. Text wins when the clipboard has
 text too, and files copied in Finder paste as before. Edit › Paste and
 dropping image data do the same.
 
-### Keyboard Diagnostics (temporary)
+### Keyboard Settings
 
-**Help › Keyboard Diagnostics…** shows which Ghostty config files exist
-and which of them Cherry reads (every file Ghostty loads, and the files
-their `config-file` lines name), what Cherry does with each of their
-keyboard lines (applied, not applied, or left out because Ghostty rejects
-it), the keyboard lines Cherry applies to its terminals, the TERM a new
-tab gets, the current input source, and the keyboard modes the front
-tab's program asked for. **Open Key Test Tab**
-runs `CherryMCP --key-echo` in a new tab of the front project window: it
-prints what each key sends (keys 1–4 switch between the legacy, kitty,
-modifyOtherKeys and Claude Code's keyboard modes; q quits), and the
-window lists the results. **Copy Command** copies the same test to run
-in Ghostty, to compare. **Copy Report** copies all of it as text, for an
-issue. It will be removed once the Shift+Enter and Shift+Tab reports are
-understood.
-
-Settings shows the same in two places. **Settings › Terminal › Ghostty
-config** lists the config files Cherry read when it opened (with **Open**
-and **Reveal in Finder**), the lines left out because Ghostty rejects them,
-and **Copy Report**. **Settings › Shortcuts** lists Cherry's own keys and
-the terminal key bindings from your Ghostty config, with whether Cherry's
-terminals apply each one and which ones a Cherry shortcut takes first. The
-key test also runs by hand: `CherryMCP --key-echo` in any tab.
+**Settings › Terminal › Ghostty config** lists the Ghostty config files
+Cherry read when it opened (every file Ghostty loads, and the files their
+`config-file` lines name; with **Open** and **Reveal in Finder**), the lines
+left out because Ghostty rejects them, and **Copy Report**, which copies
+what Cherry does with each keyboard line, the lines its terminals apply,
+the TERM a new tab gets, the input source and the front tab's keyboard
+modes as text, for an issue. **Settings › Shortcuts** lists Cherry's own
+keys and the terminal key bindings from your Ghostty config, with whether
+Cherry's terminals apply each one and which ones a Cherry shortcut takes
+first.
 
 ## Persistent Sessions
 

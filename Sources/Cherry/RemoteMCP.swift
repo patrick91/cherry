@@ -248,20 +248,11 @@ enum RemoteMCPPaths {
             .map { $0 + "/control.sock" }
     }
 
-    /// CherryMCP's name in an install (next to cherry and cherry-host).
-    static let helperName = "CherryMCP"
     /// The command-line tool's name in an install.
     static let cliName = "cherry"
 
-    /// The CherryMCP of the install a device's `remoteHostPath` names,
-    /// under its home; nil when that is not one of ours.
-    static func helperPath(remoteHostPath: String?, homeDirectory: String?) -> String? {
-        RemoteLaunchSpec.Resources.of(remoteHostPath: remoteHostPath, homeDirectory: homeDirectory)
-            .map { "\($0.root)/\(helperName)" }
-    }
-
-    /// The `cherry` of the install a device's `remoteHostPath` names (beside
-    /// its CherryMCP), under its home; nil when that is not one of ours.
+    /// The `cherry` of the install a device's `remoteHostPath` names, under
+    /// its home; nil when that is not one of ours.
     static func cliPath(remoteHostPath: String?, homeDirectory: String?) -> String? {
         RemoteLaunchSpec.Resources.of(remoteHostPath: remoteHostPath, homeDirectory: homeDirectory)
             .map { "\($0.root)/\(cliName)" }
@@ -273,22 +264,16 @@ struct RemoteMCPLaunch: Equatable, Sendable {
     var deviceID: UUID
     /// The forwarded control socket there.
     var socketPath: String
-    /// The install's CherryMCP there, when it has one.
-    var helperPath: String?
     /// The install's `cherry` there, the tab's `CHERRY_CLI` (never This
     /// Mac's), when it has one.
     var cliPath: String? = nil
-    /// The name Cherry's server has in the agents there (the identity's
-    /// scheme), the tab's `CHERRY_MCP_SERVER_NAME` beside its helper.
-    var serverName: String = CherryAppIdentity.current.urlScheme
     /// This Mac's name, for "Cherry on <Mac> is not reachable".
     var controlMachine: String
     var tokens: RemoteMCPTokens
 
     static func == (lhs: RemoteMCPLaunch, rhs: RemoteMCPLaunch) -> Bool {
-        lhs.deviceID == rhs.deviceID && lhs.socketPath == rhs.socketPath && lhs.helperPath == rhs.helperPath
-            && lhs.cliPath == rhs.cliPath && lhs.serverName == rhs.serverName
-            && lhs.controlMachine == rhs.controlMachine && lhs.tokens === rhs.tokens
+        lhs.deviceID == rhs.deviceID && lhs.socketPath == rhs.socketPath
+            && lhs.cliPath == rhs.cliPath && lhs.controlMachine == rhs.controlMachine && lhs.tokens === rhs.tokens
     }
 
     /// The Cherry variables of a new launch of the tab `processID`.
@@ -300,10 +285,6 @@ struct RemoteMCPLaunch: Equatable, Sendable {
         if let tabID = UUID(uuidString: processID) {
             // Built for each Create (a start or restart): a new generation.
             environment[CherryControl.mcpTokenEnvironmentKey] = tokens.newGeneration(tabID: tabID, deviceID: deviceID)
-        }
-        if let helperPath {
-            environment[CherryControl.mcpHelperEnvironmentKey] = helperPath
-            environment[CherryControl.mcpServerNameEnvironmentKey] = serverName
         }
         if let cliPath { environment[CherryControl.cliEnvironmentKey] = cliPath }
         return environment

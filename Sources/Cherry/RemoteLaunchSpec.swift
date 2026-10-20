@@ -38,7 +38,7 @@ import Foundation
 ///   `CHERRY_AGENT_ID`, `CHERRY_PROJECT_ROOT` as the path there,
 ///   `INSIDE_CHERRY`, `CHERRY_TERM_PROGRAM`, `TERM_PROGRAM`), the `cherry` command's
 ///   (`CHERRY_CONTROL_SOCKET` as the socket forwarded there,
-///   `CHERRY_MCP_TOKEN`, `CHERRY_MCP_HELPER`, `CHERRY_CONTROL_MACHINE`;
+///   `CHERRY_MCP_TOKEN`, `CHERRY_CLI`, `CHERRY_CONTROL_MACHINE`;
 ///   phase 4b), the shell
 ///   integration's variables (paths on the device), the command's own
 ///   variables (cherry.toml), the locale (`LANG`, `LC_*`), and
@@ -82,8 +82,7 @@ enum RemoteLaunchSpec {
         var homeDirectory: String?
         var resources: Resources?
         /// What its tabs' `cherry` needs (phase 4b): the forwarded control
-        /// socket there, the tab's token, the install's `cherry` and
-        /// CherryMCP.
+        /// socket there, the tab's token and the install's `cherry`.
         var mcp: RemoteMCPLaunch?
         /// Its interactive login shell's variables, as Cherry last read them
         /// there (`RemoteLoginEnvironment.isSent` only): its commands and
@@ -160,7 +159,7 @@ enum RemoteLaunchSpec {
                 // Set by the line itself, after the startup files, with the
                 // install's directory first so its programs run `cherry`
                 // (`TabCLIDirectory` on This Mac). The directory also holds
-                // the install's cherry-host and CherryMCP, which nothing
+                // the install's cherry-host, which nothing
                 // there names otherwise.
                 if let cliPath = device.mcp?.cliPath?.nilIfEmpty {
                     path = TabCLIDirectory.prepending((cliPath as NSString).deletingLastPathComponent, to: path)

@@ -72,18 +72,22 @@ cherry host start|shutdown|restart|list|new|attach|kill|remove|control|status|do
 
 ### Implementation
 
-- The front end lives in Swift next to the catalog: `CherryMCP cli ARGS…`
-  parses the verbs into a tool name and arguments and calls
-  `CherryMCPSession.call(…, interface: "cli")`, so caller identity (process
-  ancestry; a device tab's token), the private-socket checks, the legacy
-  fallback and device scoping are the ones MCP used.
-- The Rust `cherry` keeps the host commands and hands every other subcommand
-  to the helper (`execv`: `CHERRY_MCP_HELPER`, else `CherryMCP` beside its own
-  executable), so there is one `cherry` on PATH.
+- The front end lives in Swift next to the catalog, in the app: a
+  `runCommand` request (control protocol 3) carries the command's words,
+  and the app parses the verbs into a tool name and arguments and runs it
+  as a `callTool` of the same caller (interface "cli"), so caller identity
+  (process ancestry; a device tab's token) and device scoping are the
+  tools'. What only the caller's Mac has (standard input, a file a flag
+  names) the answer asks for, and `cherry` sends the command again with it.
+- The Rust `cherry` keeps the host commands and sends every other
+  subcommand to the app's control socket itself (`agent.rs`: the socket
+  path, the private-socket checks, the token envelope), so there is one
+  `cherry` on PATH and no helper. (Phase 1 to 6 ran a Swift helper,
+  `CherryMCP cli`; phase 7 removed it.)
 - `cherry skill show` prints the guide, generated from `CherryToolCatalog`
   and the worker rules, so it always matches the running build.
 - As built (phase 1, Swift half): the commands' table is `CherryCLI.commands`
-  (`Sources/CherryMCP/CherryCLI.swift`); the catalog has no notes tools, so
+  (`Sources/CherryControl/CherryCLI.swift`); the catalog has no notes tools, so
   there is no `cherry note`. `cherry send` to a tab that is not an agent
   types the text as a line once the app refused `send_agent_message`
   (`not_agent_process`, nothing sent). `cherry keys` takes named keys (`up`,
@@ -103,8 +107,7 @@ PATH in native and hosted launches, and Cherry's zsh bootstrap puts it first
 again after the user's `.zshrc` (bash and fish keep it wherever their startup
 files leave it; path_helper keeps it, after the system directories). A
 device's commands and agents get the install's build directory first in
-`CHERRY_LOGIN_PATH`; that directory also holds the install's `cherry-host`
-and `CherryMCP`. A device's interactive terminals have no such line and keep
+`CHERRY_LOGIN_PATH`; that directory also holds the install's `cherry-host`. A device's interactive terminals have no such line and keep
 `CHERRY_CLI` only.
 
 ## Teaching agents: the skill
@@ -157,8 +160,7 @@ selection, a name wins; workers and tasks in five lines) that ends with "run
   files, so a device agent gets the line (`hasSkill: false`, naming `cherry
   skill show`), Claude Code also `--settings` for the forwarded socket, and
   Codex's `developer_instructions` only while a grep of its `config.toml`
-  there finds none; the gated line checks the install's `cherry` and
-  CherryMCP.
+  there finds none; the gated line checks the install's `cherry`.
 
 ## Sandboxes and permissions
 
@@ -270,9 +272,14 @@ Pi's) clears it. Connect agents Cherry starts keeps its key
    owner's OK).
 
 6. Remove Cherry MCP (above); devices get the CLI's flags; every worker
-   text names `cherry` commands. Next: the Rust `cherry` speaks the control
-   protocol itself (the app supplies the commands' table, the guide and the
-   skill install), and CherryMCP is deleted.
+   text names `cherry` commands.
+7. The Rust `cherry` speaks the control protocol itself (`runCommand`,
+   control protocol 3: the app parses the command, prints the guide and
+   help, and places the skill's files on the caller's Mac, any Mac, through
+   its `cherry`: paths described and steps taken there), and
+   CherryMCP is deleted, with Help › Keyboard Diagnostics and its key echo
+   (Settings › Terminal's Copy Report stays). Device installs carry no
+   CherryMCP; an older install's still works (`callTool`).
 
 ## Open questions
 

@@ -1,12 +1,11 @@
 import AppKit
-import CherryControl
+@testable import CherryControl
 import Darwin
 import Foundation
 import GhosttyTerminal
 import SwiftUI
 import Testing
 @testable import Cherry
-@testable import CherryMCP
 
 private func canonicalPathForTest(_ url: URL) throws -> String {
     guard let resolved = url.path.withCString({ realpath($0, nil) }) else {
@@ -2174,7 +2173,7 @@ private struct MCPWhoamiPayload: Decodable {
     }
     #expect(try await harness.send(.selectProcess(.init(processID: selectedParent.process.id))).error == nil)
 
-    let childResult = await CherryMCPTools.call(
+    let childResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2188,7 +2187,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(child.process.parentAgentID == nil)
     #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == nil)
 
-    let emptyParentResult = await CherryMCPTools.call(
+    let emptyParentResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2202,7 +2201,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(emptyParentChild.process.parentAgentID == nil)
     #expect(harness.workspace.session(id: emptyParentChild.process.id)?.parentAgentID == nil)
 
-    let topLevelResult = await CherryMCPTools.call(
+    let topLevelResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2266,7 +2265,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(try await harness.send(.selectProcess(.init(processID: second.process.id))).error == nil)
     #expect(harness.workspace.selectedSessionID == secondID)
 
-    let sessionContext = CherryMCPToolContext.bound(callerProcessID: second.process.id)
+    let sessionContext = ToolCallBinding.bound(callerProcessID: second.process.id)
     #expect(sessionContext.callerProcessID == second.process.id)
     #expect(sessionContext.boundProcessID == second.process.id)
 
@@ -2276,7 +2275,7 @@ private struct MCPWhoamiPayload: Decodable {
     harness.chromeState.selectTerminal()
     #expect(harness.workspace.selectedSessionID == firstID)
 
-    let childResult = await CherryMCPTools.call(
+    let childResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2290,7 +2289,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(child.process.parentAgentID == second.process.id)
     #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == secondID)
 
-    let secondChildResult = await CherryMCPTools.call(
+    let secondChildResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2408,8 +2407,8 @@ private struct MCPWhoamiPayload: Decodable {
         request: .selectProcess(.init(processID: parentB.process.id))
     ))).error == nil)
 
-    let sessionContext = CherryMCPToolContext.bound(callerProcessID: parentA.process.id)
-    let childResult = await CherryMCPTools.call(
+    let sessionContext = ToolCallBinding.bound(callerProcessID: parentA.process.id)
+    let childResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2517,13 +2516,26 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(advertisedNames.isDisjoint(with: removedToolNames))
 }
 
+/// A transport no request reaches: the layer refuses a name it does not
+/// know before it sends anything.
+private struct UnreachedToolTransport: CherryToolTransport {
+    var socketPath: String? { nil }
+
+    func send(_ request: CherryControlRequest, timeout: TimeInterval?) async throws -> CherryControlResponse {
+        Issue.record("The layer sent \(request) for a tool it does not know")
+        throw CherryControlError(code: "cherry_unavailable", message: "No app here.")
+    }
+}
+
 @Test func mcpLegacyTerminalToolsReturnUnknownTool() async throws {
-    let result = await CherryMCPTools.call(
+    let result = await CherryToolLayer.call(
         name: "send_input",
         arguments: [
             "terminal_id": .string(UUID().uuidString),
             "text": .string("ignored")
-        ]
+        ],
+        caller: CherryToolCaller(),
+        transport: UnreachedToolTransport()
     )
 
     #expect(result.isError == true)
@@ -2545,9 +2557,11 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(Set(CherryToolCatalog.tools(for: .unknown).map(\.name)).isDisjoint(with: noteToolNames))
 
     // An agent whose tool list predates their removal gets a clean error.
-    let result = await CherryMCPTools.call(
+    let result = await CherryToolLayer.call(
         name: "create_note",
-        arguments: ["title": .string("Review"), "markdown": .string("# Review")]
+        arguments: ["title": .string("Review"), "markdown": .string("# Review")],
+        caller: CherryToolCaller(),
+        transport: UnreachedToolTransport()
     )
     #expect(result.isError == true)
     #expect(result.text.contains("unknown_tool"))
@@ -2592,8 +2606,8 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(first.process.parentAgentID == nil)
     #expect(second.process.parentAgentID == nil)
 
-    let sessionContext = CherryMCPToolContext.bound()
-    let childResult = await CherryMCPTools.call(
+    let sessionContext = ToolCallBinding.bound()
+    let childResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2607,7 +2621,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(child.process.parentAgentID == nil)
     #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == nil)
 
-    let spawnResult = await CherryMCPTools.call(
+    let spawnResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2655,8 +2669,8 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
 
-    let context = CherryMCPToolContext.bound()
-    let bindResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let bindResult = await ToolCalls.call(
         name: "bind_session_process",
         arguments: ["process_id": .string(started.process.id)],
         context: context
@@ -2668,7 +2682,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(bound.process.id == started.process.id)
     #expect(context.boundProcessID == started.process.id)
 
-    let statusResult = await CherryMCPTools.call(
+    let statusResult = await ToolCalls.call(
         name: "get_process_status",
         arguments: [:],
         context: context
@@ -2676,7 +2690,7 @@ private struct MCPWhoamiPayload: Decodable {
     let status = try decodeMCPToolResult(MCPProcessStatusPayload.self, from: statusResult)
     #expect(status.process.id == started.process.id)
 
-    let whoamiResult = await CherryMCPTools.call(
+    let whoamiResult = await ToolCalls.call(
         name: "whoami",
         arguments: [:],
         context: context
@@ -2687,7 +2701,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(whoami.boundProcessID == started.process.id)
     #expect(whoami.selectedProcessID == harness.workspace.selectedSessionID?.uuidString)
 
-    let selectResult = await CherryMCPTools.call(
+    let selectResult = await ToolCalls.call(
         name: "select_process",
         arguments: [:],
         context: context
@@ -2717,8 +2731,8 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound()
-    let spawnResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Echo"),
@@ -2732,7 +2746,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(spawned.boundProcessID == nil)
     #expect(context.boundProcessID == nil)
 
-    let sendResult = await CherryMCPTools.call(
+    let sendResult = await ToolCalls.call(
         name: "send_agent_message",
         arguments: ["message": .string("should require a target")],
         context: context
@@ -2761,7 +2775,7 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Codex", command: "/bin/echo", arguments: "--yolo"))
     harness.server.start()
 
-    let result = await CherryMCPTools.call(
+    let result = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Codex"),
@@ -2793,8 +2807,8 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound()
-    let spawnResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Echo"),
@@ -2810,7 +2824,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(spawned.previousBoundProcessID == nil)
     #expect(context.boundProcessID == spawned.process.id)
 
-    let sendResult = await CherryMCPTools.call(
+    let sendResult = await ToolCalls.call(
         name: "send_agent_message",
         arguments: [
             "message": .string("hello from agent message"),
@@ -2853,7 +2867,7 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Codex", command: scriptURL.path))
     harness.server.start()
 
-    let spawnResult = await CherryMCPTools.call(
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Codex"),
@@ -2896,8 +2910,8 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Codex", command: scriptURL.path))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound()
-    let spawnResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Codex"),
@@ -2912,7 +2926,7 @@ private struct MCPWhoamiPayload: Decodable {
     let spawnOutput = spawned.output?.lines.joined(separator: "\n") ?? ""
     #expect(spawnOutput.contains("ready"), Comment(rawValue: spawnOutput))
 
-    let sendResult = await CherryMCPTools.call(
+    let sendResult = await ToolCalls.call(
         name: "send_agent_message",
         arguments: [
             "message": .string("bound prompt"),
@@ -2956,8 +2970,8 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: scriptURL.path))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound()
-    let spawnResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Claude"),
@@ -2971,7 +2985,7 @@ private struct MCPWhoamiPayload: Decodable {
     let spawned = try decodeMCPToolResult(MCPSpawnAgentPayload.self, from: spawnResult)
     #expect(spawned.process.kind == "agent")
 
-    let sendResult = await CherryMCPTools.call(
+    let sendResult = await ToolCalls.call(
         name: "send_agent_message",
         arguments: [
             "message": .string("after startup"),
@@ -3013,8 +3027,8 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Pi", command: scriptURL.path))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound()
-    let spawnResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Pi"),
@@ -3029,7 +3043,7 @@ private struct MCPWhoamiPayload: Decodable {
     let spawnOutput = spawned.output?.lines.joined(separator: "\n") ?? ""
     #expect(spawnOutput.contains("ready"), Comment(rawValue: spawnOutput))
 
-    let sendResult = await CherryMCPTools.call(
+    let sendResult = await ToolCalls.call(
         name: "send_process_input",
         arguments: [
             "text": .string("pi prompt"),
@@ -3080,8 +3094,8 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Pi", command: scriptURL.path))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound()
-    let spawnResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Pi"),
@@ -3099,7 +3113,7 @@ private struct MCPWhoamiPayload: Decodable {
         let deadline = Date(timeIntervalSinceNow: 30)
         var lines: [String] = []
         repeat {
-            let result = await CherryMCPTools.call(
+            let result = await ToolCalls.call(
                 name: "get_process_output",
                 arguments: ["process_id": .string(spawned.process.id), "line_limit": .int(20)],
                 context: context
@@ -3115,7 +3129,7 @@ private struct MCPWhoamiPayload: Decodable {
     let started = try await output { $0.trimmingCharacters(in: .whitespaces) == "ready" }
     try #require(started.contains("ready"), Comment(rawValue: started))
 
-    let sendResult = await CherryMCPTools.call(
+    let sendResult = await ToolCalls.call(
         name: "send_process_input",
         arguments: [
             "text": .string("newline prompt\n"),
@@ -3162,7 +3176,7 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
 
-    let result = await CherryMCPTools.call(
+    let result = await ToolCalls.call(
         name: "send_agent_message",
         arguments: [
             "process_id": .string(started.process.id),
@@ -3214,7 +3228,7 @@ private struct MCPWhoamiPayload: Decodable {
     setEnvironmentValue(second.process.id, for: CherryControl.agentIDEnvironmentKey)
     setEnvironmentValue(first.process.id, for: CherryControl.processIDEnvironmentKey)
 
-    let childResult = await CherryMCPTools.call(
+    let childResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -3265,12 +3279,12 @@ private struct MCPWhoamiPayload: Decodable {
     let parentSession = try #require(harness.workspace.session(id: parent.process.id))
     #expect(await eventually(timeout: 1) { parentSession.childProcessID != nil })
     let parentPID = try #require(parentSession.childProcessID)
-    let inferredCallerID = await CherryMCPTools.inferredCallerProcessID(parentPIDs: [parentPID])
+    let inferredCallerID = await ToolCalls.inferredCallerProcessID(parentPIDs: [parentPID])
 
     #expect(inferredCallerID == parent.process.id)
 
-    let sessionContext = CherryMCPToolContext.bound(callerProcessID: inferredCallerID)
-    let childResult = await CherryMCPTools.call(
+    let sessionContext = ToolCallBinding.bound(callerProcessID: inferredCallerID)
+    let childResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -3320,7 +3334,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(await eventually(timeout: 1) { parentSession.childProcessID != nil })
     let parentPID = try #require(parentSession.childProcessID)
     let unrelatedIntermediatePID = Int32.max
-    let inferredCallerID = await CherryMCPTools.inferredCallerProcessID(
+    let inferredCallerID = await ToolCalls.inferredCallerProcessID(
         parentPIDs: [unrelatedIntermediatePID, parentPID]
     )
 
@@ -3572,7 +3586,7 @@ private struct ProjectFeatureAvailabilityBeforeNotesWereRemoved: Decodable {
     harness.server.start()
 
     for name in ["list_projects", "get_project_status"] {
-        let result = await CherryMCPTools.call(name: name, arguments: [:])
+        let result = await ToolCalls.call(name: name, arguments: [:])
         let text = result.text
         #expect(result.isError != true, Comment(rawValue: text))
         #expect(text.contains("todos_enabled"), Comment(rawValue: text))

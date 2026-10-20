@@ -10,7 +10,6 @@ let package = Package(
     ],
     products: [
         .executable(name: "Cherry", targets: ["Cherry"]),
-        .executable(name: "CherryMCP", targets: ["CherryMCPStdio"]),
     ],
     dependencies: [
         .package(path: "ThirdParty/libghostty-spm"),
@@ -27,19 +26,6 @@ let package = Package(
             publicHeadersPath: "include",
             linkerSettings: [
                 .linkedFramework("AppKit"),
-            ]
-        ),
-        .target(
-            name: "CherryMCP",
-            dependencies: [
-                "CherryControl",
-            ]
-        ),
-        .executableTarget(
-            name: "CherryMCPStdio",
-            dependencies: [
-                "CherryControl",
-                "CherryMCP",
             ]
         ),
         .executableTarget(
@@ -71,7 +57,6 @@ let package = Package(
             dependencies: [
                 "Cherry",
                 "CherryControl",
-                "CherryMCP",
                 .product(name: "GhosttyKit", package: "libghostty-spm"),
                 .product(name: "GhosttyTerminal", package: "libghostty-spm"),
             ],

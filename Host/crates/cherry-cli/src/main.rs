@@ -1,3 +1,4 @@
+mod agent;
 mod attach;
 mod control;
 mod diagnose;
@@ -266,9 +267,7 @@ fn main() -> ExitCode {
     let arguments = match route::route(&arguments) {
         route::Route::Host(arguments) => arguments,
         route::Route::Agent(arguments) => {
-            let (code, message) = route::run_agent_command(&arguments);
-            eprintln!("{message}");
-            return ExitCode::from(code);
+            return ExitCode::from(agent::run(&arguments));
         }
         route::Route::Overview => {
             print!("{}", route::OVERVIEW);

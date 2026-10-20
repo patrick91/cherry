@@ -816,6 +816,8 @@ public enum CherryToolLayer {
         case .callTool(let payload):
             // Already a tool's result (the layer never sends callTool).
             return payload
+        case .runCommand(let payload):
+            return try encodedResult(payload)
         }
     }
 

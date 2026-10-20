@@ -6,19 +6,14 @@
 //! `status` always, and `start` and `restart` only in their host shapes
 //! (nothing but global options, and for `restart` its `--if-*` checks),
 //! since `cherry start ID` and `cherry restart ID` are agent commands.
-//! Every other command line is an agent command, which the Swift helper
-//! (`CherryMCP cli`) runs: it gets the arguments after `cherry` unchanged.
+//! Every other command line is an agent command, which goes to the Cherry
+//! app over its control socket with the arguments after `cherry` unchanged
+//! (`agent.rs`): the app parses and runs it.
 
 use std::{
     ffi::{OsStr, OsString},
-    path::{Path, PathBuf},
+    path::Path,
 };
-
-/// The environment variable naming the helper in Cherry's tabs.
-pub const HELPER_ENVIRONMENT_KEY: &str = "CHERRY_MCP_HELPER";
-/// The helper's file name beside `cherry` (an app bundle's Contents/MacOS,
-/// a device install's build directory).
-pub const HELPER_FILE_NAME: &str = "CherryMCP";
 
 /// Global options that take a value (`--host mini`, or `--host=mini`).
 const VALUE_OPTIONS: &[&str] = &[
@@ -35,18 +30,12 @@ const HOST_ALIASES: &[&str] = &[
     "attach", "control", "new", "kill", "remove", "shutdown", "doctor", "list", "status",
 ];
 
-/// What follows a missing helper's command in the message `cherry` gives.
-const MISSING_HELPER: &str = "is an agent command, which needs Cherry's CherryMCP \
-    helper: none at $CHERRY_MCP_HELPER or beside this cherry. Run it in a Cherry tab, \
-    or use the cherry inside Cherry.app (Contents/MacOS). Session-host commands are \
-    under `cherry host`.";
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
     /// A host command: parse these arguments (the program name first, then
     /// everything but a leading `host`) as before.
     Host(Vec<OsString>),
-    /// An agent command: hand the arguments after `cherry` to the helper.
+    /// An agent command: send the arguments after `cherry` to the app.
     Agent(Vec<OsString>),
     /// `cherry`, `cherry --help` or `cherry help`: the overview.
     Overview,
@@ -162,58 +151,6 @@ fn only_host_options(arguments: &[OsString], extra: &[&str]) -> bool {
     true
 }
 
-/// The helper that runs agent commands: `$CHERRY_MCP_HELPER` when it names
-/// an executable file, else `CherryMCP` beside this `cherry` (links of the
-/// running executable followed).
-pub fn helper(
-    environment_value: Option<&OsStr>,
-    current_executable: Option<&Path>,
-) -> Option<PathBuf> {
-    if let Some(value) = environment_value.filter(|value| !value.is_empty()) {
-        let path = PathBuf::from(value);
-        if is_executable(&path) {
-            return Some(path);
-        }
-    }
-    let executable = current_executable?;
-    let resolved = match std::fs::canonicalize(executable) {
-        Ok(path) => path,
-        Err(_) => executable.to_path_buf(),
-    };
-    let beside = resolved.parent()?.join(HELPER_FILE_NAME);
-    is_executable(&beside).then_some(beside)
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    match std::fs::metadata(path) {
-        Ok(metadata) => metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
-        Err(_) => false,
-    }
-}
-
-/// Replaces this process with the helper (`HELPER cli ARGS…`). Returns only
-/// when that could not be done, with the exit status and message to give.
-pub fn run_agent_command(arguments: &[OsString]) -> (u8, String) {
-    use std::os::unix::process::CommandExt;
-    let current = std::env::current_exe().ok();
-    let environment = std::env::var_os(HELPER_ENVIRONMENT_KEY);
-    let Some(helper) = helper(environment.as_deref(), current.as_deref()) else {
-        let command = match arguments.first() {
-            Some(argument) => argument.to_string_lossy().into_owned(),
-            None => String::new(),
-        };
-        let message = format!("cherry: {command} {MISSING_HELPER}");
-        return (127, message);
-    };
-    let error = std::process::Command::new(&helper)
-        .arg("cli")
-        .args(arguments)
-        .exec();
-    let message = format!("cherry: could not run {}: {error}", helper.display());
-    (127, message)
-}
-
 /// `cherry`, `cherry --help`: the agent commands and `host`.
 pub const OVERVIEW: &str = "\
 Cherry from the command line: its tabs, agents, tasks and todos, and its
@@ -263,12 +200,6 @@ mod tests {
 
     fn agent(line: &str) -> Route {
         Route::Agent(arguments(line)[1..].to_vec())
-    }
-
-    fn set_mode(path: &Path, mode: u32) {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(mode);
-        std::fs::set_permissions(path, permissions).unwrap();
     }
 
     #[test]
@@ -364,38 +295,5 @@ mod tests {
         for line in ["--version", "-V", "--host mini"] {
             assert_eq!(route(&arguments(line)), host(line), "{line}");
         }
-    }
-
-    #[test]
-    fn helper_prefers_the_environment_then_the_executable_beside_cherry() {
-        let directory = tempfile::tempdir().unwrap();
-        let bin = directory.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let cherry = bin.join("cherry");
-        let beside = bin.join(HELPER_FILE_NAME);
-        let named = directory.path().join("named-helper");
-        for file in [&cherry, &beside, &named] {
-            std::fs::write(file, "").unwrap();
-            set_mode(file, 0o755);
-        }
-        let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
-
-        let found = helper(Some(named.as_os_str()), Some(&cherry));
-        assert_eq!(found, Some(named.clone()));
-        // An empty or unusable variable falls back to the file beside cherry.
-        for value in ["", "/nonexistent/CherryMCP"] {
-            let found = helper(Some(OsStr::new(value)), Some(&cherry)).unwrap();
-            assert_eq!(canonical(&found), canonical(&beside), "{value}");
-        }
-        // A link to cherry finds the helper beside the real file.
-        let links = directory.path().join("links");
-        std::fs::create_dir(&links).unwrap();
-        let link = links.join("cherry");
-        std::os::unix::fs::symlink(&cherry, &link).unwrap();
-        let found = helper(None, Some(&link)).unwrap();
-        assert_eq!(canonical(&found), canonical(&beside));
-        // A file that is not executable is no helper.
-        set_mode(&beside, 0o644);
-        assert_eq!(helper(None, Some(&cherry)), None);
     }
 }

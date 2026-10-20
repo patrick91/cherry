@@ -5,10 +5,11 @@ import Foundation
 //
 // `cherry ls`, `cherry send ID <<'EOF'`, `cherry task report` …: the agent
 // commands of `cherry` (docs/specs/agent-cli.md). The Rust `cherry` keeps
-// the session host's commands (`cherry host …`) and hands every other one
-// to this helper as `CherryMCP cli ARGS…`. Each command is one catalog
-// tool, called as MCP calls it (`CherryMCPSession.call`, interface "cli"),
-// so the caller's identity, scoping and errors are MCP's.
+// the session host's commands (`cherry host …`) and sends every other one
+// to the app as a `runCommand` request, which the app parses here and runs
+// as its caller (`CherryControlServer.handleCommand`). Each command is one
+// catalog tool, called as a `callTool` is (interface "cli"), so the
+// caller's identity, scoping and errors are the tools'.
 //
 // A command's words and positional arguments are in `CherryCLI.commands`;
 // every other `--flag` is the tool's own parameter in kebab case
@@ -74,22 +75,11 @@ public struct CherryCLIInput: Sendable {
     public init(
         hasPipedInput: Bool,
         read: @escaping @Sendable () -> String?,
-        readFile: @escaping @Sendable (String) -> String? = { try? String(contentsOfFile: $0, encoding: .utf8) }
+        readFile: @escaping @Sendable (String) -> String? = { _ in nil }
     ) {
         self.hasPipedInput = hasPipedInput
         self.read = read
         self.readFile = readFile
-    }
-
-    /// This process's standard input.
-    public static var standard: CherryCLIInput {
-        var status = stat()
-        let piped = fstat(STDIN_FILENO, &status) == 0
-            && ((status.st_mode & S_IFMT) == S_IFIFO || (status.st_mode & S_IFMT) == S_IFREG || (status.st_mode & S_IFMT) == S_IFSOCK)
-        return CherryCLIInput(hasPipedInput: piped, read: {
-            let data = FileHandle.standardInput.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8)
-        })
     }
 
     /// No standard input (tests).

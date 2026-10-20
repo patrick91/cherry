@@ -362,15 +362,11 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     #expect(try shellHash(directory.path) == digest)
-    // With CherryMCP: the shell counts what the build directory has, as
-    // the Swift digest counts what it is given.
+    // A CherryMCP an older install left beside them is not counted.
     let mcp = directory.appendingPathComponent("CherryMCP")
     try "#!/bin/sh\n".write(to: mcp, atomically: true, encoding: .utf8)
-    let withHelper = try RemoteHostResources.digest(of: installable, mcpHelper: mcp)
-    #expect(withHelper != digest)
-    #expect(try shellHash(directory.path) == withHelper)
-    try FileManager.default.removeItem(at: mcp)
     #expect(try shellHash(directory.path) == digest)
+    try FileManager.default.removeItem(at: mcp)
     // Changed, or missing: another digest, or `-`.
     try "# changed\n".write(to: directory.appendingPathComponent("Ghostty/shell-integration/bash/ghostty.bash"), atomically: true, encoding: .utf8)
     #expect(try shellHash(directory.path) != digest)
@@ -405,10 +401,7 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
         "-C", installable.resourcesDirectory.deletingLastPathComponent().path, "Ghostty",
         "-C", installable.terminfoDirectory.deletingLastPathComponent().path, "terminfo",
     ])
-    // Then CherryMCP.
-    var withMCP = helpers
-    withMCP.mcpHelper = mcp
-    #expect(Array(RemoteHostInstaller.archiveArguments(withMCP).suffix(3)) == ["-C", directory.path, "CherryMCP"])
+    #expect(!arguments.contains("CherryMCP"))
     // The check of a copy compares the digest.
     var verification = RemoteHostInstaller.Verification(fields: [
         ("codesign", "ok"), ("verify_status", "0"),

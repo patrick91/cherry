@@ -1,5 +1,4 @@
-import CherryControl
-@testable import CherryMCP
+@testable import CherryControl
 import Foundation
 import Testing
 @testable import Cherry
@@ -292,7 +291,7 @@ private func typed(_ harness: PersistentHarness) -> [String] {
     )
 
     // The original report: wait_for_process_idle, then send_agent_message.
-    let idle = await CherryMCPTools.call(
+    let idle = await ToolCalls.call(
         name: "wait_for_process_idle",
         arguments: ["process_id": .string(agent.id.uuidString), "require_new_output": .bool(false), "timeout_ms": .int(3_000)]
     )
@@ -300,7 +299,7 @@ private func typed(_ harness: PersistentHarness) -> [String] {
     let idleText = idle.text
     #expect(idleText.contains("permission"), Comment(rawValue: idleText))
 
-    let sent = await CherryMCPTools.call(
+    let sent = await ToolCalls.call(
         name: "send_agent_message",
         arguments: ["process_id": .string(agent.id.uuidString), "message": .string("carry on"), "timeout_ms": .int(2_000)]
     )

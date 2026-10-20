@@ -13,7 +13,6 @@ import Testing
 // and variables it carries, and every launch that keeps today's line
 // exactly.
 
-private let helperPath = "/Users/them/Library/Application Support/cherry-host/bin/b1/CherryMCP"
 private let cliPath = "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry"
 private let socketPath = "/var/folders/8s/f8v56gzs3232x21hn7nngwmc0000gn/T/cherry-mcp-0123456789abcdef/control.sock"
 
@@ -26,7 +25,6 @@ private struct DeviceAgentLaunch {
 
     func device(
         shell: String = "/bin/zsh",
-        helper: String? = helperPath,
         cli: String? = cliPath,
         loginPath: String? = "/Users/them/.local/bin:/usr/bin:/bin",
         connects: Bool = true
@@ -35,7 +33,7 @@ private struct DeviceAgentLaunch {
             shell: shell,
             homeDirectory: "/Users/them",
             mcp: RemoteMCPLaunch(
-                deviceID: deviceID, socketPath: socketPath, helperPath: helper, cliPath: cli,
+                deviceID: deviceID, socketPath: socketPath, cliPath: cli,
                 controlMachine: "Laptop", tokens: tokens
             ),
             loginEnvironment: loginPath.map { ["PATH": $0] },
@@ -176,14 +174,12 @@ private func run(_ spec: HostedLaunchSpec, home: URL, timeout: TimeInterval = 20
     try writeStandIn("pi", in: agents)
     let nothing = home.appendingPathComponent("nothing", isDirectory: true)
     try FileManager.default.createDirectory(at: nothing, withIntermediateDirectories: true)
-    // The install's `cherry` and CherryMCP, which the line checks for
-    // (neither runs here).
+    // The install's `cherry`, which the line checks for (it does not run
+    // here).
     let build = home.appendingPathComponent("cherry-host/bin/b1", isDirectory: true)
-    let installedHelper = build.appendingPathComponent("CherryMCP")
     let installedCLI = build.appendingPathComponent("cherry")
-    try writeStandIn("CherryMCP", in: build)
     try writeStandIn("cherry", in: build)
-    let missingHelper = home.appendingPathComponent("cherry-host/bin/b0/CherryMCP").path
+    let missingCLI = home.appendingPathComponent("cherry-host/bin/b0/cherry").path
     let launch = DeviceAgentLaunch()
     let line = instructions(launch)
     let testProcessID = getpid()
@@ -192,16 +188,16 @@ private func run(_ spec: HostedLaunchSpec, home: URL, timeout: TimeInterval = 20
         /// `command` launched as an agent there, with the stand-ins (or
         /// nothing) on the device's login PATH.
         func launched(
-            _ command: String, path: URL = agents, helper: String? = nil
+            _ command: String, path: URL = agents, cli: String? = nil
         ) throws -> (spec: HostedLaunchSpec, run: LaunchRun) {
-            let helper = helper ?? installedHelper.path
+            let cli = cli ?? installedCLI.path
             let spec = launch.spec(
                 launch.configuration(command, workingDirectory: home.path),
-                device: launch.device(shell: shell, helper: helper, cli: installedCLI.path, loginPath: "\(path.path):/usr/bin:/bin")
+                device: launch.device(shell: shell, cli: cli, loginPath: "\(path.path):/usr/bin:/bin")
             )
             #expect(spec.argv.count == 4 && spec.argv[0] == shell && spec.argv[1] == "-l" && spec.argv[2] == "-c", "\(shell)")
             #expect(spec.argv[3].hasPrefix(
-                "export PATH=\"$CHERRY_LOGIN_PATH\"; unset CHERRY_LOGIN_PATH; if [ -x '\(installedCLI.path)' ] && [ -x '\(helper)' ] && "
+                "export PATH=\"$CHERRY_LOGIN_PATH\"; unset CHERRY_LOGIN_PATH; if [ -x '\(cli)' ] && "
             ), "\(shell)")
             return (spec, try run(spec, home: home))
         }
@@ -238,12 +234,12 @@ private func run(_ spec: HostedLaunchSpec, home: URL, timeout: TimeInterval = 20
         let unknown = try launched("claude --dangerously-skip-permissions")
         #expect(unknown.run.arguments == ["--dangerously-skip-permissions"], "\(shell): \(unknown.run.output)")
 
-        // An install without its CherryMCP (which runs `cherry`): the line
-        // exactly, though the CLI is new enough.
+        // An install without its `cherry`: the line exactly, though the
+        // CLI is new enough.
         try setStandIn("claude", in: agents, version: "2.1.299 (Claude Code)")
-        let noHelper = try launched("claude --dangerously-skip-permissions", helper: missingHelper)
-        #expect(noHelper.run.status == 0, "\(shell): \(noHelper.run.output)")
-        #expect(noHelper.run.arguments == ["--dangerously-skip-permissions"], "\(shell): \(noHelper.run.output)")
+        let noCLI = try launched("claude --dangerously-skip-permissions", cli: missingCLI)
+        #expect(noCLI.run.status == 0, "\(shell): \(noCLI.run.output)")
+        #expect(noCLI.run.arguments == ["--dangerously-skip-permissions"], "\(shell): \(noCLI.run.output)")
 
         // A positional prompt keeps its place, before the flags.
         let prompt = try launched("claude \"fix it\"")
@@ -333,7 +329,7 @@ private func run(_ spec: HostedLaunchSpec, home: URL, timeout: TimeInterval = 20
         let today = launch.spec(configuration, device: off)
         #expect(on.argv == today.argv, comment)
         #expect(on.environment.filter { $0.key != "CHERRY_MCP_TOKEN" } == today.environment.filter { $0.key != "CHERRY_MCP_TOKEN" }, comment)
-        #expect(!on.argv.contains { $0.contains("cherry_v") || $0.contains(helperPath) }, comment)
+        #expect(!on.argv.contains { $0.contains("cherry_v") || $0.contains(cliPath) }, comment)
     }
 
     // Shells whose syntax the check is not written in.
@@ -343,9 +339,8 @@ private func run(_ spec: HostedLaunchSpec, home: URL, timeout: TimeInterval = 20
     }
     let fish = launch.spec(launch.configuration("claude"), device: launch.device(shell: "/opt/homebrew/bin/fish"))
     #expect(fish.argv.last == "set -gx PATH (string split ':' \"$CHERRY_LOGIN_PATH\"); set -e CHERRY_LOGIN_PATH; claude")
-    // No CherryMCP or `cherry` in the install (no resources), or no
-    // forwarded socket at all.
-    keepsTodaysLine("claude", device: launch.device(helper: nil), "no helper")
+    // No `cherry` in the install (no resources), or no forwarded socket
+    // at all.
     keepsTodaysLine("claude", device: launch.device(cli: nil), "no cherry")
     var withoutMCP = launch.device()
     withoutMCP.mcp = nil
@@ -403,14 +398,14 @@ private func run(_ spec: HostedLaunchSpec, home: URL, timeout: TimeInterval = 20
     #expect(line == "export PATH=\"$CHERRY_LOGIN_PATH\"; unset CHERRY_LOGIN_PATH; "
         + RemoteAgentLaunch.gatedLine(
             line: "claude --dangerously-skip-permissions", executableWord: "claude", cli: .claudeCode,
-            checks: ["[ -x \(ShellQuoting.singleQuoted(cliPath)) ]", "[ -x \(ShellQuoting.singleQuoted(helperPath)) ]"],
+            checks: ["[ -x \(ShellQuoting.singleQuoted(cliPath)) ]"],
             suffix: words
         ))
     #expect(line.contains("then exec claude --dangerously-skip-permissions\(words); else exec claude --dangerously-skip-permissions; fi"))
-    // The environment is the spec's as before: the device's socket and
-    // helper, the install's `cherry`.
+    // The environment is the spec's as before: the device's socket, the
+    // install's `cherry`.
     #expect(claude.environment["CHERRY_CONTROL_SOCKET"] == socketPath)
-    #expect(claude.environment["CHERRY_MCP_HELPER"] == helperPath)
+    #expect(claude.environment["CHERRY_MCP_HELPER"] == nil)
     #expect(claude.environment["CHERRY_CLI"] == cliPath)
 
     // Codex's line checks its config there first.
@@ -422,7 +417,7 @@ private func run(_ spec: HostedLaunchSpec, home: URL, timeout: TimeInterval = 20
     // Without the device's login environment the line is the gated one
     // alone (the host's PATH, for the check and the agent alike).
     let unread = launch.spec(launch.configuration("claude"), device: launch.device(loginPath: nil))
-    #expect(unread.argv.last?.hasPrefix("if [ -x '\(cliPath)' ] && [ -x '\(helperPath)' ] && cherry_v=$('claude' --version 2>/dev/null </dev/null) && ") == true)
+    #expect(unread.argv.last?.hasPrefix("if [ -x '\(cliPath)' ] && cherry_v=$('claude' --version 2>/dev/null </dev/null) && ") == true)
     // A `~/` executable expands in the check as in the line.
     let home = launch.spec(launch.configuration("~/.local/bin/claude"), device: launch.device())
     #expect(home.argv.last?.contains("&& cherry_v=$(~/'.local/bin/claude' --version") == true)
@@ -474,7 +469,7 @@ private final class LaunchSwitch {
     let device = try addStudio(to: plain)
     let plainLaunch = try #require(plain.launchDevice(id: device.id))
     #expect(plainLaunch.connectsAgentsAtLaunch == false)
-    #expect(plainLaunch.mcp?.helperPath == helperPath)
+    #expect(plainLaunch.mcp?.cliPath == cliPath)
     let today = RemoteLaunchSpec.make(for: launch.configuration("claude"), device: plainLaunch, localeEnvironment: [:])
     #expect(today.argv == ["/bin/zsh", "-l", "-c", "claude"])
 
@@ -485,7 +480,7 @@ private final class LaunchSwitch {
     let on = try #require(connecting.launchDevice(id: studio.id))
     #expect(on.connectsAgentsAtLaunch)
     let gated = RemoteLaunchSpec.make(for: launch.configuration("claude"), device: on, localeEnvironment: [:])
-    #expect(gated.argv.last?.hasPrefix("if [ -x '\(cliPath)' ] && [ -x '\(helperPath)' ] && cherry_v=$('claude' --version") == true)
+    #expect(gated.argv.last?.hasPrefix("if [ -x '\(cliPath)' ] && cherry_v=$('claude' --version") == true)
     #expect(gated.argv.last?.contains("'--append-system-prompt'") == true)
     toggle.isOn = false
     #expect(connecting.launchDevice(id: studio.id)?.connectsAgentsAtLaunch == false)

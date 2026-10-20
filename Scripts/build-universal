@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Build a SwiftPM product for arm64 and x86_64 and join them with lipo:
 # one `swift build --triple <arch>-apple-macosx<minimum>.0` per architecture,
-# this Mac's own last. Scripts/build-mcp-helper builds CherryMCP with it, and
-# Scripts/install-local-app the app with CHERRY_APP_ARCHS=universal (release
-# mode).
+# this Mac's own last. Scripts/install-local-app builds the app with it with
+# CHERRY_APP_ARCHS=universal (release mode).
 #
 #   Scripts/build-universal PRODUCT [debug|release] [--archs universal|native] [-- SWIFT_BUILD_ARGS...]
 #

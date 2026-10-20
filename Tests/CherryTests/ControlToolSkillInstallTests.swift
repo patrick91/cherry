@@ -302,12 +302,12 @@ private extension CherrySkillChange {
 
 // MARK: - Connect
 
-/// Connect's model reads nothing without an installer (tests' and every
-/// MCPRegistrations but `shared`), and with one shows the files before
-/// writing them; only `perform` (the confirmation's Install) writes.
+/// Connect's model reads nothing without an installer (tests'; `shared`
+/// has the account's), and with one shows the files before writing them;
+/// only `perform` (the confirmation's Install) writes.
 @MainActor
 @Test func ControlToolSkillConnectShowsTheFilesThenWritesThem() async throws {
-    let inert = MCPRegistrations().skills
+    let inert = CherrySkillsModel()
     await inert.refresh()
     #expect(inert.items.isEmpty)
     #expect(inert.plan(for: CherrySkillTarget.allCases) == nil)

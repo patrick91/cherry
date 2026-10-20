@@ -362,23 +362,13 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     #expect(try shellHash(directory.path) == digest)
-    // With CherryMCP, and with Cherry's Pi extension beside it: the shell
-    // counts what the build directory has, as the Swift digest counts what
-    // it is given. A directory without the extension (an install made
-    // before Cherry had one) hashes exactly as before.
+    // With CherryMCP: the shell counts what the build directory has, as
+    // the Swift digest counts what it is given.
     let mcp = directory.appendingPathComponent("CherryMCP")
     try "#!/bin/sh\n".write(to: mcp, atomically: true, encoding: .utf8)
     let withHelper = try RemoteHostResources.digest(of: installable, mcpHelper: mcp)
     #expect(withHelper != digest)
     #expect(try shellHash(directory.path) == withHelper)
-    let piExtension = try #require(PiMCPExtension.bundledURL)
-    try FileManager.default.copyItem(at: piExtension, to: directory.appendingPathComponent("cherry-pi-mcp.ts"))
-    let withExtension = try RemoteHostResources.digest(of: installable, mcpHelper: mcp, piExtension: piExtension)
-    #expect(withExtension != withHelper)
-    #expect(try shellHash(directory.path) == withExtension)
-    try FileManager.default.removeItem(at: directory.appendingPathComponent("cherry-pi-mcp.ts"))
-    #expect(try shellHash(directory.path) == withHelper)
-    #expect(try RemoteHostResources.digest(of: installable, mcpHelper: mcp, piExtension: nil) == withHelper)
     try FileManager.default.removeItem(at: mcp)
     #expect(try shellHash(directory.path) == digest)
     // Changed, or missing: another digest, or `-`.
@@ -415,18 +405,10 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
         "-C", installable.resourcesDirectory.deletingLastPathComponent().path, "Ghostty",
         "-C", installable.terminfoDirectory.deletingLastPathComponent().path, "terminfo",
     ])
-    // Then CherryMCP, and Cherry's Pi extension only with it.
+    // Then CherryMCP.
     var withMCP = helpers
     withMCP.mcpHelper = mcp
-    withMCP.piExtension = piExtension
-    #expect(Array(RemoteHostInstaller.archiveArguments(withMCP).suffix(6)) == [
-        "-C", directory.path, "CherryMCP",
-        "-C", piExtension.deletingLastPathComponent().path, "cherry-pi-mcp.ts",
-    ])
-    var extensionOnly = helpers
-    extensionOnly.piExtension = piExtension
-    #expect(RemoteHostInstaller.archiveArguments(extensionOnly) == arguments)
-    #expect(!arguments.contains("cherry-pi-mcp.ts"))
+    #expect(Array(RemoteHostInstaller.archiveArguments(withMCP).suffix(3)) == ["-C", directory.path, "CherryMCP"])
     // The check of a copy compares the digest.
     var verification = RemoteHostInstaller.Verification(fields: [
         ("codesign", "ok"), ("verify_status", "0"),

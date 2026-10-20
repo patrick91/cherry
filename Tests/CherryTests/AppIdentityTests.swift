@@ -18,10 +18,6 @@ import Testing
     #expect(identity.applicationSupportName == "Cherry Sessions")
     #expect(identity.urlScheme == "cherry-sessions")
     #expect(warnings.isEmpty)
-    #expect(MCPInstallCommandBuilder.commands(identity: identity).allSatisfy {
-        $0.command.contains(" cherry-sessions -- ")
-            || $0.command.contains(" cherry-sessions --exposure deferred --description '\(PiMCPRegistration.serverDescription)' -- ")
-    })
 
     // Absent keys are the standard build and are not worth a warning.
     #expect(CherryAppIdentity(infoDictionary: [:], warn: { warnings.append($0) }) == CherryAppIdentity())

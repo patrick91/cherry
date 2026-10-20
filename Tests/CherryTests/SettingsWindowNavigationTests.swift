@@ -38,7 +38,7 @@ private func keyDown(_ characters: String, modifiers: NSEvent.ModifierFlags = [.
         .sessions, .interface, .themes, .terminal, .shortcuts, .notifications, .macs, .agents, .projects, .updates,
     ])
     #expect(SettingsPage.allCases.map(\.title) == [
-        "Sessions", "Interface", "Themes", "Terminal", "Shortcuts", "Notifications", "Macs", "Agents & MCP",
+        "Sessions", "Interface", "Themes", "Terminal", "Shortcuts", "Notifications", "Macs", "Agents",
         "Projects", "Updates",
     ])
     #expect(SettingsPage.allCases.map(\.sidebarGroup) == [0, 1, 1, 2, 2, 2, 3, 3, 3, 4])
@@ -67,7 +67,7 @@ private func keyDown(_ characters: String, modifiers: NSEvent.ModifierFlags = [.
 
 @Test func settingsWindowRowIDsThatCrossPagesKeepTheirNames() {
     #expect(SettingsRowID.agentsList.rawValue == "agents.list")
-    #expect(SettingsRowID.agentsMCPServer.rawValue == "agents.mcpServer")
+    #expect(SettingsRowID.agentsCherryCommand.rawValue == "agents.mcpServer")
     #expect(SettingsRowID.notificationsBackground.rawValue == "notifications.background")
     #expect(SettingsRowID.sessionsBackground.rawValue == "sessions.background")
     #expect(SettingsRowID.terminalKeyBindings.rawValue == "terminal.keyBindings")

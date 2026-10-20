@@ -6,7 +6,7 @@ import SwiftUI
 
 /// The Settings window's pages, in the sidebar's order: Sessions (its
 /// status item), then four groups ([Interface, Themes], [Terminal,
-/// Shortcuts, Notifications], [Macs, Agents & MCP, Projects], [Updates]).
+/// Shortcuts, Notifications], [Macs, Agents, Projects], [Updates]).
 /// Each agent and each project has a page of its own besides
 /// (`SettingsRoute`).
 enum SettingsPage: String, CaseIterable, Identifiable, Sendable {
@@ -32,7 +32,7 @@ enum SettingsPage: String, CaseIterable, Identifiable, Sendable {
         case .shortcuts: "Shortcuts"
         case .notifications: "Notifications"
         case .macs: "Macs"
-        case .agents: "Agents & MCP"
+        case .agents: "Agents"
         case .projects: "Projects"
         case .updates: "Updates"
         }
@@ -99,7 +99,8 @@ enum SettingsRoute: Hashable, Sendable {
 /// defines its other row ids in its own file.
 extension SettingsRowID {
     static let agentsList: Self = "agents.list"
-    static let agentsMCPServer: Self = "agents.mcpServer"
+    /// The cherry command's section (its id from when it was Cherry MCP's).
+    static let agentsCherryCommand: Self = "agents.mcpServer"
     static let notificationsBackground: Self = "notifications.background"
     static let sessionsBackground: Self = "sessions.background"
     static let terminalKeyBindings: Self = "terminal.keyBindings"
@@ -206,7 +207,7 @@ final class SettingsNavigator: ObservableObject {
 
     /// Drops the pages of agents and projects that are gone (deleted,
     /// renamed, removed) from the history; the page shown falls back to
-    /// Agents & MCP or Projects. Runs on the turn after `AgentSettings`
+    /// Agents or Projects. Runs on the turn after `AgentSettings`
     /// published, since it publishes itself.
     func reconcile(agentIDs: Set<String>, projectRoots: Set<String>) {
         func exists(_ route: SettingsRoute) -> Bool {
@@ -268,7 +269,7 @@ final class SettingsNavigator: ObservableObject {
 /// and the menu bar panel's Settings… open the last page.
 @MainActor
 enum SettingsOpening {
-    /// "Edit Agents…" in the sidebar's agent + menu: Agents & MCP › Agents.
+    /// "Edit Agents…" in the sidebar's agent + menu: Agents › Agents.
     static func editAgents(navigator: SettingsNavigator, openSettings: () -> Void) {
         open(.page(.agents), row: .agentsList, navigator: navigator, openSettings: openSettings)
     }

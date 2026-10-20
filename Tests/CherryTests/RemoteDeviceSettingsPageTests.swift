@@ -77,8 +77,7 @@ private final class MacsFixture {
         RemoteDeviceSettingsModel.Presenters(
             confirmRemove: { _, _ in },
             confirmTrustNewIdentity: { _, _ in },
-            updateSessionHost: { _, _ in },
-            setUpCherryMCP: { _, _ in }
+            updateSessionHost: { _, _ in }
         )
     }
 
@@ -332,14 +331,12 @@ private final class MacsFixture {
     let model = fixture.model(presenters: RemoteDeviceSettingsModel.Presenters(
         confirmRemove: { shown.append(("remove", $0, $1)) },
         confirmTrustNewIdentity: { shown.append(("trust", $0, $1)) },
-        updateSessionHost: { shown.append(("update", $0, $1)) },
-        setUpCherryMCP: { shown.append(("mcp", $0, $1)) }
+        updateSessionHost: { shown.append(("update", $0, $1)) }
     ))
     model.confirmRemove(mini.id)
     model.trustNewIdentity(mini.id)
     model.updateSessionHost(mini.id)
-    model.setUpCherryMCP(mini.id)
-    #expect(shown.map(\.0) == ["remove", "trust", "update", "mcp"])
+    #expect(shown.map(\.0) == ["remove", "trust", "update"])
     #expect(shown.allSatisfy { $0.1 == mini.id && $0.2 === fixture.store })
     // Asking is not removing.
     #expect(fixture.store.device(id: mini.id) != nil)

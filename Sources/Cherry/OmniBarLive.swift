@@ -389,9 +389,6 @@ enum OmniBarGathering {
         context.isSidebarHidden = chromeState.isSidebarHidden
         context.detachTitle = inSplit ? "Detach Pane" : "Detach Tab"
         context.closeTitle = inSplit ? "Close Pane" : "Close Tab"
-        context.selectedAgent = selected.flatMap(ConnectThisAgent.harness(of:)).map {
-            OmniSelectedAgent(harness: $0, productName: $0.productName)
-        }
         context.finishedWorkerCount = selected.map {
             workspace.finishedWorkers(of: $0, summaries: AgentTaskBoard.shared.workerSummaries).count
         } ?? 0
@@ -548,11 +545,6 @@ struct OmniBarPerformer {
             toggleAppearance()
         case .connectAgents:
             ConnectAgentsPresenter.present()
-        case .connectThisAgent:
-            guard let session = workspace.selectedSession, ConnectThisAgent.harness(of: session) != nil else {
-                return NSSound.beep()
-            }
-            ConnectThisAgentPresenter.present(session: session, repository: repository)
         case .closeFinishedWorkers:
             guard let session = workspace.selectedSession,
                   SessionCloseCoordinator.closeFinishedWorkers(of: session, in: workspace, chromeState: chromeState) > 0

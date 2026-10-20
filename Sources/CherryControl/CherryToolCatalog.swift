@@ -113,7 +113,7 @@ public enum CherryToolCatalog {
             ),
             tool(
                 "subscribe",
-                "Events instead of polling: done (a turn ended; status unknown: its output went quiet, basis output_quiet), needs_input, permission, error, exited (with exit_code), closed, output_match. A state already true comes at once (initial: true); wait_for_events reads them. Task workers: use wait_for_tasks, get_task. With wake, Cherry types one line into your own tab when events are ready and you are idle (counts only, never text of the watched processes); off in Settings › Agents & MCP › Monitors (the result's wake field). Only processes this session may reach.",
+                "Events instead of polling: done (a turn ended; status unknown: its output went quiet, basis output_quiet), needs_input, permission, error, exited (with exit_code), closed, output_match. A state already true comes at once (initial: true); wait_for_events reads them. Task workers: use wait_for_tasks, get_task. With wake, Cherry types one line into your own tab when events are ready and you are idle (counts only, never text of the watched processes); off in Settings › Agents › Monitors (the result's wake field). Only processes this session may reach.",
                 properties: projectScopedProperties([
                     "process_ids": stringArray(),
                     "sub_agents": boolean("Also your sub-agents, later ones too."),
@@ -561,7 +561,7 @@ public enum CherryToolCatalog {
     /// `longestClientWaitMilliseconds`. A Claude Code that declares none
     /// gets the longest, since its default timeout is longer still; any
     /// other client, and a Codex or Pi that declares none (their default is
-    /// 60 s; Cherry's Pi extension declares 300 s, a registration nothing),
+    /// 60 s),
     /// keeps today's 50 s (`CherryControl.maximumEventWaitMilliseconds`,
     /// which tasks share).
     public static func waitCap(for profile: ToolClientProfile) -> Int {

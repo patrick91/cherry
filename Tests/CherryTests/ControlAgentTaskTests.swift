@@ -2,15 +2,14 @@ import CherryControl
 @testable import CherryMCP
 import Darwin
 import Foundation
-import MCP
 import Testing
 @testable import Cherry
 
-// Tasks and results (docs/mcp.md): spawn_agent with a task, the worker's
+// Tasks and results (docs/cli.md): spawn_agent with a task, the worker's
 // get_my_task and report_result (its own tab, never a selector), the
 // orchestrator's wait_for_tasks, the nudge and no_report fallback, and the
 // run's wake line. Agents are `/bin/cat` (screens injected) or fake agent
-// scripts; the end-to-end test drives the real CherryMCP `--call`.
+// scripts; the end-to-end test drives the real CherryMCP `cli tool`.
 
 @MainActor
 private extension ControlAgentWaitHarness {
@@ -161,18 +160,18 @@ private func json(_ text: String) throws -> JSONValue {
     #expect(text.contains(#""value":{"fileName":"a","nested":{"camelCase":[1,2.5,null]}}"#), "\(text)")
     #expect(text.contains(#""reported_at""#))
 
-    let arguments: [String: Value] = [
+    let arguments: [String: JSONValue] = [
         "value": .object(["count": .int(2), "ok": .bool(true), "items": .array([.string("x")])]),
         "result_schema": .string(#"{"type":"object"}"#),
     ]
-    #expect(try CherryMCPTools.jsonArgument("value", in: arguments) == json(#"{"count":2,"ok":true,"items":["x"]}"#))
-    #expect(try CherryMCPTools.schemaArgument("result_schema", in: arguments) == json(#"{"type":"object"}"#))
-    #expect(throws: CherryControlError.self) { try CherryMCPTools.schemaArgument("bad", in: ["bad": .string("not json")]) }
+    #expect(try CherryToolLayer.jsonArgument("value", in: arguments) == json(#"{"count":2,"ok":true,"items":["x"]}"#))
+    #expect(try CherryToolLayer.schemaArgument("result_schema", in: arguments) == json(#"{"type":"object"}"#))
+    #expect(throws: CherryControlError.self) { try CherryToolLayer.schemaArgument("bad", in: ["bad": .string("not json")]) }
 }
 
 @MainActor
 @Test func ControlAgentTaskToolsAreAdvertisedAndWaitsFitASixtySecondTimeout() async throws {
-    let advertised = Set(CherryMCPTools.all.map(\.name))
+    let advertised = Set(CherryToolCatalog.tools(for: .unknown).map(\.name))
     #expect(advertised.isSuperset(of: ["get_my_task", "report_result", "report_progress", "wait_for_tasks", "get_task", "list_tasks", "cancel_tasks"]))
     let wait = try #require(CherryMCPTools.clientTimeout(for: "wait_for_tasks", arguments: [:]))
     #expect(wait <= 55)
@@ -192,7 +191,7 @@ private func json(_ text: String) throws -> JSONValue {
     #expect(both.structured?.objectValue?["error"]?.objectValue?["code"]?.stringValue == "invalid_argument", "\(both.text)")
     #expect(both.toolsDigest != nil, "the app answered it")
     #expect(sent.isEmpty)
-    let spawnAgent = try #require(CherryMCPTools.all.first { $0.name == "spawn_agent" })
+    let spawnAgent = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "spawn_agent" })
     let properties = spawnAgent.inputSchema.objectValue?["properties"]?.objectValue ?? [:]
     #expect(Set(properties.keys).isSuperset(of: ["task", "label", "phase", "run_id", "result_schema"]))
 }
@@ -222,10 +221,9 @@ struct ControlAgentTaskTests {
         #expect(spawned.sentBytes > 0)
         #expect(worker.parentAgentID == orchestrator.id)
         #expect(worker.title == "Parser review")
-        let kickoff = try await harness.waitForOutput("You are Cherry task \(task.taskID): call get_my_task", in: worker)
-        #expect(kickoff.contains("You are Cherry task \(task.taskID): call get_my_task (Cherry MCP) for your brief, do it, then call report_result."))
-        #expect(kickoff.contains("\"$CHERRY_MCP_HELPER\" --call get_my_task"))
-        #expect(!kickoff.contains("Review the parser"), "the brief is read with get_my_task, never typed")
+        let kickoff = try await harness.waitForOutput("You are Cherry task \(task.taskID): run cherry task mine", in: worker)
+        #expect(kickoff.contains("You are Cherry task \(task.taskID): run cherry task mine for your brief, do it, then report with cherry task report"))
+        #expect(!kickoff.contains("Review the parser"), "the brief is read with cherry task mine, never typed")
 
         let summary = try await harness.status(of: worker)
         #expect(summary.taskID == task.taskID)
@@ -311,7 +309,7 @@ struct ControlAgentTaskTests {
         #expect(assignment.taskID == taskA && assignment.brief == "Brief A" && assignment.label == "A")
         #expect(assignment.resultSchema == findingsSchema)
         #expect(assignment.state == .working)
-        #expect(assignment.rules.contains { $0.contains("report_result") })
+        #expect(assignment.rules.contains { $0.contains("cherry task report") })
 
         let mismatch = try await harness.send(.reportResult(.init(value: try json(#"{"severity":"medium","files":[1]}"#), summary: "x")))
         #expect(mismatch.error?.code == "schema_mismatch")
@@ -553,7 +551,7 @@ struct ControlAgentTaskTests {
         harness.server.callerSessionResolverForTesting = { _ in workerB }
         _ = try await harness.send(.reportResult(.init(value: .null, status: "failed", summary: "SECRET-SUMMARY-B")))
         let woken = try await harness.waitForOutput("handled [cherry] Run \(runID)", in: orchestrator, seconds: 10)
-        #expect(woken.contains("[cherry] Run \(runID): 2 tasks settled (1 reported, 1 failed). Call the cherry wait_for_tasks tool with run_id \"\(runID)\" to read them, and get_task for each result."), "\(woken)")
+        #expect(woken.contains("[cherry] Run \(runID): 2 tasks settled (1 reported, 1 failed). Run cherry task wait \(runID) to read them, and cherry task get for each result."), "\(woken)")
         #expect(!woken.contains("SECRET-SUMMARY"), "the wake line carries no worker text")
         try await Task.sleep(for: .milliseconds(1_000))
         #expect(try await harness.output(of: orchestrator).components(separatedBy: "handled [cherry] Run").count - 1 == 1)
@@ -696,7 +694,7 @@ struct ControlAgentTaskTests {
             return
         }
         #expect(plainTask.rules.first?.contains("Don't hand parts of it to other agents") == true)
-        #expect(plainTask.rules.contains { $0.contains("awaiting_approval true") })
+        #expect(plainTask.rules.contains { $0.contains("cherry task progress --awaiting-approval") })
         #expect(!plainTask.rules.contains { $0.contains("rather than waiting for an answer") })
 
         harness.server.callerSessionResolverForTesting = { _ in free }
@@ -705,7 +703,7 @@ struct ControlAgentTaskTests {
             return
         }
         #expect(freeTask.rules.first?.contains("You may use your own CLI's subagents") == true)
-        #expect(freeTask.rules.first?.contains("not spawn_agent with task") == true)
+        #expect(freeTask.rules.first?.contains("not cherry spawn agent with --task") == true)
         // Still one level deep.
         try harness.settings.upsertAgent(AgentToolDefinition(name: "Worker", command: "/bin/cat"))
         let nested = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Worker", task: "C")))
@@ -719,7 +717,7 @@ struct ControlAgentTaskTests {
     // MARK: End to end
 
     /// A fake orchestrator spawns two fake workers through the real
-    /// CherryMCP; each reads its brief and reports with `CherryMCP --call`,
+    /// CherryMCP; each reads its brief and reports with `CherryMCP cli tool`,
     /// identified by its tab's process tree alone; the settled run wakes
     /// the orchestrator, and the results are there to read.
     @Test func fakeOrchestratorRunsTwoWorkersThroughCherryMCP() async throws {
@@ -731,7 +729,7 @@ struct ControlAgentTaskTests {
         defer { harness.stop() }
         harness.useFastTaskSampling()
         harness.server.start()
-        let call = "CHERRY_CONTROL_SOCKET='\(harness.socketURL.path)' '\(helper.path)' --call"
+        let call = "CHERRY_CONTROL_SOCKET='\(harness.socketURL.path)' '\(helper.path)' cli tool"
 
         let worker = harness.projectRoot.appendingPathComponent("fake-worker.sh")
         try """
@@ -1102,8 +1100,9 @@ struct ControlAgentTaskLimitTests {
             wrapped.append(String(word))
         }
     }
-    let rows = ["notes from earlier:", "- the parser", "- the lexer", ""] + wrapped + [""]
-    #expect(wrapped.count >= 9 && rows.count >= 14, "\(wrapped.count) rows")
+    let draft = ["notes from earlier:", "- the parser", "- the lexer", "- the checker", "- the emitter", "- the runner", ""]
+    let rows = draft + wrapped + [""]
+    #expect(wrapped.count >= 5 && rows.count >= 14, "\(wrapped.count) rows")
     #expect(wrapped.first?.contains(AgentTaskRegistry.kickoffMarker(taskID: id)) == true)
     let box = ["\u{256D}" + String(repeating: "\u{2500}", count: width + 2) + "\u{256E}"]
         + rows.map { "\u{2502} " + $0.padding(toLength: width, withPad: " ", startingAt: 0) + " \u{2502}" }

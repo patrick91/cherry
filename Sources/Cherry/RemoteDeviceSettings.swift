@@ -5,7 +5,7 @@ import Foundation
 // Settings › Macs (docs/specs/remote-devices.md): each device, how it
 // stands (connected, offline, needs attention, an update available), its
 // name, its windows' colour and its projects, with Reconnect, Update
-// Session Host…, Set Up Cherry MCP… and Remove…; and the saved SSH hosts no
+// Session Host… and Remove…; and the saved SSH hosts no
 // Mac uses. The page's views are in Settings/Pages/MacsSettingsPage.swift.
 
 /// One device's row; pure, for tests.
@@ -151,9 +151,9 @@ struct RemoteDeviceSettingsSSHHost: Equatable, Identifiable {
 /// through its own store, and its alerts and sheets get that store.
 @MainActor
 final class RemoteDeviceSettingsModel: ObservableObject {
-    /// What Remove…, Trust New Identity…, Update Session Host… and Set Up
-    /// Cherry MCP… show, each given the model's store: the app's alerts and
-    /// sheets. Tests record them.
+    /// What Remove…, Trust New Identity… and Update Session Host… show,
+    /// each given the model's store: the app's alerts and sheets. Tests
+    /// record them.
     struct Presenters {
         var confirmRemove: @MainActor (UUID, RemoteDeviceStore) -> Void = { id, store in
             RemoteDeviceAlerts.confirmRemove(id, store: store)
@@ -163,9 +163,6 @@ final class RemoteDeviceSettingsModel: ObservableObject {
         }
         var updateSessionHost: @MainActor (UUID, RemoteDeviceStore) -> Void = { id, store in
             RemoteDeviceUpdatePresenter.present(deviceID: id, store: store)
-        }
-        var setUpCherryMCP: @MainActor (UUID, RemoteDeviceStore) -> Void = { id, store in
-            RemoteMCPSetupPresenter.present(deviceID: id, store: store)
         }
     }
 
@@ -313,9 +310,5 @@ final class RemoteDeviceSettingsModel: ObservableObject {
 
     func updateSessionHost(_ id: UUID) {
         presenters.updateSessionHost(id, store)
-    }
-
-    func setUpCherryMCP(_ id: UUID) {
-        presenters.setUpCherryMCP(id, store)
     }
 }

@@ -1523,7 +1523,7 @@ final class TerminalWorkspace: ObservableObject {
             parentAgentID: normalizedParentAgentID,
             launchBackend: launchBackend,
             persistentHosting: persistentHostingForNewTab(),
-            agentMCPLaunch: backendPolicy.agentMCPLaunch
+            agentLaunch: backendPolicy.agentLaunch
         )
         sessions.append(session)
         if select {
@@ -1762,7 +1762,7 @@ final class TerminalWorkspace: ObservableObject {
             adoptingPersistentSession: launch,
             deferredLaunch: deferringLaunch,
             provisionalRestore: provisional,
-            agentMCPLaunch: backendPolicy.agentMCPLaunch
+            agentLaunch: backendPolicy.agentLaunch
         )
         if record.hasUnreadNotification == true { session.markUnread() }
         return session
@@ -1815,7 +1815,7 @@ final class TerminalWorkspace: ObservableObject {
             restartOnExit: record.restartOnExit,
             launchBackend: launchBackend,
             persistentHosting: hosting,
-            agentMCPLaunch: backendPolicy.agentMCPLaunch
+            agentLaunch: backendPolicy.agentLaunch
         )
         session.showSystemSessionEnd(end, exitStatus: record.exitStatus)
         if record.hasUnreadNotification == true { session.markUnread() }
@@ -3186,7 +3186,7 @@ final class TerminalWorkspace: ObservableObject {
         parentAgentID: UUID?,
         launchBackend: TerminalSessionLaunchBackend,
         persistentHosting: PersistentLocalSessions?,
-        agentMCPLaunch: AgentMCPLaunchContext?
+        agentLaunch: AgentLaunchContext?
     ) -> TerminalSession {
         let baseTitle = agent.name.isEmpty ? "Agent" : agent.name
         let explicitTitle = requestedTitle?
@@ -3206,7 +3206,7 @@ final class TerminalWorkspace: ObservableObject {
             launchCommand: agent.commandLine,
             launchBackend: launchBackend,
             persistentHosting: persistentHosting,
-            agentMCPLaunch: agentMCPLaunch
+            agentLaunch: agentLaunch
         )
     }
 
@@ -3701,30 +3701,22 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var parentAgentID: UUID?
     private(set) var commandName: String?
     private(set) var launchCommand: String?
-    /// What this launch runs when it is an agent's that gets Cherry MCP on
-    /// its command line (`AgentMCPLaunch`): `launchCommand` and the flags.
+    /// What this launch runs when it is an agent's that gets Cherry's flags
+    /// on its command line (`AgentLaunch`): `launchCommand` and the flags.
     /// Nil runs `launchCommand`. Decided once per launch (`startShell`),
     /// so a rebuilt native surface and a Create retry run the same command
     /// and a restart decides again; never saved (a record keeps
     /// `launchCommand`).
     private(set) var launchStartupCommand: String?
-    /// What this launch decided for Cherry MCP on its agent's command line
-    /// (`AgentMCPLaunchContext.outcome`): the flags it appended, or why
+    /// What this launch decided for Cherry's flags on its agent's command
+    /// line (`AgentLaunchContext.outcome`): the flags it appended, or why
     /// none. Set in `startShell` for every This Mac agent launch whose
-    /// workspace has an `agentMCPLaunch`; nil for any other tab or launch
+    /// workspace has an `agentLaunch`; nil for any other tab or launch
     /// (a device's, an attached or adopted session's, a context-less
     /// workspace's). Never saved.
-    private(set) var lastAgentMCPLaunchOutcome: AgentMCPLaunch.Outcome?
-    /// This launch started its agent to use the `cherry` CLI, not Cherry
-    /// MCP (`AgentMCPLaunch.Outcome.cli`): the lines Cherry types into it
-    /// (a task's kickoff, the nudge, wake lines) name `cherry` commands.
-    var launchUsesCherryCLI: Bool { lastAgentMCPLaunchOutcome?.usesCherryCLI ?? false }
-    /// Why a launch that got Cherry MCP's flags did not get the `cherry`
-    /// CLI's (`AgentMCPLaunchContext.cliInterfaceReason`: a Codex whose
-    /// sandbox cannot reach the socket, say). Never saved.
-    private(set) var lastAgentLaunchNotCLIReason: String?
-    /// The workspace policy's `agentMCPLaunch`: nil adds nothing.
-    private let agentMCPLaunch: AgentMCPLaunchContext?
+    private(set) var lastAgentLaunchOutcome: AgentLaunch.Outcome?
+    /// The workspace policy's `agentLaunch`: nil adds nothing.
+    private let agentLaunch: AgentLaunchContext?
     private(set) var launchEnvironment: [String: String]
     private(set) var restartOnExit: Bool
     /// Set by the owning workspace: called after a rename, a managed command
@@ -3993,7 +3985,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         adoptingPersistentSession: PersistentSessionLaunch? = nil,
         deferredLaunch: Bool = false,
         provisionalRestore: Bool = false,
-        agentMCPLaunch: AgentMCPLaunchContext? = nil,
+        agentLaunch: AgentLaunchContext? = nil,
         programStatusNotificationHandler: @escaping @MainActor (ProgramStatus, TerminalSession) -> Void = { status, session in
             TerminalNotificationCenter.shared.postProgramStatus(status, for: session)
         }
@@ -4019,7 +4011,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.parentAgentID = kind == .agent ? parentAgentID : nil
         self.commandName = commandName
         self.launchCommand = launchCommand?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-        self.agentMCPLaunch = agentMCPLaunch
+        self.agentLaunch = agentLaunch
         self.launchEnvironment = launchEnvironment
         self.restartOnExit = restartOnExit
         self.programStatusNotificationHandler = programStatusNotificationHandler
@@ -5566,57 +5558,25 @@ final class TerminalSession: ObservableObject, Identifiable {
         )
     }
 
-    /// `launchCommand` and Cherry MCP's flags when this launch is an agent's
-    /// on This Mac (native, or in This Mac's host) that gets them
-    /// (`AgentMCPLaunchContext.outcome`); nil for any other launch, which
-    /// runs `launchCommand`. Another Mac's launches add theirs in
+    /// `launchCommand` and Cherry's flags when this launch is an agent's on
+    /// This Mac (native, or in This Mac's host) that gets them
+    /// (`AgentLaunchContext.outcome`); nil for any other launch, which runs
+    /// `launchCommand`. Another Mac's launches add theirs in
     /// `RemoteLaunchSpec`. The log says why an agent did or did not get them.
     /// `outcome` is what was decided, nil when nothing was (not a This Mac
     /// agent's launch, or no context).
-    private func commandWithAgentMCP() -> (command: String?, outcome: AgentMCPLaunch.Outcome?) {
-        guard kind == .agent, let agentMCPLaunch, let launchCommand, hostedAttachment == nil,
+    private func commandWithAgentFlags() -> (command: String?, outcome: AgentLaunch.Outcome?) {
+        guard kind == .agent, let agentLaunch, let launchCommand, hostedAttachment == nil,
               persistentHosting?.profile.isThisMac ?? true
         else { return (nil, nil) }
-        let outcome = agentMCPLaunch.outcome(
-            commandLine: launchCommand,
-            serverName: CherryAppIdentity.current.urlScheme,
-            environmentKeys: AgentMCPLaunch.environmentKeys(
-                projectRoot: projectRoot,
-                controlSocketPath: CherryControlServer.appSocketPath,
-                helperPath: agentMCPLaunch.helperPath
-            ),
-            processID: id.uuidString
-        )
+        let outcome = agentLaunch.outcome(commandLine: launchCommand, processID: id.uuidString)
         switch outcome {
-        case .cli(let suffix):
-            SessionLog.debug("[mcp] tab \(id.uuidString) starts its agent with the cherry CLI:\(suffix)")
-            return (launchCommand + suffix, outcome)
         case .appended(let suffix):
-            let why = agentMCPLaunch.cliInterfaceReason(commandLine: launchCommand).map { " (not the cherry CLI: \($0))" } ?? ""
-            SessionLog.debug("[mcp] tab \(id.uuidString) starts its agent with Cherry MCP\(why):\(suffix)")
-            if AgentMCPLaunch.detect(commandLine: launchCommand)?.cli == .pi {
-                logPiRegistrationPreferredToTheLaunch(agentMCPLaunch)
-            }
+            SessionLog.debug("[agent] tab \(id.uuidString) starts its agent with the cherry CLI's flags:\(suffix)")
             return (launchCommand + suffix, outcome)
         case .skipped(let reason):
-            SessionLog.debug("[mcp] tab \(id.uuidString) starts its agent without Cherry MCP on its command line: \(reason)")
+            SessionLog.debug("[agent] tab \(id.uuidString) starts its agent without Cherry's flags: \(reason)")
             return (nil, outcome)
-        }
-    }
-
-    /// Pi uses a server of the same name in its `mcp.json` instead of the
-    /// one Cherry's extension registers: logs one that is not this app's
-    /// (`AgentMCPLaunch.piRegistrationNote`), read off the main thread
-    /// from the context's agent directory (never waiting for the login
-    /// shell). It changes nothing about the launch.
-    private func logPiRegistrationPreferredToTheLaunch(_ context: AgentMCPLaunchContext) {
-        guard let agentDirectory = context.piAgentDirectory, let helperPath = context.helperPath else { return }
-        let serverName = CherryAppIdentity.current.urlScheme
-        Task.detached(priority: .utility) {
-            let status = PiMCPRegistration.status(serverName: serverName, helperPath: helperPath, agentDirectory: agentDirectory())
-            if let note = AgentMCPLaunch.piRegistrationNote(status, serverName: serverName) {
-                SessionLog.debug("[mcp] \(note)")
-            }
         }
     }
 
@@ -5703,12 +5663,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         // before this launch.
         startedCurrentProgram = hostedAttachment == nil
             && (persistentHosting == nil || persistentSessionToAdopt == nil)
-        (launchStartupCommand, lastAgentMCPLaunchOutcome) = startedCurrentProgram ? commandWithAgentMCP() : (nil, nil)
-        if case .appended? = lastAgentMCPLaunchOutcome, let launchCommand {
-            lastAgentLaunchNotCLIReason = agentMCPLaunch?.cliInterfaceReason(commandLine: launchCommand)
-        } else {
-            lastAgentLaunchNotCLIReason = nil
-        }
+        (launchStartupCommand, lastAgentLaunchOutcome) = startedCurrentProgram ? commandWithAgentFlags() : (nil, nil)
         cancelPersistentReconnect()
         if let hostedAttachment {
             hostedAttachmentStatus = .active

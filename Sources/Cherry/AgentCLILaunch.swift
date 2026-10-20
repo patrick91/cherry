@@ -1,11 +1,11 @@
 import CherryControl
 import Foundation
 
-/// The `cherry` CLI on the command line of the agents Cherry starts
-/// (docs/specs/agent-cli.md, Teaching agents and Sandboxes): instead of
-/// Cherry MCP's flags (`AgentMCPLaunch`), the agent gets the `cherry` skill
-/// for that launch and a line saying it runs in a Cherry tab, and reaches
-/// Cherry with the `cherry` on its PATH (`TabCLIDirectory`).
+/// The `cherry` CLI's flags on the command line of the agents Cherry starts
+/// (docs/specs/agent-cli.md, Teaching agents and Sandboxes; `AgentLaunch`):
+/// the `cherry` skill for that launch and a line saying the agent runs in a
+/// Cherry tab, which reaches Cherry with the `cherry` on its PATH
+/// (`TabCLIDirectory`).
 ///
 /// - Claude Code: `--plugin-dir <agent-skill>/cherry-plugin`
 ///   (`AgentSkillDirectory`), `--append-system-prompt <line>`, and
@@ -14,15 +14,15 @@ import Foundation
 ///   settings merge across Claude Code's scopes, and `--settings` is one,
 ///   so the user's own list stays).
 /// - Pi: `--skill <cherry-plugin>/skills/cherry` and
-///   `--append-system-prompt <line>`; no extension (it registers MCP).
+///   `--append-system-prompt <line>`.
 /// - Codex has no flag for a skill: `-c developer_instructions=<line>`, which
-///   names `cherry skill show`. Only when Codex can run `cherry`: Cherry's
-///   rules file is installed (`CodexLaunchFacts.rulesInstalled`: an allowed
-///   `cherry` command runs outside Codex's sandbox), or Approvals is Auto
-///   review (a sandboxed `cherry` fails, and Codex's reviewer decides on
-///   running it outside). Otherwise Codex gets Cherry MCP as before.
+///   names `cherry skill show`. A sandbox that cannot reach the socket makes
+///   `cherry` fail there unless Cherry's rules file is installed
+///   (`CodexLaunchFacts.rulesInstalled`: an allowed `cherry` command runs
+///   outside it) or Approvals is Auto review (its reviewer decides on
+///   running it outside); otherwise Codex asks the user to.
 ///
-/// Approvals (`AgentApprovals`, Settings › Agents & MCP) add to either.
+/// Approvals (`AgentApprovals`, Settings › Agents) add to them.
 enum AgentCLILaunch {
     /// The line a launch appends to the agent's instructions: no `'`, `"`
     /// or `\`, so it reads the same in every shell's single quotes and as a
@@ -49,7 +49,7 @@ enum AgentCLILaunch {
     /// instructions: Claude Code's and Pi's `--system-prompt*` and
     /// `--append-system-prompt*`, Codex's `developer_instructions` or
     /// `model_instructions_file` in a `-c`.
-    static func setsOwnInstructions(_ cli: AgentMCPLaunch.CLI, words: [String]) -> Bool {
+    static func setsOwnInstructions(_ cli: AgentLaunch.CLI, words: [String]) -> Bool {
         switch cli {
         case .claudeCode, .pi:
             words.contains { $0.hasPrefix("--system-prompt") || $0.hasPrefix("--append-system-prompt") }
@@ -59,12 +59,12 @@ enum AgentCLILaunch {
     }
 
     /// The words a CLI launch appends (unquoted), or nil when one of the
-    /// paths cannot go on a command line (`AgentMCPLaunch.isLinePath`).
+    /// paths cannot go on a command line (`AgentLaunch.isLinePath`).
     /// `pluginDirectory` is the app's (`AgentSkillDirectory.current`);
     /// `socketPath` the app's control socket; `addsInstructions` false
     /// leaves the agent's instructions alone.
     static func arguments(
-        for cli: AgentMCPLaunch.CLI,
+        for cli: AgentLaunch.CLI,
         words: [String],
         pluginDirectory: URL?,
         socketPath: String?,
@@ -74,13 +74,13 @@ enum AgentCLILaunch {
         let instructions = addsInstructions && !setsOwnInstructions(cli, words: words)
         switch cli {
         case .claudeCode:
-            guard let plugin = pluginDirectory?.path, AgentMCPLaunch.isLinePath(plugin) else { return nil }
+            guard let plugin = pluginDirectory?.path, AgentLaunch.isLinePath(plugin) else { return nil }
             var arguments = ["--plugin-dir", plugin]
             if instructions {
                 arguments += ["--append-system-prompt", instructionLine(processID: processID, hasSkill: true)]
             }
             // One `--settings` only: a command with its own keeps it.
-            if let socketPath, AgentMCPLaunch.isLinePath(socketPath),
+            if let socketPath, AgentLaunch.isLinePath(socketPath),
                !words.contains(where: { $0 == "--settings" || $0.hasPrefix("--settings=") }),
                let settings = claudeSandboxSettings(socketPath: socketPath) {
                 arguments += ["--settings", settings]
@@ -89,7 +89,7 @@ enum AgentCLILaunch {
         case .pi:
             guard let plugin = pluginDirectory else { return nil }
             let skill = AgentSkillDirectory.skillDirectory(inPlugin: plugin).path
-            guard AgentMCPLaunch.isLinePath(skill) else { return nil }
+            guard AgentLaunch.isLinePath(skill) else { return nil }
             var arguments = ["--skill", skill]
             if instructions {
                 arguments += ["--append-system-prompt", instructionLine(processID: processID, hasSkill: true)]
@@ -97,12 +97,41 @@ enum AgentCLILaunch {
             return arguments
         case .codex:
             guard instructions else { return [] }
-            return ["-c", "developer_instructions=" + AgentMCPLaunch.tomlString(instructionLine(processID: processID, hasSkill: false))]
+            return codexInstructions(processID: processID)
         }
+    }
+
+    /// The words a device agent's launch appends (`RemoteAgentLaunch`):
+    /// the line, which names `cherry skill show` (the device has no skill
+    /// files), and for Claude Code the sandbox setting for the forwarded
+    /// `socketPath`. Nil when the socket's path cannot go on a command line.
+    static func deviceArguments(for cli: AgentLaunch.CLI, words: [String], socketPath: String, processID: String?) -> [String]? {
+        let instructions = !setsOwnInstructions(cli, words: words)
+        switch cli {
+        case .claudeCode:
+            guard AgentLaunch.isLinePath(socketPath) else { return nil }
+            var arguments: [String] = []
+            if instructions {
+                arguments += ["--append-system-prompt", instructionLine(processID: processID, hasSkill: false)]
+            }
+            if !words.contains(where: { $0 == "--settings" || $0.hasPrefix("--settings=") }),
+               let settings = claudeSandboxSettings(socketPath: socketPath) {
+                arguments += ["--settings", settings]
+            }
+            return arguments
+        case .pi:
+            return instructions ? ["--append-system-prompt", instructionLine(processID: processID, hasSkill: false)] : []
+        case .codex:
+            return instructions ? codexInstructions(processID: processID) : []
+        }
+    }
+
+    private static func codexInstructions(processID: String?) -> [String] {
+        ["-c", "developer_instructions=" + AgentLaunch.tomlString(instructionLine(processID: processID, hasSkill: false))]
     }
 }
 
-/// Settings › Agents & MCP › an agent's Approvals, for the agents Cherry
+/// Settings › Agents › an agent's Approvals, for the agents Cherry
 /// starts of one CLI: as the agent is configured, or Auto review (Claude
 /// Code `--permission-mode auto`, its classifier deciding each action;
 /// Codex `--approve-for-me`, approval requests going to Codex's automatic
@@ -114,18 +143,18 @@ enum AgentApprovals: String, CaseIterable, Sendable {
     case autoReview
 
     /// `agents.approvals.claudeCode`, `agents.approvals.codex`.
-    static func defaultsKey(for cli: AgentMCPLaunch.CLI) -> String {
+    static func defaultsKey(for cli: AgentLaunch.CLI) -> String {
         "agents.approvals.\(cli.rawValue)"
     }
 
     /// The CLIs that have an automatic review.
-    static func isOffered(for cli: AgentMCPLaunch.CLI) -> Bool {
+    static func isOffered(for cli: AgentLaunch.CLI) -> Bool {
         cli != .pi
     }
 
     /// The stored choice, as a launch reads it (a string; anything else is
     /// As configured).
-    static func current(for cli: AgentMCPLaunch.CLI, defaults: UserDefaults = .standard) -> AgentApprovals {
+    static func current(for cli: AgentLaunch.CLI, defaults: UserDefaults = .standard) -> AgentApprovals {
         guard isOffered(for: cli),
               let raw = defaults.object(forKey: defaultsKey(for: cli)) as? String,
               let value = AgentApprovals(rawValue: raw)
@@ -141,7 +170,7 @@ enum AgentApprovals: String, CaseIterable, Sendable {
     }
 
     /// What Auto review appends for `cli`.
-    static func autoReviewArguments(for cli: AgentMCPLaunch.CLI) -> [String] {
+    static func autoReviewArguments(for cli: AgentLaunch.CLI) -> [String] {
         switch cli {
         case .claudeCode: ["--permission-mode", "auto"]
         case .codex: ["--approve-for-me"]
@@ -157,7 +186,7 @@ enum AgentApprovals: String, CaseIterable, Sendable {
     /// or a `-c` of `approval_policy`, `approvals_reviewer` or `sandbox_mode`.
     /// From Claude Code 2.1.303's and Codex 0.162.1's `--help`; recheck
     /// after an upgrade.
-    static func setsOwnApprovals(_ cli: AgentMCPLaunch.CLI, words: [String]) -> Bool {
+    static func setsOwnApprovals(_ cli: AgentLaunch.CLI, words: [String]) -> Bool {
         func has(_ option: String) -> Bool {
             words.contains { $0 == option || $0.hasPrefix(option + "=") }
         }
@@ -332,8 +361,8 @@ struct CodexLaunchFacts: Equatable, Sendable {
 
 /// The last reading of `CodexLaunchFacts`, which a launch uses as it is
 /// (never waiting) and refreshes in the background for the next one; nil
-/// until the first reading finished: a Codex launch then gets Cherry MCP,
-/// as before.
+/// until the first reading finished: a Codex launch then gets no
+/// instructions line.
 @MainActor
 final class CodexLaunchFactsCache {
     static let shared = CodexLaunchFactsCache()

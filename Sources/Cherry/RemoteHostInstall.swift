@@ -122,17 +122,13 @@ struct RemoteHostHelpers: Equatable, Sendable {
     /// has none (then nothing is installed with them).
     var resources: GhosttyResourceStaging.Source? = nil
     /// Their digest (`RemoteHostResources.digest`), as the other Mac's
-    /// scripts compute it (`resources_hash`), CherryMCP and Cherry's Pi
-    /// extension included when there are.
+    /// scripts compute it (`resources_hash`), CherryMCP included when there
+    /// is one.
     var resourcesHash: String? = nil
     /// CherryMCP (docs/specs/remote-devices.md, phase 4b), installed with
     /// the resources as `<build>/CherryMCP` for agents in tabs there; nil
     /// when this Cherry has none next to its helpers or its own executable.
     var mcpHelper: URL? = nil
-    /// Cherry's Pi extension (`PiMCPExtension`), installed with CherryMCP
-    /// as `<build>/cherry-pi-mcp.ts` for the Pi agents Cherry starts there
-    /// (`RemoteAgentMCPLaunch`); nil without CherryMCP, which it runs.
-    var piExtension: URL? = nil
 
     var build: String { version.build ?? "unknown" }
 
@@ -151,18 +147,13 @@ struct RemoteHostHelpers: Equatable, Sendable {
 
     /// Reads the helpers in `directory` (runs `cherry-host version --json`),
     /// with the Ghostty resources (`resources`: the app's bundled ones by
-    /// default) installed next to them, and CherryMCP with Cherry's Pi
-    /// extension (`piExtension`: the bundle's by default, kept only with a
-    /// CherryMCP and under its install name).
+    /// default) installed next to them, and CherryMCP.
     static func load(
         directory: URL,
         resources: GhosttyResourceStaging.Source? = GhosttyResourceStaging.bundledSource(),
-        mcpHelper: URL?? = nil,
-        piExtension: URL?? = nil
+        mcpHelper: URL?? = nil
     ) throws -> RemoteHostHelpers {
         let mcpHelper = mcpHelper ?? defaultMCPHelper(near: directory)
-        let piExtension = mcpHelper == nil ? nil : (piExtension ?? PiMCPExtension.bundledURL)
-            .flatMap { $0.lastPathComponent == RemoteMCPPaths.piExtensionName ? $0 : nil }
         let files = names.map { directory.appendingPathComponent($0) }
         for file in files where !FileManager.default.isExecutableFile(atPath: file.path) {
             throw HostedSessionError.message("This Cherry has no \(file.lastPathComponent) to install (looked in \(directory.path)).")
@@ -186,10 +177,9 @@ struct RemoteHostHelpers: Equatable, Sendable {
             hashes: try files.map(sha256),
             resources: installable,
             resourcesHash: installable.flatMap {
-                try? RemoteHostResources.digest(of: $0, mcpHelper: mcpHelper, piExtension: piExtension)
+                try? RemoteHostResources.digest(of: $0, mcpHelper: mcpHelper)
             },
-            mcpHelper: installable == nil ? nil : mcpHelper,
-            piExtension: installable == nil ? nil : piExtension
+            mcpHelper: installable == nil ? nil : mcpHelper
         )
     }
 
@@ -320,16 +310,14 @@ enum RemoteHostResources {
 
     /// The digest the other Mac's `resources_hash` computes: the SHA-256 of
     /// `shasum -a 256` lines ("<hex>  <path>") of every regular file under
-    /// `Ghostty/` and `terminfo/`, and CherryMCP and Cherry's Pi extension
-    /// when given, by path in byte order. Without the extension it is the
-    /// digest of an install made before Cherry had one.
-    static func digest(of source: GhosttyResourceStaging.Source, mcpHelper: URL? = nil, piExtension: URL? = nil) throws -> String {
+    /// `Ghostty/` and `terminfo/`, and CherryMCP when given, by path in byte
+    /// order.
+    static func digest(of source: GhosttyResourceStaging.Source, mcpHelper: URL? = nil) throws -> String {
         var files: [(path: String, url: URL)] = []
         for (name, root) in zip(treeNames, [source.resourcesDirectory, source.terminfoDirectory]) {
             try collectFiles(in: root, relativePath: name, into: &files)
         }
         if let mcpHelper { files.append((RemoteMCPPaths.helperName, mcpHelper)) }
-        if let piExtension { files.append((RemoteMCPPaths.piExtensionName, piExtension)) }
         files.sort { Array($0.path.utf8).lexicographicallyPrecedes(Array($1.path.utf8)) }
         var listing = ""
         for file in files {
@@ -351,12 +339,12 @@ enum RemoteHostResources {
         }
     }
 
-    /// `resources_hash D`: the digest of D's trees, its CherryMCP and its
-    /// Pi extension (when it has them), or `-` when either tree is missing.
+    /// `resources_hash D`: the digest of D's trees and its CherryMCP (when
+    /// it has one), or `-` when either tree is missing.
     static let hashFunction: [String] = [
         "resources_hash() {",
         "  if [ -d \"$1/Ghostty/shell-integration\" ] && [ -d \"$1/terminfo\" ]; then",
-        "    (cd \"$1\" && { /usr/bin/find Ghostty terminfo -type f -print 2>/dev/null; if [ -f CherryMCP ]; then echo CherryMCP; fi; if [ -f \(RemoteMCPPaths.piExtensionName) ]; then echo \(RemoteMCPPaths.piExtensionName); fi; } | LC_ALL=C /usr/bin/sort | while IFS= read -r f; do \(RemoteHostInstaller.Tool.shasum) -a 256 \"$f\"; done) | \(RemoteHostInstaller.Tool.shasum) -a 256 | \(RemoteHostInstaller.Tool.awk) '{ print $1 }'",
+        "    (cd \"$1\" && { /usr/bin/find Ghostty terminfo -type f -print 2>/dev/null; if [ -f CherryMCP ]; then echo CherryMCP; fi; } | LC_ALL=C /usr/bin/sort | while IFS= read -r f; do \(RemoteHostInstaller.Tool.shasum) -a 256 \"$f\"; done) | \(RemoteHostInstaller.Tool.shasum) -a 256 | \(RemoteHostInstaller.Tool.awk) '{ print $1 }'",
         "  else",
         "    echo -",
         "  fi",
@@ -952,7 +940,6 @@ struct RemoteHostInstaller: Sendable {
             "  \(Tool.xattr) -c \"$src/cherry\" \"$src/cherry-host\" 2>/dev/null",
             "  for tree in Ghostty terminfo; do [ -d \"$src/$tree\" ] && \(Tool.xattr) -cr \"$src/$tree\" 2>/dev/null; done",
             "  [ -f \"$src/CherryMCP\" ] && \(Tool.xattr) -c \"$src/CherryMCP\" 2>/dev/null",
-            "  [ -f \"$src/\(RemoteMCPPaths.piExtensionName)\" ] && \(Tool.xattr) -c \"$src/\(RemoteMCPPaths.piExtensionName)\" 2>/dev/null",
             "  printf 'resources_hash=%s\\n' \"$(resources_hash \"$src\")\"",
             "  if signature=$(\(Tool.codesign) --verify --strict \"$src/cherry-host\" 2>&1) && signature=$(\(Tool.codesign) --verify --strict \"$src/cherry\" 2>&1); then",
             "    echo codesign=ok",
@@ -1421,8 +1408,7 @@ struct RemoteHostInstaller: Sendable {
     }
 
     /// What `tar -cf -` archives: the helpers, then Ghostty's two trees
-    /// when there are any, each from its own directory, then CherryMCP and
-    /// Cherry's Pi extension.
+    /// when there are any, each from its own directory, then CherryMCP.
     static func archiveArguments(_ helpers: RemoteHostHelpers) -> [String] {
         var arguments = ["-cf", "-", "-C", helpers.directory.path] + RemoteHostHelpers.names
         if let resources = helpers.resources, helpers.resourcesHash != nil {
@@ -1432,9 +1418,6 @@ struct RemoteHostInstaller: Sendable {
             ]
             if let mcpHelper = helpers.mcpHelper {
                 arguments += ["-C", mcpHelper.deletingLastPathComponent().path, mcpHelper.lastPathComponent]
-                if let piExtension = helpers.piExtension {
-                    arguments += ["-C", piExtension.deletingLastPathComponent().path, RemoteMCPPaths.piExtensionName]
-                }
             }
         }
         return arguments

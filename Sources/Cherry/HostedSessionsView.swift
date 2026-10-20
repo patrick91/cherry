@@ -295,7 +295,7 @@ struct HostedSessionsSheet: View {
     @State private var terminationCandidate: HostedSessionInfo?
     /// A device window's own Mac (docs/specs/remote-devices.md): the only
     /// host its sheet offers, so no session of This Mac or of another host
-    /// is ever attached into it (Cherry MCP there reaches only that Mac's).
+    /// is ever attached into it (`cherry` there reaches only that Mac's).
     private let deviceHost: HostedSessionHost?
 
     /// Opens on the host the picker asked for (Persistent Sessions on

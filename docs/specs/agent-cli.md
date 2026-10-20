@@ -1,7 +1,8 @@
 # Agents use the `cherry` CLI
 
-Status: plan (2026-10-19). Supersedes the 2026-10-15 decision to keep Cherry
-MCP as the agents' primary interface; MCP stays as a fallback.
+Status: built (2026-10-19), and Cherry MCP removed (2026-10-20, phase 6).
+Supersedes the 2026-10-15 decision to keep Cherry MCP as the agents'
+primary interface.
 
 ## Why
 
@@ -75,7 +76,7 @@ cherry host start|shutdown|restart|list|new|attach|kill|remove|control|status|do
   parses the verbs into a tool name and arguments and calls
   `CherryMCPSession.call(…, interface: "cli")`, so caller identity (process
   ancestry; a device tab's token), the private-socket checks, the legacy
-  fallback and device scoping are the ones MCP uses today.
+  fallback and device scoping are the ones MCP used.
 - The Rust `cherry` keeps the host commands and hands every other subcommand
   to the helper (`execv`: `CHERRY_MCP_HELPER`, else `CherryMCP` beside its own
   executable), so there is one `cherry` on PATH.
@@ -129,7 +130,7 @@ selection, a name wins; workers and tasks in five lines) that ends with "run
   `.cherry-skill` marker with its SKILL.md's hash (an edit by hand makes it
   `foreign`); the rules file starts with `CherrySkill.rulesFirstLine`, and
   allows every agent command's first word but `start`, `restart` and
-  `skill` (docs/mcp.md › The `cherry` Command).
+  `skill` (docs/cli.md › The `cherry` Command).
 - In the app, Connect Agents to Cherry… shows these rows and installs only
   after its confirmation, as today (Cherry writes no agent configuration
   otherwise).
@@ -149,12 +150,15 @@ selection, a name wins; workers and tasks in five lines) that ends with "run
   is not a bundle resource: SwiftPM's `.process` flattens directories, and a
   Claude Code plugin needs `.claude-plugin/plugin.json` beside `skills/`. So
   install-local-app, package-release and the signing scripts are unchanged.
-- Pi started with the CLI gets no `-e` extension (it registers Cherry MCP);
-  its `cherry_workers` prompt section is MCP's, and the skill and the line
-  take its place.
-- Devices stay on Cherry MCP (`RemoteAgentMCPLaunch`): a device install
-  carries no skill files yet, and its gated line would need them checked
-  there as it checks the Pi extension. A later phase.
+- Pi started with the CLI gets no `-e` extension (it registered Cherry MCP,
+  and is gone with it); the skill and the line take its `cherry_workers`
+  prompt section's place.
+- Devices (phase 6, `RemoteAgentLaunch`): the install carries no skill
+  files, so a device agent gets the line (`hasSkill: false`, naming `cherry
+  skill show`), Claude Code also `--settings` for the forwarded socket, and
+  Codex's `developer_instructions` only while a grep of its `config.toml`
+  there finds none; the gated line checks the install's `cherry` and
+  CherryMCP.
 
 ## Sandboxes and permissions
 
@@ -181,9 +185,10 @@ for Codex, or a `-c` of `approval_policy`, `approvals_reviewer`,
 `--permission-prompt-tool` too: `AgentApprovals.setsOwnApprovals`, from
 Claude Code 2.1.303's and Codex 0.162.1's `--help`).
 
-A Codex tab gets the CLI when any of these holds
-(`AgentMCPLaunchContext.cliUnavailableReason`), else launch-time MCP as
-before:
+Phase 3 gave a Codex tab the CLI only when one of these held, else
+launch-time MCP; since phase 6 every Codex tab gets the CLI, and these
+decide only whether a `cherry` there runs without asking (the agent's page
+says which, `AgentSettingsPage.interface`):
 
 1. Its sandbox reaches the socket (`CodexLaunchFacts.launchReachesSockets`):
    the command's own choice (`--dangerously-bypass-approvals-and-sandbox`,
@@ -204,9 +209,7 @@ before:
 Codex's files are read off the main thread (`CodexLaunchFactsCache`, again
 after each launch); a launch never waits for them: before the first reading
 only the command's own words count (1), and the line is left out (the config
-may set instructions). The reason a tab got Cherry MCP instead is
-`TerminalSession.lastAgentLaunchNotCLIReason`, logged with the launch and
-shown on the agent's page (Interface).
+may set instructions).
 
 ## Workers and orchestrators
 
@@ -227,13 +230,16 @@ shown on the agent's page (Interface).
 
 ## MCP
 
-- Stays, unchanged, on the same layer: for sandboxed Codex without the rules
-  file, for agents started by hand that are configured for it, and for anyone
-  who prefers it.
-- Connect agents Cherry starts (`mcp.connectAgentsAtLaunch`) covers both: an
-  agent that gets the CLI gets no Cherry MCP flags (a `.cli` outcome), one
-  that cannot gets them as before. Each agent's page shows which
-  (Interface) and why.
+Removed in phase 6 (the owner's call, 2026-10-20: "we can add it back
+later if the CLI is not enough"): CherryMCP's stdio server and the MCP SDK,
+launch-time `--mcp-config`/`-c mcp_servers`/Pi's `-e` extension, the
+Connect rows that ran `claude|codex|pi mcp add`, Connect This Agent, and
+Set Up Cherry MCP on <Mac>…. The tool layer, the catalog (its fixtures and
+`listTools`) and the control protocol stay: the wire is append-only, and
+the CLI is a front end on the same calls. A `cherry` registration someone
+made by hand now fails to start; `claude mcp remove cherry` (and Codex's,
+Pi's) clears it. Connect agents Cherry starts keeps its key
+(`mcp.connectAgentsAtLaunch`).
 
 ## Sidebar (with this work)
 
@@ -262,6 +268,11 @@ shown on the agent's page (Interface).
    launch-time skill when the installed one is `current`, read off the main
    thread as Codex's config is. A real Codex run of Auto review (needs the
    owner's OK).
+
+6. Remove Cherry MCP (above); devices get the CLI's flags; every worker
+   text names `cherry` commands. Next: the Rust `cherry` speaks the control
+   protocol itself (the app supplies the commands' table, the guide and the
+   skill install), and CherryMCP is deleted.
 
 ## Open questions
 

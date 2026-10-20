@@ -134,8 +134,6 @@ struct ProjectSwitcherActions {
             RemoteDeviceAlerts.confirmTrustNewIdentity(of: deviceID, store: store)
         case .updateDeviceHost(let deviceID):
             RemoteDeviceUpdatePresenter.present(deviceID: deviceID, store: store)
-        case .setUpDeviceMCP(let deviceID):
-            RemoteMCPSetupPresenter.present(deviceID: deviceID, store: store)
         case .renameDevice(let deviceID):
             RemoteDeviceAlerts.rename(deviceID, store: store)
         case .removeDevice(let deviceID):

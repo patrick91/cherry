@@ -461,7 +461,7 @@ struct ControlAgentMonitorTests {
             if typed.contains("handled [cherry] Monitor") { break }
             try await Task.sleep(for: .milliseconds(100))
         }
-        #expect(typed.contains("[cherry] Monitor \(id): 1 event ready (1 done). Call the cherry wait_for_events tool with subscription_id \"\(id)\" to read them."))
+        #expect(typed.contains("[cherry] Monitor \(id): 1 event ready (1 done). Run cherry events \(id) to read them."))
         #expect(!typed.contains("Done."), "the wake line carries no worker text")
         // The wake line is a turn submitted to the subscriber, after the
         // turn it reported working on.

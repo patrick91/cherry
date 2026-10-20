@@ -1,10 +1,10 @@
 import Darwin
 import Foundation
 
-// Cherry MCP for agents on another Mac (docs/specs/remote-devices.md, phase
-// 4b). A tab Cherry runs on another Mac (a device) gets a capability token
+// The `cherry` command for agents on another Mac
+// (docs/specs/remote-devices.md, phase 4b). A tab Cherry runs on another Mac (a device) gets a capability token
 // for that tab in its environment, and the path of the app's control socket
-// forwarded there over SSH. Its CherryMCP presents the token with every
+// forwarded there over SSH. Its `cherry` presents the token with every
 // request (`CherryControlEnvelope`): the app's control server identifies a
 // caller that comes through a forward by its token, never by process id
 // (its processes are another Mac's).
@@ -14,20 +14,17 @@ extension CherryControl {
     /// tab Cherry runs on another Mac.
     public static let mcpTokenEnvironmentKey = "CHERRY_MCP_TOKEN"
     /// The CherryMCP of the Cherry build that started the tab, on the Mac
-    /// that runs it (the device), which the stable launcher runs.
+    /// that runs it (the device), which its `cherry` runs.
     public static let mcpHelperEnvironmentKey = "CHERRY_MCP_HELPER"
-    /// The name Cherry's server has in the agents Cherry starts (the
-    /// identity's URL scheme), next to `CHERRY_MCP_HELPER` in every tab
-    /// that has it: what Cherry's Pi extension registers the helper as.
+    /// The identity's URL scheme, next to `CHERRY_MCP_HELPER` in every tab
+    /// that has it (the name Cherry MCP's server had).
     public static let mcpServerNameEnvironmentKey = "CHERRY_MCP_SERVER_NAME"
     /// The name of the Mac Cherry runs on, for "Cherry on <Mac> is not
     /// reachable".
     public static let controlMachineEnvironmentKey = "CHERRY_CONTROL_MACHINE"
 
-    /// The Cherry variables a tab of another Mac carries, which CherryMCP
-    /// needs: Set Up Cherry MCP lists them in Codex's `env_vars`, since
-    /// Codex starts MCP servers with only a few variables of its own
-    /// environment. (Reading them from an ancestor does not work: macOS
+    /// The Cherry variables a tab of another Mac carries, which its
+    /// `cherry` needs. (Reading them from an ancestor does not work: macOS
     /// does not show another process's environment.)
     public static let remoteTabEnvironmentKeys: [String] = [
         mcpTokenEnvironmentKey,

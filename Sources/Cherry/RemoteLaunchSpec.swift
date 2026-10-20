@@ -26,16 +26,17 @@ import Foundation
 ///   environment would not reach the program. Its `MANPATH`, `TZ` and
 ///   `XDG_*` are in `env`. A shell whose syntax is not known here gets PATH
 ///   in `env` instead. A terminal gets none of it: its login shell reads its
-///   startup files itself. An agent's plain `claude` or `codex` line, under
-///   an sh-family login shell, asks its CLI's version there and runs with
-///   Cherry MCP's flags when it is new enough (`RemoteAgentMCPLaunch`,
-///   while the app's device store connects agents at launch).
+///   startup files itself. An agent's plain `claude`, `codex` or `pi` line,
+///   under an sh-family login shell, asks its CLI's version there and runs
+///   with the `cherry` CLI's flags when it is new enough
+///   (`RemoteAgentLaunch`, while the app's device store connects agents at
+///   launch).
 /// - `env` is what describes the terminal and the tab: `TERM`
 ///   (`xterm-ghostty` with the device's `TERMINFO` and
 ///   `GHOSTTY_RESOURCES_DIR` when it has the resources, else
 ///   `xterm-256color`), `COLORTERM`, the tab's identity (`CHERRY_PROCESS_ID`,
 ///   `CHERRY_AGENT_ID`, `CHERRY_PROJECT_ROOT` as the path there,
-///   `INSIDE_CHERRY`, `CHERRY_TERM_PROGRAM`, `TERM_PROGRAM`), Cherry MCP's
+///   `INSIDE_CHERRY`, `CHERRY_TERM_PROGRAM`, `TERM_PROGRAM`), the `cherry` command's
 ///   (`CHERRY_CONTROL_SOCKET` as the socket forwarded there,
 ///   `CHERRY_MCP_TOKEN`, `CHERRY_MCP_HELPER`, `CHERRY_CONTROL_MACHINE`;
 ///   phase 4b), the shell
@@ -80,8 +81,9 @@ enum RemoteLaunchSpec {
         var shell: String?
         var homeDirectory: String?
         var resources: Resources?
-        /// Cherry MCP for its agents (phase 4b): the forwarded control
-        /// socket there, the tab's token, the install's CherryMCP.
+        /// What its tabs' `cherry` needs (phase 4b): the forwarded control
+        /// socket there, the tab's token, the install's `cherry` and
+        /// CherryMCP.
         var mcp: RemoteMCPLaunch?
         /// Its interactive login shell's variables, as Cherry last read them
         /// there (`RemoteLoginEnvironment.isSent` only): its commands and
@@ -90,10 +92,10 @@ enum RemoteLaunchSpec {
         /// Why they are not known (the capture failed, or has not run), for
         /// the message of a command that is then not found.
         var loginEnvironmentProblem: String?
-        /// Its agents get Cherry MCP on their command line, gated on their
-        /// CLI's version there (`RemoteAgentMCPLaunch`): Settings › Agents &
-        /// MCP › Connect agents Cherry starts, for the app's device store
-        /// only (`RemoteDeviceStore.launchDevice(id:)`).
+        /// Its agents get the `cherry` CLI's flags on their command line,
+        /// gated on their CLI's version there (`RemoteAgentLaunch`):
+        /// Settings › Agents › Connect agents Cherry starts, for the app's
+        /// device store only (`RemoteDeviceStore.launchDevice(id:)`).
         var connectsAgentsAtLaunch = false
     }
 
@@ -232,8 +234,8 @@ enum RemoteLaunchSpec {
     }
 
     /// An agent's line there: gated on its CLI's version, so that one new
-    /// enough gets Cherry MCP (`RemoteAgentMCPLaunch`), else as it is. The
-    /// log says which, and why.
+    /// enough gets the `cherry` CLI's flags (`RemoteAgentLaunch`), else as
+    /// it is. The log says which, and why.
     private static func agentLine(
         _ line: String,
         agentID: String,
@@ -241,15 +243,12 @@ enum RemoteLaunchSpec {
         device: Device,
         environment: [String: String]
     ) -> String {
-        switch RemoteAgentMCPLaunch.outcome(
-            line: line, shell: shell, device: device, environment: environment,
-            serverName: CherryAppIdentity.current.urlScheme
-        ) {
+        switch RemoteAgentLaunch.outcome(line: line, shell: shell, device: device, environment: environment) {
         case .gated(let gated, let suffix):
-            SessionLog.debug("[mcp] device tab \(agentID) starts its agent with Cherry MCP if its CLI is new enough:\(suffix)")
+            SessionLog.debug("[agent] device tab \(agentID) starts its agent with the cherry CLI's flags if its CLI is new enough:\(suffix)")
             return gated
         case .skipped(let reason):
-            SessionLog.debug("[mcp] device tab \(agentID) starts its agent without Cherry MCP on its command line: \(reason)")
+            SessionLog.debug("[agent] device tab \(agentID) starts its agent without Cherry's flags: \(reason)")
             return line
         }
     }
@@ -304,7 +303,7 @@ enum RemoteLaunchSpec {
     }
 
     /// The login shells, by name, that read a line as the POSIX shell does
-    /// (`lineSettingLoginPath`, `RemoteAgentMCPLaunch`).
+    /// (`lineSettingLoginPath`, `RemoteAgentLaunch`).
     static let shFamilyShellNames: Set<String> = ["zsh", "bash", "sh", "ksh", "mksh", "dash", "yash", "oksh", "loksh"]
 
     static func isShFamily(_ shell: String) -> Bool {

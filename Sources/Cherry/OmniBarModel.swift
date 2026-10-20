@@ -98,7 +98,6 @@ enum OmniMenuCommand: String, CaseIterable {
     case persistentSessions
     case toggleSidebar
     case connectAgents
-    case connectThisAgent
     case closeFinishedWorkers
     // Ids of the command palette's commands, kept so their usage carries
     // over (`OmniFrecencyStore`).
@@ -494,13 +493,6 @@ struct OmniAgent: Equatable {
     var commandLine: String
 }
 
-/// The selected tab's agent, when Cherry connects its CLI (Connect This
-/// Agent to Cherry…).
-struct OmniSelectedAgent: Equatable {
-    var harness: MCPHarness
-    var productName: String
-}
-
 /// What the window the bar is open in can do now (the commands offered).
 struct OmniWindowContext: Equatable {
     var hasSelectedTab = false
@@ -514,9 +506,6 @@ struct OmniWindowContext: Equatable {
     var isSidebarHidden = false
     var detachTitle = "Detach Tab"
     var closeTitle = "Close Tab"
-    /// The selected tab is a Claude Code, Codex or Pi agent
-    /// (`ConnectThisAgent.harness`).
-    var selectedAgent: OmniSelectedAgent?
     /// The selected tab's sub-agents whose task settled (Close Finished
     /// Workers).
     var finishedWorkerCount = 0
@@ -701,8 +690,7 @@ enum OmniProviders {
 
     /// A Mac's ⌘K actions: its folders, a terminal on it, and, for a
     /// device, what can be done with it now (Reconnect, Trust New
-    /// Identity…, Update Session Host…, Set Up Cherry MCP…, Rename…,
-    /// Remove…).
+    /// Identity…, Update Session Host…, Rename…, Remove…).
     static func macActions(_ machine: ProjectSwitcherModel.Machine, sources: OmniSources) -> [OmniAction] {
         let hasBackground = sources.backgroundSessions.contains { $0.machine == machine }
         let endBackgroundSessions = OmniAction(
@@ -745,9 +733,6 @@ enum OmniProviders {
                 actions.append(.init(title: entry.hostUpdateTitle, command: .switcher(.updateDeviceHost(id))))
             }
             actions.append(.init(title: "Persistent Sessions on \(device.name)…", command: .switcher(.openDeviceSessions(id))))
-            if canOpen {
-                actions.append(.init(title: "Set Up Cherry MCP on \(device.name)…", command: .switcher(.setUpDeviceMCP(id))))
-            }
             // The machine's own actions go before its management.
             if hasBackground { actions.append(endBackgroundSessions) }
             if canModify {
@@ -945,16 +930,8 @@ enum OmniProviders {
         }
         items.append(command(
             .connectAgents, title: "Connect Agents to Cherry…", symbol: "link",
-            keywords: ["mcp", "claude", "codex", "pi", "register"]
+            keywords: ["skill", "cherry command", "claude", "codex", "pi", "install"]
         ))
-        if let agent = window.selectedAgent {
-            var item = command(
-                .connectThisAgent, title: "Connect This Agent to Cherry…", symbol: "link",
-                keywords: ["mcp", agent.harness.executableName, "register"]
-            )
-            item.detail = agent.productName
-            items.append(item)
-        }
         if window.finishedWorkerCount > 0 {
             var item = command(
                 .closeFinishedWorkers, title: "Close Finished Workers", symbol: "xmark.circle",

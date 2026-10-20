@@ -1,23 +1,22 @@
 import CherryControl
 import SwiftUI
 
-/// An agent's page (the Agents section of the sidebar, a row of Agents &
-/// MCP's list): whether it is on, its command and default arguments (saved
-/// where it is in the list, so the Agents menu keeps its order), connecting
-/// its CLI to Cherry's MCP helper (its CLI's row: what it has, and buttons
-/// that run only what the user confirms), and whether it reports its state.
-/// Rename…, Duplicate and Delete… are in the toolbar's `···`: a renamed
-/// agent's page follows it (`SettingsNavigator.renameAgent`), a deleted
-/// one's falls back to Agents & MCP (`SettingsNavigator.reconcile`).
+/// An agent's page (the Agents section of the sidebar, a row of Agents'
+/// list): whether it is on, its command and default arguments (saved where
+/// it is in the list, so the Agents menu keeps its order), the `cherry`
+/// skill for its CLI (installed only once the user confirms), how Cherry
+/// starts it, and whether it reports its state. Rename…, Duplicate and
+/// Delete… are in the toolbar's `···`: a renamed agent's page follows it
+/// (`SettingsNavigator.renameAgent`), a deleted one's falls back to Agents
+/// (`SettingsNavigator.reconcile`).
 struct AgentSettingsPage: View, SettingsPageContent {
     static let statusReportingCaption = "Agents that don't report fall back to their output going quiet."
-    static let runItYourself = "Or run it yourself:"
 
     let agentID: String
     @ObservedObject private var settings: AgentSettings
     private let navigator: SettingsNavigator
-    private let registrations: MCPRegistrations
-    /// Where Connect agents Cherry starts is (Agents & MCP › MCP server).
+    private let skills: CherrySkillsModel
+    /// Where Connect agents Cherry starts is (Agents).
     private let defaults: UserDefaults
 
     @State private var confirmation: SettingsConfirmation?
@@ -34,13 +33,13 @@ struct AgentSettingsPage: View, SettingsPageContent {
         agentID: String,
         settings: AgentSettings = .shared,
         navigator: SettingsNavigator = .shared,
-        registrations: MCPRegistrations = .shared,
+        skills: CherrySkillsModel = .shared,
         defaults: UserDefaults = .standard
     ) {
         self.agentID = agentID
         self.settings = settings
         self.navigator = navigator
-        self.registrations = registrations
+        self.skills = skills
         self.defaults = defaults
     }
 
@@ -53,7 +52,7 @@ struct AgentSettingsPage: View, SettingsPageContent {
             page(agent)
         } else {
             // Gone (deleted, renamed elsewhere): the navigator shows Agents
-            // & MCP on the next turn.
+            // on the next turn.
             SettingsPageScroll(SettingsPage.agents.title) {}
         }
     }
@@ -75,21 +74,13 @@ struct AgentSettingsPage: View, SettingsPageContent {
             AgentCommandSection(agent: agent, settings: settings, drafts: $drafts, errors: $draftErrors)
 
             if let skillAgent = CherrySkillConnection.agent(for: Self.brand(of: agent)) {
-                AgentSkillSection(agent: skillAgent, skills: registrations.skills)
+                AgentSkillSection(agent: skillAgent, skills: skills)
             }
 
             let connectsAtLaunch = AgentsSettingsPage.connectsAgentsAtLaunch(
                 defaults: defaults,
                 launchArguments: SettingSource.launchArguments(for: defaults)
             )
-            AgentMCPSection(
-                agentID: agent.id,
-                connection: Self.mcpConnection(for: agent, connectsAtLaunch: connectsAtLaunch),
-                connectsAtLaunch: connectsAtLaunch,
-                registrations: registrations,
-                navigator: navigator
-            )
-
             if let cli = Self.launchCLI(of: agent) {
                 AgentLaunchSection(
                     agentID: agent.id, commandLine: agent.commandLine, cli: cli,
@@ -183,7 +174,6 @@ struct AgentSettingsPage: View, SettingsPageContent {
             launchArguments: context.launchArguments
         )
         return context.agents.agents.flatMap { agent in
-            let connection = mcpConnection(for: agent, connectsAtLaunch: connectsAtLaunch)
             let reporting = statusReporting(for: agent)
             return [
                 SettingsSearchRow(
@@ -201,14 +191,6 @@ struct AgentSettingsPage: View, SettingsPageContent {
                     help: argumentsHelp(for: agent),
                     keywords: argumentsTags(for: agent),
                     value: agent.arguments.isEmpty ? nil : agent.arguments
-                ),
-                SettingsSearchRow(
-                    id: .agent(agent.id, mcpRow),
-                    route: .agent(agent.id),
-                    section: "Cherry MCP",
-                    title: connection.title,
-                    help: connection.help,
-                    keywords: connection.searchKeywords
                 ),
             ] + launchSearchRows(for: agent, connectsAtLaunch: connectsAtLaunch, defaults: context.defaults) + [
                 SettingsSearchRow(
@@ -265,7 +247,6 @@ extension AgentSettingsPage {
         }
     }
 
-    static let mcpRow = "mcp"
     static let statusReportingRow = "statusReporting"
 
     /// Saves `text` as the agent's command or default arguments, where the
@@ -353,7 +334,7 @@ extension AgentSettingsPage {
     }
 
     /// Delete Agent… and `···` › Delete…: the editor's question, then the
-    /// agent goes; its page falls back to Agents & MCP.
+    /// agent goes; its page falls back to Agents.
     static func deleteConfirmation(agentName: String, settings: AgentSettings) -> SettingsConfirmation {
         AgentToolEditor.deleteConfirmation(agentName: agentName) {
             settings.removeAgent(named: agentName)
@@ -376,22 +357,6 @@ extension AgentSettingsPage {
     struct Header: Equatable {
         var subtitle: String?
         var isMonospaced: Bool
-    }
-
-    /// Cherry MCP for the agent's CLI: its row's title and help, and the
-    /// command Connect runs, or, for a CLI Cherry has no command for, where
-    /// the helper is. The row's state and buttons are its CLI's model's
-    /// (`AgentConnection.row`, `piRow`).
-    struct MCPConnection: Equatable {
-        /// Nil: a CLI with no `mcp add` Cherry knows (Gemini CLI, OpenCode,
-        /// Amp, a custom agent).
-        var harness: MCPHarness?
-        var title: String
-        var help: String
-        /// What Connect runs, for "Or run it yourself:"; nil without a
-        /// harness.
-        var command: String?
-        var searchKeywords: [String]
     }
 
     /// Reports its state: whether the CLI tells Cherry its state (program
@@ -438,182 +403,13 @@ extension AgentSettingsPage {
         agent.skipsPermissionPrompts ? ["Skips permission prompts"] : []
     }
 
-    /// `connectsAtLaunch`: Connect agents Cherry starts is on
-    /// (`AgentsSettingsPage.connectsAgentsAtLaunch`). Only an agent whose
-    /// own command line Cherry extends (`AgentMCPLaunch.detect`: a plain
-    /// `claude`, `codex` or `pi` command naming no MCP configuration) is
-    /// started with Cherry MCP.
-    static func mcpConnection(
-        for agent: AgentToolDefinition,
-        identity: CherryAppIdentity = .current,
-        connectsAtLaunch: Bool = true
-    ) -> MCPConnection {
-        guard let harness = brand(of: agent)?.mcpHarness else {
-            let name = cliName(of: agent)
-            return MCPConnection(
-                harness: nil,
-                title: "Connect \(name) to Cherry",
-                help: "Add Cherry's MCP helper to \(name) as a stdio server.",
-                command: nil,
-                searchKeywords: ["mcp", "install", "register", "stdio", "helper"]
-            )
-        }
-        let product = harness.productName
-        let cli = harness.executableName
-        let startsWithMCP = connectsAtLaunch
-            && AgentMCPLaunch.detect(commandLine: agent.commandLine)?.cli == harness.launchCLI
-        return MCPConnection(
-            harness: harness,
-            title: "Connect \(product) to Cherry",
-            help: mcpHelp(for: harness, connectsAtLaunch: startsWithMCP, serverName: identity.urlScheme),
-            command: MCPInstallCommandBuilder.command(for: harness, identity: identity).command,
-            searchKeywords: ["mcp", "install", "register", "\(cli) mcp add"]
-        )
-    }
-
-    /// What Cherry MCP's row says for `harness`'s CLI. The agents Cherry
-    /// starts get Cherry MCP on their command line (`AgentMCPLaunch`) while
-    /// Connect agents Cherry starts is on and their command is one Cherry
-    /// extends (`connectsAtLaunch`), so Connect is for the sessions started
-    /// elsewhere; otherwise they use what it registers.
-    /// Pi prefers an entry named `serverName` in its settings to the one
-    /// Cherry starts it with.
-    static func mcpHelp(
-        for harness: MCPHarness, connectsAtLaunch: Bool, serverName: String = CherryAppIdentity.current.urlScheme
-    ) -> String {
-        let product = harness.productName
-        let cli = harness.executableName
-        guard let launchCLI = harness.launchCLI, connectsAtLaunch else {
-            if harness == .pi {
-                return "\(product) agents use what Connect adds to \(product)'s settings (deferred: \(product) loads Cherry's tools when it needs them). Needs \(product) \(PiMCPRegistration.minimumVersion) or later."
-            }
-            return "Lets \(product) see and drive your tabs. Connect runs \(cli) mcp add once you confirm; \(product) keeps it in its own settings."
-        }
-        if harness == .pi {
-            return "Cherry starts \(product) with Cherry MCP (\(launchCLI.minimumVersion) or later). Connect also adds it to \(product)'s settings, for \(cli) you start yourself. A \(serverName) entry in \(product)'s settings takes precedence over it."
-        }
-        return "Cherry starts \(product) with Cherry MCP (\(launchCLI.minimumVersion) or later). Connect also adds it to \(product)'s settings, for \(cli) you start yourself."
-    }
-
-    /// Whether `harness`'s `mcp add` shows to run by hand ("Or run it
-    /// yourself:", Agents & MCP's Connect other agent CLIs): Claude Code's
-    /// and Codex's always, Pi's only while `pi` says it has MCP
-    /// (`PiMCPRegistration.State.hasMCP`), as the Connect sheet shows one
-    /// only with a button that registers: a Pi without MCP takes `pi mcp
-    /// add …` as prompts for its model.
-    static func showsCommand(for harness: MCPHarness, pi state: PiMCPRegistration.State) -> Bool {
-        harness != .pi || state.hasMCP
-    }
-
-    /// Pi's row, as a Pi agent's page and Agents & MCP's Connect other
-    /// agent CLIs show it (`piRow`).
-    struct PiRow: Equatable {
-        var status: String
-        var style: SettingsStatusText.Style
-        var dot: SettingsStatusDot.Tone
-        /// The line under the row: what the state means.
-        var detail: String?
-        /// Check Again, Connect, Make Deferred or Re-register; nil: none.
-        var button: String?
-        /// Whether `button` runs `pi mcp add` once the user confirms it
-        /// (`PiMCPRegistrationModel.perform`); else it reads again
-        /// (`refresh`).
-        var buttonRegisters: Bool
-        /// Connect Again, in a `⋯` menu, for a registration that needs
-        /// nothing.
-        var menuButton: String?
-    }
-
-    /// What Pi's row says and offers in `state`, `serverName` the name
-    /// Cherry registers. A button that registers runs only on a Pi with MCP;
-    /// one without it, or one Cherry can't tell, is only checked again.
-    static func piRow(for state: PiMCPRegistration.State, serverName: String) -> PiRow {
-        let minimum = PiMCPRegistration.minimumVersion
-        func row(
-            _ status: String,
-            _ look: (SettingsStatusText.Style, SettingsStatusDot.Tone),
-            _ detail: String?,
-            button: String? = nil,
-            registers: Bool = true,
-            menu: String? = nil
-        ) -> PiRow {
-            PiRow(status: status, style: look.0, dot: look.1, detail: detail, button: button, buttonRegisters: registers, menuButton: menu)
-        }
-        let gray = (SettingsStatusText.Style.neutral, SettingsStatusDot.Tone.gray)
-        let orange = (SettingsStatusText.Style.warning, SettingsStatusDot.Tone.orange)
-        let green = (SettingsStatusText.Style.ok, SettingsStatusDot.Tone.green)
-        let unknown = "Cherry connects only a Pi it knows has MCP (\(minimum) or later)."
-        switch state {
-        case .checking:
-            return row("Checking…", gray, nil)
-        case .notInstalled:
-            return row(
-                "Not installed", gray,
-                "pi isn't on your login shell's PATH (nor in \(MCPCLIRegistration.shownFallbackDirectories)).",
-                button: "Check Again", registers: false
-            )
-        case .unknownVersion(let path, let output):
-            return row("Unknown Pi", orange, "\(path) --version printed “\(output)”. \(unknown)", button: "Check Again", registers: false)
-        case .noAnswer(let path):
-            return row("Unknown Pi", orange, "\(path) --version did not answer. \(unknown)", button: "Check Again", registers: false)
-        case .withoutMCP(let version):
-            return row(
-                "Update Pi", orange,
-                "Pi \(version) has no MCP. Pi \(minimum) or later uses Cherry's tools; until then Pi agents work without them.",
-                button: "Check Again", registers: false
-            )
-        case .notConnected:
-            return row(
-                "Not connected", gray,
-                "Pi agents Cherry starts get Cherry MCP for their session (nothing saved). Connect adds it to Pi's settings, for pi you start yourself.",
-                button: "Connect"
-            )
-        case .connected(let version, .deferred):
-            return row("Connected", green, "Pi \(version) loads Cherry's tools with tool_search when it needs them.", menu: "Connect Again")
-        case .connected(_, .direct):
-            return row(
-                "Connected (direct)", green,
-                "Pi sends all of Cherry's tools with every request (about 25 KB). Make Deferred keeps them out until Pi needs them.",
-                button: "Make Deferred"
-            )
-        case .toolsHidden(_, let exposure):
-            return row(
-                "Tools hidden", orange,
-                "Its exposure is \(exposure): only Pi's codemode scripts (or nothing) reach Cherry's tools, and Pi agents Cherry starts use this one too, since Pi prefers its own settings.",
-                button: "Make Deferred"
-            )
-        case .turnedOff:
-            return row(
-                "Turned off in Pi", orange,
-                "Pi's settings turn \(serverName) off, which also turns off the one Cherry gives agents it starts. Connect replaces it with an enabled one.",
-                button: "Connect"
-            )
-        case .otherHelper(_, let path, runs: true):
-            return row(
-                "Another Cherry", orange,
-                "Pi's \(serverName) runs \(path). It still reaches the Cherry its tab runs in; Re-register makes it this copy's.",
-                button: "Re-register"
-            )
-        case .otherHelper(_, let path, runs: false):
-            return row(
-                "Broken", orange,
-                "Pi's \(serverName) runs \(path), which isn't there any more. Pi prefers it to the server Cherry gives agents it starts, so they have no Cherry tools until you re-register.",
-                button: "Re-register"
-            )
-        case .otherArguments(_, let line):
-            return row("Differs", orange, "Pi's \(serverName) runs \(line).", button: "Re-register")
-        case .unreadable(_, let why):
-            return row("Can't read", orange, "Pi's MCP settings could not be read: \(why).", button: "Check Again", registers: false)
-        }
-    }
-
     static func statusReporting(for agent: AgentToolDefinition) -> StatusReporting {
         let name = cliName(of: agent)
         switch brand(of: agent)?.programStatusSupport ?? .unknown {
         case .reports(let minimumVersion):
             return StatusReporting(
                 status: "Supported",
-                help: "\(name) tells Cherry when it needs you, works and finishes, so the sidebar, notifications and MCP waits follow it. Needs \(name) \(minimumVersion) or later.",
+                help: "\(name) tells Cherry when it needs you, works and finishes, so the sidebar, notifications and cherry wait follow it. Needs \(name) \(minimumVersion) or later.",
                 style: .ok,
                 dot: .green
             )
@@ -766,111 +562,7 @@ extension AgentSettingsPage {
     static let skillCaption = "Teaches the agent the cherry command, for sessions you start yourself too."
 }
 
-/// Cherry MCP: the CLI's row (`AgentConnectionModel`: its state, read each
-/// time the page shows, and buttons that open the confirmation; only its
-/// Connect runs `mcp add`) and the command to run by hand (Pi's only on a
-/// Pi with MCP, `AgentSettingsPage.showsCommand`); for a CLI Cherry has
-/// no command for, a link to Agents & MCP's MCP server, which shows the
-/// helper's path.
-private struct AgentMCPSection: View {
-    let agentID: String
-    let connection: AgentSettingsPage.MCPConnection
-    let connectsAtLaunch: Bool
-    let registrations: MCPRegistrations
-    let navigator: SettingsNavigator
-
-    @State private var request: AgentConnectionRequest?
-
-    var body: some View {
-        let id = SettingsRowID.agent(agentID, AgentSettingsPage.mcpRow)
-        SettingsSection("Cherry MCP") {
-            if let harness = connection.harness {
-                switch harness {
-                case .claude: connectionRow(id: id, model: registrations.claude)
-                case .codex: connectionRow(id: id, model: registrations.codex)
-                case .pi: connectionRow(id: id, model: registrations.pi)
-                }
-                if let command = connection.command {
-                    if harness == .pi {
-                        AgentPiRunItYourself(command: command, model: registrations.pi)
-                    } else {
-                        AgentRunItYourself(command: command)
-                    }
-                }
-            } else {
-                SettingsItem(id: id, connection.title, help: connection.help) {
-                    Button("Show MCP Server") {
-                        navigator.open(.page(.agents), row: .agentsMCPServer)
-                    }
-                    .settingsButton(.standard, size: .small)
-                }
-            }
-        }
-        .agentConnectionConfirmation($request) { await registrations.perform($0) }
-    }
-
-    private func connectionRow<Model: AgentConnectionModel>(id: SettingsRowID, model: Model) -> some View {
-        AgentConnectionSettingsRow(id: id, connection: connection, model: model, connectsAtLaunch: connectsAtLaunch) {
-            request = AgentConnectionRequest(plans: [$0])
-        }
-    }
-}
-
-/// "Or run it yourself:" and the command Connect runs, to copy.
-private struct AgentRunItYourself: View {
-    let command: String
-
-    var body: some View {
-        SettingsSubItem {
-            Text(AgentSettingsPage.runItYourself)
-                .font(SettingsDesign.Fonts.help)
-                .foregroundStyle(.secondary)
-            SettingsCodeBlock(text: command, copyLabel: "Copy command")
-        }
-    }
-}
-
-/// Pi's "Or run it yourself:", only while its state says it has MCP
-/// (`AgentSettingsPage.showsCommand`).
-private struct AgentPiRunItYourself: View {
-    let command: String
-    @ObservedObject var model: PiMCPRegistrationModel
-
-    var body: some View {
-        if AgentSettingsPage.showsCommand(for: .pi, pi: model.state) {
-            AgentRunItYourself(command: command)
-        }
-    }
-}
-
-/// An agent CLI's Cherry MCP row (`AgentConnection.Row`): its status and
-/// buttons, what its state means and what the last run said; read each
-/// time the page shows (`--version`, then the CLI's settings, read only).
-private struct AgentConnectionSettingsRow<Model: AgentConnectionModel>: View {
-    let id: SettingsRowID
-    let connection: AgentSettingsPage.MCPConnection
-    @ObservedObject var model: Model
-    let connectsAtLaunch: Bool
-    let confirm: (AgentConnection.Plan) -> Void
-
-    var body: some View {
-        let row = model.row(connectsAtLaunch: connectsAtLaunch)
-        SettingsItem(id: id, connection.title, help: connection.help) {
-            HStack(spacing: 10) {
-                SettingsStatusText(row.status, style: row.style, dot: row.dot)
-                AgentConnectionActions(model: model, row: row, size: .regular, confirm: confirm)
-            }
-        } detail: {
-            AgentConnectionStatus(model: model, row: row)
-                .padding(.top, 4)
-        }
-        .task {
-            await model.refresh(asksAgain: false)
-        }
-    }
-}
-
-/// What a CLI's `mcp add` printed: mono, selectable, orange when it failed.
+/// What an install printed: mono, selectable, orange when it failed.
 struct AgentRegistrationOutput: View {
     let text: String
     let failed: Bool
@@ -894,26 +586,24 @@ extension AgentSettingsPage {
         + "what the agent may do instead of asking you. It covers everything the agent does in the tabs Cherry "
         + "starts, not only cherry, and a command that sets its own mode keeps it."
 
-    /// The CLI Cherry starts with flags of its own (`AgentMCPLaunch.CLI`),
+    /// The CLI Cherry starts with flags of its own (`AgentLaunch.CLI`),
     /// nil for any other agent.
-    static func launchCLI(of agent: AgentToolDefinition) -> AgentMCPLaunch.CLI? {
+    static func launchCLI(of agent: AgentToolDefinition) -> AgentLaunch.CLI? {
         guard let brand = brand(of: agent) else { return nil }
-        return AgentMCPLaunch.CLI.allCases.first { $0.brand == brand }
+        return AgentLaunch.CLI.allCases.first { $0.brand == brand }
     }
 
-    /// The Interface line: how the agent Cherry starts reaches Cherry (the
-    /// `cherry` command or Cherry MCP) and why, as a launch decides it
-    /// (`AgentMCPLaunchContext.cliUnavailableReason`), from cached state
-    /// only (`AgentSkillDirectory.current`, `CodexLaunchFactsCache`'s last
-    /// reading).
+    /// The Interface line: what Cherry starts the agent with, and what that
+    /// needs, from cached state only (`AgentSkillDirectory.current`,
+    /// `CodexLaunchFactsCache`'s last reading).
     struct Interface: Equatable {
         var status: String
         var help: String
-        var usesCLI: Bool
+        var startsWithCLI: Bool
     }
 
     static func interface(
-        cli: AgentMCPLaunch.CLI,
+        cli: AgentLaunch.CLI,
         commandLine: String,
         connectsAtLaunch: Bool,
         skillReady: Bool,
@@ -922,33 +612,34 @@ extension AgentSettingsPage {
     ) -> Interface {
         guard connectsAtLaunch else {
             return Interface(
-                status: "Not connected at launch",
-                help: "Connect agents Cherry starts is off in Agents & MCP: it uses what its CLI has registered.",
-                usesCLI: false
+                status: "Started as it is",
+                help: "Connect agents Cherry starts is off in Agents: Cherry adds nothing to its command line. The cherry command is still on its PATH.",
+                startsWithCLI: false
             )
         }
-        let cliHelp = cli == .codex
-            ? "Cherry tells it, in each tab it starts, that the cherry command reaches Cherry; it needs no Cherry MCP."
-            : "Cherry gives it the cherry skill and a line about its tab, in each tab it starts; it needs no Cherry MCP."
-        func viaCLI(_ why: String = "") -> Interface {
-            Interface(status: "The cherry command", help: cliHelp + why, usesCLI: true)
-        }
-        func viaMCP(_ why: String) -> Interface {
-            Interface(status: "Cherry MCP", help: why + " So Cherry starts it with Cherry MCP.", usesCLI: false)
+        func viaCLI(_ help: String) -> Interface {
+            Interface(status: "The cherry command", help: help, startsWithCLI: true)
         }
         switch cli {
         case .claudeCode, .pi:
-            return skillReady ? viaCLI() : viaMCP("The cherry skill's files aren't ready.")
-        case .codex:
-            if approvals == .autoReview {
-                return viaCLI(" Its sandbox blocks Cherry's socket, so a cherry command runs once Codex's reviewer lets it outside.")
+            guard skillReady else {
+                return Interface(
+                    status: "Started as it is",
+                    help: "The cherry skill's files aren't ready, so Cherry adds nothing to its command line. The cherry command is still on its PATH.",
+                    startsWithCLI: false
+                )
             }
-            let words = Array((AgentMCPLaunch.plainWords(commandLine) ?? []).dropFirst())
+            return viaCLI("Cherry gives it the cherry skill and a line about its tab, in each tab it starts.")
+        case .codex:
+            let lead = "Cherry tells it, in each tab it starts, that the cherry command reaches Cherry."
+            if approvals == .autoReview {
+                return viaCLI(lead + " Where its sandbox blocks Cherry's socket, a cherry command runs once Codex's reviewer lets it outside.")
+            }
+            let words = Array((AgentLaunch.plainWords(commandLine) ?? []).dropFirst())
             let facts = codexFacts ?? CodexLaunchFacts(rulesInstalled: false, setsDeveloperInstructions: true)
-            if facts.rulesInstalled { return viaCLI(" Cherry's rules for Codex run cherry outside its sandbox.") }
-            if facts.launchReachesSockets(words: words) { return viaCLI(" Its sandbox lets it reach Cherry's socket.") }
-            guard codexFacts != nil else { return viaMCP("Codex's settings aren't read yet.") }
-            return viaMCP("Codex's sandbox can't reach Cherry's socket, Cherry's rules for Codex aren't installed, and Approvals isn't Auto review.")
+            if facts.rulesInstalled { return viaCLI(lead + " Cherry's rules for Codex run cherry outside its sandbox.") }
+            if facts.launchReachesSockets(words: words) { return viaCLI(lead + " Its sandbox lets it reach Cherry's socket.") }
+            return viaCLI(lead + " Its sandbox blocks Cherry's socket, so Codex asks you before each cherry command runs outside it: install Cherry's rules for Codex, or choose Auto review, to skip that.")
         }
     }
 
@@ -972,7 +663,7 @@ extension AgentSettingsPage {
                 section: "Starting \(cli.brand.productName)",
                 title: "Interface",
                 help: interface.help,
-                keywords: ["cherry command", "cli", "skill", "mcp", "sandbox"],
+                keywords: ["cherry command", "cli", "skill", "sandbox"],
                 value: interface.status
             ),
         ]
@@ -991,7 +682,7 @@ extension AgentSettingsPage {
     }
 
     /// Stores Approvals for `cli` (As configured removes the value).
-    static func setApprovals(_ value: AgentApprovals, for cli: AgentMCPLaunch.CLI, defaults: UserDefaults) {
+    static func setApprovals(_ value: AgentApprovals, for cli: AgentLaunch.CLI, defaults: UserDefaults) {
         if value == .configured {
             defaults.removeObject(forKey: AgentApprovals.defaultsKey(for: cli))
         } else {
@@ -1005,7 +696,7 @@ extension AgentSettingsPage {
 private struct AgentLaunchSection: View {
     let agentID: String
     let commandLine: String
-    let cli: AgentMCPLaunch.CLI
+    let cli: AgentLaunch.CLI
     let connectsAtLaunch: Bool
     let defaults: UserDefaults
 
@@ -1024,7 +715,7 @@ private struct AgentLaunchSection: View {
         )
         SettingsSection("Starting \(cli.brand.productName)") {
             SettingsItem(id: .agent(agentID, AgentSettingsPage.interfaceRow), "Interface", help: interface.help) {
-                SettingsStatusText(interface.status, style: interface.usesCLI ? .ok : .neutral, dot: interface.usesCLI ? .green : .gray)
+                SettingsStatusText(interface.status, style: interface.startsWithCLI ? .ok : .neutral, dot: interface.startsWithCLI ? .green : .gray)
             }
             if AgentApprovals.isOffered(for: cli) {
                 SettingsItem(id: .agent(agentID, AgentSettingsPage.approvalsRow), "Approvals", help: AgentSettingsPage.approvalsHelp) {

@@ -454,9 +454,9 @@ final class ShellProcessController: @unchecked Sendable {
     }
 
     /// This app's CherryMCP (next to its executable), when it is there:
-    /// every tab's `CHERRY_MCP_HELPER`, so an agent without Cherry MCP
-    /// tools (or a script) can run `"$CHERRY_MCP_HELPER" --call …`,
-    /// whatever its PATH. Device tabs get their install's (`RemoteMCPLaunch`).
+    /// every tab's `CHERRY_MCP_HELPER`, which the tab's `cherry` runs for
+    /// its agent commands whatever its PATH. Device tabs get their
+    /// install's (`RemoteMCPLaunch`).
     static let appMCPHelperPath: String? = {
         guard let directory = Bundle.main.executableURL?.deletingLastPathComponent() else { return nil }
         let helper = directory.appendingPathComponent("CherryMCP", isDirectory: false).path
@@ -506,9 +506,8 @@ final class ShellProcessController: @unchecked Sendable {
     /// (`CherryControlServer.appSocketPath`), the tab's
     /// `CHERRY_CONTROL_SOCKET`; `cliPath` its `CHERRY_CLI`; `cliDirectory`
     /// its `CHERRY_BIN_DIR`, first on its PATH (`TabCLIDirectory`); `mcpServerName`
-    /// the name Cherry's server has in its agents (the identity's scheme),
-    /// its `CHERRY_MCP_SERVER_NAME` beside `CHERRY_MCP_HELPER`, which
-    /// Cherry's Pi extension registers the helper as.
+    /// the identity's scheme, its `CHERRY_MCP_SERVER_NAME` beside
+    /// `CHERRY_MCP_HELPER`.
     static func nativeExecLaunch(
         for configuration: Configuration,
         shellIntegration: ShellIntegrationBootstrap?,

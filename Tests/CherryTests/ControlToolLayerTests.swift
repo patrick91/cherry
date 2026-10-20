@@ -2,7 +2,6 @@
 import CherryControl
 @testable import CherryMCP
 import Foundation
-import MCP
 import Testing
 
 // The MCP tool layer (`CherryToolLayer`, Sources/CherryControl), which the
@@ -369,7 +368,7 @@ private func controlToolLayerProcess(id: String = controlToolLayerAgentID, kind:
     for name in ["activate_worktree", "list_notes", "", "LIST_PROCESSES"] {
         let refusal = await controlToolLayerRefusal(name, ["project_root": .string("/work/app")], caller: caller)
         #expect(refusal.code == "unknown_tool", "\(name)")
-        #expect(refusal.message == "Unknown Cherry MCP tool: \(name)")
+        #expect(refusal.message == "Unknown Cherry tool: \(name)")
         #expect(!refusal.sentRequests, "\(name)")
     }
 }
@@ -708,22 +707,15 @@ private func controlToolLayerProcess(id: String = controlToolLayerAgentID, kind:
 
 // MARK: - CherryMCP's adapter
 
-@Test func controlToolLayerAdapterPassesTheSDKsArgumentsOnAsJSON() throws {
-    // A whole number the SDK kept as a double counts, as the layer reads it.
+@Test func controlToolLayerAdapterTimesOutAsTheLayerReadsItsArguments() throws {
+    // A whole number kept as a double counts, as the layer reads it.
     #expect(CherryMCPTools.clientTimeout(for: "send_process_input", arguments: ["wait_ms": .double(2_000.0)]) == 22)
     #expect(CherryMCPTools.clientTimeout(for: "spawn_process", arguments: ["kind": .string(" Command "), "wait_ms": .int(1_000)]) == 31)
     #expect(CherryMCPTools.clientTimeout(for: "wait_for_events", arguments: ["timeout_ms": .double(1.5)]) == 55)
-
-    // A string the SDK read as a data URL is a string again, in base64.
-    #expect(try CherryMCPTools.jsonArgument("value", in: ["value": .data(mimeType: "text/plain", Data("hi".utf8))])
-        == .string("data:text/plain;base64,aGk="))
-    #expect(try CherryMCPTools.jsonArgument("value", in: ["value": .object(["ok": .bool(true), "n": .int(2), "items": .array([.null])])])
-        == .object(["ok": .bool(true), "n": .int(2), "items": .array([.null])]))
-    #expect(try CherryMCPTools.jsonArgument("value", in: [:]) == nil)
-    #expect(try CherryMCPTools.schemaArgument("result_schema", in: ["result_schema": .string(#"{"type":"object"}"#)])
+    #expect(try CherryToolLayer.schemaArgument("result_schema", in: ["result_schema": .string(#"{"type":"object"}"#)])
         == .object(["type": .string("object")]))
     #expect(throws: CherryControlError.self) {
-        try CherryMCPTools.schemaArgument("result_schema", in: ["result_schema": .string("[1]")])
+        try CherryToolLayer.schemaArgument("result_schema", in: ["result_schema": .string("[1]")])
     }
 }
 

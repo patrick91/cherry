@@ -32,9 +32,8 @@ struct AgentCLIVersion: Comparable, Hashable, Sendable, CustomStringConvertible 
 }
 
 /// The versions of the agent CLIs on This Mac (`claude`, `codex`, `pi`),
-/// which decide whether a launch gets Cherry MCP on its command line
-/// (`AgentMCPLaunch`, `AgentMCPLaunchContext`) and whether Settings may
-/// run Pi's `pi mcp` (`PiMCPRegistration`). A version is what
+/// which decide whether a launch gets Cherry's flags on its command line
+/// (`AgentLaunch`, `AgentLaunchContext`). A version is what
 /// `<executable> --version` prints on its standard output, run off the
 /// main thread in the login environment, as the tab's shell finds the
 /// executable, for at most `timeout`; it is kept for this run by the file
@@ -168,14 +167,12 @@ final class AgentCLIVersions: @unchecked Sendable {
     /// known answer, else what it prints now (off the caller's thread),
     /// kept as `version(of:)` keeps it. `.noAnswer` when `word` names no
     /// executable, or it does not exit 0 within `timeout` (it is killed,
-    /// with what it started). Settings waits for it before it runs a CLI's
-    /// `mcp` (`PiMCPRegistration.register`); launches never wait for a
-    /// version (`version(of:)`, `warmUp(agents:)`).
+    /// with what it started). Launches never wait for a version
+    /// (`version(of:)`, `warmUp(agents:)`).
     ///
     /// `asksAgain`: runs it even when its answer is known, and forgets that
     /// one first. A file can stay the same while what it runs changes (a
-    /// version manager's shim: Volta, mise, asdf), so Settings asks again
-    /// right before it runs `pi mcp`, and on Check Again.
+    /// version manager's shim: Volta, mise, asdf).
     func answer(_ word: String, environment: [String: String], asksAgain: Bool = false) async -> VersionAnswer {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async { [self] in
@@ -207,12 +204,12 @@ final class AgentCLIVersions: @unchecked Sendable {
         }
     }
 
-    /// Asks the CLIs that `agents`' launches would give Cherry MCP to, once
+    /// Asks the CLIs that `agents`' launches would give flags to, once
     /// the login environment is known (off the main thread), so the agents
     /// of this run find their versions.
     func warmUp(agents: [AgentToolDefinition]) {
         let words = Set(agents.filter(\.isLaunchable).compactMap {
-            AgentMCPLaunch.detect(commandLine: $0.commandLine)?.executableWord
+            AgentLaunch.detect(commandLine: $0.commandLine)?.executableWord
         })
         guard !words.isEmpty else { return }
         let resolvedEnvironment = resolvedEnvironment

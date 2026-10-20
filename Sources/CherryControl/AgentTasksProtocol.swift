@@ -10,7 +10,7 @@ import Foundation
 // `wait_for_tasks` (or ends its turn: Cherry types one line into its tab
 // once the run settled) and reads results with `get_task`. Task records
 // are kept by the app, which saves them (`agent-tasks.json`) so they
-// survive its relaunch (docs/mcp.md, Tasks and results).
+// survive its relaunch (docs/cli.md, Tasks and results).
 
 extension CherryControl {
     /// The longest `wait_for_tasks` call, as `wait_for_events`.

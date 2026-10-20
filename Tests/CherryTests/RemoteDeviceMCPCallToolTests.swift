@@ -695,7 +695,7 @@ private func remoteToolArguments(_ arguments: [String: JSONValue], _ extra: [Str
         revoke = nil
         #expect(remoteToolErrorCode(result) == "unauthorized", "\(what): \(result.text)")
         let refusal = result.structured?.objectValue?["error"]?.objectValue?["message"]?.stringValue
-        #expect(refusal?.hasPrefix("Cherry refused this Cherry MCP token") == true, "\(what): \(result.text)")
+        #expect(refusal?.hasPrefix("Cherry refused this Cherry token") == true, "\(what): \(result.text)")
         // The lookup, then the input it was refused; no wait after it.
         #expect(sent.count == 2, "\(what): \(sent)")
         if case .getProcessStatus? = sent.first {} else { Issue.record("\(what): \(sent)") }

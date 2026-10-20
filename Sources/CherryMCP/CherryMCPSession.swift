@@ -1,15 +1,12 @@
 import CherryControl
 import Darwin
 import Foundation
-import MCP
 
-/// One MCP session of CherryMCP (or one `--call`): the tab it runs for, the
-/// client it serves, and how it reaches the app's tools. Against an app of
-/// control protocol 2 or later it is a pipe: `tools/list` is the app's
-/// `listTools` for the client, and each `tools/call` one `callTool` the app
-/// runs as its caller. Against an older app (one that cannot decode
-/// `appInfo`) it runs the tool layer itself over typed requests, as every
-/// CherryMCP did before (legacy).
+/// How one `cherry` command reaches the app's tools (`CherryMCP cli`): the
+/// tab it runs for, and the app it asks. Against an app of control protocol
+/// 2 or later it is a pipe: each call is one `callTool` the app runs as its
+/// caller. Against an older app (one that cannot decode `appInfo`) it runs
+/// the tool layer itself over typed requests (legacy).
 ///
 /// The environment it was made with is the only one it reads (`main` passes
 /// the process's; tests their own).
@@ -46,48 +43,28 @@ public actor CherryMCPSession {
     /// The caller's current directory, whose innermost open project scopes
     /// a call that names none.
     let workingDirectory: String?
-    /// False when no MCP session keeps a binding (a single call made without
+    /// False when nothing keeps a binding (a single call made without
     /// one): `bind_session_process` then has nothing to bind.
     let bindsSession: Bool
     /// Whether a legacy session whose environment names no tab finds it
     /// from its process ancestry, as CherryMCP did at startup before the app
     /// identified its callers.
     let infersCaller: Bool
-    /// The client's own limit per tool call: `--client-tool-timeout
-    /// <seconds>` among the server's arguments (Cherry passes 300 to the
-    /// Codex it starts).
-    let declaredToolTimeoutMilliseconds: Int?
-    /// This helper's build (`CherryBuildInfo`), for the server's
-    /// `initialize` answer and `get_status`.
+    /// This helper's build (`CherryBuildInfo`), for `get_status`.
     public nonisolated let helperBuild: String
 
-    /// The client, as its `initialize` names itself.
-    private(set) var client: ToolClientInfo?
     /// The process this session is bound to (`bind_session_process`),
     /// first the claim.
     private(set) var boundProcessID: String?
     private(set) var mode: Mode = .unknown
-    /// The digest of the list the client was last served: a call whose
-    /// answer names another one means the app's tools changed.
-    private(set) var servedDigest: String?
-    private var notifiedDigest: String?
     /// The caller a legacy session found from its ancestry: looked for once.
     private var inferredCaller: String??
-    private var listChanged: (@Sendable () async -> Void)?
-    /// The arguments of calls the SDK changed, as their client wrote them
-    /// (`CherryMCPCallArguments`), oldest first, until their handler runs.
-    private var writtenCallArguments: [CherryMCPCallArguments] = []
-    /// How many of them are kept: a call the server refuses before its
-    /// handler runs leaves its own behind.
-    static let writtenCallArgumentsLimit = 32
 
-    /// A session of `CherryMCP` itself (its server, or `--call`): its caller
-    /// and project from `environment`, its client's tool timeout from
-    /// `arguments`, its build (and its app's socket, when `environment`
+    /// A session of `CherryMCP` itself (`cli`): its caller and project from
+    /// `environment`, its build (and its app's socket, when `environment`
     /// names none) from where the helper is.
     public init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        arguments: [String] = [],
         workingDirectory: String? = FileManager.default.currentDirectoryPath,
         helperExecutableURL: URL? = Bundle.main.executableURL
     ) {
@@ -98,21 +75,19 @@ public actor CherryMCPSession {
             boundProcessID: claim,
             bindsSession: true,
             infersCaller: true,
-            arguments: arguments,
             workingDirectory: workingDirectory,
             helperExecutableURL: helperExecutableURL
         )
     }
 
     /// A session for one call whose maker already knows its caller and
-    /// binding (`CherryMCPTools.call` with an MCP session's context).
+    /// binding (`CherryMCPTools.call` with a context).
     init(
         environment: [String: String],
         claim: String?,
         boundProcessID: String?,
         bindsSession: Bool,
         infersCaller: Bool,
-        arguments: [String] = [],
         workingDirectory: String?,
         helperExecutableURL: URL? = Bundle.main.executableURL
     ) {
@@ -128,88 +103,15 @@ public actor CherryMCPSession {
         self.workingDirectory = workingDirectory
         self.bindsSession = bindsSession
         self.infersCaller = infersCaller
-        declaredToolTimeoutMilliseconds = Self.declaredToolTimeoutMilliseconds(in: arguments)
         helperBuild = CherryBuildInfo.build(executableURL: helperExecutableURL)
     }
 
-    // MARK: The client
+    // MARK: The caller
 
-    /// What Cherry knows of the client: its name, and the longest a tool
-    /// call may take for it (declared at launch, else Claude Code's
-    /// MCP_TOOL_TIMEOUT, in milliseconds).
+    /// What Cherry knows of the caller: nothing of a client, so its waits
+    /// keep to the default limit.
     public var profile: ToolClientProfile {
-        ToolClientProfile(
-            client: client,
-            toolTimeoutMilliseconds: declaredToolTimeoutMilliseconds
-                ?? (client?.name == "claude-code" ? Self.milliseconds(environment["MCP_TOOL_TIMEOUT"]) : nil)
-        )
-    }
-
-    /// The client of the `initialize` request: noted before the session
-    /// answers anything after it.
-    public func noteClient(_ client: ToolClientInfo) {
-        self.client = client
-    }
-
-    /// The arguments of a `tools/call` the SDK changes, as the client wrote
-    /// them: noted before the server's handler gets the call.
-    public func noteCallArguments(_ arguments: CherryMCPCallArguments) {
-        writtenCallArguments.append(arguments)
-        if writtenCallArguments.count > Self.writtenCallArgumentsLimit {
-            writtenCallArguments.removeFirst()
-        }
-    }
-
-    /// The arguments of the call to `name` the server's handler got as
-    /// `decoded`, as JSON: as the client wrote them when the SDK changed
-    /// them (a string that looks like a data URL stays that string), else
-    /// converted.
-    func callArguments(name: String, decoded: [String: Value]) -> [String: JSONValue] {
-        if decoded.values.contains(where: CherryMCPTools.holdsData),
-           let index = writtenCallArguments.firstIndex(where: { $0.name == name && $0.decoded == decoded }) {
-            return writtenCallArguments.remove(at: index).written
-        }
-        return CherryMCPTools.jsonArguments(decoded)
-    }
-
-    /// Sends `notifications/tools/list_changed` to the client (the server's
-    /// `notify`).
-    public func setListChangedHandler(_ handler: @escaping @Sendable () async -> Void) {
-        listChanged = handler
-    }
-
-    /// The milliseconds of `--client-tool-timeout <seconds>` (or
-    /// `--client-tool-timeout=<seconds>`) in `arguments`; other arguments
-    /// are ignored, as they always were.
-    static func declaredToolTimeoutMilliseconds(in arguments: [String]) -> Int? {
-        let option = "--client-tool-timeout"
-        for (index, argument) in arguments.enumerated() {
-            if argument == option, arguments.indices.contains(index + 1) {
-                return milliseconds(seconds: arguments[index + 1])
-            }
-            if argument.hasPrefix(option + "=") {
-                return milliseconds(seconds: String(argument.dropFirst(option.count + 1)))
-            }
-        }
-        return nil
-    }
-
-    /// A positive number of seconds as milliseconds, at most a day (a cap
-    /// is clamped far lower anyway, `CherryToolCatalog.waitCap`).
-    private static func milliseconds(seconds text: String) -> Int? {
-        guard let seconds = Double(text.trimmingCharacters(in: .whitespaces)), seconds.isFinite, seconds > 0 else {
-            return nil
-        }
-        return Int(min(seconds, 86_400) * 1_000)
-    }
-
-    private static func milliseconds(_ text: String?) -> Int? {
-        guard let text, let milliseconds = Double(text.trimmingCharacters(in: .whitespaces)),
-              milliseconds.isFinite, milliseconds > 0
-        else {
-            return nil
-        }
-        return Int(min(milliseconds, 86_400_000))
+        ToolClientProfile(client: nil, toolTimeoutMilliseconds: nil)
     }
 
     // MARK: Which app answers
@@ -251,46 +153,13 @@ public actor CherryMCPSession {
         }
     }
 
-    // MARK: tools/list
+    // MARK: Calls
 
-    /// The tools for the client's `tools/list`: the app's for its profile
-    /// (pipe), else this helper's own catalog for a client it knows nothing
-    /// of (legacy, or no app answered in time): an app before control
-    /// protocol 2 waits at most 50 s whatever the client allows, so the
-    /// descriptions say so. Either way the session keeps the list's digest,
-    /// which the app's call answers are compared with: a pipe app that
-    /// answers later, for a client that may wait longer, sends
-    /// `list_changed`.
-    public func toolList() async -> [CherryToolDefinition] {
-        let profile = profile
-        if await settleMode(timeout: Self.listTimeout) == nil, case .pipe = mode {
-            do {
-                let response = try await transport.send(.listTools(.init(profile: profile)), timeout: Self.listTimeout)
-                if case .listTools(let listed)? = response.result {
-                    servedDigest = listed.digest
-                    return listed.tools
-                }
-                if response.error?.code == "invalid_request" {
-                    // An app that cannot decode listTools may have been
-                    // replaced by an older one: ask it again.
-                    mode = .unknown
-                    _ = await settleMode(timeout: Self.listTimeout)
-                }
-            } catch {
-                mode = .unknown
-            }
-        }
-        servedDigest = CherryToolCatalog.digest(for: .unknown)
-        return CherryToolCatalog.tools(for: .unknown)
-    }
-
-    // MARK: tools/call
-
-    /// Runs one tool for the client: the app runs it (pipe), else this
-    /// helper over typed requests (legacy). `get_status` always runs here,
-    /// since it reports this helper's socket. `interface` says which
-    /// interface made the call ("mcp", or "call" for `--call`).
-    public func call(name: String, arguments: [String: JSONValue], interface: String = "mcp") async -> CallToolResult {
+    /// Runs one tool: the app runs it (pipe), else this helper over typed
+    /// requests (legacy). `get_status` always runs here, since it reports
+    /// this helper's socket. `interface` says which interface made the call
+    /// ("cli").
+    public func call(name: String, arguments: [String: JSONValue], interface: String = "cli") async -> CallToolResult {
         if name == "get_status" {
             return await statusResult()
         }
@@ -339,12 +208,11 @@ public actor CherryMCPSession {
         if let bindProcessID = result.bindProcessID {
             boundProcessID = bindProcessID
         }
-        await noteToolsDigest(result.toolsDigest)
         return result
     }
 
     /// What a `callTool` says of its caller: the claim and the binding, the
-    /// caller's project and directory, and its client.
+    /// caller's project and directory, and its profile.
     func callContext(interface: String) -> ToolCallContext {
         ToolCallContext(
             callerProcessID: claim,
@@ -355,18 +223,6 @@ public actor CherryMCPSession {
             profile: profile,
             interface: interface
         )
-    }
-
-    /// Tells the client its tool list changed when the app's tools for its
-    /// profile are no longer the ones it was served (an update replaced the
-    /// app while the agent runs): once per new digest, and only after a
-    /// list was served.
-    private func noteToolsDigest(_ digest: String?) async {
-        guard let digest, let servedDigest, digest != servedDigest, digest != notifiedDigest else {
-            return
-        }
-        notifiedDigest = digest
-        await listChanged?()
     }
 
     /// The tool layer run here, over typed requests, for an app that
@@ -480,44 +336,5 @@ private struct FailedToolTransport: CherryToolTransport {
 
     func send(_ request: CherryControlRequest, timeout: TimeInterval?) async throws -> CherryControlResponse {
         throw error
-    }
-}
-
-extension CherryMCPSession {
-    /// Serves MCP for this session on `transport` (CherryMCP's standard
-    /// input and output) and returns the started server. Its `initialize`
-    /// answer names this helper's build and says the tool list may change;
-    /// `CherryMCPToolListTransport` answers `tools/list` from `toolList()`
-    /// (the server's own handler answers what it passes on: a batch, an
-    /// escaped method); each `tools/call` is `call(name:arguments:)`, with
-    /// its arguments as the client wrote them (`callArguments`).
-    public nonisolated func serve(on transport: any Transport) async throws -> Server {
-        let server = Server(
-            name: "cherry",
-            version: helperBuild,
-            title: "Cherry",
-            instructions: CherryToolCatalog.instructions,
-            capabilities: .init(tools: .init(listChanged: true))
-        )
-        await setListChangedHandler { [weak server] in
-            // As the server does, a message that cannot be written is dropped.
-            try? await server?.notify(ToolListChangedNotification.message())
-        }
-        await server.withMethodHandler(ListTools.self) { [self] _ in
-            ListTools.Result(tools: await toolList().map(CherryMCPTools.sdkTool))
-        }
-        await server.withMethodHandler(CallTool.self) { [self] params in
-            let arguments = await callArguments(name: params.name, decoded: params.arguments ?? [:])
-            return CherryMCPTools.sdkResult(await call(name: params.name, arguments: arguments))
-        }
-        try await server.start(
-            transport: CherryMCPToolListTransport(base: transport, session: self),
-            // The transport notes the client as the request passes; this
-            // covers one it passed on undecoded (in a batch).
-            initializeHook: { [self] client, _ in
-                await noteClient(ToolClientInfo(name: client.name, version: client.version.nilIfEmpty))
-            }
-        )
-        return server
     }
 }

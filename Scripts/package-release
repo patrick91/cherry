@@ -242,17 +242,16 @@ step_build() {
   # The debug maps point at the per-triple object files, still on disk.
   log "==> Debug symbols into $out/dSYMs"
   mkdir -p "$out/dSYMs"
-  for binary in "$GUI_EXECUTABLE"; do
-    if ! output="$(dsymutil "$app/Contents/MacOS/$binary" -o "$out/dSYMs/$binary.dSYM" 2>&1)"; then
-      log "warning: dsymutil failed for $binary; no dSYM for it: $output"
-      rm -rf "$out/dSYMs/$binary.dSYM"
-    elif [[ "$output" == *"no debug symbols"* ]]; then
-      log "warning: $binary has no debug information; no dSYM for it"
-      rm -rf "$out/dSYMs/$binary.dSYM"
-    elif [ -n "$output" ]; then
-      log "$output"
-    fi
-  done
+  binary="$GUI_EXECUTABLE"
+  if ! output="$(dsymutil "$app/Contents/MacOS/$binary" -o "$out/dSYMs/$binary.dSYM" 2>&1)"; then
+    log "warning: dsymutil failed for $binary; no dSYM for it: $output"
+    rm -rf "$out/dSYMs/$binary.dSYM"
+  elif [[ "$output" == *"no debug symbols"* ]]; then
+    log "warning: $binary has no debug information; no dSYM for it"
+    rm -rf "$out/dSYMs/$binary.dSYM"
+  elif [ -n "$output" ]; then
+    log "$output"
+  fi
 
   log "==> Checking $app"
   expect_plist CFBundleIdentifier "$RELEASE_BUNDLE_ID"

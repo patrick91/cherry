@@ -1303,11 +1303,11 @@ mod tests {
         assert_eq!(results, vec![None, None]);
         assert!(!skill.exists());
 
-        // A folder this user cannot write: the write fails, the rest of its
-        // group is not attempted, a later group still is.
+        // A "folder" that is a file (a failure root gets too): the write
+        // fails, the rest of its group is not attempted, a later group
+        // still is.
         let locked = root.join("locked");
-        std::fs::create_dir(&locked).unwrap();
-        set_mode(&locked, 0o555);
+        std::fs::write(&locked, "a file").unwrap();
         let later = root.join("later.rules");
         let results = perform_operations(&[
             operation(2, OperationKind::Write, &locked.join("SKILL.md"), Some("x")),
@@ -1319,17 +1319,16 @@ mod tests {
             ),
             operation(3, OperationKind::Write, &later, Some("rules\n")),
         ]);
-        set_mode(&locked, 0o755);
         let first = results[0].clone().expect("the write fails");
         assert!(
             first.starts_with(&format!("{}: ", locked.join("SKILL.md").display())),
             "{first}"
         );
-        assert!(first.contains("Permission denied"), "{first}");
+        assert!(first.contains("Not a directory"), "{first}");
         assert_eq!(results[1].as_deref(), Some(NOT_ATTEMPTED));
         assert_eq!(results[2], None);
         assert_eq!(std::fs::read_to_string(&later).unwrap(), "rules\n");
-        assert_eq!(std::fs::read_dir(&locked).unwrap().count(), 0);
+        assert_eq!(std::fs::read_to_string(&locked).unwrap(), "a file");
     }
 
     #[test]

@@ -426,10 +426,6 @@ private struct MacCard: View {
                 .settingsButton()
                 .disabled(!model.canModify)
             }
-            Button("Set Up Cherry MCP…") {
-                model.setUpCherryMCP(row.id)
-            }
-            .settingsButton()
             Button("Remove…", role: .destructive) {
                 model.confirmRemove(row.id)
             }

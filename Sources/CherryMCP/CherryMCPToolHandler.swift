@@ -1,9 +1,8 @@
 import CherryControl
 import Foundation
-import MCP
 
-/// An MCP session's caller and the process it is bound to
-/// (`bind_session_process`), for the session's whole life.
+/// A caller and the process it is bound to (`bind_session_process`), for
+/// the calls made with it.
 public final class CherryMCPToolContext: @unchecked Sendable {
     public let callerProcessID: String?
     private let lock = NSLock()
@@ -34,25 +33,21 @@ public final class CherryMCPToolContext: @unchecked Sendable {
     }
 }
 
-/// CherryMCP's side of the tools: the MCP SDK's types around a
-/// `CherryMCPSession`, which pipes each call to the app (`callTool`), or runs
-/// `CherryToolLayer` (Sources/CherryControl) itself over the socket for an
-/// app that predates `appInfo`.
+/// CherryMCP's side of the tools: a `CherryMCPSession`, which pipes each
+/// call to the app (`callTool`), or runs `CherryToolLayer`
+/// (Sources/CherryControl) itself over the socket for an app that predates
+/// `appInfo`.
 public enum CherryMCPTools {
-    /// The catalog's tools for a client CherryMCP knows nothing of, as the
-    /// MCP SDK's `Tool`.
-    public static let all: [Tool] = CherryToolCatalog.tools(for: .unknown).map(sdkTool)
-
-    /// Runs `name` with the helper's caller: the session's `context`, else
-    /// (no MCP session) the environment's tab. The project is the
-    /// environment's CHERRY_PROJECT_ROOT, else the current directory's. A
-    /// session of its own, made from the environment as it is now, sends
-    /// the call: the app runs it, or this helper does for an older app.
+    /// Runs `name` with the helper's caller: `context`'s, else the
+    /// environment's tab. The project is the environment's
+    /// CHERRY_PROJECT_ROOT, else the current directory's. A session of its
+    /// own, made from the environment as it is now, sends the call: the app
+    /// runs it, or this helper does for an older app.
     public static func call(
         name: String,
-        arguments: [String: Value],
+        arguments: [String: JSONValue],
         context: CherryMCPToolContext? = nil
-    ) async -> CallTool.Result {
+    ) async -> CallToolResult {
         let environment = ProcessInfo.processInfo.environment
         let session = CherryMCPSession(
             environment: environment,
@@ -63,34 +58,11 @@ public enum CherryMCPTools {
             infersCaller: false,
             workingDirectory: FileManager.default.currentDirectoryPath
         )
-        let result = await session.call(name: name, arguments: jsonArguments(arguments))
+        let result = await session.call(name: name, arguments: arguments)
         if let bindProcessID = result.bindProcessID {
             context?.bindProcessID(bindProcessID)
         }
-        return sdkResult(result)
-    }
-
-    /// The SDK's arguments as JSON. A `Value` decoded from JSON always
-    /// converts: a string the SDK read as a data URL is a string again, a
-    /// base64 data URL of the same bytes and type (not always the text the
-    /// client sent: an MCP session passes such a call's arguments as
-    /// written, `CherryMCPSession.callArguments`). Only a number JSON
-    /// cannot carry (NaN, an infinity) would not, and is left out.
-    static func jsonArguments(_ arguments: [String: Value]) -> [String: JSONValue] {
-        arguments.compactMapValues { try? JSONValue.parse(JSONEncoder().encode($0)) }
-    }
-
-    /// A tool's result as the SDK's: its text, and its structured content.
-    static func sdkResult(_ result: CallToolResult) -> CallTool.Result {
-        CallTool.Result(
-            content: [.text(text: result.text, annotations: nil, _meta: nil)],
-            structuredContent: result.structured.flatMap(sdkValue),
-            isError: result.isError
-        )
-    }
-
-    private static func sdkValue(_ value: JSONValue) -> Value? {
-        (try? JSONEncoder().encode(value)).flatMap { try? JSONDecoder().decode(Value.self, from: $0) }
+        return result
     }
 
     /// The tab the process's environment names: CHERRY_PROCESS_ID, else
@@ -137,33 +109,14 @@ public enum CherryMCPTools {
         )
     }
 
-    /// An argument as JSON, whatever its type.
-    static func jsonArgument(_ key: String, in arguments: [String: Value]) throws -> JSONValue? {
-        guard let value = arguments[key] else { return nil }
-        let json: JSONValue
-        do {
-            json = try JSONValue.parse(JSONEncoder().encode(value))
-        } catch {
-            throw CherryControlError(code: "invalid_argument", message: "\(key) is not JSON: \(error.localizedDescription)")
-        }
-        return try CherryToolLayer.jsonArgument(key, in: [key: json])
+    /// How long a caller waits for Cherry's answer to a tool call: nil for
+    /// the default (10 s).
+    static func clientTimeout(for toolName: String, arguments: [String: JSONValue]) -> TimeInterval? {
+        CherryToolLayer.clientTimeout(for: toolName, arguments: arguments)
     }
 
-    /// A JSON Schema argument: an object, or JSON text of one (some
-    /// clients send nested objects as strings).
-    static func schemaArgument(_ key: String, in arguments: [String: Value]) throws -> JSONValue? {
-        guard let value = try jsonArgument(key, in: arguments) else { return nil }
-        return try CherryToolLayer.schemaArgument(key, in: [key: value])
-    }
-
-    /// How long the MCP client waits for Cherry's answer to a tool call:
-    /// nil for the client's default (10 s).
-    static func clientTimeout(for toolName: String, arguments: [String: Value]) -> TimeInterval? {
-        CherryToolLayer.clientTimeout(for: toolName, arguments: jsonArguments(arguments))
-    }
-
-    /// `CherryMCP --version`: this helper's build, as its control protocol
-    /// and its MCP server's version (sorted keys).
+    /// `CherryMCP --version`: this helper's build and control protocol
+    /// (sorted keys).
     public static func versionJSON(build: String) -> String {
         JSONValue.object([
             "build": .string(build),
@@ -171,25 +124,5 @@ public enum CherryMCPTools {
             "name": .string("CherryMCP"),
             "version": .string(build),
         ]).compactJSON
-    }
-
-    /// `definition` as the SDK's `Tool`: its schema as `Value`, its
-    /// annotations (when it has any) as `Tool.Annotations`.
-    static func sdkTool(_ definition: CherryToolDefinition) -> Tool {
-        let inputSchema = (try? JSONEncoder().encode(definition.inputSchema))
-            .flatMap { try? JSONDecoder().decode(Value.self, from: $0) }
-        return Tool(
-            name: definition.name,
-            description: definition.description,
-            inputSchema: inputSchema ?? .object([:]),
-            annotations: definition.annotations.map {
-                Tool.Annotations(
-                    readOnlyHint: $0.readOnlyHint,
-                    destructiveHint: $0.destructiveHint,
-                    idempotentHint: $0.idempotentHint,
-                    openWorldHint: $0.openWorldHint
-                )
-            } ?? Tool.Annotations()
-        )
     }
 }

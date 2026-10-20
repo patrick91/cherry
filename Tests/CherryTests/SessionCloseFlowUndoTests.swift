@@ -928,7 +928,7 @@ private func quitSteps(_ harness: PersistentHarness, events: Recorder<[String]>)
 
 // MARK: - Cherry tasks
 
-/// A Cherry task follows its worker's tab by id (docs/mcp.md, Tasks And
+/// A Cherry task follows its worker's tab by id (docs/cli.md, Tasks And
 /// Results): a ⌘W that is undone, or a ⌘D, leaves it the task's worker (the
 /// tab that comes back is a new object with the same id); only a close that
 /// can no longer be undone, whose session ends, cancels the task.

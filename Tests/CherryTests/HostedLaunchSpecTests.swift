@@ -372,10 +372,9 @@ func hostedLaunchMatchesNativeLaunchForEveryTabKind(shell: String) throws {
 }
 
 /// Every tab of This Mac names the app's CherryMCP in CHERRY_MCP_HELPER,
-/// native and hosted alike, so `"$CHERRY_MCP_HELPER" --call …` works
-/// whatever the tab's PATH, and beside it the name Cherry's server has in
-/// its agents (CHERRY_MCP_SERVER_NAME, what Cherry's Pi extension
-/// registers it as); ones the app inherited are never passed on.
+/// native and hosted alike, which `cherry` runs whatever the tab's PATH,
+/// and beside it the identity's name for it (CHERRY_MCP_SERVER_NAME); ones
+/// the app inherited are never passed on.
 @Test func hostedAndNativeLaunchesNameTheAppsCherryMCP() {
     let helper = "\(binDirectory)/CherryMCP"
     let name = CherryAppIdentity.current.urlScheme

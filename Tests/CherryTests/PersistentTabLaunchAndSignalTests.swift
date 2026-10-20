@@ -1,7 +1,6 @@
 import AppKit
 import CherryControl
 import Foundation
-import MCP
 import Testing
 @testable import Cherry
 @testable import CherryMCP

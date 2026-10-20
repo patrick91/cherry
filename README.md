@@ -29,7 +29,7 @@ tests pass. Turning that off never goes back to an older build.
 Until the first stable release exists, install the newest pre-release from
 the [Releases](https://github.com/patrick91/cherry/releases) page and turn
 that switch on. Keep one copy of Cherry: each copy updates itself in place,
-and `cherry://` links, MCP paths and the CLI symlinks become ambiguous with
+and `cherry://` links, the control socket and the CLI symlinks become ambiguous with
 two. How releases are made is described in
 [docs/releasing.md](docs/releasing.md).
 
@@ -266,29 +266,25 @@ is logged in there), the copy's path is pasted instead; when the image
 cannot be copied, Ctrl-V goes on anyway; a notice says why either way. A
 `localhost` link in its tab (Cmd-click) opens through a port forwarded from
 that Mac over its SSH connection to `127.0.0.1` on this Mac ("Forwarded from
-Studio"). Cherry's MCP tools (`get_process_ports`, `services_list`,
-`wait_for_bound_port`) report the ports its programs listen on there,
+Studio"). Cherry's tools (`cherry ports`, `cherry services`,
+`cherry wait-port`) report the ports its programs listen on there,
 naming the Mac (`machine`, `remoteURL`); they forward nothing, except
 `wait_for_bound_port` with `probe_http`, which forwards the port it probes
 (`url` is then the forwarded one). Forwards end when their tab or window
-closes. Agents in its tabs (Claude Code, Codex) can use Cherry's MCP tools
-too, scoped to their window and never reaching beyond that Mac's projects
-and tabs: Cherry forwards its control socket to that Mac over the SSH
-connection and gives each tab a token of its own, renewed whenever its
+closes. Agents in its tabs (Claude Code, Codex, Pi) can use the `cherry`
+command too, scoped to their window and never reaching beyond that Mac's
+projects and tabs: Cherry forwards its control socket to that Mac over the
+SSH connection and gives each tab a token of its own, renewed whenever its
 program restarts. The agents Cherry starts there (under zsh, bash or
-another sh-family login shell) get Cherry MCP on their command line when
-their CLI there is new enough. **Set Up Cherry MCP on Studio…** (in its
-menu and in Settings › Macs), for agents started there by hand and Pi,
-shows the commands that register Cherry MCP with Claude Code, Codex and
-Pi there and runs them only when you confirm;
-**Remove** takes them away again. While Cherry cannot be reached from there
+another sh-family login shell) are told about it on their command line
+when their CLI there is new enough. While Cherry cannot be reached from there
 (it quit, or the connection is being made again) the tools say "Cherry on
 <this Mac> is not reachable". Its
 sessions no tab shows are listed under its name in Background Sessions
 (while Cherry is connected to it, or while the menu is open; looking at a
 Mac, there or in the project picker, never starts its session host), and
 **Settings › Macs** shows how each Mac stands, with
-**Reconnect**, **Update Session Host…**, **Set Up Cherry MCP…** and **Remove…**;
+**Reconnect**, **Update Session Host…** and **Remove…**;
 there you also rename a Mac, see its projects and add one
 (**Add Project on Studio…**). A tab that cannot
 start there says so ("Couldn't start on Studio: …", with **Retry**), never
@@ -404,7 +400,7 @@ Run the installer again after making changes to replace the installed copy.
 `CHERRY_INSTALL_DIR` sets the destination. A copy under another name is a
 separate app, and it must set its own `CHERRY_BUNDLE_ID`,
 `CHERRY_APPLICATION_SUPPORT_NAME` (the folder in `~/Library/Application
-Support`) and `CHERRY_URL_SCHEME` (its deep links and MCP server name): the
+Support`) and `CHERRY_URL_SCHEME` (its deep links): the
 installer refuses `dev.patrick.cherry`, which updates itself, under another
 name, data folder or scheme, and warns when another bundle identifier still
 shares Cherry's data folder or `cherry://` scheme. Such a copy never updates
@@ -461,56 +457,34 @@ Inside the prototype:
 - Click inside the terminal to type directly.
 - Use the `Prototype` menu commands for interrupt, restart, and clearing scrollback.
 
-## MCP Control
+## Agent Control
 
-Cherry installs a stdio MCP helper next to the app executable, and the
-app runs the tools. The Claude Code (2.0.0 or later), Codex (0.162.0 or
-later) and Pi (0.99.2 or later) agents Cherry starts need nothing
-registered: Cherry puts the helper on their command line for that run
-(`--mcp-config` for Claude Code, `-c mcp_servers.cherry=…` for Codex, and
-for Pi `-e` with Cherry's Pi extension, `cherry-pi-mcp.ts` in the app's
-resources, which registers it for that session), here and on your other
-Macs, and writes no agent configuration. **Settings › Agents & MCP › MCP
-server › Connect agents Cherry starts** turns that off.
-
-Agents you start yourself use a registration. **Connect Agents to
-Cherry…** (the Omni bar, or **Settings › Agents & MCP › MCP server**) shows
-Claude Code, Codex and Pi on this Mac, whether each has Cherry MCP (read
-from Claude Code's settings file, `codex mcp get --json` and Pi's
-`mcp.json`; never a command that starts MCP servers), and offers
-**Connect** (or **Re-register**, **Make Deferred**, **Connect All**); each
-agent's page shows its CLI's row too. Every one of them shows the exact
-commands first and runs them only when you confirm. **Connect This Agent
-to Cherry…** (the Omni bar) says whether the selected agent tab started
-with Cherry MCP, and offers **Restart Tab** when it would now (for an
-agent on another Mac, **Set Up Cherry MCP on <Mac>…**). **MCP server ›
-Connect other agent CLIs** there shows the command for each, with this
-copy's path; for Cherry in `/Applications`:
-
-```bash
-codex mcp add cherry -- /Applications/Cherry.app/Contents/MacOS/CherryMCP
-claude mcp add --transport stdio --scope user cherry -- /Applications/Cherry.app/Contents/MacOS/CherryMCP
-pi mcp add cherry --exposure deferred --description 'Cherry, the terminal app this Pi runs in: its tabs, agents, waits and ports. Workers: spawn_agent with task, then wait_for_tasks and get_task. Given a Cherry task: get_my_task, then report_result. Load its tools with tool_search.' -- /Applications/Cherry.app/Contents/MacOS/CherryMCP
-```
-
-Pi registers with deferred exposure (its tool search finds Cherry's tools
-when the model needs them), and needs Pi 0.99.2 or later: Cherry runs `pi
-mcp` only after `pi --version` shows that, since an older Pi would take
-the words as prompts. A registration named `cherry` is shadowed for the
-Claude Code and Codex agents Cherry starts, so they see one Cherry server;
-Pi prefers its own `cherry` entry to the extension's, so Pi's row flags a
-stale one and offers **Re-register**.
-
-Run the Cherry app first. The helper forwards MCP tool calls to Cherry's
+Agents in Cherry's tabs drive it with the `cherry` command, first on every
+tab's PATH: `cherry ls`, `cherry read ID`, `cherry send ID <<'EOF'`,
+`cherry spawn agent NAME --task -`, `cherry task report`, … (`cherry skill
+show` prints the guide). The app runs the commands over its
 instance-scoped Unix control socket under `/tmp/cherry-$UID/` (each tab
-names its app's in `CHERRY_CONTROL_SOCKET`, and the `cherry` tool of its
-build in `CHERRY_CLI`); it connects only to a socket private to your
-account. The MCP server exposes process-first tools for terminals, agents,
-configured project commands, output reads, idle waiting, service
-readiness, and todos. Agents Cherry starts on your other Macs get it the
-same way; agents you start there yourself reach it through **Set Up Cherry
-MCP on <Mac>…** (see Devices above). See [docs/mcp.md](docs/mcp.md) for the
-tool guide and recommended agent workflows.
+names its app's in `CHERRY_CONTROL_SOCKET`, and the `cherry` of its build
+in `CHERRY_CLI`); `cherry` connects only to a socket private to your
+account. The tools are process-first: terminals, agents, configured
+project commands, output reads, idle waiting, service readiness, tasks
+and todos.
+
+The Claude Code (2.1.0 or later), Codex (0.162.0 or later) and Pi (0.99.2
+or later) agents Cherry starts need nothing set up: Cherry gives Claude
+Code and Pi the `cherry` skill for that run and tells each one, in a line
+of its instructions, that `cherry` reaches its tab and the others, here
+and on your other Macs, and writes no agent configuration. **Settings ›
+Agents › The cherry command › Connect agents Cherry starts** turns that
+off. Codex's default sandbox blocks the socket, so Codex asks before each
+`cherry` runs outside it, unless Cherry's rules for Codex are installed or
+the agent's Approvals is **Auto review**.
+
+For agents you start yourself, install the skill: `cherry skill setup`,
+or **Connect Agents to Cherry…** (the Omni bar, or **Settings › Agents ›
+The cherry command**), which shows every file it writes and writes them
+only when you confirm. See [docs/cli.md](docs/cli.md) for the tool guide
+and recommended agent workflows.
 
 ## Rendering Debug
 

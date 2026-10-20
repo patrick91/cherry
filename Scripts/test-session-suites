@@ -142,7 +142,7 @@ groups=(
   AppUpdate             # AppUpdateTests: restart to update keeps sessions
   NativeKeyboard        # NativeKeyboard{Config,Surface}Tests: keys and the user's Ghostty keybinds
   SettingsWindow        # SettingsWindow*Tests: the Settings window's navigation, search, sources and page models
-  ControlTool           # ControlTool*Tests: the MCP tool layer and catalog, the control socket's tool requests and identity, CherryMCP's pipe, agents' launch-time MCP, connecting agent CLIs
+  ControlTool           # ControlTool*Tests: the tool layer and catalog, the control socket's tool requests and identity, the cherry command, agents' launch flags, the skill install
   AgentTitle            # AgentTitleTests: an agent's terminal title as its tab's task name
   ControlAgentMonitor   # ControlAgentMonitorTests: MCP monitors' events, task workers' settles, silent agents' quiet dones
 )

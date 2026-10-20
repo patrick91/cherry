@@ -2,7 +2,6 @@ import CherryControl
 @testable import CherryMCP
 import Darwin
 import Foundation
-import MCP
 import Testing
 @testable import Cherry
 
@@ -297,7 +296,7 @@ struct ControlAgentWaitTests {
         #expect(events <= 55)
         // wait_for_events never waits longer, whatever it is asked.
         #expect(CherryMCPTools.clientTimeout(for: "wait_for_events", arguments: ["timeout_ms": .int(300_000)]) == events)
-        let advertised = Set(CherryMCPTools.all.map(\.name))
+        let advertised = Set(CherryToolCatalog.tools(for: .unknown).map(\.name))
         #expect(advertised.isSuperset(of: ["subscribe", "unsubscribe", "wait_for_events", "list_subscriptions"]))
     }
 }

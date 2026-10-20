@@ -701,7 +701,7 @@ public enum CherryToolLayer {
                 commentID: try requiredString("comment_id", in: arguments)
             ))
         default:
-            throw CherryControlError(code: "unknown_tool", message: "Unknown Cherry MCP tool: \(name)")
+            throw CherryControlError(code: "unknown_tool", message: "Unknown Cherry tool: \(name)")
         }
     }
 

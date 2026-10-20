@@ -4,7 +4,7 @@ import Foundation
 import Testing
 @testable import Cherry
 
-// MCP tasks across a relaunch (docs/mcp.md › Tasks And Results): the saved
+// MCP tasks across a relaunch (docs/cli.md › Tasks And Results): the saved
 // file (`AgentTaskStore`, `agent-tasks.json`) and what a new registry does
 // with it. A relaunch is a second control server whose registry reads the
 // first one's file, with its tabs brought back (same ids, as a restore

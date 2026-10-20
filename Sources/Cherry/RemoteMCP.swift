@@ -5,8 +5,8 @@ import Darwin
 import Foundation
 import Security
 
-// Cherry MCP for agents running on another Mac (docs/specs/remote-devices.md,
-// phase 4b).
+// The `cherry` command for agents running on another Mac
+// (docs/specs/remote-devices.md, phase 4b).
 //
 // - Transport: the app listens on a socket of its own per device
 //   (`CherryControlServer.addDeviceListener`), and the device's first SSH
@@ -15,16 +15,13 @@ import Security
 //   `CHERRY_CONTROL_SOCKET`.
 // - Identity: every tab of a device gets a capability token in its
 //   environment (`CHERRY_MCP_TOKEN`, with `CHERRY_PROCESS_ID`), which its
-//   CherryMCP sends with every request. The device's listener refuses a
+//   `cherry` sends with every request. The device's listener refuses a
 //   request without a valid one; This Mac's socket keeps identifying its
 //   callers by process.
-// - Setup: the Claude Code, Codex and Pi agents Cherry starts there get the
-//   install's CherryMCP on their command line (Pi through the install's
-//   copy of Cherry's Pi extension), gated on their version there
-//   (`RemoteAgentMCPLaunch`); agents started there by hand read their MCP
-//   servers from their own configuration, where "Set Up Cherry MCP on
-//   <Mac>…" registers a stable launcher, only when the user confirms
-//   (`RemoteMCPSetup`).
+// - Setup: the install's `cherry` is first on the PATH of the commands and
+//   agents Cherry starts there, and the Claude Code, Codex and Pi agents
+//   are told about it on their command line, gated on their version there
+//   (`RemoteAgentLaunch`).
 
 // MARK: - Tokens
 
@@ -225,7 +222,7 @@ enum RemoteMCPPaths {
     static func validTemporaryDirectory(_ path: String?, source: String) -> String? {
         guard let path = path?.nilIfEmpty else { return nil }
         if let problem = temporaryDirectoryProblem(path) {
-            SessionLog.error("Cherry MCP: ignoring the per-user temporary directory \(source) reported: \(problem)")
+            SessionLog.error("Control socket forward: ignoring the per-user temporary directory \(source) reported: \(problem)")
             return nil
         }
         return path
@@ -234,7 +231,7 @@ enum RemoteMCPPaths {
     /// The directory there, in the account's per-user temporary directory
     /// (`getconf DARWIN_USER_TEMP_DIR`, which only that account can enter;
     /// never the shared /tmp). Nil when that is not a plain absolute path
-    /// (`temporaryDirectoryProblem`: no Cherry MCP for that device), or the
+    /// (`temporaryDirectoryProblem`: no forwarded socket for that device), or the
     /// socket in it would be longer than a socket path may be
     /// (`~/Library/Application Support/…` is, for most homes).
     static func remoteDirectory(temporaryDirectory: String?, installationID: UUID, deviceID: UUID) -> String? {
@@ -251,16 +248,8 @@ enum RemoteMCPPaths {
             .map { $0 + "/control.sock" }
     }
 
-    /// The launcher Set Up Cherry MCP registers with the agents there,
-    /// under the home folder: it runs the CherryMCP of the Cherry build
-    /// that started the tab (`CHERRY_MCP_HELPER`), so a registration never
-    /// names a build directory that an update collects later.
-    static let launcherRelativePath = "Library/Application Support/cherry-host/mcp/cherry-mcp"
-
     /// CherryMCP's name in an install (next to cherry and cherry-host).
     static let helperName = "CherryMCP"
-    /// Cherry's Pi extension's name in an install, next to its CherryMCP.
-    static let piExtensionName = PiMCPExtension.fileName
     /// The command-line tool's name in an install.
     static let cliName = "cherry"
 
@@ -277,18 +266,9 @@ enum RemoteMCPPaths {
         RemoteLaunchSpec.Resources.of(remoteHostPath: remoteHostPath, homeDirectory: homeDirectory)
             .map { "\($0.root)/\(cliName)" }
     }
-
-    /// Cherry's Pi extension in the install a device's `remoteHostPath`
-    /// names (beside its CherryMCP), under its home; nil when that is not
-    /// one of ours. An install made before Cherry had it has none, which
-    /// its Pi agents' line checks (`RemoteAgentMCPLaunch`).
-    static func piExtensionPath(remoteHostPath: String?, homeDirectory: String?) -> String? {
-        RemoteLaunchSpec.Resources.of(remoteHostPath: remoteHostPath, homeDirectory: homeDirectory)
-            .map { "\($0.root)/\(piExtensionName)" }
-    }
 }
 
-/// What a tab of a device needs for Cherry MCP (`RemoteLaunchSpec`).
+/// What a tab of a device needs to reach Cherry (`RemoteLaunchSpec`).
 struct RemoteMCPLaunch: Equatable, Sendable {
     var deviceID: UUID
     /// The forwarded control socket there.
@@ -298,9 +278,6 @@ struct RemoteMCPLaunch: Equatable, Sendable {
     /// The install's `cherry` there, the tab's `CHERRY_CLI` (never This
     /// Mac's), when it has one.
     var cliPath: String? = nil
-    /// Cherry's Pi extension in the install there, which its Pi agents get
-    /// with `-e` (`RemoteAgentMCPLaunch`), when it has the resources.
-    var piExtensionPath: String? = nil
     /// The name Cherry's server has in the agents there (the identity's
     /// scheme), the tab's `CHERRY_MCP_SERVER_NAME` beside its helper.
     var serverName: String = CherryAppIdentity.current.urlScheme
@@ -310,7 +287,7 @@ struct RemoteMCPLaunch: Equatable, Sendable {
 
     static func == (lhs: RemoteMCPLaunch, rhs: RemoteMCPLaunch) -> Bool {
         lhs.deviceID == rhs.deviceID && lhs.socketPath == rhs.socketPath && lhs.helperPath == rhs.helperPath
-            && lhs.cliPath == rhs.cliPath && lhs.piExtensionPath == rhs.piExtensionPath && lhs.serverName == rhs.serverName
+            && lhs.cliPath == rhs.cliPath && lhs.serverName == rhs.serverName
             && lhs.controlMachine == rhs.controlMachine && lhs.tokens === rhs.tokens
     }
 
@@ -456,7 +433,7 @@ final class RemoteMCPForwards {
                 state = .failed(RemoteMCPForwardError.stopped.localizedDescription)
             } catch {
                 state = .failed(error.localizedDescription)
-                SessionLog.error("Cherry MCP forward to \(target.machine): \(error.localizedDescription)")
+                SessionLog.error("Control socket forward to \(target.machine): \(error.localizedDescription)")
             }
             return state
         }

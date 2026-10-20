@@ -5,12 +5,12 @@ import os
 import Testing
 @testable import Cherry
 
-// Cherry MCP on the command line of the agents Cherry starts on This Mac
-// (AgentMCPLaunch, AgentCLIVersions; docs/mcp.md › Setup): which commands
-// get the flags, what the flags are, how a CLI's version is read, and what
-// a tab's launch runs. No test runs the real claude, codex or pi: the CLIs
+// Cherry's flags on the command line of the agents Cherry starts on This
+// Mac (AgentLaunch, AgentCLIVersions; docs/cli.md › Agents Cherry Starts):
+// which commands get the flags, how they read in every shell, how a CLI's
+// version is read, and what a tab's launch runs. No test runs the real claude, codex or pi: the CLIs
 // here are stand-in scripts in temporary directories. Every workspace that
-// adds flags gets its own AgentMCPLaunchContext, never `.shared`'s versions
+// adds flags gets its own AgentLaunchContext, never `.shared`'s versions
 // or UserDefaults.standard, and never reads the real ~/.pi; every other
 // workspace's policy has none.
 
@@ -73,12 +73,10 @@ private func launchEventually(timeout: TimeInterval = 10, _ condition: () -> Boo
     return true
 }
 
-private let launchHelperPath = "/Applications/Cherry.app/Contents/MacOS/CherryMCP"
-
 // MARK: - Which commands
 
 @Test func controlToolLaunchDetectsPlainClaudeCodexAndPiCommands() {
-    let detected: [(String, AgentMCPLaunch.CLI, String)] = [
+    let detected: [(String, AgentLaunch.CLI, String)] = [
         ("claude", .claudeCode, "claude"),
         ("claude --dangerously-skip-permissions", .claudeCode, "claude"),
         ("codex --yolo", .codex, "codex"),
@@ -97,11 +95,14 @@ private let launchHelperPath = "/Applications/Cherry.app/Contents/MacOS/CherryMC
         ("pi --model x", .pi, "pi"),
         (#"pi "fix it""#, .pi, "pi"),
         ("pi -c", .pi, "pi"),
-        // Its own extensions load beside Cherry's.
         ("pi -e ./mine.ts", .pi, "pi"),
+        // Its own MCP configuration is its own business.
+        ("claude --mcp-config f", .claudeCode, "claude"),
+        (#"codex -c 'mcp_servers.x.command="y"'"#, .codex, "codex"),
+        ("pi --no-mcp", .pi, "pi"),
     ]
     for (line, cli, word) in detected {
-        let detection = AgentMCPLaunch.detect(commandLine: line)
+        let detection = AgentLaunch.detect(commandLine: line)
         #expect(detection?.cli == cli, "\(line)")
         #expect(detection?.executableWord == word, "\(line)")
     }
@@ -117,29 +118,10 @@ private let launchHelperPath = "/Applications/Cherry.app/Contents/MacOS/CherryMC
         "FOO=1 pi", "pi | tee log", "pi -- x", "pi $(cat prompt)",
     ]
     for line in notPlain {
-        #expect(AgentMCPLaunch.detection(commandLine: line) == .notPlain, "\(line)")
-        #expect(AgentMCPLaunch.detect(commandLine: line) == nil, "\(line)")
+        #expect(AgentLaunch.detection(commandLine: line) == .notPlain, "\(line)")
+        #expect(AgentLaunch.detect(commandLine: line) == nil, "\(line)")
     }
-    let ownConfiguration: [(String, AgentMCPLaunch.CLI)] = [
-        ("claude --mcp-config f", .claudeCode),
-        ("claude --mcp-config=f", .claudeCode),
-        ("claude --strict-mcp-config", .claudeCode),
-        (#"codex -c 'mcp_servers.x.command="y"'"#, .codex),
-        ("codex --config mcp_servers.x.command=y", .codex),
-        ("codex -cmcp_servers.x.command=y", .codex),
-        // Pi without its MCP, or without extensions: nothing would connect
-        // the extension's server.
-        ("pi --no-mcp", .pi),
-        ("pi -ne", .pi),
-        ("pi --no-extensions", .pi),
-        ("pi --no-extensions=all", .pi),
-        ("pi --model x -ne -e builtin:mcp", .pi),
-    ]
-    for (line, cli) in ownConfiguration {
-        #expect(AgentMCPLaunch.detection(commandLine: line) == .ownConfiguration(cli), "\(line)")
-        #expect(AgentMCPLaunch.detect(commandLine: line) == nil, "\(line)")
-    }
-    let subcommands: [(String, AgentMCPLaunch.CLI, String)] = [
+    let subcommands: [(String, AgentLaunch.CLI, String)] = [
         ("claude mcp list", .claudeCode, "mcp"),
         ("claude update", .claudeCode, "update"),
         ("claude --verbose doctor", .claudeCode, "doctor"),
@@ -174,12 +156,12 @@ private let launchHelperPath = "/Applications/Cherry.app/Contents/MacOS/CherryMC
         ("pi help", .pi, "help"),
     ]
     for (line, cli, subcommand) in subcommands {
-        #expect(AgentMCPLaunch.detection(commandLine: line) == .subcommand(cli, subcommand), "\(line)")
-        #expect(AgentMCPLaunch.detect(commandLine: line) == nil, "\(line)")
+        #expect(AgentLaunch.detection(commandLine: line) == .subcommand(cli, subcommand), "\(line)")
+        #expect(AgentLaunch.detect(commandLine: line) == nil, "\(line)")
     }
     // A last option that takes the next word, whatever it is: it would take
     // the first appended word, and the next one would be a prompt.
-    let optionsWithoutValue: [(String, AgentMCPLaunch.CLI, String)] = [
+    let optionsWithoutValue: [(String, AgentLaunch.CLI, String)] = [
         ("claude --model", .claudeCode, "--model"),
         (#"claude "fix it" --permission-mode"#, .claudeCode, "--permission-mode"),
         ("claude -n", .claudeCode, "-n"),
@@ -191,104 +173,41 @@ private let launchHelperPath = "/Applications/Cherry.app/Contents/MacOS/CherryMC
         ("pi -c --name", .pi, "--name"),
     ]
     for (line, cli, option) in optionsWithoutValue {
-        #expect(AgentMCPLaunch.detection(commandLine: line) == .optionWithoutValue(cli, option), "\(line)")
-        #expect(AgentMCPLaunch.detect(commandLine: line) == nil, "\(line)")
-        #expect(AgentMCPLaunch.plan(
-            commandLine: line, serverName: "cherry", helperPath: launchHelperPath, environmentKeys: [],
-            piExtensionPath: "/tmp/cherry-pi-mcp.ts"
-        ) == .skipped("its last word, \(option), is an option without its value"), "\(line)")
+        #expect(AgentLaunch.detection(commandLine: line) == .optionWithoutValue(cli, option), "\(line)")
+        #expect(AgentLaunch.detect(commandLine: line) == nil, "\(line)")
+        #expect(AgentLaunch.skipReason(AgentLaunch.detection(commandLine: line))
+            == "its last word, \(option), is an option without its value", "\(line)")
     }
     // With its value, or an option that takes none, it is a session.
     for line in ["claude --model opus", "claude -r", "claude --debug", "codex -m o3", "pi --model x", "pi -e ./mine.ts", "pi -p", "pi --print"] {
-        #expect(AgentMCPLaunch.detect(commandLine: line) != nil, "\(line)")
+        #expect(AgentLaunch.detect(commandLine: line) != nil, "\(line)")
     }
 }
 
 // MARK: - The flags
 
-@Test func controlToolLaunchArgumentsNameTheHelperForClaudeAndCodex() throws {
-    let helper = #"/tmp/My Apps/Cherry "Dev".app/Contents/MacOS/CherryMCP"#
-    let claude = try #require(AgentMCPLaunch.arguments(
-        for: .claudeCode, serverName: "cherry", helperPath: helper, environmentKeys: ["CHERRY_PROCESS_ID"]
+@Test func controlToolLaunchSuffixReadsBackUnchangedInEveryShell() throws {
+    let plugin = URL(fileURLWithPath: #"/tmp/My Apps/Cherry "Dev"/agent-skill/cherry-plugin"#, isDirectory: true)
+    let socket = "/tmp/cherry-501/control.sock"
+    let claude = try #require(AgentCLILaunch.arguments(
+        for: .claudeCode, words: [], pluginDirectory: plugin, socketPath: socket, processID: "TAB", addsInstructions: true
     ))
-    #expect(claude.count == 2)
-    #expect(claude.first == "--mcp-config")
-    // Sorted keys, slashes as they are; no environment (Claude Code passes its own).
-    #expect(claude.last == #"{"mcpServers":{"cherry":{"args":[],"command":"/tmp/My Apps/Cherry \"Dev\".app/Contents/MacOS/CherryMCP","type":"stdio"}}}"#)
-    let json = try #require(claude.last)
-    let decoded = try #require(
-        JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: [String: [String: Any]]]
-    )
-    let server = try #require(decoded["mcpServers"]?["cherry"])
-    #expect(server["command"] as? String == helper)
-    #expect((server["args"] as? [String])?.isEmpty == true)
-    #expect(server["type"] as? String == "stdio")
-    #expect(Set(server.keys) == ["args", "command", "type"])
-
-    let codex = try #require(AgentMCPLaunch.arguments(
-        for: .codex, serverName: "cherry-dev", helperPath: helper,
-        environmentKeys: ["CHERRY_PROCESS_ID", "CHERRY_MCP_TOKEN"]
+    let codex = try #require(AgentCLILaunch.arguments(
+        for: .codex, words: [], pluginDirectory: nil, socketPath: socket, processID: "TAB", addsInstructions: true
     ))
-    #expect(codex == [
-        "-c",
-        #"mcp_servers.cherry-dev={command="/tmp/My Apps/Cherry \"Dev\".app/Contents/MacOS/CherryMCP",args=["--client-tool-timeout","300"],env_vars=["CHERRY_PROCESS_ID","CHERRY_MCP_TOKEN"],startup_timeout_sec=30,tool_timeout_sec=300}"#,
-    ])
-    #expect(AgentMCPLaunch.tomlString("a\\b\"c\td") == #""a\\b\"c\u0009d""#)
-
-    // Pi: its extension, which runs the helper the tab names; nothing else
-    // goes on the line.
-    let piExtension = "/Applications/Cherry.app/Contents/Resources/Cherry_Cherry.bundle/cherry-pi-mcp.ts"
-    #expect(AgentMCPLaunch.arguments(
-        for: .pi, serverName: "cherry", helperPath: helper, environmentKeys: ["CHERRY_PROCESS_ID"], piExtensionPath: piExtension
-    ) == ["-e", piExtension])
-    for path in ["/tmp/it's/cherry-pi-mcp.ts", "/tmp/back\\slash/cherry-pi-mcp.ts", "/tmp/new\nline/x.ts", "relative/cherry-pi-mcp.ts", ""] {
-        #expect(AgentMCPLaunch.arguments(
-            for: .pi, serverName: "cherry", helperPath: launchHelperPath, environmentKeys: [], piExtensionPath: path
+    let pi = try #require(AgentCLILaunch.arguments(
+        for: .pi, words: [], pluginDirectory: plugin, socketPath: socket, processID: "TAB", addsInstructions: true
+    ))
+    let device = try #require(AgentCLILaunch.deviceArguments(for: .claudeCode, words: [], socketPath: socket, processID: "TAB"))
+    #expect(AgentLaunch.shellSuffix(["a b", "it's"]) == #" 'a b' 'it'\''s'"#)
+    #expect(AgentLaunch.tomlString("a\\b\"c\td") == #""a\\b\"c\u0009d""#)
+    // A path that would not read the same in every shell's single quotes
+    // gives no flags.
+    for path in ["/tmp/it's/cherry-plugin", "/tmp/back\\slash/cherry-plugin", "/tmp/new\nline/cherry-plugin"] {
+        #expect(AgentCLILaunch.arguments(
+            for: .claudeCode, words: [], pluginDirectory: URL(fileURLWithPath: path), socketPath: socket, processID: nil, addsInstructions: true
         ) == nil, "\(path)")
     }
-    #expect(AgentMCPLaunch.arguments(for: .pi, serverName: "cherry", helperPath: launchHelperPath, environmentKeys: []) == nil)
-    // The extension runs the helper, so the helper's path is checked too.
-    #expect(AgentMCPLaunch.arguments(
-        for: .pi, serverName: "cherry", helperPath: "relative/CherryMCP", environmentKeys: [], piExtensionPath: piExtension
-    ) == nil)
-    #expect(AgentMCPLaunch.plan(
-        commandLine: "pi", serverName: "cherry", helperPath: launchHelperPath, environmentKeys: []
-    ) == .skipped("no Pi extension next to the app"))
-    #expect(AgentMCPLaunch.plan(
-        commandLine: "pi", serverName: "cherry", helperPath: launchHelperPath, environmentKeys: [], piExtensionPath: "/tmp/it's.ts"
-    ) == .skipped("the server name cherry, CherryMCP's path \(launchHelperPath) or the Pi extension's path /tmp/it's.ts can't go on a command line"))
-    #expect(AgentMCPLaunch.plan(
-        commandLine: "pi --model x", serverName: "cherry", helperPath: launchHelperPath, environmentKeys: [], piExtensionPath: piExtension
-    ) == .flags(cli: .pi, executableWord: "pi", arguments: ["-e", piExtension]))
-    #expect(AgentMCPLaunch.plan(
-        commandLine: "pi -ne", serverName: "cherry", helperPath: launchHelperPath, environmentKeys: [], piExtensionPath: piExtension
-    ) == .skipped("it turns off Pi's MCP or extensions"))
-    #expect(AgentMCPLaunch.plan(
-        commandLine: "pi | tee x", serverName: "cherry", helperPath: launchHelperPath, environmentKeys: [], piExtensionPath: piExtension
-    ) == .skipped("not a plain claude, codex or pi command"))
-
-    // Words that would not read the same in every shell's single quotes,
-    // and names a CLI's configuration cannot take, give no flags.
-    for cli in AgentMCPLaunch.CLI.allCases {
-        for path in ["/tmp/it's/CherryMCP", "/tmp/back\\slash/CherryMCP", "/tmp/new\nline/CherryMCP", "relative/CherryMCP", ""] {
-            #expect(AgentMCPLaunch.arguments(for: cli, serverName: "cherry", helperPath: path, environmentKeys: []) == nil, "\(path)")
-        }
-        for name in ["", "Cherry", "cherry.dev", "cherry+x", "cher ry", "cherry'"] {
-            #expect(AgentMCPLaunch.arguments(
-                for: cli, serverName: name, helperPath: launchHelperPath, environmentKeys: [], piExtensionPath: "/tmp/cherry-pi-mcp.ts"
-            ) == nil, "\(name)")
-        }
-    }
-}
-
-@Test func controlToolLaunchSuffixReadsBackUnchangedInEveryShell() throws {
-    let helper = #"/tmp/My Apps/Cherry "Dev".app/Contents/MacOS/CherryMCP"#
-    let claude = try #require(AgentMCPLaunch.arguments(for: .claudeCode, serverName: "cherry", helperPath: helper, environmentKeys: []))
-    let codex = try #require(AgentMCPLaunch.arguments(
-        for: .codex, serverName: "cherry", helperPath: helper,
-        environmentKeys: AgentMCPLaunch.environmentKeys(projectRoot: "/p", controlSocketPath: "/s", helperPath: helper)
-    ))
-    #expect(AgentMCPLaunch.shellSuffix(["a b", "it's"]) == #" 'a b' 'it'\''s'"#)
     var shells: [(String, [String])] = [
         ("/bin/sh", ["-c"]),
         ("/bin/zsh", ["-f", "-c"]),
@@ -299,12 +218,8 @@ private let launchHelperPath = "/Applications/Cherry.app/Contents/MacOS/CherryMC
     for fish in ["/opt/homebrew/bin/fish", "/usr/local/bin/fish"] where FileManager.default.isExecutableFile(atPath: fish) {
         shells.append((fish, ["--no-config", "-c"]))
     }
-    let pi = try #require(AgentMCPLaunch.arguments(
-        for: .pi, serverName: "cherry", helperPath: helper, environmentKeys: [],
-        piExtensionPath: "/tmp/My Apps/Cherry \"Dev\".app/Contents/Resources/Cherry_Cherry.bundle/cherry-pi-mcp.ts"
-    ))
-    for words in [claude, codex, pi] {
-        let suffix = AgentMCPLaunch.shellSuffix(words)
+    for words in [claude, codex, pi, device] {
+        let suffix = AgentLaunch.shellSuffix(words)
         for (shell, options) in shells {
             let run = try runLaunchProcess(shell, options + ["printf '%s\\n'" + suffix])
             #expect(run.status == 0, "\(shell)")
@@ -313,26 +228,16 @@ private let launchHelperPath = "/Applications/Cherry.app/Contents/MacOS/CherryMC
     }
 }
 
-@Test func controlToolLaunchEnvironmentKeysAreTheOnesTheLaunchSets() {
-    #expect(AgentMCPLaunch.environmentKeys(projectRoot: "/p", controlSocketPath: "/tmp/s.sock", helperPath: "/h") == [
-        "CHERRY_PROCESS_ID", "CHERRY_AGENT_ID", "CHERRY_PROJECT_ROOT", "CHERRY_CONTROL_SOCKET", "CHERRY_MCP_HELPER",
-    ])
-    #expect(AgentMCPLaunch.environmentKeys(projectRoot: nil, controlSocketPath: nil, helperPath: nil)
-        == ["CHERRY_PROCESS_ID", "CHERRY_AGENT_ID"])
-    #expect(AgentMCPLaunch.environmentKeys(projectRoot: "", controlSocketPath: "", helperPath: "")
-        == ["CHERRY_PROCESS_ID", "CHERRY_AGENT_ID"])
-}
-
 @Test func controlToolLaunchSwitchIsOnUnlessTurnedOff() throws {
     let suite = "CherryTests.ControlToolLaunch.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: suite))
     defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
-    #expect(AgentMCPLaunch.enabledDefaultsKey == "mcp.connectAgentsAtLaunch")
-    #expect(AgentMCPLaunch.isEnabled(defaults))
-    defaults.set(false, forKey: AgentMCPLaunch.enabledDefaultsKey)
-    #expect(!AgentMCPLaunch.isEnabled(defaults))
-    defaults.set(true, forKey: AgentMCPLaunch.enabledDefaultsKey)
-    #expect(AgentMCPLaunch.isEnabled(defaults))
+    #expect(AgentLaunch.enabledDefaultsKey == "mcp.connectAgentsAtLaunch")
+    #expect(AgentLaunch.isEnabled(defaults))
+    defaults.set(false, forKey: AgentLaunch.enabledDefaultsKey)
+    #expect(!AgentLaunch.isEnabled(defaults))
+    defaults.set(true, forKey: AgentLaunch.enabledDefaultsKey)
+    #expect(AgentLaunch.isEnabled(defaults))
 }
 
 // MARK: - Versions
@@ -351,17 +256,14 @@ private let launchHelperPath = "/Applications/Cherry.app/Contents/MacOS/CherryMC
     #expect(AgentCLIVersion(major: 0, minor: 162, patch: 0) > AgentCLIVersion(major: 0, minor: 99, patch: 99))
     #expect(AgentCLIVersion(major: 10, minor: 0, patch: 0) > AgentCLIVersion(major: 9, minor: 99, patch: 99))
 
-    #expect(AgentMCPLaunch.CLI.claudeCode.minimumVersion == AgentCLIVersion(major: 2, minor: 0, patch: 0))
-    #expect(AgentMCPLaunch.CLI.codex.minimumVersion == AgentCLIVersion(major: 0, minor: 162, patch: 0))
-    // Pi's is the one Settings' registration has, defined once.
-    #expect(AgentMCPLaunch.CLI.pi.minimumVersion == AgentCLIVersion(major: 0, minor: 99, patch: 2))
-    #expect(AgentMCPLaunch.CLI.pi.minimumVersion == PiMCPRegistration.minimumVersion)
-    #expect(AgentCLIVersion(versionOutput: "1.3.0")! >= AgentMCPLaunch.CLI.pi.minimumVersion)
-    #expect(AgentCLIVersion(versionOutput: "0.62.0")! < AgentMCPLaunch.CLI.pi.minimumVersion)
-    #expect(MCPHarness.pi.launchCLI == .pi)
-    #expect(AgentCLIVersion(versionOutput: "2.1.299 (Claude Code)")! >= AgentMCPLaunch.CLI.claudeCode.minimumVersion)
-    #expect(AgentCLIVersion(versionOutput: "codex-cli 0.162.1")! >= AgentMCPLaunch.CLI.codex.minimumVersion)
-    #expect(AgentCLIVersion(versionOutput: "codex-cli 0.161.9")! < AgentMCPLaunch.CLI.codex.minimumVersion)
+    #expect(AgentLaunch.CLI.claudeCode.minimumVersion == AgentCLIVersion(major: 2, minor: 1, patch: 0))
+    #expect(AgentLaunch.CLI.codex.minimumVersion == AgentCLIVersion(major: 0, minor: 162, patch: 0))
+    #expect(AgentLaunch.CLI.pi.minimumVersion == AgentCLIVersion(major: 0, minor: 99, patch: 2))
+    #expect(AgentCLIVersion(versionOutput: "1.3.0")! >= AgentLaunch.CLI.pi.minimumVersion)
+    #expect(AgentCLIVersion(versionOutput: "0.62.0")! < AgentLaunch.CLI.pi.minimumVersion)
+    #expect(AgentCLIVersion(versionOutput: "2.1.299 (Claude Code)")! >= AgentLaunch.CLI.claudeCode.minimumVersion)
+    #expect(AgentCLIVersion(versionOutput: "codex-cli 0.162.1")! >= AgentLaunch.CLI.codex.minimumVersion)
+    #expect(AgentCLIVersion(versionOutput: "codex-cli 0.161.9")! < AgentLaunch.CLI.codex.minimumVersion)
 }
 
 @Test func controlToolLaunchProbeAsksTheCLIOnPATHOnceUntilItChanges() async throws {
@@ -465,11 +367,12 @@ private let launchHelperPath = "/Applications/Cherry.app/Contents/MacOS/CherryMC
     #expect(await versions.answer(errorsOnly.path, environment: environment) == .versionOnErrorOutput(named, output: ""))
     #expect(await versions.probe(errorsOnly.path, environment: environment) == nil)
     #expect(versions.version(of: errorsOnly.path) == nil)
-    let context = AgentMCPLaunchContext(isEnabled: { true }, versions: versions, helperPath: launchHelperPath)
-    let keys = AgentMCPLaunch.environmentKeys(projectRoot: directory.path, controlSocketPath: nil, helperPath: launchHelperPath)
-    #expect(context.outcome(commandLine: errorsOnly.path, serverName: "cherry", environmentKeys: keys)
-        == .skipped("claude's version is not known yet"))
-    let noisyGetsFlags = if case .appended = context.outcome(commandLine: noisy.path, serverName: "cherry", environmentKeys: keys) {
+    let plugin = try #require(AgentSkillDirectory.prepare(
+        plugin: directory.appendingPathComponent("agent-skill/cherry-plugin", isDirectory: true), canWrite: true
+    ))
+    let context = AgentLaunchContext(isEnabled: { true }, versions: versions, pluginDirectory: { plugin })
+    #expect(context.outcome(commandLine: errorsOnly.path) == .skipped("claude's version is not known yet"))
+    let noisyGetsFlags = if case .appended = context.outcome(commandLine: noisy.path) {
         true
     } else {
         false
@@ -567,7 +470,7 @@ private final class LaunchHarness {
     let claude: URL
     let codex: URL
     let pi: URL
-    let piExtension: URL
+    let plugin: URL
     let versions: AgentCLIVersions
     let suite = "CherryTests.ControlToolLaunch.\(UUID().uuidString)"
     let defaults: UserDefaults
@@ -582,27 +485,28 @@ private final class LaunchHarness {
         try writeVersionStandIn("codex-cli 0.162.1", to: codex)
         pi = directory.appendingPathComponent("bin/pi")
         try writeVersionStandIn("1.3.0", to: pi)
-        piExtension = directory.appendingPathComponent("Cherry_Cherry.bundle/cherry-pi-mcp.ts")
-        try FileManager.default.createDirectory(at: piExtension.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try "export default function cherryMCP(pi) {}\n".write(to: piExtension, atomically: true, encoding: .utf8)
+        plugin = try #require(AgentSkillDirectory.prepare(
+            plugin: directory.appendingPathComponent("agent-skill/cherry-plugin", isDirectory: true), canWrite: true
+        ))
         let path = "\(directory.appendingPathComponent("bin").path):/usr/bin:/bin"
         versions = AgentCLIVersions(environment: { ["PATH": path] })
         defaults = try #require(UserDefaults(suiteName: suite))
     }
 
-    var context: AgentMCPLaunchContext {
+    var context: AgentLaunchContext {
         let defaults = defaults
-        return AgentMCPLaunchContext(
-            isEnabled: { AgentMCPLaunch.isEnabled(defaults) },
+        let plugin = plugin
+        return AgentLaunchContext(
+            isEnabled: { AgentLaunch.isEnabled(defaults) },
             versions: versions,
-            helperPath: launchHelperPath,
-            piExtensionPath: piExtension.path
+            pluginDirectory: { plugin },
+            codexFacts: { CodexLaunchFacts(rulesInstalled: false, setsDeveloperInstructions: false) }
         )
     }
 
-    func workspace(agentMCPLaunch: AgentMCPLaunchContext?) -> TerminalWorkspace {
+    func workspace(agentLaunch: AgentLaunchContext?) -> TerminalWorkspace {
         var policy = SessionBackendPolicy.native
-        policy.agentMCPLaunch = agentMCPLaunch
+        policy.agentLaunch = agentLaunch
         let workspace = TerminalWorkspace(
             projectRoot: directory.path, createInitialSession: false, launchBackend: .hostManaged, backendPolicy: policy
         )
@@ -610,17 +514,12 @@ private final class LaunchHarness {
         return workspace
     }
 
-    func suffix(_ cli: AgentMCPLaunch.CLI) throws -> String {
-        let arguments = try #require(AgentMCPLaunch.arguments(
-            for: cli,
-            serverName: CherryAppIdentity.current.urlScheme,
-            helperPath: launchHelperPath,
-            environmentKeys: AgentMCPLaunch.environmentKeys(
-                projectRoot: directory.path, controlSocketPath: CherryControlServer.appSocketPath, helperPath: launchHelperPath
-            ),
-            piExtensionPath: piExtension.path
+    /// What a launch of `cli` in the tab `tab` appends (its line names the tab).
+    func suffix(_ cli: AgentLaunch.CLI, tab: TerminalSession) throws -> String {
+        let arguments = try #require(AgentCLILaunch.arguments(
+            for: cli, words: [], pluginDirectory: plugin, socketPath: nil, processID: tab.id.uuidString, addsInstructions: true
         ))
-        return AgentMCPLaunch.shellSuffix(arguments)
+        return AgentLaunch.shellSuffix(arguments)
     }
 
     func cleanUp() {
@@ -638,50 +537,49 @@ private final class LaunchHarness {
     let token = SessionLog.observe { entry in seen.withLock { $0.append(entry.message) } }
     defer { SessionLog.remove(token) }
     func logged(_ tab: TerminalSession) -> [String] {
-        seen.withLock { $0 }.filter { $0.hasPrefix("[mcp] tab \(tab.id.uuidString) ") }
+        seen.withLock { $0 }.filter { $0.hasPrefix("[agent] tab \(tab.id.uuidString) ") }
     }
     harness.versions.seed([
         harness.claude.path: AgentCLIVersion(major: 2, minor: 1, patch: 299),
         harness.codex.path: AgentCLIVersion(major: 0, minor: 162, patch: 1),
     ])
-    let workspace = harness.workspace(agentMCPLaunch: harness.context)
-    let claudeSuffix = try harness.suffix(.claudeCode)
-    let codexSuffix = try harness.suffix(.codex)
+    let workspace = harness.workspace(agentLaunch: harness.context)
 
     let claudeLine = "\(harness.claude.path) --dangerously-skip-permissions"
     let claude = workspace.addAgentSession(
         agent: AgentToolDefinition(name: "Claude", command: harness.claude.path, arguments: "--dangerously-skip-permissions"),
         projectRoot: harness.directory.path
     )
+    let claudeSuffix = try harness.suffix(.claudeCode, tab: claude)
     #expect(claude.launchCommand == claudeLine)
     #expect(claude.launchStartupCommand == claudeLine + claudeSuffix)
     #expect(logged(claude).count == 1)
-    #expect(logged(claude).first?.contains("with Cherry MCP: '--mcp-config'") == true)
-    #expect(claude.lastAgentMCPLaunchOutcome == .appended(claudeSuffix))
+    #expect(logged(claude).first?.contains("with the cherry CLI's flags: '--plugin-dir'") == true)
+    #expect(claude.lastAgentLaunchOutcome == .appended(claudeSuffix))
 
     let codexLine = "\(harness.codex.path) --yolo"
     let codex = workspace.addAgentSession(
         agent: AgentToolDefinition(name: "Codex", command: harness.codex.path, arguments: "--yolo"),
         projectRoot: harness.directory.path
     )
-    #expect(codex.launchStartupCommand == codexLine + codexSuffix)
-    #expect(codex.launchStartupCommand?.contains("'-c' 'mcp_servers.\(CherryAppIdentity.current.urlScheme)={command=") == true)
+    #expect(codex.launchStartupCommand == codexLine + (try harness.suffix(.codex, tab: codex)))
+    #expect(codex.launchStartupCommand?.contains("'-c' 'developer_instructions=") == true)
 
     // Never saved: a record keeps the command as configured.
     let record = workspace.makeStateRecord(root: harness.directory.path, collapsedAgentGroupIDs: [])
     #expect(record.sessions.first { $0.id == claude.id }?.launchCommand == claudeLine)
     #expect(record.sessions.first { $0.id == codex.id }?.launchCommand == codexLine)
     #expect(record.sessions.allSatisfy { record in
-        !(record.launchCommand ?? "").contains("--mcp-config") && !(record.launchCommand ?? "").contains("mcp_servers")
+        !(record.launchCommand ?? "").contains("--plugin-dir") && !(record.launchCommand ?? "").contains("developer_instructions")
     })
 
     // A restart decides again: the switch is read at every launch.
-    harness.defaults.set(false, forKey: AgentMCPLaunch.enabledDefaultsKey)
+    harness.defaults.set(false, forKey: AgentLaunch.enabledDefaultsKey)
     #expect(claude.restart())
     #expect(claude.launchStartupCommand == nil)
-    #expect(logged(claude).last?.hasSuffix(": turned off in Settings › Agents & MCP") == true)
-    #expect(claude.lastAgentMCPLaunchOutcome == .skipped("turned off in Settings › Agents & MCP"))
-    harness.defaults.set(true, forKey: AgentMCPLaunch.enabledDefaultsKey)
+    #expect(logged(claude).last?.hasSuffix(": turned off in Settings › Agents") == true)
+    #expect(claude.lastAgentLaunchOutcome == .skipped("turned off in Settings › Agents"))
+    harness.defaults.set(true, forKey: AgentLaunch.enabledDefaultsKey)
     #expect(claude.restart())
     #expect(claude.launchStartupCommand == claudeLine + claudeSuffix)
     #expect(claude.launchCommand == claudeLine)
@@ -697,8 +595,8 @@ private final class LaunchHarness {
     #expect(command.launchStartupCommand == nil)
     #expect(logged(terminal).isEmpty)
     #expect(logged(command).isEmpty)
-    #expect(terminal.lastAgentMCPLaunchOutcome == nil)
-    #expect(command.lastAgentMCPLaunchOutcome == nil)
+    #expect(terminal.lastAgentLaunchOutcome == nil)
+    #expect(command.lastAgentLaunchOutcome == nil)
 }
 
 @Test @MainActor func controlToolLaunchAgentsStartAsTheirCommandSaysWithoutAKnownVersionOrTheSwitch() async throws {
@@ -708,13 +606,13 @@ private final class LaunchHarness {
     let token = SessionLog.observe { entry in seen.withLock { $0.append(entry.message) } }
     defer { SessionLog.remove(token) }
     func reason(_ tab: TerminalSession) -> String? {
-        seen.withLock { $0 }.last { $0.hasPrefix("[mcp] tab \(tab.id.uuidString) ") }?
-            .components(separatedBy: "on its command line: ").last
+        seen.withLock { $0 }.last { $0.hasPrefix("[agent] tab \(tab.id.uuidString) ") }?
+            .components(separatedBy: "without Cherry's flags: ").last
     }
     let claudeAgent = AgentToolDefinition(name: "Claude", command: harness.claude.path, arguments: "--resume")
 
     // A version not known yet: no flags, and no CLI is run to find it.
-    let cold = harness.workspace(agentMCPLaunch: harness.context)
+    let cold = harness.workspace(agentLaunch: harness.context)
     let coldTab = cold.addAgentSession(agent: claudeAgent, projectRoot: harness.directory.path)
     #expect(coldTab.launchStartupCommand == nil)
     #expect(reason(coldTab) == "claude's version is not known yet")
@@ -728,13 +626,7 @@ private final class LaunchHarness {
     #expect(reason(oldTab) == "codex 0.161.9 is older than 0.162.0")
 
     harness.versions.seed([harness.claude.path: AgentCLIVersion(major: 2, minor: 1, patch: 299)])
-    // A command that names its own MCP configuration, or is not plain.
-    let own = cold.addAgentSession(
-        agent: AgentToolDefinition(name: "Own", command: harness.claude.path, arguments: "--mcp-config /tmp/mine.json"),
-        projectRoot: harness.directory.path
-    )
-    #expect(own.launchStartupCommand == nil)
-    #expect(reason(own) == "it names its own MCP configuration")
+    // A command that is not plain.
     let piped = cold.addAgentSession(
         agent: AgentToolDefinition(name: "Piped", command: harness.claude.path, arguments: "| tee /dev/null"),
         projectRoot: harness.directory.path
@@ -743,33 +635,32 @@ private final class LaunchHarness {
     #expect(reason(piped) == "not a plain claude, codex or pi command")
 
     // The switch off.
-    harness.defaults.set(false, forKey: AgentMCPLaunch.enabledDefaultsKey)
+    harness.defaults.set(false, forKey: AgentLaunch.enabledDefaultsKey)
     let off = cold.addAgentSession(agent: claudeAgent, projectRoot: harness.directory.path)
     #expect(off.launchStartupCommand == nil)
-    #expect(reason(off) == "turned off in Settings › Agents & MCP")
-    harness.defaults.removeObject(forKey: AgentMCPLaunch.enabledDefaultsKey)
+    #expect(reason(off) == "turned off in Settings › Agents")
+    harness.defaults.removeObject(forKey: AgentLaunch.enabledDefaultsKey)
 
-    // No CherryMCP next to the app.
-    var noHelper = harness.context
-    noHelper.helperPath = nil
-    let helperless = harness.workspace(agentMCPLaunch: noHelper).addAgentSession(agent: claudeAgent, projectRoot: harness.directory.path)
-    #expect(helperless.launchStartupCommand == nil)
-    #expect(reason(helperless) == "no CherryMCP next to the app")
+    // No skill files.
+    var noSkill = harness.context
+    noSkill.pluginDirectory = { nil }
+    let skillless = harness.workspace(agentLaunch: noSkill).addAgentSession(agent: claudeAgent, projectRoot: harness.directory.path)
+    #expect(skillless.launchStartupCommand == nil)
+    #expect(reason(skillless) == "the cherry skill's files are not ready")
 
     // A workspace whose policy has none (every other test's, `.native`):
     // nothing, with the version known too, and nothing logged.
-    let plain = harness.workspace(agentMCPLaunch: nil)
+    let plain = harness.workspace(agentLaunch: nil)
     let plainTab = plain.addAgentSession(agent: claudeAgent, projectRoot: harness.directory.path)
     #expect(plainTab.launchStartupCommand == nil)
     #expect(reason(plainTab) == nil)
-    #expect(plainTab.lastAgentMCPLaunchOutcome == nil)
-    #expect(coldTab.lastAgentMCPLaunchOutcome == .skipped("claude's version is not known yet"))
-    #expect(SessionBackendPolicy.native.agentMCPLaunch == nil)
+    #expect(plainTab.lastAgentLaunchOutcome == nil)
+    #expect(coldTab.lastAgentLaunchOutcome == .skipped("claude's version is not known yet"))
+    #expect(SessionBackendPolicy.native.agentLaunch == nil)
 
     // And with it, the same agent gets the flags.
-    let suffix = try harness.suffix(.claudeCode)
     let hot = cold.addAgentSession(agent: claudeAgent, projectRoot: harness.directory.path)
-    #expect(hot.launchStartupCommand == "\(harness.claude.path) --resume" + suffix)
+    #expect(hot.launchStartupCommand == "\(harness.claude.path) --resume" + (try harness.suffix(.claudeCode, tab: hot)))
 }
 
 /// A saved agent tab that comes back ended (`makeSystemEndedSession`)
@@ -778,7 +669,7 @@ private final class LaunchHarness {
     let harness = try LaunchHarness()
     defer { harness.cleanUp() }
     harness.versions.seed([harness.claude.path: AgentCLIVersion(major: 2, minor: 1, patch: 299)])
-    let workspace = harness.workspace(agentMCPLaunch: harness.context)
+    let workspace = harness.workspace(agentLaunch: harness.context)
     let line = "\(harness.claude.path) --resume"
     let record = WorkspaceSessionRecord(
         id: UUID(),
@@ -790,12 +681,11 @@ private final class LaunchHarness {
         workingDirectory: harness.directory.path,
         projectRoot: harness.directory.path
     )
-    let suffix = try harness.suffix(.claudeCode)
     let tab = workspace.makeSystemEndedSession(record: record, ended: .restart)
     harness.looseTabs.append(tab)
     #expect(tab.launchStartupCommand == nil)
     #expect(tab.restart())
-    #expect(tab.launchStartupCommand == line + suffix)
+    #expect(tab.launchStartupCommand == line + (try harness.suffix(.claudeCode, tab: tab)))
     #expect(tab.launchCommand == line)
 }
 
@@ -805,7 +695,7 @@ private final class LaunchHarness {
     let launch = try LaunchHarness()
     let harness = try PersistentHarness()
     var policy = harness.policy
-    policy.agentMCPLaunch = launch.context
+    policy.agentLaunch = launch.context
     let workspace = TerminalWorkspace(projectRoot: harness.project.path, createInitialSession: false, backendPolicy: policy)
     defer {
         workspace.closeAllSessions(intent: .windowClosed)
@@ -821,10 +711,7 @@ private final class LaunchHarness {
     )
     #expect(agent.isPersistentLocalSession)
     #expect(await harness.waitUntilAttached(agent))
-    let arguments = try #require(AgentMCPLaunch.arguments(
-        for: .claudeCode, serverName: CherryAppIdentity.current.urlScheme, helperPath: launchHelperPath, environmentKeys: []
-    ))
-    let expected = line + AgentMCPLaunch.shellSuffix(arguments)
+    let expected = line + (try launch.suffix(.claudeCode, tab: agent))
     let configuration = try #require(harness.configurations.value.first { $0.processID == agent.id.uuidString })
     #expect(configuration.startupCommand == expected)
     #expect(configuration.agentID == agent.id.uuidString)
@@ -849,186 +736,39 @@ private final class LaunchHarness {
 
 // MARK: - Pi
 
-/// Pi's outcome, as the app's context decides it: the extension on Pi
-/// 0.99.2 or later, else today's line and why.
-@Test @MainActor func controlToolLaunchPiGetsTheExtensionOnlyWhenItsVersionAndFileAllow() throws {
+/// Pi's outcome: the skill and the line on Pi 0.99.2 or later, else today's
+/// line and why.
+@Test @MainActor func controlToolLaunchPiGetsTheSkillOnlyWhenItsVersionAllows() async throws {
     let harness = try LaunchHarness()
     defer { harness.cleanUp() }
-    let context = harness.context
-    let keys = AgentMCPLaunch.environmentKeys(projectRoot: harness.directory.path, controlSocketPath: nil, helperPath: launchHelperPath)
-    func outcome(_ line: String = "pi", context: AgentMCPLaunchContext? = nil) -> AgentMCPLaunch.Outcome {
-        (context ?? harness.context).outcome(commandLine: line, serverName: "cherry", environmentKeys: keys)
+    let skill = AgentSkillDirectory.skillDirectory(inPlugin: harness.plugin).path
+    func outcome(_ line: String = "pi") -> AgentLaunch.Outcome {
+        harness.context.outcome(commandLine: line, processID: "TAB")
     }
-    let suffix = " '-e' '\(harness.piExtension.path)'"
+    let suffix = AgentLaunch.shellSuffix(["--skill", skill, "--append-system-prompt", AgentCLILaunch.instructionLine(processID: "TAB", hasSkill: true)])
 
     // Not known yet: no flags, and nothing ran to find out.
     #expect(outcome() == .skipped("pi's version is not known yet"))
     for (version, expected) in [
-        (AgentCLIVersion(major: 1, minor: 3, patch: 0), AgentMCPLaunch.Outcome.appended(suffix)),
+        (AgentCLIVersion(major: 1, minor: 3, patch: 0), AgentLaunch.Outcome.appended(suffix)),
         (AgentCLIVersion(major: 0, minor: 99, patch: 2), .appended(suffix)),
         (AgentCLIVersion(major: 0, minor: 99, patch: 1), .skipped("pi 0.99.1 is older than 0.99.2")),
-        (AgentCLIVersion(major: 0, minor: 62, patch: 0), .skipped("pi 0.62.0 is older than 0.99.2")),
     ] {
         harness.versions.seed([harness.pi.path: version])
         #expect(outcome() == expected, "\(version)")
         #expect(outcome(harness.pi.path + " --model x") == expected, "\(version)")
     }
-    // The flags are the line's last words: options and prompts may come first.
     harness.versions.seed([harness.pi.path: AgentCLIVersion(major: 1, minor: 3, patch: 0)])
     #expect(outcome(#"pi "fix it""#) == .appended(suffix))
-    // Its own MCP or extensions turned off, a subcommand, a line that is not plain.
-    #expect(outcome("pi --no-mcp") == .skipped("it turns off Pi's MCP or extensions"))
-    #expect(outcome("pi -ne") == .skipped("it turns off Pi's MCP or extensions"))
     #expect(outcome("pi install npm:x") == .skipped("pi install starts no session"))
     #expect(outcome("pi | tee log") == .skipped("not a plain claude, codex or pi command"))
 
-    // No extension, or one gone since (an app moved while it runs).
-    var none = context
-    none.piExtensionPath = nil
-    #expect(outcome(context: none) == .skipped("no Pi extension next to the app"))
-    try FileManager.default.removeItem(at: harness.piExtension)
-    #expect(outcome() == .skipped("no Pi extension next to the app"))
-    try "export default function cherryMCP(pi) {}\n".write(to: harness.piExtension, atomically: true, encoding: .utf8)
-    #expect(outcome() == .appended(suffix))
-
-    // The switch off.
-    harness.defaults.set(false, forKey: AgentMCPLaunch.enabledDefaultsKey)
-    #expect(outcome() == .skipped("turned off in Settings › Agents & MCP"))
-}
-
-/// A Pi agent tab gets the extension for its launch only: never in its
-/// command or its record.
-@Test @MainActor func controlToolLaunchAPiAgentTabGetsTheExtensionOnlyForItsLaunch() async throws {
-    let harness = try LaunchHarness()
-    defer { harness.cleanUp() }
-    harness.versions.seed([harness.pi.path: AgentCLIVersion(major: 1, minor: 3, patch: 0)])
-    let workspace = harness.workspace(agentMCPLaunch: harness.context)
-    let suffix = try harness.suffix(.pi)
-    #expect(suffix == " '-e' '\(harness.piExtension.path)'")
-
-    let line = "\(harness.pi.path) --model x"
+    // A tab gets them for its launch only, never in its record.
+    let workspace = harness.workspace(agentLaunch: harness.context)
     let tab = workspace.addAgentSession(
-        agent: AgentToolDefinition(name: "Pi", command: harness.pi.path, arguments: "--model x"),
-        projectRoot: harness.directory.path
+        agent: AgentToolDefinition(name: "Pi", command: harness.pi.path, arguments: "--model x"), projectRoot: harness.directory.path
     )
-    #expect(tab.launchCommand == line)
-    #expect(tab.launchStartupCommand == line + suffix)
-    #expect(tab.lastAgentMCPLaunchOutcome == .appended(suffix))
+    #expect(tab.launchStartupCommand == "\(harness.pi.path) --model x" + (try harness.suffix(.pi, tab: tab)))
     let record = workspace.makeStateRecord(root: harness.directory.path, collapsedAgentGroupIDs: [])
-    #expect(record.sessions.first { $0.id == tab.id }?.launchCommand == line)
-    #expect(record.sessions.allSatisfy { !($0.launchCommand ?? "").contains("-e") })
-
-    // Too old a Pi starts as its command says; a restart decides again.
-    harness.versions.seed([harness.pi.path: AgentCLIVersion(major: 0, minor: 62, patch: 0)])
-    #expect(tab.restart())
-    #expect(tab.launchStartupCommand == nil)
-    #expect(tab.lastAgentMCPLaunchOutcome == .skipped("pi 0.62.0 is older than 0.99.2"))
-    #expect(tab.launchCommand == line)
-
-    // A context-less workspace decides nothing.
-    let plain = harness.workspace(agentMCPLaunch: nil).addAgentSession(
-        agent: AgentToolDefinition(name: "Pi", command: harness.pi.path), projectRoot: harness.directory.path
-    )
-    #expect(plain.launchStartupCommand == nil)
-    #expect(plain.lastAgentMCPLaunchOutcome == nil)
-}
-
-/// Pi prefers its own mcp.json entry of the server's name to the
-/// extension's: the launch logs one that is not this app's, and changes
-/// nothing.
-@Test @MainActor func controlToolLaunchLogsAPiRegistrationThatPiPrefers() async throws {
-    let harness = try LaunchHarness()
-    defer { harness.cleanUp() }
-    let seen = OSAllocatedUnfairLock<[String]>(initialState: [])
-    let token = SessionLog.observe { entry in seen.withLock { $0.append(entry.message) } }
-    defer { SessionLog.remove(token) }
-    func notes() -> [String] { seen.withLock { $0 }.filter { $0.hasPrefix("[mcp] Pi's mcp.json") } }
-    harness.versions.seed([harness.pi.path: AgentCLIVersion(major: 1, minor: 3, patch: 0)])
-    let agentDirectory = harness.directory.appendingPathComponent("pi-agent", isDirectory: true)
-    try FileManager.default.createDirectory(at: agentDirectory, withIntermediateDirectories: true)
-    var context = harness.context
-    context.piAgentDirectory = { agentDirectory }
-    let workspace = harness.workspace(agentMCPLaunch: context)
-    let pi = AgentToolDefinition(name: "Pi", command: harness.pi.path)
-    let name = CherryAppIdentity.current.urlScheme
-
-    // A stale entry: Pi runs it instead of the extension's server.
-    let stale = "/nonexistent-\(UUID().uuidString)/CherryMCP"
-    try #"{"mcpServers":{"\#(name)":{"command":"\#(stale)","exposure":"deferred"}}}"#
-        .write(to: agentDirectory.appendingPathComponent("mcp.json"), atomically: true, encoding: .utf8)
-    let suffix = try harness.suffix(.pi)
-    let tab = workspace.addAgentSession(agent: pi, projectRoot: harness.directory.path)
-    #expect(tab.launchStartupCommand == harness.pi.path + suffix)
-    #expect(await launchEventually { !notes().isEmpty })
-    #expect(notes() == [
-        "[mcp] Pi's mcp.json has its own \(name) (it runs \(stale), which isn't there); Pi uses it instead of the launch-time server",
-    ])
-
-    // This app's own entry serves the agent as well: nothing to say.
-    try #"{"mcpServers":{"\#(name)":{"command":"\#(launchHelperPath)","exposure":"deferred","description":"\#(PiMCPRegistration.serverDescription)"}}}"#
-        .write(to: agentDirectory.appendingPathComponent("mcp.json"), atomically: true, encoding: .utf8)
-    #expect(tab.restart())
-    try await Task.sleep(for: .milliseconds(300))
-    #expect(notes().count == 1)
-    // A Claude Code agent reads nothing of Pi's.
-    let claudeTab = workspace.addAgentSession(
-        agent: AgentToolDefinition(name: "Claude", command: harness.claude.path), projectRoot: harness.directory.path
-    )
-    #expect(claudeTab.lastAgentMCPLaunchOutcome == .skipped("claude's version is not known yet"))
-    try await Task.sleep(for: .milliseconds(300))
-    #expect(notes().count == 1)
-}
-
-@Test func controlToolLaunchSaysWhichPiRegistrationPiPrefers() {
-    func note(_ status: PiMCPRegistration.EntryStatus) -> String? {
-        AgentMCPLaunch.piRegistrationNote(status, serverName: "cherry")
-    }
-    let preferred = "; Pi uses it instead of the launch-time server"
-    #expect(note(.notRegistered) == nil)
-    #expect(note(.connected(.deferred)) == nil)
-    #expect(note(.connected(.direct)) == nil)
-    #expect(note(.toolsHidden(exposure: "codemode")) == "Pi's mcp.json has its own cherry (its exposure is codemode)" + preferred)
-    #expect(note(.turnedOff) == "Pi's mcp.json has its own cherry (turned off)" + preferred)
-    #expect(note(.otherHelper(path: "/old/CherryMCP", runs: true)) == "Pi's mcp.json has its own cherry (it runs /old/CherryMCP)" + preferred)
-    #expect(note(.otherHelper(path: "/old/CherryMCP", runs: false))
-        == "Pi's mcp.json has its own cherry (it runs /old/CherryMCP, which isn't there)" + preferred)
-    #expect(note(.otherArguments(line: "/h --x")) == "Pi's mcp.json has its own cherry (it runs /h --x)" + preferred)
-    #expect(note(.unreadable("/p/mcp.json is not a JSON object")) == "Pi's mcp.json could not be read: /p/mcp.json is not a JSON object")
-}
-
-/// A persistent Pi tab on This Mac's host: its Create carries the extension
-/// in the command its shell runs, and the variables the extension reads.
-@Test @MainActor func controlToolLaunchAPersistentPiTabsCreateCarriesTheExtension() async throws {
-    let launch = try LaunchHarness()
-    let harness = try PersistentHarness(mcpHelperPath: launchHelperPath)
-    var policy = harness.policy
-    policy.agentMCPLaunch = launch.context
-    let workspace = TerminalWorkspace(projectRoot: harness.project.path, createInitialSession: false, backendPolicy: policy)
-    defer {
-        workspace.closeAllSessions(intent: .windowClosed)
-        harness.cleanUp()
-        launch.cleanUp()
-    }
-    launch.versions.seed([launch.pi.path: AgentCLIVersion(major: 1, minor: 3, patch: 0)])
-
-    let agent = workspace.addAgentSession(
-        agent: AgentToolDefinition(name: "Pi", command: launch.pi.path), projectRoot: harness.project.path
-    )
-    #expect(agent.isPersistentLocalSession)
-    #expect(await harness.waitUntilAttached(agent))
-    let expected = launch.pi.path + AgentMCPLaunch.shellSuffix(["-e", launch.piExtension.path])
-    #expect(agent.lastAgentMCPLaunchOutcome == .appended(AgentMCPLaunch.shellSuffix(["-e", launch.piExtension.path])))
-    let create = try #require(harness.creates().first)
-    let argv = try #require(create.json["command"] as? [String])
-    let environment = create.json["env"] as? [String: String] ?? [:]
-    if let startup = environment["CHERRY_STARTUP_COMMAND"] {
-        #expect(startup == expected)
-    } else {
-        #expect(argv.last?.contains(ShellQuoting.singleQuoted("exec \(expected)")) == true, "\(argv)")
-    }
-    // The extension registers the tab's helper under the identity's name.
-    #expect(environment["CHERRY_MCP_HELPER"] == launchHelperPath)
-    #expect(environment["CHERRY_MCP_SERVER_NAME"] == CherryAppIdentity.current.urlScheme)
-    let record = workspace.makeStateRecord(root: harness.project.path, collapsedAgentGroupIDs: [])
-    #expect(record.sessions.first { $0.id == agent.id }?.launchCommand == launch.pi.path)
+    #expect(record.sessions.first { $0.id == tab.id }?.launchCommand == "\(harness.pi.path) --model x")
 }

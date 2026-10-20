@@ -3,7 +3,6 @@ import CherryControl
 import Darwin
 import Foundation
 import GhosttyTerminal
-import MCP
 import SwiftUI
 import Testing
 @testable import Cherry
@@ -401,15 +400,8 @@ private func installStartupConfirmationAgentScript(
     return scriptURL
 }
 
-private func decodeMCPToolResult<T: Decodable>(_ type: T.Type, from result: CallTool.Result) throws -> T {
-    guard let text = result.content.compactMap({ content -> String? in
-        if case .text(let text, _, _) = content {
-            return text
-        }
-        return nil
-    }).first else {
-        throw CherryControlError(code: "missing_tool_text", message: "MCP tool result did not include text content.")
-    }
+private func decodeMCPToolResult<T: Decodable>(_ type: T.Type, from result: CallToolResult) throws -> T {
+    let text = result.text
     if result.isError == true {
         throw CherryControlError(code: "mcp_tool_error", message: text)
     }
@@ -2434,7 +2426,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func mcpAgentCreationToolsDoNotAdvertiseTopLevelOverride() throws {
-    let tool = try #require(CherryMCPTools.all.first { $0.name == "spawn_process" })
+    let tool = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "spawn_process" })
     let schema = try #require(tool.inputSchema.objectValue)
     let properties = try #require(schema["properties"]?.objectValue)
 
@@ -2445,7 +2437,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func mcpSendProcessInputAdvertisesSubmitOverride() throws {
-    let tool = try #require(CherryMCPTools.all.first { $0.name == "send_process_input" })
+    let tool = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "send_process_input" })
     let schema = try #require(tool.inputSchema.objectValue)
     let properties = try #require(schema["properties"]?.objectValue)
 
@@ -2453,7 +2445,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func mcpOpenProjectAdvertisesOnlyAProjectRoot() throws {
-    let tool = try #require(CherryMCPTools.all.first { $0.name == "open_project" })
+    let tool = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "open_project" })
     let schema = try #require(tool.inputSchema.objectValue)
     let properties = try #require(schema["properties"]?.objectValue)
     let required = try #require(schema["required"]?.arrayValue)
@@ -2465,7 +2457,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func mcpWaitForProcessIdleAdvertisesOnlyProcessSelectors() throws {
-    let tool = try #require(CherryMCPTools.all.first { $0.name == "wait_for_process_idle" })
+    let tool = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "wait_for_process_idle" })
     let schema = try #require(tool.inputSchema.objectValue)
     let properties = try #require(schema["properties"]?.objectValue)
 
@@ -2477,7 +2469,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func mcpAgentSpecificToolsAdvertiseMessageSchemas() throws {
-    let spawnTool = try #require(CherryMCPTools.all.first { $0.name == "spawn_agent" })
+    let spawnTool = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "spawn_agent" })
     let spawnSchema = try #require(spawnTool.inputSchema.objectValue)
     let spawnProperties = try #require(spawnSchema["properties"]?.objectValue)
     let spawnRequired = try #require(spawnSchema["required"]?.arrayValue)
@@ -2490,7 +2482,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(spawnProperties["kind"] == nil)
     #expect(spawnRequired.contains(.string("name")))
 
-    let sendTool = try #require(CherryMCPTools.all.first { $0.name == "send_agent_message" })
+    let sendTool = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "send_agent_message" })
     let sendSchema = try #require(sendTool.inputSchema.objectValue)
     let sendProperties = try #require(sendSchema["properties"]?.objectValue)
     let sendRequired = try #require(sendSchema["required"]?.arrayValue)
@@ -2520,7 +2512,7 @@ private struct MCPWhoamiPayload: Decodable {
         "close_terminal",
         "wait_for_idle"
     ]
-    let advertisedNames = Set(CherryMCPTools.all.map(\.name))
+    let advertisedNames = Set(CherryToolCatalog.tools(for: .unknown).map(\.name))
 
     #expect(advertisedNames.isDisjoint(with: removedToolNames))
 }
@@ -2535,12 +2527,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
 
     #expect(result.isError == true)
-    #expect(result.content.contains { content in
-        if case .text(let text, _, _) = content {
-            return text.contains("unknown_tool")
-        }
-        return false
-    })
+    #expect(result.text.contains("unknown_tool"))
 }
 
 @Test func mcpNoteToolsAreGone() async throws {
@@ -2555,7 +2542,7 @@ private struct MCPWhoamiPayload: Decodable {
         "delete_note",
         "select_note"
     ]
-    #expect(Set(CherryMCPTools.all.map(\.name)).isDisjoint(with: noteToolNames))
+    #expect(Set(CherryToolCatalog.tools(for: .unknown).map(\.name)).isDisjoint(with: noteToolNames))
 
     // An agent whose tool list predates their removal gets a clean error.
     let result = await CherryMCPTools.call(
@@ -2563,12 +2550,7 @@ private struct MCPWhoamiPayload: Decodable {
         arguments: ["title": .string("Review"), "markdown": .string("# Review")]
     )
     #expect(result.isError == true)
-    #expect(result.content.contains { content in
-        if case .text(let text, _, _) = content {
-            return text.contains("unknown_tool")
-        }
-        return false
-    })
+    #expect(result.text.contains("unknown_tool"))
 }
 
 @MainActor
@@ -2757,12 +2739,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
 
     #expect(sendResult.isError == true)
-    #expect(sendResult.content.contains { content in
-        if case .text(let text, _, _) = content {
-            return text.contains("missing_process_selector")
-        }
-        return false
-    })
+    #expect(sendResult.text.contains("missing_process_selector"))
 }
 
 @MainActor
@@ -3194,12 +3171,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
 
     #expect(result.isError == true)
-    #expect(result.content.contains { content in
-        if case .text(let text, _, _) = content {
-            return text.contains("not_agent_process")
-        }
-        return false
-    })
+    #expect(result.text.contains("not_agent_process"))
 }
 
 @MainActor
@@ -3601,17 +3573,12 @@ private struct ProjectFeatureAvailabilityBeforeNotesWereRemoved: Decodable {
 
     for name in ["list_projects", "get_project_status"] {
         let result = await CherryMCPTools.call(name: name, arguments: [:])
-        let text = result.content.compactMap { content -> String? in
-            if case .text(let text, _, _) = content {
-                return text
-            }
-            return nil
-        }.joined()
+        let text = result.text
         #expect(result.isError != true, Comment(rawValue: text))
         #expect(text.contains("todos_enabled"), Comment(rawValue: text))
         #expect(!text.contains("notes_enabled"), Comment(rawValue: text))
 
-        let structured = String(decoding: try JSONEncoder().encode(try #require(result.structuredContent)), as: UTF8.self)
+        let structured = String(decoding: try JSONEncoder().encode(try #require(result.structured)), as: UTF8.self)
         #expect(structured.contains("todosEnabled"), Comment(rawValue: structured))
         #expect(!structured.contains("notesEnabled"), Comment(rawValue: structured))
     }
@@ -8023,26 +7990,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
             ProjectCommandDefinition(name: " web ", command: "pnpm")
         ])
     }
-}
-
-@Test func mcpInstallCommandsUseProcessBoundStdioHelper() async throws {
-    let commands = MCPInstallCommandBuilder.commands()
-    let helperCommand = MCPInstallCommandBuilder.helperCommand
-
-    #expect(commands == [
-        MCPInstallCommand(
-            harness: .codex,
-            command: "codex mcp add cherry -- \(helperCommand)"
-        ),
-        MCPInstallCommand(
-            harness: .claude,
-            command: "claude mcp add --transport stdio --scope user cherry -- \(helperCommand)"
-        ),
-        MCPInstallCommand(
-            harness: .pi,
-            command: "pi mcp add cherry --exposure deferred --description '\(PiMCPRegistration.serverDescription)' -- \(helperCommand)"
-        )
-    ])
 }
 
 @Test func cherryControlSocketSeparatesInstalledAppFromSwiftPMBuild() {

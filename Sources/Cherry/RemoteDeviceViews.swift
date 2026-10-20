@@ -636,7 +636,7 @@ struct UpdateDeviceHostSheet: View {
     }
 }
 
-/// Shows a device's sheet (Update Session Host…, Set Up Cherry MCP…) on
+/// Shows a device's sheet (Update Session Host…, Connect Agents…) on
 /// the key window, else as a window of its own; `content` is given what
 /// closes it.
 @MainActor

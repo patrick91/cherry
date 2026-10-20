@@ -196,7 +196,7 @@ extension AgentToolDefinition {
 }
 
 /// Whether an agent CLI reports its state to Cherry (program status, OSC
-/// 7501, docs/mcp.md): from which version, not at all, or not known. One
+/// 7501, docs/cli.md): from which version, not at all, or not known. One
 /// that does not report is followed by its output going quiet.
 enum ProgramStatusSupport: Equatable, Sendable {
     case reports(minimumVersion: String)
@@ -217,7 +217,7 @@ extension AgentToolBrand {
         }
     }
 
-    /// Whether the CLI reports its state (docs/mcp.md › program status):
+    /// Whether the CLI reports its state (docs/cli.md › program status):
     /// Claude Code from 2.1.295 and Pi from 1.1.0; Codex and Amp do not;
     /// Gemini CLI and OpenCode are not known either way.
     var programStatusSupport: ProgramStatusSupport {
@@ -226,17 +226,6 @@ extension AgentToolBrand {
         case .pi: .reports(minimumVersion: "1.1.0")
         case .codex, .amp: .doesNotReport
         case .gemini, .openCode: .unknown
-        }
-    }
-
-    /// The CLI whose `mcp add` connects it to Cherry's MCP helper; nil for
-    /// one Cherry has no command for.
-    var mcpHarness: MCPHarness? {
-        switch self {
-        case .claude: .claude
-        case .codex: .codex
-        case .pi: .pi
-        case .gemini, .openCode, .amp: nil
         }
     }
 }

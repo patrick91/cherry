@@ -600,7 +600,7 @@ final class CherryControlServer: @unchecked Sendable {
     /// A request on a device's listener without a token.
     static let missingDeviceToken = CherryControlError(
         code: "unauthorized",
-        message: "This request came from another Mac without a Cherry MCP token. Run CherryMCP in a Cherry tab of that Mac."
+        message: "This request came from another Mac without a Cherry token. Run cherry in a Cherry tab of that Mac."
     )
 
     /// The requests of the notes Cherry no longer has, as a CherryMCP from
@@ -672,7 +672,7 @@ final class CherryControlServer: @unchecked Sendable {
     func remoteCaller(_ credentials: CherryControlCredentials, origin: CallerOrigin) throws -> RemoteCaller {
         let refused = CherryControlError(
             code: "unauthorized",
-            message: "Cherry refused this Cherry MCP token: it does not belong to an open tab of this Mac's Cherry (the tab was closed, or it was started by another copy of Cherry)."
+            message: "Cherry refused this Cherry token: it does not belong to an open tab of this Mac's Cherry (the tab was closed, or it was started by another copy of Cherry)."
         )
         guard let tabID = UUID(uuidString: credentials.processID) else { throw refused }
         // Every window: a tab of a project's second window is as much its

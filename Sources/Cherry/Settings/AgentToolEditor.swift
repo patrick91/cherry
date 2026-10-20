@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// The sheet that adds an agent (Settings › Agents & MCP's + Add Agent and
+/// The sheet that adds an agent (Settings › Agents' + Add Agent and
 /// Custom…, the Omni bar's Add Agent…) or edits one: its name, command,
 /// default arguments and whether it is on. Delete… (only while editing)
 /// asks first. Saving is the caller's (`onSave`), which shows why it failed

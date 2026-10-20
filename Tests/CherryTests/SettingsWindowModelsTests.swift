@@ -146,7 +146,6 @@ private func projectFileContents(_ directory: URL) throws -> String {
         .unknown,
         .doesNotReport,
     ])
-    #expect(brands.map(\.mcpHarness) == [.claude, .codex, .pi, nil, nil, nil])
 }
 
 @Test @MainActor func settingsWindowProjectValueSourcesFollowThisMacAndCherryToml() throws {

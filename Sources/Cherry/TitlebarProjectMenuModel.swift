@@ -49,9 +49,6 @@ enum TitlebarProjectMenuModel {
         case trustDeviceIdentity(UUID)
         /// Update Session Host…: install this Cherry's there.
         case updateDeviceHost(UUID)
-        /// Set Up Cherry MCP on <Mac>…: registers Cherry MCP with the
-        /// agents there, when the user confirms (phase 4b).
-        case setUpDeviceMCP(UUID)
         case renameDevice(UUID)
         case removeDevice(UUID)
         case addMac

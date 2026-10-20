@@ -1,7 +1,6 @@
 import CherryControl
 @testable import CherryMCP
 import Foundation
-import MCP
 import Testing
 
 // The MCP tool catalog (`CherryToolCatalog`, Sources/CherryControl), which
@@ -88,7 +87,7 @@ private let controlToolCatalogFacts: [String: [String]] = [
     "subscribe": [
         "done", "needs_input, permission, error, exited (with exit_code), closed, output_match", "initial: true",
         "one line into your own tab", "you are idle", "never text of the watched processes",
-        "Settings › Agents & MCP › Monitors", "wake field", "Only processes this session may reach",
+        "Settings › Agents › Monitors", "wake field", "Only processes this session may reach",
     ],
     "get_my_task": ["no_assignment", "report_result"],
     "report_result": ["schema_mismatch lists problems in details", "task_cancelled", "bumps version", "At most 400 characters"],
@@ -158,17 +157,6 @@ private let controlToolCatalogClaude = ToolClientProfile(client: ToolClientInfo(
     let catalog = try controlToolCatalogEncodedList(CherryToolCatalog.tools(for: .unknown))
     #expect(catalog == fixture, "the catalog's tools/list differs from Fixtures/mcp-tools-list.json")
     #expect(try CherryToolCatalog.encodedListResult(CherryToolCatalog.tools(for: .unknown)) == fixture)
-}
-
-/// CherryMCP's own list (`CherryMCPTools.all`, the SDK's `Tool`s) encodes
-/// as the catalog does, annotations included.
-@Test func controlToolCatalogSurvivesTheConversionToTheSDKsTools() throws {
-    let catalog = try controlToolCatalogEncodedList(CherryToolCatalog.tools(for: .unknown))
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    #expect(try encoder.encode(ListTools.Result(tools: CherryMCPTools.all)) == catalog)
-    let json = String(decoding: catalog, as: UTF8.self)
-    #expect(json.components(separatedBy: #""annotations":{"#).count - 1 == 53)
 }
 
 @Test func controlToolCatalogSchemasMatchTheFixture() throws {

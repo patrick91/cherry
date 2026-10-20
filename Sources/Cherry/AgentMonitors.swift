@@ -136,7 +136,7 @@ final class WatchedProcess {
 /// The monitors of one control server.
 @MainActor
 final class AgentMonitorRegistry {
-    /// Settings › Agents & MCP › Monitors › Wake idle agents.
+    /// Settings › Agents › Monitors › Wake idle agents.
     nonisolated static let wakeLinesDefaultsKey = "mcp.monitorWakeLines"
     /// Whether wake lines are on while nothing is stored: the registry and
     /// Settings read this one default.
@@ -246,19 +246,15 @@ final class AgentMonitorRegistry {
 
     /// The wake line: the subscription and event counts only, never text a
     /// watched process controls (its name, title or output).
-    static func wakeLine(for subscription: MonitorSubscription, unread: [MonitorEvent], usesCLI: Bool = false) -> String {
+    static func wakeLine(for subscription: MonitorSubscription, unread: [MonitorEvent]) -> String {
         var counts: [MonitorEventType: Int] = [:]
         for event in unread { counts[event.type, default: 0] += 1 }
         let parts = MonitorEventType.allCases.compactMap { type in
             counts[type].map { "\($0) \(type.rawValue)" }
         }
         let noun = unread.count == 1 ? "event" : "events"
-        let ready = "[cherry] Monitor \(subscription.id): \(unread.count) \(noun) ready (\(parts.joined(separator: ", ")))."
-        if usesCLI {
-            // A subscriber started to use the `cherry` CLI.
-            return ready + " Run cherry events \(subscription.id) to read them."
-        }
-        return ready + " Call the cherry wait_for_events tool with subscription_id \"\(subscription.id)\" to read them."
+        return "[cherry] Monitor \(subscription.id): \(unread.count) \(noun) ready (\(parts.joined(separator: ", ")))."
+            + " Run cherry events \(subscription.id) to read them."
     }
 }
 
@@ -881,7 +877,7 @@ extension CherryControlServer {
         // (a run's wake line, a task's nudge or kickoff), and under the
         // tab's typing lock (`typeCherryLine`).
         guard !isTypingWakeLine(into: subscriber), subscriberTakesWakeLine(subscriber, now: now) else { return }
-        let line = AgentMonitorRegistry.wakeLine(for: subscription, unread: unread, usesCLI: subscriber.launchUsesCherryCLI)
+        let line = AgentMonitorRegistry.wakeLine(for: subscription, unread: unread)
         subscription.isWaking = true
         Task { @MainActor [weak self] in
             defer { subscription.isWaking = false }
@@ -917,7 +913,7 @@ extension CherryControlServer {
     @MainActor
     func info(for subscription: MonitorSubscription) -> SubscriptionInfo {
         let reason = subscription.wakeUnavailableReason
-            ?? (monitors.wakeLinesEnabled ? nil : "Wake lines are turned off in Cherry's Settings › Agents & MCP › Monitors; poll with wait_for_events.")
+            ?? (monitors.wakeLinesEnabled ? nil : "Wake lines are turned off in Cherry's Settings › Agents › Monitors; poll with wait_for_events.")
         return SubscriptionInfo(
             subscriptionID: subscription.id,
             subscriberProcessID: subscription.subscriberID,

@@ -7,13 +7,12 @@ import Testing
 
 // The `cherry` CLI on the command line of the agents Cherry starts
 // (AgentCLILaunch, AgentApprovals, CodexLaunchFacts, AgentSkillDirectory;
-// docs/specs/agent-cli.md): which agents get it instead of Cherry MCP, its
-// words, Approvals', Codex's sandbox rules, the skill's files, and the
-// texts Cherry types into a tab started with it. No real CLI runs: the CLIs
+// docs/specs/agent-cli.md): which agents get its flags, their words,
+// Approvals', Codex's sandbox rules, the skill's files, and the texts Cherry
+// types into a tab. No real CLI runs: the CLIs
 // are stand-in scripts, the versions seeded, Codex's home a temporary
 // directory, and every context and UserDefaults the test's own.
 
-private let cliHelperPath = "/Applications/Cherry.app/Contents/MacOS/CherryMCP"
 private let cliSocketPath = "/tmp/cherry-test-501/control.sock"
 
 private func cliTemporaryDirectory(_ name: String) throws -> URL {
@@ -34,7 +33,7 @@ private final class CLILaunchHarness {
     let pi: URL
     let plugin: URL
     let versions: AgentCLIVersions
-    var approvals: [AgentMCPLaunch.CLI: AgentApprovals] = [:]
+    var approvals: [AgentLaunch.CLI: AgentApprovals] = [:]
     var codexFacts: CodexLaunchFacts?
     var skillReady = true
 
@@ -59,21 +58,19 @@ private final class CLILaunchHarness {
         ])
     }
 
-    var context: AgentMCPLaunchContext {
-        AgentMCPLaunchContext(
+    var context: AgentLaunchContext {
+        AgentLaunchContext(
             isEnabled: { true },
             versions: versions,
-            helperPath: cliHelperPath,
-            piExtensionPath: nil,
-            cliPluginDirectory: { [unowned self] in skillReady ? plugin : nil },
+            pluginDirectory: { [unowned self] in skillReady ? plugin : nil },
             controlSocketPath: { cliSocketPath },
             approvals: { [unowned self] in approvals[$0] ?? .configured },
             codexFacts: { [unowned self] in codexFacts }
         )
     }
 
-    func outcome(_ commandLine: String, processID: String = "TAB") -> AgentMCPLaunch.Outcome {
-        context.outcome(commandLine: commandLine, serverName: "cherry", environmentKeys: [], processID: processID)
+    func outcome(_ commandLine: String, processID: String = "TAB") -> AgentLaunch.Outcome {
+        context.outcome(commandLine: commandLine, processID: processID)
     }
 
     func cleanUp() {
@@ -82,7 +79,7 @@ private final class CLILaunchHarness {
 }
 
 private func suffix(_ words: [String]) -> String {
-    AgentMCPLaunch.shellSuffix(words)
+    AgentLaunch.shellSuffix(words)
 }
 
 @Test @MainActor func controlToolLaunchCLIClaudeCodeGetsThePluginItsLineAndTheSocketForItsSandbox() throws {
@@ -91,25 +88,20 @@ private func suffix(_ words: [String]) -> String {
     let line = AgentCLILaunch.instructionLine(processID: "TAB", hasSkill: true)
     let settings = try #require(AgentCLILaunch.claudeSandboxSettings(socketPath: cliSocketPath))
     #expect(settings == #"{"sandbox":{"network":{"allowUnixSockets":["/tmp/cherry-test-501/control.sock"]}}}"#)
-    #expect(harness.outcome(harness.claude.path) == .cli(suffix([
+    #expect(harness.outcome(harness.claude.path) == .appended(suffix([
         "--plugin-dir", harness.plugin.path, "--append-system-prompt", line, "--settings", settings,
     ])))
     // Instructions and settings of its own are kept; the plugin is added.
-    #expect(harness.outcome("\(harness.claude.path) --append-system-prompt mine --settings /x.json") == .cli(suffix([
+    #expect(harness.outcome("\(harness.claude.path) --append-system-prompt mine --settings /x.json") == .appended(suffix([
         "--plugin-dir", harness.plugin.path,
     ])))
     // The line reads the same in every shell's single quotes and in TOML.
     #expect(!line.contains("'") && !line.contains("\"") && !line.contains("\\"))
     #expect(line.contains("CHERRY_PROCESS_ID TAB") && line.contains("cherry skill show"))
 
-    // Without the skill's files it gets Cherry MCP, as before.
+    // Without the skill's files it starts as it is.
     harness.skillReady = false
-    guard case .appended(let mcp) = harness.outcome(harness.claude.path) else {
-        Issue.record("no Cherry MCP without the skill")
-        return
-    }
-    #expect(mcp.contains("'--mcp-config'"))
-    #expect(harness.context.cliInterfaceReason(commandLine: harness.claude.path) == "the cherry skill's files are not ready")
+    #expect(harness.outcome(harness.claude.path) == .skipped("the cherry skill's files are not ready"))
 }
 
 @Test @MainActor func controlToolLaunchCLIPiGetsTheSkillDirectoryAndNoExtension() throws {
@@ -117,56 +109,51 @@ private func suffix(_ words: [String]) -> String {
     defer { harness.cleanUp() }
     let skill = AgentSkillDirectory.skillDirectory(inPlugin: harness.plugin).path
     #expect(FileManager.default.fileExists(atPath: skill + "/SKILL.md"))
-    #expect(harness.outcome("\(harness.pi.path) --model x") == .cli(suffix([
+    #expect(harness.outcome("\(harness.pi.path) --model x") == .appended(suffix([
         "--skill", skill, "--append-system-prompt", AgentCLILaunch.instructionLine(processID: "TAB", hasSkill: true),
     ])))
     // Pi has no automatic review: Approvals adds nothing.
     harness.approvals[.pi] = .autoReview
-    #expect(harness.outcome("\(harness.pi.path) --system-prompt mine") == .cli(suffix(["--skill", skill])))
+    #expect(harness.outcome("\(harness.pi.path) --system-prompt mine") == .appended(suffix(["--skill", skill])))
 }
 
-@Test @MainActor func controlToolLaunchCLICodexGetsItOnlyWhenItCanRunCherry() throws {
+@Test @MainActor func controlToolLaunchCLICodexGetsTheLineUnlessItsConfigSetsInstructions() throws {
     let harness = try CLILaunchHarness()
     defer { harness.cleanUp() }
-    let instructions = "developer_instructions=" + AgentMCPLaunch.tomlString(AgentCLILaunch.instructionLine(processID: "TAB", hasSkill: false))
-    func isMCP(_ outcome: AgentMCPLaunch.Outcome) -> Bool {
-        if case .appended(let words) = outcome { return words.contains("mcp_servers.cherry=") }
-        return false
-    }
+    let instructions = "developer_instructions=" + AgentLaunch.tomlString(AgentCLILaunch.instructionLine(processID: "TAB", hasSkill: false))
 
-    // Its settings not read yet: Cherry MCP, unless the command itself
-    // turns the sandbox off (then without instructions: its config may set
-    // its own).
-    #expect(isMCP(harness.outcome(harness.codex.path)))
-    #expect(harness.outcome("\(harness.codex.path) --dangerously-bypass-approvals-and-sandbox") == .cli(""))
-    #expect(harness.outcome("\(harness.codex.path) -s danger-full-access") == .cli(""))
+    // Its settings not read yet: nothing (its config may set instructions).
+    #expect(harness.outcome(harness.codex.path) == .skipped("nothing to add: the command sets its own instructions"))
 
-    // A sandbox that blocks the socket, no rules, As configured.
+    // Whatever its sandbox: one that blocks the socket asks before each
+    // cherry command runs outside it.
     harness.codexFacts = CodexLaunchFacts(rulesInstalled: false, setsDeveloperInstructions: false)
-    #expect(isMCP(harness.outcome(harness.codex.path)))
-    #expect(harness.context.cliInterfaceReason(commandLine: harness.codex.path)?.contains("can't reach Cherry's socket") == true)
-    #expect(harness.outcome("\(harness.codex.path) --sandbox danger-full-access") == .cli(suffix(["-c", instructions])))
-    #expect(harness.outcome("\(harness.codex.path) -c sandbox_mode=\"danger-full-access\"") == .cli(suffix(["-c", instructions])))
-    #expect(harness.outcome("\(harness.codex.path) -s workspace-write -c sandbox_workspace_write.network_access=true")
-        == .cli(suffix(["-c", instructions])))
-    #expect(isMCP(harness.outcome("\(harness.codex.path) -s workspace-write")))
+    #expect(harness.outcome(harness.codex.path) == .appended(suffix(["-c", instructions])))
+    #expect(harness.outcome("\(harness.codex.path) -s workspace-write") == .appended(suffix(["-c", instructions])))
+    #expect(harness.outcome("\(harness.codex.path) -c developer_instructions=mine")
+        == .skipped("nothing to add: the command sets its own instructions"))
 
-    // A config whose sandbox reaches sockets; a profile is not read.
-    harness.codexFacts?.sandboxReachesSockets = true
-    #expect(harness.outcome(harness.codex.path) == .cli(suffix(["-c", instructions])))
-    #expect(isMCP(harness.outcome("\(harness.codex.path) -p work")))
-    #expect(isMCP(harness.outcome("\(harness.codex.path) -s read-only")))
-
-    // Cherry's rules: allowed cherry commands run outside the sandbox.
+    // A config with instructions of its own keeps them.
     harness.codexFacts = CodexLaunchFacts(rulesInstalled: true, setsDeveloperInstructions: true)
-    #expect(harness.outcome(harness.codex.path) == .cli(""))
+    #expect(harness.outcome(harness.codex.path) == .skipped("nothing to add: the command sets its own instructions"))
 
-    // Auto review: the reviewer decides; added only where the command sets
-    // no approvals of its own.
+    // Auto review: added only where the command sets no approvals of its own.
     harness.codexFacts = CodexLaunchFacts(rulesInstalled: false, setsDeveloperInstructions: false)
     harness.approvals[.codex] = .autoReview
-    #expect(harness.outcome(harness.codex.path) == .cli(suffix(["--approve-for-me", "-c", instructions])))
-    #expect(harness.outcome("\(harness.codex.path) -a never") == .cli(suffix(["-c", instructions])))
+    #expect(harness.outcome(harness.codex.path) == .appended(suffix(["--approve-for-me", "-c", instructions])))
+    #expect(harness.outcome("\(harness.codex.path) -a never") == .appended(suffix(["-c", instructions])))
+
+    // Which sandboxes reach the socket (the settings page says so).
+    let facts = CodexLaunchFacts(rulesInstalled: false, setsDeveloperInstructions: false)
+    #expect(facts.launchReachesSockets(words: ["--sandbox", "danger-full-access"]))
+    #expect(facts.launchReachesSockets(words: ["-c", "sandbox_mode=\"danger-full-access\""]))
+    #expect(facts.launchReachesSockets(words: ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]))
+    #expect(!facts.launchReachesSockets(words: ["-s", "workspace-write"]))
+    var reaching = facts
+    reaching.sandboxReachesSockets = true
+    #expect(reaching.launchReachesSockets(words: []))
+    #expect(!reaching.launchReachesSockets(words: ["-p", "work"]))
+    #expect(!reaching.launchReachesSockets(words: ["-s", "read-only"]))
 }
 
 @Test @MainActor func controlToolLaunchCLIApprovalsGoFirstAndNeverOverACommandsOwnMode() throws {
@@ -174,26 +161,18 @@ private func suffix(_ words: [String]) -> String {
     defer { harness.cleanUp() }
     harness.approvals[.claudeCode] = .autoReview
     let outcome = harness.outcome(harness.claude.path)
-    guard case .cli(let words) = outcome else {
+    guard case .appended(let words) = outcome else {
         Issue.record("\(outcome)")
         return
     }
     #expect(words.hasPrefix(suffix(["--permission-mode", "auto", "--plugin-dir"])))
     for own in ["--dangerously-skip-permissions", "--permission-mode plan", "--allow-dangerously-skip-permissions"] {
-        guard case .cli(let kept) = harness.outcome("\(harness.claude.path) \(own)") else {
+        guard case .appended(let kept) = harness.outcome("\(harness.claude.path) \(own)") else {
             Issue.record("\(own)")
             continue
         }
         #expect(!kept.contains("'--permission-mode' 'auto'"), "\(own)")
     }
-    // With Cherry MCP too, before `--mcp-config` (it takes every word after it).
-    harness.skillReady = false
-    guard case .appended(let mcp) = harness.outcome(harness.claude.path) else {
-        Issue.record("no Cherry MCP")
-        return
-    }
-    #expect(mcp.hasPrefix(suffix(["--permission-mode", "auto", "--mcp-config"])))
-
     #expect(AgentApprovals.setsOwnApprovals(.codex, words: ["-sread-only"]))
     #expect(AgentApprovals.setsOwnApprovals(.codex, words: ["-c", "approval_policy=\"never\""]))
     #expect(!AgentApprovals.setsOwnApprovals(.codex, words: ["--search", "-m", "o3"]))
@@ -257,30 +236,27 @@ private func suffix(_ words: [String]) -> String {
 }
 
 @Test @MainActor func controlToolLaunchCLIWorkerTextsNameTheCherryCommands() {
-    let kickoff = AgentTaskRegistry.kickoffLine(taskID: "task-1", usesCLI: true)
+    let kickoff = AgentTaskRegistry.kickoffLine(taskID: "task-1")
     #expect(kickoff.contains("cherry task mine") && kickoff.contains("cherry task report"))
     #expect(!kickoff.contains("CHERRY_MCP_HELPER") && !kickoff.contains("get_my_task"))
-    #expect(AgentTaskRegistry.kickoffLine(taskID: "task-1") == AgentTaskRegistry.kickoffLine(taskID: "task-1", usesCLI: false))
 
-    let rules = AgentTaskRegistry.workerRules(allowSubagents: true, usesCLI: true).joined(separator: "\n")
+    let rules = AgentTaskRegistry.workerRules(allowSubagents: true).joined(separator: "\n")
     for mcp in ["report_result", "report_progress", "spawn_agent", "CHERRY_MCP_HELPER", "awaiting_approval true"] {
         #expect(!rules.contains(mcp), "\(mcp)")
     }
     #expect(rules.contains("cherry task progress --awaiting-approval") && rules.contains("cherry task report <<'EOF'"))
-    #expect(AgentTaskRegistry.workerRules(allowSubagents: false) == AgentTaskRegistry.workerRules(allowSubagents: false, usesCLI: false))
 
-    #expect(AgentTaskRegistry.nudgeLine(usesCLI: true) == "Please run cherry task report with your result.")
-    #expect(AgentTaskRegistry.nudgeLine(usesCLI: false) == AgentTaskRegistry.nudgeLine)
+    #expect(AgentTaskRegistry.nudgeLine == "Please run cherry task report with your result.")
     var counts = AgentRunCounts()
     counts.total = 2
     counts.reported = 1
     counts.failed = 1
-    let wake = AgentTaskRegistry.wakeLine(runID: "run-1", counts: counts, usesCLI: true)
+    let wake = AgentTaskRegistry.wakeLine(runID: "run-1", counts: counts)
     #expect(wake.contains("cherry task wait run-1") && !wake.contains("wait_for_tasks"))
     var waiting = AgentRunCounts()
     waiting.total = 1
     waiting.awaitingApproval = 1
-    let approval = AgentTaskRegistry.approvalWakeLine(runID: "run-1", counts: waiting, usesCLI: true)
+    let approval = AgentTaskRegistry.approvalWakeLine(runID: "run-1", counts: waiting)
     #expect(approval.contains("cherry task wait run-1") && approval.contains("cherry send"))
 }
 
@@ -288,7 +264,7 @@ private func suffix(_ words: [String]) -> String {
     let harness = try CLILaunchHarness()
     defer { harness.cleanUp() }
     var policy = SessionBackendPolicy.native
-    policy.agentMCPLaunch = harness.context
+    policy.agentLaunch = harness.context
     let workspace = TerminalWorkspace(
         projectRoot: harness.directory.path, createInitialSession: false, launchBackend: .hostManaged, backendPolicy: policy
     )
@@ -296,36 +272,33 @@ private func suffix(_ words: [String]) -> String {
     let claude = workspace.addAgentSession(
         agent: AgentToolDefinition(name: "Claude", command: harness.claude.path), projectRoot: harness.directory.path
     )
-    #expect(claude.launchUsesCherryCLI)
-    #expect(claude.lastAgentLaunchNotCLIReason == nil)
+    #expect(claude.lastAgentLaunchOutcome.map { if case .appended = $0 { true } else { false } } == true)
     #expect(claude.launchStartupCommand?.contains("CHERRY_PROCESS_ID \(claude.id.uuidString)") == true)
     #expect(claude.launchCommand == harness.claude.path)
 
     let codex = workspace.addAgentSession(
         agent: AgentToolDefinition(name: "Codex", command: harness.codex.path), projectRoot: harness.directory.path
     )
-    #expect(!codex.launchUsesCherryCLI)
-    #expect(codex.lastAgentLaunchNotCLIReason == "Codex's settings are not read yet")
+    #expect(codex.lastAgentLaunchOutcome == .skipped("nothing to add: the command sets its own instructions"))
+    #expect(codex.launchStartupCommand == nil)
 }
 
 @Test @MainActor func controlToolLaunchCLISettingsInterfaceLineSaysWhichAndWhy() {
-    func interface(_ cli: AgentMCPLaunch.CLI, _ command: String = "x", connects: Bool = true, skill: Bool = true,
+    func interface(_ cli: AgentLaunch.CLI, _ command: String = "x", connects: Bool = true, skill: Bool = true,
                    approvals: AgentApprovals = .configured, facts: CodexLaunchFacts? = nil) -> AgentSettingsPage.Interface {
         AgentSettingsPage.interface(
             cli: cli, commandLine: command, connectsAtLaunch: connects, skillReady: skill, approvals: approvals, codexFacts: facts
         )
     }
-    #expect(interface(.claudeCode).usesCLI)
+    #expect(interface(.claudeCode).startsWithCLI)
     #expect(interface(.claudeCode).status == "The cherry command")
-    #expect(!interface(.claudeCode, skill: false).usesCLI)
-    #expect(interface(.claudeCode, connects: false).status == "Not connected at launch")
-    #expect(!interface(.codex).usesCLI)
-    #expect(interface(.codex).help.contains("aren't read yet"))
-    #expect(interface(.codex, "codex --dangerously-bypass-approvals-and-sandbox").usesCLI)
-    #expect(interface(.codex, approvals: .autoReview).usesCLI)
-    #expect(interface(.codex, facts: CodexLaunchFacts(rulesInstalled: true, setsDeveloperInstructions: false)).usesCLI)
-    let blocked = interface(.codex, facts: CodexLaunchFacts(rulesInstalled: false, setsDeveloperInstructions: false))
-    #expect(!blocked.usesCLI && blocked.help.contains("can't reach Cherry's socket"))
+    #expect(!interface(.claudeCode, skill: false).startsWithCLI)
+    #expect(interface(.claudeCode, connects: false).status == "Started as it is")
+    #expect(interface(.codex).startsWithCLI)
+    #expect(interface(.codex).help.contains("asks you before each cherry command"))
+    #expect(interface(.codex, "codex --dangerously-bypass-approvals-and-sandbox").help.contains("lets it reach Cherry's socket"))
+    #expect(interface(.codex, approvals: .autoReview).help.contains("reviewer"))
+    #expect(interface(.codex, facts: CodexLaunchFacts(rulesInstalled: true, setsDeveloperInstructions: false)).help.contains("rules"))
     #expect(AgentSettingsPage.launchCLI(of: AgentToolDefinition(name: "Codex", command: "codex")) == .codex)
     #expect(AgentSettingsPage.launchCLI(of: AgentToolDefinition(name: "Amp", command: "amp")) == nil)
 }

@@ -48,7 +48,7 @@ struct RemoteDevice: Codable, Equatable, Identifiable, Sendable {
     /// resources (terminfo, shell integration) next to cherry-host.
     var installedResources = false
     /// Its account's per-user temporary directory (`getconf
-    /// DARWIN_USER_TEMP_DIR`), from the check or the first Cherry MCP
+    /// DARWIN_USER_TEMP_DIR`), from the check or the first control socket
     /// forward: where the forwarded control socket goes (phase 4b).
     var userTemporaryDirectory: String? = nil
     /// The colour its windows show it in (Settings › Macs); nil:
@@ -154,7 +154,7 @@ final class RemoteDeviceStore: ObservableObject {
         // and reads nothing unless the test gives it its fake Mac's.
         markBuild: RemoteDeviceStore.markBuildOverSSH,
         captureLoginEnvironment: RemoteDeviceStore.captureLoginEnvironmentOverSSH,
-        connectsAgentsAtLaunch: { AgentMCPLaunch.isEnabled() }
+        connectsAgentsAtLaunch: { AgentLaunch.isEnabled() }
     )
 
     /// Makes a device's hosting: its profile, and this installation's id
@@ -201,9 +201,10 @@ final class RemoteDeviceStore: ObservableObject {
     /// ends on purpose, and those its host reports lost, there, and
     /// finishes the ends it could not do while its device was offline.
     var endedSessionsStore: WorkspaceStateStore?
-    /// Whether the devices' agents get Cherry MCP on their command line
-    /// (`RemoteAgentMCPLaunch`), asked at each launch. The app's store
-    /// follows Settings › Agents & MCP › Connect agents Cherry starts; a
+    /// Whether the devices' agents get the `cherry` CLI's flags on their
+    /// command line
+    /// (`RemoteAgentLaunch`), asked at each launch. The app's store
+    /// follows Settings › Agents › Connect agents Cherry starts; a
     /// test's says no unless the test says otherwise, so no test's command
     /// line changes.
     private let connectsAgentsAtLaunch: @MainActor () -> Bool
@@ -450,8 +451,8 @@ final class RemoteDeviceStore: ObservableObject {
     }
 
     /// What a launch of the device's tabs needs (`RemoteLaunchSpec.Device`),
-    /// with Cherry MCP's forwarded socket and tokens (phase 4b), and whether
-    /// its agents get Cherry MCP on their command line.
+    /// with the forwarded control socket and tokens (phase 4b), and whether
+    /// its agents get the `cherry` CLI's flags on their command line.
     func launchDevice(id: UUID) -> RemoteLaunchSpec.Device? {
         guard let device = device(id: id) else { return nil }
         var launch = device.launchDevice
@@ -461,7 +462,7 @@ final class RemoteDeviceStore: ObservableObject {
         }
         // The socket goes in the account's per-user temporary directory
         // there: known from the check or the first forward; until then its
-        // tabs have no Cherry MCP (never a path in the shared /tmp).
+        // tabs have no forwarded socket (never a path in the shared /tmp).
         if let installation = installationID(),
            let socket = RemoteMCPPaths.remoteSocket(
                temporaryDirectory: device.userTemporaryDirectory, installationID: installation, deviceID: id
@@ -474,9 +475,6 @@ final class RemoteDeviceStore: ObservableObject {
                     : nil,
                 cliPath: device.installedResources
                     ? RemoteMCPPaths.cliPath(remoteHostPath: device.remoteHostPath, homeDirectory: device.homeDirectory)
-                    : nil,
-                piExtensionPath: device.installedResources
-                    ? RemoteMCPPaths.piExtensionPath(remoteHostPath: device.remoteHostPath, homeDirectory: device.homeDirectory)
                     : nil,
                 serverName: CherryAppIdentity.current.urlScheme,
                 controlMachine: RemoteMCPLaunch.thisMacName,

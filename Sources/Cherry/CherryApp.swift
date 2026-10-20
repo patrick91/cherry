@@ -1132,9 +1132,9 @@ struct CherryApp: App {
                     // back (off this thread) before any request is handled.
                     server.configureTaskPersistence(store: .shared, hostings: .shared, stateStore: .shared)
                     server.start()
-                    // The run's agents find their CLIs' versions for Cherry
-                    // MCP on their command line (`AgentMCPLaunch`).
-                    SessionBackendPolicy.userSettings.agentMCPLaunch?.warmUp(agents: AgentSettings.shared.agents)
+                    // The run's agents find their CLIs' versions for Cherry's
+                    // flags on their command line (`AgentLaunch`).
+                    SessionBackendPolicy.userSettings.agentLaunch?.warmUp(agents: AgentSettings.shared.agents)
                     controlServer = server
                     // Devices' forwards reach its listeners (phase 4b).
                     RemoteMCPForwards.appServer = server

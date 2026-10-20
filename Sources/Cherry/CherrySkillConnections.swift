@@ -81,11 +81,14 @@ enum CherrySkillConnection {
     static let confirmationLead = "Cherry writes these files and changes nothing else. `cherry skill remove` removes them."
 }
 
-/// The skill's state for the app's life (`MCPRegistrations.skills`), shared
-/// by the sheet and the agents' pages. A model made without an installer
-/// (the default, tests) reads and writes nothing.
+/// The skill's state for the app's life (`shared`), shared by the sheet and
+/// the agents' pages. A model made without an installer (the default,
+/// tests) reads and writes nothing.
 @MainActor
 final class CherrySkillsModel: ObservableObject {
+    /// The account's, for the app's life.
+    static let shared = CherrySkillsModel.live()
+
     @Published private(set) var items: [CherrySkillItem] = []
     @Published private(set) var isRunning = false
     @Published private(set) var message: String?

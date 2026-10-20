@@ -1,7 +1,6 @@
 import CherryControl
 @testable import CherryMCP
 import Foundation
-import MCP
 import Testing
 @testable import Cherry
 
@@ -298,10 +297,7 @@ private func typed(_ harness: PersistentHarness) -> [String] {
         arguments: ["process_id": .string(agent.id.uuidString), "require_new_output": .bool(false), "timeout_ms": .int(3_000)]
     )
     #expect(idle.isError != true)
-    let idleText = idle.content.compactMap { content -> String? in
-        if case .text(let text, _, _) = content { return text }
-        return nil
-    }.joined()
+    let idleText = idle.text
     #expect(idleText.contains("permission"), Comment(rawValue: idleText))
 
     let sent = await CherryMCPTools.call(
@@ -309,10 +305,7 @@ private func typed(_ harness: PersistentHarness) -> [String] {
         arguments: ["process_id": .string(agent.id.uuidString), "message": .string("carry on"), "timeout_ms": .int(2_000)]
     )
     #expect(sent.isError == true)
-    let sentText = sent.content.compactMap { content -> String? in
-        if case .text(let text, _, _) = content { return text }
-        return nil
-    }.joined()
+    let sentText = sent.text
     #expect(sentText.contains("agent_awaiting_permission"), Comment(rawValue: sentText))
     try await Task.sleep(for: .milliseconds(1_000))
     #expect(typed(harness).isEmpty)

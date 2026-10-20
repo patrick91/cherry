@@ -874,6 +874,14 @@ Deviations from the plan below:
 
 ## Phase 4b as built
 
+> **2026-10-20:** Cherry MCP is gone (docs/specs/agent-cli.md, phase 6).
+> What follows about the stdio server, launch-time `--mcp-config`, the Pi
+> extension in the install and Set Up Cherry MCP on <Mac>… is history:
+> device agents now get the `cherry` CLI's flags, gated the same way
+> (`RemoteAgentLaunch`, docs/cli.md › Agents On Another Mac), and the
+> install carries CherryMCP (which `cherry` runs) but no Pi extension. The
+> forward, the tokens and every bound below are unchanged.
+
 Cherry MCP for agents running in a device's tabs (Claude Code, Codex): the
 same tools as a local agent in that window, but bounded to that Mac: a
 caller on device D reaches only sessions, windows and projects whose
@@ -1064,7 +1072,7 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
   (the launcher stays: another Cherry may use it). The server's name is
   the identity's URL scheme (`cherry`).
 - **Later: the app runs the tools, and agents Cherry starts need no Set
-  Up** (docs/mcp.md › Versions, Agents On Another Mac). A device install's
+  Up** (docs/cli.md › Versions, Agents On Another Mac). A device install's
   CherryMCP from control protocol 2 on is a pipe: its `tools/list` is the
   app's `listTools` and each call one `callTool`, sent in the envelope
   through the same listener. The app runs the tool layer with the token's

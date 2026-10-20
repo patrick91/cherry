@@ -448,21 +448,20 @@ private func session(
     // Each Mac's actions, as it answers now.
     #expect(macs[1].actions.map(\.title) == [
         "Open Home Folder", "Add Project on Studio…", "New Terminal on Studio",
-        "Persistent Sessions on Studio…", "Set Up Cherry MCP on Studio…", "Rename…", "Remove…",
+        "Persistent Sessions on Studio…", "Rename…", "Remove…",
     ])
     #expect(macs[1].actions.map(\.command) == [
         .switcher(.openDeviceHome(studioID)),
         .browseFolders(on: .device(studioID), intent: .add),
         .newTerminal(on: .device(studioID)),
         .switcher(.openDeviceSessions(studioID)),
-        .switcher(.setUpDeviceMCP(studioID)),
         .switcher(.renameDevice(studioID)),
         .switcher(.removeDevice(studioID)),
     ])
     // Its home is not known yet: no Open Home Folder.
     #expect(macs[2].actions.map(\.title) == [
         "Add Project on Mini…", "New Terminal on Mini", "Reconnect",
-        "Persistent Sessions on Mini…", "Set Up Cherry MCP on Mini…", "Rename…", "Remove…",
+        "Persistent Sessions on Mini…", "Rename…", "Remove…",
     ])
     // Another identity answers: nothing to open there.
     #expect(macs[3].actions.map(\.title) == ["Trust New Identity…", "Persistent Sessions on Laptop…", "Rename…", "Remove…"])
@@ -806,7 +805,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     #expect(connected.primary == .drill(.mac(.device(studioID), name: "Studio")))
     #expect(connected.actions.map(\.title) == [
         "Open Home Folder", "Add Project on Studio…", "New Terminal on Studio",
-        "Persistent Sessions on Studio…", "Set Up Cherry MCP on Studio…",
+        "Persistent Sessions on Studio…",
         "End Background Sessions…", "Rename…", "Remove…",
     ])
     #expect(connected.actions[2].command == .newTerminal(on: .device(studioID)))

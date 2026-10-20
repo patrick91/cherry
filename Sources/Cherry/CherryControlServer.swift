@@ -555,31 +555,41 @@ final class CherryControlServer: @unchecked Sendable {
                 // point), however it was mapped.
                 return try await Self.$remoteDevice.withValue(caller.deviceID) {
                     try await Self.$remoteCallerSessionID.withValue(caller.session.id) {
-                        guard case .callTool(let call) = request else {
-                            return try await handle(request, remoteCaller: caller)
-                        }
                         // Each of a tool's requests is checked as when each
                         // was a connection of its own: the token again (a tab
                         // closed meanwhile is refused the rest), then the
                         // device's choke point.
-                        return .init(result: .callTool(await handleToolCall(call) { request in
+                        let dispatch: @Sendable @MainActor (CherryControlRequest) async throws -> CherryControlResponse = { request in
                             let caller = try self.remoteCaller(credentials, origin: origin)
                             return try await self.handle(request, remoteCaller: caller)
-                        }))
+                        }
+                        switch request {
+                        case .callTool(let call):
+                            return .init(result: .callTool(await handleToolCall(call, dispatch: dispatch)))
+                        case .runCommand(let command):
+                            return .init(result: .runCommand(await handleCommand(command, dispatch: dispatch)))
+                        default:
+                            return try await handle(request, remoteCaller: caller)
+                        }
                     }
                 }
             }
             guard origin == .thisMac else { throw Self.missingDeviceToken }
             return try await Self.$callerProcessChain.withValue(callerChain) {
                 try await Self.$callerPeerPID.withValue(callerChain?.pids.first) {
-                    guard case .callTool(let call) = request else {
-                        return try await handle(request, callerChain: callerChain)
-                    }
                     // Each of a tool's requests goes where the caller's own
                     // typed request would: to its window, found from its process.
-                    return .init(result: .callTool(await handleToolCall(call) { request in
+                    let dispatch: @Sendable @MainActor (CherryControlRequest) async throws -> CherryControlResponse = { request in
                         try await self.handle(request, callerChain: callerChain)
-                    }))
+                    }
+                    switch request {
+                    case .callTool(let call):
+                        return .init(result: .callTool(await handleToolCall(call, dispatch: dispatch)))
+                    case .runCommand(let command):
+                        return .init(result: .runCommand(await handleCommand(command, dispatch: dispatch)))
+                    default:
+                        return try await handle(request, callerChain: callerChain)
+                    }
                 }
             }
         } catch let error as CherryControlError {
@@ -1283,7 +1293,7 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .clearOutput(.init(
                 terminalID: session.id.uuidString, cleared: kept == nil, hostKeptHistory: kept
             )))
-        case .appInfo, .listTools, .callTool:
+        case .appInfo, .listTools, .callTool, .runCommand:
             // `handleRequestData` answers these before any window is
             // resolved: here they could only come nested in a scoped request.
             throw CherryControlError(

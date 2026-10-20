@@ -183,6 +183,90 @@ public struct CherrySkillFile: Equatable, Sendable {
     public var contents: String
 }
 
+/// What is at a path, as `lstat` says (a link is never followed).
+public enum CherrySkillEntry: String, Codable, Sendable {
+    case none
+    case link
+    case directory
+    case file
+}
+
+/// The file system the skill's files are on: This Mac's
+/// (`LocalSkillFiles`), or that of the Mac whose `cherry` asked
+/// (`cherry skill setup` in a `runCommand`, which reads and writes through
+/// it). `begin` marks the steps of one target's write or removal: when one
+/// fails, the target's later steps are not taken.
+public protocol CherrySkillFiles: Sendable {
+    /// What is at `path`, links not followed.
+    func entry(_ path: String) -> CherrySkillEntry
+    /// Whether `path` is a directory, links followed.
+    func isDirectory(_ path: String) -> Bool
+    /// Whether anything is at `path`, links followed.
+    func exists(_ path: String) -> Bool
+    /// Whether `path` is an executable file, links followed.
+    func isExecutable(_ path: String) -> Bool
+    func contents(_ path: String) -> Data?
+    /// A directory's names, nil when it cannot be listed.
+    func list(_ path: String) -> [String]?
+    func begin(_ target: CherrySkillTarget)
+    /// Creates `path` and the directories above it.
+    func createDirectory(_ path: String) throws
+    /// Replaces `path` with `text` atomically (a link there is replaced, never written through).
+    func write(_ text: String, to path: String) throws
+    /// Removes a file, a link or an empty directory.
+    func remove(_ path: String) throws
+}
+
+/// This Mac's file system.
+public struct LocalSkillFiles: CherrySkillFiles {
+    public init() {}
+
+    public func entry(_ path: String) -> CherrySkillEntry {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return .none }
+        switch info.st_mode & S_IFMT {
+        case S_IFLNK: return .link
+        case S_IFDIR: return .directory
+        default: return .file
+        }
+    }
+
+    public func isDirectory(_ path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
+
+    public func exists(_ path: String) -> Bool {
+        FileManager.default.fileExists(atPath: path)
+    }
+
+    public func isExecutable(_ path: String) -> Bool {
+        FileManager.default.isExecutableFile(atPath: path)
+    }
+
+    public func contents(_ path: String) -> Data? {
+        FileManager.default.contents(atPath: path)
+    }
+
+    public func list(_ path: String) -> [String]? {
+        try? FileManager.default.contentsOfDirectory(atPath: path)
+    }
+
+    public func begin(_ target: CherrySkillTarget) {}
+
+    public func createDirectory(_ path: String) throws {
+        try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+    }
+
+    public func write(_ text: String, to path: String) throws {
+        try Data(text.utf8).write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+
+    public func remove(_ path: String) throws {
+        try FileManager.default.removeItem(atPath: path)
+    }
+}
+
 /// Where the agents' folders are and which agents are here.
 public struct CherrySkillEnvironment: Sendable {
     public var home: URL
@@ -192,16 +276,20 @@ public struct CherrySkillEnvironment: Sendable {
     public var projectRoot: URL?
     /// Whether an executable of this name is on PATH.
     public var isOnPath: @Sendable (String) -> Bool
+    /// Where the files are.
+    public var files: any CherrySkillFiles
 
     public init(
         home: URL,
         variables: [String: String],
         projectRoot: URL? = nil,
+        files: any CherrySkillFiles = LocalSkillFiles(),
         isOnPath: @escaping @Sendable (String) -> Bool
     ) {
         self.home = home
         self.variables = variables
         self.projectRoot = projectRoot
+        self.files = files
         self.isOnPath = isOnPath
     }
 
@@ -211,26 +299,37 @@ public struct CherrySkillEnvironment: Sendable {
         let variables = ProcessInfo.processInfo.environment
         let home = variables["HOME"].flatMap { $0.hasPrefix("/") ? URL(fileURLWithPath: $0) : nil }
             ?? FileManager.default.homeDirectoryForCurrentUser
+        return caller(home: home, variables: variables, projectRoot: projectRoot, files: LocalSkillFiles())
+    }
+
+    /// A process's with `variables` (its PATH) at `home`, its files on
+    /// `files`.
+    public static func caller(
+        home: URL,
+        variables: [String: String],
+        projectRoot: URL? = nil,
+        files: any CherrySkillFiles
+    ) -> CherrySkillEnvironment {
         let path = variables["PATH"] ?? ""
-        return CherrySkillEnvironment(home: home, variables: variables, projectRoot: projectRoot) { name in
-            searchPath(path, contains: name)
+        return CherrySkillEnvironment(home: home, variables: variables, projectRoot: projectRoot, files: files) { name in
+            searchPath(path, contains: name, files: files)
         }
     }
 
     /// Whether a directory of `path` (colon-separated) has an executable
     /// `name`.
-    public static func searchPath(_ path: String, contains name: String) -> Bool {
+    public static func searchPath(_ path: String, contains name: String, files: any CherrySkillFiles = LocalSkillFiles()) -> Bool {
         path.split(separator: ":").contains { directory in
-            FileManager.default.isExecutableFile(atPath: URL(fileURLWithPath: String(directory)).appendingPathComponent(name).path)
+            files.isExecutable(URL(fileURLWithPath: String(directory)).appendingPathComponent(name).path)
         }
     }
 
     /// The repository `directory` is in (the nearest folder up with a
     /// `.git`), else `directory`.
-    public static func projectRoot(from directory: URL) -> URL {
+    public static func projectRoot(from directory: URL, files: any CherrySkillFiles = LocalSkillFiles()) -> URL {
         var candidate = directory.standardizedFileURL
         while true {
-            if FileManager.default.fileExists(atPath: candidate.appendingPathComponent(".git").path) {
+            if files.exists(candidate.appendingPathComponent(".git").path) {
                 return candidate
             }
             let parent = candidate.deletingLastPathComponent()
@@ -266,11 +365,7 @@ public struct CherrySkillEnvironment: Sendable {
         case .opencode: configDirectory.appendingPathComponent("opencode")
         case .amp: configDirectory.appendingPathComponent("amp")
         }
-        var isDirectory: ObjCBool = false
-        if FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue {
-            return true
-        }
-        return isOnPath(agent.executableName)
+        return files.isDirectory(folder.path) || isOnPath(agent.executableName)
     }
 }
 
@@ -373,25 +468,14 @@ public struct CherrySkillInstaller: Sendable {
         }
     }
 
-    enum Entry {
-        case none
-        case link
-        case directory
-        case file
-    }
+    var files: any CherrySkillFiles { environment.files }
 
-    static func entry(at url: URL) -> Entry {
-        var info = stat()
-        guard lstat(url.path, &info) == 0 else { return .none }
-        switch info.st_mode & S_IFMT {
-        case S_IFLNK: return .link
-        case S_IFDIR: return .directory
-        default: return .file
-        }
+    func entry(at url: URL) -> CherrySkillEntry {
+        files.entry(url.path)
     }
 
     func skillStatus(at folder: URL) -> (CherrySkillStatus, String?) {
-        switch Self.entry(at: folder) {
+        switch entry(at: folder) {
         case .none: return (.missing, nil)
         case .link: return (.unreadable, "\(folder.path) is a link")
         case .file: return (.unreadable, "\(folder.path) is a file, not a folder")
@@ -399,20 +483,20 @@ public struct CherrySkillInstaller: Sendable {
         }
         let skill = folder.appendingPathComponent("SKILL.md")
         let marker = folder.appendingPathComponent(CherrySkill.markerFileName)
-        for url in [skill, marker] where Self.entry(at: url) == .link {
+        for url in [skill, marker] where entry(at: url) == .link {
             return (.unreadable, "\(url.path) is a link")
         }
-        let hasMarker = Self.entry(at: marker) == .file
-        guard Self.entry(at: skill) == .file else {
+        let hasMarker = entry(at: marker) == .file
+        guard entry(at: skill) == .file else {
             if hasMarker { return (.outdated, "SKILL.md is missing") }
-            let contents = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+            let contents = files.list(folder.path) ?? []
             return contents.isEmpty ? (.missing, nil) : (.foreign, "a cherry folder Cherry didn't write")
         }
-        guard let data = FileManager.default.contents(atPath: skill.path) else {
+        guard let data = files.contents(skill.path) else {
             return (.unreadable, "can't read \(skill.path)")
         }
         let text = String(decoding: data, as: UTF8.self)
-        guard hasMarker, let markerData = FileManager.default.contents(atPath: marker.path),
+        guard hasMarker, let markerData = files.contents(marker.path),
               let object = try? JSONSerialization.jsonObject(with: markerData) as? [String: Any],
               object["by"] as? String == "Cherry", let hash = object["sha256"] as? String
         else { return (.foreign, "a cherry skill Cherry didn't write") }
@@ -421,13 +505,13 @@ public struct CherrySkillInstaller: Sendable {
     }
 
     func rulesStatus(at file: URL) -> (CherrySkillStatus, String?) {
-        switch Self.entry(at: file) {
+        switch entry(at: file) {
         case .none: return (.missing, nil)
         case .link: return (.unreadable, "\(file.path) is a link")
         case .directory: return (.unreadable, "\(file.path) is a folder")
         case .file: break
         }
-        guard let data = FileManager.default.contents(atPath: file.path) else {
+        guard let data = files.contents(file.path) else {
             return (.unreadable, "can't read \(file.path)")
         }
         let text = String(decoding: data, as: UTF8.self)
@@ -494,22 +578,22 @@ public struct CherrySkillInstaller: Sendable {
 
     func write(_ target: CherrySkillTarget) throws {
         let url = try location(of: target).get()
-        let manager = FileManager.default
+        files.begin(target)
         if target == .codexRules {
-            try manager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            guard Self.entry(at: url) != .link else { throw CherrySkillProblem("\(url.path) is a link") }
-            try Data(rulesText.utf8).write(to: url, options: .atomic)
+            try files.createDirectory(url.deletingLastPathComponent().path)
+            guard entry(at: url) != .link else { throw CherrySkillProblem("\(url.path) is a link") }
+            try files.write(rulesText, to: url.path)
             return
         }
-        guard Self.entry(at: url) != .link else { throw CherrySkillProblem("\(url.path) is a link") }
-        try manager.createDirectory(at: url, withIntermediateDirectories: true)
+        guard entry(at: url) != .link else { throw CherrySkillProblem("\(url.path) is a link") }
+        try files.createDirectory(url.path)
         let skill = url.appendingPathComponent("SKILL.md")
         let marker = url.appendingPathComponent(CherrySkill.markerFileName)
-        for file in [skill, marker] where Self.entry(at: file) == .link {
+        for file in [skill, marker] where entry(at: file) == .link {
             throw CherrySkillProblem("\(file.path) is a link")
         }
-        try Data(skillFileText.utf8).write(to: skill, options: .atomic)
-        try Data(Self.markerText(for: skillFileText).utf8).write(to: marker, options: .atomic)
+        try files.write(skillFileText, to: skill.path)
+        try files.write(Self.markerText(for: skillFileText), to: marker.path)
     }
 
     // MARK: Remove
@@ -552,17 +636,23 @@ public struct CherrySkillInstaller: Sendable {
     }
 
     func delete(_ target: CherrySkillTarget, at url: URL) throws {
-        let manager = FileManager.default
+        files.begin(target)
         if target == .codexRules {
-            try manager.removeItem(at: url)
+            try files.remove(url.path)
             return
         }
+        // What the folder holds besides Cherry's two files, read before
+        // they go (a folder that cannot be listed stays).
+        var left = files.list(url.path).map(Set.init)
         for name in ["SKILL.md", CherrySkill.markerFileName] {
             let file = url.appendingPathComponent(name)
-            if Self.entry(at: file) != .none { try manager.removeItem(at: file) }
+            if entry(at: file) != .none {
+                try files.remove(file.path)
+                left?.remove(name)
+            }
         }
-        if (try? manager.contentsOfDirectory(atPath: url.path))?.isEmpty == true {
-            try manager.removeItem(at: url)
+        if left?.isEmpty == true {
+            try files.remove(url.path)
         }
     }
 }

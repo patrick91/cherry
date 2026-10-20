@@ -1,21 +1,12 @@
-// Temporary keyboard diagnostics; remove once the Shift+Enter/Shift+Tab report is understood.
-//
-// Help › Keyboard Diagnostics…: the Ghostty config files Ghostty and Cherry
-// read, the keyboard lines Cherry applies to its terminals, this Mac's
-// version and input source, the TERM a new tab gets, what Cherry knows of
-// the front tab's and the key test tab's keyboard, and a key test tab
-// (`CherryMCP --key-echo`) whose log this window reads. Copy Report puts it
-// all on the pasteboard as text.
-//
-// Settings › Terminal's Ghostty config section and its Copy Report
-// (GhosttyConfigSettings.swift) use the same parts (`configFiles`, `masked`,
-// `Tab`, `newTabEnvironment`, `inputSourceID`, `Report`): they stay when the
-// window goes.
+// Keyboard diagnostics for Settings › Terminal's Ghostty config section and
+// its Copy Report (GhosttyConfigSettings.swift): the Ghostty config files
+// Ghostty and Cherry read, the keyboard lines Cherry applies to its
+// terminals, this Mac's version and input source, the TERM a new tab gets
+// and what Cherry knows of the front tab's keyboard.
 
 import AppKit
 import Carbon.HIToolbox
 import CherryControl
-import SwiftUI
 
 enum KeyboardDiagnostics {
     struct ConfigFile: Equatable {
@@ -143,79 +134,6 @@ enum KeyboardDiagnostics {
         return result
     }
 
-    // MARK: Key test
-
-    /// Where the key test tab's `--key-echo` logs.
-    static var keyLogURL: URL {
-        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches", isDirectory: true)
-        return caches
-            .appendingPathComponent(CherryAppIdentity.current.applicationSupportName, isDirectory: true)
-            .appendingPathComponent("Keyboard Diagnostics", isDirectory: true)
-            .appendingPathComponent("key-echo.jsonl", isDirectory: false)
-    }
-
-    /// What the key test tab's shell runs.
-    nonisolated static func keyTestCommand(helper: String, log: String) -> String {
-        "\(RemoteDeviceProbe.singleQuoted(helper)) --key-echo --log \(RemoteDeviceProbe.singleQuoted(log))"
-    }
-
-    /// One line of `--key-echo`'s log (CherryMCP's `KeyEchoLogRecord`).
-    struct KeyLogRecord: Decodable, Equatable {
-        var event: String
-        var time: String
-        var mode: String
-        var hex: String?
-        var escaped: String?
-        var name: String?
-        var term: String?
-        var termProgram: String?
-        var termProgramVersion: String?
-        var place: String?
-        var before: String?
-
-        enum CodingKeys: String, CodingKey {
-            case event, time, mode, hex, escaped, name, term, place, before
-            case termProgram = "term_program"
-            case termProgramVersion = "term_program_version"
-        }
-
-        /// A run's start separates it from the runs before it, with where it
-        /// ran and the terminal variables it got.
-        var line: String {
-            switch event {
-            case "start":
-                let variables = terminalVariables(
-                    ["TERM": term, "TERM_PROGRAM": termProgram, "TERM_PROGRAM_VERSION": termProgramVersion].compactMapValues(\.self)
-                )
-                return "── run \(time) in \(place ?? "an unknown terminal") · \(variables) · before any change: \(before ?? "not asked")"
-            case "mode":
-                return "── mode \(mode): wrote \(escaped ?? "")"
-            default:
-                return "[\(mode)] \(name ?? "?")   \(escaped ?? "")   \(hex ?? "")"
-            }
-        }
-    }
-
-    /// The log's last `limit` records, runs and mode switches included.
-    nonisolated static func keyLog(_ text: String, limit: Int = 60) -> [KeyLogRecord] {
-        let decoder = JSONDecoder()
-        let records = text.split(whereSeparator: \.isNewline).compactMap {
-            try? decoder.decode(KeyLogRecord.self, from: Data($0.utf8))
-        }
-        return Array(records.suffix(limit))
-    }
-
-    /// The log's last 256 KiB.
-    nonisolated static func readKeyLog(at url: URL) -> [KeyLogRecord] {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        try? handle.seek(toOffset: size > 262_144 ? size - 262_144 : 0)
-        let data = (try? handle.readToEnd()) ?? Data()
-        return keyLog(String(decoding: data, as: UTF8.self))
-    }
-
     // MARK: Tabs
 
     /// What Cherry knows of a tab's keyboard: where its program runs,
@@ -340,8 +258,7 @@ enum KeyboardDiagnostics {
             for: configuration,
             shellIntegration: nil,
             inheritedEnvironment: processEnvironment,
-            terminfoDirectories: ShellProcessController.preferredTerminfo.additionalDirs,
-            mcpHelperPath: nil
+            terminfoDirectories: ShellProcessController.preferredTerminfo.additionalDirs
         )
         environment.merge(cherry.environment) { _, cherry in cherry }
         return environment
@@ -374,11 +291,6 @@ enum KeyboardDiagnostics {
         var appliedKeyboardLines: [String] = []
         /// The selected tab of the front project window on This Mac.
         var frontTab: Tab?
-        /// Whether `text` has the key test's parts: Settings › Terminal's
-        /// Copy Report has no key test (`GhosttyConfigReport`).
-        var includesKeyTest = true
-        var keyTestTab: Tab?
-        var keyLog: [KeyLogRecord] = []
 
         func shortened(_ path: String) -> String {
             guard !homeDirectory.isEmpty, path.hasPrefix(homeDirectory + "/") else { return path }
@@ -392,13 +304,7 @@ enum KeyboardDiagnostics {
 
         var frontTabLines: [String] {
             guard let frontTab else { return ["Front tab: no project window on This Mac"] }
-            if frontTab.id == keyTestTab?.id { return ["Front tab: the key test tab"] }
             return ["Front tab: " + frontTab.lines[0]] + frontTab.lines.dropFirst()
-        }
-
-        var keyTestTabLines: [String] {
-            guard let keyTestTab else { return ["Key test tab: none open"] }
-            return ["Key test tab: " + keyTestTab.lines[0]] + keyTestTab.lines.dropFirst()
         }
 
         var text: String {
@@ -424,277 +330,7 @@ enum KeyboardDiagnostics {
             lines += appliedKeyboardLines.map { "  \($0)" }
             lines.append("")
             lines += frontTabLines
-            if includesKeyTest {
-                lines += keyTestTabLines
-                lines.append("Key test log:")
-                lines += keyLog.isEmpty ? ["  No keys yet."] : keyLog.map { "  \($0.line)" }
-            }
             return lines.joined(separator: "\n") + "\n"
         }
-    }
-}
-
-/// The Keyboard Diagnostics window's state.
-@MainActor
-final class KeyboardDiagnosticsModel: ObservableObject {
-    @Published private(set) var report = KeyboardDiagnostics.Report()
-    @Published private(set) var message: String?
-    let keyLogURL: URL
-    /// The latest key test tab, followed across the window's closes.
-    private static weak var keyTestSession: TerminalSession?
-    private static var keyTestProject = ""
-
-    init(keyLogURL: URL = KeyboardDiagnostics.keyLogURL) {
-        self.keyLogURL = keyLogURL
-        refresh()
-    }
-
-    /// Everything but the new tabs' TERM (`refreshTerminalEnvironments`),
-    /// the tabs and the key log (`refreshLive`).
-    func refresh() {
-        var report = report
-        GhosttyConfigReport.fill(&report, from: .app())
-        self.report = report
-    }
-
-    func refreshTerminalEnvironments() async {
-        var resources: GhosttyStagedResources?
-        if report.persistentSessions { resources = try? await GhosttyResourceStager.shared.resolve() }
-        var report = report
-        GhosttyConfigReport.fillNewTabs(&report, resources: resources, environment: ProcessInfo.processInfo.environment)
-        self.report = report
-    }
-
-    /// The key log, the front tab and the key test tab, as they are now.
-    func refreshLive() async {
-        let url = keyLogURL
-        let log = await Task.detached { KeyboardDiagnostics.readKeyLog(at: url) }.value
-        var report = report
-        report.keyLog = log
-        if let workspace = ProjectWindowRegistry.shared.frontmostLocalWorkspace(), let session = workspace.selectedSession {
-            report.frontTab = KeyboardDiagnostics.tab(session, project: KeyboardDiagnostics.projectName(workspace))
-        } else {
-            report.frontTab = nil
-        }
-        report.keyTestTab = Self.keyTestSession.map { KeyboardDiagnostics.tab($0, project: Self.keyTestProject) }
-        if report != self.report { self.report = report }
-    }
-
-    /// A terminal tab in the front project window on This Mac whose shell
-    /// runs `CherryMCP --key-echo`, opened as any new tab is (persistent
-    /// when This Mac's tabs are).
-    func openKeyTestTab() {
-        guard let command = keyTestCommand() else { return }
-        guard let workspace = ProjectWindowRegistry.shared.frontmostLocalWorkspace() else {
-            message = "Open a project window on This Mac first."
-            return
-        }
-        let tab = workspace.addSession(title: "Key Test", command: command)
-        Self.keyTestSession = tab
-        Self.keyTestProject = KeyboardDiagnostics.projectName(workspace)
-        report.keyTestTab = KeyboardDiagnostics.tab(tab, project: Self.keyTestProject)
-        message = "Opened “Key Test” in \(Self.keyTestProject). Press keys there; they show here."
-        // The window that shows `workspace`, never another window of its project.
-        ProjectWindowRegistry.shared.chromeState(for: workspace)?.selectTerminal()
-        ProjectWindowRegistry.shared.focus(workspace: workspace)
-    }
-
-    /// The key test's command, to run in Ghostty or another terminal and
-    /// compare: its keys show here too.
-    func copyKeyTestCommand() {
-        guard let command = keyTestCommand() else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(command, forType: .string)
-        message = "Copied the key test command. Run it in Ghostty to compare; its keys show here too."
-    }
-
-    private func keyTestCommand() -> String? {
-        guard let helper = ShellProcessController.appMCPHelperPath else {
-            message = "This copy of Cherry has no CherryMCP next to its executable."
-            return nil
-        }
-        try? FileManager.default.createDirectory(
-            at: keyLogURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        return KeyboardDiagnostics.keyTestCommand(helper: helper, log: keyLogURL.path)
-    }
-
-    func copyReport() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(report.text, forType: .string)
-        message = "Copied the report."
-    }
-}
-
-struct KeyboardDiagnosticsView: View {
-    @ObservedObject var model: KeyboardDiagnosticsModel
-
-    var body: some View {
-        let report = model.report
-        VStack(alignment: .leading, spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("Temporary: what Cherry does with Shift+Enter, Shift+Tab and the keyboard protocols. Copy the report into the issue; words that text: keybinds type show as ***.")
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    GroupBox("Ghostty config (Ghostty's order)") {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ForEach(report.configFiles, id: \.path) { file in
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                        Image(systemName: file.exists ? "doc.text.fill" : "doc")
-                                            .foregroundStyle(file.exists ? HierarchicalShapeStyle.primary : .tertiary)
-                                        Text(report.shortened(file.path)).font(.system(.body, design: .monospaced))
-                                        Text(file.state)
-                                            .foregroundStyle(file.readByCherry || file.readByCherryNext ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
-                                    }
-                                    ForEach(Array(file.lines.enumerated()), id: \.offset) { _, line in
-                                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                            Text(line.text).font(.system(.caption, design: .monospaced))
-                                            Text(line.state)
-                                                .font(.caption)
-                                                .foregroundStyle(line.rejection != nil ? AnyShapeStyle(.red)
-                                                    : line.isApplied ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
-                                        }
-                                        .padding(.leading, 22)
-                                    }
-                                }
-                            }
-                            if !report.configFiles.contains(where: { $0.readByCherry || $0.readByCherryNext }) {
-                                Text("Cherry reads none of them.").foregroundStyle(.secondary)
-                            }
-                            Divider()
-                            Text("Applied to Cherry's terminals (read once, at launch)").font(.callout.weight(.medium))
-                            ForEach(Array(report.appliedKeyboardLines.enumerated()), id: \.offset) { _, line in
-                                Text(line).font(.system(.caption, design: .monospaced))
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                    }
-
-                    GroupBox("This Mac") {
-                        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 4) {
-                            row("Cherry", "\(report.version) (\(report.build))")
-                            row("macOS", report.macOS)
-                            row("Input source", report.inputSource)
-                            row("Keyboard layout", report.keyboardLayout)
-                            row("Persistent sessions", report.persistentSessionsState)
-                            if let failure = report.lastSessionLaunchFailure { row("Last session that could not start", failure) }
-                            if let persistentTab = report.persistentTab { row("New persistent tab", persistentTab) }
-                            row("New native tab", report.nativeTab)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                    }
-
-                    GroupBox("Tabs") {
-                        VStack(alignment: .leading, spacing: 2) {
-                            ForEach(Array((report.frontTabLines + report.keyTestTabLines).enumerated()), id: \.offset) { _, line in
-                                Text(line).font(.system(.caption, design: .monospaced))
-                            }
-                            Text("Open this window while Claude Code or lazygit runs in the front tab to see the modes it asked for.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .padding(.top, 4)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                    }
-
-                    GroupBox("Key test") {
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Button("Open Key Test Tab") { model.openKeyTestTab() }
-                                Button("Copy Command") { model.copyKeyTestCommand() }
-                            }
-                            Text("Open Key Test Tab runs CherryMCP --key-echo in a new tab of the front project window. Press Enter, Shift+Enter and Shift+Tab in each mode (keys 1–4); q quits. For a native tab, turn off Settings › Sessions › Run local terminals as persistent sessions first. Copy Command runs the same test in Ghostty, to compare.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                            if report.keyLog.isEmpty {
-                                Text("No keys yet.").foregroundStyle(.secondary)
-                            }
-                            ForEach(Array(report.keyLog.enumerated()), id: \.offset) { _, record in
-                                Text(record.line)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(record.event == "key" ? HierarchicalShapeStyle.primary : .secondary)
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                    }
-                }
-                .padding(20)
-            }
-            Divider()
-            HStack {
-                if let message = model.message {
-                    Text(message).font(.callout).foregroundStyle(.secondary).lineLimit(2)
-                }
-                Spacer()
-                Button("Refresh") {
-                    model.refresh()
-                    Task { await model.refreshTerminalEnvironments() }
-                }
-                Button("Copy Report") { model.copyReport() }
-                    .keyboardShortcut(.defaultAction)
-            }
-            .padding(12)
-        }
-        .frame(minWidth: 620, idealWidth: 720, minHeight: 520, idealHeight: 760)
-        .task {
-            await model.refreshTerminalEnvironments()
-            while !Task.isCancelled {
-                await model.refreshLive()
-                try? await Task.sleep(for: .seconds(1))
-            }
-        }
-    }
-
-    private func row(_ label: String, _ value: String) -> some View {
-        GridRow {
-            Text(label).foregroundStyle(.secondary)
-            Text(value)
-        }
-    }
-}
-
-/// The one Keyboard Diagnostics window (Help › Keyboard Diagnostics…).
-@MainActor
-enum KeyboardDiagnosticsWindow {
-    private static var window: NSWindow?
-    private static var closeObserver: NSObjectProtocol?
-
-    static func show() {
-        if let window {
-            window.makeKeyAndOrderFront(nil)
-            return
-        }
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 760),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: true
-        )
-        window.title = "Keyboard Diagnostics"
-        window.isReleasedWhenClosed = false
-        window.contentViewController = NSHostingController(rootView: KeyboardDiagnosticsView(model: KeyboardDiagnosticsModel()))
-        window.center()
-        closeObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.willCloseNotification, object: window, queue: .main
-        ) { _ in
-            MainActor.assumeIsolated {
-                if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
-                closeObserver = nil
-                Self.window = nil
-            }
-        }
-        Self.window = window
-        window.makeKeyAndOrderFront(nil)
     }
 }

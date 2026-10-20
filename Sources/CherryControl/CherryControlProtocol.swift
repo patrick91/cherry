@@ -188,6 +188,9 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case appInfo
     case listTools(ListToolsRequest)
     case callTool(CallToolRequest)
+    /// Control protocol 3: one `cherry` agent command, run in the app as
+    /// its caller. Never inside `scoped`.
+    case runCommand(RunCommandRequest)
 }
 
 public struct ScopedControlRequest: Codable, Equatable, Sendable {
@@ -721,6 +724,8 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case appInfo(AppInfoResult)
     case listTools(ListToolsResult)
     case callTool(CallToolResult)
+    /// Control protocol 3.
+    case runCommand(RunCommandResult)
 }
 
 public struct CherryControlError: Codable, Equatable, Error, Sendable {

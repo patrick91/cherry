@@ -13,11 +13,11 @@ extension CherryControl {
     /// The tab's capability token (hex, 256 bits), in the environment of a
     /// tab Cherry runs on another Mac.
     public static let mcpTokenEnvironmentKey = "CHERRY_MCP_TOKEN"
-    /// The CherryMCP of the Cherry build that started the tab, on the Mac
-    /// that runs it (the device), which its `cherry` runs.
+    /// What Cherry's tabs had before `cherry` sent its agent commands to the
+    /// app itself: the CherryMCP helper it ran, and the name of its MCP
+    /// server. No tab gets them now; an inherited one is dropped
+    /// (`CherryTabEnvironment.keys`).
     public static let mcpHelperEnvironmentKey = "CHERRY_MCP_HELPER"
-    /// The identity's URL scheme, next to `CHERRY_MCP_HELPER` in every tab
-    /// that has it (the name Cherry MCP's server had).
     public static let mcpServerNameEnvironmentKey = "CHERRY_MCP_SERVER_NAME"
     /// The name of the Mac Cherry runs on, for "Cherry on <Mac> is not
     /// reachable".
@@ -32,7 +32,6 @@ extension CherryControl {
         processIDEnvironmentKey,
         agentIDEnvironmentKey,
         projectRootEnvironmentKey,
-        mcpHelperEnvironmentKey,
         controlMachineEnvironmentKey,
     ]
 }

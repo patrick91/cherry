@@ -288,7 +288,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
 @Test @MainActor func RemoteDeviceMCPTokenChangesWhenTheTabsProgramRestarts() throws {
     let tokens = RemoteMCPTokens(key: SymmetricKey(size: .bits256))
     let deviceID = UUID(), tab = UUID()
-    let mcp = RemoteMCPLaunch(deviceID: deviceID, socketPath: "/var/folders/x/T/cherry-mcp-1/control.sock", helperPath: nil, controlMachine: "Laptop", tokens: tokens)
+    let mcp = RemoteMCPLaunch(deviceID: deviceID, socketPath: "/var/folders/x/T/cherry-mcp-1/control.sock", controlMachine: "Laptop", tokens: tokens)
     let configuration = ShellProcessController.Configuration(
         shellPath: "/bin/zsh", workingDirectory: "/Users/them/app", processID: tab.uuidString,
         term: "xterm-ghostty", initialSize: TerminalViewportSize(columns: 80, rows: 24)
@@ -732,7 +732,6 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     #expect(RemoteMCPPaths.remoteSocket(temporaryDirectory: "/" + String(repeating: "x", count: 70), installationID: installation, deviceID: deviceID) == nil)
     let mcp = RemoteMCPLaunch(
         deviceID: deviceID, socketPath: socket,
-        helperPath: "/Users/them/Library/Application Support/cherry-host/bin/b1/CherryMCP",
         cliPath: "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry",
         controlMachine: "Laptop", tokens: tokens
     )
@@ -751,34 +750,26 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     let spec = RemoteLaunchSpec.make(for: configuration, device: .init(mcp: mcp), localeEnvironment: [:])
     #expect(spec.environment["CHERRY_CONTROL_SOCKET"] == socket)
     #expect(spec.environment["CHERRY_MCP_TOKEN"] == tokens.currentToken(tabID: tab, deviceID: deviceID))
-    #expect(spec.environment["CHERRY_MCP_HELPER"] == "/Users/them/Library/Application Support/cherry-host/bin/b1/CherryMCP")
-    // Beside it, the identity's name for it.
-    #expect(spec.environment["CHERRY_MCP_SERVER_NAME"] == CherryAppIdentity.current.urlScheme)
+    // No CherryMCP or MCP server name: `cherry` sends its commands itself.
+    #expect(spec.environment["CHERRY_MCP_HELPER"] == nil)
+    #expect(spec.environment["CHERRY_MCP_SERVER_NAME"] == nil)
     #expect(spec.environment["CHERRY_CONTROL_MACHINE"] == "Laptop")
-    // The install's own `cherry`, beside its CherryMCP.
+    // The install's own `cherry`.
     #expect(spec.environment["CHERRY_CLI"] == "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry")
     #expect(spec.environment["CHERRY_PROCESS_ID"] == tab.uuidString)
     #expect(spec.environment["CHERRY_PROJECT_ROOT"] == "/Users/them/app")
-    // Without Cherry MCP (a device store with no installation id): none of it.
+    // Without a forwarded socket (a device store with no installation id): none of it.
     let plain = RemoteLaunchSpec.make(for: configuration, localeEnvironment: [:])
     for key in ["CHERRY_CONTROL_SOCKET", "CHERRY_MCP_TOKEN", "CHERRY_MCP_HELPER", "CHERRY_CONTROL_MACHINE", "CHERRY_CLI", "CHERRY_MCP_SERVER_NAME"] {
         #expect(plain.environment[key] == nil)
     }
-    // Without the install's CherryMCP, no name either.
-    var helperless = mcp
-    helperless.helperPath = nil
-    let unnamed = RemoteLaunchSpec.make(for: configuration, device: .init(mcp: helperless), localeEnvironment: [:])
-    #expect(unnamed.environment["CHERRY_MCP_SERVER_NAME"] == nil)
-    // The helper and the CLI there are the install's.
-    #expect(RemoteMCPPaths.helperPath(remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host", homeDirectory: "/Users/them")
-        == "/Users/them/Library/Application Support/cherry-host/bin/b1/CherryMCP")
-    #expect(RemoteMCPPaths.helperPath(remoteHostPath: "/usr/local/bin/cherry-host", homeDirectory: "/Users/them") == nil)
+    // The CLI there is the install's.
     #expect(RemoteMCPPaths.cliPath(remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host", homeDirectory: "/Users/them")
         == "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry")
     #expect(RemoteMCPPaths.cliPath(remoteHostPath: "/usr/local/bin/cherry-host", homeDirectory: "/Users/them") == nil)
 
     // The device store names them for a device whose install has its
-    // resources (and so its CherryMCP), else neither.
+    // resources, else none.
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ch-mcpcli-\(UUID().uuidString.prefix(8))")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -799,15 +790,13 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         userTemporaryDirectory: temporary
     )
     let stored = try #require(store.launchDevice(id: device.id)?.mcp)
-    #expect(stored.helperPath == "/Users/them/Library/Application Support/cherry-host/bin/b1/CherryMCP")
     #expect(stored.cliPath == "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry")
-    #expect(stored.serverName == CherryAppIdentity.current.urlScheme)
     store.update(device.id) { $0.installedResources = false }
     let withoutResources = try #require(store.launchDevice(id: device.id)?.mcp)
-    #expect(withoutResources.helperPath == nil && withoutResources.cliPath == nil)
+    #expect(withoutResources.cliPath == nil)
 }
 
-@Test @MainActor func RemoteDeviceMCPDeviceStoreGivesItsTabsCherryMCP() throws {
+@Test @MainActor func RemoteDeviceMCPDeviceStoreGivesItsTabsTheForwardedSocket() throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ch-mcpstore-\(UUID().uuidString.prefix(8))")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -827,14 +816,14 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host",
         homeDirectory: "/Users/them", installedBuild: "b1"
     ))
-    // Its per-user temporary directory not known yet: no Cherry MCP (never
-    // a socket in the shared /tmp).
+    // Its per-user temporary directory not known yet: no forwarded socket
+    // (never one in the shared /tmp).
     #expect(store.launchDevice(id: device.id)?.mcp == nil)
     store.update(device.id) { $0.userTemporaryDirectory = "/var/folders/ab/cd/T/" }
     let launch = try #require(store.launchDevice(id: device.id)?.mcp)
     #expect(launch.socketPath == RemoteMCPPaths.remoteSocket(temporaryDirectory: "/var/folders/ab/cd/T/", installationID: installation, deviceID: device.id))
-    // No resources recorded: no CherryMCP there to name.
-    #expect(launch.helperPath == nil)
+    // No resources recorded: no `cherry` there to name.
+    #expect(launch.cliPath == nil)
 }
 
 // MARK: - The forward's scripts

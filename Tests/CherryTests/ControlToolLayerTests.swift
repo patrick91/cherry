@@ -1,6 +1,5 @@
 @testable import Cherry
-import CherryControl
-@testable import CherryMCP
+@testable import CherryControl
 import Foundation
 import Testing
 
@@ -709,9 +708,9 @@ private func controlToolLayerProcess(id: String = controlToolLayerAgentID, kind:
 
 @Test func controlToolLayerAdapterTimesOutAsTheLayerReadsItsArguments() throws {
     // A whole number kept as a double counts, as the layer reads it.
-    #expect(CherryMCPTools.clientTimeout(for: "send_process_input", arguments: ["wait_ms": .double(2_000.0)]) == 22)
-    #expect(CherryMCPTools.clientTimeout(for: "spawn_process", arguments: ["kind": .string(" Command "), "wait_ms": .int(1_000)]) == 31)
-    #expect(CherryMCPTools.clientTimeout(for: "wait_for_events", arguments: ["timeout_ms": .double(1.5)]) == 55)
+    #expect(CherryToolLayer.clientTimeout(for: "send_process_input", arguments: ["wait_ms": .double(2_000.0)]) == 22)
+    #expect(CherryToolLayer.clientTimeout(for: "spawn_process", arguments: ["kind": .string(" Command "), "wait_ms": .int(1_000)]) == 31)
+    #expect(CherryToolLayer.clientTimeout(for: "wait_for_events", arguments: ["timeout_ms": .double(1.5)]) == 55)
     #expect(try CherryToolLayer.schemaArgument("result_schema", in: ["result_schema": .string(#"{"type":"object"}"#)])
         == .object(["type": .string("object")]))
     #expect(throws: CherryControlError.self) {

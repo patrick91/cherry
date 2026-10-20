@@ -7,13 +7,13 @@ import Testing
 @testable import Cherry
 
 // Cherry MCP for agents on another Mac (docs/specs/remote-devices.md, phase
-// 4b) end to end: the real CherryMCP (`swift build --build-tests` builds
+// 4b) end to end: the real `cherry` (`Scripts/build-host debug` builds
 // it), the app's control server with a device listener, and the reverse
 // forward of the app's control socket made by `RemoteMCPForwards` on an SSH
 // master. Against the fake remote Mac (Scripts/fake-remote-mac, whose
 // stand-in master bridges `-O forward -R THERE:HERE` with a link, since the
 // fake Mac's files are this Mac's), or, for
-// RemoteDeviceRealHostForwardsCherryMCPOverSSH run by
+// RemoteDeviceRealHostForwardsTheControlSocketOverSSH run by
 // Scripts/test-remote-mac-loopback (CHERRY_TEST_LOOPBACK_SSH), a real
 // `ssh -O forward -R` of a Unix socket through a private sshd on 127.0.0.1.
 // Gated like the other real-host suites. Every forwarded socket is under
@@ -21,17 +21,6 @@ import Testing
 // app's own control socket and daemon are never touched.
 
 private let mcpRealHostEnabled = ProcessInfo.processInfo.environment["CHERRY_TEST_HOST_INTEGRATION"] == "1"
-
-/// The CherryMCP `swift build` made.
-private func builtCherryMCP() throws -> URL {
-    let repository = URL(fileURLWithPath: #filePath)
-        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-    let helper = repository.appendingPathComponent(".build/debug/CherryMCP")
-    guard FileManager.default.isExecutableFile(atPath: helper.path) else {
-        throw HostedSessionError.message("Build CherryMCP first: swift build --build-tests (or --product CherryMCP)")
-    }
-    return helper
-}
 
 private func mcpSocketDirectory() throws -> URL {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("ch-mcp-\(UUID().uuidString.prefix(6))")
@@ -51,22 +40,11 @@ private func userTemporaryDirectory() throws -> String {
     return String(cString: buffer)
 }
 
-/// Runs CherryMCP `cli tool` with exactly `environment`.
-private func callCherryMCP(_ helper: URL, _ tool: String, _ arguments: String? = nil, environment: [String: String]) async throws -> (status: Int32, output: String) {
-    try await Task.detached {
-        let process = Process()
-        process.executableURL = helper
-        process.arguments = ["cli", "tool", tool] + (arguments.map { [$0] } ?? [])
-        process.environment = environment
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = output
-        process.standardInput = FileHandle.nullDevice
-        try process.run()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
-    }.value
+/// Runs `cherry tool TOOL [ARGUMENTS]` with exactly `environment`: its
+/// status and everything it printed.
+private func callCherry(_ cli: URL, _ tool: String, _ arguments: String? = nil, environment: [String: String]) async throws -> (status: Int32, output: String) {
+    let run = try await runCherryCLI(cli, ["tool", tool] + (arguments.map { [$0] } ?? []), environment: environment)
+    return (run.status, run.output + run.error)
 }
 
 private func readFile(_ url: URL) -> String {
@@ -76,8 +54,8 @@ private func readFile(_ url: URL) -> String {
 // MARK: - A device tab's agent through the fake Mac
 
 @Test(.enabled(if: mcpRealHostEnabled))
-@MainActor func RemoteDeviceRealHostAgentInADeviceTabUsesCherryMCPThroughTheForward() async throws {
-    let helper = try builtCherryMCP()
+@MainActor func RemoteDeviceRealHostAgentInADeviceTabUsesCherryThroughTheForward() async throws {
+    let cli = try builtCherryCLI()
     let mac = try FakeRemoteMac(name: "mcpmac")
     try Data().write(to: mac.root.appendingPathComponent("masters"))
     let sockets = try mcpSocketDirectory()
@@ -90,7 +68,7 @@ private func readFile(_ url: URL) -> String {
         temporaryDirectory: try userTemporaryDirectory(), installationID: mac.installationID, deviceID: mac.deviceID
     ))
     let launch = RemoteMCPLaunch(
-        deviceID: mac.deviceID, socketPath: remoteSocket, helperPath: helper.path, controlMachine: "Laptop", tokens: tokens
+        deviceID: mac.deviceID, socketPath: remoteSocket, cliPath: cli.path, controlMachine: "Laptop", tokens: tokens
     )
     let control = mac.makeControl()
     let hosting = PersistentHostSessions.remote(
@@ -156,32 +134,38 @@ private func readFile(_ url: URL) -> String {
             return (readFile(statusFile).trimmingCharacters(in: .whitespacesAndNewlines), readFile(home.appendingPathComponent("\(name).out")))
         }
         // Its environment: the forwarded socket, its own token.
-        let variables = try await runThere("env | grep -E '^CHERRY_(CONTROL_SOCKET|MCP_TOKEN|MCP_HELPER|CONTROL_MACHINE|PROCESS_ID)='", name: "env")
+        let variables = try await runThere("env | grep -E '^CHERRY_(CONTROL_SOCKET|MCP_TOKEN|MCP_HELPER|CLI|CONTROL_MACHINE|PROCESS_ID)='", name: "env")
         #expect(variables.output.contains("CHERRY_CONTROL_SOCKET=\(remoteSocket)\n"))
         #expect(variables.output.contains("CHERRY_MCP_TOKEN=\(tokens.currentToken(tabID: tab.id, deviceID: mac.deviceID) ?? "none")\n"))
-        #expect(variables.output.contains("CHERRY_MCP_HELPER=\(helper.path)\n"))
+        #expect(variables.output.contains("CHERRY_CLI=\(cli.path)\n"))
+        #expect(!variables.output.contains("CHERRY_MCP_HELPER="))
         #expect(variables.output.contains("CHERRY_CONTROL_MACHINE=Laptop\n"))
         #expect(!variables.output.contains(socket.path))
 
         // list_processes through the forward: its window's processes.
-        let listed = try await runThere("\"$CHERRY_MCP_HELPER\" cli tool list_processes", name: "list")
+        let listed = try await runThere("\"$CHERRY_CLI\" tool list_processes", name: "list")
         #expect(listed.status == "0", "\(listed.output)")
         #expect(listed.output.contains(tab.id.uuidString))
+        // The skill, set up there: in that Mac's home, by its `cherry`.
+        try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
+        let skill = try await runThere("\"$CHERRY_CLI\" skill setup --agent claude --json", name: "skill")
+        #expect(skill.status == "0", "\(skill.output)")
+        #expect(skill.output.contains(#""change":"wrote""#), "\(skill.output)")
+        #expect(FileManager.default.fileExists(atPath: home.appendingPathComponent(".claude/skills/cherry/SKILL.md").path))
         // Its project: the device window, from its path there.
-        let project = try await runThere("\"$CHERRY_MCP_HELPER\" cli tool get_project_status", name: "project")
+        let project = try await runThere("\"$CHERRY_CLI\" tool get_project_status", name: "project")
         #expect(project.status == "0", "\(project.output)")
         #expect(project.output.contains(mac.deviceID.uuidString.lowercased()))
-        // Started as Codex starts MCP servers once Set Up listed Cherry's
-        // variables in its env_vars: those and a few of its own only.
+        // With Cherry's variables and a few others only.
         let passed = CherryControl.remoteTabEnvironmentKeys.map { "\($0)=\"$\($0)\"" }.joined(separator: " ")
         let stripped = try await runThere(
-            "h=\"$CHERRY_MCP_HELPER\"; env -i HOME=\"$HOME\" PATH=/usr/bin:/bin \(passed) \"$h\" cli tool list_processes", name: "stripped"
+            "h=\"$CHERRY_CLI\"; env -i HOME=\"$HOME\" PATH=/usr/bin:/bin \(passed) \"$h\" tool list_processes", name: "stripped"
         )
         #expect(stripped.status == "0", "\(stripped.output)")
         #expect(stripped.output.contains(tab.id.uuidString))
         // A wrong token is refused.
         let wrong = try await runThere(
-            "CHERRY_MCP_TOKEN=0000000000000000000000000000000000000000000000000000000000000000 \"$CHERRY_MCP_HELPER\" cli tool list_processes",
+            "CHERRY_MCP_TOKEN=0000000000000000000000000000000000000000000000000000000000000000 \"$CHERRY_CLI\" tool list_processes",
             name: "wrong"
         )
         #expect(wrong.status == "1")
@@ -190,7 +174,7 @@ private func readFile(_ url: URL) -> String {
 
         // A This Mac window, registered where the server looks, with a
         // terminal: the agent there cannot reach it by a `..` project root
-        // (a) or by its process id (c), through the real CherryMCP.
+        // (a) or by its process id (c), through the real `cherry`.
         let localRoot = FileManager.default.temporaryDirectory.appendingPathComponent("ch-mcp-here-\(UUID().uuidString.prefix(6))")
         try FileManager.default.createDirectory(at: localRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: localRoot) }
@@ -209,18 +193,18 @@ private func readFile(_ url: URL) -> String {
         }
         let escape = String(repeating: "/..", count: 40) + localRoot.path
         let dotdot = try await runThere(
-            "\"$CHERRY_MCP_HELPER\" cli tool spawn_process '{\"kind\":\"terminal\",\"project_root\":\"\(escape)\"}'", name: "dotdot"
+            "\"$CHERRY_CLI\" tool spawn_process '{\"kind\":\"terminal\",\"project_root\":\"\(escape)\"}'", name: "dotdot"
         )
         #expect(dotdot.status == "1", "\(dotdot.output)")
         #expect(dotdot.output.contains("invalid_project_root"), "\(dotdot.output)")
         #expect(here.sessions.map(\.id) == [hereTab.id])
         let byID = try await runThere(
-            "\"$CHERRY_MCP_HELPER\" cli tool send_process_input '{\"process_id\":\"\(hereTab.id.uuidString)\",\"text\":\"from-there\"}'", name: "byid"
+            "\"$CHERRY_CLI\" tool send_process_input '{\"process_id\":\"\(hereTab.id.uuidString)\",\"text\":\"from-there\"}'", name: "byid"
         )
         #expect(byID.status == "1", "\(byID.output)")
         #expect(byID.output.contains("terminal_not_found"), "\(byID.output)")
         let hereStatus = try await runThere(
-            "\"$CHERRY_MCP_HELPER\" cli tool get_process_status '{\"process_id\":\"\(hereTab.id.uuidString)\"}'", name: "status"
+            "\"$CHERRY_CLI\" tool get_process_status '{\"process_id\":\"\(hereTab.id.uuidString)\"}'", name: "status"
         )
         #expect(hereStatus.status == "1" && hereStatus.output.contains("terminal_not_found"), "\(hereStatus.output)")
 
@@ -229,7 +213,7 @@ private func readFile(_ url: URL) -> String {
         forwards.masterStopped(mac.name)
         #expect(forwards.states[mac.deviceID] == nil)
         #expect(await forwards.ensure(target) == state)
-        let again = try await runThere("\"$CHERRY_MCP_HELPER\" cli tool list_processes", name: "again")
+        let again = try await runThere("\"$CHERRY_CLI\" tool list_processes", name: "again")
         #expect(again.status == "0", "\(again.output)")
 
         // A server that refuses to forward Unix sockets: said so.
@@ -247,7 +231,7 @@ private func readFile(_ url: URL) -> String {
         // says Cherry is not reachable.
         await forwards.stop(deviceID: mac.deviceID)
         #expect(!FileManager.default.fileExists(atPath: local))
-        let offline = try await runThere("\"$CHERRY_MCP_HELPER\" cli tool list_processes", name: "offline")
+        let offline = try await runThere("\"$CHERRY_CLI\" tool list_processes", name: "offline")
         #expect(offline.status == "1")
         #expect(offline.output.contains("Cherry on Laptop is not reachable"))
     } catch {
@@ -259,8 +243,8 @@ private func readFile(_ url: URL) -> String {
 // MARK: - The forward over a real sshd (or the fake Mac)
 
 @Test(.enabled(if: mcpRealHostEnabled))
-@MainActor func RemoteDeviceRealHostForwardsCherryMCPOverSSH() async throws {
-    let helper = try builtCherryMCP()
+@MainActor func RemoteDeviceRealHostForwardsTheControlSocketOverSSH() async throws {
+    let cli = try builtCherryCLI()
     let environment = ProcessInfo.processInfo.environment
     let sockets = try mcpSocketDirectory()
     let ssh: String
@@ -322,7 +306,7 @@ private func readFile(_ url: URL) -> String {
             await cleanUp()
             return
         }
-        // "Their" CherryMCP, with a tab's variables.
+        // "Their" `cherry`, with a tab's variables.
         let variables = [
             "HOME": NSTemporaryDirectory(),
             "PATH": "/usr/bin:/bin",
@@ -335,7 +319,7 @@ private func readFile(_ url: URL) -> String {
         var listed = (status: Int32(-1), output: "")
         let deadline = Date().addingTimeInterval(10)
         while Date() < deadline {
-            listed = try await callCherryMCP(helper, "list_processes", environment: variables)
+            listed = try await callCherry(cli, "list_processes", environment: variables)
             if listed.status == 0 { break }
             try await Task.sleep(for: .milliseconds(100))
         }
@@ -349,17 +333,17 @@ private func readFile(_ url: URL) -> String {
         // Without its token, or with another tab's: refused.
         var noToken = variables
         noToken["CHERRY_MCP_TOKEN"] = nil
-        let refusedWithout = try await callCherryMCP(helper, "list_processes", environment: noToken)
+        let refusedWithout = try await callCherry(cli, "list_processes", environment: noToken)
         #expect(refusedWithout.status == 1 && refusedWithout.output.contains("unauthorized"))
         var wrong = variables
         wrong["CHERRY_MCP_TOKEN"] = tokens.newGeneration(tabID: UUID(), deviceID: deviceID)
-        let refusedWrong = try await callCherryMCP(helper, "list_processes", environment: wrong)
+        let refusedWrong = try await callCherry(cli, "list_processes", environment: wrong)
         #expect(refusedWrong.status == 1 && refusedWrong.output.contains("unauthorized"))
         // The forward ends: cancelled, its socket there removed; the tool
         // says so.
         await forwards.stop(deviceID: deviceID)
         #expect(!FileManager.default.fileExists(atPath: remoteSocket))
-        let offline = try await callCherryMCP(helper, "list_processes", environment: variables)
+        let offline = try await callCherry(cli, "list_processes", environment: variables)
         #expect(offline.status == 1 && offline.output.contains("Cherry on Laptop is not reachable"))
     } catch {
         Issue.record(error)

@@ -1,5 +1,4 @@
-import CherryControl
-@testable import CherryMCP
+@testable import CherryControl
 import Darwin
 import Foundation
 import Testing
@@ -9,7 +8,7 @@ import Testing
 // get_my_task and report_result (its own tab, never a selector), the
 // orchestrator's wait_for_tasks, the nudge and no_report fallback, and the
 // run's wake line. Agents are `/bin/cat` (screens injected) or fake agent
-// scripts; the end-to-end test drives the real CherryMCP `cli tool`.
+// scripts; the end-to-end test drives the real `cherry tool`.
 
 @MainActor
 private extension ControlAgentWaitHarness {
@@ -173,9 +172,9 @@ private func json(_ text: String) throws -> JSONValue {
 @Test func ControlAgentTaskToolsAreAdvertisedAndWaitsFitASixtySecondTimeout() async throws {
     let advertised = Set(CherryToolCatalog.tools(for: .unknown).map(\.name))
     #expect(advertised.isSuperset(of: ["get_my_task", "report_result", "report_progress", "wait_for_tasks", "get_task", "list_tasks", "cancel_tasks"]))
-    let wait = try #require(CherryMCPTools.clientTimeout(for: "wait_for_tasks", arguments: [:]))
+    let wait = try #require(CherryToolLayer.clientTimeout(for: "wait_for_tasks", arguments: [:]))
     #expect(wait <= 55)
-    #expect(CherryMCPTools.clientTimeout(for: "wait_for_tasks", arguments: ["timeout_ms": .int(300_000)]) == wait)
+    #expect(CherryToolLayer.clientTimeout(for: "wait_for_tasks", arguments: ["timeout_ms": .int(300_000)]) == wait)
     // task and message together are refused before anything is sent: the
     // app runs the tool (`callTool`), so it needs one.
     let harness = try ControlAgentWaitHarness()
@@ -183,10 +182,9 @@ private func json(_ text: String) throws -> JSONValue {
     harness.server.start()
     var sent: [CherryControlRequest] = []
     harness.server.toolDispatchWillSendForTesting = { sent.append($0) }
-    let session = CherryMCPSession(environment: [CherryControl.socketEnvironmentKey: harness.socketURL.path])
-    let both = await session.call(name: "spawn_agent", arguments: [
+    let both = await ToolCalls.call(name: "spawn_agent", arguments: [
         "name": .string("Claude"), "task": .string("Review"), "message": .string("hi"),
-    ])
+    ], socketURL: harness.socketURL)
     #expect(both.isError)
     #expect(both.structured?.objectValue?["error"]?.objectValue?["code"]?.stringValue == "invalid_argument", "\(both.text)")
     #expect(both.toolsDigest != nil, "the app answered it")
@@ -717,19 +715,16 @@ struct ControlAgentTaskTests {
     // MARK: End to end
 
     /// A fake orchestrator spawns two fake workers through the real
-    /// CherryMCP; each reads its brief and reports with `CherryMCP cli tool`,
+    /// `cherry`; each reads its brief and reports with `cherry tool`,
     /// identified by its tab's process tree alone; the settled run wakes
     /// the orchestrator, and the results are there to read.
-    @Test func fakeOrchestratorRunsTwoWorkersThroughCherryMCP() async throws {
-        let repository = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let helper = repository.appendingPathComponent(".build/debug/CherryMCP")
-        try #require(FileManager.default.isExecutableFile(atPath: helper.path), "Build CherryMCP first: swift build --build-tests")
+    @Test func fakeOrchestratorRunsTwoWorkersThroughCherry() async throws {
+        let cli = try builtCherryCLI()
         let harness = try ControlAgentWaitHarness()
         defer { harness.stop() }
         harness.useFastTaskSampling()
         harness.server.start()
-        let call = "CHERRY_CONTROL_SOCKET='\(harness.socketURL.path)' '\(helper.path)' cli tool"
+        let call = "CHERRY_CONTROL_SOCKET='\(harness.socketURL.path)' '\(cli.path)' tool"
 
         let worker = harness.projectRoot.appendingPathComponent("fake-worker.sh")
         try """

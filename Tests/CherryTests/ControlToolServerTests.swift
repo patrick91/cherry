@@ -112,7 +112,7 @@ private let controlToolClaudeProfile = ToolClientProfile(client: ToolClientInfo(
         Issue.record("Expected an appInfo result, got \(String(describing: response))")
         return
     }
-    #expect(info.controlProtocol == 2)
+    #expect(info.controlProtocol == 3)
     #expect(info.controlProtocol == CherryControl.controlProtocolVersion)
     #expect(info.urlScheme == CherryAppIdentity.current.urlScheme)
     #expect(info.build == CherryBuildInfo.build(executableURL: Bundle.main.executableURL))

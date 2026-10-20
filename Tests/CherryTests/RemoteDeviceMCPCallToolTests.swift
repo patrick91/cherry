@@ -131,6 +131,50 @@ private func remoteToolArguments(_ arguments: [String: JSONValue], _ extra: [Str
     #expect(!FileManager.default.fileExists(atPath: listener.path))
 }
 
+/// A `cherry` command from a device tab (`runCommand`): refused without
+/// its token like a callTool, run as that tab with it (its window's tabs
+/// only), and `cherry skill setup|status|remove` placed on that Mac: the
+/// app asks that `cherry` what is at the skill's paths.
+@Test @MainActor func RemoteDeviceMCPCallToolRunCommandRunsAsTheTokensTabAndAsksItsMacForTheSkill() async throws {
+    let harness = try DeviceMCPHarness()
+    defer { harness.stop() }
+    let listener = try harness.server.addDeviceListener(deviceID: harness.deviceID)
+    let here = try await harness.startLocalEcho()
+    let ls = CherryControlRequest.runCommand(.init(arguments: ["ls"], context: .init(interface: "cli")))
+    let refused = try await harness.send(ls, to: listener, credentials: nil)
+    #expect(refused.result == nil && refused.error?.code == "unauthorized")
+
+    let listed = try await harness.send(ls, to: listener, credentials: harness.credentials)
+    guard case .runCommand(let run)? = listed.result else {
+        Issue.record("Expected runCommand, got \(listed)")
+        return
+    }
+    #expect(run.exitCode == 0, "\(run.standardError)")
+    for session in harness.deviceWorkspace.sessions {
+        #expect(run.standardOutput.contains(session.id.uuidString), "\(run.standardOutput)")
+    }
+    #expect(!run.standardOutput.contains(here.id.uuidString))
+
+    for operation in ["setup", "status", "remove"] {
+        let skill = try await harness.send(
+            .runCommand(.init(arguments: ["skill", operation, "--agent", "claude"], environment: ["HOME": "/Users/them"])),
+            to: listener, credentials: harness.credentials
+        )
+        guard case .runCommand(let result)? = skill.result else {
+            Issue.record("Expected runCommand, got \(skill)")
+            continue
+        }
+        #expect(result.needsPaths?.contains("/Users/them/.claude/skills/cherry") == true, "\(operation): \(result)")
+    }
+    // The guide still prints there.
+    let guide = try await harness.send(.runCommand(.init(arguments: ["skill", "show"])), to: listener, credentials: harness.credentials)
+    guard case .runCommand(let shown)? = guide.result else {
+        Issue.record("Expected runCommand, got \(guide)")
+        return
+    }
+    #expect(shown.standardOutput == CherryCLIGuide.guide)
+}
+
 /// (a) `..` in a project root never leaves the caller's Mac, as the tool's
 /// `project_root` or as the caller's own (its CHERRY_PROJECT_ROOT):
 /// refused, and This Mac's live command gets no spawn and no input. A

@@ -19,9 +19,9 @@ import Foundation
 /// there, each time it starts, and only a CLI at least the minimum
 /// (`AgentLaunch.CLI.minimumVersion`) gets the flags:
 ///
-///     if [ -x '<cli>' ] && [ -x '<helper>' ] && cherry_v=$('claude' --version 2>/dev/null </dev/null) && printf '%s\n' "$cherry_v" | /usr/bin/awk '…'; then exec <line> <flags>; else exec <line>; fi
+///     if [ -x '<cli>' ] && cherry_v=$('claude' --version 2>/dev/null </dev/null) && printf '%s\n' "$cherry_v" | /usr/bin/awk '…'; then exec <line> <flags>; else exec <line>; fi
 ///
-/// An install without its `cherry` and CherryMCP, an older CLI, or one
+/// An install without its `cherry`, an older CLI, or one
 /// whose version cannot be read, runs the line as it always did, and a
 /// missing CLI still exits 127 (`remoteProgramNotFoundMessage`). Both
 /// branches `exec`, so the session's program is the agent itself, as with a
@@ -54,7 +54,7 @@ enum RemoteAgentLaunch {
         environment: [String: String]
     ) -> Outcome {
         guard device.connectsAgentsAtLaunch else { return .skipped("Connect agents Cherry starts is off") }
-        guard let mcp = device.mcp, let helperPath = mcp.helperPath?.nilIfEmpty, let cliPath = mcp.cliPath?.nilIfEmpty else {
+        guard let mcp = device.mcp, let cliPath = mcp.cliPath?.nilIfEmpty else {
             return .skipped("the Mac's session host has no cherry command")
         }
         // Without the forwarded socket `cherry` there would look for the
@@ -77,9 +77,7 @@ enum RemoteAgentLaunch {
             return .skipped("nothing to add: the command sets its own instructions")
         }
         let suffix = AgentLaunch.shellSuffix(arguments)
-        var checks = [(test: "-x", path: cliPath), (test: "-x", path: helperPath)].map {
-            "[ \($0.test) \(ShellQuoting.singleQuoted($0.path)) ]"
-        }
+        var checks = ["[ -x \(ShellQuoting.singleQuoted(cliPath)) ]"]
         if cli == .codex { checks.append(codexSetsNoInstructions) }
         return .gated(
             gatedLine(line: line, executableWord: executableWord, cli: cli, checks: checks, suffix: suffix),
@@ -94,8 +92,8 @@ enum RemoteAgentLaunch {
         "! /usr/bin/grep -qsE '^[[:space:]]*(developer_instructions|model_instructions_file)[[:space:]]*=' \"${CODEX_HOME:-$HOME/.codex}/config.toml\""
 
     /// `line` with `suffix` (`AgentLaunch.shellSuffix`, its last words)
-    /// when every one of `checks` (shell tests: the install's `cherry` and
-    /// CherryMCP, Codex's config) holds and `executableWord --version`
+    /// when every one of `checks` (shell tests: the install's `cherry`,
+    /// Codex's config) holds and `executableWord --version`
     /// prints a version of `cli` at least its minimum, else `line` alone;
     /// both `exec`. `line` is a plain command (`AgentLaunch.detect`), so
     /// `exec` runs the same command.

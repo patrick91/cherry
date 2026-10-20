@@ -80,9 +80,10 @@ are not supported by these scripts.
 The session-host commands are `cherry host …`; they still answer at the top
 level (`cherry list`, `cherry attach ID`, …), except `start` and `restart`,
 which are the host's only without a process ID. Every other `cherry` command
-is an agent command (docs/specs/agent-cli.md), which `cherry` hands to
-Cherry's `CherryMCP cli` (`$CHERRY_MCP_HELPER`, else the `CherryMCP` beside
-`cherry`).
+is an agent command (docs/specs/agent-cli.md), which `cherry` sends to the
+Cherry app over its control socket (`$CHERRY_CONTROL_SOCKET`, else the socket
+of the app `cherry` is in) as one `runCommand` request; the app parses and
+runs it (`crates/cherry-cli/src/agent.rs`).
 
 ```sh
 cherry host new --cwd /absolute/path/to/project --name Work
@@ -502,8 +503,8 @@ adopts the other's sessions (the other's are attached, never owned).
 Add Mac… (and a device's Update Session Host…) installs the Mac app's own
 `cherry` and `cherry-host` on that Mac, in
 `~/Library/Application Support/cherry-host/bin/<build>/` (with Ghostty's
-terminfo and shell integration, and the app's `CherryMCP` for agents in its
-tabs, checked by the same `resources_hash` digest), and passes
+terminfo and shell integration, checked by the same `resources_hash`
+digest), and passes
 `--remote-host-path ~/Library/Application Support/cherry-host/bin/<build>/cherry-host`
 from then on. Each build has its own directory, which is never changed once
 in place: a running signed executable whose pages change is killed by
@@ -735,17 +736,17 @@ the control connection, so the protocol (and a daemon another app shares)
 is unchanged, and an older cherry-host without it makes the app say to
 update it.
 
-Cherry MCP for agents in a device's tabs (docs/specs/remote-devices.md,
+The `cherry` agent commands in a device's tabs (docs/specs/remote-devices.md,
 phase 4b) uses neither the host nor its protocol: the app reverse-forwards
 a listener of its own control server to that Mac over the device's SSH
 master (`ssh -O forward -R <DARWIN_USER_TEMP_DIR>/cherry-mcp-<hash>/control.sock:<here>`; the
 directory is 0700 and this account's, and the socket a dead master left is
 removed first, since sshd's StreamLocalBindUnlink is off by default), and
 the tabs' Create carries `CHERRY_CONTROL_SOCKET` (that path),
-`CHERRY_MCP_TOKEN`, `CHERRY_MCP_HELPER`, `CHERRY_CLI` and
-`CHERRY_CONTROL_MACHINE` in its environment like any other variable (and an
-agent's command line may carry Cherry MCP's flags, behind a version check
-of its own). The holder does nothing with them.
+`CHERRY_MCP_TOKEN`, `CHERRY_CLI` and `CHERRY_CONTROL_MACHINE` in its
+environment like any other variable (and an agent's command line may carry
+the flags that tell it about `cherry`, behind a version check of its own).
+The holder does nothing with them.
 The server's sshd must allow remote forwards of Unix sockets:
 `AllowStreamLocalForwarding` and `AllowTcpForwarding` yes or remote (sshd
 denies one under `AllowTcpForwarding local`); both are yes by default.

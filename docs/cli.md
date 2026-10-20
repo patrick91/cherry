@@ -96,19 +96,24 @@ agent's page shows its CLI's items too.
 
 ## The `cherry` Command
 
-Each command is one catalog tool, run by `CherryMCP cli ARGS…` (the Rust
-`cherry` hands its non-host commands there, docs/specs/agent-cli.md) as one
-`callTool` (`CherryMCPSession.call`, interface `cli`): the app identifies,
-scopes and refuses the caller (Scope And Identity).
+The Rust `cherry` sends each command line that is not a session-host
+command to the app as one `runCommand` request (Versions), and prints what
+the app answers. The app parses it (`CherryCLI`) into one catalog tool and
+runs it as a `callTool` of the same caller (interface `cli`): the app
+identifies, scopes and refuses the caller (Scope And Identity).
 
 - A command's words and positional arguments are in `CherryCLI.commands`
-  (`Sources/CherryMCP/CherryCLI.swift`); every other `--flag` is the tool's
+  (`Sources/CherryControl/CherryCLI.swift`); every other `--flag` is the tool's
   parameter in kebab case, typed by its schema (`--no-x` sets a boolean
   false, a list is `a,b`, an object is JSON, a file or `-`).
   `cherry tool NAME [JSON | -]` calls any tool with its JSON arguments.
 - Long text (a brief, a message, a report, a schema) comes on standard
   input: `-`, or nothing when standard input is a pipe or a file (never a
-  terminal or `/dev/null`).
+  terminal or `/dev/null`). The app asks `cherry` for it, and for a file a
+  flag names (`--schema schema.json`, read relative to `cherry`'s
+  directory), only once the command needs it; `cherry` sends the command
+  again with them (`needsStandardInput`, `needsFiles`; `cherry skill` also
+  `needsPaths` and `operations`, below).
 - `cherry send` to a tab that is not an agent types the text as a line
   (`send_process_input` with submit), after the app refused
   `send_agent_message` without sending anything.
@@ -119,8 +124,12 @@ scopes and refuses the caller (Scope And Identity).
 - `cherry skill show` prints the guide (`CherryCLIGuide.guide`, from the
   commands' table), `--skill-md` the `cherry` skill's SKILL.md.
 - `cherry skill setup|status|remove [--agent A]… [--dry-run] [--project]
-  [--force] [--json]` (`CherrySkillInstaller`, Sources/CherryControl) writes,
-  reports and removes the skill: `$CLAUDE_CONFIG_DIR` (else `~/.claude`)
+  [--force] [--json]` (`CherrySkillInstaller`, Sources/CherryControl; run by
+  the app with the caller's HOME, PATH and agent folders, its file work done
+  by the calling `cherry` on its own Mac, This Mac or another: the app asks
+  what is at the skill's paths, `needsPaths`, and answers the steps to take,
+  `operations`, which `cherry` takes and reports; `skill_unavailable`
+  without an absolute HOME) writes, reports and removes the skill: `$CLAUDE_CONFIG_DIR` (else `~/.claude`)
   `/skills/cherry` for Claude Code, `~/.agents/skills/cherry` for Codex, Pi,
   OpenCode and Amp, and Codex's `${CODEX_HOME:-~/.codex}/rules/cherry.rules`;
   with `--project` the repository's `.claude`, `.agents` and `.codex`.
@@ -153,32 +162,29 @@ scopes and refuses the caller (Scope And Identity).
 
 ## Versions
 
-The app answers three requests of control protocol 2 besides the typed
-requests older helpers send: `appInfo` (which app answers and its build),
+The app answers four requests besides the typed requests older helpers
+send: `appInfo` (which app answers, its control protocol and build),
 `listTools` (the tools for one client) and `callTool` (one tool run in the
-app as its caller). `cherry` asks `appInfo` before its call:
+app as its caller), of control protocol 2, and `runCommand` (one `cherry`
+command line run in the app as its caller), of control protocol 3.
 
-- Against an app of control protocol 2 or later each command is one
-  `callTool`, and every tool name goes to the app (a name it does not know
-  is its `unknown_tool`). Against an older app (one that cannot decode
-  `appInfo`, `invalid_request`) the helper runs the tool layer itself over
-  typed requests for 60 s, then asks again. Any other failure
-  (`cherry_unavailable`, `cherry_unreachable`, `unauthorized`,
-  `socket_not_private`) is the command's error.
-- `appInfo` waits 10 s; with no answer the command fails
-  (`cherry_unavailable`, or `cherry_unreachable` from another Mac), after
-  the checks the helper can make itself (an unknown tool, a missing
-  argument).
-- `CherryMCP --version` prints
-  `{"build":"<build>","controlProtocol":2,"name":"CherryMCP","version":"<build>"}`:
-  the enclosing app's `CFBundleVersion`, a device install's build directory
-  name, else `dev`.
-- `get_status` always runs in the helper (it reports the helper's socket)
-  and asks `appInfo` again. It adds `helper_build`, and `app_build`,
-  `app_control_protocol` and `mode` (`pipe` or `legacy`; absent while no
-  app answers). Its `socket_path` and `socket_exists` are left out when the
-  caller has no socket of its own (a `callTool` from another Mac, answered
-  in the app).
+- `runCommand` carries the command's words, what the caller says of itself
+  (`CHERRY_PROCESS_ID`, `CHERRY_PROJECT_ROOT`, its directory), whether its
+  standard output is a terminal and its standard input a pipe or a file,
+  `HOME`, `PATH` and the agents' folder variables (for `cherry skill`), and
+  `cherry`'s build; from another Mac it comes in the tab's token envelope.
+  The answer is what to print and the exit status, or what to send the
+  command again with (standard input, files), at most four times.
+- `cherry` waits up to 340 s for the answer (the longest wait a command can
+  ask for, 300 s, and its margins). With no answer the command fails
+  (`cherry_unavailable`, or `cherry_unreachable` from another Mac); an app
+  that cannot decode `runCommand` (`invalid_request`) is
+  `cherry_outdated: … update Cherry.`
+- An older install's `cherry` runs its CherryMCP, which sends `appInfo` and
+  `callTool` (or typed requests): the app still answers them.
+- `get_status` adds `cli_build` (the `cherry` that asked), `app_build` and
+  `app_control_protocol`. Its `socket_path` and `socket_exists` are left
+  out for a caller on another Mac (it has no socket of This Mac's).
 - Every tool has annotations, `openWorldHint: false`: 24 read-only, 11
   destructive, and the other 18 add or start something.
 
@@ -187,9 +193,9 @@ app as its caller). `cherry` asks `appInfo` before its call:
 - The app runs every tool (`callTool`) and identifies its caller itself:
   on This Mac by its process, the tab whose program is the `cherry`
   process or one of its parents, as the process tree was when it
-  connected; on another Mac by its tab's token (below). What the helper
-  says of itself (`CHERRY_PROCESS_ID`, its bound process, its project and
-  directory) only supplies defaults when Cherry verified no caller; tasks,
+  connected; on another Mac by its tab's token (below). What `cherry`
+  says of itself (`CHERRY_PROCESS_ID`, its project and directory) only
+  supplies defaults when Cherry verified no caller; tasks,
   wake lines, `sub_agents` and run ownership use only the verified caller.
 - `whoami` reports the caller process, active/effective project root,
   selected process, and bound process.
@@ -200,19 +206,16 @@ app as its caller). `cherry` asks `appInfo` before its call:
   socket that app's server listens on (on This Mac; a tab on another Mac
   names the forward there), and `CHERRY_CLI` is the `cherry` command-line
   tool of the Cherry build that started the tab (a device tab's names the
-  install's on that Mac, when it has CherryMCP and Ghostty's resources
-  there). `cherry` uses the tab's socket, so one of another build reaches
+  install's on that Mac, when it has Ghostty's resources there). `cherry` uses the tab's socket, so one of another build reaches
   the tab's own app. A tab of a
   Cherry whose server could not listen has `CHERRY_CONTROL_SOCKET` empty or
   unset, and never names the socket of a Cherry that Cherry was started
   from; whatever reads it treats an empty value as unset.
-- `CHERRY_MCP_HELPER` is the absolute path of the CherryMCP of the Cherry
-  that started the tab (This Mac's tabs, native and persistent, and tabs on
-  another Mac alike), which `cherry` runs (`cherry` execs `$CHERRY_MCP_HELPER
-  cli …`, else the CherryMCP beside it).
+- No tab has `CHERRY_MCP_HELPER` or `CHERRY_MCP_SERVER_NAME` any more
+  (they named CherryMCP, which `cherry` ran); one Cherry inherited is
+  dropped.
 - A command whose environment lost Cherry's variables is still identified
-  by its process; a legacy helper (against an older app) matches its own
-  parent process ancestry against Cherry's live process list.
+  by its process.
 - The socket is private: the app's socket directory is this account's
   (0700, `/tmp/cherry-$UID/<instance>/`, the shared `/tmp/cherry-$UID` not
   writable by others), the socket 0600. `cherry` connects only to a socket
@@ -233,8 +236,8 @@ app as its caller). `cherry` asks `appInfo` before its call:
   file it bound itself. A Cherry started from a Cherry tab inherits that
   tab's `CHERRY_CONTROL_SOCKET` and uses its own default path instead. A
   second copy of the same Cherry (the same path) runs without a control
-  socket and logs why (`socket_in_use`); the helpers of its tabs reach the
-  first copy, which finds none of its own tabs to be the caller and
+  socket and logs why (`socket_in_use`); the `cherry` of its tabs reaches
+  the first copy, which finds none of its own tabs to be the caller and
   answers unscoped requests in its active window. To tell a live socket
   from a stale one, Cherry connects, sends an empty line (an invalid
   request to every Cherry) and waits for the answer or the close, at most
@@ -302,21 +305,22 @@ same tools as a local agent in that window, bounded to that Mac:
   `probe_http` probes only through the port's forward. Requests are at
   most 8 MiB, must arrive within 15 s, and at most 16 run at once
   (`request_too_large`, `request_timeout`, `too_many_connections`).
-- `CHERRY_MCP_HELPER` is the CherryMCP of the Cherry build that started the
-  tab, installed on that Mac with `cherry` and `cherry-host`, and
-  `CHERRY_CLI` that install's `cherry`, which is first on the PATH of the
+- `CHERRY_CLI` is the `cherry` of the Cherry build that started the tab,
+  installed on that Mac with `cherry-host`, and first on the PATH of the
   commands and agents Cherry starts there.
 - When Cherry cannot be reached from there (it quit, the Mac slept, the SSH
-  connection is being made again), tools fail with `cherry_unreachable`:
+  connection is being made again), commands fail with `cherry_unreachable`:
   "Cherry on <this Mac> is not reachable". The forward is made again when
   Cherry reconnects to that Mac.
-- The helper there is the install's build, older than this Cherry until
-  **Update Session Host…**: an install from before control protocol 2
-  sends typed requests, answered as before. A newer one is a pipe: its
-  tool calls run in the app as `callTool` over the forward, each of their
-  requests checked as a typed request is (the token again before each one,
-  the bounds above), and its `get_status` names the forward, never a path
-  of This Mac.
+- The `cherry` there is the install's build, older than this Cherry until
+  **Update Session Host…**: an install from before control protocol 3 runs
+  its CherryMCP, which sends `callTool` (or, before control protocol 2,
+  typed requests), answered as before. A newer one sends `runCommand`,
+  run in the app as that tab, each of its tool's requests checked as a
+  typed request is (the token again before each one, the bounds above);
+  `cherry skill setup|status|remove` places the skill on that Mac, through
+  its `cherry` (The `cherry` Command), and `get_status` names no path of
+  This Mac.
 
 **Agents Cherry starts there** are told about `cherry` on their command
 line, as on This Mac (Setup), without a skill (that Mac has no skill
@@ -328,13 +332,13 @@ Mac's CLIs, so the agent's line checks its CLI each time it starts
 (`RemoteAgentLaunch`):
 
 ```sh
-if [ -x '<build>/cherry' ] && [ -x '<build>/CherryMCP' ] && cherry_v=$('claude' --version 2>/dev/null </dev/null) && printf '%s\n' "$cherry_v" | /usr/bin/awk '…at least 2.1.0…'; then exec claude … '--append-system-prompt' '…' '--settings' '{…}'; else exec claude …; fi
-if [ -x '<build>/cherry' ] && [ -x '<build>/CherryMCP' ] && ! /usr/bin/grep -qsE '^[[:space:]]*(developer_instructions|model_instructions_file)[[:space:]]*=' "${CODEX_HOME:-$HOME/.codex}/config.toml" && cherry_v=$('codex' --version …) && …; then exec codex … '-c' 'developer_instructions="…"'; else exec codex …; fi
+if [ -x '<build>/cherry' ] && cherry_v=$('claude' --version 2>/dev/null </dev/null) && printf '%s\n' "$cherry_v" | /usr/bin/awk '…at least 2.1.0…'; then exec claude … '--append-system-prompt' '…' '--settings' '{…}'; else exec claude …; fi
+if [ -x '<build>/cherry' ] && ! /usr/bin/grep -qsE '^[[:space:]]*(developer_instructions|model_instructions_file)[[:space:]]*=' "${CODEX_HOME:-$HOME/.codex}/config.toml" && cherry_v=$('codex' --version …) && …; then exec codex … '-c' 'developer_instructions="…"'; else exec codex …; fi
 ```
 
 - Only for a plain `claude`, `codex` or `pi` command (Setup's rules), only
-  in a tab that has the forwarded socket and an install with `cherry` and
-  CherryMCP, only under an sh-family login shell there (zsh, bash, sh, ksh,
+  in a tab that has the forwarded socket and an install with `cherry`,
+  only under an sh-family login shell there (zsh, bash, sh, ksh,
   mksh, dash, yash, oksh, loksh; fish, csh, tcsh and others run the line as
   before), and only while Connect agents Cherry starts is on.
 - Both branches `exec`, so the session's program is the agent itself, as
@@ -1090,7 +1094,7 @@ wait on purpose:
 - `wait_for_events` and `wait_for_tasks` (`cherry events`, `cherry task
   wait`): `timeout_ms` (default 50 s, at most 50 s) + 5 s.
 
-A legacy helper (against an older Cherry) sends each of a tool's typed
+An older install's CherryMCP against an app before control protocol 2 sends each of a tool's typed
 requests on its own connection and waits for each as long as before
 (`CherryToolLayer.clientTimeout`). Waits default to 50 s
 (`send_agent_message` 40 s), so a call fits an agent's shell timeout;
@@ -1106,13 +1110,14 @@ answer, `{"result":…}` or `{"error":{"code":…,"message":…}}` (a caller on
 another Mac wraps its request in `{"cherryAuth":{"token":…,"processID":…},"request":…}`).
 Besides the typed requests (`{"listTerminals":{}}` and the like, which
 older helpers send and which stay as they are; the wire is append-only),
-control protocol 2 has three:
+control protocols 2 and 3 have four:
 
 | Request | Answer |
 |---|---|
-| `{"appInfo":{}}` | `{"result":{"appInfo":{"_0":{"build":"…","bundleIdentifier":"dev.patrick.cherry","controlProtocol":2,"urlScheme":"cherry","version":"…"}}}}` |
+| `{"appInfo":{}}` | `{"result":{"appInfo":{"_0":{"build":"…","bundleIdentifier":"dev.patrick.cherry","controlProtocol":3,"urlScheme":"cherry","version":"…"}}}}` |
 | `{"listTools":{"_0":{"profile":{"client":{"name":"claude-code","version":"2.1.299"}}}}}` | `{"result":{"listTools":{"_0":{"digest":"<16 hex>","instructions":"…","tools":[…]}}}}` |
 | `{"callTool":{"_0":{"name":"list_processes","arguments":{"kind":"agent"},"context":{…}}}}` | `{"result":{"callTool":{"_0":{"isError":false,"structured":{…},"text":"{…}","toolsDigest":"<16 hex>"}}}}` |
+| `{"runCommand":{"_0":{"arguments":["send","dev","-"],"context":{…},"standardInputIsPiped":true,"standardOutputIsTerminal":false,"cliBuild":"…"}}}` | `{"result":{"runCommand":{"_0":{"exitCode":0,"needsStandardInput":true,"standardError":"","standardOutput":""}}}}`, then, sent again with `"standardInput":"…"`, `{"result":{"runCommand":{"_0":{"exitCode":0,"standardError":"","standardOutput":"{…}\n"}}}}` |
 
 - `tools` are tool definitions (`name`, `description`, `inputSchema`,
   `annotations`, as MCP defined them), and `digest` the first 16 hex digits of the SHA-256 of
@@ -1186,8 +1191,10 @@ have a group of their own in `Scripts/test-session-suites unit` (and CI),
   caller chain pinned at accept, and probes and clients that leave at once
   (no SIGPIPE).
 - `ControlToolCLITests`: the commands' parsing, standard input, output and
-  exits, and one command end to end through `.build/debug/CherryMCP cli`
-  against a private server.
+  exits, `runCommand` (standard input and files asked for, `get_status`'s
+  builds, the caller's skill folders), and commands end to end through the
+  built Rust `cherry` against a private server (the Rust side's own tests,
+  against a fake app socket, are `Host/crates/cherry-cli/tests/agent_commands.rs`).
 - `ControlToolLaunchTests`: the launch flags on This Mac (detection,
   quoting under sh, zsh, bash and fish, the version probe with stand-in
   CLIs, the switch, launches native, persistent and restored, Pi's).
@@ -1198,10 +1205,10 @@ have a group of their own in `Scripts/test-session-suites unit` (and CI),
   Connect's rows, in a temporary home.
 
 Tests never use the default socket (every client gets its harness's).
-The ControlTool and device tests inject their environment
-(`CherryMCPSession(environment:)`, `SocketToolTransport(socketURL:)`) and
+The ControlTool and device tests inject their socket
+(`ToolCalls.call(…socketURL:)`, `SocketToolTransport(socketURL:)`) and
 never `setenv` it; the older `mcp` tests in CherryTests.swift still set
-the process environment around `CherryMCPTools.call`, which reads it, so
+the process environment around `ToolCalls.call` (Tests/CherryTests/ToolCallClient.swift), which reads it, so
 run them without a Cherry tab's variables (a tab on another Mac has a
 `CHERRY_MCP_TOKEN` the test server refuses). Tests never get launch flags
 or probe a CLI unless they build their own `AgentCLIVersions` (a test

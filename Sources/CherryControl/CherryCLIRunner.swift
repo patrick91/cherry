@@ -9,18 +9,25 @@ public enum CherryCLIRunner {
         public var exitCode: Int32
     }
 
-    /// `invocation` through `call` (`CherryMCPSession.call` with interface
-    /// "cli"); `isTerminal` says whether standard output is a terminal,
-    /// which gets the human form unless `--json`.
+    /// `invocation` through `call` (a `callTool` with interface "cli");
+    /// `isTerminal` says whether standard output is a terminal, which gets
+    /// the human form unless `--json`. `skillInstaller` places the skill's
+    /// files on the caller's Mac; none (or none for a request) refuses
+    /// `cherry skill setup|status|remove`. It runs on
+    /// its caller's actor (the app's main actor), as `call` does.
     public static func run(
         _ invocation: CherryCLIInvocation,
         isTerminal: Bool,
-        skillInstaller: (CherrySkillRequest) -> CherrySkillInstaller = installer(for:),
+        skillInstaller: ((CherrySkillRequest) -> CherrySkillInstaller?)? = nil,
+        isolation: isolated (any Actor)? = #isolation,
         call: (String, [String: JSONValue]) async -> CallToolResult
     ) async -> Outcome {
         switch invocation.action {
         case .skill(let request):
-            return runSkill(request, installer: skillInstaller(request), json: invocation.json || !isTerminal)
+            guard let installer = skillInstaller?(request) else {
+                return Outcome(standardOutput: "", standardError: skillUnavailable(request) + "\n", exitCode: 1)
+            }
+            return runSkill(request, installer: installer, json: invocation.json || !isTerminal)
         case .print(let text):
             return Outcome(standardOutput: text.hasSuffix("\n") ? text : text + "\n", standardError: "", exitCode: 0)
         case .usage(let message):

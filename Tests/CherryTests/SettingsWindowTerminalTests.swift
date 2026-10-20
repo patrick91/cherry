@@ -322,7 +322,7 @@ private func reportSources(home: TemporaryHome, persistent: Bool, resourcesAsked
 
     let report = await GhosttyConfigReport.build(from: reportSources(home: home, persistent: false) { asked += 1 })
     let text = report.text
-    #expect(!report.includesKeyTest)
+    #expect(!text.contains("Key test"))
     #expect(text.hasPrefix("Cherry keyboard diagnostics\nCherry 2026.10.14.5 (20261014120000.cdb92d6)\nmacOS Version 26.1 (Build 25B78)\n"))
     #expect(text.contains("Persistent sessions: off\n"))
     #expect(text.contains("New native tab: TERM=xterm-ghostty"))

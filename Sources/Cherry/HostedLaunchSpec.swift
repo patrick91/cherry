@@ -117,8 +117,6 @@ struct HostedLaunchSpec: Equatable, Sendable {
             shellIntegration: isZsh ? context.zshBootstrap : nil,
             inheritedEnvironment: context.processEnvironment,
             terminfoDirectories: resources?.terminfoDirectory,
-            mcpHelperPath: context.mcpHelperPath,
-            mcpServerName: context.mcpServerName,
             controlSocketPath: context.controlSocketPath,
             cliPath: context.cliPath,
             cliDirectory: context.cliDirectory
@@ -527,20 +525,13 @@ struct HostedLaunchContext: Equatable, Sendable {
     /// belongs to the configuration it was prepared for.
     var zshBootstrap: ShellIntegrationBootstrap?
     /// Cherry.app/Contents/MacOS: Ghostty's GHOSTTY_BIN_DIR, appended to
-    /// PATH so the bundled `cherry` and `CherryMCP` are found, as in a
+    /// PATH so the bundled `cherry` is found, as in a
     /// native tab. It is the running app's path, not a staged copy.
     var executableDirectory: String?
     /// TERM_PROGRAM_VERSION: the embedded Ghostty's version.
     var terminalProgramVersion: String?
     /// GHOSTTY_SHELL_FEATURES, as Ghostty derives it from its configuration.
     var shellFeatures: String
-    /// CHERRY_MCP_HELPER: the app's CherryMCP, when `executableDirectory`
-    /// has one (as a native tab's, `ShellProcessController.appMCPHelperPath`).
-    var mcpHelperPath: String? = nil
-    /// CHERRY_MCP_SERVER_NAME, set beside CHERRY_MCP_HELPER: the name
-    /// Cherry's server has in its agents (the identity's scheme), as a
-    /// native tab's.
-    var mcpServerName: String? = CherryAppIdentity.current.urlScheme
     /// CHERRY_CONTROL_SOCKET: the socket the app's control server answers
     /// (`CherryControlServer.appSocketPath`), never the one Cherry
     /// inherited. Nil when it has none (tests, a server that did not listen).
@@ -595,11 +586,10 @@ struct HostedLaunchContext: Equatable, Sendable {
     ) async -> HostedLaunchContext {
         let shellPath = configuration.shellPath
         let resources = try? await stager.resolve()
-        let (bootstrap, account, mcpHelperPath) = await stager.perform {
+        let (bootstrap, account) = await stager.perform {
             (
                 try? ShellIntegrationBootstrap.prepare(shellPath: shellPath, homeDirectory: homeDirectory),
-                HostedLaunchAccount.current(),
-                executableDirectory.map { "\($0)/CherryMCP" }.flatMap { FileManager.default.isExecutableFile(atPath: $0) ? $0 : nil }
+                HostedLaunchAccount.current()
             )
         }
         return HostedLaunchContext(
@@ -615,7 +605,6 @@ struct HostedLaunchContext: Equatable, Sendable {
             executableDirectory: executableDirectory,
             terminalProgramVersion: embeddedGhosttyVersion,
             shellFeatures: ghosttyShellFeatures(cursorBlink: cursorBlink),
-            mcpHelperPath: mcpHelperPath,
             controlSocketPath: controlSocketPath,
             cliPath: cliPath,
             cliDirectory: cliDirectory

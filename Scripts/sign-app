@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Signs a built Cherry.app inside out, never with --deep: Sparkle's
-# Autoupdate and Updater.app, Sparkle.framework, the helpers (cherry,
-# cherry-host, CherryMCP, each if present, with today's identifiers), then
+# Autoupdate and Updater.app, Sparkle.framework, the helpers (cherry and
+# cherry-host, each if present, with today's identifiers), then
 # the app with its entitlements. Scripts/install-local-app,
 # Scripts/package-release and Scripts/test-packaged-app call it.
 #
@@ -105,7 +105,7 @@ if [ "$hardened" = true ]; then
 fi
 sign "$framework/Versions/B/Updater.app"
 sign "$framework"
-for helper in cherry cherry-host CherryMCP; do
+for helper in cherry cherry-host; do
   if [ -e "$app/Contents/MacOS/$helper" ]; then
     sign --identifier "$helper" "$app/Contents/MacOS/$helper"
   fi

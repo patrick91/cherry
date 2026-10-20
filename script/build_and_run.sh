@@ -74,10 +74,6 @@ if [[ "$BUNDLE_HOST" == 1 ]]; then
   # stays a distinct file beside it.
   cp "$HOST_BIN_DIR/cherry" "$APP_MACOS/cherry"
   cp "$HOST_BIN_DIR/cherry-host" "$APP_MACOS/cherry-host"
-  # `cherry`'s agent commands run through CherryMCP beside it (`cherry
-  # ls` outside a tab, where CHERRY_MCP_HELPER is not set), as in a release.
-  [[ -x "$BUILD_BIN_DIR/CherryMCP" ]] || fail "Missing $BUILD_BIN_DIR/CherryMCP"
-  cp "$BUILD_BIN_DIR/CherryMCP" "$APP_MACOS/CherryMCP"
   cmp -s "$BUILD_BINARY" "$APP_BINARY" \
     || fail "The $APP_NAME executable was overwritten; GUI and helper filenames must be distinct."
 fi

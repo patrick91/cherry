@@ -45,9 +45,9 @@
 # a remote Unix socket forward unless AllowTcpForwarding allows remote
 # forwards, so it is yes, with PermitListen none: no remote TCP listener),
 # and the Swift
-# test RemoteDeviceRealHostForwardsCherryMCPOverSSH reverse-forwards a test
-# control server's device listener with `ssh -O forward -R <socket there>:
-# <socket here>` on an app-style master, then runs the real CherryMCP with a
+# test RemoteDeviceRealHostForwardsTheControlSocketOverSSH reverse-forwards a
+# test control server's device listener with `ssh -O forward -R <socket
+# there>:<socket here>` on an app-style master, then runs the real `cherry` with a
 # tab's test token against the forwarded socket (list_processes), checks
 # that a missing or wrong token is refused, and that `-O cancel` and the
 # cleanup take the socket away ("Cherry on Laptop is not reachable").
@@ -311,17 +311,17 @@ grep -q "Test $path_test() passed" "$dir/swift-path.log" || { cat "$dir/swift-pa
 grep -q "^sh -s\$" "$dir/commands" || fail "the login PATH was read through sh -s"
 pass "a device's login PATH read from zsh -l -i over SSH (no terminal, standard input closed), and an agent's line found its tool"
 
-# Cherry MCP through a reverse forward of a Unix socket (the app's
-# RemoteMCPForwards and the real CherryMCP, run by their Swift test).
-mcp_test=RemoteDeviceRealHostForwardsCherryMCPOverSSH
+# `cherry` through a reverse forward of a Unix socket (the app's
+# RemoteMCPForwards and the real `cherry`, run by their Swift test).
+mcp_test=RemoteDeviceRealHostForwardsTheControlSocketOverSSH
 if ! (cd "$root" && env PATH="$original_path" CHERRY_TEST_HOST_INTEGRATION=1 \
   CHERRY_TEST_LOOPBACK_SSH="$dir/bin/ssh" CHERRY_TEST_LOOPBACK_DESTINATION=loopback \
   swift test --skip-build --no-parallel --filter "$mcp_test" >"$dir/swift-mcp.log" 2>&1); then
   cat "$dir/swift-mcp.log" >&2
-  fail "Cherry MCP over a reverse forward ($mcp_test)"
+  fail "cherry over a reverse forward ($mcp_test)"
 fi
 grep -q "Test $mcp_test() passed" "$dir/swift-mcp.log" || { cat "$dir/swift-mcp.log" >&2; fail "$mcp_test did not run"; }
-pass "CherryMCP called list_processes through ssh -O forward -R of a Unix socket, refused without a valid token"
+pass "cherry called list_processes through ssh -O forward -R of a Unix socket, refused without a valid token"
 
 # The daemon it started is this script's private one.
 pgrep -f "serve --socket $socket" >/dev/null || fail "a private daemon served $socket"

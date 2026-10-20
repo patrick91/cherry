@@ -372,9 +372,8 @@ final class GhosttyConfigPageModel: ObservableObject {
 
 // MARK: - Report
 
-/// Settings › Terminal's Copy Report: what the Keyboard
-/// Diagnostics window reports (`KeyboardDiagnostics.Report`) without its
-/// key test: Cherry's version and this Mac's, the files and what Cherry
+/// Settings › Terminal's Copy Report (`KeyboardDiagnostics.Report`):
+/// Cherry's version and this Mac's, the files and what Cherry
 /// does with each of their keyboard lines (`text:` words masked), the
 /// lines its terminals take, the TERM a new tab gets and the front tab's
 /// keyboard. Built when Copy Report is clicked, from `Sources`, which tests
@@ -441,7 +440,6 @@ enum GhosttyConfigReport {
     @MainActor
     static func build(from sources: Sources) async -> KeyboardDiagnostics.Report {
         var report = KeyboardDiagnostics.Report()
-        report.includesKeyTest = false
         fill(&report, from: sources)
         report.frontTab = sources.frontTab()
         let resources = sources.persistentSessions ? await sources.stagedResources() : nil
@@ -449,8 +447,7 @@ enum GhosttyConfigReport {
         return report
     }
 
-    /// What Copy Report and the Keyboard Diagnostics window both say,
-    /// apart from the tabs and the new tabs' TERM: Cherry's version and
+    /// What Copy Report says apart from the tabs and the new tabs' TERM: Cherry's version and
     /// this Mac's, its keyboard, persistent sessions, the lines Cherry's
     /// terminals take and the files.
     @MainActor

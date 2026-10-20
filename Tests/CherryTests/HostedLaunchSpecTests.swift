@@ -371,53 +371,30 @@ func hostedLaunchMatchesNativeLaunchForEveryTabKind(shell: String) throws {
     #expect(unanswered.environment["CHERRY_CONTROL_SOCKET"] == nil)
 }
 
-/// Every tab of This Mac names the app's CherryMCP in CHERRY_MCP_HELPER,
-/// native and hosted alike, which `cherry` runs whatever the tab's PATH,
-/// and beside it the identity's name for it (CHERRY_MCP_SERVER_NAME); ones
-/// the app inherited are never passed on.
-@Test func hostedAndNativeLaunchesNameTheAppsCherryMCP() {
-    let helper = "\(binDirectory)/CherryMCP"
-    let name = CherryAppIdentity.current.urlScheme
+/// No tab names a CherryMCP (CHERRY_MCP_HELPER) or an MCP server's name
+/// (CHERRY_MCP_SERVER_NAME) any more: `cherry` sends its commands to the
+/// app itself. Ones the app inherited are never passed on, nor sent to
+/// another Mac.
+@Test func hostedAndNativeLaunchesNameNoCherryMCP() {
     var inherited = processEnvironment
     inherited[CherryControl.mcpHelperEnvironmentKey] = "/elsewhere/CherryMCP"
     inherited[CherryControl.mcpServerNameEnvironmentKey] = "elsewhere"
-    var hostedContext = context(processEnvironment: inherited)
-    hostedContext.mcpHelperPath = helper
-    #expect(hostedContext.mcpServerName == name)
     for kind in TabKind.allCases {
-        let hosted = HostedLaunchSpec.make(for: configuration(kind, shell: "/bin/zsh"), context: hostedContext)
-        #expect(hosted.environment[CherryControl.mcpHelperEnvironmentKey] == helper, Comment(rawValue: kind.rawValue))
-        #expect(hosted.environment[CherryControl.mcpServerNameEnvironmentKey] == name, Comment(rawValue: kind.rawValue))
+        let hosted = HostedLaunchSpec.make(for: configuration(kind, shell: "/bin/zsh"), context: context(processEnvironment: inherited))
+        #expect(hosted.environment[CherryControl.mcpHelperEnvironmentKey] == nil, Comment(rawValue: kind.rawValue))
+        #expect(hosted.environment[CherryControl.mcpServerNameEnvironmentKey] == nil, Comment(rawValue: kind.rawValue))
         let native = ShellProcessController.nativeExecLaunch(
             for: configuration(kind, shell: "/bin/bash"),
             shellIntegration: nil,
             inheritedEnvironment: inherited,
-            terminfoDirectories: nil,
-            mcpHelperPath: helper
+            terminfoDirectories: nil
         )
-        #expect(native.environment[CherryControl.mcpHelperEnvironmentKey] == helper, Comment(rawValue: kind.rawValue))
-        #expect(native.environment[CherryControl.mcpServerNameEnvironmentKey] == name, Comment(rawValue: kind.rawValue))
+        #expect(native.environment[CherryControl.mcpHelperEnvironmentKey] == nil, Comment(rawValue: kind.rawValue))
+        #expect(native.environment[CherryControl.mcpServerNameEnvironmentKey] == nil, Comment(rawValue: kind.rawValue))
     }
-    // Another identity's name.
-    var devContext = hostedContext
-    devContext.mcpServerName = "cherry-dev"
-    let dev = HostedLaunchSpec.make(for: configuration(.agent, shell: "/bin/zsh"), context: devContext)
-    #expect(dev.environment[CherryControl.mcpServerNameEnvironmentKey] == "cherry-dev")
-    // Without a CherryMCP next to the app: neither, not the inherited ones.
-    let without = HostedLaunchSpec.make(for: configuration(.agent, shell: "/bin/zsh"), context: context(processEnvironment: inherited))
-    #expect(without.environment[CherryControl.mcpHelperEnvironmentKey] == nil)
-    #expect(without.environment[CherryControl.mcpServerNameEnvironmentKey] == nil)
-    let nativeWithout = ShellProcessController.nativeExecLaunch(
-        for: configuration(.agent, shell: "/bin/bash"),
-        shellIntegration: nil,
-        inheritedEnvironment: inherited,
-        terminfoDirectories: nil,
-        mcpHelperPath: nil
-    )
-    #expect(nativeWithout.environment[CherryControl.mcpServerNameEnvironmentKey] == nil)
     #expect(CherryTabEnvironment.keys.contains(CherryControl.mcpHelperEnvironmentKey))
     #expect(CherryTabEnvironment.keys.contains(CherryControl.mcpServerNameEnvironmentKey))
-    // Never sent to another Mac from This Mac's environment.
+    #expect(RemoteLaunchSpec.localOnlyKeys.contains(CherryControl.mcpHelperEnvironmentKey))
     #expect(RemoteLaunchSpec.localOnlyKeys.contains(CherryControl.mcpServerNameEnvironmentKey))
 }
 

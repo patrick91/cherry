@@ -46,11 +46,11 @@ extension CherryControlServer {
         )
     }
 
-    /// Whether `request` is one of control protocol 2's: answered in
+    /// Whether `request` is one of control protocol 2's or 3's: answered in
     /// `handleRequestData`, never nested in another request.
     static func isToolRequest(_ request: CherryControlRequest) -> Bool {
         switch request {
-        case .appInfo, .listTools, .callTool:
+        case .appInfo, .listTools, .callTool, .runCommand:
             true
         default:
             false
@@ -77,7 +77,10 @@ extension CherryControlServer {
                 message: "This Cherry does not know tool requests: it predates control protocol 2."
             )
         }
-        if case .callTool = request { return nil }
+        switch request {
+        case .callTool, .runCommand: return nil
+        default: break
+        }
 
         if let credentials {
             _ = try remoteCaller(credentials, origin: origin)
@@ -153,7 +156,7 @@ extension CherryControlServer {
         if Self.isToolRequest(request) {
             return .init(error: CherryControlError(
                 code: "invalid_request",
-                message: "A tool call sends typed requests only, never appInfo, listTools or callTool."
+                message: "A tool call sends typed requests only, never appInfo, listTools, callTool or runCommand."
             ))
         }
         do {

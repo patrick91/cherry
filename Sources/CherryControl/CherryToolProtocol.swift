@@ -11,8 +11,9 @@ import Foundation
 
 extension CherryControl {
     /// The control requests this build knows. 1: typed requests only (no
-    /// `appInfo`). 2: `appInfo`, `listTools` and `callTool`.
-    public static let controlProtocolVersion = 2
+    /// `appInfo`). 2: `appInfo`, `listTools` and `callTool`. 3:
+    /// `runCommand`, one `cherry` agent command run in the app.
+    public static let controlProtocolVersion = 3
     /// The tab's Cherry command-line tool (its build's `cherry`).
     public static let cliEnvironmentKey = "CHERRY_CLI"
 }
@@ -210,6 +211,166 @@ public struct CallToolResult: Codable, Equatable, Sendable {
         self.structured = structured
         self.bindProcessID = bindProcessID
         self.toolsDigest = toolsDigest
+    }
+}
+
+/// `runCommand`: one `cherry` agent command line (the words after
+/// `cherry`), which the app parses and runs as its caller
+/// (`CherryCLI`, `CherryControlServer.handleCommand`). The Rust `cherry`
+/// sends it; what the command needs from the caller's Mac (standard input,
+/// a file named on the command line) the app asks for in its answer
+/// (`needsStandardInput`, `needsFiles`), and the command is sent again with
+/// it: parsing calls nothing until it has everything.
+public struct RunCommandRequest: Codable, Equatable, Sendable {
+    /// A file the command named, as the caller read it (relative to its
+    /// directory): nil contents when it could not be read as UTF-8 text.
+    public struct File: Codable, Equatable, Sendable {
+        public var path: String
+        public var contents: String?
+
+        public init(path: String, contents: String?) {
+            self.path = path
+            self.contents = contents
+        }
+    }
+
+    /// What is at a path on the caller's Mac (`cherry skill`'s files),
+    /// as its `cherry` found it.
+    public struct PathInfo: Codable, Equatable, Sendable {
+        public var path: String
+        /// `lstat`'s kind.
+        public var entry: CherrySkillEntry
+        /// The kind with links followed (never `link`).
+        public var target: CherrySkillEntry
+        /// An executable file, links followed.
+        public var executable: Bool?
+        /// A directory's names, when it could be listed.
+        public var entries: [String]?
+
+        public init(path: String, entry: CherrySkillEntry, target: CherrySkillEntry, executable: Bool? = nil, entries: [String]? = nil) {
+            self.path = path
+            self.entry = entry
+            self.target = target
+            self.executable = executable
+            self.entries = entries
+        }
+    }
+
+    /// How one of the answer's `operations` went: no error when it did.
+    public struct OperationResult: Codable, Equatable, Sendable {
+        public var error: String?
+
+        public init(error: String? = nil) {
+            self.error = error
+        }
+    }
+
+    public var arguments: [String]
+    /// The caller's claim, project and directory, interface "cli".
+    public var context: ToolCallContext?
+    /// The caller's standard output is a terminal: the human form, unless
+    /// `--json`.
+    public var standardOutputIsTerminal: Bool?
+    /// Its standard input is a pipe, a file or a socket (never a terminal
+    /// or /dev/null), which a missing text argument reads.
+    public var standardInputIsPiped: Bool?
+    /// All of standard input, once an answer asked for it.
+    public var standardInput: String?
+    /// The files an answer asked for.
+    public var files: [File]?
+    /// The paths an answer asked about.
+    public var paths: [PathInfo]?
+    /// How the operations an answer asked for went, in their order.
+    public var operationResults: [OperationResult]?
+    /// The caller's variables the skill's files are placed by (HOME, PATH,
+    /// CLAUDE_CONFIG_DIR, CODEX_HOME, PI_CODING_AGENT_DIR, XDG_CONFIG_HOME).
+    public var environment: [String: String]?
+    /// The caller's `cherry` build, for `get_status`.
+    public var cliBuild: String?
+
+    public init(
+        arguments: [String],
+        context: ToolCallContext? = nil,
+        standardOutputIsTerminal: Bool? = nil,
+        standardInputIsPiped: Bool? = nil,
+        standardInput: String? = nil,
+        files: [File]? = nil,
+        paths: [PathInfo]? = nil,
+        operationResults: [OperationResult]? = nil,
+        environment: [String: String]? = nil,
+        cliBuild: String? = nil
+    ) {
+        self.paths = paths
+        self.operationResults = operationResults
+        self.arguments = arguments
+        self.context = context
+        self.standardOutputIsTerminal = standardOutputIsTerminal
+        self.standardInputIsPiped = standardInputIsPiped
+        self.standardInput = standardInput
+        self.files = files
+        self.environment = environment
+        self.cliBuild = cliBuild
+    }
+
+    /// The variables `environment` carries.
+    public static let environmentKeys = ["HOME", "PATH", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "XDG_CONFIG_HOME"]
+}
+
+/// The answer to `runCommand`: what the command prints and its exit status
+/// (0, 1 on the tool's error, 2 on a usage error), or what it needs first.
+public struct RunCommandResult: Codable, Equatable, Sendable {
+    /// A step `cherry` takes on its Mac (`cherry skill setup|remove`): make
+    /// a directory (and those above it), write a file atomically (a link
+    /// there is replaced), or remove a file, a link or an empty directory.
+    /// After a failed step, the later ones of its group are not taken.
+    public struct Operation: Codable, Equatable, Sendable {
+        public enum Kind: String, Codable, Sendable {
+            case createDirectory
+            case write
+            case remove
+        }
+
+        public var group: Int
+        public var kind: Kind
+        public var path: String
+        public var contents: String?
+
+        public init(group: Int, kind: Kind, path: String, contents: String? = nil) {
+            self.group = group
+            self.kind = kind
+            self.path = path
+            self.contents = contents
+        }
+    }
+
+    public var standardOutput: String
+    public var standardError: String
+    public var exitCode: Int32
+    /// Send the command again with all of standard input.
+    public var needsStandardInput: Bool?
+    /// Send the command again with these files.
+    public var needsFiles: [String]?
+    /// Send the command again saying what is at these paths.
+    public var needsPaths: [String]?
+    /// Take these steps, then send the command again with how they went.
+    public var operations: [Operation]?
+
+    public init(
+        standardOutput: String = "",
+        standardError: String = "",
+        exitCode: Int32 = 0,
+        needsStandardInput: Bool? = nil,
+        needsFiles: [String]? = nil,
+        needsPaths: [String]? = nil,
+        operations: [Operation]? = nil
+    ) {
+        self.needsPaths = needsPaths
+        self.operations = operations
+        self.standardOutput = standardOutput
+        self.standardError = standardError
+        self.exitCode = exitCode
+        self.needsStandardInput = needsStandardInput
+        self.needsFiles = needsFiles
     }
 }
 

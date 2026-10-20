@@ -1316,13 +1316,6 @@ struct CherryApp: App {
                 .disabled(focusedWorkspace == nil)
             }
 
-            // Temporary keyboard diagnostics; remove once the Shift+Enter/Shift+Tab report is understood.
-            CommandGroup(after: .help) {
-                Button("Keyboard Diagnostics…") {
-                    KeyboardDiagnosticsWindow.show()
-                }
-            }
-
             CommandMenu("Agents") {
                 let project = agentSettings.resolvedProject(for: focusedWorkspace?.projectRoot)
                 if project.launchableAgents.isEmpty {

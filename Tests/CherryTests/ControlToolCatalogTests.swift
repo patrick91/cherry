@@ -1,5 +1,4 @@
-import CherryControl
-@testable import CherryMCP
+@testable import CherryControl
 import Foundation
 import Testing
 
@@ -385,7 +384,23 @@ private let controlToolCatalogClaude = ToolClientProfile(client: ToolClientInfo(
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     let info = AppInfoResult(controlProtocol: CherryControl.controlProtocolVersion, build: "dev", version: nil, bundleIdentifier: nil, urlScheme: "cherry")
-    #expect(String(decoding: try encoder.encode(info), as: UTF8.self) == #"{"build":"dev","controlProtocol":2,"urlScheme":"cherry"}"#)
+    #expect(String(decoding: try encoder.encode(info), as: UTF8.self) == #"{"build":"dev","controlProtocol":3,"urlScheme":"cherry"}"#)
+
+    // runCommand as the Rust `cherry` sends it and reads its answer
+    // (Host/crates/cherry-cli/src/agent.rs).
+    let command = CherryControlRequest.runCommand(.init(
+        arguments: ["send", "dev", "-"],
+        context: .init(workingDirectory: "/w", interface: "cli"),
+        standardOutputIsTerminal: false, standardInputIsPiped: true, standardInput: "hi\n",
+        files: [.init(path: "a.json", contents: nil)], environment: ["HOME": "/h"], cliBuild: "b"
+    ))
+    #expect(String(decoding: try encoder.encode(command), as: UTF8.self) == #"{"runCommand":{"_0":{"arguments":["send","dev","-"],"cliBuild":"b","context":{"interface":"cli","workingDirectory":"/w"},"environment":{"HOME":"/h"},"files":[{"path":"a.json"}],"standardInput":"hi\n","standardInputIsPiped":true,"standardOutputIsTerminal":false}}}"#)
+    let rustCommand = #"{"runCommand":{"_0":{"arguments":["ls"],"context":{"callerProcessID":null,"interface":"cli"},"standardOutputIsTerminal":true,"standardInputIsPiped":false,"cliBuild":"b"}}}"#
+    #expect(try JSONDecoder().decode(CherryControlRequest.self, from: Data(rustCommand.utf8))
+        == .runCommand(.init(arguments: ["ls"], context: .init(interface: "cli"), standardOutputIsTerminal: true, standardInputIsPiped: false, cliBuild: "b")))
+    let answer = CherryControlResponse(result: .runCommand(.init(needsStandardInput: true)))
+    #expect(String(decoding: try encoder.encode(answer), as: UTF8.self)
+        == #"{"result":{"runCommand":{"_0":{"exitCode":0,"needsStandardInput":true,"standardError":"","standardOutput":""}}}}"#)
 
     let result = CallToolResult(text: #"{"ok":true}"#, isError: false, structured: .object(["ok": .bool(true)]), toolsDigest: "3f2a")
     let decoded = try JSONDecoder().decode(CallToolResult.self, from: encoder.encode(result))

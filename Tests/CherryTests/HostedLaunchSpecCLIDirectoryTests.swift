@@ -76,7 +76,6 @@ private func cliConfiguration(
         shellIntegration: ShellIntegrationBootstrap(zdotdir: "/tmp/zdotdir"),
         inheritedEnvironment: ["PATH": "/usr/bin:/bin"],
         terminfoDirectories: nil,
-        mcpHelperPath: nil,
         controlSocketPath: nil,
         cliPath: appCLI,
         cliDirectory: cliDirectory
@@ -91,7 +90,6 @@ private func cliConfiguration(
         shellIntegration: nil,
         inheritedEnvironment: ["PATH": "/usr/bin:/bin"],
         terminfoDirectories: nil,
-        mcpHelperPath: nil,
         controlSocketPath: nil,
         cliPath: appCLI,
         cliDirectory: cliDirectory
@@ -104,7 +102,6 @@ private func cliConfiguration(
         shellIntegration: nil,
         inheritedEnvironment: ["PATH": "/usr/bin:/bin"],
         terminfoDirectories: nil,
-        mcpHelperPath: nil,
         controlSocketPath: nil,
         cliPath: appCLI,
         cliDirectory: nil
@@ -196,7 +193,7 @@ private func cliConfiguration(
     let install = "/Users/them/Library/Application Support/cherry-host/bin/b1"
     let tab = UUID()
     let mcp = RemoteMCPLaunch(
-        deviceID: UUID(), socketPath: "/var/folders/x/T/cherry-mcp-1/control.sock", helperPath: "\(install)/CherryMCP",
+        deviceID: UUID(), socketPath: "/var/folders/x/T/cherry-mcp-1/control.sock",
         cliPath: "\(install)/cherry", controlMachine: "Laptop", tokens: RemoteMCPTokens(key: SymmetricKey(size: .bits256))
     )
     let configuration = ShellProcessController.Configuration(

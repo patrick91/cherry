@@ -1,13 +1,13 @@
-import CherryControl
-@testable import CherryMCP
+@testable import CherryControl
 import Darwin
 import Foundation
 import Testing
+@testable import Cherry
 
-// `cherry`'s agent commands (`CherryCLI`, `CherryMCP cli`;
+// `cherry`'s agent commands (`CherryCLI`, run in the app for a `runCommand`;
 // docs/specs/agent-cli.md): each command's words become one catalog tool's
-// call, its output JSON or a short human form, and the built helper runs
-// one end to end against a private control socket.
+// call, its output JSON or a short human form, and the built Rust `cherry`
+// runs them end to end against a private control socket.
 
 private func cliCall(_ arguments: [String], input: CherryCLIInput = .none) -> (tool: String, arguments: [String: JSONValue], fallback: CherryCLIFallback?)? {
     guard case .call(let tool, let arguments, let fallback) = CherryCLI.parse(arguments, input: input).action else { return nil }
@@ -303,132 +303,144 @@ private actor CLICallLog {
     func append(_ tool: String, _ arguments: [String: JSONValue]) { tools.append(tool) }
 }
 
-// MARK: - End to end
+// MARK: - runCommand
 
-/// A control socket that answers `appInfo` and records each `callTool`,
-/// answering it with `answer`.
-private final class CLITestApp: @unchecked Sendable {
-    let directory: URL
-    let socketURL: URL
-    private let listener: Int32
-    private let answer: @Sendable (CallToolRequest) -> CallToolResult
-    private let lock = NSLock()
-    private var received: [CallToolRequest] = []
-    private var isStopped = false
-    private let finished = DispatchSemaphore(value: 0)
-
-    init(answer: @escaping @Sendable (CallToolRequest) -> CallToolResult) throws {
-        self.answer = answer
-        directory = URL(fileURLWithPath: "/tmp/cherry-cli-\(UUID().uuidString.prefix(8))", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try #require(chmod(directory.path, 0o700) == 0)
-        socketURL = directory.appendingPathComponent("control.sock")
-        listener = socket(AF_UNIX, SOCK_STREAM, 0)
-        try #require(listener >= 0)
-        let bound = UnixIO.withSocketAddress(path: socketURL.path) { Darwin.bind(listener, $0, $1) }
-        try #require(bound == 0 && listen(listener, 16) == 0)
-        Thread.detachNewThread { [self] in serve() }
+/// `request` answered by `server` as This Mac's caller with no tab.
+@MainActor
+private func runCommand(_ request: RunCommandRequest, on server: CherryControlServer) async throws -> RunCommandResult {
+    let data = try JSONEncoder().encode(CherryControlRequest.runCommand(request))
+    let response = await server.handleRequestData(data, peerPID: nil)
+    guard case .runCommand(let result)? = response.result else {
+        throw CherryControlError(code: "unexpected_response", message: "\(response)")
     }
-
-    var calls: [CallToolRequest] {
-        lock.withLock { received }
-    }
-
-    func stop() {
-        lock.withLock { isStopped = true }
-        finished.wait()
-        try? FileManager.default.removeItem(at: directory)
-    }
-
-    private func serve() {
-        while !lock.withLock({ isStopped }) {
-            var poll = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
-            guard Darwin.poll(&poll, 1, 50) > 0 else { continue }
-            let connection = accept(listener, nil, nil)
-            guard connection >= 0 else { continue }
-            UnixIO.setNoSigPipe(connection)
-            respond(on: connection)
-            Darwin.close(connection)
-        }
-        Darwin.close(listener)
-        finished.signal()
-    }
-
-    private func respond(on connection: Int32) {
-        var line = Data()
-        var bytes = [UInt8](repeating: 0, count: 4_096)
-        while line.last != 0x0A {
-            let count = Darwin.read(connection, &bytes, bytes.count)
-            guard count > 0 else { break }
-            line.append(contentsOf: bytes.prefix(count))
-        }
-        guard let request = try? CherryControlEnvelope.decode(line.filter { $0 != 0x0A }).request else { return }
-        let response: CherryControlResponse
-        switch request {
-        case .appInfo:
-            response = .init(result: .appInfo(AppInfoResult(
-                controlProtocol: 2, build: "20261019120000.abcdef0", version: "2026.10.19.1", bundleIdentifier: "dev.patrick.cherry", urlScheme: "cherry"
-            )))
-        case .callTool(let call):
-            lock.withLock { received.append(call) }
-            response = .init(result: .callTool(answer(call)))
-        default:
-            response = .init(error: .init(code: "unexpected", message: "\(request)"))
-        }
-        guard let encoded = try? JSONEncoder().encode(response) else { return }
-        let reply = encoded + Data([0x0A])
-        _ = reply.withUnsafeBytes { Darwin.write(connection, $0.baseAddress, reply.count) }
-    }
+    return result
 }
 
-/// The built helper's `cli`: a multi-line message from standard input to a
-/// tab that is a command reaches the app as one `send_agent_message`, then,
-/// refused, as one `send_process_input` line; the app's answer is printed
-/// as JSON (standard output is a pipe), interface "cli".
-@Test func ControlToolCLIBuiltHelperRunsACommandEndToEnd() async throws {
-    let repository = URL(fileURLWithPath: #filePath)
-        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-    let helper = repository.appendingPathComponent(".build/debug/CherryMCP")
-    try #require(FileManager.default.isExecutableFile(atPath: helper.path), "Build CherryMCP first: swift build --build-tests")
-    let app = try CLITestApp { call in
-        call.name == "send_agent_message"
-            ? CallToolResult(text: #"{"error":{"code":"not_agent_process","message":"dev is a command."}}"#, isError: true, structured: nil)
-            : CallToolResult(text: #"{"sent_bytes":12}"#, isError: false, structured: nil)
-    }
-    defer { app.stop() }
-    let home = app.directory.appendingPathComponent("home", isDirectory: true)
-    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
-    let tab = UUID().uuidString
+/// The app parses a command; what only the caller's Mac has (standard
+/// input, a file) it asks for, and nothing runs until the command comes
+/// back with it.
+@MainActor
+@Test func ControlToolCLIRunCommandAsksForStandardInputAndFiles() async throws {
+    let harness = try ControlAgentWaitHarness()
+    defer { harness.stop() }
+    var sent: [CherryControlRequest] = []
+    harness.server.toolDispatchWillSendForTesting = { sent.append($0) }
 
-    let message = "line one\nline two\n"
-    let run = try await Task.detached { () -> (Int32, String, String) in
-        let process = Process()
-        process.executableURL = helper
-        process.arguments = ["cli", "send", "dev", "-"]
-        process.environment = [
-            CherryControl.socketEnvironmentKey: app.socketURL.path,
-            CherryControl.processIDEnvironmentKey: tab,
-            "HOME": home.path,
-        ]
-        let input = Pipe()
-        let output = Pipe()
-        let errors = Pipe()
-        process.standardInput = input
-        process.standardOutput = output
-        process.standardError = errors
-        try process.run()
-        input.fileHandleForWriting.write(Data(message.utf8))
-        try input.fileHandleForWriting.close()
-        let outputData = output.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: outputData, as: UTF8.self), String(decoding: errorData, as: UTF8.self))
-    }.value
-    #expect(run.0 == 0, "\(run.1) \(run.2)")
-    #expect(run.1 == #"{"sent_bytes":12}"# + "\n")
-    let calls = app.calls
-    #expect(calls.map(\.name) == ["send_agent_message", "send_process_input"])
-    #expect(calls.first?.arguments == ["process_name": .string("dev"), "message": .string(message)])
-    #expect(calls.last?.arguments == ["process_name": .string("dev"), "text": .string(message), "submit": .bool(true)])
-    #expect(calls.allSatisfy { $0.context?.interface == "cli" && $0.context?.callerProcessID == tab })
+    let piped = RunCommandRequest(arguments: ["todo", "add", "Ship it"], standardInputIsPiped: true)
+    let asked = try await runCommand(piped, on: harness.server)
+    #expect(asked == RunCommandResult(needsStandardInput: true))
+    #expect(sent.isEmpty)
+    var answered = piped
+    answered.standardInput = "The *notes*."
+    _ = try await runCommand(answered, on: harness.server)
+    // Sent once, with the text (the harness's project has todos off, which
+    // the tool then says).
+    #expect(sent.count == 1)
+    guard case .createTodo(let todo)? = sent.first else {
+        Issue.record("Expected createTodo, got \(sent)")
+        return
+    }
+    #expect(todo.title == "Ship it" && todo.markdown == "The *notes*.")
+
+    // A file named for an object parameter.
+    let report = RunCommandRequest(arguments: ["task", "report", "--value", "result.json", "--status", "ok"])
+    let wantsFile = try await runCommand(report, on: harness.server)
+    #expect(wantsFile == RunCommandResult(needsFiles: ["result.json"]))
+    var withFile = report
+    withFile.files = [.init(path: "result.json", contents: #"{"word":"alpha"}"#)]
+    let reported = try await runCommand(withFile, on: harness.server)
+    // No task: the tool's own refusal, after the file was read.
+    #expect(reported.exitCode == 1)
+    #expect(reported.standardError.hasPrefix("no_assignment:"), "\(reported.standardError)")
+    var unreadable = report
+    unreadable.files = [.init(path: "result.json", contents: nil)]
+    let refused = try await runCommand(unreadable, on: harness.server)
+    #expect(refused.exitCode == 2 && refused.standardError.contains("neither JSON nor a readable file"), "\(refused.standardError)")
+
+    // Usage, help and the guide need nothing.
+    #expect(try await runCommand(.init(arguments: ["bogus"]), on: harness.server).exitCode == 2)
+    #expect(try await runCommand(.init(arguments: ["skill", "show"]), on: harness.server).standardOutput == CherryCLIGuide.guide)
+}
+
+/// `get_status` names the builds that talk; `cherry skill status` reads
+/// the caller's own folders (its HOME, not the app's).
+@MainActor
+@Test func ControlToolCLIRunCommandStatusAndTheCallersSkill() async throws {
+    let harness = try ControlAgentWaitHarness()
+    defer { harness.stop() }
+    let status = try await runCommand(.init(arguments: ["tool", "get_status"], cliBuild: "dev-1.abc"), on: harness.server)
+    #expect(status.exitCode == 0, "\(status.standardError)")
+    let payload = try #require(try JSONValue.parse(Data(status.standardOutput.utf8)).objectValue)
+    #expect(payload["cli_build"] == .string("dev-1.abc"))
+    #expect(payload["app_control_protocol"] == .int(CherryControl.controlProtocolVersion))
+    #expect(payload["app_build"]?.stringValue != nil)
+
+    // The skill's files are the caller's: the app asks its `cherry` what
+    // is at their paths (never looks at its own disk), and without HOME it
+    // cannot place them.
+    let home = harness.projectRoot.appendingPathComponent("home", isDirectory: true)
+    let skill = try await runCommand(
+        .init(arguments: ["skill", "status", "--agent", "claude"], environment: ["HOME": home.path, "PATH": "/usr/bin:/bin"]),
+        on: harness.server
+    )
+    #expect(skill.needsPaths?.contains(home.appendingPathComponent(".claude/skills/cherry").path) == true, "\(skill)")
+    #expect(skill.operations == nil && skill.standardOutput.isEmpty)
+    let homeless = try await runCommand(.init(arguments: ["skill", "status"]), on: harness.server)
+    #expect(homeless.exitCode == 1 && homeless.standardError.hasPrefix("skill_unavailable:"), "\(homeless)")
+}
+
+// MARK: - End to end
+
+/// The Rust `cherry` against the app's control server: a multi-line message
+/// from standard input to a terminal reaches it as one line, `cherry ls`
+/// lists the tab, and the output is the tool's JSON (standard output is a
+/// pipe).
+@MainActor
+@Test func ControlToolCLIBuiltCherryRunsCommandsEndToEnd() async throws {
+    let cli = try builtCherryCLI()
+    let harness = try ControlAgentWaitHarness()
+    defer { harness.stop() }
+    harness.server.start()
+    let terminal = harness.workspace.addSession(title: "dev")
+    let home = harness.projectRoot.appendingPathComponent("home", isDirectory: true)
+    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+    let environment = [
+        CherryControl.socketEnvironmentKey: harness.socketURL.path,
+        CherryControl.projectRootEnvironmentKey: harness.projectRoot.path,
+        "HOME": home.path,
+        "PATH": "/usr/bin:/bin",
+    ]
+
+    let listed = try await runCherryCLI(cli, ["ls"], environment: environment)
+    #expect(listed.status == 0, "\(listed.error)")
+    #expect(listed.output.contains(terminal.id.uuidString), "\(listed.output)")
+
+    var typed: [CherryControlRequest] = []
+    harness.server.toolDispatchWillSendForTesting = { typed.append($0) }
+    let sent = try await runCherryCLI(cli, ["send", terminal.id.uuidString, "-"], environment: environment, input: "echo one\necho two\n")
+    #expect(sent.status == 0, "\(sent.error)")
+    #expect(sent.output.contains("sent_bytes"), "\(sent.output)")
+    let input = typed.compactMap { request -> String? in
+        guard case .scoped(let scoped) = request, case .sendProcessInput(let send) = scoped.request else { return nil }
+        return send.text
+    }
+    #expect(input == ["echo one\necho two\n"])
+
+    let unknown = try await runCherryCLI(cli, ["bogus"], environment: environment)
+    #expect(unknown.status == 2 && unknown.error.contains("unknown command"), "\(unknown.error)")
+
+    // The skill, set up, checked and removed on the Mac `cherry` runs on
+    // (its HOME, not the app's), through the paths and steps the app asks.
+    let skillFolder = home.appendingPathComponent(".claude/skills/cherry")
+    try FileManager.default.createDirectory(at: home.appendingPathComponent(".claude"), withIntermediateDirectories: true)
+    let setup = try await runCherryCLI(cli, ["skill", "setup", "--agent", "claude", "--json"], environment: environment)
+    #expect(setup.status == 0, "\(setup.output) \(setup.error)")
+    #expect(setup.output.contains(#""change":"wrote""#), "\(setup.output)")
+    #expect(try String(contentsOf: skillFolder.appendingPathComponent("SKILL.md"), encoding: .utf8) == CherrySkill.markdown + (CherrySkill.markdown.hasSuffix("\n") ? "" : "\n"))
+    #expect(FileManager.default.fileExists(atPath: skillFolder.appendingPathComponent(CherrySkill.markerFileName).path))
+    let status = try await runCherryCLI(cli, ["skill", "status", "--agent", "claude", "--json"], environment: environment)
+    #expect(status.status == 0 && status.output.contains(#""status":"current""#), "\(status.output) \(status.error)")
+    let removed = try await runCherryCLI(cli, ["skill", "remove", "--agent", "claude", "--json"], environment: environment)
+    #expect(removed.status == 0 && removed.output.contains(#""change":"removed""#), "\(removed.output) \(removed.error)")
+    #expect(!FileManager.default.fileExists(atPath: skillFolder.path))
 }

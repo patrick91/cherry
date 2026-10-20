@@ -447,21 +447,10 @@ final class ShellProcessController: @unchecked Sendable {
             shellIntegration: try? ShellIntegrationBootstrap.prepare(shellPath: configuration.shellPath),
             inheritedEnvironment: ProcessInfo.processInfo.environment,
             terminfoDirectories: Self.preferredTerminfo.additionalDirs,
-            mcpHelperPath: Self.appMCPHelperPath,
             controlSocketPath: CherryControlServer.appSocketPath,
             cliPath: Self.appCLIPath
         )
     }
-
-    /// This app's CherryMCP (next to its executable), when it is there:
-    /// every tab's `CHERRY_MCP_HELPER`, which the tab's `cherry` runs for
-    /// its agent commands whatever its PATH. Device tabs get their
-    /// install's (`RemoteMCPLaunch`).
-    static let appMCPHelperPath: String? = {
-        guard let directory = Bundle.main.executableURL?.deletingLastPathComponent() else { return nil }
-        let helper = directory.appendingPathComponent("CherryMCP", isDirectory: false).path
-        return FileManager.default.isExecutableFile(atPath: helper) ? helper : nil
-    }()
 
     /// The `cherry` this app runs itself, resolved once: every tab's
     /// `CHERRY_CLI`, nil when there is none. Device tabs get their
@@ -505,16 +494,12 @@ final class ShellProcessController: @unchecked Sendable {
     /// `controlSocketPath` is the socket the app's control server answers
     /// (`CherryControlServer.appSocketPath`), the tab's
     /// `CHERRY_CONTROL_SOCKET`; `cliPath` its `CHERRY_CLI`; `cliDirectory`
-    /// its `CHERRY_BIN_DIR`, first on its PATH (`TabCLIDirectory`); `mcpServerName`
-    /// the identity's scheme, its `CHERRY_MCP_SERVER_NAME` beside
-    /// `CHERRY_MCP_HELPER`.
+    /// its `CHERRY_BIN_DIR`, first on its PATH (`TabCLIDirectory`).
     static func nativeExecLaunch(
         for configuration: Configuration,
         shellIntegration: ShellIntegrationBootstrap?,
         inheritedEnvironment: [String: String],
         terminfoDirectories: String?,
-        mcpHelperPath: String? = appMCPHelperPath,
-        mcpServerName: String? = CherryAppIdentity.current.urlScheme,
         controlSocketPath: String? = CherryControlServer.appSocketPath,
         cliPath: String? = appCLIPath,
         cliDirectory: String? = TabCLIDirectory.current
@@ -553,12 +538,6 @@ final class ShellProcessController: @unchecked Sendable {
         }
         if let agentID = configuration.agentID, !agentID.isEmpty {
             environment[CherryControl.agentIDEnvironmentKey] = agentID
-        }
-        if let mcpHelperPath, !mcpHelperPath.isEmpty {
-            environment[CherryControl.mcpHelperEnvironmentKey] = mcpHelperPath
-            if let mcpServerName, !mcpServerName.isEmpty {
-                environment[CherryControl.mcpServerNameEnvironmentKey] = mcpServerName
-            }
         }
         if let controlSocketPath, !controlSocketPath.isEmpty {
             environment[CherryControl.socketEnvironmentKey] = controlSocketPath

@@ -1,6 +1,5 @@
 @testable import Cherry
-import CherryControl
-@testable import CherryMCP
+@testable import CherryControl
 import Foundation
 import Testing
 

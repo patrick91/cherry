@@ -211,11 +211,15 @@ struct HostedLaunchSpec: Equatable, Sendable {
     }
 
     /// The launch command inside the shell layer: the last argument without
-    /// its `exec -l ` prefix, or the `/bin/sh -c` command.
+    /// its `exec -l ` prefix (and a device terminal's lines before it,
+    /// `RemoteShellBootstrap`), or the `/bin/sh -c` command.
     var shellCommand: String? {
         guard let last = argv.last else { return nil }
         let prefix = "exec -l "
-        return argv.first == Self.launchShell && last.hasPrefix(prefix) ? String(last.dropFirst(prefix.count)) : last
+        guard argv.first == Self.launchShell else { return last }
+        if last.hasPrefix(prefix) { return String(last.dropFirst(prefix.count)) }
+        if let range = last.range(of: "; " + prefix, options: .backwards) { return String(last[range.upperBound...]) }
+        return last
     }
 
     // MARK: - Environment

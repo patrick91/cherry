@@ -1270,6 +1270,25 @@ store's reads in `RemoteDevices.swift`, `RemoteLaunchSpec`):
   shell whose syntax is not known here (nushell) gets PATH in `env` instead.
   A terminal tab gets none of this: its login shell reads its own startup
   files. `CHERRY_LOGIN_PATH` from a tab's own variables is never sent.
+- **`cherry` in a terminal there**: the install's directory first on PATH
+  once the startup files ran, as Cherry's zsh bootstrap puts This Mac's
+  first after `.zshrc`, so `cherry` is the install's even when that Mac's
+  own (an older Cherry.app's `~/.local/bin/cherry`) comes first
+  (`RemoteShellBootstrap`). The terminal gets it as `CHERRY_BIN_DIR`, and
+  a file of Cherry's goes in front of Ghostty's integration: zsh's
+  `.zshenv` (ZDOTDIR; it runs Ghostty's `.zshenv`, then prepends at the
+  first prompt), bash's ENV file (it runs Ghostty's `ghostty.bash`, which
+  reads the startup files, then prepends) and fish's `vendor_conf.d` (it
+  takes its directory back out of `XDG_DATA_DIRS` and prepends at the
+  first prompt). The launch line writes the shell's file there itself,
+  through a temporary file and a rename, into
+  `~/Library/Application Support/cherry-host/shell/<digest>/`, named by
+  the files' contents, so older installs get it too and a launch never
+  reads other contents; when it cannot write it the terminal starts with
+  Ghostty's alone. Only terminals with Ghostty's integration there (a
+  device with `installedResources` and a known login shell); Apple's
+  /bin/bash (which Ghostty does not integrate) and other shells keep that
+  Mac's PATH.
 - **When it cannot be read**: today's launch (the host's PATH, the
   account's). The launch records why (`HostedLaunchSpec.loginPathProblem`,
   `PersistentSessionLaunch.loginPathProblem`,

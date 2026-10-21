@@ -158,7 +158,12 @@ identifies, scopes and refuses the caller (Scope And Identity).
   `<Application Support>/bin`, made by the instance-lock holder), which
   Cherry's zsh bootstrap puts first again after the user's `.zshrc`. A
   device's commands and agents get their install's directory first on the
-  login PATH their line sets; its interactive terminals keep `CHERRY_CLI`.
+  login PATH their line sets, and its terminals get it first once their
+  startup files ran (`CHERRY_BIN_DIR` there, `RemoteShellBootstrap`: zsh,
+  a bash Ghostty integrates and fish, with Ghostty's integration there; a
+  file in front of Ghostty's, which the launch writes into
+  `~/Library/Application Support/cherry-host/shell/<digest>/`). Apple's
+  /bin/bash and other shells keep that Mac's PATH, and `CHERRY_CLI`.
 
 ## Versions
 

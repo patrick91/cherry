@@ -14,7 +14,9 @@ import Foundation
 ///   known, the terminal runs that shell the way `HostedLaunchSpec` runs
 ///   This Mac's: `/bin/bash --noprofile --norc -c 'exec -l <shell…>'` with
 ///   Ghostty's zsh, bash or fish integration (OSC 7 directory, titles,
-///   prompt marks).
+///   prompt marks), and the install's `cherry` first on PATH once the
+///   startup files ran (`RemoteShellBootstrap`, whose lines go before the
+///   `exec -l`).
 /// - A command or an agent runs `[remoteShell, "-l", "-c", line]`, so its
 ///   line sees the other Mac's login PATH. That shell is not interactive, so
 ///   it never reads ~/.zshrc (or ~/.bashrc), where many tools put themselves
@@ -218,6 +220,14 @@ enum RemoteLaunchSpec {
                     command: command,
                     account: HostedLaunchAccount(userName: "remote", homeDirectory: "", shell: loginShell)
                 )
+                // The install's `cherry` first on PATH once its startup
+                // files ran (`RemoteShellBootstrap`).
+                if argv.first == HostedLaunchSpec.launchShell,
+                   let line = RemoteShellBootstrap.launchLine(
+                       command: command, loginShell: loginShell, installRoot: resources.root, environment: &environment
+                   ) {
+                    argv[argv.count - 1] = line
+                }
             }
         } else {
             environment["TERM"] = term

@@ -60,7 +60,8 @@ directly (or with `open --env`).
   removes every session there, shuts the daemon down, kills leftover holders and adapters, and
   deletes the directory. Its sessions' holders outlive a killed daemon, so never just kill it.
 - Quitting CherryDev (⌘Q, `osascript -e 'quit app "CherryDev"'`) or closing a project window
-  while persistent tabs run asks "Keep N sessions running in the background?" and waits for an
+  while persistent tabs run, one of them busy (idle shells alone are kept without asking), asks
+  "Keep N sessions running in the background?" and waits for an
   answer. For scripted runs, launch with `-sessions.onQuit keep` (or `end`) so it asks nothing:
   `dist/CherryDev.app/Contents/MacOS/CherryDev -sessions.onQuit keep &` (or
   `open -n dist/CherryDev.app --args -sessions.onQuit keep`). SIGTERM (`kill <pid>`) also quits

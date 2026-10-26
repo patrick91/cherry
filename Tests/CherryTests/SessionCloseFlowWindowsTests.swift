@@ -206,7 +206,10 @@ private let backgroundSessionsLine = "Open or end it from Background Sessions in
     let primary = project.open()
     let other = project.open(UUID())
     for opened in [primary, other] {
-        #expect(await harness.waitUntilAttached(try #require(opened.workspace.sessions.first)))
+        let tab = try #require(opened.workspace.sessions.first)
+        #expect(await harness.waitUntilAttached(tab))
+        // A busy shell: idle ones are kept without a question.
+        #expect(await harness.makeBusy(tab))
     }
 
     #expect(!project.registry.isLastWindowOfProject(other.window))
@@ -265,7 +268,10 @@ private let backgroundSessionsLine = "Open or end it from Background Sessions in
     let kept = project.open(keptID)
     let ended = project.open(endedID)
     for opened in [primary, kept, ended] {
-        #expect(await harness.waitUntilAttached(try #require(opened.workspace.sessions.first)))
+        let tab = try #require(opened.workspace.sessions.first)
+        #expect(await harness.waitUntilAttached(tab))
+        // A busy shell: idle ones are kept without a question.
+        #expect(await harness.makeBusy(tab))
     }
     let keptSession = try sessionID(of: try #require(kept.workspace.sessions.first))
     let endedSession = try sessionID(of: try #require(ended.workspace.sessions.first))
@@ -327,6 +333,7 @@ private let backgroundSessionsLine = "Open or end it from Background Sessions in
     let primary = project.open()
     let tab = try #require(primary.workspace.sessions.first)
     #expect(await harness.waitUntilAttached(tab))
+    #expect(await harness.makeBusy(tab))
 
     #expect(!primary.delegate.windowShouldClose(primary.window))
     #expect(try #require(questions.asked.last).tabsComeBack)
@@ -352,7 +359,9 @@ private let backgroundSessionsLine = "Open or end it from Background Sessions in
     // Two windows: one asking to close is not the last.
     let reopened = project.open()
     let other = project.open(UUID())
-    #expect(await harness.waitUntilAttached(try #require(other.workspace.sessions.first)))
+    let otherTab = try #require(other.workspace.sessions.first)
+    #expect(await harness.waitUntilAttached(otherTab))
+    #expect(await harness.makeBusy(otherTab))
     #expect(!other.delegate.windowShouldClose(other.window))
     #expect(try #require(questions.asked.last).tabsComeBack == false)
     #expect(project.registry.openAnotherWindow(from: reopened.window))
@@ -591,6 +600,7 @@ private let backgroundSessionsLine = "Open or end it from Background Sessions in
     #expect(await harness.fake.wait { primary.workspace.sessions.map(\.id) == [primaryTab.id] })
     let shell = primary.workspace.addSession(title: "Shell")
     #expect(await harness.waitUntilAttached(shell))
+    #expect(await harness.makeBusy(shell))
 
     #expect(!registry.isLastWindowOfProject(primary.window))
     #expect(!primary.delegate.windowShouldClose(primary.window))

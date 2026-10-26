@@ -149,6 +149,21 @@ final class PersistentHarness {
         if let exited { connection.push(.event(.changed(exited))) }
     }
 
+    /// Reports that the tab's shell runs `job` in its foreground (a busy
+    /// terminal), and waits until the tab sees it.
+    func makeBusy(_ session: TerminalSession, job: String = "sleep") async -> Bool {
+        guard let id = session.persistentSession?.sessionID,
+              let info = fake.sessions.first(where: { $0.id == id }) else { return false }
+        let busy = HostedSessionInfo(
+            id: id, name: info.name, cwd: info.cwd, command: info.command, pid: info.pid ?? 42,
+            foreground: HostedSessionForeground(pid: 99, name: job),
+            owner: info.owner, tags: info.tags, createdAt: info.createdAt
+        )
+        fake.sessions = fake.sessions.map { $0.id == id ? busy : $0 }
+        fake.connections.last(where: { !$0.isClosed })?.push(.event(.changed(busy)))
+        return await fake.wait { session.hasRunningProcess() }
+    }
+
     func statusFile(of call: String) throws -> URL {
         let parts = call.split(separator: " ").map(String.init)
         let index = try #require(parts.firstIndex(of: "--status-file"))

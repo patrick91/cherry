@@ -1055,9 +1055,11 @@ enum SessionTeardownConfirmation: Equatable {
 
     /// `preference`: Settings › Sessions (`LocalSessionsOnQuit`).
     /// `mayAsk`: false for a log out, restart, shut down or update, which
-    /// keep sessions whatever the preference and never ask about them. With
-    /// no running session nothing is asked: ended persistent tabs follow the
-    /// preference (asking keeps them, showing their exit next time).
+    /// keep sessions whatever the preference and never ask about them. It
+    /// asks only when one of the running sessions is busy (an agent, a
+    /// command, a shell running a job): idle shells, like ended persistent
+    /// tabs, follow the preference without a question (asking keeps them,
+    /// as its default answer does; ended ones show their exit next time).
     /// `systemEndsSessions`: a log out, restart or shut down, after which
     /// the system ends the sessions it keeps: their busy programs stop as
     /// surely as native ones, so they are confirmed too, and Cancel keeps
@@ -1068,7 +1070,7 @@ enum SessionTeardownConfirmation: Equatable {
         mayAsk: Bool,
         systemEndsSessions: Bool = false
     ) -> Self {
-        if mayAsk, preference == .ask, !summary.runningSessions.isEmpty {
+        if mayAsk, preference == .ask, summary.runningSessions.contains(where: \.isBusy) {
             return .askAboutSessions
         }
         let endsSessions = mayAsk && preference == .end

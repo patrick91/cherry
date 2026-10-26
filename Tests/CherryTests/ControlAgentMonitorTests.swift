@@ -476,6 +476,42 @@ struct ControlAgentMonitorTests {
         #expect(events.events.map(\.type) == [.done])
     }
 
+    /// The subscriber answered the worker's turn while busy (the turn's
+    /// `done` came meanwhile): that `done` is old news by the time the
+    /// subscriber is idle. It stays readable, but no wake line names it.
+    @Test func turnsDoneTheWorkerHasMovedPastWakesNobody() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        let worker = try await harness.spawnAgent(named: "Claude")
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(800))
+        let id = try await harness.subscribe(.init(
+            processIDs: [worker.id.uuidString], subscriberProcessID: orchestrator.id.uuidString
+        )).subscription.subscriptionID
+
+        // The worker's turn ends while the orchestrator is busy, and the
+        // orchestrator answers it before it goes idle.
+        harness.report("state=working:app=fake", on: orchestrator)
+        harness.screen("⏺ Here is my plan.\n\n❯ \n", on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(600))
+        _ = try await harness.send(.sendProcessInput(.init(processID: worker.id.uuidString, text: "approved", submit: true)))
+        harness.report("state=working:app=claude-code", on: worker)
+        harness.report("state=done:app=fake", on: orchestrator)
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(!(try await harness.output(of: orchestrator)).contains("[cherry] Monitor"))
+
+        // Still there to read.
+        let events = try await harness.events(id, timeoutMilliseconds: 0)
+        #expect(events.events.map(\.type) == [.done])
+        #expect(events.events.first?.agentTurn == 1)
+    }
+
     @Test func wakeLineSettingOffAndUnconfirmedSubscriberOnlyPoll() async throws {
         let harness = try ControlAgentWaitHarness()
         defer { harness.stop() }

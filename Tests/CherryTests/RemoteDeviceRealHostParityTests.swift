@@ -213,6 +213,15 @@ private func hostName() -> String {
         defer { HostedRemoteHostPaths.shared.setOverride(nil, for: "term") }
         let hosting = try #require(store.hosting(for: device.id))
         let key = device.projectKey(path: mac.projectPath)
+        // Its .zshrc puts that Mac's own `cherry` first (an older
+        // Cherry.app's ~/.local/bin link).
+        let other = mac.home.appendingPathComponent("other-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        try "#!/bin/sh\necho old\n".write(to: other.appendingPathComponent("cherry"), atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: other.appendingPathComponent("cherry").path)
+        let zshrc = mac.home.appendingPathComponent(".zshrc")
+        try "export PATH=\"$HOME/other-bin:$PATH\"\n".write(to: zshrc, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: zshrc) }
         let window = TerminalWorkspace(
             projectRoot: key, createInitialSession: false,
             backendPolicy: .remote(hosting, settings: { .defaults }, hostReconnects: nil)
@@ -224,10 +233,22 @@ private func hostName() -> String {
         let their = mac.makeTheirControl()
         let listed = try #require(try await mac.sessions(their).first { $0.id == binding.sessionID })
         #expect(listed.command.first == "/bin/bash")
-        #expect(listed.command.last == "exec -l /bin/zsh")
+        #expect(listed.command.last?.hasSuffix("; exec -l /bin/zsh") == true)
         try await tab.sendControlInput(Data("printf 'T=%s:%s\\n' \"$TERM\" \"$(infocmp -x xterm-ghostty >/dev/null 2>&1 && echo ok)\"\n".utf8), raw: false)
         try await mac.waitFor("TERM and its terminfo there") {
             (try? await hosting.screen(of: binding).text.contains("T=xterm-ghostty:ok")) == true
+        }
+        // `cherry` is the install's, whatever the .zshrc did.
+        // (Compared there: the path is longer than the screen is wide.)
+        let check = "[ \"$(command -v cherry)\" = \(RemoteDeviceProbe.singleQuoted(build.path + "/cherry")) ] && echo C=in\"\"stall || echo C=other\n"
+        try await tab.sendControlInput(Data(check.utf8), raw: false)
+        do {
+            try await mac.waitFor("the install's cherry first on PATH") {
+                (try? await hosting.screen(of: binding).text.contains("C=install")) == true
+            }
+        } catch {
+            Issue.record("screen=\((try? await hosting.screen(of: binding).text) ?? "")")
+            throw error
         }
         // OSC 7 (Ghostty's zsh integration) reaches the tab through the host.
         let work = mac.home.appendingPathComponent("work").path

@@ -266,12 +266,16 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     }
     let terminal = configuration()
     // zsh: its login shell through bash's `exec -l`, with ZDOTDIR on
-    // Ghostty's zsh integration there.
+    // Ghostty's zsh integration there (Cherry's file in front of it,
+    // `RemoteShellBootstrap`).
     let zsh = RemoteLaunchSpec.make(
         for: terminal, device: .init(shell: "/bin/zsh", homeDirectory: "/Users/me", resources: resources),
         cursorBlink: false, localeEnvironment: ["LANG": "en_GB.UTF-8"]
     )
-    #expect(zsh.argv == ["/bin/bash", "--noprofile", "--norc", "-c", "exec -l /bin/zsh"])
+    #expect(Array(zsh.argv.prefix(4)) == ["/bin/bash", "--noprofile", "--norc", "-c"])
+    #expect(zsh.argv.last?.hasSuffix("; exec -l /bin/zsh") == true)
+    #expect(zsh.shellCommand == "/bin/zsh")
+    #expect(zsh.environment["CHERRY_BIN_DIR"] == root)
     #expect(zsh.environment["TERM"] == "xterm-ghostty")
     #expect(zsh.environment["TERMINFO"] == root + "/terminfo")
     #expect(zsh.environment["GHOSTTY_RESOURCES_DIR"] == root + "/Ghostty")
@@ -288,7 +292,7 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
         for: terminal, device: .init(shell: "/opt/homebrew/bin/bash", homeDirectory: "/Users/me", resources: resources),
         localeEnvironment: [:]
     )
-    #expect(bash.argv == ["/bin/bash", "--noprofile", "--norc", "-c", "exec -l /opt/homebrew/bin/bash --posix"])
+    #expect(bash.shellCommand == "/opt/homebrew/bin/bash --posix")
     #expect(bash.environment["ENV"] == root + "/Ghostty/shell-integration/bash/ghostty.bash")
     #expect(bash.environment["HISTFILE"] == "/Users/me/.bash_history")
     // fish: its data directories.
@@ -296,7 +300,7 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
         for: terminal, device: .init(shell: "/opt/homebrew/bin/fish", homeDirectory: "/Users/me", resources: resources),
         localeEnvironment: [:]
     )
-    #expect(fish.argv.last == "exec -l /opt/homebrew/bin/fish")
+    #expect(fish.shellCommand == "/opt/homebrew/bin/fish")
     #expect(fish.environment["XDG_DATA_DIRS"] == root + "/Ghostty/shell-integration:/usr/local/share:/usr/share")
 
     // A command: its line through the login shell, with the terminfo.

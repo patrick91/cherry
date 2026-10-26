@@ -155,7 +155,7 @@ public enum CherryCLI {
                 usage: "cherry answer ID CHOICE", summary: "Pick an option of an agent's permission or question menu (number or label)."),
         Command(words: ["spawn", "agent"], tool: "spawn_agent", positionals: [.value("name")],
                 aliases: [Alias(flag: "schema", parameter: "result_schema"), Alias(flag: "run", parameter: "run_id")],
-                usage: "cherry spawn agent NAME [--task - | --message -] [--label L] [--phase P] [--schema FILE|-] [--run RUN] [--allow-subagents]",
+                usage: "cherry spawn agent NAME [--task - | --message -] [--label L] [--phase P] [--schema FILE|-] [--run RUN] [--allow-subagents] [--project-root DIR]",
                 summary: "Start a configured agent; with --task it is a worker of yours."),
         Command(words: ["spawn", "terminal"], tool: "spawn_process", positionals: [.text("text", optional: true)],
                 fixed: ["kind": .string("terminal")],

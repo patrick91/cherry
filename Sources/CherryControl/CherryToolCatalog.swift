@@ -266,11 +266,11 @@ public enum CherryToolCatalog {
             ),
             tool(
                 "spawn_agent",
-                "Create a configured agent (sent_bytes 0 if its message did not arrive). With task, not message, it is a worker: Cherry types it a kickoff; it reads the brief with get_my_task and answers with report_result. Wait with wait_for_tasks or end your turn; read results with get_task. Workers are tabs nested under you; use them instead of your CLI's own subagents.",
+                "Create a configured agent (sent_bytes 0 if its message failed). With task, not message, it is a worker: Cherry types it a kickoff; it calls get_my_task and report_result. Wait with wait_for_tasks or end your turn; read results with get_task. Workers are tabs nested under you; use them instead of your CLI's own subagents.",
                 properties: [
                     "name": string("Configured agent."),
                     "model": string(),
-                    "effort": string("Reasoning effort, e.g. high."),
+                    "effort": string("Reasoning effort."),
                     "title": string("Default label for a task."),
                     "message": string("First message, Enter added. Not with task."),
                     "task": string("The worker's brief: what to do and report."),
@@ -279,6 +279,7 @@ public enum CherryToolCatalog {
                     "run_id": string("With task: run to join; default your current one."),
                     "result_schema": object("With task: JSON Schema of the value: type, properties, required, items, enum, additionalProperties; other keywords are refused before anything is spawned."),
                     "allow_subagents": boolean("With task: it may use its CLI's subagents."),
+                    "project_root": string("Default: yours."),
                     "parent_agent_id": string(defaultCallerAgent),
                     "bind_session": boolean("Bind this session to it (default false)."),
                     "wait_ms": waitBeforeOutput,

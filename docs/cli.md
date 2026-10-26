@@ -758,6 +758,14 @@ Codex, Pi and others.
   (`invalid_result_schema`, with `details`), a run the caller cannot use
   (`unknown_run`), and a worker of an open task handing out tasks itself
   (`nested_task`).
+- `project_root` (`cherry spawn agent NAME --project-root DIR --task -`)
+  runs the worker in another open project: its tab opens there, in that
+  project's folder, top-level in that project's window (a sidebar nests only
+  its own window's tabs), and its task is still the caller's, in the
+  caller's run, counted on the caller's row. A parent in another window
+  (the caller, which the tool layer names by default, or an explicit
+  `parent_agent_id`) owns the task that way; a project that is not open is
+  `project_unavailable`, whose message names `cherry project open DIR`.
 - Once the worker is ready, Cherry types one line into it:
 
   ```text

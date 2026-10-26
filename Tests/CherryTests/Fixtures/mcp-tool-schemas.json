@@ -455,6 +455,9 @@
       "phase": {
         "type": "string"
       },
+      "project_root": {
+        "type": "string"
+      },
       "result_schema": {
         "type": "object"
       },

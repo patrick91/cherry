@@ -62,6 +62,8 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
         (["spawn", "agent", "claude", "--task", "Fix it", "--label", "Fix", "--phase", "impl", "--run", "run-1", "--allow-subagents"],
          "spawn_agent", ["name": .string("claude"), "task": .string("Fix it"), "label": .string("Fix"), "phase": .string("impl"),
                          "run_id": .string("run-1"), "allow_subagents": .bool(true)]),
+        (["spawn", "agent", "claude", "--task", "Add logout", "--project-root", "/Users/me/auth"], "spawn_agent",
+         ["name": .string("claude"), "task": .string("Add logout"), "project_root": .string("/Users/me/auth")]),
         (["spawn", "agent", "claude", "--schema", #"{"type":"object"}"#], "spawn_agent",
          ["name": .string("claude"), "result_schema": .object(["type": .string("object")])]),
         (["spawn", "terminal", "npm test"], "spawn_process", ["kind": .string("terminal"), "text": .string("npm test")]),

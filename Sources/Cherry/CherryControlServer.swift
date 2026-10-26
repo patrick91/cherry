@@ -944,7 +944,10 @@ final class CherryControlServer: @unchecked Sendable {
         guard let longest = containing.map(\.1.count).max(),
               let window = preferredWindow(among: containing.filter { $0.1.count == longest }.map(\.0), caller: caller.workspace)
         else {
-            throw CherryControlError(code: "project_unavailable", message: "Cherry project is not open for scoped request: \(projectRoot).")
+            throw CherryControlError(
+                code: "project_unavailable",
+                message: "Cherry project is not open for scoped request: \(projectRoot). Open it first: cherry project open \(projectRoot)"
+            )
         }
         return window
     }
@@ -1785,14 +1788,14 @@ final class CherryControlServer: @unchecked Sendable {
                 throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(resolvedAgent.name)' is not launchable.")
             }
             let agentDefinition = try agentDefinition(resolvedAgent, overridingModel: request.model, effort: request.effort)
-            let parentID = try parentAgentID(from: request.parentAgentID, workspace: workspace)
+            let parent = try spawnParent(from: request.parentAgentID, workspace: workspace)
             // Checked (its schema too) before anything is spawned.
-            let taskPlan = try prepareTaskSpawn(request, parentAgentID: parentID, workspace: workspace)
+            let taskPlan = try prepareTaskSpawn(request, parentAgentID: parent.owner, workspace: workspace)
             session = workspace.addAgentSession(
                 agent: agentDefinition,
                 projectRoot: projectRoot,
                 title: request.title ?? taskPlan?.label,
-                parentAgentID: parentID,
+                parentAgentID: parent.tab,
                 select: false
             )
             if let taskPlan {
@@ -2347,6 +2350,32 @@ final class CherryControlServer: @unchecked Sendable {
         }
     }
 
+    /// The agent a spawned agent is nested under (`tab`) and the one that
+    /// owns its task (`owner`): the same agent, except one in another
+    /// window, another project's included (an orchestrator handing a task
+    /// to a worker in another project, `project_root`; the tool layer names
+    /// the caller as the parent). That one owns the task, and the worker
+    /// opens top-level in `workspace`: a sidebar nests only its own
+    /// window's tabs.
+    @MainActor
+    private func spawnParent(from rawValue: String?, workspace: TerminalWorkspace) throws -> (tab: UUID?, owner: UUID?) {
+        do {
+            let parentID = try parentAgentID(from: rawValue, workspace: workspace)
+            return (parentID, parentID)
+        } catch let error as CherryControlError where error.code == "parent_agent_not_found" {
+            guard let rawValue, let parentID = UUID(uuidString: rawValue.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  let found = try? findSessionWithWorkspace(workspace: workspace, terminalID: parentID.uuidString),
+                  found.workspace !== workspace,
+                  callerReaches(found.session, in: found.workspace)
+            else { throw error }
+            guard found.session.kind == .agent else {
+                throw CherryControlError(code: "parent_agent_not_agent", message: "parent_agent_id must refer to an agent session.")
+            }
+            mcpControlDebugLog("parent_agent_id=\(parentID.uuidString) is in another window: owns the task, worker top-level")
+            return (nil, parentID)
+        }
+    }
+
     @MainActor
     private func parentAgentID(from rawValue: String?, workspace: TerminalWorkspace) throws -> UUID? {
         mcpControlDebugLog("parentAgentID(from:) raw=\(rawValue ?? "nil")")
@@ -2578,7 +2607,7 @@ final class CherryControlServer: @unchecked Sendable {
 
         throw CherryControlError(
             code: "project_unavailable",
-            message: "Cherry project is not open for scoped request: \(rawProjectRoot)."
+            message: "Cherry project is not open for scoped request: \(rawProjectRoot). Open it first: cherry project open \(rawProjectRoot)"
         )
     }
 

@@ -71,6 +71,9 @@ public enum CherryCLIGuide {
 
         - `--schema FILE` gives the result's JSON Schema; `--run RUN` joins a run;
           `--allow-subagents` lets the worker use its own CLI's subagents.
+        - `--project-root DIR` runs the worker in another open project (`cherry project ls`;
+          `cherry project open DIR` first): its tab is in that project's window, and it
+          still reports to you.
         - Then end your turn: when the run settled and you are idle, Cherry types one
           line into your tab. Or wait: `cherry task wait RUN --cursor N` (call again on
           timed_out). Read each result with `cherry task get TASK`: results are the

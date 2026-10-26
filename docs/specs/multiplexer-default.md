@@ -169,8 +169,10 @@ Undoing a close or detach (`ClosedTabHistory`):
 
 Quit and window close ask at most one question. When local persistent tabs
 (not native tabs, not tabs attached to a session they do not own) have a
-running program, a Create under way included, and *on quit* is Ask, a sheet
-asks "Keep N sessions running in the background?": **Keep Running** (the
+running program, a Create under way included, at least one of them is busy
+(an agent, a command, or a shell running a job: idle shells alone are kept
+without a question, as its default answer keeps them), and *on quit* is Ask,
+a sheet asks "Keep N sessions running in the background?": **Keep Running** (the
 default, Return) closes with `windowClosed`/`appQuit`, **End Sessions**
 (destructive) with `windowClosedEndingSessions`/`appQuitEndingSessions`, and
 **Cancel** closes nothing. It lists up to five of them (busy ones first,

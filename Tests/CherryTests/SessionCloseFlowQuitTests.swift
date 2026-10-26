@@ -30,7 +30,7 @@ private func summary(
     )
 }
 
-@Test @MainActor func aWindowCloseOrQuitAsksOnlyWhenSessionsRunAndThePreferenceAsks() {
+@Test @MainActor func aWindowCloseOrQuitAsksOnlyWhenABusySessionRunsAndThePreferenceAsks() {
     let cases: [(String, SessionTeardownSummary)] = [
         ("nothing", summary()),
         ("idle sessions", summary(running: [false, false])),
@@ -42,17 +42,18 @@ private func summary(
             var summary = base
             summary.stoppedWhenKeeping = nativeBusy
             summary.stoppedWhenEnding = base.stoppedWhenEnding + nativeBusy
-            let running = !summary.runningSessions.isEmpty
+            let busy = summary.runningSessions.contains(where: \.isBusy)
             for mayAsk in [true, false] {
                 let label = Comment(rawValue: "\(name), native busy \(nativeBusy), may ask \(mayAsk)")
                 let keeping: SessionTeardownConfirmation = nativeBusy > 0
                     ? .confirmStopping(count: nativeBusy, endsSessions: false)
                     : .none(endsSessions: false)
 
-                // Asked only when sessions run, the preference asks, and
-                // the quit is the user's.
+                // Asked only when a session is busy (idle shells are kept,
+                // as the question's default answer keeps them), the
+                // preference asks, and the quit is the user's.
                 #expect(SessionTeardownConfirmation.decide(summary, preference: .ask, mayAsk: mayAsk)
-                    == (mayAsk && running ? .askAboutSessions : keeping), label)
+                    == (mayAsk && busy ? .askAboutSessions : keeping), label)
                 #expect(SessionTeardownConfirmation.decide(summary, preference: .keep, mayAsk: mayAsk) == keeping, label)
                 // Ending them stops the busy ones too; a log out, restart,
                 // shut down or update keeps them whatever the preference.
@@ -557,8 +558,10 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
         return (workspace, tabs)
     }
 
-    // End Sessions with "Don't ask again".
+    // End Sessions with "Don't ask again" (one shell busy: idle ones are
+    // kept without a question).
     let (workspace, tabs) = try await openWindow(["One", "Two"])
+    #expect(await harness.makeBusy(tabs[0]))
     let ended = try sessionIDs(tabs)
     let window = ClosingWindow()
     let delegate = closeDelegate(for: window, workspace: workspace)
@@ -651,6 +654,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     // every tab and the window, and stores nothing.
     let running = workspace.addSession(title: "Running")
     #expect(await harness.waitUntilAttached(running))
+    #expect(await harness.makeBusy(running))
     #expect(!delegate.windowShouldClose(window))
     #expect(dialogs.questions.map { $0.summary.runningSessions.map(\.id) } == [[running.id]])
     #expect(dialogs.stoppingCounts == [1])
@@ -663,6 +667,40 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     #expect(harness.fake.requests("kill").isEmpty)
     #expect(harness.fake.requests("remove").isEmpty)
     #expect(window.closeCount == 0)
+}
+
+@Test @MainActor func aWindowWithOnlyIdleShellsClosesWithoutAskingAndKeepsThem() async throws {
+    let harness = try PersistentHarness()
+    let dialogs = CloseDialogs()
+    let workspace = harness.workspace()
+    defer {
+        dialogs.restore()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let tabs = [workspace.addSession(title: "One"), workspace.addSession(title: "Two")]
+    for tab in tabs {
+        #expect(await harness.waitUntilAttached(tab))
+    }
+    let sessions = try sessionIDs(tabs)
+    #expect(!tabs.contains { $0.hasRunningProcess() })
+    let summary = workspace.teardownSummary(.windowClose, pathDisplayMode: .repoFocused)
+    #expect(summary.runningSessions.count == 2)
+    // A quit with them asks nothing either.
+    #expect(SessionTeardownConfirmation.decide(summary, preference: .ask, mayAsk: true) == .none(endsSessions: false))
+
+    // Two idle shells: the window closes at once, keeping them, as Keep
+    // Running would, and the launch notice may still name them.
+    let window = ClosingWindow()
+    let delegate = closeDelegate(for: window, workspace: workspace)
+    #expect(delegate.windowShouldClose(window))
+    closeWithoutConfirmation(window, delegate: delegate)
+    #expect(dialogs.questions.isEmpty)
+    #expect(dialogs.stoppingCounts.isEmpty)
+    #expect(dialogs.keptInBackground.isEmpty)
+    #expect(workspace.closeAllIntent == .windowClosed)
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(Set(harness.requestIDs("kill")).isDisjoint(with: sessions))
 }
 
 @Test @MainActor func aWindowCloseQuestionListsBusyAndIdleSessionsAndMentionsNativeProcessesInOneDialog() async throws {
@@ -834,6 +872,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     }
     let shell = workspace.addSession(title: "Shell")
     #expect(await harness.waitUntilAttached(shell))
+    #expect(await harness.makeBusy(shell))
     let other = ClosingWindow()
     let window = ClosingWindow()
     let delegate = closeDelegate(for: window, workspace: workspace)
@@ -862,7 +901,8 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     )
     #expect(await harness.waitUntilAttached(command))
     #expect(!delegate.windowShouldClose(window))
-    #expect(dialogs.stoppingCounts == [1])
+    // The command and the busy shell.
+    #expect(dialogs.stoppingCounts == [2])
     #expect(waiting(.user) === window)
     dialogs.respond(.alertSecondButtonReturn)
     #expect(waiting(.user) == nil)
@@ -1245,6 +1285,7 @@ private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindow
         workspaces.append(workspace)
         let tab = workspace.addSession(title: "Shell")
         #expect(await harness.waitUntilAttached(tab), label)
+        #expect(await harness.makeBusy(tab), label)
         let window = ClosingWindow()
         let delegate = closeDelegate(for: window, workspace: workspace)
         var tabsWhenOffScreen: [Int] = []

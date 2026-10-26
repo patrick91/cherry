@@ -867,7 +867,12 @@ extension CherryControlServer {
               let subscriber = subscription.subscriber
         else { return }
         let unread = subscription.pending.filter { $0.seq > subscription.ackCursor }
-        guard let newest = unread.last, newest.seq > subscription.lastWokenSeq else { return }
+        // A turn's `done` whose agent began another turn since is old news
+        // (the subscriber answered it, most often): it stays readable and
+        // counted, but wakes nobody.
+        guard let newest = unread.last(where: { !Self.turnDoneIsSuperseded($0, in: subscription) }),
+              newest.seq > subscription.lastWokenSeq
+        else { return }
         let now = Date()
         if let lastWakeAt = subscription.lastWakeAt,
            now.timeIntervalSince(lastWakeAt) < monitors.wakeMinimumInterval {
@@ -892,6 +897,18 @@ extension CherryControlServer {
             }
             subscription.lastWakeAt = Date()
         }
+    }
+
+    /// The event is the `done` of an agent's turn (not a task's settle)
+    /// and that agent's turn counter has gone past the turn it ended: a
+    /// message sent to it, or a turn it began by itself, followed.
+    @MainActor
+    static func turnDoneIsSuperseded(_ event: MonitorEvent, in subscription: MonitorSubscription) -> Bool {
+        guard event.type == .done, event.taskID == nil, let turn = event.agentTurn,
+              let session = subscription.watched.first(where: { $0.id == event.processID })?.session,
+              session.kind == .agent
+        else { return false }
+        return session.agentTurnCount > turn
     }
 
     /// The subscriber is idle: it reports `idle` (OSC 7501), or, when it

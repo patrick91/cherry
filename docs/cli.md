@@ -704,7 +704,10 @@ to their events and ends its turn; Cherry tells it when something happened.
   output went quiet), its screen has been still for 2 s, nobody typed into
   it for 10 s, and it is not in a `wait_for_events` call. Cherry never types
   the line while the subscriber works or is blocked on the user, and
-  types it at most once per batch of events and once every 5 s. The line
+  types it at most once per batch of events and once every 5 s. A turn's
+  `done` whose agent began another turn before the line could go (most
+  often the subscriber answered it meanwhile) wakes nobody: it stays
+  readable and is counted in the next line. The line
   names only the subscription and event counts, never text a watched
   process controls (names, titles or output), so it cannot carry
   instructions from a worker. Settings › Agents › Monitors › Wake

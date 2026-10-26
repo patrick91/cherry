@@ -1,0 +1,67 @@
+#!/bin/sh
+# Builds the app and takes screenshots of its screens against the Demo Mac,
+# headless: a private simulator (CherryMobile-Proto) is created, booted
+# without Simulator.app, used, shut down and deleted. No other simulator is
+# touched, and the app connects to nothing but the Demo Mac (-screen).
+#
+#   Mobile/Scripts/screenshots [OUTPUT_DIR]
+set -eu
+
+scripts=$(cd "$(dirname "$0")" && pwd)
+out=${1:-"$PWD/ios-screenshots"}
+name=CherryMobile-Proto
+bundle=dev.patrick.cherry.mobile
+device_type=${CHERRY_MOBILE_DEVICE_TYPE:-com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro}
+
+"$scripts/build-app" -quiet
+app="$scripts/../App/build/DerivedData/Build/Products/Debug-iphonesimulator/CherryMobile.app"
+mkdir -p "$out"
+
+# Leftovers of an earlier run of this script only, by name.
+xcrun simctl list devices -j | /usr/bin/python3 -c '
+import json, sys
+for devices in json.load(sys.stdin)["devices"].values():
+    for device in devices:
+        if device["name"] == sys.argv[1]:
+            print(device["udid"])
+' "$name" | while read -r stale; do
+    xcrun simctl shutdown "$stale" 2>/dev/null || true
+    xcrun simctl delete "$stale"
+done
+
+runtime=$(xcrun simctl list runtimes -j | /usr/bin/python3 -c '
+import json, sys
+runtimes = [r for r in json.load(sys.stdin)["runtimes"] if r["platform"] == "iOS" and r["isAvailable"]]
+runtimes.sort(key=lambda r: [int(p) for p in r["version"].split(".")])
+print(runtimes[-1]["identifier"])
+')
+
+udid=$(xcrun simctl create "$name" "$device_type" "$runtime")
+cleanup() {
+    xcrun simctl shutdown "$udid" 2>/dev/null || true
+    xcrun simctl delete "$udid" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+xcrun simctl boot "$udid"
+xcrun simctl bootstatus "$udid" >/dev/null
+xcrun simctl status_bar "$udid" override --time 9:41 --batteryState charged --batteryLevel 100 \
+    --cellularMode active --cellularBars 4 --wifiBars 3 >/dev/null 2>&1 || true
+xcrun simctl install "$udid" "$app"
+
+shoot() {
+    file=$1
+    screen=$2
+    settle=$3
+    xcrun simctl launch --terminate-running-process "$udid" "$bundle" -screen "$screen" >/dev/null
+    sleep "$settle"
+    xcrun simctl io "$udid" screenshot --type=png "$out/$file.png" >/dev/null 2>&1
+    echo "$out/$file.png"
+}
+
+shoot 1-inbox inbox 4
+shoot 2-session-approval session:demo-claude 4
+shoot 3-session-result session:demo-pi 4
+shoot 4-terminal-keep-mac-size terminal:demo-codex 6
+shoot 5-terminal-fit-to-phone terminal-fit:demo-claude 6
+shoot 6-macs macs 4

@@ -1,0 +1,5 @@
+.build/
+.swiftpm/
+# Generated from App/project.yml by xcodegen.
+/App/*.xcodeproj/
+/App/build/

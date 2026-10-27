@@ -265,7 +265,7 @@ public enum CherryToolCatalog {
             ),
             tool(
                 "spawn_process",
-                "Create a terminal, configured agent or trusted project command. Input goes once it started; sent_bytes 0 if it did not arrive.",
+                "Create a terminal, configured agent or trusted project command, in your project or project_root's open window (on device, it runs there). Input goes once it started; sent_bytes 0 if it did not arrive.",
                 properties: [
                     "kind": string(processKinds),
                     "name": string("Configured agent or command."),
@@ -276,6 +276,8 @@ public enum CherryToolCatalog {
                     "text": inputText,
                     "raw_base64": string("Base64 bytes, not normalized."),
                     "submit": submitInput,
+                    "project_root": string("Default: yours."),
+                    "device": string(deviceParameter),
                     "parent_agent_id": string(defaultCallerAgent),
                     "wait_ms": waitBeforeOutput,
                     "line_limit": lineLimit

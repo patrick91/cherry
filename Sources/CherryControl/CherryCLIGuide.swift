@@ -58,7 +58,7 @@ public enum CherryCLIGuide {
         - When the agent shows a permission or question menu, `send` refuses
           (agent_awaiting_permission, agent_awaiting_input) and lists the menu's options:
           answer with `cherry answer ID 2` or `cherry answer ID "Yes, allow"`.
-        - Other keys: `cherry keys ID down enter`. Esc interrupts most agents.
+        - Other keys: `cherry keys ID down enter`; Esc interrupts most agents.
 
         ## Workers (tasks)
         When the user asks for workers, agents or a workflow, start each worker with
@@ -82,10 +82,9 @@ public enum CherryCLIGuide {
           `cherry task cancel TASK --close` (or `cherry close ID`), never by default.
 
         ## Another machine
-        To continue on another machine (`cherry devices`): push your branch,
-        `cherry project add ~/app --device NAME [--create]`, then
+        `cherry devices`; `cherry project add ~/app --device NAME [--create]`,
         `cherry spawn agent claude --device NAME --project-root ~/app --task -`
-        told to check it out.
+        (push first) or `cherry spawn terminal CMD --device NAME --project-root ~/app`.
 
         ## Being a worker
         If your tab got a Cherry task kickoff:

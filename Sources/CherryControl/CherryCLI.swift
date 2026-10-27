@@ -242,7 +242,7 @@ public enum CherryCLI {
                 usage: "cherry project add PATH [--device D] [--create] [--no-open]",
                 summary: "Add a folder of a device (default: yours) as a project and open it; --create makes the folder."),
         Command(words: ["devices"], tool: "list_devices",
-                usage: "cherry devices", summary: "This Mac and your other machines: names, connected, projects and their keys."),
+                usage: "cherry devices", summary: "This Mac and your other machines: names, projects and their keys."),
         Command(words: ["project", "show"], tool: "get_project_status",
                 usage: "cherry project show", summary: "The project's status."),
         Command(words: ["commands", "start"], tool: "start_all_commands",

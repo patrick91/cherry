@@ -126,6 +126,10 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
         (["devices"], "list_devices", [:]),
         (["spawn", "agent", "claude", "--device", "patmini", "--project-root", "~/app"], "spawn_agent",
          ["name": .string("claude"), "device": .string("patmini"), "project_root": .string("~/app")]),
+        (["spawn", "terminal", "df -h", "--device", "patmini", "--project-root", "~/app"], "spawn_process",
+         ["kind": .string("terminal"), "text": .string("df -h"), "device": .string("patmini"), "project_root": .string("~/app")]),
+        (["spawn", "command", "server", "--device", "patmini", "--project-root", "~/app"], "spawn_process",
+         ["kind": .string("command"), "name": .string("server"), "device": .string("patmini"), "project_root": .string("~/app")]),
         (["project", "show"], "get_project_status", [:]),
         (["commands", "start"], "start_all_commands", [:]),
         (["commands", "stop"], "stop_all_commands", [:]),
@@ -253,7 +257,7 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
     #expect(guide.utf8.count < 6_500, "\(guide.utf8.count) bytes")
     for fact in [
         "cherry task report", "--awaiting-approval", "cherry answer", "<<'EOF'", "cherry task cancel TASK --close", "never your\nCLI's own subagents",
-        "cherry devices", "cherry project add ~/app --device NAME", "--device NAME --project-root",
+        "cherry devices", "cherry project add ~/app --device NAME", "--device NAME --project-root", "cherry spawn terminal CMD --device NAME",
     ] {
         #expect(guide.contains(fact), "\(fact)")
     }
@@ -470,10 +474,10 @@ private func runCommand(_ request: RunCommandRequest, on server: CherryControlSe
 
 /// `cherry devices` at a terminal: each machine, then its projects' paths.
 @Test func ControlToolCLIDevicesPrintsEachMachineAndItsProjects() {
-    let text = #"{"devices":[{"id":"this-mac","name":"This Mac","os":"macOS","caller":true,"connected":true,"projects":[{"root":"/Users/me/app","path":"/Users/me/app","open":true}]},{"id":"5b0e","name":"patmini","os":"macOS","caller":false,"connected":false,"projects":[]}]}"#
+    let text = #"{"devices":[{"id":"this-mac","name":"This Mac","os":"macOS","caller":true,"projects":[{"root":"/Users/me/app","path":"/Users/me/app","open":true}]},{"id":"5b0e","name":"patmini","os":"macOS","caller":false,"projects":[]}]}"#
     #expect(CherryCLIRunner.render(text, command: ["devices"]) == """
-    This Mac (this-mac): macOS, connected, you are here
+    This Mac (this-mac): macOS, you are here
       /Users/me/app  (open)
-    patmini (5b0e): macOS, not connected
+    patmini (5b0e): macOS
     """)
 }

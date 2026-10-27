@@ -1063,6 +1063,7 @@ final class CherryControlServer: @unchecked Sendable {
             // throttled native-surface refresh.
             await session.refreshContentFromHostIfNeeded()
             _ = session.lineCount
+            callerLearnedState(of: session)
             return .init(result: .getProcessStatus(.init(
                 process: processInfo(for: session, workspace: sessionWorkspace),
                 prompt: await statusPrompt(of: session)
@@ -1070,6 +1071,7 @@ final class CherryControlServer: @unchecked Sendable {
         case .getProcessOutput(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
             await session.refreshContentFromHostIfNeeded()
+            callerLearnedState(of: session)
             return .init(result: .getProcessOutput(terminalOutput(for: session, startLine: request.startLine, lineLimit: request.lineLimit)))
         case .getProcessRawOutput(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
@@ -1587,7 +1589,6 @@ final class CherryControlServer: @unchecked Sendable {
                 id: DeviceInfo.thisMacID,
                 name: DeviceInfo.thisMacName,
                 caller: true,
-                connected: true,
                 homeDirectory: NSHomeDirectory(),
                 projects: roots.map { DeviceProject(root: $0, path: $0, open: open.contains($0)) }
             ))
@@ -1602,7 +1603,6 @@ final class CherryControlServer: @unchecked Sendable {
                 id: device.id.uuidString.lowercased(),
                 name: device.name,
                 caller: Self.remoteDevice == device.id,
-                connected: device.connected,
                 homeDirectory: device.homeDirectory,
                 projects: keys.map { DeviceProject(root: $0, path: ProjectLocation(key: $0).path, open: open.contains($0)) }
             ))
@@ -3172,8 +3172,10 @@ final class CherryControlServer: @unchecked Sendable {
             guard !keysOnly else { return }
             switch session.agentActivityState {
             case .permission:
+                callerLearnedState(of: session, status: .permission)
                 throw Self.awaitingPermission(session: session, name: name, prompt: Self.shownPrompt(of: session))
             case .needsInput:
+                callerLearnedState(of: session, status: .needsInput)
                 throw Self.awaitingInput(session: session, name: name, prompt: Self.shownPrompt(of: session))
             case .unknown, .idle, .working, .error:
                 return
@@ -3187,9 +3189,11 @@ final class CherryControlServer: @unchecked Sendable {
         }
         guard !keysOnly else { return }
         if AgentPermissionPrompt.isShowing(in: lines) {
+            callerLearnedState(of: session, status: .permission)
             throw Self.awaitingPermission(session: session, name: name, prompt: AgentPromptMenu.read(from: lines))
         }
         if AgentQuestionPrompt.isShowing(in: lines) {
+            callerLearnedState(of: session, status: .needsInput)
             throw Self.awaitingInput(session: session, name: name, prompt: AgentPromptMenu.read(from: lines))
         }
     }

@@ -1225,7 +1225,7 @@ have a group of their own in `Scripts/test-session-suites unit` (and CI),
 - `ControlToolCatalogTests`: the 55 tools in their order, the list encoded
   byte for byte as `Fixtures/mcp-tools-list.json` (for a client Cherry
   knows nothing of) and the schemas as `Fixtures/mcp-tool-schemas.json`,
-  the list's byte budget (29 000), the facts agents act on, the
+  the facts agents act on, the
   annotations, the per-client caps and the descriptions that state them.
   A deliberate change of a description or an annotation regenerates the
   list fixture; the schema fixture changes only by an added optional

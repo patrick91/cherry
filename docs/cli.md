@@ -369,7 +369,42 @@ hand, as on This Mac.
   whether it is active or open, and its to-dos feature.
 - `open_project` focuses the project's most recently active window by
   absolute `project_root`, opening it when the project is saved in Cherry
-  but none of its windows is open.
+  but none of its windows is open. A device's project is named by its key
+  (`device:<uuid>:/path`, matched by location, never as a path of This
+  Mac), or by its path there with `device` (`cherry project open
+  ~/code/app --device patmini`).
+
+## Devices
+
+The machines Cherry runs tabs on are devices: This Mac and the user's
+other Macs (docs/specs/remote-devices.md). The commands say "device", not
+"Mac", so another operating system needs no new words.
+
+- `list_devices` (`cherry devices`) lists This Mac first, then each
+  device: `id` (`this-mac`, or the device's UUID lowercased), `name`, `os`,
+  `caller` (the machine the caller runs on), `connected` (its control
+  connection or SSH master is up; nothing connects to find out),
+  `home_directory` and `projects` (`root`, the key `project_root` takes;
+  `path` there; `open`). A caller on another Mac sees only its own.
+- `device` (open_project, spawn_agent, and any tool that takes
+  `project_root`) names a device by id, name (any case) or `this-mac`; its
+  `project_root` is then a path there (absolute or `~/…`, its home's), which
+  the tool layer turns into the project's key (`DeviceInfo.projectKey`).
+  `device_not_found` and `device_ambiguous` list the choices.
+- `add_project` (`cherry project add PATH [--device D] [--create]`) adds a
+  folder of a device (default: the caller's) as a project and opens its
+  window (`open` false leaves it closed). On This Mac it is
+  `AgentSettings.addProject`; on a device, Add Project on <Mac>…'s
+  `RemoteDeviceProjectAdding` over its SSH connection (`pwd -P`), and with
+  `create` a missing folder is made first by the Omni bar's New folder
+  script (only that folder, never its parents). The result has
+  `project_root` (the key), `device`, `path`, `created`, `already_added`
+  and `opened`. Errors: `folder_not_found`, `folder_not_created`,
+  `device_unreachable`, `devices_read_only` (another copy of Cherry keeps
+  the devices). A caller on another Mac adds only on its own
+  (`outside_caller_mac`). Cherry copies no files and runs no git: an agent
+  that continues work there pushes a branch first and briefs the worker to
+  clone or fetch it (the guide's "Another machine").
 
 Cherry has no Git worktree support: a worktree is a folder, opened as a
 project like any other.
@@ -1187,10 +1222,10 @@ The tools, the control socket's tool requests and the `cherry` command
 have a group of their own in `Scripts/test-session-suites unit` (and CI),
 **ControlTool** (`--filter ControlTool`):
 
-- `ControlToolCatalogTests`: the 53 tools in their order, the list encoded
+- `ControlToolCatalogTests`: the 55 tools in their order, the list encoded
   byte for byte as `Fixtures/mcp-tools-list.json` (for a client Cherry
   knows nothing of) and the schemas as `Fixtures/mcp-tool-schemas.json`,
-  the list's byte budget (28 000), the facts agents act on, the
+  the list's byte budget (29 000), the facts agents act on, the
   annotations, the per-client caps and the descriptions that state them.
   A deliberate change of a description or an annotation regenerates the
   list fixture; the schema fixture changes only by an added optional

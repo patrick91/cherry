@@ -87,6 +87,22 @@ public enum CherryCLIRunner {
             }
         case ["task", "list"]:
             if let rows = firstArray(in: value) { return table(rows) }
+        case ["devices"]:
+            if let devices = value.objectValue?["devices"]?.arrayValue?.compactMap(\.objectValue) {
+                return devices.map { device in
+                    let state = device["connected"] == .bool(true) ? "connected" : "not connected"
+                    let you = device["caller"] == .bool(true) ? ", you are here" : ""
+                    let header = "\(string(device["name"])) (\(string(device["id"]))): \(string(device["os"])), \(state)\(you)"
+                    let projects = (device["projects"]?.arrayValue ?? []).compactMap(\.objectValue).map { project in
+                        "  \(string(project["path"]))" + (project["open"] == .bool(true) ? "  (open)" : "")
+                    }
+                    return ([header] + projects).joined(separator: "\n")
+                }.joined(separator: "\n")
+            }
+        case ["project", "add"]:
+            if let object = value.objectValue {
+                return fields(object, keys: ["project_root", "device", "path", "created", "already_added", "opened"])
+            }
         default:
             break
         }

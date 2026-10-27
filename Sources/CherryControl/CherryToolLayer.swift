@@ -114,6 +114,7 @@ public enum CherryToolLayer {
         transport: some CherryToolTransport
     ) async -> CallToolResult {
         do {
+            let arguments = try await resolvingDevice(in: arguments, of: name, transport: transport)
             if name == "get_status" {
                 return try await statusResult(caller: caller, transport: transport)
             }
@@ -142,6 +143,32 @@ public enum CherryToolLayer {
         } catch {
             return errorResult(controlError(error))
         }
+    }
+
+    /// A tool's `device` (open_project, spawn_agent, …) names the machine
+    /// its `project_root` is on: the root becomes that machine's project
+    /// key (`DeviceInfo.projectKey`, `~/…` its home's) and `device` goes.
+    /// add_project takes `device` itself.
+    private static func resolvingDevice(
+        in arguments: [String: JSONValue],
+        of name: String,
+        transport: some CherryToolTransport
+    ) async throws -> [String: JSONValue] {
+        guard name != "add_project", let device = stringArgument("device", in: arguments)?.nilIfEmpty else {
+            return arguments
+        }
+        guard let path = stringArgument("project_root", in: arguments)?.nilIfEmpty else {
+            throw CherryControlError(code: "invalid_arguments", message: "device needs project_root: the project's path on that device.")
+        }
+        let response = try await transport.send(.listDevices, timeout: nil)
+        if let error = response.error { throw error }
+        guard case .listDevices(let payload)? = response.result else {
+            throw CherryControlError(code: "unexpected_response", message: "Cherry returned an unexpected response for its devices.")
+        }
+        var arguments = arguments
+        arguments["project_root"] = .string(try DeviceInfo.named(device, in: payload.devices).projectKey(path: path))
+        arguments["device"] = nil
+        return arguments
     }
 
     /// `error` as a tool's result, encoded as every tool's error is:
@@ -378,6 +405,9 @@ public enum CherryToolLayer {
         if case .openProject = request {
             return request
         }
+        // Devices are the caller's Macs, not a project's.
+        if case .listDevices = request { return request }
+        if case .addProject = request { return request }
 
         if let projectRoot = explicitProjectRoot(in: arguments) ?? trimmedProjectRoot(caller.projectRoot) {
             return .scoped(.init(projectRoot: projectRoot, request: request))
@@ -468,6 +498,15 @@ public enum CherryToolLayer {
             return .listProjects
         case "open_project":
             return .openProject(.init(projectRoot: try requiredString("project_root", in: arguments)))
+        case "list_devices":
+            return .listDevices
+        case "add_project":
+            return .addProject(.init(
+                path: try requiredString("path", in: arguments),
+                device: stringArgument("device", in: arguments),
+                create: boolArgument("create", in: arguments),
+                open: boolArgument("open", in: arguments)
+            ))
         case "get_project_status":
             return .getProjectStatus
         case "resolve_link":
@@ -710,6 +749,10 @@ public enum CherryToolLayer {
         case .listProjects(let payload):
             return try encodedResult(payload)
         case .openProject(let payload):
+            return try encodedResult(payload)
+        case .listDevices(let payload):
+            return try encodedResult(payload)
+        case .addProject(let payload):
             return try encodedResult(payload)
         case .getProjectStatus(let payload):
             return try encodedResult(payload)
@@ -1114,6 +1157,10 @@ public enum CherryToolLayer {
             // (2 s), then `wait_ms`.
             let waitMilliseconds = min(max(intArgument("wait_ms", in: arguments) ?? 0, 0), 5_000)
             return TimeInterval(waitMilliseconds) / 1_000 + 20
+        case "add_project":
+            // Making and resolving the folder over the device's SSH
+            // connection, which may have to log in first.
+            return 45
         case "spawn_agent", "spawn_process", "send_process_input":
             // Input waits until it reached the program: a persistent-session
             // tab's session may still be created (Cherry gives up after about

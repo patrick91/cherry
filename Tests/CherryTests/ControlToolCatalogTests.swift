@@ -12,8 +12,8 @@ import Testing
 
 /// The tools, in the order clients list them.
 private let controlToolCatalogNames = [
-    "get_status", "list_projects", "open_project", "get_project_status", "whoami", "resolve_link",
-    "list_processes", "get_process_status", "get_process_output", "get_process_raw_output",
+    "get_status", "list_projects", "open_project", "list_devices", "add_project", "get_project_status", "whoami",
+    "resolve_link", "list_processes", "get_process_status", "get_process_output", "get_process_raw_output",
     "search_process_output", "wait_for_process_idle", "subscribe", "wait_for_events", "unsubscribe",
     "list_subscriptions", "get_my_task", "report_result", "report_progress", "wait_for_tasks", "get_task",
     "list_tasks", "cancel_tasks", "get_process_ports", "services_list", "wait_for_bound_port",
@@ -29,14 +29,14 @@ private let controlToolCatalogNames = [
 // bind_session_process binds only the MCP session. wait_for_bound_port is
 // not one: probe_http can forward another Mac's port to This Mac.
 private let controlToolCatalogReadOnly: Set<String> = [
-    "get_status", "list_projects", "get_project_status", "whoami", "resolve_link", "list_processes",
+    "get_status", "list_projects", "list_devices", "get_project_status", "whoami", "resolve_link", "list_processes",
     "get_process_status", "get_process_output", "get_process_raw_output", "search_process_output",
     "wait_for_process_idle", "wait_for_events", "list_subscriptions", "get_my_task", "wait_for_tasks",
     "get_task", "list_tasks", "get_process_ports", "services_list", "list_agents", "list_todos", "get_todo",
     "list_todo_comments", "bind_session_process",
 ]
 private let controlToolCatalogAdditive: Set<String> = [
-    "open_project", "subscribe", "unsubscribe", "report_result", "report_progress", "wait_for_bound_port",
+    "open_project", "add_project", "subscribe", "unsubscribe", "report_result", "report_progress", "wait_for_bound_port",
     "spawn_process", "spawn_agent", "start_process", "start_all_commands", "rename_process", "select_process", "create_todo",
     "update_todo", "move_todo", "select_todo", "add_todo_comment", "update_todo_comment",
 ]
@@ -144,11 +144,11 @@ private func controlToolCatalogTool(_ name: String, for profile: ToolClientProfi
 
 private let controlToolCatalogClaude = ToolClientProfile(client: ToolClientInfo(name: "claude-code", version: "2.1.299"))
 
-@Test func controlToolCatalogListsTheFiftyThreeToolsInTodaysOrder() {
+@Test func controlToolCatalogListsTheFiftyFiveToolsInTodaysOrder() {
     let tools = CherryToolCatalog.tools(for: .unknown)
     #expect(tools.map(\.name) == controlToolCatalogNames)
     #expect(CherryToolCatalog.names == Set(controlToolCatalogNames))
-    #expect(CherryToolCatalog.names.count == 53)
+    #expect(CherryToolCatalog.names.count == 55)
 }
 
 @Test func controlToolCatalogEncodesTheFixtureByteForByte() throws {
@@ -214,7 +214,7 @@ private let controlToolCatalogClaude = ToolClientProfile(client: ToolClientInfo(
 @Test func controlToolCatalogFitsItsBudget() throws {
     let tools = CherryToolCatalog.tools(for: .unknown)
     let bytes = try CherryToolCatalog.encodedListResult(tools).count
-    #expect(bytes <= 28_000, "tools/list is \(bytes) bytes")
+    #expect(bytes <= 29_000, "tools/list is \(bytes) bytes")
     let characters = tools.reduce(0) { total, tool in
         total + tool.description.count + controlToolCatalogParameterDescriptions(tool).values.reduce(0) { $0 + $1.count }
     }
@@ -256,8 +256,8 @@ private let controlToolCatalogClaude = ToolClientProfile(client: ToolClientInfo(
 }
 
 @Test func controlToolCatalogAnnotatesEveryTool() throws {
-    #expect(controlToolCatalogReadOnly.count == 24)
-    #expect(controlToolCatalogAdditive.count == 18)
+    #expect(controlToolCatalogReadOnly.count == 25)
+    #expect(controlToolCatalogAdditive.count == 19)
     #expect(controlToolCatalogDestructive.count == 11)
     #expect(controlToolCatalogReadOnly.union(controlToolCatalogAdditive).union(controlToolCatalogDestructive) == Set(controlToolCatalogNames))
     #expect(controlToolCatalogIdempotent.isSubset(of: controlToolCatalogAdditive))

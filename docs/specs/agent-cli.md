@@ -46,7 +46,8 @@ cherry task mine | report [-] | progress MSG [--awaiting-approval]
 cherry task get ID | list | wait RUN [--cursor C] | cancel …
 cherry subscribe …, cherry events SUB [--cursor C], cherry unsubscribe SUB
 cherry ports [ID], cherry services, cherry wait-port …
-cherry todo ls|show|add|edit|move|rm|select|comment|comments, cherry project ls|open|show
+cherry todo ls|show|add|edit|move|rm|select|comment|comments, cherry project ls|open|add|show
+cherry devices                                     list_devices (--device D on project open|add, spawn agent)
 cherry commands start|stop|restart, cherry agents, cherry link LINK, cherry subscriptions
 cherry whoami
 cherry skill setup|status|show|remove [--agent A] [--dry-run] [--project] [--json]

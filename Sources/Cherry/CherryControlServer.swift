@@ -221,6 +221,10 @@ final class CherryControlServer: @unchecked Sendable {
     /// Checks the tokens of callers on other Macs (the app's).
     var mcpTokens: RemoteMCPTokens = .shared
 
+    /// The user's other Macs, for list_devices and add_project: none
+    /// unless set (the app sets its store's, `ControlDeviceDirectory.app`).
+    @MainActor var deviceDirectory: ControlDeviceDirectory = .none
+
     private struct DeviceListener {
         var url: URL
         var source: DispatchSourceRead
@@ -971,6 +975,7 @@ final class CherryControlServer: @unchecked Sendable {
     private func openRemoteProject(_ request: OpenProjectRequest, caller: RemoteCaller) throws -> OpenProjectResult {
         let key = try Self.remoteProjectLocation(request.projectRoot, deviceID: caller.deviceID).key
         let known = agentSettings.projects.map(\.root) + openProjectRootsProvider() + [caller.workspace.projectRoot].compactMap { $0 }
+            + deviceProjectKeys(of: caller.deviceID)
         guard known.contains(key) else {
             throw CherryControlError(code: "project_not_found", message: "Cherry project is not configured: \(request.projectRoot).")
         }
@@ -1039,6 +1044,10 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .listProjects(listProjects(workspace: workspace)))
         case .openProject(let request):
             return .init(result: .openProject(try openProject(request, fallbackWorkspace: workspace)))
+        case .listDevices:
+            return .init(result: .listDevices(listDevices()))
+        case .addProject(let request):
+            return .init(result: .addProject(try await addProject(request)))
         case .getProjectStatus:
             return .init(result: .getProjectStatus(projectStatus(workspace: workspace)))
         case .getPerformanceStatus:
@@ -1519,12 +1528,22 @@ final class CherryControlServer: @unchecked Sendable {
         fallbackWorkspace workspace: TerminalWorkspace
     ) throws -> OpenProjectResult {
         if Self.remoteDevice != nil { throw Self.refusedOutsideDevice("that project") }
-        let requestedRoot = CherryControl.standardizedProjectRoot(request.projectRoot)
         let candidateRoots = agentSettings.projects.map(\.root)
             + openProjectRootsProvider()
             + ProjectWindowRegistry.shared.knownProjectRoots
             + [workspace.projectRoot].compactMap { $0 }
-        guard let projectRoot = candidateRoots.first(where: { CherryControl.standardizedProjectRoot($0) == requestedRoot }) else {
+            + deviceProjectKeys()
+        // A device's key names its project by location, never as a path
+        // of This Mac.
+        let requested = request.projectRoot.trimmingCharacters(in: .whitespacesAndNewlines)
+        let matches: (String) -> Bool = if ProjectLocation.isRemoteKey(requested) {
+            { ProjectLocation(key: $0) == ProjectLocation(key: requested) }
+        } else {
+            { [requestedRoot = CherryControl.standardizedProjectRoot(requested)] in
+                !ProjectLocation.isRemoteKey($0) && CherryControl.standardizedProjectRoot($0) == requestedRoot
+            }
+        }
+        guard let projectRoot = candidateRoots.first(where: matches) else {
             throw CherryControlError(
                 code: "project_not_found",
                 message: "Cherry project is not configured: \(request.projectRoot)."
@@ -1536,6 +1555,123 @@ final class CherryControlServer: @unchecked Sendable {
         openProjectProvider(projectRoot)
 
         return OpenProjectResult(projectRoot: projectRoot, alreadyOpen: alreadyOpen)
+    }
+
+    /// The added projects' keys of every device, or of `deviceID`'s.
+    @MainActor
+    private func deviceProjectKeys(of deviceID: UUID? = nil) -> [String] {
+        deviceDirectory.devices()
+            .filter { deviceID == nil || $0.id == deviceID }
+            .flatMap { device in device.projects.map { ProjectLocation.remote(deviceID: device.id, path: $0).key } }
+    }
+
+    /// list_devices: This Mac, then the user's other Macs, each with its
+    /// projects. A caller on another Mac sees only its own.
+    @MainActor
+    private func listDevices() -> ListDevicesResult {
+        let open = Set(openProjectRootsProvider())
+        var devices: [DeviceInfo] = []
+        if Self.remoteDevice == nil {
+            // A saved root and its window's may spell the folder apart
+            // (/var and /private/var): one project, named as its window is.
+            func folder(_ root: String) -> String { URL(fileURLWithPath: root).resolvingSymlinksInPath().path }
+            let openRoots = Dictionary(
+                openProjectRootsProvider().filter { !ProjectLocation.isRemoteKey($0) }.map { (folder($0), $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            var seen = Set<String>()
+            let roots = (agentSettings.projects.map(\.root) + openProjectRootsProvider())
+                .filter { !ProjectLocation.isRemoteKey($0) && seen.insert(folder($0)).inserted }
+                .map { openRoots[folder($0)] ?? $0 }
+            devices.append(DeviceInfo(
+                id: DeviceInfo.thisMacID,
+                name: DeviceInfo.thisMacName,
+                caller: true,
+                connected: true,
+                homeDirectory: NSHomeDirectory(),
+                projects: roots.map { DeviceProject(root: $0, path: $0, open: open.contains($0)) }
+            ))
+        }
+        for device in deviceDirectory.devices() where Self.remoteDevice == nil || Self.remoteDevice == device.id {
+            // Its added projects, then its open windows' others.
+            var seen = Set<String>()
+            let keys = (device.projects.map { ProjectLocation.remote(deviceID: device.id, path: $0).key }
+                + openProjectRootsProvider().filter { Self.isOnDevice($0, device.id) })
+                .filter { seen.insert($0).inserted }
+            devices.append(DeviceInfo(
+                id: device.id.uuidString.lowercased(),
+                name: device.name,
+                caller: Self.remoteDevice == device.id,
+                connected: device.connected,
+                homeDirectory: device.homeDirectory,
+                projects: keys.map { DeviceProject(root: $0, path: ProjectLocation(key: $0).path, open: open.contains($0)) }
+            ))
+        }
+        return ListDevicesResult(devices: devices)
+    }
+
+    /// add_project: the folder on This Mac (`AgentSettings.addProject`) or
+    /// on a device (`deviceDirectory`), made first when asked, then opened.
+    /// A caller on another Mac adds only on its own.
+    @MainActor
+    private func addProject(_ request: AddProjectRequest) async throws -> AddProjectResult {
+        let devices = listDevices().devices
+        let device: DeviceInfo
+        if let name = request.device?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty {
+            do {
+                device = try DeviceInfo.named(name, in: devices)
+            } catch where Self.remoteDevice != nil {
+                // It lists its own Mac only.
+                throw Self.refusedOutsideDevice(name.debugDescription)
+            }
+        } else {
+            guard let caller = devices.first(where: \.caller) else {
+                throw CherryControlError(code: "device_not_found", message: "Which device? Run cherry devices.")
+            }
+            device = caller
+        }
+        let path = try device.expandedPath(request.path)
+        if ProjectLocation.hasDotComponents(path) {
+            throw CherryControlError(code: "invalid_project_root", message: "A project path may not contain . or .. components.")
+        }
+        let create = request.create ?? false
+        let key: String
+        let resolvedPath: String
+        let created: Bool
+        let alreadyAdded: Bool
+        if device.isThisMac {
+            var isDirectory: ObjCBool = false
+            let existed = FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
+            if !existed, create, case .failed(let message) = OmniLocalFolders.create(path) {
+                throw CherryControlError(code: "folder_not_created", message: "\(path) could not be made: \(message)")
+            }
+            let rootsBefore = Set(agentSettings.projects.map(\.root))
+            guard let project = agentSettings.addProject(path: path) else {
+                throw CherryControlError(
+                    code: "folder_not_found",
+                    message: "There is no folder at \(path)." + (create ? "" : " Pass create to make it.")
+                )
+            }
+            key = project.root
+            resolvedPath = project.root
+            created = !existed
+            alreadyAdded = rootsBefore.contains(project.root)
+        } else {
+            guard let deviceID = UUID(uuidString: device.id) else {
+                throw CherryControlError(code: "device_not_found", message: "Not a device id: \(device.id).")
+            }
+            let added = try await deviceDirectory.addProject(path, deviceID, create)
+            key = ProjectLocation.remote(deviceID: deviceID, path: added.path).key
+            resolvedPath = added.path
+            created = added.created
+            alreadyAdded = added.alreadyAdded
+        }
+        let opens = request.open ?? true
+        if opens { openProjectProvider(key) }
+        return AddProjectResult(
+            projectRoot: key, device: device.name, path: resolvedPath,
+            created: created, alreadyAdded: alreadyAdded, opened: opens
+        )
     }
 
     @MainActor

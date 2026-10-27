@@ -11,7 +11,7 @@ import os
 /// fields in get_process_status, the selection rule in the instructions and
 /// select_process, the Todos requirement in list_todos.
 public enum CherryToolCatalog {
-    /// The 53 tools, in the order clients list them.
+    /// The 55 tools, in the order clients list them.
     public static func tools(for profile: ToolClientProfile) -> [CherryToolDefinition] {
         let maximumWait = waitCap(for: profile)
         let defaultWait = CherryControl.defaultWaitMilliseconds
@@ -32,10 +32,29 @@ public enum CherryToolCatalog {
                 "open_project",
                 "Focus (or open) a saved project's window.",
                 properties: [
-                    "project_root": string("Absolute path.")
+                    "project_root": string("Absolute path."),
+                    "device": string(deviceParameter)
                 ],
                 required: ["project_root"],
                 annotations: idempotent
+            ),
+            tool(
+                "list_devices",
+                "This Mac and the user's other machines, with their projects' keys.",
+                properties: [:],
+                annotations: readOnly
+            ),
+            tool(
+                "add_project",
+                "Add a device's folder as a project and open it. Runs no git.",
+                properties: [
+                    "path": string("Absolute or ~/…"),
+                    "device": string("Default: yours."),
+                    "create": boolean("Make the folder."),
+                    "open": boolean("Default true.")
+                ],
+                required: ["path"],
+                annotations: additive
             ),
             tool(
                 "get_project_status",
@@ -280,6 +299,7 @@ public enum CherryToolCatalog {
                     "result_schema": object("With task: JSON Schema of the value: type, properties, required, items, enum, additionalProperties; other keywords are refused before anything is spawned."),
                     "allow_subagents": boolean("With task: it may use its CLI's subagents."),
                     "project_root": string("Default: yours."),
+                    "device": string(deviceParameter),
                     "parent_agent_id": string(defaultCallerAgent),
                     "bind_session": boolean("Bind this session to it (default false)."),
                     "wait_ms": waitBeforeOutput,
@@ -705,6 +725,8 @@ public enum CherryToolCatalog {
             "line_limit": lineLimit
         ])
     }
+
+    private static let deviceParameter = "list_devices name; project_root is a path there."
 
     private static func projectScopedProperties(_ extra: [String: JSONValue] = [:]) -> [String: JSONValue] {
         var properties: [String: JSONValue] = [

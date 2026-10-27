@@ -167,6 +167,7 @@ Agent commands (run `cherry skill show` for the full guide):
   subscribe, events, unsubscribe      monitors
   ports, services, wait-port          localhost services
   todo, note, project, whoami
+  devices                             This Mac and your other machines
   skill                               set up, check, show or remove Cherry's agent skill
   tool NAME [JSON | -]                any Cherry tool by its MCP name
 

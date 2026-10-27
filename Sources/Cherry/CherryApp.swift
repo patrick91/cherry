@@ -1131,6 +1131,7 @@ struct CherryApp: App {
                     // MCP tasks survive a relaunch: the last run's are read
                     // back (off this thread) before any request is handled.
                     server.configureTaskPersistence(store: .shared, hostings: .shared, stateStore: .shared)
+                    server.deviceDirectory = .app(store: .shared)
                     server.start()
                     // The run's agents find their CLIs' versions for Cherry's
                     // flags on their command line (`AgentLaunch`).

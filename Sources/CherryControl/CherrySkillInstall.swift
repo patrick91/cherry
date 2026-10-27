@@ -51,7 +51,7 @@ public enum CherrySkill {
     /// settings, which the sandbox should keep refusing; `skill show`
     /// needs no socket).
     public static let allowedWords = [
-        "agents", "answer", "close", "commands", "events", "help", "keys", "link", "ls", "ports", "project",
+        "agents", "answer", "close", "commands", "devices", "events", "help", "keys", "link", "ls", "ports", "project",
         "read", "rename", "search", "select", "send", "services", "show", "spawn", "stop", "subscribe",
         "subscriptions", "task", "todo", "tool", "unsubscribe", "wait", "wait-port", "whoami",
     ]

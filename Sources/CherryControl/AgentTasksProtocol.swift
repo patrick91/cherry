@@ -19,6 +19,9 @@ extension CherryControl {
     public static let maximumTaskSummaryCharacters = 400
     /// A `report_progress` message, in characters; a longer one is cut.
     public static let maximumTaskProgressCharacters = 200
+    /// A `report_progress` message that asks for approval (the plan or the
+    /// question, its lines kept), in characters; a longer one is cut.
+    public static let maximumTaskApprovalRequestCharacters = 4_000
 }
 
 /// Any JSON value: a task's result and its schema.

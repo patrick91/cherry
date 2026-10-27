@@ -677,6 +677,33 @@ struct ControlAgentTaskTests {
         #expect(after.events.map(\.kind).contains(.resumed))
     }
 
+    /// An approval request carries the whole plan, its lines kept, up to
+    /// its own limit; plain progress stays one short line.
+    @Test func approvalRequestKeepsTheWholePlan() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.tasks.progressInterval = 0
+        harness.server.start()
+        let (worker, spawned) = try await harness.spawnTask(agent: "Worker", task: "Plan it")
+        let taskID = try #require(spawned.task?.taskID)
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+
+        let plan = (1...11).map { "\($0). Step \($0): " + String(repeating: "x", count: 150) }.joined(separator: "\n")
+        #expect(plan.count > CherryControl.maximumTaskProgressCharacters)
+        _ = try await harness.send(.reportProgress(.init(message: plan + "\n\nOK?\n", awaitingApproval: true)))
+        #expect(try await harness.task(taskID).task.progress == plan + "\n\nOK?")
+
+        let huge = String(repeating: "y", count: CherryControl.maximumTaskApprovalRequestCharacters + 500)
+        _ = try await harness.send(.reportProgress(.init(message: huge, awaitingApproval: true)))
+        let cut = try #require(try await harness.task(taskID).task.progress)
+        #expect(cut.count <= CherryControl.maximumTaskApprovalRequestCharacters)
+
+        // Back to work: progress is one line, cut at its own limit.
+        _ = try await harness.send(.reportProgress(.init(message: plan)))
+        let line = try #require(try await harness.task(taskID).task.progress)
+        #expect(!line.contains("\n") && line.count <= CherryControl.maximumTaskProgressCharacters)
+    }
+
     /// allow_subagents changes the rules get_my_task gives, goes only with
     /// a task, and still leaves the worker unable to hand out Cherry tasks.
     @Test func allowSubagentsChangesTheWorkersRules() async throws {

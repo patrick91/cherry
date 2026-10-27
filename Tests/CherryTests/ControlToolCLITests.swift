@@ -78,6 +78,13 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
         (["task", "mine"], "get_my_task", [:]),
         (["task", "progress", "Plan ready, OK?", "--awaiting-approval"], "report_progress",
          ["message": .string("Plan ready, OK?"), "awaiting_approval": .bool(true)]),
+        // A switch before the text takes only true or false as its value.
+        (["task", "progress", "--awaiting-approval", "Plan ready, OK?"], "report_progress",
+         ["message": .string("Plan ready, OK?"), "awaiting_approval": .bool(true)]),
+        (["task", "progress", "--awaiting-approval", "false", "Halfway"], "report_progress",
+         ["message": .string("Halfway"), "awaiting_approval": .bool(false)]),
+        (["task", "cancel", "--close", "task-1"], "cancel_tasks",
+         ["task_ids": .array([.string("task-1")]), "close": .bool(true)]),
         (["task", "get", "task-1"], "get_task", ["task_id": .string("task-1")]),
         (["task", "list", "--run", "run-1", "--state", "reported"], "list_tasks", ["run_id": .string("run-1"), "state": .string("reported")]),
         (["task", "wait", "run-1", "--cursor", "4", "--until", "all"], "wait_for_tasks",

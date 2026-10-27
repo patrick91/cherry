@@ -346,6 +346,7 @@ final class AgentTaskRegistry {
     /// can be many bytes).
     static let summaryBytes = 4 * CherryControl.maximumTaskSummaryCharacters
     static let progressBytes = 4 * CherryControl.maximumTaskProgressCharacters
+    static let approvalRequestBytes = 4 * CherryControl.maximumTaskApprovalRequestCharacters
     static let labelLimit = (characters: 80, bytes: 320)
     static let phaseLimit = (characters: 60, bytes: 240)
     /// A report's or progress message's excerpt in an event.
@@ -478,7 +479,7 @@ final class AgentTaskRegistry {
                 ? "Do the brief in this tab. You may use your own CLI's subagents for parts of it, but not cherry spawn agent with --task: Cherry tasks are one level deep."
                 : "Do the brief in this tab. Don't hand parts of it to other agents: Cherry tasks are one level deep.",
             "Finish with cherry task report: value (matching result_schema when there is one), status ok or failed, and a summary of at most \(CherryControl.maximumTaskSummaryCharacters) characters.",
-            "If you need your orchestrator's approval or an answer before you go on (a plan to approve, a question), run cherry task progress --awaiting-approval with your question, then end your turn: the task waits, and the answer comes as a message in this tab.",
+            "If you need your orchestrator's approval or an answer before you go on (a plan to approve, a question), run cherry task progress --awaiting-approval with the whole plan or question (at most \(CherryControl.maximumTaskApprovalRequestCharacters) characters, lines kept; - or a heredoc reads it from standard input), then end your turn: the task waits, and the answer comes as a message in this tab.",
             "If you cannot finish otherwise, report status failed with the reason in summary.",
             "For long work you may run cherry task progress with a short message (at most one every few seconds is kept).",
             "If you get more instructions in this tab later, report again: the newest report replaces the earlier one.",
@@ -1323,17 +1324,22 @@ extension CherryControlServer {
     func reportProgress(_ request: ReportProgressRequest) throws -> ReportProgressResult {
         let task = try callerTask()
         if task.state == .cancelled { throw Self.taskCancelled(task) }
-        let oneLine = request.message
-            .components(separatedBy: .newlines)
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespaces)
-        guard !oneLine.isEmpty else {
-            throw CherryControlError(code: "invalid_argument", message: "message is empty.")
-        }
         let now = Date()
         // A settled task's worker (it reported) is not asked to report
         // again: its question is a progress message.
         let asksApproval = request.awaitingApproval == true && !task.state.isSettled
+        // An approval request carries the whole plan or question, its lines
+        // kept, for the orchestrator to read with get_task; progress is one
+        // short line.
+        let text = asksApproval
+            ? request.message.trimmingCharacters(in: .whitespacesAndNewlines)
+            : request.message
+                .components(separatedBy: .newlines)
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else {
+            throw CherryControlError(code: "invalid_argument", message: "message is empty.")
+        }
         // An approval request is never dropped: the worker ends its turn
         // after it, and a dropped one would leave it to the nudge.
         if !asksApproval, let last = task.progressAt, now.timeIntervalSince(last) < tasks.progressInterval {
@@ -1342,9 +1348,13 @@ extension CherryControlServer {
                 taskID: task.id, recorded: false, retryAfterMilliseconds: Int((wait * 1_000).rounded(.up)), state: task.state
             )
         }
-        let message = AgentTaskRegistry.clip(
-            oneLine, characters: CherryControl.maximumTaskProgressCharacters, bytes: AgentTaskRegistry.progressBytes
-        ).text
+        let message = asksApproval
+            ? AgentTaskRegistry.clip(
+                text, characters: CherryControl.maximumTaskApprovalRequestCharacters, bytes: AgentTaskRegistry.approvalRequestBytes
+            ).text
+            : AgentTaskRegistry.clip(
+                text, characters: CherryControl.maximumTaskProgressCharacters, bytes: AgentTaskRegistry.progressBytes
+            ).text
         noteFetched(task)
         task.progress = message
         task.progressAt = now

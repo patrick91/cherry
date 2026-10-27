@@ -105,7 +105,9 @@ identifies, scopes and refuses the caller (Scope And Identity).
 - A command's words and positional arguments are in `CherryCLI.commands`
   (`Sources/CherryControl/CherryCLI.swift`); every other `--flag` is the tool's
   parameter in kebab case, typed by its schema (`--no-x` sets a boolean
-  false, a list is `a,b`, an object is JSON, a file or `-`).
+  false, and a boolean takes the next word only when it is true, false,
+  yes, no, 1 or 0, so `--awaiting-approval "Plan ready?"` is the switch
+  and the text; a list is `a,b`, an object is JSON, a file or `-`).
   `cherry tool NAME [JSON | -]` calls any tool with its JSON arguments.
 - Long text (a brief, a message, a report, a schema) comes on standard
   input: `-`, or nothing when standard input is a pipe or a file (never a
@@ -916,10 +918,13 @@ names); the tools take no selector, so no agent can report for another.
   `retry_after_milliseconds` otherwise); the answer has the task's `state`.
 - **Approval checkpoints.** A worker that needs its orchestrator's
   approval or an answer before it goes on (a plan to approve, a question)
-  calls `report_progress` with `awaiting_approval: true` and its question
-  as `message` (never dropped by the 5 s limit), then ends its turn. Its
+  calls `report_progress` with `awaiting_approval: true` and the whole plan
+  or question as `message` (its lines kept, at most 4000 characters and
+  16 000 UTF-8 bytes; never dropped by the 5 s limit; `cherry task progress
+  --awaiting-approval -` reads it from standard input), then ends its turn.
+  The orchestrator reads it as the task's `progress` (`get_task`). Its
   open task is `awaiting_approval` (the sidebar's "awaits approval"; an
-  `awaiting_approval` event with the question; `counts.awaiting_approval`):
+  `awaiting_approval` event with the question's start; `counts.awaiting_approval`):
   not settled, never nudged and never `no_report`, and the run does not
   settle. `wait_for_tasks` (`until: any`) returns for it, and the
   orchestrator's wake line says so. The task is back at `working` (a

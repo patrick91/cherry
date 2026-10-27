@@ -1441,3 +1441,52 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     // "fizzup.club @ patstudio" is wider than the project alone would be.
     #expect(remoteHeader.fittingSize.width > localHeader.fittingSize.width)
 }
+
+/// add_project on a device (`ControlDeviceDirectory.add`): a folder that
+/// is there is added as Add Project on <Mac>… adds it; a missing one only
+/// with create, made first by the Omni bar's New folder script, then added.
+@Test @MainActor func RemoteDeviceControlDirectoryAddsAndMakesADevicesFolder() async throws {
+    let directory = try temporaryDirectory("devices-control-add")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let (hostStore, _, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+    let store = makeStore(directory: directory, hostStore: hostStore)
+    let studio = try store.add(name: "Studio", sshDestination: "me@studio.local", homeDirectory: "/Users/me")
+    var folders: Set<String> = ["/Users/me/app"]
+    var made: [String] = []
+    let resolve: RemoteDeviceProjectAdding.Resolver = { path, _ in
+        folders.contains(path) ? .success(path) : .failure(.message("There is no folder at \(path) on that Mac."))
+    }
+    let makeFolder: @MainActor (String, RemoteDevice) async -> OmniFolderCreation = { path, device in
+        #expect(device.id == studio.id)
+        made.append(path)
+        folders.insert(path)
+        return .created
+    }
+
+    let existing = try await ControlDeviceDirectory.add("/Users/me/app", to: studio.id, create: true, store: store, resolve: resolve, makeFolder: makeFolder)
+    #expect(existing == .init(path: "/Users/me/app", created: false, alreadyAdded: false))
+    let again = try await ControlDeviceDirectory.add("/Users/me/app", to: studio.id, create: false, store: store, resolve: resolve, makeFolder: makeFolder)
+    #expect(again.alreadyAdded)
+    #expect(made.isEmpty)
+
+    await #expect(throws: CherryControlError.self) {
+        try await ControlDeviceDirectory.add("/Users/me/new", to: studio.id, create: false, store: store, resolve: resolve, makeFolder: makeFolder)
+    }
+    #expect(made.isEmpty)
+    let new = try await ControlDeviceDirectory.add("/Users/me/new", to: studio.id, create: true, store: store, resolve: resolve, makeFolder: makeFolder)
+    #expect(new == .init(path: "/Users/me/new", created: true, alreadyAdded: false))
+    #expect(made == ["/Users/me/new"])
+    #expect(store.device(id: studio.id)?.addedProjects == ["/Users/me/app", "/Users/me/new"])
+
+    // A folder that cannot be made says why, and adds nothing.
+    let refusing: @MainActor (String, RemoteDevice) async -> OmniFolderCreation = { _, _ in .failed("Permission denied") }
+    do {
+        _ = try await ControlDeviceDirectory.add("/nope", to: studio.id, create: true, store: store, resolve: resolve, makeFolder: refusing)
+        Issue.record("added a folder that could not be made")
+    } catch let error as CherryControlError {
+        #expect(error.code == "folder_not_created")
+        #expect(error.message.contains("Permission denied"))
+    }
+    #expect(store.device(id: studio.id)?.addedProjects.count == 2)
+}

@@ -802,3 +802,71 @@ private func controlToolLayerProcess(id: String = controlToolLayerAgentID, kind:
     #expect(error["prompt"]?.objectValue?["options"]?.arrayValue?.count == 2)
     #expect(result.text.contains(#""question":"Do you want to proceed?""#))
 }
+
+@Test func controlToolLayerTurnsADeviceAndItsPathIntoTheProjectsKey() async throws {
+    let deviceID = "5b0e7c1a-2f4d-4c8e-9a61-0d3e2f1b7c55"
+    let devices = CherryControlResponse(result: .listDevices(ListDevicesResult(devices: [
+        DeviceInfo(id: DeviceInfo.thisMacID, name: DeviceInfo.thisMacName, caller: true, connected: true, homeDirectory: "/Users/me", projects: []),
+        DeviceInfo(id: deviceID, name: "patmini", caller: false, connected: true, homeDirectory: "/Users/pat", projects: []),
+        DeviceInfo(id: "6b0e7c1a-2f4d-4c8e-9a61-0d3e2f1b7c55", name: "Twin", caller: false, connected: false, homeDirectory: nil, projects: []),
+        DeviceInfo(id: "7b0e7c1a-2f4d-4c8e-9a61-0d3e2f1b7c55", name: "twin", caller: false, connected: false, homeDirectory: nil, projects: []),
+    ])))
+    let answering = { @Sendable (request: CherryControlRequest) -> CherryControlResponse in
+        if case .listDevices = request { return devices }
+        return CherryControlResponse(error: CherryControlError(code: "recorded", message: "Recorded."))
+    }
+
+    // A device's name (any case) and a path in its home: its key.
+    let open = ControlToolLayerRecorder(answer: answering)
+    _ = await CherryToolLayer.call(
+        name: "open_project", arguments: ["project_root": .string("~/code/app"), "device": .string("PatMini")],
+        caller: CherryToolCaller(), transport: open
+    )
+    #expect(open.requests == [.listDevices, .openProject(.init(projectRoot: "device:\(deviceID):/Users/pat/code/app"))])
+
+    // A spawn is scoped to it, by id too.
+    let spawn = ControlToolLayerRecorder(answer: answering)
+    _ = await CherryToolLayer.call(
+        name: "spawn_agent",
+        arguments: ["name": .string("claude"), "device": .string(deviceID.uppercased()), "project_root": .string("/srv/app")],
+        caller: CherryToolCaller(projectRoot: "/mine"), transport: spawn
+    )
+    guard case .scoped(let scoped)? = spawn.requests.dropFirst().first else {
+        Issue.record("spawn sends \(spawn.requests)")
+        return
+    }
+    #expect(spawn.requests.first == .listDevices)
+    #expect(scoped.projectRoot == "device:\(deviceID):/srv/app")
+
+    // This Mac's key is the path itself.
+    let local = ControlToolLayerRecorder(answer: answering)
+    _ = await CherryToolLayer.call(
+        name: "open_project", arguments: ["project_root": .string("~/app"), "device": .string("this-mac")],
+        caller: CherryToolCaller(), transport: local
+    )
+    #expect(local.requests == [.listDevices, .openProject(.init(projectRoot: "/Users/me/app"))])
+
+    // Refused: an unknown or ambiguous name, a relative path, no home for
+    // ~, a device without a project_root.
+    for (arguments, code) in [
+        (["project_root": JSONValue.string("/a"), "device": .string("nope")], "device_not_found"),
+        (["project_root": .string("/a"), "device": .string("twin")], "device_ambiguous"),
+        (["project_root": .string("code/app"), "device": .string("patmini")], "invalid_project_root"),
+        (["project_root": .string("~/app"), "device": .string("6b0e7c1a-2f4d-4c8e-9a61-0d3e2f1b7c55")], "invalid_project_root"),
+        (["device": .string("patmini")], "invalid_arguments"),
+    ] {
+        let recorder = ControlToolLayerRecorder(answer: answering)
+        let result = await CherryToolLayer.call(name: "open_project", arguments: arguments, caller: CherryToolCaller(), transport: recorder)
+        #expect(result.structured?.objectValue?["error"]?.objectValue?["code"]?.stringValue == code, "\(arguments)")
+        #expect(!recorder.requests.contains { if case .openProject = $0 { true } else { false } })
+    }
+
+    // add_project takes device itself, unscoped.
+    let add = ControlToolLayerRecorder(answer: answering)
+    _ = await CherryToolLayer.call(
+        name: "add_project", arguments: ["path": .string("~/x"), "device": .string("patmini"), "create": .bool(true)],
+        caller: CherryToolCaller(projectRoot: "/mine"), transport: add
+    )
+    #expect(add.requests == [.addProject(.init(path: "~/x", device: "patmini", create: true, open: nil))])
+    #expect(CherryToolLayer.clientTimeout(for: "add_project", arguments: [:]) == 45)
+}

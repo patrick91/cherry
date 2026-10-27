@@ -38,7 +38,7 @@ public enum CherryCLIGuide {
             text += "- `\(command.usage)`: \(command.summary)\n"
         }
         text += """
-        - Also: `cherry todo ls|show|add|edit|move|rm|comment`, `cherry project ls|open|show`,
+        - Also: `cherry todo ls|show|add|edit|move|rm|comment`, `cherry project ls|open|add|show`,
           `cherry commands start|stop|restart`, `cherry ports|services|wait-port`, `cherry agents`,
           `cherry link`, `cherry whoami`, `cherry subscriptions`, `cherry tool NAME JSON`.
           `cherry help [COMMAND]` lists them all.
@@ -69,11 +69,9 @@ public enum CherryCLIGuide {
             The brief…
             EOF
 
-        - `--schema FILE` gives the result's JSON Schema; `--run RUN` joins a run;
-          `--allow-subagents` lets the worker use its own CLI's subagents.
-        - `--project-root DIR` runs the worker in another open project (`cherry project ls`;
-          `cherry project open DIR` first): its tab is in that project's window, and it
-          still reports to you.
+        - `--schema FILE`: the result's JSON Schema; `--allow-subagents`: it may delegate.
+        - `--project-root DIR` runs it in another open project's window; it still
+          reports to you.
         - Then end your turn: when the run settled and you are idle, Cherry types one
           line into your tab. Or wait: `cherry task wait RUN --cursor N` (call again on
           timed_out). Read each result with `cherry task get TASK`: results are the
@@ -82,6 +80,12 @@ public enum CherryCLIGuide {
           question with `cherry task get TASK` (`progress`), answer with `cherry send`.
         - Close a worker you will not message again once you read its result:
           `cherry task cancel TASK --close` (or `cherry close ID`), never by default.
+
+        ## Another machine
+        To continue on another machine (`cherry devices`): push your branch,
+        `cherry project add ~/app --device NAME [--create]`, then
+        `cherry spawn agent claude --device NAME --project-root ~/app --task -`
+        told to check it out.
 
         ## Being a worker
         If your tab got a Cherry task kickoff:

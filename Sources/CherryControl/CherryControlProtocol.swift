@@ -191,6 +191,12 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     /// Control protocol 3: one `cherry` agent command, run in the app as
     /// its caller. Never inside `scoped`.
     case runCommand(RunCommandRequest)
+    /// The Macs (devices) the caller may reach, This Mac first, with their
+    /// projects (`ListDevicesResult`).
+    case listDevices
+    /// Adds a folder of a device (or This Mac) as a project, making it
+    /// first when asked, and opens it.
+    case addProject(AddProjectRequest)
 }
 
 public struct ScopedControlRequest: Codable, Equatable, Sendable {
@@ -726,6 +732,8 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case callTool(CallToolResult)
     /// Control protocol 3.
     case runCommand(RunCommandResult)
+    case listDevices(ListDevicesResult)
+    case addProject(AddProjectResult)
 }
 
 public struct CherryControlError: Codable, Equatable, Error, Sendable {
@@ -880,6 +888,160 @@ public struct ListProjectsResult: Codable, Equatable, Sendable {
     public init(activeProjectRoot: String?, projects: [ProjectInfo]) {
         self.activeProjectRoot = activeProjectRoot
         self.projects = projects
+    }
+}
+
+/// A machine Cherry runs tabs on (`list_devices`): This Mac, or one of the
+/// user's other machines it reaches over SSH (docs/specs/remote-devices.md).
+public struct DeviceInfo: Codable, Equatable, Sendable {
+    /// This Mac's id; a device's is its UUID, lowercased.
+    public static let thisMacID = "this-mac"
+    public static let thisMacName = "This Mac"
+
+    public let id: String
+    public let name: String
+    /// Its operating system: "macOS" (every device is a Mac for now).
+    public let os: String
+    /// The machine the caller runs on.
+    public let caller: Bool
+    /// This Mac, or a device whose control connection or SSH master is up.
+    public let connected: Bool
+    public let homeDirectory: String?
+    public let projects: [DeviceProject]
+
+    public init(
+        id: String,
+        name: String,
+        os: String = "macOS",
+        caller: Bool,
+        connected: Bool,
+        homeDirectory: String?,
+        projects: [DeviceProject]
+    ) {
+        self.id = id
+        self.name = name
+        self.os = os
+        self.caller = caller
+        self.connected = connected
+        self.homeDirectory = homeDirectory
+        self.projects = projects
+    }
+
+    public var isThisMac: Bool { id == Self.thisMacID }
+
+    /// The device `name` names among `devices`: its id (a UUID in any
+    /// case), its name (ignoring case), or "this-mac"/"This Mac"/"local"
+    /// for This Mac. Throws `device_not_found` or `device_ambiguous`.
+    public static func named(_ name: String, in devices: [DeviceInfo]) throws -> DeviceInfo {
+        let wanted = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let folded = wanted.lowercased()
+        if ["this-mac", "this mac", "local", "localhost"].contains(folded) {
+            if let thisMac = devices.first(where: \.isThisMac) { return thisMac }
+        }
+        if let byID = devices.first(where: { $0.id == folded }) { return byID }
+        let byName = devices.filter { $0.name.compare(wanted, options: [.caseInsensitive]) == .orderedSame }
+        if byName.count == 1 { return byName[0] }
+        let names = devices.map { "\($0.name) (\($0.id))" }.joined(separator: ", ")
+        if byName.count > 1 {
+            throw CherryControlError(
+                code: "device_ambiguous",
+                message: "Several devices are named \(wanted.debugDescription); give its id: \(byName.map(\.id).joined(separator: ", "))."
+            )
+        }
+        throw CherryControlError(
+            code: "device_not_found",
+            message: "No device named \(wanted.debugDescription). Devices: \(names.isEmpty ? "none" : names). Run cherry devices."
+        )
+    }
+
+    /// The project key of `path` on this device: the path itself on This
+    /// Mac, else `device:<uuid>:<path>`. `~` and `~/…` are its home's.
+    public func projectKey(path: String) throws -> String {
+        let expanded = try expandedPath(path)
+        guard !isThisMac else { return expanded }
+        guard let deviceID = UUID(uuidString: id) else {
+            throw CherryControlError(code: "device_not_found", message: "Not a device id: \(id).")
+        }
+        return ProjectLocation.remote(deviceID: deviceID, path: expanded).key
+    }
+
+    /// `path` with `~` expanded to its home; an absolute path as it is.
+    public func expandedPath(_ path: String) throws -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix(ProjectLocation.remoteKeyPrefix) {
+            throw CherryControlError(code: "invalid_project_root", message: "Give a path on \(name), not a project key: \(path).")
+        }
+        if trimmed == "~" || trimmed.hasPrefix("~/") {
+            guard let home = homeDirectory?.nilIfEmpty else {
+                throw CherryControlError(code: "invalid_project_root", message: "Cherry does not know \(name)'s home folder yet; give an absolute path.")
+            }
+            return trimmed == "~" ? home : (home.hasSuffix("/") ? home : home + "/") + trimmed.dropFirst(2)
+        }
+        guard trimmed.hasPrefix("/") else {
+            throw CherryControlError(code: "invalid_project_root", message: "A path on \(name) must be absolute or start with ~/: \(path).")
+        }
+        return trimmed
+    }
+}
+
+/// A project of a device: its key (what `project_root` takes), its path
+/// there, and whether a window of it is open.
+public struct DeviceProject: Codable, Equatable, Sendable {
+    public let root: String
+    public let path: String
+    public let open: Bool
+
+    public init(root: String, path: String, open: Bool) {
+        self.root = root
+        self.path = path
+        self.open = open
+    }
+}
+
+public struct ListDevicesResult: Codable, Equatable, Sendable {
+    public let devices: [DeviceInfo]
+
+    public init(devices: [DeviceInfo]) {
+        self.devices = devices
+    }
+}
+
+public struct AddProjectRequest: Codable, Equatable, Sendable {
+    /// Absolute, or `~/…` on its device.
+    public let path: String
+    /// A device's id or name (`DeviceInfo.named`); nil: the caller's.
+    public let device: String?
+    /// Make the folder first (only it, never its parents).
+    public let create: Bool?
+    /// Open its window (default true).
+    public let open: Bool?
+
+    public init(path: String, device: String? = nil, create: Bool? = nil, open: Bool? = nil) {
+        self.path = path
+        self.device = device
+        self.create = create
+        self.open = open
+    }
+}
+
+public struct AddProjectResult: Codable, Equatable, Sendable {
+    /// The project's key: `project_root` of spawn_agent and open_project.
+    public let projectRoot: String
+    public let device: String
+    public let path: String
+    /// The folder was made now.
+    public let created: Bool
+    /// It was a project already.
+    public let alreadyAdded: Bool
+    public let opened: Bool
+
+    public init(projectRoot: String, device: String, path: String, created: Bool, alreadyAdded: Bool, opened: Bool) {
+        self.projectRoot = projectRoot
+        self.device = device
+        self.path = path
+        self.created = created
+        self.alreadyAdded = alreadyAdded
+        self.opened = opened
     }
 }
 

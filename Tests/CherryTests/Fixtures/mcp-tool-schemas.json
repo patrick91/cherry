@@ -14,10 +14,38 @@
     "properties": {
       "project_root": {
         "type": "string"
+      },
+      "device": {
+        "type": "string"
       }
     },
     "required": [
       "project_root"
+    ]
+  },
+  {
+    "name": "list_devices",
+    "properties": {},
+    "required": []
+  },
+  {
+    "name": "add_project",
+    "properties": {
+      "path": {
+        "type": "string"
+      },
+      "device": {
+        "type": "string"
+      },
+      "create": {
+        "type": "boolean"
+      },
+      "open": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "path"
     ]
   },
   {
@@ -472,6 +500,9 @@
       },
       "wait_ms": {
         "type": "integer"
+      },
+      "device": {
+        "type": "string"
       }
     },
     "required": [

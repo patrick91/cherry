@@ -115,6 +115,17 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
         (["todo", "comments", "t1"], "list_todo_comments", ["todo_id": .string("t1")]),
         (["project", "ls"], "list_projects", [:]),
         (["project", "open", "/Users/someone/app"], "open_project", ["project_root": .string("/Users/someone/app")]),
+        (["project", "open", "~/app", "--device", "patmini"], "open_project",
+         ["project_root": .string("~/app"), "device": .string("patmini")]),
+        (["project", "add", "~/code/app", "--device", "patmini", "--create"], "add_project",
+         ["path": .string("~/code/app"), "device": .string("patmini"), "create": .bool(true)]),
+        (["project", "add", "/Users/someone/app", "--open", "false"], "add_project",
+         ["path": .string("/Users/someone/app"), "open": .bool(false)]),
+        (["project", "add", "/Users/someone/app", "--no-open"], "add_project",
+         ["path": .string("/Users/someone/app"), "open": .bool(false)]),
+        (["devices"], "list_devices", [:]),
+        (["spawn", "agent", "claude", "--device", "patmini", "--project-root", "~/app"], "spawn_agent",
+         ["name": .string("claude"), "device": .string("patmini"), "project_root": .string("~/app")]),
         (["project", "show"], "get_project_status", [:]),
         (["commands", "start"], "start_all_commands", [:]),
         (["commands", "stop"], "stop_all_commands", [:]),
@@ -240,7 +251,10 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
 @Test func ControlToolCLIGuideAndSkill() throws {
     let guide = CherryCLIGuide.guide
     #expect(guide.utf8.count < 6_500, "\(guide.utf8.count) bytes")
-    for fact in ["cherry task report", "--awaiting-approval", "cherry answer", "<<'EOF'", "cherry task cancel TASK --close", "never your\nCLI's own subagents"] {
+    for fact in [
+        "cherry task report", "--awaiting-approval", "cherry answer", "<<'EOF'", "cherry task cancel TASK --close", "never your\nCLI's own subagents",
+        "cherry devices", "cherry project add ~/app --device NAME", "--device NAME --project-root",
+    ] {
         #expect(guide.contains(fact), "\(fact)")
     }
     guard case .print(let skill) = CherryCLI.parse(["skill", "show", "--skill-md"]).action else {
@@ -452,4 +466,14 @@ private func runCommand(_ request: RunCommandRequest, on server: CherryControlSe
     let removed = try await runCherryCLI(cli, ["skill", "remove", "--agent", "claude", "--json"], environment: environment)
     #expect(removed.status == 0 && removed.output.contains(#""change":"removed""#), "\(removed.output) \(removed.error)")
     #expect(!FileManager.default.fileExists(atPath: skillFolder.path))
+}
+
+/// `cherry devices` at a terminal: each machine, then its projects' paths.
+@Test func ControlToolCLIDevicesPrintsEachMachineAndItsProjects() {
+    let text = #"{"devices":[{"id":"this-mac","name":"This Mac","os":"macOS","caller":true,"connected":true,"projects":[{"root":"/Users/me/app","path":"/Users/me/app","open":true}]},{"id":"5b0e","name":"patmini","os":"macOS","caller":false,"connected":false,"projects":[]}]}"#
+    #expect(CherryCLIRunner.render(text, command: ["devices"]) == """
+    This Mac (this-mac): macOS, connected, you are here
+      /Users/me/app  (open)
+    patmini (5b0e): macOS, not connected
+    """)
 }

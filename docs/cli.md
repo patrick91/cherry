@@ -384,12 +384,15 @@ other Macs (docs/specs/remote-devices.md). The commands say "device", not
 
 - `list_devices` (`cherry devices`) lists This Mac first, then each
   device: `id` (`this-mac`, or the device's UUID lowercased), `name`, `os`,
-  `caller` (the machine the caller runs on), `connected` (its control
-  connection or SSH master is up; nothing connects to find out),
-  `home_directory` and `projects` (`root`, the key `project_root` takes;
-  `path` there; `open`). A caller on another Mac sees only its own.
-- `device` (open_project, spawn_agent, and any tool that takes
-  `project_root`) names a device by id, name (any case) or `this-mac`; its
+  `caller` (the machine the caller runs on), `home_directory` and
+  `projects` (`root`, the key `project_root` takes; `path` there; `open`).
+  A caller on another Mac sees only its own. It does not say whether a
+  device is connected (Cherry connects one when a window of it opens, and
+  agents took "not connected" as something to ask the user to fix): a tool
+  that needs the device reaches it itself and says so when it cannot
+  (`device_unreachable`, a tab waiting for its Mac).
+- `device` (open_project, spawn_agent, spawn_process, and any tool that
+  takes `project_root`) names a device by id, name (any case) or `this-mac`; its
   `project_root` is then a path there (absolute or `~/…`, its home's), which
   the tool layer turns into the project's key (`DeviceInfo.projectKey`).
   `device_not_found` and `device_ambiguous` list the choices.
@@ -744,7 +747,12 @@ to their events and ends its turn; Cherry tells it when something happened.
   types it at most once per batch of events and once every 5 s. A turn's
   `done` whose agent began another turn before the line could go (most
   often the subscriber answered it meanwhile) wakes nobody: it stays
-  readable and is counted in the next line. The line
+  readable and is counted in the next line. So does a `needs_input` or
+  `permission` the subscriber already knows of, or that is gone: Cherry
+  refused the subscriber's input at that question or permission, or the
+  subscriber read the process's status or output, after the event or while
+  the process kept that state (`MonitorSubscription.processSeen`); or the
+  process no longer waits on it. The line
   names only the subscription and event counts, never text a watched
   process controls (names, titles or output), so it cannot carry
   instructions from a worker. Settings › Agents › Monitors › Wake

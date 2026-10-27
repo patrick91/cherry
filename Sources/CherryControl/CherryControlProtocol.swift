@@ -904,8 +904,6 @@ public struct DeviceInfo: Codable, Equatable, Sendable {
     public let os: String
     /// The machine the caller runs on.
     public let caller: Bool
-    /// This Mac, or a device whose control connection or SSH master is up.
-    public let connected: Bool
     public let homeDirectory: String?
     public let projects: [DeviceProject]
 
@@ -914,7 +912,6 @@ public struct DeviceInfo: Codable, Equatable, Sendable {
         name: String,
         os: String = "macOS",
         caller: Bool,
-        connected: Bool,
         homeDirectory: String?,
         projects: [DeviceProject]
     ) {
@@ -922,7 +919,6 @@ public struct DeviceInfo: Codable, Equatable, Sendable {
         self.name = name
         self.os = os
         self.caller = caller
-        self.connected = connected
         self.homeDirectory = homeDirectory
         self.projects = projects
     }

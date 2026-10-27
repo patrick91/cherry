@@ -515,14 +515,20 @@ final class RemoteDeviceStore: ObservableObject {
     /// On each connection of the device's control: marks the build
     /// directory its `remoteHostPath` names as used by this installation,
     /// so another Mac's install of Cherry never collects it
-    /// (`RemoteHostInstall.garbage`).
+    /// (`RemoteHostInstall.garbage`). As it connects and as it stops being
+    /// connected, notes it seen: Settings › Macs' "last seen".
     private func watchConnections(of id: UUID, control: HostControl) {
         guard connectionWatches[id] == nil else { return }
         connectionWatches[id] = control.$state
             .removeDuplicates()
-            .filter { $0 == .connected }
-            .sink { [weak self] _ in
+            .sink { [weak self, weak control] state in
                 MainActor.assumeIsolated {
+                    // Published before the change: `control.state` is
+                    // still the one it leaves.
+                    if state == .connected || control?.state == .connected {
+                        self?.noteSeen(id)
+                    }
+                    guard state == .connected else { return }
                     self?.markUsedBuild(of: id)
                     self?.ensureMCPForward(of: id)
                     self?.refreshLoginEnvironment(of: id)

@@ -806,10 +806,10 @@ private func controlToolLayerProcess(id: String = controlToolLayerAgentID, kind:
 @Test func controlToolLayerTurnsADeviceAndItsPathIntoTheProjectsKey() async throws {
     let deviceID = "5b0e7c1a-2f4d-4c8e-9a61-0d3e2f1b7c55"
     let devices = CherryControlResponse(result: .listDevices(ListDevicesResult(devices: [
-        DeviceInfo(id: DeviceInfo.thisMacID, name: DeviceInfo.thisMacName, caller: true, connected: true, homeDirectory: "/Users/me", projects: []),
-        DeviceInfo(id: deviceID, name: "patmini", caller: false, connected: true, homeDirectory: "/Users/pat", projects: []),
-        DeviceInfo(id: "6b0e7c1a-2f4d-4c8e-9a61-0d3e2f1b7c55", name: "Twin", caller: false, connected: false, homeDirectory: nil, projects: []),
-        DeviceInfo(id: "7b0e7c1a-2f4d-4c8e-9a61-0d3e2f1b7c55", name: "twin", caller: false, connected: false, homeDirectory: nil, projects: []),
+        DeviceInfo(id: DeviceInfo.thisMacID, name: DeviceInfo.thisMacName, caller: true, homeDirectory: "/Users/me", projects: []),
+        DeviceInfo(id: deviceID, name: "patmini", caller: false, homeDirectory: "/Users/pat", projects: []),
+        DeviceInfo(id: "6b0e7c1a-2f4d-4c8e-9a61-0d3e2f1b7c55", name: "Twin", caller: false, homeDirectory: nil, projects: []),
+        DeviceInfo(id: "7b0e7c1a-2f4d-4c8e-9a61-0d3e2f1b7c55", name: "twin", caller: false, homeDirectory: nil, projects: []),
     ])))
     let answering = { @Sendable (request: CherryControlRequest) -> CherryControlResponse in
         if case .listDevices = request { return devices }
@@ -837,6 +837,23 @@ private func controlToolLayerProcess(id: String = controlToolLayerAgentID, kind:
     }
     #expect(spawn.requests.first == .listDevices)
     #expect(scoped.projectRoot == "device:\(deviceID):/srv/app")
+
+    // A terminal (or a command) too: it opens in that project's window,
+    // where its program runs on the device.
+    let terminal = ControlToolLayerRecorder(answer: answering)
+    _ = await CherryToolLayer.call(
+        name: "spawn_process",
+        arguments: ["kind": .string("terminal"), "text": .string("df -h"), "device": .string("patmini"), "project_root": .string("~/app")],
+        caller: CherryToolCaller(projectRoot: "/mine"), transport: terminal
+    )
+    guard case .scoped(let scopedTerminal)? = terminal.requests.dropFirst().first,
+          case .spawnProcess(let spawned) = scopedTerminal.request
+    else {
+        Issue.record("spawn_process sends \(terminal.requests)")
+        return
+    }
+    #expect(scopedTerminal.projectRoot == "device:\(deviceID):/Users/pat/app")
+    #expect(spawned.kind == "terminal" && spawned.text == "df -h")
 
     // This Mac's key is the path itself.
     let local = ControlToolLayerRecorder(answer: answering)

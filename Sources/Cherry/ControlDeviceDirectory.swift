@@ -15,8 +15,6 @@ struct ControlDeviceDirectory {
         var homeDirectory: String?
         /// Its added projects' paths there.
         var projects: [String]
-        /// Its control connection or its SSH master is up.
-        var connected: Bool
     }
 
     struct Added: Equatable {
@@ -39,8 +37,8 @@ struct ControlDeviceDirectory {
         }
     )
 
-    /// The app's: `store`'s devices, connected as `OmniDeviceConnections`
-    /// tells, added through `RemoteDeviceProjectAdding`.
+    /// The app's: `store`'s devices, added through
+    /// `RemoteDeviceProjectAdding`.
     static func app(store: RemoteDeviceStore) -> ControlDeviceDirectory {
         ControlDeviceDirectory(
             devices: {
@@ -49,8 +47,7 @@ struct ControlDeviceDirectory {
                         id: device.id,
                         name: device.name,
                         homeDirectory: device.homeDirectory,
-                        projects: device.addedProjects,
-                        connected: OmniDeviceConnections.isConnected(device)
+                        projects: device.addedProjects
                     )
                 }
             },

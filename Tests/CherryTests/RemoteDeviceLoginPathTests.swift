@@ -632,6 +632,26 @@ private let bunPath = "/Users/me/.bun/bin:/Users/me/.local/bin:/usr/bin:/bin"
     #expect(harness.store.launchDevice(id: added.id)?.loginEnvironment == ["PATH": "/m/bin"])
 }
 
+/// Settings › Macs' "last seen" follows the device's control: noted as it
+/// connects and again as it stops being connected, not only when the
+/// project picker happens to look.
+@Test @MainActor func RemoteDeviceLastSeenIsNotedAsItsControlConnectsAndDisconnects() async throws {
+    let harness = try LoginPathHarness {
+        .captured(RemoteLoginEnvironment(shell: "/bin/zsh", capturedAt: Date(), environment: ["PATH": bunPath]))
+    }
+    defer { harness.cleanUp() }
+    let device = try harness.store.add(name: "Studio", sshDestination: "studio")
+    let dayAgo = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 - 86_400).rounded(.down))
+    harness.store.update(device.id) { $0.lastSeen = dayAgo }
+    let hosting = try #require(harness.store.hosting(for: device.id))
+    try await hosting.control.connect()
+    #expect(await harness.fake.wait { (harness.store.device(id: device.id)?.lastSeen ?? dayAgo) > dayAgo })
+
+    harness.store.update(device.id) { $0.lastSeen = dayAgo }
+    harness.control.disconnect()
+    #expect(await harness.fake.wait { (harness.store.device(id: device.id)?.lastSeen ?? dayAgo) > dayAgo })
+}
+
 @Test func RemoteDeviceLoginPathShowsInAddMacsChecklist() {
     let result = RemoteDeviceProbeResult(uname: "Darwin arm64", macOSVersion: "26.0", computerName: "Studio", shell: "/bin/zsh")
     let read = RemoteDeviceChecklist(

@@ -52,7 +52,7 @@ private final class ControlToolDeviceHarness {
         openProject = { [weak self] in self?.opened.append($0) }
         server.deviceDirectory = ControlDeviceDirectory(
             devices: { [weak self] in
-                [.init(id: controlToolDeviceID, name: "patmini", homeDirectory: "/Users/pat", projects: self?.deviceProjects ?? [], connected: true)]
+                [.init(id: controlToolDeviceID, name: "patmini", homeDirectory: "/Users/pat", projects: self?.deviceProjects ?? [])]
             },
             addProject: { [weak self] path, deviceID, create in
                 #expect(deviceID == controlToolDeviceID)
@@ -115,7 +115,9 @@ private func controlToolDeviceError(_ result: CallToolResult) -> String? {
     #expect(device["name"] == .string("patmini"))
     #expect(device["os"] == .string("macOS"))
     #expect(device["caller"] == .bool(false))
-    #expect(device["connected"] == .bool(true))
+    // Whether it is connected is not said: a tool that needs the device
+    // reaches it, or says why it could not.
+    #expect(device["connected"] == nil)
     let project = try #require(device["projects"]?.arrayValue?.first?.objectValue)
     #expect(project["root"] == .string("device:\(controlToolDeviceID.uuidString.lowercased()):/Users/pat/old"))
     #expect(project["path"] == .string("/Users/pat/old"))

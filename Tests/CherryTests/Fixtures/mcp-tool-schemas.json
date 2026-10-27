@@ -444,6 +444,12 @@
       },
       "working_directory": {
         "type": "string"
+      },
+      "project_root": {
+        "type": "string"
+      },
+      "device": {
+        "type": "string"
       }
     },
     "required": [

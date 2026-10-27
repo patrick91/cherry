@@ -41,6 +41,14 @@ final class MonitorSubscription {
     var ackCursor = 0
     var droppedEvents = 0
     var lastWokenSeq = 0
+    /// Per watched process, what the subscriber last learned of it from
+    /// Cherry itself (its input refused at the process's question or
+    /// permission, or it read the process's status or screen): the last seq
+    /// then, and the status it learned while the process keeps it.
+    /// `needs_input` and `permission` events up to it, and one after it of
+    /// the status it learned (the sampler had not noticed it yet), are not
+    /// news to it.
+    var processSeen: [String: (seq: Int, status: String?)] = [:]
     var lastWakeAt: Date?
     var isWaking = false
     var activeWaits = 0
@@ -720,6 +728,10 @@ extension CherryControlServer {
         let previous = watched.lastStatus
         let initial = previous == nil
         watched.lastStatus = current
+        // What the subscriber learned of it holds while it stays so.
+        if let seen = subscription.processSeen[watched.id], let status = seen.status, status != current {
+            subscription.processSeen[watched.id] = (seq: seen.seq, status: nil)
+        }
         let session = watched.session
         if let session { watched.name = processName(for: session) }
         let turn = session?.agentTurnCount
@@ -867,10 +879,12 @@ extension CherryControlServer {
               let subscriber = subscription.subscriber
         else { return }
         let unread = subscription.pending.filter { $0.seq > subscription.ackCursor }
-        // A turn's `done` whose agent began another turn since is old news
-        // (the subscriber answered it, most often): it stays readable and
-        // counted, but wakes nobody.
-        guard let newest = unread.last(where: { !Self.turnDoneIsSuperseded($0, in: subscription) }),
+        // A turn's `done` whose agent began another turn since, and a
+        // question the subscriber already knows of or that is gone, are old
+        // news: they stay readable and counted, but wake nobody.
+        guard let newest = unread.last(where: {
+                  !Self.turnDoneIsSuperseded($0, in: subscription) && !Self.questionIsOldNews($0, in: subscription)
+              }),
               newest.seq > subscription.lastWokenSeq
         else { return }
         let now = Date()
@@ -909,6 +923,38 @@ extension CherryControlServer {
               session.kind == .agent
         else { return false }
         return session.agentTurnCount > turn
+    }
+
+    /// The event is a `needs_input` or `permission` the subscriber needs no
+    /// wake for: Cherry told it of the process's question since (its input
+    /// was refused there, or it read the process), or the process no longer
+    /// waits on it (answered, or it moved on).
+    @MainActor
+    static func questionIsOldNews(_ event: MonitorEvent, in subscription: MonitorSubscription) -> Bool {
+        guard event.type == .needsInput || event.type == .permission else { return false }
+        if let seen = subscription.processSeen[event.processID] {
+            if event.seq <= seen.seq || seen.status == event.type.rawValue { return true }
+        }
+        guard let watched = subscription.watched.first(where: { $0.id == event.processID }) else { return false }
+        return watched.lastStatus != event.type.rawValue
+    }
+
+    /// The caller learned from Cherry how `session` stands now: its input
+    /// was refused at the session's question or permission (`status`), or
+    /// it read the session's status or screen (its monitor status now). Its
+    /// subscriptions' `needs_input` and `permission` events about the
+    /// session so far, or about that state, wake it no more.
+    @MainActor
+    func callerLearnedState(of session: TerminalSession, status: MonitorEventType? = nil) {
+        guard let caller = verifiedCallerSession(), caller !== session else { return }
+        let processID = session.id.uuidString
+        for subscription in monitors.subscriptions.values where subscription.subscriber === caller {
+            guard let watched = subscription.watched.first(where: { $0.id == processID }) else { continue }
+            subscription.processSeen[processID] = (
+                seq: subscription.nextSeq - 1,
+                status: status?.rawValue ?? monitorStatus(of: watched)
+            )
+        }
     }
 
     /// The subscriber is idle: it reports `idle` (OSC 7501), or, when it

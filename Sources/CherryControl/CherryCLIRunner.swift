@@ -90,9 +90,8 @@ public enum CherryCLIRunner {
         case ["devices"]:
             if let devices = value.objectValue?["devices"]?.arrayValue?.compactMap(\.objectValue) {
                 return devices.map { device in
-                    let state = device["connected"] == .bool(true) ? "connected" : "not connected"
                     let you = device["caller"] == .bool(true) ? ", you are here" : ""
-                    let header = "\(string(device["name"])) (\(string(device["id"]))): \(string(device["os"])), \(state)\(you)"
+                    let header = "\(string(device["name"])) (\(string(device["id"]))): \(string(device["os"]))\(you)"
                     let projects = (device["projects"]?.arrayValue ?? []).compactMap(\.objectValue).map { project in
                         "  \(string(project["path"]))" + (project["open"] == .bool(true) ? "  (open)" : "")
                     }

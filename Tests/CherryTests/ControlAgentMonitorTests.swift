@@ -512,6 +512,80 @@ struct ControlAgentMonitorTests {
         #expect(events.events.first?.agentTurn == 1)
     }
 
+    /// The worker asks a question while the subscriber is busy, and the
+    /// subscriber learns of it from Cherry (its message is refused with
+    /// agent_awaiting_input): the `needs_input` is old news by the time the
+    /// subscriber is idle. A question asked after that still wakes it.
+    @Test func questionTheSubscriberWasToldOfWakesNobody() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        let worker = try await harness.spawnAgent(named: "Claude")
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(800))
+        let id = try await harness.subscribe(.init(
+            processIDs: [worker.id.uuidString], subscriberProcessID: orchestrator.id.uuidString
+        )).subscription.subscriptionID
+
+        // Refused before the sampler noticed the question, too.
+        harness.report("state=working:app=fake", on: orchestrator)
+        harness.screen(claudeQuestionScreen, on: worker)
+        harness.report("state=blocked:app=claude-code:kind=question", on: worker)
+        let refused = try await harness.send(.sendProcessInput(.init(processID: worker.id.uuidString, text: "and the RAM?", submit: true)))
+        #expect(refused.error?.code == "agent_awaiting_input")
+        harness.report("state=done:app=fake", on: orchestrator)
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(!(try await harness.output(of: orchestrator)).contains("[cherry] Monitor"))
+        let unread = try await harness.events(id, cursor: 0, timeoutMilliseconds: 0)
+        #expect(unread.events.map(\.type) == [.needsInput])
+
+        // Answered, then another question: news.
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(400))
+        harness.report("state=blocked:app=claude-code:kind=question", on: worker)
+        var typed = ""
+        for _ in 0..<60 {
+            typed = try await harness.output(of: orchestrator)
+            if typed.contains("handled [cherry] Monitor") { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(typed.contains("[cherry] Monitor \(id): 2 events ready (2 needs_input)."))
+    }
+
+    /// A question answered before the subscriber went idle (the user picked
+    /// an option in its tab) wakes nobody either.
+    @Test func questionAnsweredBeforeTheSubscriberIsIdleWakesNobody() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        let worker = try await harness.spawnAgent(named: "Claude")
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(800))
+        let id = try await harness.subscribe(.init(
+            processIDs: [worker.id.uuidString], subscriberProcessID: orchestrator.id.uuidString
+        )).subscription.subscriptionID
+
+        harness.report("state=working:app=fake", on: orchestrator)
+        harness.screen(claudeQuestionScreen, on: worker)
+        harness.report("state=blocked:app=claude-code:kind=question", on: worker)
+        try await Task.sleep(for: .milliseconds(600))
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(400))
+        harness.report("state=done:app=fake", on: orchestrator)
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(!(try await harness.output(of: orchestrator)).contains("[cherry] Monitor"))
+        let events = try await harness.events(id, timeoutMilliseconds: 0)
+        #expect(events.events.map(\.type) == [.needsInput])
+    }
+
     @Test func wakeLineSettingOffAndUnconfirmedSubscriberOnlyPoll() async throws {
         let harness = try ControlAgentWaitHarness()
         defer { harness.stop() }

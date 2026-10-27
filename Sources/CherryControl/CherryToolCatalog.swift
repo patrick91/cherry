@@ -169,7 +169,7 @@ public enum CherryToolCatalog {
                 "Tell the orchestrator how it goes: one line, at most 200 characters. One per 5 s is recorded (else recorded false).",
                 properties: [
                     "message": string(),
-                    "awaiting_approval": boolean("A plan or question to approve (4000 characters); the task waits. End your turn.")
+                    "awaiting_approval": boolean("message is the plan or question for your orchestrator to approve (at most 4000 characters, lines kept); the task waits. End your turn.")
                 ],
                 required: ["message"],
                 annotations: additive

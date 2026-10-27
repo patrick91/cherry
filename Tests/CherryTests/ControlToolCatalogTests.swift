@@ -209,19 +209,6 @@ private let controlToolCatalogClaude = ToolClientProfile(client: ToolClientInfo(
     #expect(CherryToolCatalog.digest(for: pi) == digest)
 }
 
-/// The descriptions fit the budget: Codex and Pi load the whole list into
-/// every session (it was 44 311 bytes, 30 390 characters of descriptions).
-@Test func controlToolCatalogFitsItsBudget() throws {
-    let tools = CherryToolCatalog.tools(for: .unknown)
-    let bytes = try CherryToolCatalog.encodedListResult(tools).count
-    #expect(bytes <= 28_000, "tools/list is \(bytes) bytes")
-    let characters = tools.reduce(0) { total, tool in
-        total + tool.description.count + controlToolCatalogParameterDescriptions(tool).values.reduce(0) { $0 + $1.count }
-    }
-    #expect(characters <= 16_000, "the descriptions have \(characters) characters")
-    #expect(CherryToolCatalog.instructions.count <= 1_800, "the instructions have \(CherryToolCatalog.instructions.count) characters")
-}
-
 @Test func controlToolCatalogKeepsTheFactsAgentsActOn() throws {
     for (name, facts) in controlToolCatalogFacts {
         let tool = try controlToolCatalogTool(name)

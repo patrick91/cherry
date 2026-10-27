@@ -318,6 +318,13 @@ public enum CherryCLI {
         var flags: [(name: String, value: String?)] = []
         var index = 0
         var onlyPositional = false
+        // A switch (`--awaiting-approval`) takes the next word only when it
+        // is true or false: `--awaiting-approval "Plan ready?"` is the
+        // switch and the message.
+        let commandSchema = parameterTypes(of: command.tool)
+        func isSwitch(_ flag: String) -> Bool {
+            commandSchema[parameter(of: flag, command: command).name] == "boolean"
+        }
         while index < words.count {
             let word = words[index]
             index += 1
@@ -332,7 +339,8 @@ public enum CherryCLI {
             let body = String(word.dropFirst(2))
             if let equals = body.firstIndex(of: "=") {
                 flags.append((String(body[..<equals]), String(body[body.index(after: equals)...])))
-            } else if index < words.count, !words[index].hasPrefix("--") || words[index] == "-" {
+            } else if index < words.count, !words[index].hasPrefix("--") || words[index] == "-",
+                      !isSwitch(body) || Self.booleanWords.contains(words[index].lowercased()) {
                 flags.append((body, words[index]))
                 index += 1
             } else {
@@ -432,18 +440,7 @@ public enum CherryCLI {
         }
 
         for flag in flags {
-            var name = flag.name
-            var inverted = false
-            if name.hasPrefix("no-") {
-                name.removeFirst(3)
-                inverted = true
-            }
-            if let alias = command.aliases.first(where: { $0.flag == name }) {
-                name = alias.parameter
-                inverted = inverted != alias.inverted
-            } else {
-                name = name.replacingOccurrences(of: "-", with: "_")
-            }
+            let (name, inverted) = parameter(of: flag.name, command: command)
             guard let type = schema[name] else {
                 let known = schema.keys.sorted().map { "--" + $0.replacingOccurrences(of: "_", with: "-") }
                 throw UsageError(message: "Unknown option --\(flag.name). Options: \((command.aliases.map { "--" + $0.flag } + known).joined(separator: " ")).")
@@ -466,6 +463,24 @@ public enum CherryCLI {
     /// A tab named on the command line: its ID, or its name.
     static func processSelector(_ word: String) -> [String: JSONValue] {
         UUID(uuidString: word) != nil ? ["process_id": .string(word.uppercased())] : ["process_name": .string(word)]
+    }
+
+    /// The words a switch takes as its value.
+    static let booleanWords: Set<String> = ["true", "false", "yes", "no", "1", "0"]
+
+    /// The parameter a flag sets, and whether it sets it inverted
+    /// (`--no-…`, or an inverted alias such as `--no-wait`).
+    static func parameter(of flag: String, command: Command) -> (name: String, inverted: Bool) {
+        var name = flag
+        var inverted = false
+        if name.hasPrefix("no-") {
+            name.removeFirst(3)
+            inverted = true
+        }
+        if let alias = command.aliases.first(where: { $0.flag == name }) {
+            return (alias.parameter, inverted != alias.inverted)
+        }
+        return (name.replacingOccurrences(of: "-", with: "_"), inverted)
     }
 
     static func parameterName(_ flag: String, command: Command) -> String {

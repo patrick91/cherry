@@ -513,12 +513,20 @@ extension CherryControlServer {
     /// Forgets settled runs a day after they settled
     /// (`settledRunLifetime`), or once none of their tabs (owner and
     /// workers) has been in an open window or run as a session for
-    /// `goneRunLifetime`. Never an open run.
+    /// `goneRunLifetime`. Never an open run. Notes the runs whose owner is
+    /// gone (`AgentRun.ownerIsGone`).
     @MainActor
     func pruneSettledRuns(now: Date = Date()) {
         guard tasks.isRestoreSettled else { return }
-        var removed = tasks.pruneExpiredRuns(now: now)
+        var changed = tasks.pruneExpiredRuns(now: now)
         let workspaces = allOpenWorkspaces()
+        for run in tasks.orderedRuns {
+            let gone = ownerIsGone(run, in: workspaces)
+            if run.ownerIsGone != gone {
+                run.ownerIsGone = gone
+                changed = true
+            }
+        }
         for run in tasks.orderedRuns where !tasks.isOpen(run) {
             guard runTabsAreGone(run, in: workspaces) else {
                 run.tabsGoneSince = nil
@@ -528,10 +536,26 @@ extension CherryControlServer {
             run.tabsGoneSince = since
             if now.timeIntervalSince(since) >= tasks.goneRunLifetime {
                 tasks.remove(run)
-                removed = true
+                changed = true
             }
         }
-        if removed { tasks.publish() }
+        if changed { tasks.publish() }
+    }
+
+    /// The run's owner's tab is in no open window and its session does not
+    /// run (or might: a host Cherry cannot ask now counts as running). A
+    /// run that never had an owner's tab is not one.
+    @MainActor
+    private func ownerIsGone(_ run: AgentRun, in workspaces: [TerminalWorkspace]) -> Bool {
+        guard run.ownerID != nil || run.ownerSession != nil else { return false }
+        if let ownerID = run.ownerID, workspaces.contains(where: { $0.sessions.contains { $0.id == ownerID } }) { return false }
+        if let binding = run.ownerSession {
+            switch tasks.sessionStatus(binding, tasks.hostingForSession(binding), tasks.restoredFileSavedAt) {
+            case .gone, .exited: break
+            case .running, .unknown: return false
+            }
+        }
+        return true
     }
 
     /// None of the run's tabs (its owner's, its workers') is in an open

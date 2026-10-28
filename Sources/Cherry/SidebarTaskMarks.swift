@@ -3,8 +3,8 @@ import Foundation
 
 /// The one status mark a sidebar row shows. A Cherry task's worker shows
 /// its task's state, unless its agent asks for permission or a question
-/// (those need the user); any other agent shows its activity, or a result
-/// the user has not seen.
+/// (those need the user) or works again after its task settled; any other
+/// agent shows its activity, or a result the user has not seen.
 enum SidebarRowMark: Equatable {
     case none
     case permission
@@ -29,6 +29,9 @@ enum SidebarRowMark: Equatable {
             if hasUnseenResult, !isSelected { return .result(failed: activity == .error) }
             return activity == .working ? .working : .none
         }
+        // A settled task's worker back at work (asked again, or by the
+        // user) shows that, not how the task ended.
+        if taskState.isSettled, activity == .working { return .working }
         switch taskState {
         case .working:
             return .working

@@ -27,6 +27,11 @@ import Testing
         #expect(mark(.idle, unseen: true, task: state) == .task(state, emphasized: true), "\(state)")
     }
     #expect(mark(.error, unseen: true, task: .failed) == .task(.failed, emphasized: true))
+    // Back at work after its task settled: the spinner, not how it ended.
+    for state in [AgentTaskState.reported, .failed, .noReport, .cancelled] {
+        #expect(mark(.working, task: state) == .working, "\(state)")
+    }
+    #expect(mark(.working, task: .needsInput) == .task(.needsInput, emphasized: true))
 }
 
 @Test func aRowWithoutATaskKeepsItsActivityMarks() {

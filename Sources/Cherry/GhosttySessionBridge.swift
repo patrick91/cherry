@@ -2344,15 +2344,16 @@ extension GhosttySessionBridge {
     }
 
     /// Pastes `text` into the tab as the tab pastes: through the surface
-    /// (which brackets it while the program asks for it), or, when the
-    /// host takes the tab's input now, bracketed as the host reports the
-    /// program's mode (`TerminalSession.bracketsPaste`).
+    /// (which brackets it while the program asks for it and asks first, under
+    /// Ghostty's paste protection, about text that could run a command), or,
+    /// when the host takes the tab's input now, bracketed as the host reports
+    /// the program's mode (`TerminalSession.bracketsPaste`).
     func insertPastedText(_ text: String) {
         guard let session = proxy.session, session.acceptsInput else { return }
         if session.keyboardInputGoesThroughHost || !isNativePTYBacked {
             session.send(data: TerminalInputEncoder.pastedTextData(text, bracketedPasteMode: session.bracketsPaste(text)))
         } else {
-            terminalView.sendText(text)
+            terminalView.pasteText(text)
         }
     }
 }

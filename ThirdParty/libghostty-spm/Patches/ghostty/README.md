@@ -25,7 +25,8 @@ This patch workflow exists so we can carry host-managed IO work required for
 sandboxed iOS, macOS, and Mac Catalyst integration without hiding upstream
 modifications inside ad-hoc build script edits.
 
-The patches were last validated against Ghostty main commit
-`ad6e72ddc4e9e259c9b70bff6e2b389e0ce91949` (2026-08-16). Run
+The patches were last validated against Ghostty v1.4.0
+(`83fb95624b0439ee660c2679b43b38c8b63769cd`, 2026-10-27) with Zig 0.17.0,
+building the macOS slices (`./build.sh --platforms macos`). Run
 `Script/apply-patches.sh` twice against a clean checkout before building: the
 second run must leave the checkout unchanged.

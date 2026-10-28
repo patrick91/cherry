@@ -73,53 +73,22 @@ text = text.replace(
     '    // Glslang\n    if (b.lazyDependency("glslang", .{',
     '    // Glslang — only needed for custom shaders\n    if (self.config.custom_shaders) if (b.lazyDependency("glslang", .{',
 )
-# Close the extra if at end of glslang block
-text = text.replace(
-    """            step.linkLibrary(glslang_dep.artifact("glslang"));
-            try static_libs.append(
-                b.allocator,
-                glslang_dep.artifact("glslang").getEmittedBin(),
-            );
-        }
-    }
-
-    // Spirv-cross""",
-    """            step.linkLibrary(glslang_dep.artifact("glslang"));
-            try static_libs.append(
-                b.allocator,
-                glslang_dep.artifact("glslang").getEmittedBin(),
-            );
-        }
-    };
-
-    // Spirv-cross""",
-)
+# Close the extra if at end of glslang block. Zig 0.17 needs the `;` that
+# ends an if without else used as a statement.
+glslang_end = "        }\n    }\n\n    // Spirv-cross"
+if text.count(glslang_end) != 1:
+    sys.exit("[-] SharedDeps.zig: end of the glslang block not found")
+text = text.replace(glslang_end, "        }\n    };\n\n    // Spirv-cross")
 
 # Gate spirv-cross — wrap with custom_shaders check
 text = text.replace(
     '    // Spirv-cross\n    if (b.lazyDependency("spirv_cross", .{',
     '    // Spirv-cross — only needed for custom shaders\n    if (self.config.custom_shaders) if (b.lazyDependency("spirv_cross", .{',
 )
-text = text.replace(
-    """            step.linkLibrary(spirv_cross_dep.artifact("spirv_cross"));
-            try static_libs.append(
-                b.allocator,
-                spirv_cross_dep.artifact("spirv_cross").getEmittedBin(),
-            );
-        }
-    }
-
-    // Sentry""",
-    """            step.linkLibrary(spirv_cross_dep.artifact("spirv_cross"));
-            try static_libs.append(
-                b.allocator,
-                spirv_cross_dep.artifact("spirv_cross").getEmittedBin(),
-            );
-        }
-    };
-
-    // Sentry""",
-)
+spirv_cross_end = "        }\n    }\n\n    // Sentry"
+if text.count(spirv_cross_end) != 1:
+    sys.exit("[-] SharedDeps.zig: end of the spirv-cross block not found")
+text = text.replace(spirv_cross_end, "        }\n    };\n\n    // Sentry")
 
 shared_path.write_text(text)
 print("[+] patched SharedDeps.zig")

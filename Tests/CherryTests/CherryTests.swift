@@ -7374,7 +7374,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         minimumContrast: 1.15
     )
 
-    #expect(configuration.rendered.contains("scrollback-limit = 4000000"))
+    #expect(configuration.rendered.contains("scrollback-limit-bytes = 4000000"))
     #expect(configuration.rendered.contains("cursor-style = bar"))
 }
 

@@ -943,7 +943,7 @@ final class TerminalSettings: ObservableObject {
             builder.withMinimumContrast(minimumContrast)
             builder.withWindowPaddingX(8)
             builder.withWindowPaddingY(14)
-            builder.withCustom("scrollback-limit", "\(Self.shownTabScrollbackBytes)")
+            builder.withCustom("scrollback-limit-bytes", "\(Self.shownTabScrollbackBytes)")
             // The Ghostty surface owns the keyboard for every running session, so
             // honor the same input-producing bindings as standalone Ghostty.
             // App-action bindings (new tabs, splits, and windows) remain Cherry's
@@ -1146,7 +1146,7 @@ extension TerminalSettings {
     }
 
     /// How much scrollback a tab's surface keeps while it is shown, in bytes
-    /// (Ghostty's `scrollback-limit`). Fixed: not a setting.
+    /// (Ghostty's `scrollback-limit-bytes`). Fixed: not a setting.
     nonisolated static let shownTabScrollbackBytes = 4_000_000
 
     /// Where `setting`'s value comes from: a launch argument (This run only,

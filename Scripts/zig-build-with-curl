@@ -1,33 +1,60 @@
 #!/usr/bin/env python3
-"""Run `zig build` with curl fetching its dependencies.
+"""Run `zig build` with curl and git fetching its dependencies.
 
 Usage: Scripts/zig-build-with-curl ZIG [zig build arguments…]  (run in the
 project's directory)
 
 Zig 0.17 keeps packages in the project's zig-pkg/<hash> and downloads each one
 once; on some CI runners its downloads from deps.files.ghostty.org stall and
-fail with ReadFailed every time, where curl does not. So zig runs with a
-proxy that refuses every connection: each package it cannot find is an error
-on its build.zig.zon's `.url` line, which this script downloads with curl
-(retrying), checks with an offline `zig fetch` that the archive has the hash
-the build.zig.zon pins (Zig checks what it downloads, not a zig-pkg/<hash>
-folder it finds), unpacks into zig-pkg/<hash> as Zig would (one top-level
-folder stripped) and runs zig again, until the build succeeds or fails
-otherwise.
+fail with ReadFailed every time, where curl does not. So this script fetches
+them itself: first every non-lazy dependency the build.zig.zon files name
+(the project's, its path packages' and those of each package fetched), then,
+with zig run behind a proxy that refuses every connection, each lazy one the
+build reports missing on a `.url` line (and its non-lazy dependencies), until
+the build succeeds or fails otherwise. A tarball comes from curl (retrying),
+a git+https package from git at its pinned commit; an offline `zig fetch`
+must give it the hash the build.zig.zon pins (Zig checks what it downloads,
+not a zig-pkg/<hash> folder it finds) before it is moved into zig-pkg/<hash>
+as Zig lays it out (one top-level folder stripped).
 """
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ZON_ERROR = re.compile(r"^(\S*build\.zig\.zon):(\d+):\d+: error: ", re.MULTILINE)
 URL = re.compile(r'\.url\s*=\s*"([^"]+)"')
 HASH = re.compile(r'\.hash\s*=\s*"([^"]+)"')
+PATH = re.compile(r'\.path\s*=\s*"([^"]+)"')
+LAZY = re.compile(r"\.lazy\s*=\s*true")
 SAFE_HASH = re.compile(r"^[A-Za-z0-9_.\-]+$")
-MAX_ROUNDS = 20
+MAX_ROUNDS = 10
+
+
+def dependency_blocks(zon: Path):
+    """The text of each entry of the zon's `.dependencies`."""
+    text = re.sub(r"(?m)^\s*//[^\n]*", "", zon.read_text())
+    start = text.find(".dependencies")
+    if start == -1:
+        return
+    start = text.find("{", start)
+    depth, entry = 0, None
+    for index in range(start, len(text)):
+        if text[index] == "{":
+            depth += 1
+            if depth == 2:
+                entry = index
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 1 and entry is not None:
+                yield text[entry : index + 1]
+            if depth == 0:
+                return
 
 
 def dependency_at(zon: Path, line: int):
@@ -45,6 +72,33 @@ def dependency_at(zon: Path, line: int):
     return None
 
 
+def download(url: str, work: Path) -> Path:
+    if url.startswith("git+"):
+        repository, _, commit = url[len("git+") :].partition("#")
+        if not commit:
+            sys.exit(f"zig-build-with-curl: {url} names no commit")
+        checkout = work / "checkout"
+        checkout.mkdir()
+        git = ["git", "-C", str(checkout)]
+        subprocess.run([*git, "init", "-q"], check=True)
+        subprocess.run([*git, "remote", "add", "origin", repository], check=True)
+        for attempt in range(5):
+            if subprocess.run([*git, "fetch", "-q", "--depth", "1", "origin", commit]).returncode == 0:
+                break
+            if attempt == 4:
+                sys.exit(f"zig-build-with-curl: could not fetch {url}")
+        subprocess.run([*git, "checkout", "-q", "FETCH_HEAD"], check=True)
+        shutil.rmtree(checkout / ".git")
+        return checkout
+    archive = work / Path(url.split("?")[0]).name
+    subprocess.run(
+        ["curl", "-fsSL", "--retry", "5", "--retry-all-errors", "--connect-timeout", "20",
+         "--max-time", "600", "-o", str(archive), url],
+        check=True,
+    )
+    return archive
+
+
 def unpack(zig: str, url: str, digest: str, pkg_dir: Path) -> None:
     if not SAFE_HASH.match(digest):
         sys.exit(f"zig-build-with-curl: unexpected package hash {digest!r}")
@@ -53,40 +107,69 @@ def unpack(zig: str, url: str, digest: str, pkg_dir: Path) -> None:
         return
     pkg_dir.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=pkg_dir, prefix=".curl-") as work:
-        archive = Path(work) / Path(url.split("?")[0]).name
+        work = Path(work)
         print(f"zig-build-with-curl: fetching {url}", file=sys.stderr)
-        subprocess.run(
-            ["curl", "-fsSL", "--retry", "5", "--retry-all-errors", "--connect-timeout", "20",
-             "--max-time", "600", "-o", str(archive), url],
-            check=True,
-        )
-        # Zig checks the hash of what it downloads, not of a folder it finds.
+        source = download(url, work)
         checked = subprocess.run(
-            [zig, "fetch", str(archive)], capture_output=True, text=True,
-            env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(Path(work) / "cache")},
+            [zig, "fetch", str(source)], capture_output=True, text=True,
+            env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(work / "cache")},
         )
         if checked.returncode != 0 or checked.stdout.strip() != digest:
             sys.stderr.write(checked.stderr)
             sys.exit(f"zig-build-with-curl: {url} has hash {checked.stdout.strip()!r}, "
                      f"expected {digest!r}")
-        unpacked = Path(work) / "unpacked"
-        unpacked.mkdir()
-        subprocess.run(["tar", "-xf", str(archive), "-C", str(unpacked)], check=True)
-        entries = list(unpacked.iterdir())
-        root = entries[0] if len(entries) == 1 and entries[0].is_dir() else unpacked
+        if source.is_dir():
+            root = source
+        else:
+            root = work / "unpacked"
+            root.mkdir()
+            subprocess.run(["tar", "-xf", str(source), "-C", str(root)], check=True)
+            entries = list(root.iterdir())
+            if len(entries) == 1 and entries[0].is_dir():
+                root = entries[0]
         root.rename(destination)
+
+
+def fetch_all(zig: str, wanted: dict, pkg_dir: Path) -> None:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for result in [pool.submit(unpack, zig, url, digest, pkg_dir) for digest, url in wanted.items()]:
+            result.result()
+
+
+def prefetch(zig: str, pkg_dir: Path, zons: list) -> None:
+    """The non-lazy dependencies of these build.zig.zon files, level by level."""
+    seen_zons, seen = set(), set()
+    while zons:
+        wanted, next_zons = {}, []
+        for zon in zons:
+            zon = zon.resolve()
+            if zon in seen_zons or not zon.exists():
+                continue
+            seen_zons.add(zon)
+            for block in dependency_blocks(zon):
+                path = PATH.search(block)
+                if path:
+                    next_zons.append(zon.parent / path.group(1) / "build.zig.zon")
+                    continue
+                url, digest = URL.search(block), HASH.search(block)
+                if url and digest and not LAZY.search(block) and digest.group(1) not in seen:
+                    wanted[digest.group(1)] = url.group(1)
+        seen.update(wanted)
+        fetch_all(zig, wanted, pkg_dir)
+        zons = next_zons + [pkg_dir / digest / "build.zig.zon" for digest in wanted]
 
 
 def main() -> None:
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     zig, arguments = sys.argv[1], sys.argv[2:]
+    pkg_dir = Path("zig-pkg").resolve()
+    prefetch(zig, pkg_dir, [Path("build.zig.zon")])
     environment = dict(os.environ)
     for key in ("no_proxy", "NO_PROXY"):
         environment.pop(key, None)
     for key in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
         environment[key] = "http://127.0.0.1:9"
-    pkg_dir = Path("zig-pkg").resolve()
     fetched = set()
     for _ in range(MAX_ROUNDS):
         result = subprocess.run([zig, "build", *arguments], env=environment,
@@ -94,19 +177,19 @@ def main() -> None:
         if result.returncode == 0:
             sys.stderr.write(result.stderr)
             return
-        missing = []
+        missing = {}
         for match in ZON_ERROR.finditer(result.stderr):
             dependency = dependency_at(Path(match.group(1)), int(match.group(2)))
             if dependency and dependency[1] not in fetched:
-                missing.append(dependency)
+                missing[dependency[1]] = dependency[0]
         if not missing:
             sys.stderr.write(result.stderr)
             sys.exit(result.returncode)
-        for url, digest in dict(missing).items():
-            unpack(zig, url, digest, pkg_dir)
-            fetched.add(digest)
-    sys.exit("zig-build-with-curl: still missing dependencies after "
-             f"{MAX_ROUNDS} rounds")
+        print(f"zig-build-with-curl: the build needs {len(missing)} more", file=sys.stderr)
+        fetch_all(zig, missing, pkg_dir)
+        fetched.update(missing)
+        prefetch(zig, pkg_dir, [pkg_dir / digest / "build.zig.zon" for digest in missing])
+    sys.exit(f"zig-build-with-curl: still missing dependencies after {MAX_ROUNDS} rounds")
 
 
 if __name__ == "__main__":

@@ -59,6 +59,14 @@ fi
 rm -f "$prefix/SOURCE_REVISION" "$prefix/OPTIMIZE"
 (
   cd "$source_dir"
+  # Zig fetches each dependency once and gives up on a stalled download
+  # (CI saw ReadFailed from deps.files.ghostty.org), so fetch with retries first.
+  for attempt in 1 2 3; do
+    "$zig" build --fetch -Demit-lib-vt -Demit-xcframework=false && break
+    [ "$attempt" -lt 3 ] || exit 1
+    echo "Fetching Ghostty's dependencies failed; retrying" >&2
+    sleep 5
+  done
   "$zig" build -Demit-lib-vt -Demit-xcframework=false -Doptimize="$optimize" \
     -Dtarget="$zig_target" --prefix "$prefix"
 )

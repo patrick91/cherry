@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Run `zig build` with curl fetching its dependencies.
+
+Usage: Scripts/zig-build-with-curl ZIG [zig build arguments…]  (run in the
+project's directory)
+
+Zig 0.17 keeps packages in the project's zig-pkg/<hash> and downloads each one
+once; on some CI runners its downloads from deps.files.ghostty.org stall and
+fail with ReadFailed every time, where curl does not. So zig runs with a
+proxy that refuses every connection: each package it cannot find is an error
+on its build.zig.zon's `.url` line, which this script downloads with curl
+(retrying), checks with an offline `zig fetch` that the archive has the hash
+the build.zig.zon pins (Zig checks what it downloads, not a zig-pkg/<hash>
+folder it finds), unpacks into zig-pkg/<hash> as Zig would (one top-level
+folder stripped) and runs zig again, until the build succeeds or fails
+otherwise.
+"""
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ZON_ERROR = re.compile(r"^(\S*build\.zig\.zon):(\d+):\d+: error: ", re.MULTILINE)
+URL = re.compile(r'\.url\s*=\s*"([^"]+)"')
+HASH = re.compile(r'\.hash\s*=\s*"([^"]+)"')
+SAFE_HASH = re.compile(r"^[A-Za-z0-9_.\-]+$")
+MAX_ROUNDS = 20
+
+
+def dependency_at(zon: Path, line: int):
+    """The (url, hash) of the dependency whose `.url` is on `line`."""
+    lines = zon.read_text().splitlines()
+    url = URL.search(lines[line - 1]) if 0 < line <= len(lines) else None
+    if not url:
+        return None
+    for following in lines[line : line + 6]:
+        found = HASH.search(following)
+        if found:
+            return url.group(1), found.group(1)
+        if "}" in following:
+            break
+    return None
+
+
+def unpack(zig: str, url: str, digest: str, pkg_dir: Path) -> None:
+    if not SAFE_HASH.match(digest):
+        sys.exit(f"zig-build-with-curl: unexpected package hash {digest!r}")
+    destination = pkg_dir / digest
+    if destination.exists():
+        return
+    pkg_dir.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=pkg_dir, prefix=".curl-") as work:
+        archive = Path(work) / Path(url.split("?")[0]).name
+        print(f"zig-build-with-curl: fetching {url}", file=sys.stderr)
+        subprocess.run(
+            ["curl", "-fsSL", "--retry", "5", "--retry-all-errors", "--connect-timeout", "20",
+             "--max-time", "600", "-o", str(archive), url],
+            check=True,
+        )
+        # Zig checks the hash of what it downloads, not of a folder it finds.
+        checked = subprocess.run(
+            [zig, "fetch", str(archive)], capture_output=True, text=True,
+            env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(Path(work) / "cache")},
+        )
+        if checked.returncode != 0 or checked.stdout.strip() != digest:
+            sys.stderr.write(checked.stderr)
+            sys.exit(f"zig-build-with-curl: {url} has hash {checked.stdout.strip()!r}, "
+                     f"expected {digest!r}")
+        unpacked = Path(work) / "unpacked"
+        unpacked.mkdir()
+        subprocess.run(["tar", "-xf", str(archive), "-C", str(unpacked)], check=True)
+        entries = list(unpacked.iterdir())
+        root = entries[0] if len(entries) == 1 and entries[0].is_dir() else unpacked
+        root.rename(destination)
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    zig, arguments = sys.argv[1], sys.argv[2:]
+    environment = dict(os.environ)
+    for key in ("no_proxy", "NO_PROXY"):
+        environment.pop(key, None)
+    for key in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        environment[key] = "http://127.0.0.1:9"
+    pkg_dir = Path("zig-pkg").resolve()
+    fetched = set()
+    for _ in range(MAX_ROUNDS):
+        result = subprocess.run([zig, "build", *arguments], env=environment,
+                                stderr=subprocess.PIPE, text=True)
+        if result.returncode == 0:
+            sys.stderr.write(result.stderr)
+            return
+        missing = []
+        for match in ZON_ERROR.finditer(result.stderr):
+            dependency = dependency_at(Path(match.group(1)), int(match.group(2)))
+            if dependency and dependency[1] not in fetched:
+                missing.append(dependency)
+        if not missing:
+            sys.stderr.write(result.stderr)
+            sys.exit(result.returncode)
+        for url, digest in dict(missing).items():
+            unpack(zig, url, digest, pkg_dir)
+            fetched.add(digest)
+    sys.exit("zig-build-with-curl: still missing dependencies after "
+             f"{MAX_ROUNDS} rounds")
+
+
+if __name__ == "__main__":
+    main()

@@ -277,6 +277,10 @@ final class AgentRun {
     var relinkedAt: Date?
     /// Since when none of its tabs is open or running (`pruneSettledRuns`).
     var tabsGoneSince: Date?
+    /// Its owner's tab is in no open window and its session runs no more
+    /// (`pruneSettledRuns`): its settled tasks no longer mark their workers'
+    /// rows, since nobody is left to act on them.
+    var ownerIsGone = false
 
     init(
         id: String,
@@ -784,6 +788,10 @@ final class AgentTaskRegistry {
         var badges: [UUID: AgentTaskBadge] = [:]
         for id in taskOrder {
             guard let task = tasks[id] else { continue }
+            if task.state.isSettled, runs[task.runID]?.ownerIsGone == true {
+                badges[task.workerID] = nil
+                continue
+            }
             badges[task.workerID] = AgentTaskBadge(
                 state: task.state,
                 label: task.label,

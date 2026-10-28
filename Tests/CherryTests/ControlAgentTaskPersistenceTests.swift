@@ -568,7 +568,7 @@ struct ControlAgentTaskPersistenceTests {
         harness.server.callerSessionResolverForTesting = { _ in leadA }
         let (worker, settledTask) = try await harness.spawnWorker(task: "Done soon", label: "done")
         harness.server.callerSessionResolverForTesting = { _ in leadB }
-        let (_, openTask) = try await harness.spawnWorker(task: "Still open", label: "open")
+        let (openWorker, openTask) = try await harness.spawnWorker(task: "Still open", label: "open")
         harness.server.callerSessionResolverForTesting = { _ in worker }
         #expect(try await harness.send(.reportResult(.init(value: .null, summary: "ok"))).error == nil)
         let tasks = harness.server.tasks
@@ -593,9 +593,18 @@ struct ControlAgentTaskPersistenceTests {
         let (other, goneTask) = try await harness.spawnWorker(task: "Gone soon", label: "gone")
         harness.server.callerSessionResolverForTesting = { _ in other }
         #expect(try await harness.send(.reportResult(.init(value: .null, summary: "ok"))).error == nil)
-        for tab in [other, leadA] {
-            #expect(try await harness.send(.closeProcess(.init(processID: tab.id.uuidString))).error == nil)
-        }
+        // Its owner closed: its settled task no longer marks its worker's
+        // row; an open task's mark stays whatever became of its owner.
+        #expect(tasks.board.badges[other.id] != nil)
+        #expect(try await harness.send(.closeProcess(.init(processID: leadA.id.uuidString))).error == nil)
+        harness.server.pruneSettledRuns()
+        #expect(tasks.runs[goneTask.runID]?.ownerIsGone == true)
+        #expect(tasks.board.badges[other.id] == nil)
+        #expect(tasks.runs[goneTask.runID]?.tabsGoneSince == nil, "its worker is still open")
+        #expect(try await harness.send(.closeProcess(.init(processID: leadB.id.uuidString))).error == nil)
+        harness.server.pruneSettledRuns()
+        #expect(tasks.board.badges[openWorker.id].map { !$0.state.isSettled } == true)
+        #expect(try await harness.send(.closeProcess(.init(processID: other.id.uuidString))).error == nil)
         harness.server.pruneSettledRuns()
         #expect(tasks.runs[goneTask.runID] != nil && tasks.runs[goneTask.runID]?.tabsGoneSince != nil)
         harness.server.pruneSettledRuns(now: Date().addingTimeInterval(tasks.goneRunLifetime + 1))

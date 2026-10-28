@@ -57,7 +57,7 @@ replies still come.
 XTGETTCAP `TN` (the terminfo name) is never answered here: the host forwards
 it to the renderer, which answers it.
 
-The library is built with `-Doptimize=ReleaseSafe` (`Scripts/build-host-vt`):
+The library is built with `-Doptimize=safe` (Zig's ReleaseSafe) (`Scripts/build-host-vt`):
 the host parses untrusted output from every session, so Zig's runtime safety
 checks stay on. Each session's terminal lives in its own holder process
 (`cherry-host hold`), so a safety abort ends only that session. The script records the Ghostty revision and the
@@ -138,8 +138,10 @@ liveness checks are not notifications and give nothing.
 
 `snapshot` produces VT bytes, beginning with a reset (RIS), for a fresh
 renderer of the same dimensions. The shim encodes content itself from the
-grid (the upstream formatter drops trailing blank rows, background-only rows
-and per-cell hyperlinks):
+grid: the same encoder repaints single rows and cells (`refresh`, viewports)
+and streams history in bounded pieces (`snapshot_limited`), which the
+upstream formatter, writing whole screens, cannot (since 1.4 it keeps
+trailing blank rows, background-only cells and per-cell hyperlinks too):
 
 - Content is written from the oldest history row down, one line per row, so
   the stream always ends on the last active row. Every active row lands on its

@@ -117,37 +117,34 @@ struct ShellIntegrationBootstrap: Equatable, Sendable {
               _cherry_set_title() {
                 emulate -L zsh
                 local title="$1"
-                title="${title//$'\\e'/}"
-                title="${title//$'\\a'/}"
-                print -n -- $'\\e]2;'"$title"$'\\a'
+                title="${title//[[:cntrl:]]/}"
+                print -rn -- $'\\e]2;'"$title"$'\\a'
               }
 
               _cherry_set_working_directory() {
                 emulate -L zsh
                 local directory="$PWD"
-                directory="${directory//$'\\e'/}"
-                directory="${directory//$'\\a'/}"
+                directory="${directory//[[:cntrl:]]/}"
+                local host="${HOST//[[:cntrl:]]/}"
                 # Match Ghostty's shell integration: report cwd with OSC 7
                 # using the kitty-shell-cwd scheme, and report on both chpwd
                 # and precmd because commands may change cwd without chpwd.
-                print -n -- $'\\e]7;kitty-shell-cwd://'"$HOST$directory"$'\\a'
+                print -rn -- $'\\e]7;kitty-shell-cwd://'"$host$directory"$'\\a'
               }
 
               _cherry_emit_nix_shell_metadata() {
                 emulate -L zsh
                 local state="$1"
                 local command="${2-}"
-                command="${command//$'\\e'/}"
-                command="${command//$'\\a'/}"
-                print -n -- $'\\e]777;cherry-nix;'"$state"';'"$command"$'\\a'
+                command="${command//[[:cntrl:]]/}"
+                print -rn -- $'\\e]777;cherry-nix;'"$state"';'"$command"$'\\a'
               }
 
               _cherry_emit_command_metadata() {
                 emulate -L zsh
                 local command="$1"
-                command="${command//$'\\e'/}"
-                command="${command//$'\\a'/}"
-                print -n -- $'\\e]777;cherry-command;'"$command"$'\\a'
+                command="${command//[[:cntrl:]]/}"
+                print -rn -- $'\\e]777;cherry-command;'"$command"$'\\a'
               }
 
               _cherry_is_nix_shell_command() {
@@ -266,7 +263,7 @@ struct ShellIntegrationBootstrap: Equatable, Sendable {
               # precise command-boundary/idle signals for plain scripts.
               _cherry_osc133() {
                 [[ -n "${CHERRY_EMIT_OSC133-}" ]] || return 0
-                print -n -- "$1"
+                print -rn -- "$1"
               }
 
               _cherry_preexec() {

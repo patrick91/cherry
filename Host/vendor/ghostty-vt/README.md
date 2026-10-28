@@ -4,8 +4,8 @@ Cherry's host uses the upstream, headless `libghostty-vt` C API. It does not
 depend on AppKit, GhosttyTerminal's Swift wrapper, a display server, or a GPU.
 
 - Source: https://github.com/ghostty-org/ghostty
-- Revision: `291fd050b9e9c293c8adb6a140742649b7e42d3a`
-- Zig: `0.16.0`; official download SHA256 values are pinned in `Scripts/build-host-vt`.
+- Revision: `83fb95624b0439ee660c2679b43b38c8b63769cd` (v1.4.0)
+- Zig: `0.17.0`; official download SHA256 values are pinned in `Scripts/build-host-vt`.
 - Source patches: none.
 - License: MIT; see `LICENSE`. The upstream build also bundles third-party
   dependencies identified by the pinned source's `build.zig.zon` and `vendor/`.
@@ -20,11 +20,11 @@ ignored. `ZIG`, `GHOSTTY_SRC`, and `CHERRY_VT_BUILD_CACHE` optionally select
 existing build inputs; their version, revision, and clean source state are
 checked. `CHERRY_GHOSTTY_VT_DIR` overrides the installed prefix for Cargo.
 
-The library is built with `-Doptimize=ReleaseSafe`: the daemon parses untrusted
+The library is built with `-Doptimize=safe` (Zig's ReleaseSafe): the daemon parses untrusted
 output from every session, so Zig's runtime safety checks (bounds, overflow,
 unreachable) stay on. After a successful build the script writes two stamps
 into the prefix, `SOURCE_REVISION` (the Ghostty revision) and `OPTIMIZE`
-(`ReleaseSafe`); it deletes both before building, so an interrupted build
+(`safe`); it deletes both before building, so an interrupted build
 leaves none. `cherry-vt`'s build script refuses an archive whose stamps are
 missing or different, including one built before the stamps existed, and asks
 for `Scripts/build-host-vt` to be run. A prefix given with

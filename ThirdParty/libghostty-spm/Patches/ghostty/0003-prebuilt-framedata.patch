@@ -1,8 +1,9 @@
 diff --git a/src/build/GhosttyFrameData.zig b/src/build/GhosttyFrameData.zig
+index eaf6725..2b3965d 100644
 --- a/src/build/GhosttyFrameData.zig
 +++ b/src/build/GhosttyFrameData.zig
 @@ -13,7 +13,7 @@ pub fn init(b: *std.Build) !GhosttyFrameData {
-
+ 
      // Generate the Zig source file that embeds the compressed data
      const wf = b.addWriteFiles();
 -    _ = wf.addCopyFile(dist.framedata.path(b), "framedata.compressed");
@@ -34,7 +35,7 @@ diff --git a/src/build/GhosttyFrameData.zig b/src/build/GhosttyFrameData.zig
 -    } else {
 -        if (b.lazyDependency("zlib", .{
 -            .target = b.graph.host,
--            .optimize = .ReleaseFast,
+-            .optimize = .fast,
 -        })) |zlib_dep| {
 -            exe.root_module.linkLibrary(zlib_dep.artifact("z"));
 -        }

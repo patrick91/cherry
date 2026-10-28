@@ -27,7 +27,7 @@ The build requires Rust/Cargo 1.85 or later (the workspace's `rust-version`), a
 C/C++ toolchain, Git, curl, tar, and network access for dependencies. On macOS,
 install the Xcode command-line tools; on Debian/Ubuntu, install
 `build-essential git curl xz-utils`. The VT build script
-downloads checksum-pinned Zig 0.16.0 and builds a pinned Ghostty revision as a
+downloads checksum-pinned Zig 0.17.0 and builds a pinned Ghostty revision as a
 ReleaseSafe library. See [the VT dependency notes](vendor/ghostty-vt/README.md)
 for revision, stamp, and toolchain overrides. `Scripts/build-host-vt` accepts a
 Rust target triple for the library. On Linux the complete host build and

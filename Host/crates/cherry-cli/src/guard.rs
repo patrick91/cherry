@@ -13,8 +13,11 @@
 //! `ESC _`, `ESC X` or `ESC ^` (Ghostty reads SOS and PM as APC) or their
 //! 8-bit forms (0x9f, 0x98, 0x9e, which Ghostty heeds inside an escape
 //! sequence, a control sequence or a device control string), behind bytes
-//! it ignores there (DEL, 0xa0 and up), and ended by `ESC`, ST (0x9c), CAN,
-//! SUB or another 8-bit control, at each of which Ghostty carries it out.
+//! it ignores there (DEL, 0xa0 and up), and ended by `ESC` or ST (0x9c), at
+//! which Ghostty carries it out. Ghostty before 1.4 also carried out one
+//! that CAN, SUB or another 8-bit control cut short; 1.4 discards those,
+//! but the window's terminal can be an older Ghostty (another Mac's Cherry
+//! attaches through `cherry attach` too), so the guard treats them alike.
 //! Of a command (`ESC _ G …`), the guard holds the control data back until
 //! its first `;` (or its end): a command whose control data may name a
 //! medium (`cherry_vt::kitty::may_name_medium`: as Ghostty reads it, or as
@@ -315,14 +318,29 @@ mod tests {
         b"\x1b^Ga=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x1b\\",
     ];
 
+    /// The queries of `QUERIES` that CAN, SUB or another 8-bit control cuts
+    /// short: Ghostty before 1.4 carried them out, 1.4 discards them.
+    const CUT_SHORT: &[&[u8]] = &[
+        b"\x1b_Ga=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x18",
+        b"\x1b_Ga=q,i=1,s=1,v=1,f=24,t=f;L2V0Yw==\x85",
+    ];
+
     #[test]
     fn ghostty_would_read_each_of_these() {
-        for &query in QUERIES {
+        for &query in QUERIES.iter().filter(|query| !CUT_SHORT.contains(query)) {
             assert!(
                 ghostty(query).contains("unsupported medium"),
                 "{:?}",
                 String::from_utf8_lossy(query)
             );
+        }
+    }
+
+    #[test]
+    fn ghostty_discards_a_command_cut_short_which_the_guard_still_drops() {
+        for &query in CUT_SHORT {
+            assert!(QUERIES.contains(&query));
+            assert_eq!(ghostty(query), "", "{:?}", String::from_utf8_lossy(query));
         }
     }
 

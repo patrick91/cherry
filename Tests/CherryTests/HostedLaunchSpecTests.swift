@@ -17,7 +17,7 @@ private let tabID = "6F1C1F7E-5B7A-4C1B-9A55-3D2F8E0C4A11"
 private let appSocket = "/tmp/cherry-501/Cherry-0123456789ab/control.sock"
 private let appCLI = "\(binDirectory)/cherry"
 /// The embedded Ghostty whose launch code HostedLaunchSpec reproduces.
-private let auditedGhosttyVersion = "1.3.2-HEAD+1e9e14af5"
+private let auditedGhosttyVersion = "1.4.0"
 
 /// Cherry's environment as launchd gives it to a Dock launch, after
 /// libghostty's init set LANG, LANGUAGE and GHOSTTY_RESOURCES_DIR, plus

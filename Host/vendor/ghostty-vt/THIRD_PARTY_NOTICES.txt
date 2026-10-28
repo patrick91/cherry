@@ -1,9 +1,9 @@
 Third-party notices for Cherry host libghostty-vt
-Pinned Ghostty revision: 291fd050b9e9c293c8adb6a140742649b7e42d3a
+Pinned Ghostty revision: 83fb95624b0439ee660c2679b43b38c8b63769cd
 Ghostty MIT license is provided in the adjacent LICENSE file.
 
 ========================================================================
-uucode — uucode-0.2.0-ZZjBPuuFVgC8YZ8eld4fOKsZANLIhTFMzULQxhkLi1C7/LICENSE.md
+uucode — uucode-0.2.0-ZZjBPoGFVgCiflJNFc6Io8xzC67B6PA5bUkk4LT0kCxg/LICENSE.md
 ========================================================================
 # uucode license
 

@@ -360,7 +360,7 @@ The installer also builds the `cherry` and `cherry-host` helpers that
 persistent sessions use and bundles them inside the app. That needs Rust
 (`cargo` and `rustc`, from [rustup.rs](https://rustup.rs)) and the Xcode
 command-line tools. The first build also needs network access:
-`Scripts/build-host-vt` downloads a checksum-pinned Zig 0.16.0 and fetches a
+`Scripts/build-host-vt` downloads a checksum-pinned Zig 0.17.0 and fetches a
 pinned Ghostty revision, and Cargo fetches crates. Later builds reuse them.
 The helpers are built into `CARGO_TARGET_DIR` (or `CARGO_BUILD_TARGET_DIR`)
 when set, otherwise `Host/target`. They are universal (arm64 and x86_64),

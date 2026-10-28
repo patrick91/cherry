@@ -2,12 +2,12 @@
 # Build the pinned, GUI-free Ghostty C library used by the Rust host.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-revision=291fd050b9e9c293c8adb6a140742649b7e42d3a
-zig_version=0.16.0
+revision=83fb95624b0439ee660c2679b43b38c8b63769cd
+zig_version=0.17.0
 # The host parses untrusted output from every session in one daemon, so the
 # library keeps Zig's runtime safety checks (bounds, overflow, unreachable).
 # cherry-vt's build script refuses an archive without this stamp.
-optimize=ReleaseSafe
+optimize=safe
 target=${1:-$(rustc -vV | sed -n 's/^host: //p')}
 case "$target" in
   aarch64-apple-darwin) zig_target=aarch64-macos ;;
@@ -31,10 +31,10 @@ if [ -n "${ZIG:-}" ]; then zig=$ZIG
 elif command -v zig >/dev/null && [ "$(zig version)" = "$zig_version" ]; then zig=$(command -v zig)
 else
   case "$(uname -s):$(uname -m)" in
-    Darwin:arm64) platform=aarch64-macos; digest=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489 ;;
-    Darwin:x86_64) platform=x86_64-macos; digest=0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7 ;;
-    Linux:aarch64) platform=aarch64-linux; digest=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;;
-    Linux:x86_64) platform=x86_64-linux; digest=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
+    Darwin:arm64) platform=aarch64-macos; digest=b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a ;;
+    Darwin:x86_64) platform=x86_64-macos; digest=4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6 ;;
+    Linux:aarch64) platform=aarch64-linux; digest=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8 ;;
+    Linux:x86_64) platform=x86_64-linux; digest=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026 ;;
     *) echo "Unsupported build machine" >&2; exit 1 ;;
   esac
   archive="$cache/zig-$platform-$zig_version.tar.xz"
@@ -59,7 +59,9 @@ fi
 rm -f "$prefix/SOURCE_REVISION" "$prefix/OPTIMIZE"
 (
   cd "$source_dir"
-  "$zig" build -Demit-lib-vt -Demit-xcframework=false -Doptimize="$optimize" \
+  # Zig's own downloads stall on some CI runners (ReadFailed from
+  # deps.files.ghostty.org), so curl fetches its dependencies.
+  "$root/Scripts/zig-build-with-curl" "$zig" -Demit-lib-vt -Demit-xcframework=false -Doptimize="$optimize" \
     -Dtarget="$zig_target" --prefix "$prefix"
 )
 printf '%s\n' "$revision" > "$prefix/SOURCE_REVISION"

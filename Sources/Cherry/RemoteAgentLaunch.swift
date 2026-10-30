@@ -12,8 +12,9 @@ import Foundation
 /// - Claude Code: `--append-system-prompt <line>` and `--settings` letting
 ///   its sandbox reach the forwarded socket.
 /// - Pi: `--append-system-prompt <line>`.
-/// - Codex: `-c developer_instructions=<line>`, only while its
-///   `config.toml` there sets no instructions of its own (the line checks).
+/// - Codex: `--no-daemon`, and `-c developer_instructions=<line>` only
+///   while its `config.toml` there sets no instructions of its own (the
+///   line checks).
 ///
 /// Cherry keeps no device's CLI versions, so an agent's line asks its CLI
 /// there, each time it starts, and only a CLI at least the minimum
@@ -77,10 +78,13 @@ enum RemoteAgentLaunch {
             return .skipped("nothing to add: the command sets its own instructions")
         }
         let suffix = AgentLaunch.shellSuffix(arguments)
-        var checks = ["[ -x \(ShellQuoting.singleQuoted(cliPath)) ]"]
-        if cli == .codex { checks.append(codexSetsNoInstructions) }
+        let checks = ["[ -x \(ShellQuoting.singleQuoted(cliPath)) ]"]
+        // Codex's instructions only while its config there sets none; its
+        // `--no-daemon` whatever the config.
+        let base = cli == .codex ? AgentCLILaunch.codexNoDaemon(words: words) : arguments
+        let fallback = base == arguments ? nil : (check: codexSetsNoInstructions, suffix: AgentLaunch.shellSuffix(base))
         return .gated(
-            gatedLine(line: line, executableWord: executableWord, cli: cli, checks: checks, suffix: suffix),
+            gatedLine(line: line, executableWord: executableWord, cli: cli, checks: checks, suffix: suffix, unless: fallback),
             suffix: suffix
         )
     }
@@ -92,17 +96,27 @@ enum RemoteAgentLaunch {
         "! /usr/bin/grep -qsE '^[[:space:]]*(developer_instructions|model_instructions_file)[[:space:]]*=' \"${CODEX_HOME:-$HOME/.codex}/config.toml\""
 
     /// `line` with `suffix` (`AgentLaunch.shellSuffix`, its last words)
-    /// when every one of `checks` (shell tests: the install's `cherry`,
-    /// Codex's config) holds and `executableWord --version`
-    /// prints a version of `cli` at least its minimum, else `line` alone;
-    /// both `exec`. `line` is a plain command (`AgentLaunch.detect`), so
-    /// `exec` runs the same command.
-    static func gatedLine(line: String, executableWord: String, cli: AgentLaunch.CLI, checks: [String], suffix: String) -> String {
+    /// when every one of `checks` (shell tests: the install's `cherry`)
+    /// holds and `executableWord --version` prints a version of `cli` at
+    /// least its minimum, else `line` alone; every branch `exec`s. `unless`:
+    /// a further test (Codex's config) whose failure runs `line` with its
+    /// shorter suffix instead. `line` is a plain command
+    /// (`AgentLaunch.detect`), so `exec` runs the same command.
+    static func gatedLine(
+        line: String,
+        executableWord: String,
+        cli: AgentLaunch.CLI,
+        checks: [String],
+        suffix: String,
+        unless fallback: (check: String, suffix: String)? = nil
+    ) -> String {
         let check = ShellQuoting.singleQuoted(versionCheck(minimum: cli.minimumVersion))
+        let then = fallback.map { "if \($0.check); then exec \(line)\(suffix); else exec \(line)\($0.suffix); fi" }
+            ?? "exec \(line)\(suffix)"
         return "if \(checks.joined(separator: " && "))"
             + " && \(versionVariable)=$(\(quotedWord(executableWord)) --version 2>/dev/null </dev/null)"
             + " && printf '%s\\n' \"$\(versionVariable)\" | /usr/bin/awk \(check);"
-            + " then exec \(line)\(suffix); else exec \(line); fi"
+            + " then \(then); else exec \(line); fi"
     }
 
     /// An awk program that exits 0 when the first `<major>.<minor>.<patch>`

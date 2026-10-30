@@ -223,7 +223,7 @@ final class AgentTask {
     }
 
     var kickoffLine: String {
-        AgentTaskRegistry.kickoffLine(taskID: id)
+        AgentTaskRegistry.kickoffLine(taskID: id, reportsInOneWord: AgentTaskRegistry.reportsInOneWord(worker))
     }
 }
 
@@ -470,14 +470,28 @@ final class AgentTaskRegistry {
 
     /// One line, typed into the worker as its first message: the `cherry`
     /// commands it runs.
-    nonisolated static func kickoffLine(taskID: String) -> String {
-        "You are Cherry task \(taskID): run cherry task mine for your brief, do it, then report with cherry task report "
-            + "(a JSON object {\"value\":…,\"status\":\"ok\",\"summary\":\"…\"} on standard input, in a heredoc)."
+    /// `reportsInOneWord`: the JSON goes as one single-quoted argument
+    /// (`reportsInOneWord(_:)`), not on standard input.
+    nonisolated static func kickoffLine(taskID: String, reportsInOneWord: Bool = false) -> String {
+        let how = reportsInOneWord
+            ? "as one single-quoted argument, no heredoc or pipe, with any ' in it written \\u0027"
+            : "on standard input, in a heredoc"
+        return "You are Cherry task \(taskID): run cherry task mine for your brief, do it, then report with cherry task report "
+            + "(a JSON object {\"value\":…,\"status\":\"ok\",\"summary\":\"…\"} \(how))."
+    }
+
+    /// Whether `worker` reports with the JSON as one argument: Codex runs a
+    /// `cherry` command outside its sandbox (which blocks Cherry's socket)
+    /// only when Cherry's rules file matches it, and its rules match plain
+    /// commands only, never a heredoc or a pipe.
+    static func reportsInOneWord(_ worker: TerminalSession?) -> Bool {
+        guard let worker else { return false }
+        return AgentToolBrand.detect(name: worker.agentName, commandLine: worker.launchCommand) == .codex
     }
 
     /// What `cherry task mine` tells a worker: with `allowSubagents`, that
     /// it may use its own CLI's subagents (never Cherry tasks of its own).
-    static func workerRules(allowSubagents: Bool) -> [String] {
+    static func workerRules(allowSubagents: Bool, reportsInOneWord: Bool = false) -> [String] {
         [
             allowSubagents
                 ? "Do the brief in this tab. You may use your own CLI's subagents for parts of it, but not cherry spawn agent with --task: Cherry tasks are one level deep."
@@ -487,7 +501,9 @@ final class AgentTaskRegistry {
             "If you cannot finish otherwise, report status failed with the reason in summary.",
             "For long work you may run cherry task progress with a short message (at most one every few seconds is kept).",
             "If you get more instructions in this tab later, report again: the newest report replaces the earlier one.",
-            "Report with a heredoc, so the JSON needs no shell quoting: cherry task report <<'EOF', then {\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}, then EOF (one valid JSON object, no placeholders such as …).",
+            reportsInOneWord
+                ? "Report with the JSON as one single-quoted argument, never a heredoc or a pipe (only a plain cherry command runs outside your sandbox): cherry task report '{\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}' (one valid JSON object, no placeholders such as …; write any ' inside it as \\u0027)."
+                : "Report with a heredoc, so the JSON needs no shell quoting: cherry task report <<'EOF', then {\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}, then EOF (one valid JSON object, no placeholders such as …).",
         ]
     }
 
@@ -1222,7 +1238,8 @@ extension CherryControlServer {
             brief: task.brief,
             resultSchema: task.resultSchema,
             rules: AgentTaskRegistry.workerRules(
-                allowSubagents: task.allowSubagents
+                allowSubagents: task.allowSubagents,
+                reportsInOneWord: AgentTaskRegistry.reportsInOneWord(task.worker)
             ),
             state: task.state,
             resultVersion: task.result?.version ?? 0

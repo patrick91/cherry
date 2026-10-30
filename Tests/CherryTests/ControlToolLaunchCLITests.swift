@@ -121,26 +121,30 @@ private func suffix(_ words: [String]) -> String {
     defer { harness.cleanUp() }
     let instructions = "developer_instructions=" + AgentLaunch.tomlString(AgentCLILaunch.instructionLine(processID: "TAB", hasSkill: false))
 
-    // Its settings not read yet: nothing (its config may set instructions).
-    #expect(harness.outcome(harness.codex.path) == .skipped("nothing to add: the command sets its own instructions"))
+    // Its settings not read yet: no line (its config may set
+    // instructions), but always `--no-daemon`: Codex's shared app server
+    // would run `cherry` outside its tab, where Cherry cannot tell whose
+    // it is.
+    #expect(harness.outcome(harness.codex.path) == .appended(suffix(["--no-daemon"])))
+    #expect(harness.outcome("\(harness.codex.path) --no-daemon") == .skipped("nothing to add: the command sets its own instructions"))
+    #expect(harness.outcome("\(harness.codex.path) --remote ws://x") == .skipped("nothing to add: the command sets its own instructions"))
 
     // Whatever its sandbox: one that blocks the socket asks before each
     // cherry command runs outside it.
     harness.codexFacts = CodexLaunchFacts(rulesInstalled: false, setsDeveloperInstructions: false)
-    #expect(harness.outcome(harness.codex.path) == .appended(suffix(["-c", instructions])))
-    #expect(harness.outcome("\(harness.codex.path) -s workspace-write") == .appended(suffix(["-c", instructions])))
-    #expect(harness.outcome("\(harness.codex.path) -c developer_instructions=mine")
-        == .skipped("nothing to add: the command sets its own instructions"))
+    #expect(harness.outcome(harness.codex.path) == .appended(suffix(["--no-daemon", "-c", instructions])))
+    #expect(harness.outcome("\(harness.codex.path) -s workspace-write") == .appended(suffix(["--no-daemon", "-c", instructions])))
+    #expect(harness.outcome("\(harness.codex.path) -c developer_instructions=mine") == .appended(suffix(["--no-daemon"])))
 
     // A config with instructions of its own keeps them.
     harness.codexFacts = CodexLaunchFacts(rulesInstalled: true, setsDeveloperInstructions: true)
-    #expect(harness.outcome(harness.codex.path) == .skipped("nothing to add: the command sets its own instructions"))
+    #expect(harness.outcome(harness.codex.path) == .appended(suffix(["--no-daemon"])))
 
     // Auto review: added only where the command sets no approvals of its own.
     harness.codexFacts = CodexLaunchFacts(rulesInstalled: false, setsDeveloperInstructions: false)
     harness.approvals[.codex] = .autoReview
-    #expect(harness.outcome(harness.codex.path) == .appended(suffix(["--approve-for-me", "-c", instructions])))
-    #expect(harness.outcome("\(harness.codex.path) -a never") == .appended(suffix(["-c", instructions])))
+    #expect(harness.outcome(harness.codex.path) == .appended(suffix(["--approve-for-me", "--no-daemon", "-c", instructions])))
+    #expect(harness.outcome("\(harness.codex.path) -a never") == .appended(suffix(["--no-daemon", "-c", instructions])))
 
     // Which sandboxes reach the socket (the settings page says so).
     let facts = CodexLaunchFacts(rulesInstalled: false, setsDeveloperInstructions: false)
@@ -234,7 +238,7 @@ private func suffix(_ words: [String]) -> String {
     #expect(AgentSkillDirectory.prepare(plugin: plugin, canWrite: true) == plugin)
 }
 
-@Test @MainActor func controlToolLaunchCLIWorkerTextsNameTheCherryCommands() {
+@Test @MainActor func controlToolLaunchCLIWorkerTextsNameTheCherryCommands() throws {
     let kickoff = AgentTaskRegistry.kickoffLine(taskID: "task-1")
     #expect(kickoff.contains("cherry task mine") && kickoff.contains("cherry task report"))
     #expect(!kickoff.contains("CHERRY_MCP_HELPER") && !kickoff.contains("get_my_task"))
@@ -244,6 +248,17 @@ private func suffix(_ words: [String]) -> String {
         #expect(!rules.contains(mcp), "\(mcp)")
     }
     #expect(rules.contains("cherry task progress --awaiting-approval") && rules.contains("cherry task report <<'EOF'"))
+
+    // Codex runs `cherry` outside its sandbox only for a plain command its
+    // rules match, never a heredoc: its worker reports in one argument, and
+    // the example is one valid JSON object between single quotes.
+    let oneWordKickoff = AgentTaskRegistry.kickoffLine(taskID: "task-1", reportsInOneWord: true)
+    #expect(oneWordKickoff.contains("one single-quoted argument") && !oneWordKickoff.contains("in a heredoc"))
+    let oneWordRules = AgentTaskRegistry.workerRules(allowSubagents: false, reportsInOneWord: true)
+    let reportRule = try #require(oneWordRules.last)
+    #expect(!reportRule.contains("<<"))
+    let example = try #require(reportRule.components(separatedBy: "cherry task report '").dropFirst().first?.components(separatedBy: "'").first)
+    #expect((try? JSONSerialization.jsonObject(with: Data(example.utf8))) != nil, "\(example)")
 
     #expect(AgentTaskRegistry.nudgeLine == "Please run cherry task report with your result.")
     var counts = AgentRunCounts()
@@ -278,8 +293,8 @@ private func suffix(_ words: [String]) -> String {
     let codex = workspace.addAgentSession(
         agent: AgentToolDefinition(name: "Codex", command: harness.codex.path), projectRoot: harness.directory.path
     )
-    #expect(codex.lastAgentLaunchOutcome == .skipped("nothing to add: the command sets its own instructions"))
-    #expect(codex.launchStartupCommand == nil)
+    #expect(codex.lastAgentLaunchOutcome == .appended(suffix(["--no-daemon"])))
+    #expect(codex.launchStartupCommand == harness.codex.path + suffix(["--no-daemon"]))
 }
 
 @Test @MainActor func controlToolLaunchCLISettingsInterfaceLineSaysWhichAndWhy() {

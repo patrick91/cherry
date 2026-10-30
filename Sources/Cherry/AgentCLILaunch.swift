@@ -16,7 +16,7 @@ import Foundation
 /// - Pi: `--skill <cherry-plugin>/skills/cherry` and
 ///   `--append-system-prompt <line>`.
 /// - Codex has no flag for a skill: `-c developer_instructions=<line>`, which
-///   names `cherry skill show`. A sandbox that cannot reach the socket makes
+///   names `cherry skill show`, and `--no-daemon` (`codexNoDaemon`). A sandbox that cannot reach the socket makes
 ///   `cherry` fail there unless Cherry's rules file is installed
 ///   (`CodexLaunchFacts.rulesInstalled`: an allowed `cherry` command runs
 ///   outside it) or Approvals is Auto review (its reviewer decides on
@@ -96,8 +96,7 @@ enum AgentCLILaunch {
             }
             return arguments
         case .codex:
-            guard instructions else { return [] }
-            return codexInstructions(processID: processID)
+            return codexNoDaemon(words: words) + (instructions ? codexInstructions(processID: processID) : [])
         }
     }
 
@@ -122,8 +121,25 @@ enum AgentCLILaunch {
         case .pi:
             return instructions ? ["--append-system-prompt", instructionLine(processID: processID, hasSkill: false)] : []
         case .codex:
-            return instructions ? codexInstructions(processID: processID) : []
+            return codexNoDaemon(words: words) + (instructions ? codexInstructions(processID: processID) : [])
         }
+    }
+
+    /// Codex's TUI runs its commands in a background app server it shares
+    /// across sessions (`codex app-server --managed-daemon`, 0.162.1), which
+    /// outlives the Codex that started it: a `cherry` the agent runs is then
+    /// that server's child, not its tab's program's, with the environment
+    /// of the tab that started the server. Cherry identifies a caller by
+    /// its process ancestry on This Mac and by its tab's token on a device,
+    /// so neither would find the agent's tab (`no_assignment`), or would find
+    /// another's. `--no-daemon` keeps the server in the agent's own process
+    /// (checked with 0.162.1's `--help`). Not when the command picks a
+    /// server itself (`--remote`).
+    static func codexNoDaemon(words: [String]) -> [String] {
+        let picksServer = words.contains { word in
+            ["--no-daemon", "--remote"].contains { word == $0 || word.hasPrefix($0 + "=") }
+        }
+        return picksServer ? [] : ["--no-daemon"]
     }
 
     private static func codexInstructions(processID: String?) -> [String] {

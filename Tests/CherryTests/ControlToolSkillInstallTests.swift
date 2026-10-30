@@ -216,6 +216,8 @@ private extension CherrySkillChange {
     #expect(Set(CherrySkill.allowedWords) == words)
     #expect(Set(CherrySkill.forbiddenWords).isDisjoint(with: CherrySkill.allowedWords))
     #expect(CherrySkill.forbiddenWords.first == "host")
+    // The skill's read-only commands reach the socket too (the guide).
+    #expect(rules.contains("pattern = [\"cherry\", \"skill\", [\"show\", \"status\"]]"))
 
     let home = try SkillHome()
     home.onPath = ["codex"]

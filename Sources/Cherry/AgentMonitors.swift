@@ -968,15 +968,27 @@ extension CherryControlServer {
     /// output went quiet (below); its turn ended, and nobody types into it.
     @MainActor
     func subscriberTakesWakeLine(_ subscriber: TerminalSession, now: Date) -> Bool {
+        wakeLineHoldReason(subscriber, now: now) == nil
+    }
+
+    /// Why `subscriberTakesWakeLine` says no, for the log; nil when it
+    /// takes the line.
+    @MainActor
+    func wakeLineHoldReason(_ subscriber: TerminalSession, now: Date) -> String? {
+        guard subscriber.kind == .agent else { return "not an agent" }
+        guard subscriber.isRunning else { return "not running" }
+        guard subscriber.acceptsControlInput else { return "takes no input" }
         let idle = subscriber.reportsProgramStatus
             ? subscriber.agentActivityState == .idle
             : subscriber.agentActivityState == .unknown
-        guard subscriber.kind == .agent, subscriber.isRunning, subscriber.acceptsControlInput, idle,
-              Self.agentTurnMayHaveEnded(subscriber, now: now),
-              !subscriber.humanIsComposing(within: monitors.humanTypingInterval)
-        else { return false }
+        guard idle else {
+            return "not idle (\(subscriber.agentActivityState.rawValue), reports status: \(subscriber.reportsProgramStatus))"
+        }
+        guard Self.agentTurnMayHaveEnded(subscriber, now: now) else { return "its turn may not have ended" }
+        guard !subscriber.humanIsComposing(within: monitors.humanTypingInterval) else { return "someone is typing" }
         let quietSince = subscriber.lastContentChangeAt ?? subscriber.startedAt ?? now
-        return now.timeIntervalSince(quietSince) >= monitors.wakeQuietInterval
+        guard now.timeIntervalSince(quietSince) >= monitors.wakeQuietInterval else { return "its screen is not quiet" }
+        return nil
     }
 
     @MainActor

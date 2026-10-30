@@ -1057,12 +1057,11 @@ private struct RemoteWindowWaitingBarContent: View {
             control.state,
             installationProblem: hosting.profile.isKnownDevice ? nil : hosting.installationProblem()
         )
-        let waiting = count == 1 ? "1 tab waits" : "\(count) tabs wait"
         HStack(spacing: 10) {
-            Image(systemName: "network.slash")
+            Image(systemName: availability == .online ? "arrow.clockwise" : "network.slash")
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.orange)
-            Text("\(availability.text(machine: hosting.profile.displayName)) (\(waiting))")
+                .foregroundStyle(availability == .online ? Color.secondary : Color.orange)
+            Text(Self.text(availability, count: count, machine: hosting.profile.displayName))
                 .font(.system(size: 12, weight: .medium))
                 .lineLimit(2)
                 .help(availability.detail ?? "")
@@ -1076,6 +1075,16 @@ private struct RemoteWindowWaitingBarContent: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
         .frame(maxWidth: 520)
         .projectWindowToastObstacle()
+    }
+
+    /// While the device answers its tabs are on their way back (the retry
+    /// its connection fired), not waiting for it.
+    static func text(_ availability: RemoteDeviceAvailability, count: Int, machine: String) -> String {
+        if availability == .online {
+            return count == 1 ? "Reopening 1 tab on \(machine)…" : "Reopening \(count) tabs on \(machine)…"
+        }
+        let waiting = count == 1 ? "1 tab waits" : "\(count) tabs wait"
+        return "\(availability.text(machine: machine)) (\(waiting))"
     }
 }
 
@@ -1196,6 +1205,7 @@ struct RemoteNotOpenSection: View {
     }
 
     private func open(_ info: HostedSessionInfo) {
+        if info.owner == hosting.owner, workspace.reopenNotOpenSession?(info) == true { return }
         guard let attachment = hosting.attachment(for: info) else { return }
         workspace.attachHostedSession(attachment, info: info)
     }

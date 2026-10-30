@@ -760,6 +760,12 @@ extension CherryControlServer {
         // turn reported or submitted in between.
         func tellTurnDone(initial: Bool) {
             guard !selfStartedTurnOfSettledWorker else { return }
+            // The latest submit's turn never started (no working report
+            // since: a message it has not picked up yet, slow to report
+            // over a slow link past the start grace, an empty Return): the
+            // idle it reads is the previous turn's, not this one's end. Its
+            // `done` comes once it reports that turn ended.
+            if let session, Self.agentTurnStarted(session) == false { return }
             if let session, session.reportsProgramStatus,
                watched.turnDoneReportedTurn == session.agentReportedTurnCount,
                watched.turnDoneSubmittedTurn == session.agentSubmittedTurnCount {

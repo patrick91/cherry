@@ -525,6 +525,7 @@ final class RepositoryWorkspace: ObservableObject {
     /// the project, in the registry it registered with), never another
     /// window of the same project.
     private func closeTabsAfterCleanExit() {
+        workspace.reopenNotOpenSession = { [weak self] info in self?.reopenNotOpenSession(info) ?? false }
         workspace.closeTabAfterCleanExit = { [weak self] workspace, session in
             guard let self, !self.isTearingDown else { return }
             SessionCloseCoordinator.closeTabAfterCleanExit(
@@ -716,6 +717,37 @@ final class RepositoryWorkspace: ObservableObject {
             ?? record.commandName.flatMap { workspace.commandSession(named: $0) }
         if let shown { workspace.select(shown) }
         return shown
+    }
+
+    /// Reopen in a device window's Not open here. The session of one of
+    /// this window's saved tabs kept while the device could not be reached
+    /// comes back as that tab, with its id, kind, agent and place: the kept
+    /// tabs are restored again now (the device answers, since it listed
+    /// the session), never attached beside the tab their retry brings back
+    /// later. One a restore under way asks for comes back with it. Another
+    /// session of this app becomes a tab as Background Sessions' Open
+    /// adopts one. false: neither (the caller attaches it).
+    func reopenNotOpenSession(_ info: HostedSessionInfo) -> Bool {
+        guard !isTearingDown, !workspace.isTornDown, let hosting = backendPolicy.localSessions,
+              let hostID = hosting.control.hostID
+        else { return false }
+        let record = savedRecordsAwaitingRestore().first { record in
+            record.hosted.map { $0.sessionID == info.id && $0.hostID == hostID } ?? false
+        }
+        if let record {
+            if recordIDsToRetry().contains(record.id) {
+                restoreKeptRecords()
+            }
+            guard let restore = restoreTask ?? restoreRemainders.values.first else { return true }
+            Task { @MainActor [weak self] in
+                await restore.value
+                guard let self, !self.isTearingDown, let tab = self.workspace.session(withID: record.id) else { return }
+                self.workspace.select(tab)
+            }
+            return true
+        }
+        guard hosting.canAdopt(info), let attachment = hosting.attachment(for: info) else { return false }
+        return showBackgroundSession(PersistentSessionLaunch(attachment: attachment, info: info), hosting: hosting) != nil
     }
 
     /// A window close or quit that ends sessions (End Sessions, or

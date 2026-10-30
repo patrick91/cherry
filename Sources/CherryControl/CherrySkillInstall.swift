@@ -48,13 +48,18 @@ public enum CherrySkill {
     /// top-level word of `cherry`'s agent commands but `start` and
     /// `restart` (without a process ID they are the session host's, and a
     /// prefix rule cannot ask for one) and `skill` (its setup writes agent
-    /// settings, which the sandbox should keep refusing; `skill show`
-    /// needs no socket).
+    /// settings, which the sandbox should keep refusing; `skill show` and
+    /// `skill status` are allowed on their own, `allowedSkillWords`: they
+    /// reach the app's socket too).
     public static let allowedWords = [
         "agents", "answer", "close", "commands", "devices", "events", "help", "keys", "link", "ls", "ports", "project",
         "read", "rename", "search", "select", "send", "services", "show", "spawn", "stop", "subscribe",
         "subscriptions", "task", "todo", "tool", "unsubscribe", "wait", "wait-port", "whoami",
     ]
+
+    /// The `cherry skill` commands an allowed Codex command may start with:
+    /// those that only read (the guide, and what is installed where).
+    public static let allowedSkillWords = ["show", "status"]
 
     /// `cherry host` and the host commands' old top-level names.
     public static let forbiddenWords = [
@@ -73,6 +78,11 @@ public enum CherrySkill {
             pattern = ["cherry", \(list(allowedWords))],
             decision = "allow",
             justification = "Cherry's agent commands reach the Cherry app's socket, which the sandbox blocks.",
+        )
+        prefix_rule(
+            pattern = ["cherry", "skill", \(list(allowedSkillWords))],
+            decision = "allow",
+            justification = "cherry skill show prints Cherry's guide from the Cherry app's socket, which the sandbox blocks.",
         )
         prefix_rule(
             pattern = ["cherry", \(list(forbiddenWords))],

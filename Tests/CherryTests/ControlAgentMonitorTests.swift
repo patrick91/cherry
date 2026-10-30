@@ -247,6 +247,37 @@ struct ControlAgentMonitorTests {
         #expect(next.events.map(\.type) == [.done])
     }
 
+    /// A message the agent is slow to pick up (no working report within
+    /// the start grace: a slow link, a busy CLI) leaves it reading idle
+    /// from its last turn: that is no `done` of the new turn, which is
+    /// told once the agent reports it ended.
+    @Test func messageNotPickedUpWithinTheStartGraceIsNoDone() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.start()
+        let worker = try await harness.spawnAgent(named: "Claude")
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(150))
+        let id = try await harness.subscribe(.init(processIDs: [worker.id.uuidString], wake: false)).subscription.subscriptionID
+        harness.screen("⏺ Done.\n\n❯ \n", on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
+        let first = try await harness.events(id)
+        #expect(first.events.map(\.type) == [.done])
+
+        _ = try await harness.send(.sendProcessInput(.init(processID: worker.id.uuidString, text: "and the lexer?", submit: true)))
+        let stale = try await harness.events(id, timeoutMilliseconds: Int(CherryControlServer.agentTurnStartGrace * 1_000) + 1_500)
+        #expect(stale.events.isEmpty, "the new turn never started: \(stale.events.map(\.type))")
+
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(150))
+        harness.screen("⏺ The lexer is fine.\n\n❯ \n", on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
+        let next = try await harness.events(id)
+        #expect(next.events.map(\.type) == [.done])
+        #expect(next.events.first?.agentTurn == worker.agentTurnCount)
+    }
+
     @Test func needsInputPermissionAndClosedEvents() async throws {
         let harness = try ControlAgentWaitHarness()
         defer { harness.stop() }

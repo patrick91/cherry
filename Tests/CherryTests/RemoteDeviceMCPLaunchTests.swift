@@ -249,18 +249,18 @@ private func run(_ spec: HostedLaunchSpec, home: URL, timeout: TimeInterval = 20
         try setStandIn("codex", in: agents, version: "codex-cli 0.162.1")
         let codex = try launched("codex --yolo")
         #expect(codex.run.status == 0, "\(shell): \(codex.run.output)")
-        #expect(codex.run.arguments == ["--yolo", "-c", "developer_instructions=" + AgentLaunch.tomlString(line)], "\(shell): \(codex.run.output)")
+        #expect(codex.run.arguments == ["--yolo", "--no-daemon", "-c", "developer_instructions=" + AgentLaunch.tomlString(line)], "\(shell): \(codex.run.output)")
         #expect(codex.run.printedProcessID == codex.run.processID, "\(shell): \(codex.run.output)")
         let codexHome = home.appendingPathComponent(".codex", isDirectory: true)
         try FileManager.default.createDirectory(at: codexHome, withIntermediateDirectories: true)
         try "model = \"o3\"\n  developer_instructions = \"be brief\"\n".write(
             to: codexHome.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8
         )
-        #expect(try launched("codex --yolo").run.arguments == ["--yolo"], "\(shell)")
+        #expect(try launched("codex --yolo").run.arguments == ["--yolo", "--no-daemon"], "\(shell)")
         try "model = \"o3\"\n# developer_instructions = \"x\"\n".write(
             to: codexHome.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8
         )
-        #expect(try launched("codex").run.arguments == ["-c", "developer_instructions=" + AgentLaunch.tomlString(line)], "\(shell)")
+        #expect(try launched("codex").run.arguments == ["--no-daemon", "-c", "developer_instructions=" + AgentLaunch.tomlString(line)], "\(shell)")
         try FileManager.default.removeItem(at: codexHome)
         try setStandIn("codex", in: agents, version: "codex-cli 0.161.9")
         #expect(try launched("codex --yolo").run.arguments == ["--yolo"], "\(shell)")
@@ -356,10 +356,14 @@ private func run(_ spec: HostedLaunchSpec, home: URL, timeout: TimeInterval = 20
     for command in [
         "npx claude", "FOO=1 claude", "claude && x", "claude | tee log", "claude -- x", "claude $(cat prompt)",
         "claude mcp list", "claude update", "codex login", "codex mcp-server", "gemini", "/bin/cat",
-        "pi install npm:x", "pi --model", "codex -c developer_instructions=mine", "pi --system-prompt mine",
+        "pi install npm:x", "pi --model", "pi --system-prompt mine",
     ] {
         keepsTodaysLine(command, "\(command)")
     }
+    // Codex with instructions of its own still gets `--no-daemon`: its
+    // shared app server would run `cherry` outside its tab.
+    let ownInstructions = launch.spec(launch.configuration("codex -c developer_instructions=mine"), device: launch.device())
+    #expect(ownInstructions.argv.last?.contains("then exec codex -c developer_instructions=mine '--no-daemon'; else exec codex -c developer_instructions=mine; fi") == true)
 
     // A tab without the forwarded socket: `cherry` there would look for
     // that Mac's own Cherry.

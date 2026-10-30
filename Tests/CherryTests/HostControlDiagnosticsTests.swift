@@ -414,6 +414,32 @@ private func runProcessSync(_ executable: URL, _ arguments: [String], _ environm
     #expect(fake.launches.count == launches)
 }
 
+@Test @MainActor func HostControlAvailabilityOrLaterConnectionFiresForAConnectionAfterItGaveUp() async throws {
+    let fake = FakeControlHelper()
+    let (hostStore, _, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+    let control = makeFakeHostControl(fake, host: try .ssh("devbox"), hostStore: hostStore)
+    defer { control.disconnect() }
+    fake.version = HostProtocol.version + 1
+    let fired = Recorder(false)
+    let subscription = control.availabilityOrLaterConnection().sink { fired.value = true }
+    defer { subscription.cancel() }
+    // A failure nothing retries ends `availability()`'s lease...
+    #expect(await fake.wait {
+        if case .failed = control.state { return true }
+        return false
+    })
+    let launches = fake.launches.count
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(fake.launches.count == launches)
+    #expect(!fired.value)
+    // ...but a connection something else makes later (Retry, a new tab)
+    // still brings a restore's kept tabs back.
+    fake.version = HostProtocol.version
+    _ = try await control.connect()
+    #expect(await fake.wait { fired.value })
+}
+
 @Test @MainActor func HostControlAvailabilityFiresForAConnectionUpWhenItIsSubscribed() async throws {
     let fake = FakeControlHelper()
     let (hostStore, _, suite) = try makeIsolatedHostedSessionHostStore()

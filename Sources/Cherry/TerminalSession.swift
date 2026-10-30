@@ -2517,6 +2517,12 @@ final class TerminalWorkspace: ObservableObject {
     /// such a tab: `reopenClosedTab`).
     var awaitsRestoreDecision: (@MainActor (UUID) -> Bool)?
 
+    /// Reopen in a device window's Not open here, as its repository does
+    /// it (`RepositoryWorkspace.reopenNotOpenSession`): false when it did
+    /// nothing and the session is to be attached. None in tests'
+    /// workspaces.
+    var reopenNotOpenSession: (@MainActor (HostedSessionInfo) -> Bool)?
+
     func withdrawRestoredTabs(_ tabs: [TerminalSession]) {
         let ids = Set(tabs.map(\.id)).intersection(sessions.lazy.filter { tab in tabs.contains { $0 === tab } }.map(\.id))
         closeSessions(withIDs: ids, allowEmptyWorkspace: true, intent: .duplicateWindowTeardown)

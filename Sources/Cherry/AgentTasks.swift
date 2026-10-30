@@ -223,7 +223,7 @@ final class AgentTask {
     }
 
     var kickoffLine: String {
-        AgentTaskRegistry.kickoffLine(taskID: id)
+        AgentTaskRegistry.kickoffLine(taskID: id, reportsInOneWord: AgentTaskRegistry.reportsInOneWord(worker))
     }
 }
 
@@ -269,6 +269,8 @@ final class AgentRun {
     var approvalReadSeq = 0
     var lastWakeAt: Date?
     var isWaking = false
+    /// Why its wake line was last logged as held (`noteWakeHeld`).
+    var wakeHoldReason: String?
     /// `wait_for_tasks` calls on it now: no wake line while one runs.
     var activeWaits = 0
     /// Read back from the last run's file, its owner not found again yet.
@@ -470,14 +472,28 @@ final class AgentTaskRegistry {
 
     /// One line, typed into the worker as its first message: the `cherry`
     /// commands it runs.
-    nonisolated static func kickoffLine(taskID: String) -> String {
-        "You are Cherry task \(taskID): run cherry task mine for your brief, do it, then report with cherry task report "
-            + "(a JSON object {\"value\":…,\"status\":\"ok\",\"summary\":\"…\"} on standard input, in a heredoc)."
+    /// `reportsInOneWord`: the JSON goes as one single-quoted argument
+    /// (`reportsInOneWord(_:)`), not on standard input.
+    nonisolated static func kickoffLine(taskID: String, reportsInOneWord: Bool = false) -> String {
+        let how = reportsInOneWord
+            ? "as one single-quoted argument, no heredoc or pipe, with any ' in it written \\u0027"
+            : "on standard input, in a heredoc"
+        return "You are Cherry task \(taskID): run cherry task mine for your brief, do it, then report with cherry task report "
+            + "(a JSON object {\"value\":…,\"status\":\"ok\",\"summary\":\"…\"} \(how))."
+    }
+
+    /// Whether `worker` reports with the JSON as one argument: Codex runs a
+    /// `cherry` command outside its sandbox (which blocks Cherry's socket)
+    /// only when Cherry's rules file matches it, and its rules match plain
+    /// commands only, never a heredoc or a pipe.
+    static func reportsInOneWord(_ worker: TerminalSession?) -> Bool {
+        guard let worker else { return false }
+        return AgentToolBrand.detect(name: worker.agentName, commandLine: worker.launchCommand) == .codex
     }
 
     /// What `cherry task mine` tells a worker: with `allowSubagents`, that
     /// it may use its own CLI's subagents (never Cherry tasks of its own).
-    static func workerRules(allowSubagents: Bool) -> [String] {
+    static func workerRules(allowSubagents: Bool, reportsInOneWord: Bool = false) -> [String] {
         [
             allowSubagents
                 ? "Do the brief in this tab. You may use your own CLI's subagents for parts of it, but not cherry spawn agent with --task: Cherry tasks are one level deep."
@@ -487,7 +503,9 @@ final class AgentTaskRegistry {
             "If you cannot finish otherwise, report status failed with the reason in summary.",
             "For long work you may run cherry task progress with a short message (at most one every few seconds is kept).",
             "If you get more instructions in this tab later, report again: the newest report replaces the earlier one.",
-            "Report with a heredoc, so the JSON needs no shell quoting: cherry task report <<'EOF', then {\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}, then EOF (one valid JSON object, no placeholders such as …).",
+            reportsInOneWord
+                ? "Report with the JSON as one single-quoted argument, never a heredoc or a pipe (only a plain cherry command runs outside your sandbox): cherry task report '{\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}' (one valid JSON object, no placeholders such as …; write any ' inside it as \\u0027)."
+                : "Report with a heredoc, so the JSON needs no shell quoting: cherry task report <<'EOF', then {\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}, then EOF (one valid JSON object, no placeholders such as …).",
         ]
     }
 
@@ -1222,7 +1240,8 @@ extension CherryControlServer {
             brief: task.brief,
             resultSchema: task.resultSchema,
             rules: AgentTaskRegistry.workerRules(
-                allowSubagents: task.allowSubagents
+                allowSubagents: task.allowSubagents,
+                reportsInOneWord: AgentTaskRegistry.reportsInOneWord(task.worker)
             ),
             state: task.state,
             resultVersion: task.result?.version ?? 0
@@ -2218,26 +2237,38 @@ extension CherryControlServer {
     /// (`relinkGrace`); one found again waits `restoredLineGrace` first.
     @MainActor
     func deliverRunWakeIfReady(_ run: AgentRun) {
-        guard monitors.wakeLinesEnabled, !run.isWaking, run.activeWaits == 0,
-              tasks.awaitsWake(run), let settledSeq = run.settledSeq
+        guard monitors.wakeLinesEnabled, !run.isWaking, tasks.awaitsWake(run), let settledSeq = run.settledSeq
         else { return }
         let now = Date()
+        guard run.activeWaits == 0 else { return noteWakeHeld(run, "its owner waits in wait_for_tasks", now: now) }
         if run.settledAt.map({ now.timeIntervalSince($0) > tasks.wakeLifetime }) ?? false {
+            noteWakeHeld(run, "given up after \(Int(tasks.wakeLifetime)) s", now: now)
             run.wokenSeq = settledSeq
             tasks.scheduleSave()
             return
         }
         guard let owner = locateOwner(run) else {
-            if let restoredAt = run.restoredAt, now.timeIntervalSince(restoredAt) < tasks.relinkGrace { return }
+            if let restoredAt = run.restoredAt, now.timeIntervalSince(restoredAt) < tasks.relinkGrace {
+                return noteWakeHeld(run, "its owner's tab is not found again yet", now: now)
+            }
             // Nobody to wake any more.
+            noteWakeHeld(run, "given up: its owner's tab is gone", now: now)
             run.wokenSeq = settledSeq
             tasks.scheduleSave()
             return
         }
-        if inRestoredGrace(run.relinkedAt, now: now) { return }
-        if let last = run.lastWakeAt, now.timeIntervalSince(last) < monitors.wakeMinimumInterval { return }
+        if inRestoredGrace(run.relinkedAt, now: now) { return noteWakeHeld(run, "its owner was just found again", now: now) }
+        if let last = run.lastWakeAt, now.timeIntervalSince(last) < monitors.wakeMinimumInterval {
+            return noteWakeHeld(run, "a line was typed into its owner recently", now: now)
+        }
         // One line at a time into a tab.
-        guard !isTypingWakeLine(into: owner), subscriberTakesWakeLine(owner, now: now) else { return }
+        guard !isTypingWakeLine(into: owner) else {
+            return noteWakeHeld(run, "another line is being typed into its owner", now: now)
+        }
+        if let reason = wakeLineHoldReason(owner, now: now) {
+            return noteWakeHeld(run, "its owner \(owner.id.uuidString.prefix(8)) is \(reason)", now: now)
+        }
+        if run.wakeHoldReason != nil { noteWakeHeld(run, nil, now: now) }
         let line = AgentTaskRegistry.wakeLine(runID: run.id, counts: tasks.counts(of: run))
         run.isWaking = true
         Task { @MainActor [weak self] in
@@ -2255,6 +2286,21 @@ extension CherryControlServer {
             self.tasks.scheduleSave()
         }
     }
+
+    /// Logs (once per change, and only once the run settled
+    /// `wakeHoldLogDelay` ago) why its wake line is held, or that it goes
+    /// out after all (`reason` nil): a late line can be explained afterwards.
+    @MainActor
+    func noteWakeHeld(_ run: AgentRun, _ reason: String?, now: Date) {
+        guard reason != run.wakeHoldReason,
+              let settledAt = run.settledAt, now.timeIntervalSince(settledAt) >= Self.wakeHoldLogDelay
+        else { return }
+        run.wakeHoldReason = reason
+        let waited = Int(now.timeIntervalSince(settledAt))
+        SessionLog.notice("[task] wake line for \(run.id) \(reason.map { "held: \($0)" } ?? "goes out") (settled \(waited) s ago)")
+    }
+
+    static let wakeHoldLogDelay: TimeInterval = 30
 
     /// Types the approval wake line into the run's owner once a task of it
     /// awaits approval that the owner neither was woken for nor read, by

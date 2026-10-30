@@ -48,8 +48,9 @@ extension WorkspaceSessionRestorers {
     /// - Host unreachable (or This Mac cannot run sessions): the record stays
     ///   saved for the next launch, and is restored once the host comes up
     ///   during this run (`WorkspaceRestoreResult.retryWhenAvailable`; an SSH
-    ///   host's control connection is leased until then:
-    ///   `HostControl.availability()`). A host that answers with another
+    ///   host's control connection is leased until it connects or fails for
+    ///   good, and any later connection still brings them back:
+    ///   `HostControl.availabilityOrLaterConnection()`). A host that answers with another
     ///   identity is not waited for.
     ///
     /// Hosts are listed at the same time. The result has what the hosts
@@ -406,7 +407,7 @@ private final class ControlPlaneRestore {
                     // restores are; This Mac's comes up with its next use.
                     result.retryWhenAvailable = localSessions.profile.isThisMac
                         ? localSessions.hostAvailability(after: generation)
-                        : localSessions.control.availability()
+                        : localSessions.control.availabilityOrLaterConnection()
                 }
                 return result
             }
@@ -617,7 +618,7 @@ private final class ControlPlaneRestore {
             let hosted = failure as? HostedSessionError
             let never = hosted?.isIdentityMismatch == true || hosted?.isVersionMismatch == true
             if listed == nil, !isStopped, !records.isEmpty, !never {
-                result.retryWhenAvailable = control.availability()
+                result.retryWhenAvailable = control.availabilityOrLaterConnection()
             }
             return result
         }

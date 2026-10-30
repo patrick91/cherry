@@ -602,6 +602,24 @@ final class HostControl: ObservableObject {
             .eraseToAnyPublisher()
     }
 
+    /// `availability()`, and once that gave up (a failure nothing retries
+    /// by itself: a timeout on a bad network, a refused login), the next
+    /// connection something else makes (Retry, Reconnect Now, a new tab,
+    /// a wake), without keeping it leased meanwhile. What a restore that
+    /// could not reach the host waits for, so its tabs come back whenever
+    /// the host answers again during this run.
+    func availabilityOrLaterConnection() -> AnyPublisher<Void, Never> {
+        let states = $state
+        return availability()
+            .append(Deferred {
+                states
+                    .filter { $0 == .connected }
+                    .map { _ in () }
+            })
+            .first()
+            .eraseToAnyPublisher()
+    }
+
     /// Closes the connection; the next request (or lease) connects again.
     func disconnect() {
         reconnectTask?.cancel()

@@ -517,6 +517,10 @@ struct OmniBarPerformer {
         case .newWindow:
             // This window's project, never the project window active last.
             guard let appWindow, registry.openAnotherWindow(from: appWindow) else { return NSSound.beep() }
+        case .newHomeTerminal:
+            if !registry.newTerminalInHome() { NSSound.beep() }
+        case .goHome:
+            if !registry.showHome() { NSSound.beep() }
         case .splitRight:
             _ = workspace.splitDuplicateActiveTerminal()
         case .detachTab:
@@ -634,35 +638,32 @@ struct OmniBarPerformer {
         }
     }
 
-    /// A new terminal on `machine`, in `path` (New Terminal Here) or else
-    /// its home folder: in this window when it is that Mac's, else in a
-    /// window of that Mac (with no path, This Mac's active last), else in a
-    /// new window of that folder.
+    /// A new terminal on `machine`: with no `path`, in its Home
+    /// (`HomePlace`), never in a project's window; in `path` (New Terminal
+    /// Here) in this window when it is that Mac's, else in a window of that
+    /// Mac, else in a new window of that folder.
     private func newTerminal(on machine: ProjectSwitcherModel.Machine, at path: String? = nil) {
-        let directory = path.map { path -> String in
-            let home: String? = switch machine {
-            case .thisMac: NSHomeDirectory()
-            case .device(let id): RemoteDeviceStore.shared.device(id: id)?.homeDirectory
-            }
-            return ProjectSwitcherModel.expandedPath(path, home: home) ?? path
+        guard let path else {
+            if !registry.newTerminalInHome(on: machine) { NSSound.beep() }
+            return
         }
+        let home: String? = switch machine {
+        case .thisMac: NSHomeDirectory()
+        case .device(let id): RemoteDeviceStore.shared.device(id: id)?.homeDirectory
+        }
+        let directory = ProjectSwitcherModel.expandedPath(path, home: home) ?? path
         if ProjectSwitcherModel.Machine(projectKey: window.projectRoot ?? workspace.projectRoot) == machine {
             chromeState.selectTerminal()
             workspace.addSession(workingDirectory: directory)
             return
         }
-        let target = machine == .thisMac && path == nil
-            ? registry.frontmostLocalWorkspace()
-            : registry.workspacesByProjectRoot().first { ProjectSwitcherModel.Machine(projectKey: $0.projectRoot) == machine }?.workspace
+        let target = registry.workspacesByProjectRoot()
+            .first { ProjectSwitcherModel.Machine(projectKey: $0.projectRoot) == machine }?.workspace
         // That workspace's own window, never another window of its project.
         if let other = target, registry.focus(workspace: other) {
             registry.chromeState(for: other)?.selectTerminal()
             other.addSession(workingDirectory: directory)
-        } else if let directory {
-            if !switcher.openPath(directory, on: machine) { NSSound.beep() }
-        } else if case .device(let id) = machine {
-            switcher.perform(.openDeviceHome(id))
-        } else if !switcher.openPath("~", on: .thisMac) {
+        } else if !switcher.openPath(directory, on: machine) {
             NSSound.beep()
         }
     }

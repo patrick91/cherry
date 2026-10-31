@@ -447,7 +447,7 @@ private func session(
 
     // Each Mac's actions, as it answers now.
     #expect(macs[1].actions.map(\.title) == [
-        "Open Home Folder", "Add Project on Studio…", "New Terminal on Studio",
+        "Go to Home", "Add Project on Studio…", "New Terminal on Studio",
         "Persistent Sessions on Studio…", "Rename…", "Remove…",
     ])
     #expect(macs[1].actions.map(\.command) == [
@@ -458,7 +458,7 @@ private func session(
         .switcher(.renameDevice(studioID)),
         .switcher(.removeDevice(studioID)),
     ])
-    // Its home is not known yet: no Open Home Folder.
+    // Its home is not known yet: no Go to Home.
     #expect(macs[2].actions.map(\.title) == [
         "Add Project on Mini…", "New Terminal on Mini", "Reconnect",
         "Persistent Sessions on Mini…", "Rename…", "Remove…",
@@ -804,7 +804,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     #expect(connected.detail == "1 session" && connected.status == .idle)
     #expect(connected.primary == .drill(.mac(.device(studioID), name: "Studio")))
     #expect(connected.actions.map(\.title) == [
-        "Open Home Folder", "Add Project on Studio…", "New Terminal on Studio",
+        "Go to Home", "Add Project on Studio…", "New Terminal on Studio",
         "Persistent Sessions on Studio…",
         "End Background Sessions…", "Rename…", "Remove…",
     ])
@@ -820,7 +820,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     // Another identity answers: Trust New Identity…, nothing to open.
     let changed = OmniProviders.macs(sources(.identityChanged(reason: "Expected a, received b.")))[1]
     #expect(changed.actions.contains { $0.title == "Trust New Identity…" })
-    #expect(!changed.actions.contains { $0.title == "Open Home Folder" })
+    #expect(!changed.actions.contains { $0.title == "Go to Home" })
 }
 
 // MARK: - Close, detach, undo and quit of a device's tab (fake control)

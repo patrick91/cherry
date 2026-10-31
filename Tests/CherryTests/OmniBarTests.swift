@@ -466,8 +466,10 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
 
     let thisMac = try #require(OmniProviders.macs(sources).first)
     #expect(thisMac.actions.map(\.title) == [
-        "Open Folder…", "Add Project…", "New Terminal on This Mac", "Persistent Sessions…", "End Background Sessions…",
+        "Go to Home", "Open Folder…", "Add Project…", "New Terminal on This Mac", "Persistent Sessions…",
+        "End Background Sessions…",
     ])
+    #expect(thisMac.actions.first?.command == .menu(.goHome))
 
     #expect(OmniProviders.commands(sources).allSatisfy { $0.actions.isEmpty })
 }

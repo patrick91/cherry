@@ -162,6 +162,15 @@ extension CherryShortcut {
     // Tabs and windows
     static let newWindow = CherryShortcut("newWindow", "New Window", group: .tabsAndWindows, key: "n", taker: .both)
     static let newTab = CherryShortcut("newTab", "New Tab", group: .tabsAndWindows, key: "t", taker: .both)
+    /// File › New Terminal in Home and Go to Home (`HomePlace`), from any
+    /// window.
+    static let newHomeTerminal = CherryShortcut(
+        "newHomeTerminal", "New Terminal in Home", group: .tabsAndWindows, key: "t", modifiers: [.command, .option],
+        taker: .menu
+    )
+    static let goHome = CherryShortcut(
+        "goHome", "Go to Home", group: .tabsAndWindows, key: "h", modifiers: [.command, .shift], taker: .menu
+    )
     static let closeTab = CherryShortcut(
         "closeTab", "Close Tab", group: .tabsAndWindows, key: "w",
         note: "Asks first when a program is at work.", taker: .both
@@ -230,7 +239,7 @@ extension CherryShortcut {
 
     /// Every shortcut, in Settings › Shortcuts' order.
     static let all: [CherryShortcut] = [
-        newWindow, newTab, closeTab, detachTab, undoCloseTab, restartTab, previousTab, nextTab,
+        newWindow, newTab, newHomeTerminal, goHome, closeTab, detachTab, undoCloseTab, restartTab, previousTab, nextTab,
     ] + sidebarItems + [
         hideSidebar,
         splitRight, previousPane, nextPane,

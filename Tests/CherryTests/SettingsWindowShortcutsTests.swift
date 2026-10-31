@@ -202,7 +202,8 @@ private let takenByKeyCode: Set<String> = ["previousTab", "nextTab"]
     let rows = ShortcutsSettings.listRows
     #expect(rows.flatMap(\.shortcuts) == CherryShortcut.all)
     #expect(rows.map(\.title) == [
-        "New Window", "New Tab", "Close Tab", "Detach Tab", "Undo Close Tab", "Restart Tab",
+        "New Window", "New Tab", "New Terminal in Home", "Go to Home",
+        "Close Tab", "Detach Tab", "Undo Close Tab", "Restart Tab",
         "Previous Tab / Next Tab", "Go to Sidebar Item 1–9", "Hide Sidebar",
         "Split Right", "Previous Pane / Next Pane",
         "Find", "Find Next / Find Previous", "Hide Find Bar", "Clear Scrollback",
@@ -212,14 +213,14 @@ private let takenByKeyCode: Set<String> = ["previousTab", "nextTab"]
     #expect(CherryShortcut.Group.allCases.map(\.title) == ["Tabs and windows", "Panes", "Terminal", "Cherry"])
     #expect(rows.filter { $0.group == .panes }.map(\.title) == ["Split Right", "Previous Pane / Next Pane"])
 
-    let panes = rows[10]
+    let panes = rows[12]
     #expect(panes.id == "shortcuts.previousPane")
     #expect(panes.chips == [["⌘", "["], ["⌘", "]"]])
     #expect(panes.separator == "/")
     #expect(panes.keysText == "⌘[ / ⌘]")
     #expect(panes.spokenKeys == "Command Left Bracket or Command Right Bracket")
 
-    let sidebarItems = rows[7]
+    let sidebarItems = rows[9]
     #expect(sidebarItems.chips == [["⌘", "1"], ["⌘", "9"]])
     #expect(sidebarItems.separator == "…")
     #expect(sidebarItems.keysText == "⌘1 … ⌘9")

@@ -87,6 +87,8 @@ enum OmniScope: Hashable {
 enum OmniMenuCommand: String, CaseIterable {
     case newTab
     case newWindow
+    case newHomeTerminal
+    case goHome
     case splitRight
     case detachTab
     case closeTab
@@ -567,11 +569,11 @@ enum OmniProviders {
                     title: location.name,
                     detail: location.machine == .thisMac ? "" : model.name(of: location.machine),
                     status: status,
-                    symbol: "folder",
+                    symbol: location.isHome ? HomePlace.symbol : "folder",
                     primaryLabel: location.isOpen ? "Switch" : "Open",
                     primary: .openProject(key: location.key),
                     actions: projectActions(location, sources: sources),
-                    keywords: [location.displayPath],
+                    keywords: location.isHome ? [location.displayPath, "home"] : [location.displayPath],
                     machine: location.machine,
                     detailColor: location.machine.deviceID.flatMap { id in
                         sources.devices.first { $0.device.id == id }?.device.effectiveColor
@@ -596,7 +598,8 @@ enum OmniProviders {
                 actions.append(.init(title: "Remove from Projects", command: .removeProject(key: location.key), isDestructive: true))
             }
         case .device(let id):
-            if sources.canModifyDevices {
+            // A device's Home is never hidden.
+            if sources.canModifyDevices, !location.isHome {
                 actions.append(.init(
                     title: "Remove from Projects",
                     command: .switcher(.hideDeviceProject(deviceID: id, path: location.path)),
@@ -624,6 +627,9 @@ enum OmniProviders {
             .prefix(ProjectSwitcherModel.recentLimit))
         let listed = Set((open + recent).map(\.id))
         let all = items.filter { !listed.contains($0.id) }.sorted { lhs, rhs in
+            // Each Mac's Home first.
+            let lhsHome = location(lhs)?.isHome == true, rhsHome = location(rhs)?.isHome == true
+            if lhsHome != rhsHome { return lhsHome }
             let order = lhs.title.localizedStandardCompare(rhs.title)
             if order != .orderedSame { return order == .orderedAscending }
             return lhs.detail.localizedStandardCompare(rhs.detail) == .orderedAscending
@@ -699,6 +705,7 @@ enum OmniProviders {
         switch machine {
         case .thisMac:
             var actions: [OmniAction] = [
+                .init(title: "Go to Home", command: .menu(.goHome)),
                 .init(title: "Open Folder…", command: .browseFolders(on: .thisMac, intent: .openOnce)),
                 .init(title: "Add Project…", command: .browseFolders(on: .thisMac, intent: .add)),
                 .init(title: "New Terminal on This Mac", command: .newTerminal(on: .thisMac)),
@@ -716,7 +723,7 @@ enum OmniProviders {
             let canModify = sources.canModifyDevices
             var actions: [OmniAction] = []
             if canOpen, device.homeDirectory != nil {
-                actions.append(.init(title: "Open Home Folder", command: .switcher(.openDeviceHome(id))))
+                actions.append(.init(title: "Go to Home", command: .switcher(.openDeviceHome(id))))
             }
             if canOpen, canModify {
                 // Its folders, in the bar.
@@ -837,6 +844,16 @@ enum OmniProviders {
                 shortcut: CherryShortcut.newWindow.display, symbol: "macwindow.badge.plus"
             ))
         }
+        // Home (`HomePlace`), from any window.
+        items.append(command(
+            .newHomeTerminal, title: "New Terminal in Home",
+            shortcut: CherryShortcut.newHomeTerminal.display, symbol: "apple.terminal",
+            keywords: ["home", "quick", "scratch"]
+        ))
+        items.append(command(
+            .goHome, title: "Go to Home",
+            shortcut: CherryShortcut.goHome.display, symbol: HomePlace.symbol, keywords: ["~"]
+        ))
         if window.hasProject, !sources.agents.isEmpty {
             items.append(OmniItem(
                 id: "command:agents",

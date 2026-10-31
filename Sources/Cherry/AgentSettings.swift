@@ -665,7 +665,8 @@ struct CherryProject: Codable, Equatable, Identifiable {
     var id: String { root }
 
     var name: String {
-        URL(fileURLWithPath: root, isDirectory: true).lastPathComponent
+        // A Mac's Home is named so, never by its folder (the user's name).
+        HomePlace.isHome(root) ? HomePlace.name : URL(fileURLWithPath: root, isDirectory: true).lastPathComponent
     }
 }
 
@@ -796,7 +797,8 @@ final class AgentSettings: ObservableObject {
         if let root = Self.validDirectory(lastOpenedProjectRoot ?? "") {
             return root
         }
-        return projects.first?.root
+        // With no project yet, Home: a first launch opens a terminal.
+        return projects.first?.root ?? HomePlace.thisMacKey
     }
 
     func resolvedProject(for requestedRoot: String?) -> ResolvedAgentProject {
@@ -807,6 +809,8 @@ final class AgentSettings: ObservableObject {
     func projectCommands(for requestedRoot: String?) -> [ProjectCommandDefinition] {
         guard let checkoutRoot = Self.validDirectory(requestedRoot ?? "") else { return [] }
         let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
+        // Home has no commands, not even its folder's cherry.toml's.
+        guard !HomePlace.isHome(settingsRoot) else { return [] }
         var commands = CherryProjectFile.loadCommands(projectRoot: checkoutRoot)
         for localCommand in commandsByProject[settingsRoot] ?? [] {
             if let index = commands.firstIndex(where: { $0.normalizedName == localCommand.normalizedName }) {
@@ -844,6 +848,8 @@ final class AgentSettings: ObservableObject {
             return .disabled
         }
         let root = projectRootByFolder[checkoutRoot] ?? checkoutRoot
+        // Home has no to-dos.
+        guard !HomePlace.isHome(root) else { return .disabled }
 
         let shared = CherryProjectFile.loadFeatureSettings(projectRoot: root) ?? .disabled
         guard let local = featureOverridesByProject[root] else {

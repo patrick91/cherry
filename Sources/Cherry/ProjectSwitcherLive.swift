@@ -83,7 +83,8 @@ enum ProjectSwitcherLive {
                 let value = registry.canonicalProjectRoot(for: key)
                 canonical[key] = value
                 return value
-            }
+            },
+            listsHomes: true
         )
     }
 

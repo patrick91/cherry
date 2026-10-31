@@ -442,7 +442,8 @@ enum ShortcutsSettings {
     /// Cherry's keys as the page lists them: every shortcut of the catalog,
     /// in its order.
     static let listRows: [ListRow] = [
-        .one(.newWindow), .one(.newTab), .one(.closeTab), .one(.detachTab), .one(.undoCloseTab), .one(.restartTab),
+        .one(.newWindow), .one(.newTab), .one(.newHomeTerminal), .one(.goHome),
+        .one(.closeTab), .one(.detachTab), .one(.undoCloseTab), .one(.restartTab),
         .pair(.previousTab, .nextTab), .run(CherryShortcut.sidebarItems, title: "Go to Sidebar Item 1–9"),
         .one(.hideSidebar),
         .one(.splitRight), .pair(.previousPane, .nextPane),

@@ -1515,7 +1515,8 @@ final class CherryControlServer: @unchecked Sendable {
                 guard seenRepositoryRoots.insert(standardizedRoot).inserted else { return nil }
                 return ProjectInfo(
                     root: root,
-                    name: URL(fileURLWithPath: root, isDirectory: true).lastPathComponent,
+                    // "Home" for a Mac's Home (`HomePlace`).
+                    name: CherryProject(root: root).name,
                     active: standardizedRoot == activeRepositoryRoot.map(CherryControl.standardizedProjectRoot),
                     open: openRoots.contains(standardizedRoot),
                     features: projectFeatureAvailability(for: root)

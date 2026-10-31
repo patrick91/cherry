@@ -303,8 +303,14 @@ final class RepositoryWorkspace: ObservableObject {
     }
 
     var repositoryName: String {
+        if isHome { return HomePlace.name }
         let path = ProjectLocation.launchPath(forKey: repositoryRoot)
         return URL(fileURLWithPath: path, isDirectory: true).lastPathComponent
+    }
+
+    /// A Mac's Home (`HomePlace`): no commands or to-dos.
+    var isHome: Bool {
+        HomePlace.isHome(repositoryRoot)
     }
 
     /// A project on another Mac (docs/specs/remote-devices.md): its tabs run

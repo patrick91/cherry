@@ -117,6 +117,8 @@ struct ProjectSwitcherModel: Equatable {
         /// The window the bar was opened from shows it.
         var isCurrent = false
         var lastOpened: Date?
+        /// Its Mac's Home (`HomePlace`), named "Home".
+        var isHome = false
 
         var id: String { key }
         var isOpen: Bool { openStatus != nil }
@@ -202,6 +204,9 @@ extension ProjectSwitcherModel {
     /// - `openWindows`: each open project window by its key (canonical, as
     ///   `canonicalKey` gives it) with what it holds.
     /// - `recency`: last opened, by key.
+    /// - `listsHomes`: each Mac's Home (`HomePlace`) first among its
+    ///   projects, as "Home" (a device's once its home folder is known), in
+    ///   place of its home folder's own row. The app's; tests opt in.
     static func make(
         localProjects: [LocalProject],
         devices: [TitlebarProjectMenuModel.Device],
@@ -210,12 +215,31 @@ extension ProjectSwitcherModel {
         currentProjectKey: String?,
         thisMac: MachineInfo,
         canonicalKey: (String) -> String = { $0 },
-        localHome: String? = NSHomeDirectory()
+        localHome: String? = NSHomeDirectory(),
+        listsHomes: Bool = false
     ) -> ProjectSwitcherModel {
         let currentKey = currentProjectKey.map(canonicalKey)
         var machines = [thisMac]
         var locations: [Location] = []
         var seenLocalKeys = Set<String>()
+        func homeLocation(machine: Machine, key: String, path: String) -> Location {
+            Location(
+                machine: machine,
+                key: key,
+                name: HomePlace.name,
+                path: path,
+                displayPath: "~",
+                openStatus: openWindows[canonicalKey(key)],
+                isCurrent: canonicalKey(key) == currentKey,
+                lastOpened: recency[key] ?? recency[canonicalKey(key)],
+                isHome: true
+            )
+        }
+        if listsHomes, let localHome = localHome?.nilIfEmpty {
+            let key = URL(fileURLWithPath: localHome, isDirectory: true).standardizedFileURL.path
+            seenLocalKeys.insert(canonicalKey(key))
+            locations.append(homeLocation(machine: .thisMac, key: key, path: key))
+        }
         for project in localProjects {
             let key = canonicalKey(project.root)
             guard seenLocalKeys.insert(key).inserted else { continue }
@@ -237,8 +261,14 @@ extension ProjectSwitcherModel {
                 sessions: entry.sessions, added: device.addedProjects, hidden: device.hiddenProjects
             )
             var paths = Set<String>()
+            if listsHomes, let home = device.homeDirectory?.nilIfEmpty {
+                let key = device.projectKey(path: home)
+                paths.insert(ProjectLocation(key: key).path)
+                locations.append(homeLocation(machine: machine, key: key, path: ProjectLocation(key: key).path))
+            }
             for project in projects {
-                paths.insert(project.path)
+                // Its home folder is its Home's row.
+                guard paths.insert(project.path).inserted else { continue }
                 let key = device.projectKey(path: project.path)
                 locations.append(Location(
                     machine: machine,

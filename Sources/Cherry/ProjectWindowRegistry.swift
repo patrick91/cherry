@@ -115,6 +115,9 @@ final class ProjectWindowRegistry {
     /// The app sets This Mac's; tests give their own.
     var launchWindowHosting: PersistentLocalSessions?
     private var lastSavedOpenWindows: [ProjectWindowValue]?
+    /// Home roots a New Terminal in Home opened a window for: it adds its
+    /// terminal once that window's saved tabs are back (`register`).
+    private var newTerminalsAwaitingHome: Set<String> = []
     private var isTerminating = false
     /// Tells the user when this copy of the app leaves the persistent
     /// sessions alone (another copy holds the instance lock). The app sets
@@ -1105,6 +1108,15 @@ final class ProjectWindowRegistry {
         if let repository {
             repository.windowRegistry = self
         }
+        // New Terminal in Home opened this window: its terminal comes once
+        // the saved tabs are back (a window with none has its first one).
+        if isNewClaim, let repository, newTerminalsAwaitingHome.remove(key.root) != nil,
+           repository.isAwaitingInitialRestore {
+            repository.whenInitialRestoreSettles { [weak self, weak repository] in
+                guard let repository else { return }
+                self?.addHomeTerminal(to: repository.workspace, root: key.root)
+            }
+        }
 
         if activeWorkspace == nil || window.isKeyWindow || window.isMainWindow {
             activate(
@@ -1205,6 +1217,49 @@ final class ProjectWindowRegistry {
                 ProjectWindowRegistry.shared.refreshActiveWindow()
             }
         }
+    }
+
+    // MARK: Home
+
+    /// Go to Home (⇧⌘H, the Omni bar): `machine`'s Home (`HomePlace`), its
+    /// most recently active window, else its primary one, which opens.
+    /// False, opening nothing, for a device whose home folder is not known
+    /// yet and while the app quits; true but nothing while the launch waits
+    /// for the instance lock (it opens the windows itself, as a Dock click
+    /// does not).
+    @discardableResult
+    func showHome(on machine: ProjectSwitcherModel.Machine = .thisMac) -> Bool {
+        guard !isTerminating, let home = HomePlace.key(on: machine), let projectWindowOpener else { return false }
+        guard !launchAwaitsInstanceLock() else { return true }
+        projectWindowOpener(home)
+        return true
+    }
+
+    /// New Terminal in Home (⌥⌘T, the Omni bar): a terminal in `machine`'s
+    /// home folder, in its Home's most recently active window, else in the
+    /// Home window this opens, once its saved tabs are back (one with none
+    /// opens with its first terminal). False as `showHome`.
+    @discardableResult
+    func newTerminalInHome(on machine: ProjectSwitcherModel.Machine = .thisMac) -> Bool {
+        pruneStaleWindows()
+        guard !isTerminating, let home = HomePlace.key(on: machine) else { return false }
+        let root = repositoryRoot(for: home)
+        if let key = mostRecentlyActiveKey(ofProject: home), let workspace = entries[key]?.shownWorkspace {
+            _ = focus(key)
+            addHomeTerminal(to: workspace, root: root)
+            return true
+        }
+        guard !launchAwaitsInstanceLock() else { return true }
+        let opensWindow = !entries.contains { $0.key.root == root && $0.value.window != nil }
+        guard showHome(on: machine) else { return false }
+        if opensWindow { newTerminalsAwaitingHome.insert(root) }
+        return true
+    }
+
+    private func addHomeTerminal(to workspace: TerminalWorkspace, root: String) {
+        guard !workspace.isTornDown else { return }
+        chromeState(for: workspace)?.selectTerminal()
+        workspace.addSession(workingDirectory: ProjectLocation.launchPath(forKey: root))
     }
 
     // MARK: New Window

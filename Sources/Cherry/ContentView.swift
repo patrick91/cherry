@@ -2988,17 +2988,20 @@ private struct SidebarTabsPage: View {
                         .id("not-open-\(projectRoot ?? "")")
                 }
 
-                SidebarCommandSection(
-                    settings: agentSettings,
-                    workspace: workspace,
-                    chromeState: chromeState,
-                    projectRoot: projectRoot,
-                    palette: palette,
-                    commands: commands,
-                    shortcutStartIndex: visibleAgentItems.count + workspace.terminalDisplayItems.count,
-                    showShortcutHints: chromeState.isCommandKeyPressed
-                )
-                .id("commands-\(projectRoot ?? "")")
+                // Home has no commands (`HomePlace`).
+                if !HomePlace.isHome(projectRoot) {
+                    SidebarCommandSection(
+                        settings: agentSettings,
+                        workspace: workspace,
+                        chromeState: chromeState,
+                        projectRoot: projectRoot,
+                        palette: palette,
+                        commands: commands,
+                        shortcutStartIndex: visibleAgentItems.count + workspace.terminalDisplayItems.count,
+                        showShortcutHints: chromeState.isCommandKeyPressed
+                    )
+                    .id("commands-\(projectRoot ?? "")")
+                }
 
                 if features.todosEnabled {
                     SidebarTodosSection(
@@ -3042,6 +3045,8 @@ struct TitlebarProjectPicker: View {
     private static let titleFont = NSFont.systemFont(ofSize: fontSize, weight: fontWeight)
     private static let titleWidthCache = NSCache<NSString, NSNumber>()
     private static let accentDiameter: CGFloat = 7
+    /// Home's house, in place of a project's colour (`HomePlace`).
+    private static let homeSymbolWidth: CGFloat = 15
     private static let titleSpacing: CGFloat = 6
     private static let horizontalPadding: CGFloat = 8
     private static let verticalPadding: CGFloat = 4
@@ -3083,7 +3088,11 @@ struct TitlebarProjectPicker: View {
         // the Omni bar on Projects, as ⌘O does.
         Button(action: { chromeState.showOmniBarProjects() }) {
             HStack(spacing: Self.titleSpacing) {
-                if palette.showsProjectAccent {
+                if repository.isHome {
+                    Image(systemName: HomePlace.symbol)
+                        .font(.system(size: Self.fontSize - 1, weight: .semibold))
+                        .frame(width: Self.homeSymbolWidth)
+                } else if palette.showsProjectAccent {
                     Circle()
                         .fill(palette.projectAccent)
                         .frame(width: Self.accentDiameter, height: Self.accentDiameter)
@@ -3179,7 +3188,9 @@ struct TitlebarProjectPicker: View {
                 + RemoteDeviceHeaderAddress.width(of: $0, status: status, fontSize: Self.fontSize)
         } ?? 0
         let titleWidth = Self.measuredTitleWidth(projectTitle) + addressWidth
-        let accentWidth = showsProjectAccent ? Self.accentDiameter + Self.titleSpacing : 0
+        let accentWidth = repository.isHome
+            ? Self.homeSymbolWidth + Self.titleSpacing
+            : showsProjectAccent ? Self.accentDiameter + Self.titleSpacing : 0
         let paddedWidth = titleWidth + accentWidth + Self.horizontalPadding * 2
         return max(0, min(maximumWidth, paddedWidth))
     }

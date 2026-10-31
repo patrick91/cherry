@@ -1025,6 +1025,8 @@ struct CherryApp: App {
         // Helpers and adapters start with the last run's login environment
         // while this run's is captured (`LoginEnvironmentCache`).
         HostedSessionLoginEnvironment.shared.lastRunCache = .shared
+        // A device's Home is the window of its home folder (`HomePlace`).
+        HomePlace.follow(RemoteDeviceStore.shared)
         // Saved windows of a device's projects reopen while it is known.
         ProjectWindowRegistry.shared.remoteProjectIsKnown = { key in
             RemoteDeviceStore.shared.device(forProjectKey: key) != nil
@@ -1175,8 +1177,21 @@ struct CherryApp: App {
                     }
                 }
                 .keyboardShortcut(CherryShortcut.newWindow.keyboardShortcut)
+                // Home's (`HomePlace`), from any window or none.
+                Button("New Terminal in Home") {
+                    if !ProjectWindowRegistry.shared.newTerminalInHome() {
+                        NSSound.beep()
+                    }
+                }
+                .keyboardShortcut(CherryShortcut.newHomeTerminal.keyboardShortcut)
             }
             CommandGroup(after: .newItem) {
+                Button("Go to Home") {
+                    if !ProjectWindowRegistry.shared.showHome() {
+                        NSSound.beep()
+                    }
+                }
+                .keyboardShortcut(CherryShortcut.goHome.keyboardShortcut)
                 Button("Open Project…") {
                     keyWindowChromeState?.showOmniBarProjects()
                 }

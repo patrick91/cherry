@@ -1,6 +1,6 @@
 import Foundation
 
-/// The host protocol (v7, Host/crates/cherry-protocol) as `cherry control`
+/// The host protocol (v7, Host/crates/cherry-protocol) as `cherry host control`
 /// relays it on its standard input and output: the few messages the phone
 /// sends and reads. The Mac app's `Sources/Cherry/HostControlProtocol.swift`
 /// encodes the same frames; this copy goes once both share a core
@@ -168,8 +168,24 @@ struct HostWireSession: Decodable, Equatable, Sendable {
     /// Milliseconds since the Unix epoch; 0 when the host did not say.
     let createdAt: UInt64
     let alternateScreen: Bool?
+    /// The kitty keyboard protocol flags the program enabled (0: legacy keys).
+    let kittyKeyboardFlags: UInt32
+    /// Whether the program turned on application cursor keys (DECCKM).
+    let applicationCursorKeys: Bool
+    /// Whether the program turned on bracketed paste; nil when the host
+    /// can't tell (an older holder).
+    let bracketedPaste: Bool?
+    /// What the programs in the session say they are doing (OSC 7501), the
+    /// record updated longest ago first; empty from a host or holder that
+    /// predates it, and while nothing reported.
+    let programStatus: [HostWireProgramStatus]
 
     var isRunning: Bool { state == "running" }
+
+    /// The program's own record (id ""), not one of its children's.
+    var rootProgramStatus: HostWireProgramStatus? {
+        programStatus.last { $0.id.isEmpty }
+    }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, cwd, command, cols, rows, state, pid, title, pwd, foreground, clients, owner, tags
@@ -177,13 +193,19 @@ struct HostWireSession: Decodable, Equatable, Sendable {
         case exitSignal = "exit_signal"
         case createdAt = "created_at"
         case alternateScreen = "alternate_screen"
+        case kittyKeyboardFlags = "kitty_keyboard_flags"
+        case applicationCursorKeys = "application_cursor_keys"
+        case bracketedPaste = "bracketed_paste"
+        case programStatus = "program_status"
     }
 
     init(
         id: String, name: String, cwd: String, command: [String] = [], cols: Int = 120, rows: Int = 32,
         state: String = "running", pid: UInt32? = nil, exitCode: UInt32? = nil, exitSignal: Int32? = nil,
         title: String? = nil, pwd: String? = nil, foreground: Foreground? = nil, clients: Int = 0,
-        owner: String? = nil, tags: [String: String] = [:], createdAt: UInt64 = 0, alternateScreen: Bool? = nil
+        owner: String? = nil, tags: [String: String] = [:], createdAt: UInt64 = 0, alternateScreen: Bool? = nil,
+        kittyKeyboardFlags: UInt32 = 0, applicationCursorKeys: Bool = false, bracketedPaste: Bool? = nil,
+        programStatus: [HostWireProgramStatus] = []
     ) {
         self.id = id
         self.name = name
@@ -203,6 +225,10 @@ struct HostWireSession: Decodable, Equatable, Sendable {
         self.tags = tags
         self.createdAt = createdAt
         self.alternateScreen = alternateScreen
+        self.kittyKeyboardFlags = kittyKeyboardFlags
+        self.applicationCursorKeys = applicationCursorKeys
+        self.bracketedPaste = bracketedPaste
+        self.programStatus = programStatus
     }
 
     init(from decoder: Decoder) throws {
@@ -225,7 +251,63 @@ struct HostWireSession: Decodable, Equatable, Sendable {
             owner: try container.decodeIfPresent(String.self, forKey: .owner),
             tags: try container.decodeIfPresent([String: String].self, forKey: .tags) ?? [:],
             createdAt: try container.decodeIfPresent(UInt64.self, forKey: .createdAt) ?? 0,
-            alternateScreen: try container.decodeIfPresent(Bool.self, forKey: .alternateScreen)
+            alternateScreen: try container.decodeIfPresent(Bool.self, forKey: .alternateScreen),
+            kittyKeyboardFlags: try container.decodeIfPresent(UInt32.self, forKey: .kittyKeyboardFlags) ?? 0,
+            applicationCursorKeys: try container.decodeIfPresent(Bool.self, forKey: .applicationCursorKeys) ?? false,
+            bracketedPaste: try container.decodeIfPresent(Bool.self, forKey: .bracketedPaste),
+            programStatus: try container.decodeIfPresent([HostWireProgramStatus].self, forKey: .programStatus) ?? []
+        )
+    }
+
+    /// The key modes the program set, for keys the phone types into it.
+    var keyModes: KeyModes {
+        KeyModes(
+            applicationCursorKeys: applicationCursorKeys,
+            kittyKeyboardFlags: kittyKeyboardFlags,
+            bracketedPaste: bracketedPaste
+        )
+    }
+}
+
+/// A program status record (OSC 7501, `ProgramStatus` in
+/// Host/crates/cherry-protocol): the latest report a program in the session
+/// sent about one id. Its text is the program's: shown, never acted on.
+struct HostWireProgramStatus: Decodable, Equatable, Sendable {
+    /// Empty for the program itself; `parent/child` for its children.
+    let id: String
+    /// `idle`, `working`, `done`, `blocked`, `error`, or one a newer host
+    /// knows.
+    let state: String
+    /// What a blocked program needs: `permission`, `question`, `auth`.
+    let kind: String?
+    /// A stable name for the program (`claude-code`).
+    let app: String
+    let title: String
+    /// One line saying what it is doing, waiting for or finished.
+    let message: String
+
+    private enum CodingKeys: String, CodingKey {
+        case id, state, kind, app, title, message
+    }
+
+    init(id: String = "", state: String, kind: String? = nil, app: String = "", title: String = "", message: String = "") {
+        self.id = id
+        self.state = state
+        self.kind = kind
+        self.app = app
+        self.title = title
+        self.message = message
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try container.decodeIfPresent(String.self, forKey: .id) ?? "",
+            state: try container.decode(String.self, forKey: .state),
+            kind: try container.decodeIfPresent(String.self, forKey: .kind),
+            app: try container.decodeIfPresent(String.self, forKey: .app) ?? "",
+            title: try container.decodeIfPresent(String.self, forKey: .title) ?? "",
+            message: try container.decodeIfPresent(String.self, forKey: .message) ?? ""
         )
     }
 }

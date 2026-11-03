@@ -2,15 +2,13 @@ import Crypto
 import Foundation
 import NIOConcurrencyHelpers
 
-/// Reaches a real Mac over SSH and runs Cherry's helpers there
+/// Reaches a real Mac over SSH and runs Cherry's helper there
 /// (docs/specs/ios-app.md, Transport): one SSH connection per Mac, with a
-/// long-lived `cherry control --no-start` for sessions, screens, input and
-/// events, a PTY running `cherry attach` per terminal, and short runs of
-/// Cherry's MCP helper for agent state.
+/// long-lived `cherry host control --no-start` for sessions (their agents'
+/// program status included), screens, input and events, and a PTY running
+/// `cherry host attach` per terminal.
 public struct SSHMacConnector: MacConnector {
     public let identity: any DeviceIdentity
-    /// How often agent state is read from the Mac's Cherry, at most.
-    public var agentStateInterval: Duration = .seconds(3)
 
     public init(identity: any DeviceIdentity) {
         self.identity = identity
@@ -23,8 +21,7 @@ public struct SSHMacConnector: MacConnector {
         return try await SSHMacConnection.open(
             endpoint,
             key: try signing.signingKey(),
-            deviceID: try signing.deviceID(),
-            agentStateInterval: agentStateInterval
+            deviceID: try signing.deviceID()
         )
     }
 }
@@ -37,7 +34,6 @@ actor SSHMacConnection: MacConnection {
     private let control: SSHSessionChannel
     private let cherryPath: String
     private let deviceID: String
-    private let agentStateInterval: Duration
 
     private var decoder = HostWireFrameDecoder()
     private var nextRequestID: UInt64 = 1
@@ -48,9 +44,9 @@ actor SSHMacConnection: MacConnection {
     private var hostID: String?
     private var subscribers: [UUID: AsyncStream<MacEvent>.Continuation] = [:]
     private var sessionsByID: [String: HostWireSession] = [:]
-    private var agentStates = AgentStates.empty
-    private var agentStatesReadAt: ContinuousClock.Instant?
-    private var agentStatesRead: Task<AgentStates, Never>?
+    /// Each session's attention as last listed, and since when (nil: as
+    /// first seen, so not known).
+    private var attentionByID: [String: (attention: AgentAttention, since: Date?)] = [:]
     private var closedReason: String?
     private var heartbeat: Task<Void, Never>?
 
@@ -59,22 +55,19 @@ actor SSHMacConnection: MacConnection {
         ssh: SSHConnection,
         control: SSHSessionChannel,
         cherryPath: String,
-        deviceID: String,
-        agentStateInterval: Duration
+        deviceID: String
     ) {
         endpointBox = NIOLockedValueBox(endpoint)
         self.ssh = ssh
         self.control = control
         self.cherryPath = cherryPath
         self.deviceID = deviceID
-        self.agentStateInterval = agentStateInterval
     }
 
     static func open(
         _ endpoint: MacEndpoint,
         key: Curve25519.Signing.PrivateKey,
-        deviceID: String,
-        agentStateInterval: Duration
+        deviceID: String
     ) async throws -> SSHMacConnection {
         let ssh: SSHConnection
         do {
@@ -90,7 +83,7 @@ actor SSHMacConnection: MacConnection {
         }
         do {
             let cherryPath = try await findCherry(ssh, endpoint: endpoint)
-            var words = [cherryPath, "control", "--no-start"]
+            var words = [cherryPath, "host", "control", "--no-start"]
             if let expected = endpoint.expectedHostID { words += ["--expected-host-id", expected] }
             let control = try await ssh.session(command: ShellQuote.command(words))
             var connected = endpoint
@@ -100,8 +93,7 @@ actor SSHMacConnection: MacConnection {
                 ssh: ssh,
                 control: control,
                 cherryPath: cherryPath,
-                deviceID: deviceID,
-                agentStateInterval: agentStateInterval
+                deviceID: deviceID
             )
             try await connection.start()
             return connection
@@ -174,11 +166,21 @@ actor SSHMacConnection: MacConnection {
         let reply = try await request(.list)
         guard case .sessions(let list) = reply else { throw unexpected(reply) }
         sessionsByID = Dictionary(list.sessions.map { ($0.id, $0) }, uniquingKeysWith: { $1 })
-        // Only agents have a state to read.
-        let hasAgents = list.sessions.contains { $0.isRunning && $0.tags[SessionMapping.Tag.kind] == "agent" }
-        let states = hasAgents ? await currentAgentStates() : .empty
         let macID = endpoint.id
-        return list.sessions.map { SessionMapping.session($0, macID: macID, states: states) }
+        let now = Date()
+        var seen: [String: (attention: AgentAttention, since: Date?)] = [:]
+        let sessions = list.sessions.map { info -> MobileSession in
+            var session = SessionMapping.session(info, macID: macID)
+            var since: Date?
+            if let previous = attentionByID[info.id] {
+                since = previous.attention == session.attention ? previous.since : now
+            }
+            seen[info.id] = (session.attention, since)
+            session.changedAt = since
+            return session
+        }
+        attentionByID = seen
+        return sessions
     }
 
     func screen(of sessionID: String) async throws -> ScreenSnapshot {
@@ -197,8 +199,9 @@ actor SSHMacConnection: MacConnection {
     }
 
     func send(_ keys: [MobileKey], to sessionID: String) async throws {
+        let modes = sessionsByID[sessionID]?.keyModes ?? KeyModes()
         var data = Data()
-        for key in keys { data.append(key.bytes) }
+        for key in keys { data.append(key.bytes(in: modes)) }
         var offset = data.startIndex
         while offset < data.endIndex {
             let end = data.index(offset, offsetBy: HostWire.maxInputBytes, limitedBy: data.endIndex) ?? data.endIndex
@@ -224,7 +227,7 @@ actor SSHMacConnection: MacConnection {
 
     func attach(_ sessionID: String, size: TerminalSize) async throws -> any TerminalAttachment {
         if let closedReason { throw MacConnectionError.unreachable(closedReason) }
-        var words = [cherryPath, "attach", sessionID, "--detach-key", "none", "--client-id", "mobile-\(deviceID)"]
+        var words = [cherryPath, "host", "attach", sessionID, "--detach-key", "none", "--client-id", "mobile-\(deviceID)"]
         if let hostID { words += ["--expected-host-id", hostID] }
         do {
             let channel = try await ssh.session(command: ShellQuote.command(words), pty: size)
@@ -384,7 +387,7 @@ actor SSHMacConnection: MacConnection {
         await control.close()
     }
 
-    /// Why `cherry control --no-start` ended before its `Welcome`.
+    /// Why `cherry host control --no-start` ended before its `Welcome`.
     static func startError(reason: String, status: Int?) -> MacConnectionError {
         let lowercased = reason.lowercased()
         if lowercased.contains("no cherry-host is running") || lowercased.contains("never starts one") {
@@ -417,48 +420,9 @@ actor SSHMacConnection: MacConnection {
             continuation.yield(event)
         }
     }
-
-    // MARK: - Agent state
-
-    /// The Mac's Cherry's agent states, read at most every
-    /// `agentStateInterval`; empty when it can't be read.
-    private func currentAgentStates() async -> AgentStates {
-        if let readAt = agentStatesReadAt, ContinuousClock.now - readAt < agentStateInterval {
-            return agentStates
-        }
-        if let agentStatesRead {
-            return await agentStatesRead.value
-        }
-        let ssh = ssh
-        let mcpPath = AgentStateCommands.mcpPath(nextTo: cherryPath)
-        let read = Task { await AgentStateReader.read(over: ssh, mcpPath: mcpPath) }
-        agentStatesRead = read
-        let states = await read.value
-        agentStates = states
-        agentStatesReadAt = .now
-        agentStatesRead = nil
-        return states
-    }
 }
 
-/// Reads agent state with the Mac's MCP helper; nothing when it fails.
-enum AgentStateReader {
-    static func read(over ssh: SSHConnection, mcpPath: String) async -> AgentStates {
-        guard let projects = try? await ssh.run(AgentStateCommands.listProjects(mcpPath: mcpPath), timeout: .seconds(10)),
-              projects.status == 0
-        else { return .empty }
-        let roots = AgentStates.projectRoots(inListProjects: projects.stdout)
-        guard !roots.isEmpty,
-              let processes = try? await ssh.run(
-                  AgentStateCommands.listProcesses(mcpPath: mcpPath, roots: roots),
-                  timeout: .seconds(15)
-              )
-        else { return .empty }
-        return AgentStates.parse(processLists: AgentStateCommands.lines(processes.stdout))
-    }
-}
-
-/// A terminal attached over a PTY channel running `cherry attach`.
+/// A terminal attached over a PTY channel running `cherry host attach`.
 final class SSHTerminalAttachment: TerminalAttachment {
     private let channel: SSHSessionChannel
     var output: AsyncStream<Data> { channel.output }

@@ -60,13 +60,15 @@ struct LoopbackTests {
         #expect(connection.endpoint.hostKeyFingerprint == (try Loopback.value("HOST_FINGERPRINT")))
         #expect(connection.endpoint.expectedHostID == (try Loopback.value("HOST_ID")))
 
-        // Listed, with its agent state from the (stand-in) MCP helper.
+        // Listed, with what its program reported to the host (OSC 7501):
+        // the session host alone says so, no Cherry app involved.
         let sessions = try await connection.sessions()
         let listed = try #require(sessions.first { $0.id == session })
         #expect(listed.kind == .agent("claude"))
         #expect(listed.title == "Fix the tests")
         #expect(listed.attention == .approval)
-        #expect(listed.detail == "Fix the tests")
+        #expect(listed.detail == "Approve Bash: npm test")
+        #expect(listed.changedAt == nil)
         #expect(listed.isRunning)
 
         // Typed through the host: the program shows it.
@@ -78,6 +80,14 @@ struct LoopbackTests {
         await #expect(throws: MacConnectionError.sessionGone("no-such-session")) {
             try await connection.screen(of: "no-such-session")
         }
+
+        // Approved: its new status comes with the host's events, and the
+        // connection notes since when.
+        try await connection.send([.text("approve"), .enter], to: session)
+        #expect(try await eventually {
+            let listed = try await connection.sessions().first { $0.id == session }
+            return listed?.attention == .resultReady && listed?.detail == "Tests pass" && listed?.changedAt != nil
+        })
 
         // A terminal: the host paints it, and what is typed echoes.
         let terminal = try await connection.attach(session, size: TerminalSize(columns: 80, rows: 24))

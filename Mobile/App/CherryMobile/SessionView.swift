@@ -14,6 +14,9 @@ struct SessionView: View {
     var body: some View {
         VStack(spacing: 0) {
             ScreenTextView(screen: screen, problem: problem)
+            if let session, session.isRunning, let detail = session.detail {
+                StatusLine(attention: session.attention, message: detail)
+            }
             QuickReplyBar(menu: menu, isRunning: session?.isRunning ?? true) { keys in
                 await send(keys)
             }
@@ -78,6 +81,25 @@ struct SessionView: View {
         } catch {
             problem = error.localizedDescription
         }
+    }
+}
+
+/// What the session's program says it is doing or waits for (its status
+/// message), above the replies.
+struct StatusLine: View {
+    let attention: AgentAttention
+    let message: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            AttentionBadge(attention: attention, isRunning: true)
+            Text(message)
+                .font(.footnote)
+                .lineLimit(3)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
     }
 }
 

@@ -17,7 +17,9 @@
 #   test uses is a wrapper that sets them again; the test pins the private
 #   host's id (`--expected-host-id`), so no other daemon (never
 #   /tmp/cherry-host-$UID) can answer it;
-# - CherryMCP is a stand-in next to that wrapper, printing recorded JSON;
+# - the session's program is a stand-in agent that reports its status
+#   (OSC 7501) as Claude Code does: blocked on a permission, then done once
+#   a line `approve` comes;
 # - everything is stopped by the pids it started, and the directory removed.
 #
 # Exits 2 when sshd cannot run here.
@@ -48,9 +50,9 @@ cleanup() {
   set +e
   if [ -n "$sshd_pid" ]; then kill "$sshd_pid" 2>/dev/null; fi
   if [ -n "$session" ]; then
-    HOME="$dir/home" "$binaries/cherry" --socket "$socket" kill "$session" >/dev/null 2>&1
+    HOME="$dir/home" "$binaries/cherry" --socket "$socket" host kill "$session" >/dev/null 2>&1
   fi
-  HOME="$dir/home" "$binaries/cherry" --socket "$socket" shutdown >/dev/null 2>&1
+  HOME="$dir/home" "$binaries/cherry" --socket "$socket" host shutdown >/dev/null 2>&1
   sleep 0.3
   # Anything still running, by the pids this script learned.
   if [ -n "$program_pid" ] && kill -0 "$program_pid" 2>/dev/null; then
@@ -64,21 +66,30 @@ cleanup() {
 trap cleanup EXIT
 
 private() {
-  HOME="$dir/home" CHERRY_HOST_SOCKET="$socket" "$binaries/cherry" --socket "$socket" "$@"
+  HOME="$dir/home" CHERRY_HOST_SOCKET="$socket" "$binaries/cherry" --socket "$socket" host "$@"
 }
 
-# The private host, and a session in it shaped like a Cherry agent tab.
+# The private host, and a session in it shaped like a Cherry agent tab,
+# whose program reports what it needs: approval of "Approve Bash: npm test",
+# then, after a line `approve`, done with "Tests pass".
 private start >/dev/null
 status=$(private status --json)
 daemon_pid=$(printf '%s' "$status" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["host"]["pid"])')
 host_id=$(printf '%s' "$status" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["host_id"])')
 tab=7F0C1E52-3B47-4E2B-9C1A-2D3E4F5A6B7C
+agent='printf "\033]7501;state=blocked:app=claude-code:kind=permission:msg=QXBwcm92ZSBCYXNoOiBucG0gdGVzdA==\007"
+while IFS= read -r line; do
+  printf "%s\n" "$line"
+  case $line in
+    approve) printf "\033]7501;state=done:app=claude-code:msg=VGVzdHMgcGFzcw==\007" ;;
+  esac
+done'
 created=$(private new --cwd / --name "⠋ Fix the tests" \
-  --tag cherry.kind=agent --tag cherry.agent=claude --tag "cherry.tab=$tab" -- /bin/cat)
+  --tag cherry.kind=agent --tag cherry.agent=claude --tag "cherry.tab=$tab" -- /bin/sh -c "$agent")
 session=$(printf '%s' "$created" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 program_pid=$(printf '%s' "$created" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["pid"])')
 
-# The `cherry` the test names, and a CherryMCP stand-in next to it.
+# The `cherry` the test names.
 cat > "$dir/bin/cherry" <<EOF
 #!/bin/sh
 HOME='$dir/home'
@@ -86,17 +97,7 @@ CHERRY_HOST_SOCKET='$socket'
 export HOME CHERRY_HOST_SOCKET
 exec '$binaries/cherry' "\$@"
 EOF
-tab_lower=$(printf '%s' "$tab" | tr 'A-Z' 'a-z')
-cat > "$dir/bin/CherryMCP" <<EOF
-#!/bin/sh
-printf '%s\n' "\$*" >> '$dir/mcp-calls'
-case "\$2" in
-  list_projects) printf '%s\n' '{"active_project_root":"/private/project","projects":[{"active":true,"features":{"notes_enabled":false,"todos_enabled":false},"name":"project","open":true,"root":"/private/project","worktrees":[]}]}' ;;
-  list_processes) printf '%s\n' '{"active_project_root":"/private/project","processes":[{"accepts_input":true,"agent_activity_state":"permission","agent_turn_state":"active","id":"$tab_lower","kind":"agent","label":"Fix the tests","line_count":1,"name":"Fix the tests","output_version":1,"selected":true,"state":"live","working_directory":"/private/project"}],"selected_process_id":null}' ;;
-  *) exit 1 ;;
-esac
-EOF
-chmod 700 "$dir/bin/cherry" "$dir/bin/CherryMCP"
+chmod 700 "$dir/bin/cherry"
 
 # sshd: private everything; each command it runs gets the private environment.
 /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$dir/host_key" -C cherry-mobile-loopback

@@ -19,8 +19,8 @@ on the phone.
   on the LAN or over Tailscale. A relay is only considered for
   notifications (P3).
 - **Looking never changes a Mac.** Listing and reading use
-  `cherry control --no-start`: the phone never starts or replaces a daemon
-  just to look, as the Mac app's device peeks don't.
+  `cherry host control --no-start`: the phone never starts or replaces a
+  daemon just to look, as the Mac app's device peeks don't.
 - **No surprise resizes.** Attaching from the phone resizes a session only
   when the user asked for it (see Size below).
 - **The phone's key stays on the phone.** An Ed25519 key made on the device,
@@ -35,15 +35,15 @@ on the phone.
   Ctrl, arrows; pinch zoom; `UITextInput`) and an in-memory backend
   (`InMemoryTerminalSession`: the app feeds output bytes in and gets typed
   bytes out), which is what a terminal over SSH needs.
-- **Sessions.** `cherry control` relays the host protocol's frames over
-  standard input and output (List, Screen, SendInput, events), and
-  `cherry attach ID --detach-key none --client-id ID` is a terminal client
-  that repaints from the host. Both run on the Mac, so the phone only needs
-  to run commands over SSH.
-- **Agent state.** Cherry's MCP helper on the Mac,
-  `Cherry.app/Contents/MacOS/CherryMCP --call list_processes`, reports each
-  agent's `agent_activity_state` (`working`, `idle`, `permission`,
-  `needs_input`, `error`), its turn state and its Cherry task.
+- **Sessions.** `cherry host control` relays the host protocol's frames
+  over standard input and output (List, Screen, SendInput, events), and
+  `cherry host attach ID --detach-key none --client-id ID` is a terminal
+  client that repaints from the host. Both run on the Mac, so the phone only
+  needs to run commands over SSH.
+- **Agent state.** Agents report what they are doing with program status
+  (OSC 7501), and each session's host keeps the records and sends them with
+  the session (`SessionInfo.program_status`, in List and its `changed`
+  events). That is the Mac app's only source of an agent's state too.
 
 ## Architecture
 
@@ -51,18 +51,17 @@ on the phone.
 iPhone app (SwiftUI)
   └─ CherryMobileKit: MacConnection per Mac
        └─ SSH (swift-nio-ssh, through Citadel), one connection per Mac
-            ├─ exec  cherry control --no-start        host frames: list, screen, input, events
-            ├─ pty   cherry attach ID --detach-key none   the full terminal
-            └─ exec  CherryMCP --call list_processes   agent state (P0/P1)
+            ├─ exec  cherry host control --no-start        host frames: sessions with their
+            │                                               program status, screens, input, events
+            └─ pty   cherry host attach ID --detach-key none   the full terminal
 ```
 
 ### Transport
 
 One SSH connection per Mac, with channels multiplexed on it:
 
-- a long-lived `cherry control --no-start` exec channel;
-- one PTY channel per open terminal;
-- short exec channels for agent state.
+- a long-lived `cherry host control --no-start` exec channel;
+- one PTY channel per open terminal.
 
 A non-interactive SSH command does not get the Mac's login PATH, so the
 `cherry` helper is found by absolute path: the endpoint's `cherryPath`, else
@@ -76,7 +75,7 @@ from anywhere.
 
 ### Sessions and screens
 
-`cherry control --no-start` starts with the host's `Welcome`. The phone then
+`cherry host control --no-start` starts with the host's `Welcome`. The phone then
 sends `List` and `Screen` requests and reads `sessions_changed`, `exited` and
 output events. The frames are those `Sources/Cherry/HostControlProtocol.swift`
 encodes for the Mac app. The prototype keeps its own copy of the few it
@@ -88,24 +87,36 @@ width in a horizontally scrollable monospaced view.
 
 ### Agent state (attention)
 
-- **P0/P1:** the phone runs `CherryMCP --call list_processes` on the Mac and
-  matches processes to host sessions. Mapping:
-  - `permission` → *approval*;
-  - `needs_input` → *question*;
-  - `idle` after a completed turn (`agent_turn_state` `completed`) →
-    *result ready*;
-  - `working`, `idle` and `error` as they are.
+The phone reads each session's program status from the host, as the Mac
+app does, so it needs neither a running Cherry on that Mac nor its control
+socket. The program's own record (id empty; children such as a build's
+steps don't count) maps as follows:
 
-  Without a running Cherry on that Mac, agents show as *unknown*. Sessions
-  still list.
-- **P2:** the Mac app publishes each tab's verdict into its host session
-  (`Update` with a `cherry.attention` tag, as it already syncs names). Then
-  `cherry control` alone carries it, events included, and the phone needs
-  neither the MCP helper nor the Mac app's control socket.
+- `blocked` with `kind=permission` → *approval*;
+- `blocked` with another kind (`question`, `auth`) or none → *question*;
+- `done` → *result ready*;
+- `working`, `idle` and `error` as they are.
+
+Its message ("Approve Bash: npm test", "Tests pass") is the session's
+detail, shown as text and never acted on. A program that reports nothing
+(Codex and Amp today, or an older version) is *unknown*: it still lists,
+and the session screen still turns a numbered menu on its screen into
+buttons. The host has no time for a record, so the connection notes when a
+session's attention changed.
+
+### Typing
+
+The host types what it is sent, so the phone encodes keys for the modes the
+host reports for the program (`kitty_keyboard_flags`,
+`application_cursor_keys`, `bracketed_paste`), as `cherry keys` does on the
+Mac: arrows as `ESC O x` under application cursor keys unless the kitty
+flags are on, Tab as `CSI 9 u` when they report every key, and a reply of
+several lines as one bracketed paste, unless the program turned bracketed
+paste off.
 
 ### Full terminal
 
-A PTY channel runs `cherry attach ID --detach-key none --client-id
+A PTY channel runs `cherry host attach ID --detach-key none --client-id
 mobile-<device id>`, so a dropped connection's attachment is replaced, not
 doubled. Its bytes feed a `UITerminalView` through `InMemoryTerminalSession`,
 and typed bytes (including the accessory bar's keys) go back on the channel.
@@ -139,7 +150,7 @@ trick.
   app asks before adding it, with
   `restrict,pty,command="…/cherry mobile-gateway"`, so the phone's key can
   only reach Cherry: no port forwarding, no arbitrary commands. The gateway
-  allows `control`, `attach` and the MCP helper's read tools. A session is
+  allows `host control` and `host attach`. A session is
   a shell, so this narrows the surface, not what an attached user can do.
 
 ### Notifications (P3)
@@ -173,7 +184,7 @@ version. The phone needs the same layers:
 
 - the host protocol's frames (`HostControlProtocol.swift`);
 - session models;
-- MCP process summaries.
+- the key encoding for the host's key modes.
 
 The first extraction is a `CherryHostWire` target, Foundation only, that
 both the Mac app and `CherryMobileKit` import. The prototype copies what it
@@ -185,7 +196,7 @@ needs instead, so the Mac app is untouched until that extraction.
 | --- | --- | --- |
 | P0 prototype | `Mobile/`: `CherryMobileKit` (SSH, host frames, agent state, a demo Mac) and the app (Macs, inbox, screen with quick replies, full terminal) | It builds for the simulator, its kit tests pass, it talks to a private host over a loopback sshd in tests, and the demo Mac runs in the simulator |
 | P1 daily use | Your phone: install with Apple Development signing, pairing from the Mac app, reconnects, host-key UI, Tailscale names | You use it for a week to answer agents |
-| P2 host-published attention | `cherry.attention` tag from the Mac app; size-neutral attach; approval menus as buttons from the screen | The phone needs only `cherry control` and `cherry attach` |
+| P2 size and menus | Size-neutral attach; menus read as the Mac reads them (`AgentPromptMenu`, which `cherry answer` uses) | The phone never resizes a session, and answers a menu as `cherry answer` does |
 | P3 notifications | APNs from the Mac app (or a relay), the ntfy fallback | "Needs you" reaches a locked phone within seconds |
 | P4 iPad and polish | Hardware keyboard, split view with inbox and terminal, several terminals, widgets | |
 
@@ -197,7 +208,7 @@ needs instead, so the Mac app is untouched until that extraction.
 - **Shared core:** extract `CherryHostWire` from the Mac app before P1 so
   the frames are never copied twice, or after?
 - **Phone-only actions:** should the phone start new agents (`Create`
-  through `cherry control`, without `--no-start`)? P0 only looks, types and
+  through `cherry host control`, without `--no-start`)? P0 only looks, types and
   attaches.
 
 ## Prototype (P0)

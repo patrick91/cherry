@@ -92,29 +92,6 @@ private func makeExecutable(_ url: URL, _ script: String = "#!/bin/sh\nexit 0\n"
     #expect(CherryLocator.deviceInstalls == installsWord)
 }
 
-@Test func theAgentStateCommandsCallTheMCPHelperOncePerRoot() throws {
-    let home = try temporaryDirectory()
-    defer { try? FileManager.default.removeItem(at: home) }
-    // A stand-in helper that prints its arguments, one call per line.
-    let mcp = home.appendingPathComponent("Cherry.app/Contents/MacOS/CherryMCP")
-    try makeExecutable(mcp, #"#!/bin/sh"# + "\n" + #"printf '%s|' "$@"; printf '\n'"# + "\n")
-    let cherry = home.appendingPathComponent("Cherry.app/Contents/MacOS/cherry").path
-    #expect(AgentStateCommands.mcpPath(nextTo: cherry) == mcp.path)
-
-    let projects = try runAsLoginShell(AgentStateCommands.listProjects(mcpPath: mcp.path), home: home)
-    #expect(projects == (0, "--call|list_projects|\n"))
-    let processes = try runAsLoginShell(
-        AgentStateCommands.listProcesses(mcpPath: mcp.path, roots: ["/Users/me/cherry", "/Users/me/it's \"here\""]),
-        home: home
-    )
-    #expect(processes.output == #"""
-    --call|list_processes|{"project_root":"/Users/me/cherry"}|
-    --call|list_processes|{"project_root":"/Users/me/it's \"here\""}|
-
-    """#)
-    #expect(try runAsLoginShell(AgentStateCommands.listProjects(mcpPath: home.appendingPathComponent("none").path), home: home).status == 3)
-}
-
 @Test func fingerprintsAreOpenSSHs() throws {
     // `ssh-keygen -lf -E sha256` of this key: SHA256:bCclNLkphEJQt57YtXE+uupAKCJvqnlUC66A7FxPPbQ.
     let line = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOzrcsuwOW8s1E5y8Bjh5i1hXht0NUgEslGAWBKdv8fb vector"

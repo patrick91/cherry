@@ -43,8 +43,9 @@ public actor DemoMacConnection: MacConnection {
         sessions = [
             MobileSession(
                 id: "demo-claude", macID: mac, title: "claude", directory: "~/github/patrick91/cherry",
-                kind: .agent("claude"), attention: .approval, size: TerminalSize(columns: 100, rows: 30),
-                changedAt: now.addingTimeInterval(-40)
+                kind: .agent("claude"), attention: .approval,
+                detail: "Approve Bash: swift test --filter AdapterAwayKeyInput",
+                size: TerminalSize(columns: 100, rows: 30), changedAt: now.addingTimeInterval(-40)
             ),
             MobileSession(
                 id: "demo-codex", macID: mac, title: "codex", directory: "~/github/patrick91/strawberry",
@@ -53,8 +54,8 @@ public actor DemoMacConnection: MacConnection {
             ),
             MobileSession(
                 id: "demo-pi", macID: mac, title: "pi", directory: "~/notes",
-                kind: .agent("pi"), attention: .resultReady, size: TerminalSize(columns: 100, rows: 30),
-                changedAt: now.addingTimeInterval(-600)
+                kind: .agent("pi"), attention: .resultReady, detail: "Tidied 12 notes",
+                size: TerminalSize(columns: 100, rows: 30), changedAt: now.addingTimeInterval(-600)
             ),
             MobileSession(
                 id: "demo-dev", macID: mac, title: "npm run dev", directory: "~/github/patrick91/site",
@@ -283,6 +284,7 @@ public actor DemoMacConnection: MacConnection {
         if choice == "3" {
             screens[id] = ["⏺ Stopped. What should I do instead?", ""]
             sessions[index].attention = .resultReady
+            sessions[index].detail = "Stopped"
         } else {
             screens[id] = ["⏺ Bash(swift test --filter AdapterAwayKeyInput)", "", "✻ Running… (esc to interrupt)"]
             startTurn(at: index, answer: "⏺ All 16 key encoder tests passed.")
@@ -294,6 +296,7 @@ public actor DemoMacConnection: MacConnection {
     private func startTurn(at index: Int, answer: String) {
         let id = sessions[index].id
         sessions[index].attention = .working
+        sessions[index].detail = nil
         let duration = turnDuration
         Task {
             try? await Task.sleep(for: duration)
@@ -305,6 +308,7 @@ public actor DemoMacConnection: MacConnection {
         guard isConnected, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
         screens[id] = (screens[id] ?? []).filter { !$0.contains("esc to interrupt") } + [answer, ""]
         sessions[index].attention = .resultReady
+        sessions[index].detail = answer.replacingOccurrences(of: "⏺ ", with: "")
         sessions[index].changedAt = Date()
         for attachment in attachments[id] ?? [] {
             repaint(attachment, lines: screens[id, default: []])

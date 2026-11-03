@@ -38,13 +38,24 @@ current release pulls a personal fork of it):
   endpoint's `cherryPath`, `~/Applications/Cherry.app` and
   `/Applications/Cherry.app` (`CherryLocator`). Commands are single-quoted
   words, so zsh, bash and fish login shells read them alike (`ShellQuote`).
-- **Sessions:** a long-lived `cherry control --no-start` channel speaks the host
-  protocol (`HostWire`: List, Screen, SendInput, Subscribe, Ping every 15 s).
-  If no host runs, the error is `.noSessionHost`.
-- **Agent state:** `CherryMCP --call list_projects`, then `list_processes` for
-  each open project and loaded worktree, at most every 3 s. A process's `id` is
-  its tab's id, which its host session names in the `cherry.tab` tag.
-- **Terminal:** a PTY channel runs `cherry attach <id> --detach-key none
+- **Sessions:** a long-lived `cherry host control --no-start` channel speaks the
+  host protocol (`HostWire`: List, Screen, SendInput, Subscribe, Ping every
+  15 s). If no host runs, the error is `.noSessionHost`.
+- **Agent state:** each session's program status (OSC 7501), which the host
+  keeps and sends with the session (`program_status`, in the list and its
+  `changed` events), so no Cherry app is involved. The program's own record
+  (`SessionMapping.attention`): `blocked` with `kind=permission` is an
+  approval, another `blocked` a question, `done` a result ready; `working`,
+  `idle` and `error` as they are. Its message is the session's detail. Claude
+  Code and Pi report it; Codex and Amp don't, so theirs is unknown (the
+  session screen still turns a menu on it into buttons). The connection notes
+  when a session's attention changed (`changedAt`).
+- **Keys:** what the phone types follows the key modes the host reports for
+  the program (`KeyModes`), as `cherry keys` types them: arrows as `ESC O x`
+  under application cursor keys (not with the kitty flags), Tab as `CSI 9 u`
+  when the kitty flags report every key, and a reply of several lines as one
+  bracketed paste.
+- **Terminal:** a PTY channel runs `cherry host attach <id> --detach-key none
   --client-id mobile-<device id>`; `resize` is an SSH window change.
 
 ## The app
@@ -110,5 +121,8 @@ Tests never reach the user's real Macs, daemon or Cherry:
 - SSH only to a private sshd on 127.0.0.1 (as
   `Scripts/test-remote-mac-loopback` does);
 - a private `cherry-host` with its own `HOME` and sockets;
-- `cherry control --no-start`;
-- recorded JSON in place of the real `CherryMCP`.
+- `cherry host control --no-start`;
+- a stand-in agent that reports its status as Claude Code does.
+
+CI (`.github/workflows/mobile.yml`) runs the kit tests, `test-loopback` and
+`build-app` on macOS.

@@ -11,13 +11,9 @@ enum SessionMapping {
         static let command = "cherry.command"
     }
 
-    static func session(_ info: HostWireSession, macID: UUID, states: AgentStates) -> MobileSession {
+    static func session(_ info: HostWireSession, macID: UUID, attentionSince: Date? = nil) -> MobileSession {
         let kind = kind(of: info)
-        let state = states.state(forTab: info.tags[Tag.tab])
-        var attention = AgentAttention.unknown
-        if case .agent = kind, info.isRunning, let state {
-            attention = state.attention
-        }
+        let status = info.isRunning ? info.rootProgramStatus : nil
         return MobileSession(
             id: info.id,
             macID: macID,
@@ -25,11 +21,25 @@ enum SessionMapping {
             directory: directory(of: info),
             kind: kind,
             isRunning: info.isRunning,
-            attention: attention,
-            detail: info.isRunning ? state?.detail : nil,
+            attention: attention(of: status),
+            detail: status.flatMap { $0.message.nilIfBlank ?? $0.title.nilIfBlank },
             size: TerminalSize(columns: info.cols, rows: info.rows),
-            changedAt: state?.changedAt
+            changedAt: attentionSince
         )
+    }
+
+    /// What a program's own record says it needs, as the Mac's Cherry reads
+    /// it (`AgentActivityState`), except that `done` is a result waiting for
+    /// you; `unknown` while it reports nothing.
+    static func attention(of status: HostWireProgramStatus?) -> AgentAttention {
+        switch status?.state {
+        case "blocked": status?.kind == "permission" ? .approval : .question
+        case "done": .resultReady
+        case "working": .working
+        case "idle": .idle
+        case "error": .error
+        default: .unknown
+        }
     }
 
     static func kind(of info: HostWireSession) -> SessionKind {
@@ -94,5 +104,11 @@ enum SessionMapping {
             lines.removeLast()
         }
         return lines
+    }
+}
+
+extension String {
+    var nilIfBlank: String? {
+        trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : self
     }
 }

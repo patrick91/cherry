@@ -41,18 +41,20 @@ public struct MacEndpoint: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
-/// What an agent needs from you, as Cherry on its Mac sees it.
+/// What a session's program needs from you, as it says itself: its
+/// program status (OSC 7501), which its Mac's session host keeps.
 public enum AgentAttention: String, Codable, Hashable, Sendable, CaseIterable {
-    /// An approval prompt waits (`agent_activity_state` `permission`).
+    /// It waits for your approval (`blocked`, `kind=permission`).
     case approval
-    /// A question with a choice waits (`needs_input`).
+    /// It waits for an answer or a credential (`blocked`, another kind).
     case question
-    /// It finished a turn and waits at its composer.
+    /// It finished, and the result waits for you (`done`).
     case resultReady
     case working
     case idle
     case error
-    /// Its Mac's Cherry did not say (not running there, or not an agent).
+    /// It reports nothing: a program or version that doesn't speak the
+    /// protocol (Codex, Amp), or not an agent.
     case unknown
 
     /// Whether the inbox puts it first.
@@ -82,11 +84,13 @@ public struct MobileSession: Identifiable, Hashable, Sendable {
     public var kind: SessionKind
     public var isRunning: Bool
     public var attention: AgentAttention
-    /// A Cherry task's label or result summary, else nil.
+    /// What its program says it is doing, waiting for or finished (its
+    /// status message), else nil.
     public var detail: String?
     /// The shared grid its clients see now.
     public var size: TerminalSize
-    /// When its screen last changed, when known.
+    /// Since when its attention is what it is, when this connection saw it
+    /// change.
     public var changedAt: Date?
 
     public init(
@@ -138,6 +142,28 @@ public struct ScreenSnapshot: Hashable, Sendable {
     }
 }
 
+/// The key modes a session's program set, as its host reports them: how
+/// the keys the phone types must look for it to read them as a terminal
+/// would type them.
+public struct KeyModes: Hashable, Sendable {
+    /// Application cursor keys (DECCKM: `less`, `vim`).
+    public var applicationCursorKeys: Bool
+    /// The kitty keyboard protocol flags (0: legacy keys).
+    public var kittyKeyboardFlags: UInt32
+    /// Bracketed paste (DECSET 2004); nil when the host can't tell.
+    public var bracketedPaste: Bool?
+
+    public init(applicationCursorKeys: Bool = false, kittyKeyboardFlags: UInt32 = 0, bracketedPaste: Bool? = nil) {
+        self.applicationCursorKeys = applicationCursorKeys
+        self.kittyKeyboardFlags = kittyKeyboardFlags
+        self.bracketedPaste = bracketedPaste
+    }
+
+    /// The kitty flag that reports every key, Tab included, as an escape
+    /// code.
+    static let reportAllKeysAsEscapeCodes: UInt32 = 0b1000
+}
+
 /// A key the phone types into a session without a terminal open: the
 /// quick replies, and the inbox's approve and answer buttons.
 public enum MobileKey: Hashable, Sendable {
@@ -152,21 +178,37 @@ public enum MobileKey: Hashable, Sendable {
     case right
     case controlC
 
-    /// The bytes a legacy terminal types for it (cursor keys as `ESC [ x`;
-    /// the host rewrites them for a program that set application cursor
-    /// keys).
-    public var bytes: Data {
+    /// The bytes a terminal in legacy key mode types for it.
+    public var bytes: Data { bytes(in: KeyModes()) }
+
+    /// The bytes for a program in `modes`, as the Mac's Cherry types keys
+    /// through the host (`cherry keys`, `TerminalInputNormalizer`): the host
+    /// types what it is sent, so the phone encodes them itself.
+    /// - Arrows are `ESC O x` while application cursor keys are on and the
+    ///   kitty flags are 0 (the kitty encoding sends them as CSI).
+    /// - Tab is `CSI 9 u` when the kitty flags report every key.
+    /// - Text with a line break is bracketed as a paste unless the program
+    ///   is known not to take one, so an agent's composer gets it as one
+    ///   message instead of submitting each line.
+    public func bytes(in modes: KeyModes) -> Data {
+        let cursor = modes.applicationCursorKeys && modes.kittyKeyboardFlags == 0 ? "\u{1B}O" : "\u{1B}["
         switch self {
-        case .text(let text): Data(text.utf8)
-        case .enter: Data([0x0D])
-        case .escape: Data([0x1B])
-        case .tab: Data([0x09])
-        case .backspace: Data([0x7F])
-        case .up: Data("\u{1B}[A".utf8)
-        case .down: Data("\u{1B}[B".utf8)
-        case .right: Data("\u{1B}[C".utf8)
-        case .left: Data("\u{1B}[D".utf8)
-        case .controlC: Data([0x03])
+        case .text(let text):
+            guard modes.bracketedPaste != false, text.contains(where: \.isNewline) else { return Data(text.utf8) }
+            // Without ESC, nothing in it can end the paste early.
+            let pasted = text.replacingOccurrences(of: "\u{1B}", with: "")
+            return Data("\u{1B}[200~\(pasted)\u{1B}[201~".utf8)
+        case .enter: return Data([0x0D])
+        case .escape: return Data([0x1B])
+        case .tab:
+            return modes.kittyKeyboardFlags & KeyModes.reportAllKeysAsEscapeCodes != 0
+                ? Data("\u{1B}[9u".utf8) : Data([0x09])
+        case .backspace: return Data([0x7F])
+        case .up: return Data((cursor + "A").utf8)
+        case .down: return Data((cursor + "B").utf8)
+        case .right: return Data((cursor + "C").utf8)
+        case .left: return Data((cursor + "D").utf8)
+        case .controlC: return Data([0x03])
         }
     }
 }

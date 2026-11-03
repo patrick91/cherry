@@ -1,0 +1,52 @@
+name: iOS app
+
+on:
+  push:
+    paths:
+      - "Mobile/**"
+      - "ThirdParty/libghostty-spm/**"
+      # The phone runs `cherry host control` and `cherry host attach` on the
+      # Mac and speaks their protocol.
+      - "Host/crates/cherry-protocol/**"
+      - "Host/crates/cherry-cli/**"
+      - ".github/workflows/mobile.yml"
+      - ".github/actions/**"
+  pull_request:
+    paths:
+      - "Mobile/**"
+      - "ThirdParty/libghostty-spm/**"
+      - "Host/crates/cherry-protocol/**"
+      - "Host/crates/cherry-cli/**"
+      - ".github/workflows/mobile.yml"
+      - ".github/actions/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  mobile:
+    name: iOS kit, SSH loopback and simulator build
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select an Xcode for the package's Swift tools version
+        uses: ./.github/actions/xcode
+      - name: Kit tests
+        run: swift test --package-path Mobile/CherryMobileKit
+      - name: Install Rust and the pinned Ghostty VT library
+        uses: ./.github/actions/host-toolchain
+      - name: Build the Rust host helpers
+        run: CHERRY_HOST_ARCHS=native Scripts/build-host debug
+      # A private sshd and a private cherry-host on the runner's loopback.
+      - name: The SSH transport against a real sshd and host
+        run: Mobile/Scripts/test-loopback
+      - name: Install xcodegen
+        run: brew list --versions xcodegen || brew install xcodegen
+      - name: Build the app for the simulator
+        run: Mobile/Scripts/build-app

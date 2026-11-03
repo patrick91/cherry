@@ -9,7 +9,7 @@ SOURCE_DIR="${1:?Usage: $0 <ghostty-source-dir>}"
 CF_RELEASE="${SOURCE_DIR}/src/os/cf_release_thread.zig"
 if [ -f "$CF_RELEASE" ]; then
     if grep -q 'try self.loop.run(.until_done);' "$CF_RELEASE"; then
-        sed -i '' 's/try self\.loop\.run(\.until_done);/self.loop.run(.until_done) catch |err| { log.warn("cf release loop failed err={}", .{err}); return; };/' "$CF_RELEASE"
+        perl -0pi -e 's/^([ \t]*)try self\.loop\.run\(\.until_done\);$/$1self.loop.run(.until_done) catch |err| {\n$1    log.warn("cf release loop failed err={}", .{err});\n$1    return;\n$1};/m' "$CF_RELEASE"
         echo "[+] patched cf_release_thread to ignore loop errors"
     else
         echo "[+] cf_release_thread already patched"
@@ -61,10 +61,11 @@ new_fn = """    export fn ghostty_set_window_background_blur(
     }"""
 
 if old_fn not in text:
-    print("[+] blur patch already applied or source changed")
-else:
-    path.write_text(text.replace(old_fn, new_fn))
-    print("[+] patched: disabled private blur API")
+    print("[-] blur function block not found; upstream changed, update this patch")
+    sys.exit(1)
+
+path.write_text(text.replace(old_fn, new_fn))
+print("[+] patched: disabled private blur API")
 PY
     else
         echo "[+] blur patch already applied"
@@ -74,12 +75,57 @@ fi
 # Patch 3: Link Metal frameworks
 BUILD_ZIG="${SOURCE_DIR}/pkg/macos/build.zig"
 if [ -f "$BUILD_ZIG" ]; then
-    if ! grep -q 'lib.linkFramework("Metal")' "$BUILD_ZIG"; then
+    if grep -q 'linkFramework("Metal"' "$BUILD_ZIG"; then
+        echo "[+] Metal frameworks already linked"
+    elif grep -q '\.name = "IOSurface"' "$BUILD_ZIG"; then
+        # c4e16970a-era pkg/macos/build.zig refactored the old per-call-site
+        # lib.linkFramework/module.linkFramework("IOSurface", ...) statements
+        # into a data-driven `frameworks` table (name + headers, tag-gated by
+        # platform). That same table also drives genCSource(), which feeds a
+        # generated "macos_c.h" through Zig's translate-c (aro) for objc
+        # bridging — and aro's preprocessor rejects Metal.h/MetalKit.h's
+        # `#import` directives ("invalid preprocessing directive"), a clang
+        # extension aro doesn't implement. So: link Metal/MetalKit directly
+        # after the frameworks-table loop instead of adding table entries —
+        # this needs the *linker* framework, not translate-c visibility into
+        # its ObjC API.
+        python3 - "$BUILD_ZIG" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+anchor = """    inline for (.{ lib.root_module, module }) |mod| {
+        try linkFrameworks(if (target.result.os.tag == .macos) .macos else .all, mod);
+    }
+"""
+addition = """    inline for (.{ lib.root_module, module }) |mod| {
+        // Not part of the `frameworks` table above: those headers also feed
+        // genCSource()'s translate-c input, and aro (Zig's C frontend)
+        // rejects Metal.h/MetalKit.h's `#import` directives. This only
+        // needs the linker to know about the frameworks.
+        mod.linkFramework("Metal", .{});
+        mod.linkFramework("MetalKit", .{});
+    }
+"""
+
+if anchor not in text:
+    print("[-] linkFrameworks loop anchor not found; upstream changed, update this patch")
+    sys.exit(1)
+
+path.write_text(text.replace(anchor, anchor + addition))
+print("[+] patched: linked Metal frameworks (direct linkFramework, outside frameworks table)")
+PY
+    else
         perl -0pi -e 's/lib\.linkFramework\("IOSurface"\);/lib.linkFramework("IOSurface");\n    lib.linkFramework("Metal");\n    lib.linkFramework("MetalKit");/g' "$BUILD_ZIG"
         perl -0pi -e 's/module\.linkFramework\("IOSurface", \.\{\}\);/module.linkFramework("IOSurface", .{});\n        module.linkFramework("Metal", .{});\n        module.linkFramework("MetalKit", .{});/g' "$BUILD_ZIG"
+        grep -q 'lib.linkFramework("Metal")' "$BUILD_ZIG" &&
+            grep -q 'module.linkFramework("Metal", .{})' "$BUILD_ZIG" || {
+            echo "[-] IOSurface linkFramework anchors not found; upstream changed, update this patch"
+            exit 1
+        }
         echo "[+] patched: linked Metal frameworks"
-    else
-        echo "[+] Metal frameworks already linked"
     fi
 fi
 
@@ -88,9 +134,42 @@ CONFIG_ZIG="${SOURCE_DIR}/src/build/Config.zig"
 if [ -f "$CONFIG_ZIG" ]; then
     if grep -q '\.ios => \.{ \.semver = \.{' "$CONFIG_ZIG"; then
         perl -0pi -e 's/\.ios => \.{ \.semver = \.{\n\s*\.major = \d+,\n\s*\.minor = \d+,\n\s*\.patch = \d+,/.ios => .{ .semver = .{\n            .major = 15,\n            .minor = 0,\n            .patch = 0,/s' "$CONFIG_ZIG"
+        grep -A1 '\.ios => \.{ \.semver = \.{' "$CONFIG_ZIG" | grep -q '\.major = 15,' || {
+            echo "[-] iOS semver block not found; upstream changed, update this patch"
+            exit 1
+        }
         echo "[+] patched: iOS deployment target -> 15.0"
+    elif grep -q 'pub fn osVersionMin(tag: std.Target.Os.Tag)' "$CONFIG_ZIG"; then
+        # Upstream dropped the .ios arm from osVersionMin altogether when it
+        # stopped building the full Ghostty for iOS (only lib-vt keeps one,
+        # in osVersionMinLibVt); with no arm the apple-sdk step fails with
+        # AppleDeploymentTargetMissing. Put ours back as the first arm.
+        perl -0pi -e 's/(pub fn osVersionMin\(tag: std\.Target\.Os\.Tag\) \?std\.Target\.Query\.OsVersion \{\n    return switch \(tag\) \{\n)/$1        \/\/ LIBGHOSTTY_SPM_IOS_MIN: our iOS slices are the full build.\n        .ios => .{ .semver = .{\n            .major = 15,\n            .minor = 0,\n            .patch = 0,\n        } },\n\n/' "$CONFIG_ZIG"
+        grep -A1 '\.ios => \.{ \.semver = \.{' "$CONFIG_ZIG" | grep -q '\.major = 15,' || {
+            echo "[-] could not add an iOS arm to osVersionMin; upstream changed, update this patch"
+            exit 1
+        }
+        echo "[+] patched: iOS deployment target 15.0 added to osVersionMin"
     else
-        echo "[+] iOS deployment target already patched"
+        echo "[-] osVersionMin not found in Config.zig; upstream changed, update this patch"
+        exit 1
+    fi
+
+    # Patch 5: upstream refuses an iOS target for the full build (only
+    # libghostty-vt "supports" iOS there). Our iOS slices are that full build
+    # plus the patches in this directory, so the refusal is turned into a
+    # comptime-false branch; the surrounding code stays intact.
+    if grep -q 'LIBGHOSTTY_SPM_IOS_FULL_BUILD' "$CONFIG_ZIG"; then
+        echo "[+] iOS full-build guard already disabled"
+    elif grep -q 'os.tag == .ios and !emit_lib_vt' "$CONFIG_ZIG"; then
+        perl -0pi -e 's/if \(result\.result\.os\.tag == \.ios and !emit_lib_vt\) \{/if (false) { \/\/ LIBGHOSTTY_SPM_IOS_FULL_BUILD: our iOS slices are the full build/' "$CONFIG_ZIG"
+        grep -q 'LIBGHOSTTY_SPM_IOS_FULL_BUILD' "$CONFIG_ZIG" || {
+            echo "[-] iOS full-build guard not patched; upstream changed, update this patch"
+            exit 1
+        }
+        echo "[+] patched: iOS full-build guard disabled"
+    else
+        echo "[+] no iOS full-build guard in this upstream"
     fi
 fi
 

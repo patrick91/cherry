@@ -17,7 +17,7 @@ Options:
   --source <path>          Use an existing Ghostty checkout.
   --ref <tag-or-commit>    Checkout the given ref in the source checkout.
   --platforms <csv>        Build platform groups. Default:
-                           macos,ios,maccatalyst
+                           macos,ios
   --download-url <url>     Generate Package.swift from Package.swift.template.
   --skip-tests             Skip local xcodebuild and swift test verification.
   -h, --help               Show this help.
@@ -27,14 +27,15 @@ Notes:
   - This builds real per-target static archives, then assembles
     BinaryTarget/GhosttyKit.xcframework and build/GhosttyKit.xcframework.zip
   - Upstream Ghostty patches from ./Patches/ghostty are applied automatically
-  - Current verified groups: macos, ios, maccatalyst
+  - Current verified groups: macos, ios (Ghostty 1.4.0, Zig 0.17.0)
+  - maccatalyst needs patches for Zig 0.16+'s maccatalyst OS tag
   - Current upstream Ghostty crashes for: tvos, visionos, watchos
 EOF
 }
 
 ROOT_DIR=$(pwd)
 SOURCE_DIR="$ROOT_DIR/References/ghostty-upstream"
-PLATFORMS="macos,ios,maccatalyst"
+PLATFORMS="macos,ios"
 DOWNLOAD_URL=${DOWNLOAD_URL:-}
 GHOSTTY_REF=
 SKIP_TESTS=0

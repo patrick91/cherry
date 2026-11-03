@@ -1,11 +1,13 @@
 Third-party code in GhosttyKit (libghostty) and its resources
-Curated for: https://github.com/patrick91/cherry/releases/download/ghosttykit-1.4.0/GhosttyKit.xcframework.zip
+Curated for: https://github.com/patrick91/cherry/releases/download/ghosttykit-1.4.0-2/GhosttyKit.xcframework.zip
 Ghostty revision: 83fb95624b0439ee660c2679b43b38c8b63769cd (v1.4.0, https://github.com/ghostty-org/ghostty)
 
 The vendored libghostty-spm (ThirdParty/libghostty-spm, `./build.sh
---platforms macos` with Zig 0.17.0 and its Patches/ghostty) builds Ghostty's
+--platforms macos,ios` with Zig 0.17.0 and its Patches/ghostty) builds Ghostty's
 library for macOS (aarch64 and x86_64) with -Dapp-runtime=none -Dsentry=false
--Dcustom-shaders=false -Dinspector=false.
+-Dcustom-shaders=false -Dinspector=false, and for iOS devices and the iOS
+simulator, which Cherry.app does not use. The macOS slice is byte for byte the
+one in ghosttykit-1.4.0, which this list was first curated for.
 Ghostty's own license (MIT), which also covers its own packages (pkg/macos,
 the SIMD code in src/simd), is in the Ghostty section that Scripts/app-notices
 puts before this file.

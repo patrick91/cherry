@@ -109,6 +109,15 @@ identifies, scopes and refuses the caller (Scope And Identity).
   yes, no, 1 or 0, so `--awaiting-approval "Plan ready?"` is the switch
   and the text; a list is `a,b`, an object is JSON, a file or `-`).
   `cherry tool NAME [JSON | -]` calls any tool with its JSON arguments.
+- A command on tabs or a project (`ls`, `show`, `read`, `send`, `keys`,
+  `spawn`, `todo`, `project show`, `commands`, `services`… every one but
+  `task`, the subscriptions' `events`/`unsubscribe`/`subscriptions`,
+  `project ls|open|add`, `devices`, `agents`, `link` and `tool`) works in
+  the caller's project, or with `--project-root ROOT` in another open one
+  (`--device NAME`: ROOT is a path on that Mac): the call's `project_root`
+  (Scope And Identity). So `cherry ls --project-root ROOT` lists another
+  project's tabs and `cherry send NAME TEXT --project-root ROOT` finds a
+  tab there by name; a tab's ID finds it from any project.
 - Long text (a brief, a message, a report, a schema) comes on standard
   input: `-`, or nothing when standard input is a pipe or a file (never a
   terminal or `/dev/null`). The app asks `cherry` for it, and for a file a

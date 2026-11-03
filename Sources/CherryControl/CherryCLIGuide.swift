@@ -21,14 +21,16 @@ public enum CherryCLIGuide {
         var text = """
         # Cherry for agents
 
-        Cherry is a terminal app whose tabs are terminals, agents (Claude Code, Codex, Pi…)
-        and project commands. You probably run in one of them (INSIDE_CHERRY=1). The `cherry`
-        command reaches the others. Output is JSON when it is not a terminal; errors exit 1
+        Cherry is a terminal app whose tabs are terminals, agents and project commands.
+        You probably run in one of them (INSIDE_CHERRY=1). The `cherry` command reaches
+        the others. Output is JSON when it is not a terminal; errors exit 1
         with `code: message` on standard error.
 
         ## Which tab
         - No ID: your own tab. An ID is a tab's UUID (from `cherry ls`) or its name.
         - "The focused tab" means the one the user sees: `cherry ls` marks it `selected`.
+        - Another open project's tabs: `cherry ls --project-root ROOT` (`cherry project ls`
+          lists roots). An ID works from anywhere; a name needs `--project-root` too.
         - Never `cherry select` or close tabs the user did not ask about.
 
         ## Commands
@@ -70,8 +72,7 @@ public enum CherryCLIGuide {
             EOF
 
         - `--schema FILE`: the result's JSON Schema; `--allow-subagents`: it may delegate.
-        - `--project-root DIR` runs it in another open project's window; it still
-          reports to you.
+        - `--project-root ROOT`: it opens there and still reports to you.
         - Then end your turn: when the run settled and you are idle, Cherry types one
           line into your tab. Or wait: `cherry task wait RUN --cursor N` (call again on
           timed_out). Read each result with `cherry task get TASK`: results are the
@@ -89,7 +90,7 @@ public enum CherryCLIGuide {
         ## Being a worker
         If your tab got a Cherry task kickoff:
 
-            cherry task mine                    # your brief and rules
+            cherry task mine   # your brief and rules
             cherry task progress "Halfway: tests pass"
             cherry task progress --awaiting-approval - <<'EOF'   # then end your turn
             The whole plan or question (up to 4000 characters)
@@ -103,7 +104,6 @@ public enum CherryCLIGuide {
         - If you cannot finish, report status failed with the reason in summary.
 
         ## Watching tabs
-        - `cherry wait ID` waits until a tab is quiet (an agent: idle after its turn).
         - `cherry subscribe ID… --wake` (or `--sub-agents`) and end your turn: when events
           are ready and you are idle, Cherry types one line into your tab; read them with
           `cherry events SUB`.

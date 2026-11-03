@@ -131,6 +131,14 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
         (["spawn", "command", "server", "--device", "patmini", "--project-root", "~/app"], "spawn_process",
          ["kind": .string("command"), "name": .string("server"), "device": .string("patmini"), "project_root": .string("~/app")]),
         (["project", "show"], "get_project_status", [:]),
+        // A command on tabs or a project works in another open project.
+        (["ls", "--project-root", "/Users/me/auth"], "list_processes", ["project_root": .string("/Users/me/auth")]),
+        (["send", "claude", "hi", "--project-root", "/Users/me/auth"], "send_agent_message",
+         ["process_name": .string("claude"), "message": .string("hi"), "project_root": .string("/Users/me/auth")]),
+        (["read", "dev", "--device", "patmini", "--project-root", "~/app"], "get_process_output",
+         ["process_name": .string("dev"), "device": .string("patmini"), "project_root": .string("~/app")]),
+        (["project", "show", "--project-root=/Users/me/auth"], "get_project_status", ["project_root": .string("/Users/me/auth")]),
+        (["commands", "stop", "--project-root", "/Users/me/auth"], "stop_all_commands", ["project_root": .string("/Users/me/auth")]),
         (["commands", "start"], "start_all_commands", [:]),
         (["commands", "stop"], "stop_all_commands", [:]),
         (["commands", "restart"], "restart_all_commands", [:]),
@@ -163,6 +171,9 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
     #expect(call.fallback == CherryCLIFallback(tool: "send_process_input", arguments: [
         "process_name": .string("dev"), "text": .string("make test"), "submit": .bool(true), "line_limit": .int(5),
     ]))
+    // In another project, the line goes there too.
+    let elsewhere = try #require(cliCall(["send", "dev", "make test", "--project-root", "/Users/me/auth"]))
+    #expect(elsewhere.fallback?.arguments["project_root"] == .string("/Users/me/auth"))
 }
 
 // MARK: - Standard input
@@ -233,6 +244,9 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
     #expect(cliUsage(["ls", "--colour"])?.contains("Unknown option --colour") == true)
     #expect(cliUsage(["read", "--lines", "many"])?.contains("whole number") == true)
     #expect(cliUsage(["ls", "extra"])?.contains("Unexpected argument") == true)
+    // A worker's task and a subscription's events are the caller's, in no project.
+    #expect(cliUsage(["task", "mine", "--project-root", "/Users/me/auth"])?.contains("Unknown option --project-root") == true)
+    #expect(cliUsage(["events", "sub-1", "--project-root", "/Users/me/auth"])?.contains("Unknown option --project-root") == true)
     #expect(cliUsage(["tool", "list_processes", "[1]"])?.contains("not a JSON object") == true)
     #expect(cliUsage(["skill", "setup", "--agent", "gemini"])?.contains("unknown agent") == true)
     #expect(cliUsage(["skill", "remove", "--force"])?.contains("--force is for cherry skill setup") == true)
@@ -243,11 +257,13 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
         return
     }
     #expect(help.contains("cherry send ID") && help.contains("cherry task report"))
+    #expect(help.contains("--project-root ROOT"))
     guard case .print(let taskHelp) = CherryCLI.parse(["task", "report", "--help"]).action else {
         Issue.record("--help prints")
         return
     }
     #expect(taskHelp.contains("cherry task report") && !taskHelp.contains("cherry ls"))
+    #expect(!taskHelp.contains("--project-root"))
 }
 
 // MARK: - The guide
@@ -258,6 +274,7 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
     for fact in [
         "cherry task report", "--awaiting-approval", "cherry answer", "<<'EOF'", "cherry task cancel TASK --close", "never your\nCLI's own subagents",
         "cherry devices", "cherry project add ~/app --device NAME", "--device NAME --project-root", "cherry spawn terminal CMD --device NAME",
+        "cherry ls --project-root ROOT", "cherry project ls",
     ] {
         #expect(guide.contains(fact), "\(fact)")
     }
@@ -414,6 +431,62 @@ private func runCommand(_ request: RunCommandRequest, on server: CherryControlSe
     #expect(skill.operations == nil && skill.standardOutput.isEmpty)
     let homeless = try await runCommand(.init(arguments: ["skill", "status"]), on: harness.server)
     #expect(homeless.exitCode == 1 && homeless.standardError.hasPrefix("skill_unavailable:"), "\(homeless)")
+}
+
+/// A tab of another open project: `cherry ls --project-root` lists that
+/// project's tabs, a name finds its tab only with `--project-root`, and an
+/// ID finds it from any project.
+@MainActor
+@Test func ControlToolCLIReachesAnotherProjectsTabs() async throws {
+    let projects = try TwoProjects()
+    defer { projects.stop() }
+    let lead = projects.cloudWindow.addAgentSession(
+        agent: projects.echo, projectRoot: projects.cloud.path, title: "Lead", select: false
+    )
+    let tab = projects.authWindow.addSession(title: "cli", select: false)
+    projects.caller = lead
+    var sent: [CherryControlRequest] = []
+    projects.server.toolDispatchWillSendForTesting = { sent.append($0) }
+    func run(_ words: [String]) async throws -> RunCommandResult {
+        try await runCommand(.init(arguments: words), on: projects.server)
+    }
+
+    let own = try await run(["ls"])
+    #expect(own.exitCode == 0, "\(own.standardError)")
+    #expect(own.standardOutput.contains(lead.id.uuidString) && !own.standardOutput.contains(tab.id.uuidString), "\(own.standardOutput)")
+    let other = try await run(["ls", "--project-root", projects.auth.path])
+    #expect(other.exitCode == 0, "\(other.standardError)")
+    #expect(other.standardOutput.contains(tab.id.uuidString) && !other.standardOutput.contains(lead.id.uuidString), "\(other.standardOutput)")
+
+    // Its name is not one of the caller's project's tabs.
+    let missing = try await run(["send", "cli", "make test"])
+    #expect(missing.exitCode == 1 && missing.standardError.hasPrefix("process_not_found:"), "\(missing)")
+    #expect(!sent.contains { request in
+        if case .scoped(let scoped) = request, case .sendProcessInput = scoped.request { return true }
+        return false
+    })
+
+    // With --project-root it is: a terminal gets the line, in its project.
+    _ = try await run(["send", "cli", "make test", "--project-root", projects.auth.path])
+    let typed = sent.compactMap { request -> ScopedControlRequest? in
+        guard case .scoped(let scoped) = request, case .sendProcessInput = scoped.request else { return nil }
+        return scoped
+    }
+    #expect(typed.count == 1)
+    #expect(typed.first?.projectRoot == projects.auth.path)
+    guard case .sendProcessInput(let input)? = typed.first?.request else {
+        Issue.record("Expected the line typed, got \(sent)")
+        return
+    }
+    #expect(input.processName == "cli" && input.text == "make test")
+
+    // Its ID works without it.
+    let shown = try await run(["show", tab.id.uuidString])
+    #expect(shown.exitCode == 0 && shown.standardOutput.contains(tab.id.uuidString), "\(shown)")
+
+    // A device names a path there: it needs one.
+    let deviceOnly = try await run(["ls", "--device", "patmini"])
+    #expect(deviceOnly.exitCode == 1 && deviceOnly.standardError.hasPrefix("invalid_arguments:"), "\(deviceOnly)")
 }
 
 // MARK: - End to end

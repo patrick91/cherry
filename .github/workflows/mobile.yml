@@ -30,7 +30,7 @@ defaults:
 
 jobs:
   mobile:
-    name: iOS kit, SSH loopback and simulator build
+    name: iOS kit and SSH loopback
     runs-on: macos-26
     timeout-minutes: 45
     steps:
@@ -46,7 +46,6 @@ jobs:
       # A private sshd and a private cherry-host on the runner's loopback.
       - name: The SSH transport against a real sshd and host
         run: Mobile/Scripts/test-loopback
-      - name: Install xcodegen
-        run: brew list --versions xcodegen || brew install xcodegen
-      - name: Build the app for the simulator
-        run: Mobile/Scripts/build-app
+      # The app itself (Mobile/Scripts/build-app) needs a GhosttyKit with iOS
+      # slices; the ghosttykit-1.4.0 asset ThirdParty/libghostty-spm points
+      # at has macOS only. Build it here once that asset has them.

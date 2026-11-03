@@ -125,6 +125,56 @@ private func switcherModel(
     #expect(all.rows.map(\.item.title) == ["Home", "Home", "app", "cherry"])
 }
 
+/// Searching "home" lists every Mac's Home, the projects named home and
+/// the tabs in them: each says which it is.
+@Test @MainActor func homePlaceAndSameNamedRowsSayWhichIsWhich() throws {
+    var sources = OmniSources()
+    let studioWithHome = RemoteDevice(
+        id: studioID, name: "Studio", sshDestination: "studio", homeDirectory: "/Users/them",
+        addedProjects: ["/Users/them/app", "/Users/them/home"]
+    )
+    sources.projects = ProjectSwitcherModel.make(
+        localProjects: [
+            .init(root: "/Users/me/github/farbun-dev/home", name: "home"),
+            .init(root: "/Users/me/code/home", name: "home"),
+            .init(root: "/Users/me/code/cherry", name: "cherry"),
+        ],
+        devices: [.init(device: studioWithHome, state: .connected(sessionCount: 0), sessions: [])],
+        openWindows: [:], recency: [:], currentProjectKey: nil, thisMac: thisMac, localHome: "/Users/me", listsHomes: true
+    )
+    sources.devices = [.init(device: studioWithHome, state: .connected(sessionCount: 0), sessions: [])]
+    let projects = OmniProviders.projects(sources)
+    func row(_ key: String) throws -> OmniItem { try #require(projects.first { $0.id == "project:\(key)" }) }
+
+    // Two of This Mac's projects named home: each says its folder.
+    #expect(try row("/Users/me/github/farbun-dev/home").detail == "~/github/farbun-dev/home")
+    #expect(try row("/Users/me/code/home").detail == "~/code/home")
+    #expect(try row("/Users/me/code/cherry").detail.isEmpty)
+    // The only one of its Mac: its Mac's name, in its colour, no folder.
+    let studioProject = try row(studioWithHome.projectKey(path: "/Users/them/home"))
+    #expect(studioProject.detail.isEmpty && studioProject.machineName == "Studio")
+    #expect(studioProject.machineColor == RemoteDeviceColor.automatic(for: studioID))
+    // Each Mac's Home: This Mac's says nothing, another's names its Mac.
+    let home = try row("/Users/me")
+    #expect(home.title == "Home" && home.detail.isEmpty && home.machineName.isEmpty)
+    #expect(try row(studioHome).machineName == "Studio")
+
+    // A tab in Home says Home, wherever its shell is; a project's tab its
+    // project; a tab on another Mac names it too.
+    #expect(OmniTab.detail(windowPath: "/Users/me", workingDirectory: "/Users/me/code/home", home: "/Users/me", isHome: true) == "Home")
+    #expect(OmniTab.detail(windowPath: "/Users/me/code/home", workingDirectory: "/Users/me/code/home", home: "/Users/me") == "home")
+    sources.tabs = [
+        OmniTab(id: UUID(), title: "home", projectName: "Home", machine: .thisMac, isWorking: false, canDetach: true),
+        OmniTab(id: UUID(), title: "home", projectName: "Home", machine: .device(studioID), isWorking: false, canDetach: true),
+    ]
+    sources.backgroundSessions = [
+        OmniBackgroundSession(id: "s1", title: "home", machine: .device(studioID), isWorking: false, projectName: "home"),
+    ]
+    #expect(OmniProviders.tabs(sources).map(\.machineName) == ["", "Studio"])
+    let session = try #require(OmniProviders.backgroundSessions(sources).first)
+    #expect(session.detail == "home · background" && session.machineName == "Studio")
+}
+
 @Test @MainActor func homePlaceCommandsAreInTheOmniBarWithTheirShortcuts() throws {
     let commands = OmniProviders.commands(OmniSources())
     let newTerminal = try #require(commands.first { $0.id == "command:newHomeTerminal" })

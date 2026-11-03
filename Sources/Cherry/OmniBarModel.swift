@@ -167,7 +167,8 @@ struct OmniItem: Equatable, Identifiable {
     var id: String
     var kind: OmniKind
     var title: String
-    /// The one muted detail on the right.
+    /// The one muted detail on the right (a project's path when another
+    /// project of its Mac has its name, a tab's place).
     var detail = ""
     var status: OmniStatus?
     /// An SF Symbol, shown when it has no `logo`.
@@ -189,9 +190,12 @@ struct OmniItem: Equatable, Identifiable {
     var keywords: [String] = []
     /// The Mac it is on (projects, Macs, tabs and sessions).
     var machine: ProjectSwitcherModel.Machine?
-    /// The colour its `detail` is tinted with: a project on another Mac
-    /// names that Mac in its colour.
-    var detailColor: RemoteDeviceColor? = nil
+    /// The Mac a row on another Mac (a project, a tab, a background
+    /// session) is on, named after its detail in `machineColor`; empty for
+    /// This Mac's.
+    var machineName = ""
+    /// The colour its `machineName` is tinted with: that Mac's.
+    var machineColor: RemoteDeviceColor? = nil
     /// Added to its frecency in Recent: an open project, a working agent.
     var liveBoost: Double = 0
     /// Whether ↵ records it as used.
@@ -219,6 +223,7 @@ struct OmniItem: Equatable, Identifiable {
         case nil: break
         }
         if !detail.isEmpty { parts.append(detail) }
+        if !machineName.isEmpty { parts.append(machineName) }
         return parts.joined(separator: ", ")
     }
 }
@@ -433,8 +438,7 @@ enum OmniRanking {
 struct OmniTab: Equatable {
     var id: UUID
     var title: String
-    /// Its detail: its window's project name, or for a window with no
-    /// project (its home folder) its directory's name, "~" at home
+    /// Its detail: its window's project name, "Home" in its Mac's Home
     /// (`OmniTab.detail`).
     var projectName: String
     var machine: ProjectSwitcherModel.Machine
@@ -444,13 +448,15 @@ struct OmniTab: Equatable {
     /// its logo; nil for other tabs.
     var agentKey: String? = nil
 
-    /// A tab's detail: its window's folder name, unless the window is at
-    /// the home folder (no project), where it is the tab's directory's
-    /// name, or "~" when that is the home folder too (never the bare home
-    /// folder's name, the user's name). `home` is the Mac's home folder
-    /// when known; otherwise a `/Users/<name>` or `/home/<name>` window
-    /// counts as one.
-    static func detail(windowPath: String, workingDirectory: String?, home: String?) -> String {
+    /// A tab's detail: "Home" in its Mac's Home (`isHome`, `HomePlace`),
+    /// else its window's folder name, unless the window is at a home
+    /// folder Cherry does not know as Home (a device whose home it has not
+    /// read yet), where it is the tab's directory's name, or "~" when that
+    /// is the home folder too (never the bare home folder's name, the
+    /// user's name). `home` is the Mac's home folder when known; otherwise
+    /// a `/Users/<name>` or `/home/<name>` window counts as one.
+    static func detail(windowPath: String, workingDirectory: String?, home: String?, isHome: Bool = false) -> String {
+        if isHome { return HomePlace.name }
         if !SessionDisplayTitle.isHome(windowPath, home: home), windowPath != "/" {
             return SessionDisplayTitle.directoryName(windowPath, home: home)
         }
@@ -552,6 +558,14 @@ enum OmniProviders {
 
     static func projects(_ sources: OmniSources, on machine: ProjectSwitcherModel.Machine? = nil) -> [OmniItem] {
         let model = sources.projects
+        // Projects of one Mac that share a name (two "home" folders) say
+        // which folder each is; of all its projects, so a row says the
+        // same whatever the query. Home is none of them: its house says
+        // which it is.
+        var namesOnMachine: [String: Int] = [:]
+        for location in model.locations where !location.isHome {
+            namesOnMachine[sharedNameKey(location), default: 0] += 1
+        }
         return model.locations
             .filter { machine == nil || $0.machine == machine }
             .map { location in
@@ -567,7 +581,7 @@ enum OmniProviders {
                     id: "project:\(location.key)",
                     kind: .project,
                     title: location.name,
-                    detail: location.machine == .thisMac ? "" : model.name(of: location.machine),
+                    detail: !location.isHome && namesOnMachine[sharedNameKey(location), default: 0] > 1 ? location.displayPath : "",
                     status: status,
                     symbol: location.isHome ? HomePlace.symbol : "folder",
                     primaryLabel: location.isOpen ? "Switch" : "Open",
@@ -575,12 +589,28 @@ enum OmniProviders {
                     actions: projectActions(location, sources: sources),
                     keywords: location.isHome ? [location.displayPath, "home"] : [location.displayPath],
                     machine: location.machine,
-                    detailColor: location.machine.deviceID.flatMap { id in
-                        sources.devices.first { $0.device.id == id }?.device.effectiveColor
-                    },
+                    machineName: machineName(location.machine, sources: sources),
+                    machineColor: machineColor(location.machine, sources: sources),
                     liveBoost: location.isOpen ? (location.isCurrent ? 10 : 40) : 0
                 )
             }
+    }
+
+    private static func sharedNameKey(_ location: ProjectSwitcherModel.Location) -> String {
+        "\(location.machine)\u{0}\(location.name.lowercased())"
+    }
+
+    /// The name a row on `machine` shows after its detail: its Mac's, none
+    /// for This Mac.
+    static func machineName(_ machine: ProjectSwitcherModel.Machine?, sources: OmniSources) -> String {
+        guard let machine, machine != .thisMac else { return "" }
+        return sources.projects.machine(machine)?.name ?? ""
+    }
+
+    /// The colour of that name: its Mac's, when the bar has its record.
+    static func machineColor(_ machine: ProjectSwitcherModel.Machine?, sources: OmniSources) -> RemoteDeviceColor? {
+        guard let id = machine?.deviceID else { return nil }
+        return sources.devices.first { $0.device.id == id }?.device.effectiveColor
     }
 
     static func projectActions(_ location: ProjectSwitcherModel.Location, sources: OmniSources) -> [OmniAction] {
@@ -632,6 +662,8 @@ enum OmniProviders {
             if lhsHome != rhsHome { return lhsHome }
             let order = lhs.title.localizedStandardCompare(rhs.title)
             if order != .orderedSame { return order == .orderedAscending }
+            let machineOrder = lhs.machineName.localizedStandardCompare(rhs.machineName)
+            if machineOrder != .orderedSame { return machineOrder == .orderedAscending }
             return lhs.detail.localizedStandardCompare(rhs.detail) == .orderedAscending
         }
         return [
@@ -772,6 +804,8 @@ enum OmniProviders {
                     actions: actions,
                     keywords: agentKeywords(tab.agentKey),
                     machine: tab.machine,
+                    machineName: machineName(tab.machine, sources: sources),
+                    machineColor: machineColor(tab.machine, sources: sources),
                     liveBoost: tab.isWorking ? 30 : 0
                 )
             }
@@ -796,7 +830,9 @@ enum OmniProviders {
                         .init(title: "End Session", command: .endBackgroundSession(id: session.id), isDestructive: true),
                     ],
                     keywords: agentKeywords(session.agentKey),
-                    machine: session.machine
+                    machine: session.machine,
+                    machineName: machineName(session.machine, sources: sources),
+                    machineColor: machineColor(session.machine, sources: sources)
                 )
             }
     }

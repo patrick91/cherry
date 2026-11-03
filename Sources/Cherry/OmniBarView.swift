@@ -497,11 +497,19 @@ private struct OmniBarRow: View {
             }
             if !row.item.detail.isEmpty {
                 Text(row.item.detail)
-                    .font(.system(size: 12, weight: row.item.detailColor == nil ? .regular : .medium))
-                    .foregroundStyle(detailStyle)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .layoutPriority(0.5)
+            }
+            if !row.item.machineName.isEmpty {
+                Text(row.item.machineName)
+                    .font(.system(size: 12, weight: row.item.machineColor == nil ? .regular : .medium))
+                    .foregroundStyle(machineStyle)
+                    .lineLimit(1)
+                    // A path gives way before the Mac's name.
+                    .layoutPriority(0.6)
             }
         }
         .padding(.horizontal, 12)
@@ -517,9 +525,9 @@ private struct OmniBarRow: View {
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
     }
 
-    /// A project on another Mac names it in its colour.
-    private var detailStyle: AnyShapeStyle {
-        guard let color = row.item.detailColor else { return AnyShapeStyle(.secondary) }
+    /// A row on another Mac names it in its colour.
+    private var machineStyle: AnyShapeStyle {
+        guard let color = row.item.machineColor else { return AnyShapeStyle(.secondary) }
         return AnyShapeStyle(color.color(for: colorScheme))
     }
 

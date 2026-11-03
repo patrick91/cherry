@@ -106,9 +106,9 @@ private func titles(_ controller: OmniBarController) -> [String] {
 }
 
 @MainActor
-private func select(_ title: String, detail: String? = nil, in controller: OmniBarController) throws {
+private func select(_ title: String, machine: String? = nil, in controller: OmniBarController) throws {
     let row = try #require(controller.rows.first {
-        $0.item.title == title && (detail == nil || $0.item.detail == detail)
+        $0.item.title == title && (machine == nil || $0.item.machineName == machine)
     })
     controller.select(id: row.id)
 }
@@ -329,15 +329,17 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
     #expect(controller.sections[1].rows.map(\.item.title) == ["strawberry.rocks", "fastapi-cli"])
     // A project on another Mac says which; This Mac's says nothing.
     let rignore = controller.sections[0].rows[2].item
-    #expect(rignore.detail == "patstudio" && rignore.status == .idle)
-    #expect(controller.sections[0].rows[0].item.detail.isEmpty && controller.sections[0].rows[0].item.status == .working)
+    #expect(rignore.machineName == "patstudio" && rignore.detail.isEmpty && rignore.status == .idle)
+    #expect(controller.sections[0].rows[0].item.machineName.isEmpty && controller.sections[0].rows[0].item.status == .working)
     #expect(controller.sections[0].rows[0].item.primaryLabel == "Switch")
 
     controller.setQuery("cher")
     #expect(controller.sections.map(\.title) == [nil])
     #expect(titles(controller) == ["cherry", "cherry"])
-    #expect(controller.rows.map(\.item.detail) == ["", "patstudio"])
-    try select("cherry", detail: "patstudio", in: controller)
+    #expect(controller.rows.map(\.item.machineName) == ["", "patstudio"])
+    // Of two Macs, so neither needs its path.
+    #expect(controller.rows.allSatisfy { $0.item.detail.isEmpty })
+    try select("cherry", machine: "patstudio", in: controller)
     #expect(controller.primaryLabel == "Open")
 }
 
@@ -379,6 +381,8 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
         "Codex persistent-sessions multiplexer", "Shell 1", "Shell 3", "Shell 1", "GraphQL core 3.3 references update",
     ])
     #expect(controller.rows.map(\.item.detail) == ["cherry", "cherry", "pix", "rignore", "background"])
+    // A tab on another Mac says which.
+    #expect(controller.rows.map(\.item.machineName) == ["", "", "", "patstudio", ""])
     #expect(controller.rows[0].item.status == .working)
     #expect(controller.rows[0].item.primaryLabel == "Go to Tab")
     #expect(controller.rows[4].item.primaryLabel == "Open in Tab")
@@ -446,13 +450,13 @@ private func select(_ title: String, detail: String? = nil, in controller: OmniB
 
 @Test @MainActor func omniActionListsForEachKind() throws {
     let sources = fixture()
-    func actions(_ items: [OmniItem], _ title: String, detail: String? = nil) -> [String] {
-        items.first { $0.title == title && (detail == nil || $0.detail == detail) }?.actions.map(\.title) ?? ["<none>"]
+    func actions(_ items: [OmniItem], _ title: String, machine: String? = nil) -> [String] {
+        items.first { $0.title == title && (machine == nil || $0.machineName == machine) }?.actions.map(\.title) ?? ["<none>"]
     }
     let projects = OmniProviders.projects(sources)
-    #expect(actions(projects, "cherry", detail: "") == ["Open in Zed", "Reveal in Finder", "Copy Path", "Remove from Projects"])
+    #expect(actions(projects, "cherry", machine: "") == ["Open in Zed", "Reveal in Finder", "Copy Path", "Remove from Projects"])
     #expect(actions(projects, "sqlmodel") == ["Reveal in Finder", "Copy Path"])
-    #expect(actions(projects, "cherry", detail: "patstudio") == ["Copy Path", "Remove from Projects"])
+    #expect(actions(projects, "cherry", machine: "patstudio") == ["Copy Path", "Remove from Projects"])
 
     let tabs = OmniProviders.tabs(sources)
     #expect(tabs[0].actions.map(\.title) == ["Rename…", "Detach", "Close"])
@@ -998,7 +1002,8 @@ private func selectedRows(_ controller: OmniBarController) -> [String] {
     // A project window: its name, wherever the tab is.
     #expect(OmniTab.detail(windowPath: "/Users/patrickarminio/code/cherry", workingDirectory: "/tmp", home: home) == "cherry")
     #expect(OmniTab.detail(windowPath: "/Users/patrickarminio/code/cherry/", workingDirectory: nil, home: home) == "cherry")
-    // A window at the home folder (no project): the tab's directory.
+    // A window at a home folder Cherry does not know as Home: the tab's
+    // directory (in a Mac's Home it is "Home", HomePlaceTests).
     #expect(OmniTab.detail(windowPath: home, workingDirectory: "/Users/patrickarminio/code/parents-reminders", home: home) == "parents-reminders")
     #expect(OmniTab.detail(windowPath: home + "/", workingDirectory: home, home: home) == "~")
     #expect(OmniTab.detail(windowPath: home, workingDirectory: nil, home: home) == "~")
@@ -1094,18 +1099,20 @@ private func selectedRows(_ controller: OmniBarController) -> [String] {
 
 @Test @MainActor func omniProjectsOnAnotherMacTintTheirMacNameWithItsColour() {
     var sources = fixture()
-    // Without the device's record: the plain detail.
-    #expect(OmniProviders.projects(sources).allSatisfy { $0.detailColor == nil })
+    // Without the device's record: the plain name.
+    #expect(OmniProviders.projects(sources).allSatisfy { $0.machineColor == nil })
     var device = RemoteDevice(id: studioID, name: "patstudio", sshDestination: "patstudio")
     sources.devices = [.init(device: device, state: .connected(sessionCount: 2), sessions: [])]
     let projects = OmniProviders.projects(sources)
     let rignore = projects.first { $0.title == "rignore" }
-    #expect(rignore?.detail == "patstudio")
-    #expect(rignore?.detailColor == RemoteDeviceColor.automatic(for: studioID))
+    #expect(rignore?.machineName == "patstudio")
+    #expect(rignore?.machineColor == RemoteDeviceColor.automatic(for: studioID))
     // This Mac's say nothing, in no colour.
-    #expect(projects.filter { $0.machine == .thisMac }.allSatisfy { $0.detailColor == nil })
+    #expect(projects.filter { $0.machine == .thisMac }.allSatisfy { $0.machineName.isEmpty && $0.machineColor == nil })
+    // Its tabs and background sessions too.
+    #expect(OmniProviders.tabs(sources).first { $0.machine == .device(studioID) }?.machineColor == RemoteDeviceColor.automatic(for: studioID))
 
     device.color = .orange
     sources.devices = [.init(device: device, state: .connected(sessionCount: 2), sessions: [])]
-    #expect(OmniProviders.projects(sources).first { $0.title == "rignore" }?.detailColor == .orange)
+    #expect(OmniProviders.projects(sources).first { $0.title == "rignore" }?.machineColor == .orange)
 }

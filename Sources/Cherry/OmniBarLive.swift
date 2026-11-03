@@ -290,9 +290,8 @@ enum OmniBarGathering {
     }
 
     /// The tabs of every open window, the bar's own window's first. Each
-    /// one's detail is its window's project, or for a window at the home
-    /// folder its directory (`OmniTab.detail`; `home` is each Mac's home
-    /// folder when known).
+    /// one's detail is its window's project, "Home" in a Mac's Home
+    /// (`OmniTab.detail`; `home` is each Mac's home folder when known).
     static func tabs(
         registry: ProjectWindowRegistry,
         current: TerminalWorkspace?,
@@ -314,7 +313,9 @@ enum OmniBarGathering {
                 return OmniTab(
                     id: session.id,
                     title: title(of: session, workingDirectory: directory, home: machineHome),
-                    projectName: OmniTab.detail(windowPath: windowPath, workingDirectory: directory, home: machineHome),
+                    projectName: OmniTab.detail(
+                        windowPath: windowPath, workingDirectory: directory, home: machineHome, isHome: HomePlace.isHome(canonical)
+                    ),
                     machine: machine,
                     isWorking: session.agentActivityState == .working,
                     canDetach: SessionCloseCoordinator.canDetach(session),

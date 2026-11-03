@@ -124,6 +124,10 @@ public enum CherryCLI {
         var aliases: [Alias] = []
         /// For `cherry send`: the call made when the process is not an agent.
         var fallbackTool: String? = nil
+        /// Whether it works in a project's window: the caller's own, else
+        /// the open project `--project-root ROOT` names (`--device NAME`:
+        /// a path on that Mac), as any tool call's `project_root` scopes it.
+        var inProject = true
         let usage: String
         let summary: String
     }
@@ -155,7 +159,7 @@ public enum CherryCLI {
                 usage: "cherry answer ID CHOICE", summary: "Pick an option of an agent's permission or question menu (number or label)."),
         Command(words: ["spawn", "agent"], tool: "spawn_agent", positionals: [.value("name")],
                 aliases: [Alias(flag: "schema", parameter: "result_schema"), Alias(flag: "run", parameter: "run_id")],
-                usage: "cherry spawn agent NAME [--task - | --message -] [--label L] [--phase P] [--schema FILE|-] [--run RUN] [--allow-subagents] [--project-root DIR]",
+                usage: "cherry spawn agent NAME [--task - | --message -] [--label L] [--phase P] [--schema FILE|-] [--run RUN] [--allow-subagents]",
                 summary: "Start a configured agent; with --task it is a worker of yours."),
         Command(words: ["spawn", "terminal"], tool: "spawn_process", positionals: [.text("text", optional: true)],
                 fixed: ["kind": .string("terminal")],
@@ -177,25 +181,25 @@ public enum CherryCLI {
         Command(words: ["select"], tool: "select_process", positionals: [.process(optional: false)],
                 usage: "cherry select ID", summary: "Show a tab in Cherry's window (only when the user asks)."),
         Command(words: ["task", "mine"], tool: "get_my_task",
-                usage: "cherry task mine", summary: "Your task's brief, if your tab is a worker."),
+                inProject: false, usage: "cherry task mine", summary: "Your task's brief, if your tab is a worker."),
         Command(words: ["task", "report"], tool: "report_result", positionals: [.report],
-                usage: "cherry task report [JSON | -] [--status ok|failed] [--summary TEXT]",
+                inProject: false, usage: "cherry task report [JSON | -] [--status ok|failed] [--summary TEXT]",
                 summary: "Finish your task: {\"value\":…,\"status\":…,\"summary\":…}, or the value with --status/--summary."),
         Command(words: ["task", "progress"], tool: "report_progress", positionals: [.text("message")],
-                usage: "cherry task progress MESSAGE [--awaiting-approval]",
+                inProject: false, usage: "cherry task progress MESSAGE [--awaiting-approval]",
                 summary: "Tell your orchestrator how it goes; --awaiting-approval asks it and waits."),
         Command(words: ["task", "get"], tool: "get_task", positionals: [.value("task_id")],
-                usage: "cherry task get TASK", summary: "A task's state and result."),
+                inProject: false, usage: "cherry task get TASK", summary: "A task's state and result."),
         Command(words: ["task", "list"], tool: "list_tasks",
                 aliases: [Alias(flag: "run", parameter: "run_id")],
-                usage: "cherry task list [--run RUN] [--state STATE]", summary: "Your runs' tasks."),
+                inProject: false, usage: "cherry task list [--run RUN] [--state STATE]", summary: "Your runs' tasks."),
         Command(words: ["task", "wait"], tool: "wait_for_tasks", positionals: [.value("run_id", optional: true)],
                 aliases: [timeout],
-                usage: "cherry task wait [RUN] [--cursor N] [--until any|all] [--timeout MS]",
+                inProject: false, usage: "cherry task wait [RUN] [--cursor N] [--until any|all] [--timeout MS]",
                 summary: "Wait for your workers' events; call again with the cursor on timed_out."),
         Command(words: ["task", "cancel"], tool: "cancel_tasks", positionals: [.rest("task_ids")],
                 aliases: [Alias(flag: "run", parameter: "run_id")],
-                usage: "cherry task cancel [TASK…] [--run RUN] [--close]",
+                inProject: false, usage: "cherry task cancel [TASK…] [--run RUN] [--close]",
                 summary: "Cancel open tasks; --close also closes their workers' tabs."),
         Command(words: ["subscribe"], tool: "subscribe", positionals: [.rest("process_ids")],
                 aliases: [Alias(flag: "pattern", parameter: "output_pattern")],
@@ -203,11 +207,11 @@ public enum CherryCLI {
                 summary: "Watch tabs for events; with --wake Cherry types a line into your tab when you are idle."),
         Command(words: ["events"], tool: "wait_for_events", positionals: [.value("subscription_id")],
                 aliases: [timeout],
-                usage: "cherry events SUBSCRIPTION [--cursor N] [--timeout MS]", summary: "Read a subscription's events."),
+                inProject: false, usage: "cherry events SUBSCRIPTION [--cursor N] [--timeout MS]", summary: "Read a subscription's events."),
         Command(words: ["unsubscribe"], tool: "unsubscribe", positionals: [.value("subscription_id")],
-                usage: "cherry unsubscribe SUBSCRIPTION", summary: "End a subscription."),
+                inProject: false, usage: "cherry unsubscribe SUBSCRIPTION", summary: "End a subscription."),
         Command(words: ["subscriptions"], tool: "list_subscriptions",
-                usage: "cherry subscriptions", summary: "Your subscriptions."),
+                inProject: false, usage: "cherry subscriptions", summary: "Your subscriptions."),
         Command(words: ["ports"], tool: "get_process_ports", positionals: [.process(optional: true)],
                 usage: "cherry ports [ID]", summary: "A tab's localhost TCP services."),
         Command(words: ["services"], tool: "services_list",
@@ -235,14 +239,14 @@ public enum CherryCLI {
         Command(words: ["todo", "comments"], tool: "list_todo_comments", positionals: [.value("todo_id")],
                 usage: "cherry todo comments TODO", summary: "A todo's comments."),
         Command(words: ["project", "ls"], tool: "list_projects",
-                usage: "cherry project ls", summary: "Cherry's projects."),
+                inProject: false, usage: "cherry project ls", summary: "Cherry's projects."),
         Command(words: ["project", "open"], tool: "open_project", positionals: [.value("project_root")],
-                usage: "cherry project open ROOT [--device D]", summary: "Open a project's window (ROOT a path on device D)."),
+                inProject: false, usage: "cherry project open ROOT [--device D]", summary: "Open a project's window (ROOT a path on device D)."),
         Command(words: ["project", "add"], tool: "add_project", positionals: [.value("path")],
-                usage: "cherry project add PATH [--device D] [--create] [--no-open]",
+                inProject: false, usage: "cherry project add PATH [--device D] [--create] [--no-open]",
                 summary: "Add a folder of a device (default: yours) as a project and open it; --create makes the folder."),
         Command(words: ["devices"], tool: "list_devices",
-                usage: "cherry devices", summary: "This Mac and your other machines: names, projects and their keys."),
+                inProject: false, usage: "cherry devices", summary: "This Mac and your other machines: names, projects and their keys."),
         Command(words: ["project", "show"], tool: "get_project_status",
                 usage: "cherry project show", summary: "The project's status."),
         Command(words: ["commands", "start"], tool: "start_all_commands",
@@ -252,13 +256,13 @@ public enum CherryCLI {
         Command(words: ["commands", "restart"], tool: "restart_all_commands",
                 usage: "cherry commands restart", summary: "Restart the project's commands."),
         Command(words: ["agents"], tool: "list_agents",
-                usage: "cherry agents", summary: "The configured agents spawn agent takes."),
+                inProject: false, usage: "cherry agents", summary: "The configured agents spawn agent takes."),
         Command(words: ["link"], tool: "resolve_link", positionals: [.value("link")],
-                usage: "cherry link LINK", summary: "Resolve a Cherry link to a todo or a tab."),
+                inProject: false, usage: "cherry link LINK", summary: "Resolve a Cherry link to a todo or a tab."),
         Command(words: ["whoami"], tool: "whoami",
                 usage: "cherry whoami", summary: "Which tab and project Cherry sees you as."),
         Command(words: ["tool"], tool: "", positionals: [.value("name"), .toolArguments],
-                usage: "cherry tool NAME [JSON | -]", summary: "Call any Cherry tool with its MCP arguments."),
+                inProject: false, usage: "cherry tool NAME [JSON | -]", summary: "Call any Cherry tool with its MCP arguments."),
     ]
 
     /// The words that start a command, in the order help lists them.
@@ -357,6 +361,9 @@ public enum CherryCLI {
         var arguments = command.fixed
         var toolName = tool
         var schema = parameterTypes(of: tool)
+        if command.inProject {
+            schema.merge(projectParameters) { own, _ in own }
+        }
         var stdinUsed = false
         func readStandardInput() throws -> String {
             guard !stdinUsed else { throw UsageError(message: "Standard input can be read only once.") }
@@ -457,7 +464,7 @@ public enum CherryCLI {
             throw UsageError(message: "Missing the message: give it as an argument, or - to read standard input.")
         }
         let fallback: CherryCLIFallback? = command.fallbackTool.map { fallbackTool in
-            var input = arguments.filter { ["process_id", "process_name", "line_limit"].contains($0.key) }
+            var input = arguments.filter { ["process_id", "process_name", "line_limit", "project_root", "device"].contains($0.key) }
             input["text"] = arguments["message"]
             input["submit"] = .bool(true)
             return CherryCLIFallback(tool: fallbackTool, arguments: input)
@@ -469,6 +476,11 @@ public enum CherryCLI {
     static func processSelector(_ word: String) -> [String: JSONValue] {
         UUID(uuidString: word) != nil ? ["process_id": .string(word.uppercased())] : ["process_name": .string(word)]
     }
+
+    /// The parameters every call takes for the project it works in (the
+    /// tool layer scopes a call to its `project_root`, a path on `device`
+    /// when given), which a command in a project takes as flags.
+    static let projectParameters = ["project_root": "string", "device": "string"]
 
     /// The words a switch takes as its value.
     static let booleanWords: Set<String> = ["true", "false", "yes", "no", "1", "0"]
@@ -637,6 +649,10 @@ public enum CherryCLI {
         }
         lines.append("")
         lines.append("ID is a tab's ID or name; without one, a command acts on your own tab.")
+        if list.contains(where: \.inProject) {
+            lines.append("A command on tabs or a project works in your project; --project-root ROOT in another open one")
+            lines.append("(cherry project ls lists them; --device NAME: a path on another Mac). A tab's ID works from any project.")
+        }
         lines.append("Other --options are the tool's own parameters (cherry tool NAME takes its JSON).")
         lines.append("Output is JSON unless standard output is a terminal (--json forces it).")
         lines.append("cherry skill show prints the guide.")

@@ -10,9 +10,9 @@ import Testing
 // (a sidebar nests only its own window's tabs) and the caller owns its task.
 
 /// A control server for two open projects, "cloud" (the active window,
-/// where the orchestrator runs) and "auth".
+/// where the orchestrator runs) and "auth" (`ControlToolCLITests` too).
 @MainActor
-private final class TwoProjects {
+final class TwoProjects {
     let defaultsName = "CherryTests.CrossProject.\(UUID().uuidString)"
     let defaults: UserDefaults
     let settings: AgentSettings

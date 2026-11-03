@@ -23,8 +23,8 @@ runs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.cargo/bin:$PATH"
         fi
-        rustup toolchain install 1.94.0 --profile minimal --component rustfmt --component clippy
-        rustup default 1.94.0
+        rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+        rustup default 1.99.0
         # Scripts/build-host builds universal (arm64 and x86_64) helpers on
         # macOS: Cherry installs them on the user's other Macs of either kind.
         if [ "$(uname -s)" = Darwin ]; then
@@ -62,7 +62,7 @@ runs:
 
     - name: Restore Ghostty VT library
       id: vt
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: ${{ steps.pins.outputs.vt_paths }}
         key: ghostty-vt-${{ runner.os }}-${{ runner.arch }}-${{ steps.pins.outputs.script }}-${{ steps.pins.outputs.targets_key }}
@@ -70,7 +70,7 @@ runs:
     - name: Restore Zig download
       id: zig
       if: steps.vt.outputs.cache-hit != 'true'
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
         path: Host/vendor/ghostty-vt/.cache/zig-*-${{ steps.pins.outputs.zig }}.tar.xz
         key: zig-${{ runner.os }}-${{ runner.arch }}-${{ steps.pins.outputs.zig }}
@@ -88,14 +88,14 @@ runs:
     # rebuild the library.
     - name: Save Zig download
       if: steps.vt.outputs.cache-hit != 'true' && steps.zig.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       with:
         path: Host/vendor/ghostty-vt/.cache/zig-*-${{ steps.pins.outputs.zig }}.tar.xz
         key: ${{ steps.zig.outputs.cache-primary-key }}
 
     - name: Save Ghostty VT library
       if: steps.vt.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       with:
         path: ${{ steps.pins.outputs.vt_paths }}
         key: ${{ steps.vt.outputs.cache-primary-key }}

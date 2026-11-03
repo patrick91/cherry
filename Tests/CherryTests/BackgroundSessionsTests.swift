@@ -13,38 +13,6 @@ import Testing
 
 // MARK: - Helpers
 
-private func temporaryDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    let resolved = try #require(url.path.withCString { realpath($0, nil) })
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-}
-
-/// A project window that never comes on screen.
-@MainActor
-private func testWindow() -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
-        styleMask: [.titled, .closable], backing: .buffered, defer: true
-    )
-    window.isReleasedWhenClosed = false
-    return window
-}
-
-/// Waits (polling the main loop) until `condition` holds; false after
-/// `timeout`.
-@MainActor
-private func eventually(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return condition()
-}
-
 /// A session this app (CherryTests) started for a tab. `createdAt` nil: the
 /// host did not say when, so no orphan scan adopts it. `foreground`: the job
 /// its shell runs in its foreground (a busy terminal).
@@ -59,7 +27,8 @@ private func ownSession(
     owner: String? = "CherryTests",
     clients: Int = 0,
     createdAt: Date? = nil,
-    foreground: String? = nil
+    foreground: String? = nil,
+    programStatus: [ProgramStatus] = []
 ) -> HostedSessionInfo {
     var tags = [PersistentSessionTag.tab: tab.uuidString, PersistentSessionTag.kind: kind]
     if let project { tags[PersistentSessionTag.project] = project }
@@ -69,7 +38,8 @@ private func ownSession(
         id: id, name: name, cwd: project ?? "/", pid: 300,
         foreground: foreground.map { HostedSessionForeground(pid: 99, name: $0) },
         clients: clients, owner: owner, tags: tags,
-        createdAt: createdAt.map { UInt64($0.timeIntervalSince1970 * 1_000) } ?? 0
+        createdAt: createdAt.map { UInt64($0.timeIntervalSince1970 * 1_000) } ?? 0,
+        programStatus: programStatus
     )
 }
 
@@ -102,11 +72,6 @@ private func session(of record: WorkspaceSessionRecord, root: String) -> HostedS
         record.hosted!.sessionID, tab: record.id, project: root, name: record.title,
         kind: record.kind.rawValue, command: record.commandName
     )
-}
-
-/// The key a repository's saved tabs are stored under.
-private func repositoryKey(_ root: URL) -> String {
-    URL(fileURLWithPath: root.path, isDirectory: true).standardizedFileURL.path
 }
 
 /// The same directory, however it is spelled (`/var` or `/private/var`).
@@ -152,6 +117,8 @@ private func makeModel(
     prefersPersistentLocalSessions: @escaping @MainActor () -> Bool = { true },
     closesTabsOnCleanExit: @escaping @MainActor () -> Bool = { true },
     postNotification: @escaping @MainActor (BackgroundSessionNotificationContent) -> Void = { _ in },
+    // The app's defaults: only a program that waits for the user.
+    notifiesProgramState: @escaping @MainActor (ProgramStatus.State) -> Bool = { $0 == .blocked },
     endedSessionGrace: TimeInterval = BackgroundSessionsModel.defaultEndedSessionGrace,
     now: @escaping @MainActor () -> Date = { Date() },
     isAppActive: @escaping @MainActor () -> Bool = { true },
@@ -164,32 +131,12 @@ private func makeModel(
         closesTabsOnCleanExit: closesTabsOnCleanExit,
         presentAlert: confirmations.presenter,
         postNotification: postNotification,
+        notifiesProgramState: notifiesProgramState,
         endedSessionGrace: endedSessionGrace,
         now: now,
         isAppActive: isAppActive,
         removeStaleResources: removeStaleResources
     )
-}
-
-/// Suspends restores until the test opens it.
-@MainActor
-private final class RestoreGate {
-    private var continuations: [CheckedContinuation<Void, Never>] = []
-    private var isOpen = false
-    private(set) var waiting = 0
-
-    func wait() async {
-        guard !isOpen else { return }
-        waiting += 1
-        await withCheckedContinuation { continuations.append($0) }
-    }
-
-    func open() {
-        isOpen = true
-        let waiting = continuations
-        continuations.removeAll()
-        waiting.forEach { $0.resume() }
-    }
 }
 
 /// A project window for `root` whose restore uses the harness's host
@@ -218,8 +165,8 @@ private func openProject(
         restoredTabLaunchQueue: RestoredTabLaunchQueue()
     )
     _ = registry.register(
-        window: window, projectRoot: root.path, workspace: repository.activeWorkspace, repository: repository,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        window: window, projectRoot: root.path, workspace: repository.workspace, repository: repository,
+        todoStore: nil, chromeState: chromeState
     )
     repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
     return repository
@@ -310,7 +257,7 @@ private func openProject(
     #expect(await harness.waitUntilAttached(creating))
     #expect(harness.hosting.owningTab(of: "s-creating") === creating)
 
-    // The session of a forgotten saved tab (its worktree was removed) that
+    // The session of a forgotten saved tab (a window close ended it) that
     // is about to be ended is left out too.
     harness.fake.killEndsSession = true
     let background2 = try #require(harness.hosting.sessionInfo("s-background"))
@@ -393,7 +340,6 @@ private func openProject(
     #expect(model.sessions.allSatisfy { $0.projectName == harness.project.lastPathComponent })
     let command = try #require(model.sessions.first { $0.kind == .command })
     #expect(command.title == "server")
-    #expect(command.commandName == "server")
     #expect(BackgroundSessionPresentation.statusText(of: command) == "running")
 
     // End Sessions: none goes to the background.
@@ -405,8 +351,8 @@ private func openProject(
 
 @Test @MainActor func sessionsAwaitingARestoreAreNotBackgroundButSetAsideOnesAre() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-background-restore")
-    let storeDirectory = try temporaryDirectory("cherry-background-restore-store")
+    let root = try canonicalTemporaryDirectory("cherry-background-restore")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-restore-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let editor = savedTab(title: "Editor", sessionID: "s-editor", root: root.path)
     let server = savedTab(kind: .command, title: "server", sessionID: "s-server", commandName: "server", root: root.path)
@@ -438,7 +384,7 @@ private func openProject(
 
     // A copy of the server started meanwhile runs: the restored server tab
     // is set aside, its session still running and its record saved.
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     let started = workspace.addCommandSession(
         command: ProjectCommandDefinition(name: "server", command: "serve"), projectRoot: root.path, select: false
     )
@@ -455,7 +401,6 @@ private func openProject(
     let info = try #require(harness.hosting.sessionInfo("s-server"))
     let shown = repository.showBackgroundSession(
         PersistentSessionLaunch(attachment: try #require(harness.hosting.attachment(for: info)), info: info),
-        worktreeRoot: root.path,
         hosting: harness.hosting
     )
     #expect(shown === started)
@@ -621,7 +566,7 @@ private func openProject(
 }
 
 @Test @MainActor func aCopyWithoutTheInstanceLockListsAndEndsNothing() async throws {
-    let directory = try temporaryDirectory("cherry-background-lock")
+    let directory = try canonicalTemporaryDirectory("cherry-background-lock")
     defer { try? FileManager.default.removeItem(at: directory) }
     let lockURL = directory.appendingPathComponent("instance.lock")
     let holder = AppInstanceLock(fileURL: lockURL, applicationSupportName: "CherryTests")
@@ -762,7 +707,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
 
     // Known to be working: the dot.
     var working = listed[0]
-    working.isWorking = true
+    working.programState = .working
     sources.backgroundSessions = [OmniBarGathering.background(working, on: .thisMac)]
     #expect(OmniProviders.backgroundSessions(sources).first?.status == .working)
 
@@ -816,43 +761,299 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     #expect(row.agentKey == nil)
 }
 
-@Test @MainActor func aBackgroundAgentIsWorkingOnlyWhileItsTitlesSpinnerMoves() async throws {
+@Test @MainActor func aBackgroundSessionIsWorkingWhileItsProgramReportsWorking() async throws {
     let harness = try PersistentHarness()
-    let clock = Recorder(Date(timeIntervalSince1970: 1_000))
-    let model = makeModel(harness, now: { clock.value })
+    let model = makeModel(harness)
     defer {
         model.stop()
         harness.cleanUp()
     }
     let project = harness.project.path
-    func agent(title: String) -> HostedSessionInfo {
+    func agent(_ status: [ProgramStatus]) -> HostedSessionInfo {
         HostedSessionInfo(
-            id: "s-agent", name: "✳ Results feedback", cwd: project, pid: 300, title: title, owner: "CherryTests",
+            id: "s-agent", name: "✳ Results feedback", cwd: project, pid: 300, title: "⠙ Results feedback",
+            owner: "CherryTests",
             tags: [
                 PersistentSessionTag.tab: UUID().uuidString, PersistentSessionTag.kind: "agent",
                 PersistentSessionTag.agent: "Claude", PersistentSessionTag.project: project,
-            ]
+            ],
+            programStatus: status
         )
     }
-    func list(title: String, after seconds: TimeInterval) async throws -> BackgroundSession? {
-        harness.fake.sessions = [agent(title: title)]
+    func list(_ status: [ProgramStatus]) async throws -> BackgroundSession? {
+        harness.fake.sessions = [agent(status)]
         _ = try await harness.control.list()
-        clock.value = clock.value.addingTimeInterval(seconds)
         model.refresh()
         return model.sessions.first
     }
-    // Running, with a spinner frame seen once: not known to work.
-    let first = try #require(try await list(title: "⠋ Results feedback", after: 0))
-    #expect(first.displayTitle == "Results feedback")
-    #expect(first.title == "Claude")
-    #expect(!first.isWorking)
-    // The spinner moves: working, and the Omni bar shows the dot.
-    let moving = try #require(try await list(title: "⠙ Results feedback", after: 1))
-    #expect(moving.isWorking)
-    #expect(OmniBarGathering.background(moving, on: .thisMac).isWorking)
-    // The frame it left behind goes stale; a settled title is idle.
-    #expect(try await list(title: "⠙ Results feedback", after: AgentTitleHeartbeat.freshness)?.isWorking == false)
-    #expect(try await list(title: "✳ Results feedback", after: 0.5)?.isWorking == false)
+    // A spinner in its title is no evidence: it reports nothing.
+    let silent = try #require(try await list([]))
+    #expect(silent.displayTitle == "Results feedback")
+    #expect(silent.title == "Claude")
+    #expect(!silent.isWorking)
+    // It reports working: the Omni bar shows the dot.
+    let working = try #require(try await list([ProgramStatus(state: .working, app: "claude-code")]))
+    #expect(working.isWorking)
+    #expect(OmniBarGathering.background(working, on: .thisMac).isWorking)
+    // Only its own (root) record counts; done is not working.
+    #expect(try await list([ProgramStatus(id: "build", state: .working)])?.isWorking == false)
+    #expect(try await list([ProgramStatus(state: .done, app: "claude-code")])?.isWorking == false)
+}
+
+/// A background session's row follows what the host reports of it: made
+/// again when its info changes (a refresh of the same list keeps the rows
+/// it made, `BackgroundSessionRows`).
+@Test @MainActor func aBackgroundSessionsRowFollowsWhatTheHostReports() async throws {
+    let harness = try PersistentHarness()
+    let model = makeModel(harness)
+    defer {
+        model.stop()
+        harness.cleanUp()
+    }
+    let project = harness.project.path
+    let tab = UUID()
+    func shell(title: String? = nil, foreground: String? = nil) -> HostedSessionInfo {
+        HostedSessionInfo(
+            id: "s-shell", name: "Shell 6", cwd: project, pid: 300, title: title,
+            foreground: foreground.map { HostedSessionForeground(pid: 99, name: $0) },
+            owner: "CherryTests",
+            tags: [
+                PersistentSessionTag.tab: tab.uuidString, PersistentSessionTag.kind: "terminal",
+                PersistentSessionTag.project: project,
+            ]
+        )
+    }
+    func list(_ info: HostedSessionInfo) async throws -> BackgroundSession? {
+        harness.fake.sessions = [info]
+        _ = try await harness.control.list()
+        model.refresh()
+        return model.sessions.first
+    }
+    let idle = try #require(try await list(shell()))
+    #expect(idle.displayTitle == harness.project.lastPathComponent)
+    #expect(BackgroundSessionPresentation.statusText(of: idle) == "idle")
+    model.refresh()
+    #expect(model.sessions == [idle])
+
+    // Its shell runs a command, then it ends.
+    let busy = try #require(try await list(shell(title: "npm run dev", foreground: "node")))
+    #expect(busy.displayTitle == "npm run dev")
+    #expect(BackgroundSessionPresentation.statusText(of: busy) == "node")
+    let ended = try #require(try await list(shell(title: "npm run dev").exited(code: 2, signal: nil)))
+    #expect(ended.exitStatus == 2)
+    #expect(BackgroundSessionPresentation.statusText(of: ended) == "exit 2")
+}
+
+/// What a background session's program reports (OSC 7501) as the host
+/// changes it: a turn that finished or failed marks it unread; one that
+/// waits for the user is posted too, quoting the program, once per wait;
+/// what it reported before it was looked at is not news.
+@Test @MainActor func aBackgroundProgramThatFinishesIsUnreadAndOneThatWaitsForTheUserIsPosted() async throws {
+    let harness = try PersistentHarness()
+    let store = WorkspaceStateStore(directory: try canonicalTemporaryDirectory("cherry-background-program-status"))
+    harness.hosting.endedSessionsStore = store
+    let clock = Recorder(Date())
+    let posted = Recorder<[BackgroundSessionNotificationContent]>([])
+    let model = makeModel(harness, postNotification: { posted.value.append($0) }, now: { clock.value })
+    model.start()
+    defer {
+        model.stop()
+        harness.cleanUp()
+        try? FileManager.default.removeItem(at: store.directory)
+    }
+    let project = harness.project.path
+    func agent(_ id: String, _ status: ProgramStatus...) -> HostedSessionInfo {
+        ownSession(id, project: project, name: "Fix the parser", kind: "agent", agent: "Claude", programStatus: status)
+    }
+    // Found finished, and found waiting: neither is news.
+    harness.fake.sessions = [
+        agent("s-work", ProgramStatus(state: .working, app: "claude-code")),
+        agent("s-found", ProgramStatus(state: .done, app: "claude-code")),
+        agent("s-asks", ProgramStatus(state: .blocked, kind: .question, app: "pi")),
+    ]
+    _ = try await harness.control.list()
+    model.refresh()
+    #expect(model.sessions.count == 3)
+    #expect(model.unreadSessionIDs.isEmpty)
+    #expect(posted.value.isEmpty)
+    let found = try #require(model.sessions.first { $0.id == "s-found" })
+    #expect(BackgroundSessionPresentation.statusText(of: found) == "done")
+    #expect(BackgroundSessionPresentation.tone(of: found) == .finished)
+    #expect(BackgroundSessionPresentation.statusText(of: try #require(model.sessions.first { $0.id == "s-asks" })) == "needs you")
+
+    func change(_ info: HostedSessionInfo) {
+        harness.fake.connections.last(where: { !$0.isClosed })?.push(.event(.changed(info)))
+    }
+    // It blocks on a permission: posted with its own message.
+    change(agent("s-work", ProgramStatus(state: .blocked, kind: .permission, app: "claude-code", message: "approve Bash: ls")))
+    #expect(await harness.fake.wait { posted.value.count == 1 })
+    let asked = try #require(posted.value.first)
+    #expect(asked.sessionID == "s-work")
+    #expect(asked.title == "Claude")
+    #expect(asked.body == "approve Bash: ls")
+    #expect(asked.subtitle == "\(BackgroundSessionPresentation.projectName(projectRoot: project)) · in the background")
+    #expect(model.unreadSessionIDs == ["s-work"])
+    #expect(store.unreadSessions(hostID: "host-a") == ["s-work"])
+    #expect(await harness.fake.wait { model.sessions.first { $0.id == "s-work" }?.programState == .blocked })
+    let blocked = try #require(model.sessions.first { $0.id == "s-work" })
+    #expect(BackgroundSessionPresentation.statusText(of: blocked) == "needs permission")
+    #expect(BackgroundSessionPresentation.tone(of: blocked) == .attention)
+    // The same wait with another message is not posted again.
+    change(agent("s-work", ProgramStatus(state: .blocked, kind: .permission, app: "claude-code", message: "approve Bash: ls -la")))
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(posted.value.count == 1)
+
+    // It works on and finishes: unread, never posted.
+    clock.value = clock.value.addingTimeInterval(BackgroundSessionsModel.notificationInterval + 1)
+    change(agent("s-work", ProgramStatus(state: .working, app: "claude-code")))
+    change(agent("s-work", ProgramStatus(state: .done, app: "claude-code")))
+    #expect(await harness.fake.wait { model.sessions.first { $0.id == "s-work" }?.programState == .done })
+    #expect(posted.value.count == 1)
+    // A turn that starts and fails between two looks at the list.
+    change(agent("s-found", ProgramStatus(state: .working, app: "claude-code")))
+    change(agent("s-found", ProgramStatus(state: .error, app: "claude-code", message: "API error")))
+    #expect(await harness.fake.wait { model.unreadSessionIDs == ["s-work", "s-found"] })
+    #expect(posted.value.count == 1)
+    #expect(await harness.fake.wait { model.sessions.first { $0.id == "s-found" }?.programState == .error })
+    #expect(BackgroundSessionPresentation.tone(of: try #require(model.sessions.first { $0.id == "s-found" })) == .failed)
+
+    // Another wait of a session already waiting on something else is
+    // posted; within its interval it is not.
+    change(agent("s-asks", ProgramStatus(state: .blocked, kind: .auth, app: "pi")))
+    #expect(await harness.fake.wait { posted.value.count == 2 })
+    #expect(posted.value.last?.body == "Waiting for you to sign in.")
+    change(agent("s-asks", ProgramStatus(state: .working, app: "pi")))
+    change(agent("s-asks", ProgramStatus(state: .blocked, kind: .question, app: "pi")))
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(posted.value.count == 2)
+    #expect(model.unreadSessionIDs.contains("s-asks"))
+}
+
+/// Settings › Notifications: a finished or failed background program is posted
+/// too when asked for; a waiting one is not when that is off. Either way
+/// the session is marked.
+@Test @MainActor func backgroundProgramStatusNotificationsFollowTheSettings() async throws {
+    let harness = try PersistentHarness()
+    let notifies = Recorder<Set<ProgramStatus.State>>([.done, .error])
+    let posted = Recorder<[BackgroundSessionNotificationContent]>([])
+    let model = makeModel(
+        harness,
+        postNotification: { posted.value.append($0) },
+        notifiesProgramState: { notifies.value.contains($0) }
+    )
+    model.start()
+    defer {
+        model.stop()
+        harness.cleanUp()
+    }
+    let project = harness.project.path
+    func agent(_ id: String, _ status: ProgramStatus...) -> HostedSessionInfo {
+        ownSession(id, project: project, name: id, kind: "agent", agent: "Claude", programStatus: status)
+    }
+    harness.fake.sessions = [
+        agent("s-done", ProgramStatus(state: .working)),
+        agent("s-fails", ProgramStatus(state: .working)),
+        agent("s-asks", ProgramStatus(state: .working)),
+    ]
+    _ = try await harness.control.list()
+    model.refresh()
+    #expect(model.sessions.count == 3)
+    func change(_ info: HostedSessionInfo) {
+        harness.fake.connections.last(where: { !$0.isClosed })?.push(.event(.changed(info)))
+    }
+    change(agent("s-done", ProgramStatus(state: .done, message: "Wrote 3 files")))
+    change(agent("s-fails", ProgramStatus(state: .error)))
+    #expect(await harness.fake.wait { posted.value.count == 2 })
+    #expect(posted.value.map(\.body) == ["Wrote 3 files", "Failed."])
+    change(agent("s-asks", ProgramStatus(state: .blocked, kind: .permission)))
+    #expect(await harness.fake.wait { model.unreadSessionIDs == ["s-done", "s-fails", "s-asks"] })
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(posted.value.count == 2)
+}
+
+/// The menu bar icon counts background sessions too: one waiting for the
+/// user asks for attention, one at work shows work, a failure only until
+/// it is seen; done, idle, silent or ended ones add nothing.
+@Test func theMenuBarIconCountsWhatBackgroundProgramsReport() {
+    func session(_ state: ProgramStatus.State?, kind: ProgramStatus.Kind? = nil, exited: Bool = false) -> BackgroundSession {
+        var info = ownSession("s", project: "/p", kind: "agent", agent: "Claude")
+        if exited { info = info.exited(code: 0, signal: nil) }
+        var row = BackgroundSessionPresentation.session(info, hostID: "host-a")
+        row.programState = state
+        row.programKind = kind
+        return row
+    }
+    func activity(_ row: BackgroundSession, unread: Bool = false) -> AgentActivityState? {
+        MenuBarAggregateState.backgroundActivity(of: row, isUnread: unread)
+    }
+    #expect(activity(session(.blocked, kind: .permission)) == .permission)
+    #expect(activity(session(.blocked, kind: .question)) == .needsInput)
+    #expect(activity(session(.working)) == .working)
+    #expect(activity(session(.error), unread: true) == .error)
+    #expect(activity(session(.error)) == nil)
+    #expect(activity(session(.done), unread: true) == nil)
+    #expect(activity(session(.idle)) == nil)
+    #expect(activity(session(nil)) == nil)
+    #expect(activity(session(.blocked, exited: true)) == nil)
+
+    #expect(MenuBarAggregateState(items: [], background: []) == .none)
+    #expect(MenuBarAggregateState(items: [], background: [.working]) == .working)
+    let idleTab = MenuBarAgentItem(id: UUID(), projectRoot: "/p", title: "Claude", agentKey: "claude", activity: .idle)
+    #expect(MenuBarAggregateState(items: [idleTab], background: []) == .idle)
+    #expect(MenuBarAggregateState(items: [idleTab], background: [.needsInput]) == .attention)
+}
+
+/// The menu bar's agents (`MenuBarAgentsModel`): the running agent tabs of
+/// the project windows, looked at again on each of Background Sessions'
+/// ticks; a look that finds what the last one did publishes nothing.
+@Test @MainActor func theMenuBarListsRunningAgentTabsOnBackgroundSessionsTick() async throws {
+    let harness = try PersistentHarness()
+    let registry = ProjectWindowRegistry()
+    let background = makeModel(harness, registry: registry)
+    let workspace = harness.workspace()
+    let window = testWindow()
+    _ = registry.register(
+        window: window, projectRoot: harness.project.path, workspace: workspace,
+        todoStore: nil, chromeState: nil
+    )
+    defer {
+        background.stop()
+        registry.unregister(window: window, projectRoot: harness.project.path)
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let claude = workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Claude", command: "/bin/cat"), projectRoot: harness.project.path, select: false
+    )
+    #expect(await harness.waitUntilAttached(claude))
+    let model = MenuBarAgentsModel(registry: registry, background: background)
+    let group = try #require(model.groups.first)
+    #expect(model.groups.count == 1)
+    #expect(group.projectName == harness.project.lastPathComponent)
+    #expect(group.items.map(\.id) == [claude.id])
+    #expect(group.items.map(\.agentKey) == ["claude"])
+    #expect(model.aggregate == .idle)
+
+    // Nothing changed: nothing is published.
+    let published = Recorder(0)
+    let observation = model.objectWillChange.sink { published.value += 1 }
+    defer { observation.cancel() }
+    model.refresh()
+    model.refresh()
+    #expect(published.value == 0)
+
+    // Another agent is listed on Background Sessions' next tick, and gone
+    // on the one after its tab closed.
+    background.start()
+    let codex = workspace.addAgentSession(
+        agent: AgentToolDefinition(name: "Codex", command: "/bin/cat"), projectRoot: harness.project.path, select: false
+    )
+    #expect(await harness.waitUntilAttached(codex))
+    #expect(await eventually(timeout: 3) { model.groups.first?.items.map(\.id) == [claude.id, codex.id] })
+    #expect(model.groups.first?.items.map(\.agentKey) == ["claude", "codex"])
+    #expect(published.value > 0)
+    workspace.close(codex)
+    #expect(await eventually(timeout: 3) { model.groups.first?.items.map(\.id) == [claude.id] })
 }
 
 
@@ -888,7 +1089,6 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     let command = row(ownSession("c", project: project, name: "npm", kind: "command", command: "web"))
     #expect(command.title == "web")
     #expect(command.kind == .command)
-    #expect(command.commandName == "web")
     #expect(command.projectName == "cherry")
     #expect(BackgroundSessionPresentation.statusText(of: command) == "running")
     #expect(BackgroundSessionPresentation.tone(of: command) == .active)
@@ -978,7 +1178,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
         repository.closeAllSessions(intent: .windowClosed)
         harness.cleanUp()
     }
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     // The window's default shell.
     #expect(await harness.fake.wait { harness.creates().count == 1 })
     let agentTab = UUID()
@@ -994,7 +1194,6 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
         let info = try #require(list.sessions.first { $0.id == id })
         return repository.showBackgroundSession(
             PersistentSessionLaunch(attachment: try #require(harness.hosting.attachment(for: info)), info: info),
-            worktreeRoot: project,
             hosting: harness.hosting
         )
     }
@@ -1023,8 +1222,8 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
 
 @Test @MainActor func openingASessionOfAClosedWindowReopensItsProjectAndRevealsTheRestoredTab() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-background-open")
-    let storeDirectory = try temporaryDirectory("cherry-background-open-store")
+    let root = try canonicalTemporaryDirectory("cherry-background-open")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-open-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let editor = savedTab(title: "Editor", sessionID: "s-editor", root: root.path)
     let logs = savedTab(title: "Logs", sessionID: "s-logs", root: root.path)
@@ -1066,7 +1265,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     await model.open(item)?.value
     #expect(opened.map(resolved) == [resolved(root.path)])
     let repository = try #require(reopened)
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     // The window's own restore brought back its tabs; the one asked for is shown.
     #expect(workspace.sessions.map(\.id) == [editor.id, logs.id])
     #expect(workspace.selectedSessionID == logs.id)
@@ -1078,8 +1277,8 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
 
 @Test @MainActor func endingASessionOfAClosedWindowDropsItsTabWhenTheWindowReopens() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-background-end")
-    let storeDirectory = try temporaryDirectory("cherry-background-end-store")
+    let root = try canonicalTemporaryDirectory("cherry-background-end")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-end-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let editor = savedTab(title: "Editor", sessionID: "s-editor", root: root.path)
     let logs = savedTab(title: "Logs", sessionID: "s-logs", root: root.path)
@@ -1110,7 +1309,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     let repository = openProject(root, store: store, harness: harness, registry: registry, window: window)
     reopened = repository
     await repository.waitForPendingRestores()
-    #expect(repository.activeWorkspace.sessions.map(\.id) == [editor.id])
+    #expect(repository.workspace.sessions.map(\.id) == [editor.id])
     repository.flushPersistentState()
     #expect(store.load(repositoryRoot: repository.repositoryRoot)?.worktree(root: root.path)?.sessions.map(\.id) == [editor.id])
 }
@@ -1119,8 +1318,8 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     var configuration = PersistentHarness.fastConfiguration
     configuration.terminationTimeout = .milliseconds(200)
     let harness = try PersistentHarness(configuration: configuration)
-    let root = try temporaryDirectory("cherry-background-reopen-ending")
-    let storeDirectory = try temporaryDirectory("cherry-background-reopen-ending-store")
+    let root = try canonicalTemporaryDirectory("cherry-background-reopen-ending")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-reopen-ending-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let editor = savedTab(title: "Editor", sessionID: "s-editor", root: root.path)
     let logs = savedTab(title: "Logs", sessionID: "s-logs", root: root.path)
@@ -1152,7 +1351,7 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
     let repository = openProject(root, store: store, harness: harness, registry: registry, window: window)
     reopened = repository
     await repository.waitForPendingRestores()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(workspace.sessions.map(\.id) == [editor.id])
     #expect(harness.hosting.owningTab(of: "s-logs") == nil)
 
@@ -1187,10 +1386,10 @@ private func hostedAgent(_ id: String, name: String, title: String? = nil, proje
         harness.cleanUp()
     }
     #expect(registry.register(
-        window: window, projectRoot: project, workspace: repository.activeWorkspace, repository: repository,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        window: window, projectRoot: project, workspace: repository.workspace, repository: repository,
+        todoStore: nil, chromeState: nil
     ))
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(await harness.fake.wait { harness.creates().count == 1 })
     let tabs = workspace.sessions.map(\.id)
     harness.fake.sessions += [ownSession("s-kept", project: project, name: "Kept")]
@@ -1275,15 +1474,6 @@ private final class NoticeDefaults {
     }
 }
 
-/// A project window's chrome whose toasts never go by themselves and reach
-/// no VoiceOver.
-@MainActor
-private func quietChromeState() -> ProjectWindowChromeState {
-    ProjectWindowChromeState(toasts: ProjectWindowToasts(
-        schedule: { _, _ in }, announce: { _ in }, voiceOverEnabled: { false }
-    ))
-}
-
 /// Registers `window` with `registry` as the project window of `root`, with
 /// `chromeState` and a workspace that runs nothing, which the caller keeps
 /// (the registry holds it weakly).
@@ -1297,7 +1487,7 @@ private func registerWindow(
     let workspace = TerminalWorkspace(projectRoot: root, createInitialSession: false)
     #expect(registry.register(
         window: window, projectRoot: root, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        todoStore: nil, chromeState: chromeState
     ))
     return workspace
 }
@@ -1336,8 +1526,8 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
 
 @Test @MainActor func theLaunchNoticeWaitsForRestoresAndShowsItsToastOnce() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-background-notice")
-    let storeDirectory = try temporaryDirectory("cherry-background-notice-store")
+    let root = try canonicalTemporaryDirectory("cherry-background-notice")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-notice-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let noticeDefaults = try NoticeDefaults()
     let editor = savedTab(title: "Editor", sessionID: "s-editor", root: root.path)
@@ -1369,7 +1559,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
         try? FileManager.default.removeItem(at: storeDirectory)
     }
     // The launch asked for the window, which has not opened yet.
-    notice.launchWindowsOpened(expecting: [root.path])
+    notice.launchWindowsOpened(expecting: [.primary(root.path)])
     #expect(notice.phase == .checking)
     try await Task.sleep(for: .milliseconds(100))
     repository = openProject(
@@ -1416,7 +1606,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     // this launch or the next.
     chromeState.toasts.dismiss(id: toast.id)
     #expect(notice.toldIDs() == ["s-closed"])
-    notice.launchWindowsOpened(expecting: [root.path])
+    notice.launchWindowsOpened(expecting: [.primary(root.path)])
     #expect(notice.shownContent == content)
     let nextLaunch = makeNotice(model: model, registry: registry, defaults: noticeDefaults.defaults)
     nextLaunch.launchWindowsOpened()
@@ -1576,9 +1766,9 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
 
 @Test @MainActor func theLaunchNoticesReopenBringsEachSessionBackInItsOwnProjectWindow() async throws {
     let harness = try PersistentHarness()
-    let rootA = try temporaryDirectory("cherry-background-notice-a")
-    let rootB = try temporaryDirectory("cherry-background-notice-b")
-    let storeDirectory = try temporaryDirectory("cherry-background-notice-reopen-store")
+    let rootA = try canonicalTemporaryDirectory("cherry-background-notice-a")
+    let rootB = try canonicalTemporaryDirectory("cherry-background-notice-b")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-notice-reopen-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let noticeDefaults = try NoticeDefaults()
     let registry = ProjectWindowRegistry()
@@ -1626,7 +1816,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
         try? FileManager.default.removeItem(at: storeDirectory)
     }
     _ = try await harness.control.list()
-    notice.launchWindowsOpened(expecting: [rootA.path])
+    notice.launchWindowsOpened(expecting: [.primary(rootA.path)])
     #expect(await eventually { notice.shownContent != nil })
     #expect(Set(try #require(notice.shownContent).sessionIDs) == ["s-server", "s-agent"])
     let toast = try #require(chromeState.toasts.current)
@@ -1644,11 +1834,11 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     let server = try #require(harness.hosting.owningTab(of: "s-server"))
     #expect(server.id == serverTab)
     #expect(server.kind == .command)
-    #expect(repositoryA.activeWorkspace.sessions.contains { $0 === server })
+    #expect(repositoryA.workspace.sessions.contains { $0 === server })
     let agent = try #require(harness.hosting.owningTab(of: "s-agent"))
     #expect(agent.id == agentTab)
     #expect(agent.kind == .agent)
-    #expect(try #require(repositoryB).activeWorkspace.sessions.contains { $0 === agent })
+    #expect(try #require(repositoryB).workspace.sessions.contains { $0 === agent })
     model.refresh()
     #expect(model.sessions.isEmpty)
     #expect(harness.fake.requests("kill").isEmpty)
@@ -1668,7 +1858,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     let chromeState = quietChromeState()
     #expect(registry.register(
         window: window, projectRoot: harness.project.path, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        todoStore: nil, chromeState: chromeState
     ))
     defer {
         model.stop()
@@ -1732,7 +1922,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     let pendingAnswer = Recorder<(@MainActor (SessionTeardownAnswer, LocalSessionsOnQuit?) -> Void)?>(nil)
     ProjectWindowCloseDelegate.sessionsKeptInBackground = { notice.noteTold($0) }
     ProjectWindowCloseDelegate.askAboutSessions = { _, _, answer in pendingAnswer.value = answer }
-    let elsewhere = try temporaryDirectory("cherry-background-notice-window")
+    let elsewhere = try canonicalTemporaryDirectory("cherry-background-notice-window")
     let noticeWindow = testWindow()
     let chromeState = quietChromeState()
     let windowWorkspace = registerWindow(noticeWindow, root: elsewhere.path, chromeState: chromeState, in: registry)
@@ -1823,7 +2013,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     #expect(await eventually { unreached.phase == .notNeeded })
     #expect(harness.fake.launches.isEmpty)
 
-    // Off in Settings › Sessions.
+    // Off in Settings › Notifications.
     _ = try await harness.control.list()
     let lists = harness.fake.requests("list").count
     let off = makeNotice(model: model, registry: registry, defaults: noticeDefaults.defaults, isEnabled: { false })
@@ -1832,7 +2022,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     #expect(harness.fake.requests("list").count == lists)
 
     // Another copy holds the instance lock.
-    let directory = try temporaryDirectory("cherry-background-notice-lock")
+    let directory = try canonicalTemporaryDirectory("cherry-background-notice-lock")
     defer { try? FileManager.default.removeItem(at: directory) }
     let lockURL = directory.appendingPathComponent("instance.lock")
     let holder = AppInstanceLock(fileURL: lockURL, applicationSupportName: "CherryTests")
@@ -1928,7 +2118,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
 @Test @MainActor func aBackgroundSessionsBellsAndNotificationsArePostedNamingItAndMarkedUnread() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()
-    let store = WorkspaceStateStore(directory: try temporaryDirectory("cherry-background-unread"))
+    let store = WorkspaceStateStore(directory: try canonicalTemporaryDirectory("cherry-background-unread"))
     harness.hosting.endedSessionsStore = store
     let clock = Recorder(Date())
     let posted = Recorder<[BackgroundSessionNotificationContent]>([])
@@ -2036,8 +2226,8 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
 
 @Test @MainActor func clickingABackgroundSessionsNotificationOpensItAsOpenDoes() async throws {
     let harness = try PersistentHarness()
-    let root = try temporaryDirectory("cherry-background-click")
-    let storeDirectory = try temporaryDirectory("cherry-background-click-store")
+    let root = try canonicalTemporaryDirectory("cherry-background-click")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-background-click-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     harness.fake.pendingHolders = 0
     let registry = ProjectWindowRegistry()
@@ -2067,14 +2257,14 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     let tab = try #require(harness.hosting.owningTab(of: "s-agent"))
     #expect(tab.id == agentTab)
     #expect(tab.kind == .agent)
-    #expect(repository.activeWorkspace.selectedSessionID == agentTab)
+    #expect(repository.workspace.selectedSessionID == agentTab)
 }
 
 // MARK: - Removing ended sessions
 
 @Test @MainActor func endedBackgroundSessionsNoSavedTabNamesAreRemovedAfterTheGracePeriod() async throws {
     let harness = try PersistentHarness()
-    let directory = try temporaryDirectory("cherry-background-gc")
+    let directory = try canonicalTemporaryDirectory("cherry-background-gc")
     let store = WorkspaceStateStore(directory: directory)
     harness.hosting.endedSessionsStore = store
     let clock = Recorder(Date())
@@ -2241,7 +2431,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
         defaults.removePersistentDomain(forName: suite)
     }
     let project = try #require(settings.addProject(path: harness.project.path))
-    let other = try temporaryDirectory("cherry-other-project")
+    let other = try canonicalTemporaryDirectory("cherry-other-project")
     defer { try? FileManager.default.removeItem(at: other) }
     harness.fake.sessions = [
         ownSession("s-mine", project: project.root, name: "Server"),
@@ -2259,20 +2449,23 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     // Cancel: nothing changes.
     ProjectRemoval.remove(project, settings: settings, background: model, present: present)
     let alert = try #require(asked.value.first)
-    #expect(alert.messageText == "End the 2 background sessions of “\(project.name)”?")
-    #expect(alert.buttons.map(\.title) == ["End Sessions", "Keep Running", "Cancel"])
+    #expect(alert.messageText == "Remove “\(project.name)”? It has 2 background sessions.")
+    #expect(alert.informativeText == "1 of them is still running. Removing the project does not stop them; "
+        + "Keep Them Running leaves them in Background Sessions.")
+    #expect(alert.buttons.map(\.title) == ["End Sessions and Remove", "Keep Them Running", "Cancel"])
+    #expect(alert.buttons.map(\.hasDestructiveAction) == [true, false, false])
     answers.value[0](.alertThirdButtonReturn)
     #expect(settings.projects.contains { $0.root == project.root })
     #expect(harness.fake.requests("kill").isEmpty)
 
-    // Keep Running: removed, the sessions stay.
+    // Keep Them Running: removed, the sessions stay.
     ProjectRemoval.remove(project, settings: settings, background: model, present: present)
     answers.value[1](.alertSecondButtonReturn)
     #expect(!settings.projects.contains { $0.root == project.root })
     try await Task.sleep(for: .milliseconds(100))
     #expect(harness.fake.requests("kill").isEmpty)
 
-    // End Sessions: its sessions end, never another project's.
+    // End Sessions and Remove: its sessions end, never another project's.
     _ = settings.addProject(path: project.root)
     ProjectRemoval.remove(project, settings: settings, background: model, present: present)
     answers.value[2](.alertFirstButtonReturn)
@@ -2280,13 +2473,62 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     #expect(await harness.fake.wait { Set(harness.requestIDs("remove")) == ["s-mine", "s-ended"] })
     #expect(harness.requestIDs("kill") == ["s-mine"])
 
-    // A project with no background session is removed without asking.
+    // A project with no background session asks too: Cancel keeps it,
+    // Remove removes it and ends nothing.
     let quiet = try #require(settings.addProject(path: other.path))
     harness.fake.sessions.removeAll { $0.id == "s-other" }
     _ = try await harness.control.list()
     ProjectRemoval.remove(quiet, settings: settings, background: model, present: present)
-    #expect(asked.value.count == 3)
+    #expect(asked.value.count == 4)
+    let plain = try #require(asked.value.last)
+    #expect(plain.messageText == "Remove “\(quiet.name)” from Cherry?")
+    #expect(plain.informativeText == "Its commands, features and color saved on this Mac are deleted. "
+        + "The folder and its cherry.toml stay.")
+    #expect(plain.buttons.map(\.title) == ["Remove", "Cancel"])
+    #expect(plain.buttons.map(\.hasDestructiveAction) == [true, false])
+    answers.value[3](.alertSecondButtonReturn)
+    #expect(settings.projects.contains { $0.root == quiet.root })
+    #expect(!settings.removedProjectRoots.contains(quiet.root))
+
+    ProjectRemoval.remove(quiet, settings: settings, background: model, present: present)
+    answers.value[4](.alertFirstButtonReturn)
     #expect(!settings.projects.contains { $0.root == quiet.root })
+    #expect(settings.removedProjectRoots.contains(quiet.root))
+    try await Task.sleep(for: .milliseconds(100))
+    #expect(harness.requestIDs("kill") == ["s-mine"])
+}
+
+@Test @MainActor func theRemoveProjectQuestionSaysHowItsBackgroundSessionsStand() {
+    func texts(running: Int, ended: Int) -> [String] {
+        let alert = ProjectRemoval.makeAlert(projectName: "cherry", running: running, ended: ended)
+        return [alert.messageText, alert.informativeText]
+    }
+    let keepIt = "Keep Them Running leaves it in Background Sessions."
+    let keepThem = "Keep Them Running leaves them in Background Sessions."
+    #expect(texts(running: 0, ended: 0) == [
+        "Remove “cherry” from Cherry?",
+        "Its commands, features and color saved on this Mac are deleted. The folder and its cherry.toml stay."
+    ])
+    #expect(texts(running: 1, ended: 0) == [
+        "Remove “cherry”? Its background session is still running.",
+        "Removing the project does not stop it; " + keepIt
+    ])
+    #expect(texts(running: 2, ended: 0) == [
+        "Remove “cherry”? Its 2 background sessions are still running.",
+        "Removing the project does not stop them; " + keepThem
+    ])
+    #expect(texts(running: 0, ended: 1) == ["Remove “cherry”? It has a background session.", "Its program already ended. " + keepIt])
+    #expect(texts(running: 0, ended: 3) == [
+        "Remove “cherry”? It has 3 background sessions.",
+        "Their programs already ended. " + keepThem
+    ])
+    #expect(texts(running: 2, ended: 1) == [
+        "Remove “cherry”? It has 3 background sessions.",
+        "2 of them are still running. Removing the project does not stop them; " + keepThem
+    ])
+    let withSessions = ProjectRemoval.makeAlert(projectName: "cherry", running: 1, ended: 0)
+    #expect(withSessions.buttons.map(\.title) == ["End Sessions and Remove", "Keep Them Running", "Cancel"])
+    #expect(ProjectRemoval.makeAlert(projectName: "cherry", running: 0, ended: 0).buttons.map(\.title) == ["Remove", "Cancel"])
 }
 
 @Test func aBackgroundSessionWhoseHolderDiedSaysTheHostCrashed() {
@@ -2364,7 +2606,7 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
 
 @Test @MainActor func unreadMarksOfAnEarlierRunComeBackInTheList() async throws {
     let harness = try PersistentHarness()
-    let directory = try temporaryDirectory("cherry-background-unread-launch")
+    let directory = try canonicalTemporaryDirectory("cherry-background-unread-launch")
     let store = WorkspaceStateStore(directory: directory)
     harness.hosting.endedSessionsStore = store
     let model = makeModel(harness)

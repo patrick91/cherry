@@ -4,7 +4,7 @@ import Testing
 @testable import Cherry
 
 // The Omni bar's folders on another Mac, against a fake remote Mac
-// (Scripts/fake-remote-mac): the listing and scanning scripts run with
+// (Scripts/fake-remote-mac): the listing, New folder and scanning scripts run with
 // `sh -s` through the ssh shim, as `RemoteProjectAccess` runs git, with the
 // fake Mac's private HOME. Gated like the other real-host suites
 // (CHERRY_TEST_HOST_INTEGRATION=1, Scripts/build-host debug). No daemon runs
@@ -13,7 +13,7 @@ import Testing
 private let foldersRealHostEnabled = ProcessInfo.processInfo.environment["CHERRY_TEST_HOST_INTEGRATION"] == "1"
 
 @Test(.enabled(if: foldersRealHostEnabled))
-@MainActor func RemoteDeviceRealHostOmniFoldersListAndScanTheDevicesFoldersOverSSH() async throws {
+@MainActor func RemoteDeviceRealHostOmniFoldersListMakeAndScanTheDevicesFoldersOverSSH() async throws {
     let mac = try FakeRemoteMac(name: "folders", host: "none", startsDaemon: false)
     do {
         let home = mac.home
@@ -41,10 +41,22 @@ private let foldersRealHostEnabled = ProcessInfo.processInfo.environment["CHERRY
             "github/pat/cherry", "github/pat/it's $(touch pwned)", "code/app",
         ].map { home.appendingPathComponent($0).path }))
 
+        // New folder: made there, only it, and nothing in its name runs.
+        let made = home.appendingPathComponent("github/pat/new $(touch pwned-new)")
+        #expect(await OmniRemoteFolders.create(made.path, on: mac.name, shell: shell) == .created)
+        var isDirectory: ObjCBool = false
+        #expect(FileManager.default.fileExists(atPath: made.path, isDirectory: &isDirectory) && isDirectory.boolValue)
+        #expect(!FileManager.default.fileExists(atPath: home.appendingPathComponent("github/pat/pwned-new").path))
+        let orphan = home.appendingPathComponent("github/none/new")
+        #expect(await OmniRemoteFolders.create(orphan.path, on: mac.name, shell: shell) == .failed("No such file or directory"))
+
         // The Mac does not answer: a failure, never an empty folder.
         mac.set("offline", true)
         if case .failed = await OmniRemoteFolders.list("~/github/pat/", on: mac.name, shell: shell) {} else {
             Issue.record("an offline Mac's folder listed")
+        }
+        if case .failed = await OmniRemoteFolders.create(home.appendingPathComponent("github/pat/later").path, on: mac.name, shell: shell) {} else {
+            Issue.record("a folder was made on an offline Mac")
         }
         #expect(await OmniRemoteFolders.scan(on: mac.name, shell: shell) == nil)
         mac.set("offline", false)

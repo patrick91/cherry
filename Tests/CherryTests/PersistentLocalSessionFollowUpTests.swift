@@ -259,6 +259,36 @@ private func agentSession(_ id: String, tab: UUID, project: String) -> HostedSes
     #expect(tab.hostSessionEnd == nil)
 }
 
+@Test @MainActor func aTabWhoseAdapterHearsOfTheEndFirstStillSaysTheHostCrashed() async throws {
+    let harness = try PersistentHarness()
+    let workspace = harness.workspace()
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let keep = workspace.addSession(title: "Keep")
+    let tab = workspace.addSession(title: "Shell")
+    #expect(await harness.waitUntilAttached(keep))
+    #expect(await harness.waitUntilAttached(tab))
+    let sessionID = try #require(tab.persistentSession?.sessionID)
+    #expect(await harness.fake.wait { harness.attachCalls.contains { $0.contains("attach \(sessionID) ") } })
+    let call = try #require(harness.attachCalls.last { $0.contains("attach \(sessionID) ") })
+
+    // The adapter reports the end before the host's event comes (another
+    // connection): only the host says its holder died, so the tab waits.
+    try HostedSessionFakeCLI.writeStatus(
+        #"{"outcome":"exited","exit_code":1,"signal":null,"message":null}"#, to: try harness.statusFile(of: call)
+    )
+    tab.ingestNativeChildExit(exitCode: 0)
+    #expect(tab.isRunning)
+    harness.loseHolder(of: sessionID)
+    #expect(await harness.fake.wait { !tab.isRunning })
+    #expect(tab.hostSessionEnd?.isHolderLost == true)
+    #expect(tab.state == .exited(1))
+    // It launched no adapter while it waited.
+    #expect(harness.attachCalls.filter { $0.contains("attach \(sessionID) ") }.count == 1)
+}
+
 @Test @MainActor func aCommandWhoseHolderDiedIsNotRestartedByItself() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()
@@ -322,7 +352,7 @@ private func agentSession(_ id: String, tab: UUID, project: String) -> HostedSes
 
 // MARK: - A restored agent's turn
 
-@Test @MainActor func aRestoredAgentThatShowsItIsAtWorkIsInAnActiveTurn() async throws {
+@Test @MainActor func aRestoredAgentThatReportsItIsAtWorkIsInAnActiveTurn() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()
     defer {
@@ -341,11 +371,23 @@ private func agentSession(_ id: String, tab: UUID, project: String) -> HostedSes
     #expect(!adopted.startedCurrentProgram)
     #expect(adopted.agentTurnState == .notStarted)
 
-    // Its spinner says a turn submitted before the tab followed it runs:
-    // its end is a finished turn.
+    // A spinner in its title says nothing.
     adopted.ingestNativeTitle("⠋ Fix the failing test | \(projectName)")
-    #expect(adopted.agentActivityState == .working)
+    #expect(adopted.agentActivityState == .unknown)
+    // Its host's records say a turn submitted before the tab followed it
+    // runs: its end is a finished turn, a result the user has not seen.
+    harness.push(.changed(HostedSessionInfo(
+        id: info.id, name: info.name, cwd: info.cwd, pid: info.pid, owner: info.owner, tags: info.tags,
+        programStatus: [ProgramStatus(state: .working, app: "claude-code")]
+    )))
+    #expect(await harness.fake.wait { adopted.agentActivityState == .working })
     #expect(adopted.agentTurnState == .active)
+    harness.push(.changed(HostedSessionInfo(
+        id: info.id, name: info.name, cwd: info.cwd, pid: info.pid, owner: info.owner, tags: info.tags,
+        programStatus: [ProgramStatus(state: .done, app: "claude-code")]
+    )))
+    #expect(await harness.fake.wait { adopted.agentTurnState == .completed })
+    #expect(adopted.hasUnseenAgentResult)
 
     // An agent the tab started waits for a submitted turn, as before.
     let started = workspace.addAgentSession(

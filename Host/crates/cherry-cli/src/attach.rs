@@ -53,12 +53,12 @@
 //! that, it is not read while reconnecting and continues once reattached.
 use crate::{
     guard::MediaGuard,
-    input::{DetachInput, DetachKey, Leftover, DEVICE_ATTRIBUTES, PASTE_END, PASTE_START},
+    input::{DetachInput, DetachKey, Leftover, PasteMarkers, DEVICE_ATTRIBUTES, PASTE_END},
     is_unresolvable, message_kind,
     passthrough::Passthrough,
     settle::{self, Settled, SizeFile},
     status::{Live, StatusFile},
-    sys::{self, interrupted, poll, pollfd, read_some, set_nonblocking},
+    sys::{self, interrupted, poll, pollfd, read_some, NonBlocking},
     timing::timing,
     tracker::Tracker,
     transport::{is_lost, lost, Transport, READ_BYTES, RPC_TIMEOUT, SSH_TAIL_WAIT},
@@ -101,9 +101,6 @@ pub const RESIZE_COALESCE: Duration = Duration::from_millis(50);
 /// new size without a viewport in between (whose modes() would, for example,
 /// make the terminal report focus again).
 pub const GRID_WAIT: Duration = Duration::from_millis(300);
-/// Upper bound on one poll, which also bounds how late a signal that arrives
-/// just before poll() is noticed.
-const MAX_WAIT: Duration = Duration::from_millis(250);
 /// While buffered frames are handled, terminal input is looked for at most
 /// this often, and at the latest once they are (the next poll). One look
 /// per frame would cost more than writing the frame: a poll on a macOS
@@ -347,10 +344,7 @@ fn request_attach(
             refreshes,
         }),
         ServerMessage::Error { code, message } => Err(Refused { code, message }.into()),
-        message => {
-            unexpected("attached session", message)?;
-            unreachable!()
-        }
+        message => Err(unexpected("attached session", message)),
     }
 }
 
@@ -821,13 +815,14 @@ impl Attachment<'_> {
                     },
                     libc::POLLIN,
                 ),
+                // A signal ends the wait, so it lasts until the next deadline.
+                pollfd(sys::signal_wake_fd(), libc::POLLIN),
             ];
             let wait = if (read_stdin && self.stdin_is_file) || frame_wait == FrameWait::Now {
                 Duration::ZERO
             } else {
                 let detach = connection.detach.as_ref();
-                let mut deadline = now + MAX_WAIT;
-                for candidate in [
+                [
                     detach
                         .is_none()
                         .then(|| self.input.next_deadline())
@@ -852,12 +847,15 @@ impl Attachment<'_> {
                 ]
                 .into_iter()
                 .flatten()
-                {
-                    deadline = deadline.min(candidate);
-                }
-                deadline.saturating_duration_since(now)
+                .min()
+                .map_or(Duration::MAX, |deadline| {
+                    deadline.saturating_duration_since(now)
+                })
             };
             poll(&mut fds, wait)?;
+            if fds[4].revents != 0 {
+                sys::clear_signal_wake();
+            }
             self.interrupted(transport, connection)?;
             if fds[3].revents != 0 {
                 self.output.clear_wake();
@@ -1193,7 +1191,7 @@ impl Attachment<'_> {
             }
             if now < next_attempt {
                 if let Waited::Detached =
-                    self.wait(next_attempt.min(deadline), None, &mut noticed)?
+                    self.wait(Some(next_attempt.min(deadline)), None, &mut noticed)?
                 {
                     return Ok(Reconnected::Ended(detached_while_reconnecting()));
                 }
@@ -1263,7 +1261,7 @@ impl Attachment<'_> {
                 }
             });
             let waited = loop {
-                match self.wait(Instant::now() + MAX_WAIT, Some(done.as_raw_fd()), noticed) {
+                match self.wait(None, Some(done.as_raw_fd()), noticed) {
                     Ok(Waited::Pending) => {}
                     waited => break waited,
                 }
@@ -1282,21 +1280,30 @@ impl Attachment<'_> {
         })
     }
 
-    /// Wait until `until` at most (and `MAX_WAIT`) for the terminal, or for
-    /// `wake` to be readable or closed, while reconnecting. Terminal input
-    /// is read only to see the detach key and the end of input.
-    fn wait(&mut self, until: Instant, wake: Option<RawFd>, noticed: &mut bool) -> Result<Waited> {
+    /// Wait until `until` at most for the terminal, for `wake` to be
+    /// readable or closed, or for a signal, while reconnecting. Terminal
+    /// input is read only to see the detach key and the end of input.
+    fn wait(
+        &mut self,
+        until: Option<Instant>,
+        wake: Option<RawFd>,
+        noticed: &mut bool,
+    ) -> Result<Waited> {
         let now = Instant::now();
         let read = self.stdin_open && self.stdin_is_terminal;
         let mut fds = [
             pollfd(if read { libc::STDIN_FILENO } else { -1 }, libc::POLLIN),
             pollfd(wake.unwrap_or(-1), libc::POLLIN),
+            pollfd(sys::signal_wake_fd(), libc::POLLIN),
         ];
-        let mut wake_at = until.min(now + MAX_WAIT);
-        if let Some(at) = self.input.next_deadline() {
-            wake_at = wake_at.min(at);
+        let wake_at = until.into_iter().chain(self.input.next_deadline()).min();
+        poll(
+            &mut fds,
+            wake_at.map_or(Duration::MAX, |at| at.saturating_duration_since(now)),
+        )?;
+        if fds[2].revents != 0 {
+            sys::clear_signal_wake();
         }
-        poll(&mut fds, wake_at.saturating_duration_since(now))?;
         interrupted()?;
         let expired = self.input.expire(Instant::now());
         self.discard(&expired.data, noticed);
@@ -1435,10 +1442,7 @@ fn may_return(transport: &mut Transport, id: &str, idle: Duration) -> Result<boo
             pending_holders,
             ..
         } => Ok(pending_holders > 0 || sessions.iter().any(|session| session.id == id)),
-        message => {
-            unexpected("session list", message)?;
-            unreachable!()
-        }
+        message => Err(unexpected("session list", message)),
     }
 }
 
@@ -1625,44 +1629,6 @@ impl Overflow {
             INPUT_OVERFLOW.saturating_sub(self.waiting.len())
         } else {
             0
-        }
-    }
-}
-
-/// Whether the input queued so far leaves a bracketed paste open: its start
-/// marker was queued, and its end marker not yet.
-#[derive(Default)]
-struct PasteMarkers {
-    open: bool,
-    /// How much of the marker awaited has matched.
-    matched: usize,
-}
-
-impl PasteMarkers {
-    /// Feed `data` while a paste is open: how much of it the paste takes,
-    /// its end marker included, once the paste ends in it.
-    fn until_closed(&mut self, data: &[u8]) -> Option<usize> {
-        for (index, byte) in data.iter().enumerate() {
-            if !self.open {
-                return Some(index);
-            }
-            self.feed(std::slice::from_ref(byte));
-        }
-        (!self.open).then_some(data.len())
-    }
-
-    fn feed(&mut self, data: &[u8]) {
-        for &byte in data {
-            let marker = if self.open { PASTE_END } else { PASTE_START };
-            self.matched = if byte == marker[self.matched] {
-                self.matched + 1
-            } else {
-                usize::from(byte == 0x1b)
-            };
-            if self.matched == marker.len() {
-                self.open = !self.open;
-                self.matched = 0;
-            }
         }
     }
 }
@@ -1939,22 +1905,32 @@ impl Renderer {
         self.refresh_asked = false;
     }
 
-    /// Back in direct mode after `snapshot` of the copy was written: follow
-    /// the modes from it instead of the copy, when the host can send a copy
-    /// again.
-    fn lighten(&mut self, snapshot: &[u8]) -> Result<()> {
+    /// Back in direct mode with `snapshot` written to the window: follow the
+    /// modes from it with a tracker instead of a copy, when the host can send
+    /// a copy again. Returns whether it does.
+    fn lighten(&mut self, snapshot: &[u8]) -> Result<bool> {
         if !self.refreshes || self.keep_copy || !self.direct() {
-            return Ok(());
+            return Ok(false);
         }
         let mut tracker = Tracker::new()?;
         tracker.feed(snapshot);
         if tracker.origin() {
             self.keep_copy = true;
-            return Ok(());
+            return Ok(false);
         }
         self.tracker = Some(tracker);
         self.terminal = None;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Back on the stream from the copy: returns a full snapshot of it,
+    /// which resets the window.
+    fn back_to_stream(&mut self) -> Result<Vec<u8>> {
+        let snapshot = self.terminal().snapshot()?;
+        self.images_from_host();
+        self.window_images = memchr::memmem::find(&snapshot, b"\x1b_G").is_some();
+        self.lighten(&snapshot)?;
+        Ok(snapshot)
     }
 
     /// The copy is inside the session's synchronized update.
@@ -2009,17 +1985,10 @@ impl Renderer {
         let written = |window_images: bool| {
             (window_images && !full) || memchr::memmem::find(snapshot, b"\x1b_G").is_some()
         };
-        if self.refreshes && self.direct() && !self.keep_copy {
-            let mut tracker = Tracker::new()?;
-            tracker.feed(snapshot);
-            if !tracker.origin() {
-                self.tracker = Some(tracker);
-                self.terminal = None;
-                self.sent_modes = None;
-                self.window_images = written(self.window_images);
-                return Ok(snapshot.to_vec());
-            }
-            self.keep_copy = true;
+        if self.lighten(snapshot)? {
+            self.sent_modes = None;
+            self.window_images = written(self.window_images);
+            return Ok(snapshot.to_vec());
         }
         let mut terminal =
             cherry_vt::Terminal::new(canonical.0, canonical.1, RENDER_SCROLLBACK_BYTES)?;
@@ -2180,11 +2149,7 @@ impl Renderer {
             self.dirty = false;
             self.held_since = None;
             if self.sent_modes.take().is_some() {
-                let snapshot = self.terminal().snapshot()?;
-                self.images_from_host();
-                self.window_images = memchr::memmem::find(&snapshot, b"\x1b_G").is_some();
-                self.lighten(&snapshot)?;
-                return Ok(snapshot);
+                return self.back_to_stream();
             }
         } else if self.terminal.is_none() {
             // A viewport is painted from a copy, which the host sends.
@@ -2219,11 +2184,7 @@ impl Renderer {
         if self.direct() {
             // Back to the direct stream: a full snapshot resets the window.
             self.sent_modes = None;
-            let snapshot = self.terminal().snapshot()?;
-            self.images_from_host();
-            self.window_images = memchr::memmem::find(&snapshot, b"\x1b_G").is_some();
-            self.lighten(&snapshot)?;
-            Ok(snapshot)
+            self.back_to_stream()
         } else {
             if self.sent_modes.is_none() {
                 // Leaving direct mode: the window shows the copy's screen.
@@ -2776,8 +2737,9 @@ fn frame_wait(held: bool, output: &TerminalOutput) -> FrameWait {
 }
 
 pub struct TerminalOutput {
-    fd: RawFd,
-    original_flags: i32,
+    /// Non-blocking while attached. Fields drop after `drop` wrote the
+    /// reset, in order: this one restores the flags before `writer` goes.
+    output: NonBlocking,
     restore_screen: bool,
     /// Writes the output, in order, while this thread goes on (see
     /// `Writer`); the descriptor is written here only once it finished.
@@ -2799,16 +2761,11 @@ pub struct TerminalOutput {
 
 impl TerminalOutput {
     pub fn new(fd: RawFd, input: Option<RawFd>) -> Result<Self> {
-        let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if original_flags < 0 {
-            return Err(io::Error::last_os_error()).context("could not read terminal output flags");
-        }
-        set_nonblocking(fd)?;
+        let output = NonBlocking::set(fd, "terminal output")?;
         let restore_screen = unsafe { libc::isatty(fd) } == 1;
         let writer = Writer::start(fd).context("could not start writing terminal output")?;
         Ok(Self {
-            fd,
-            original_flags,
+            output,
             restore_screen,
             writer,
             blocked: Cell::new(false),
@@ -2998,8 +2955,13 @@ impl Drop for TerminalOutput {
             if drain.is_some() {
                 self.reset.extend_from_slice(DEVICE_ATTRIBUTES);
             }
-            let written =
-                sys::write_all(self.fd, &self.reset, Duration::from_millis(100), false).is_ok();
+            let written = sys::write_all(
+                self.output.fd(),
+                &self.reset,
+                Duration::from_millis(100),
+                false,
+            )
+            .is_ok();
             if let Some(input) = drain.filter(|_| written) {
                 leftover.await_answer();
                 read_reports(input, &mut leftover, timing().report_wait);
@@ -3007,9 +2969,6 @@ impl Drop for TerminalOutput {
         }
         if let Some(input) = self.input {
             give_back(input, &leftover.finish());
-        }
-        unsafe {
-            libc::fcntl(self.fd, libc::F_SETFL, self.original_flags);
         }
     }
 }

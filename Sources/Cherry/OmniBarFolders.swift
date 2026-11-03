@@ -40,8 +40,14 @@ struct OmniPathQuery: Equatable {
         directory == "/" ? "/" : String(directory.dropLast())
     }
 
-    /// Hidden folders are listed only for a segment that starts with ".".
-    var showsHidden: Bool { segment.hasPrefix(".") }
+    /// The folder a New folder row would make in `directory`: the segment
+    /// without spaces around it; nil when that names no folder ("", ".",
+    /// "..").
+    var newFolderName: String? {
+        let name = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("\0") else { return nil }
+        return name
+    }
 
     /// The absolute path a typed path names on a Mac whose home is `home`
     /// (nil: `~` cannot be expanded), with repeated `/` and `.` removed and
@@ -93,7 +99,7 @@ struct OmniPathQuery: Equatable {
 /// A folder in a listing.
 struct OmniFolderEntry: Equatable, Hashable, Sendable {
     var name: String
-    /// It has a `.git` (a repository or a worktree).
+    /// It has a `.git` (a repository, or a git worktree's file).
     var isRepository: Bool
 }
 
@@ -104,8 +110,6 @@ struct OmniFolderContents: Equatable, Sendable {
     /// It is itself a git repository.
     var isRepository: Bool
     var entries: [OmniFolderEntry]
-    /// More folders than `OmniFolderListingLimits.entries` were there.
-    var truncated = false
 }
 
 enum OmniFolderListingLimits {
@@ -125,6 +129,20 @@ enum OmniFolderListing: Equatable, Sendable {
     /// Its Mac is not connected: nothing is asked there until it is.
     case notConnected
     case failed(String)
+}
+
+/// What making a new folder came to (`OmniLocalFolders.create`,
+/// `OmniRemoteFolders.create`).
+enum OmniFolderCreation: Equatable, Sendable {
+    /// A folder is there now: made, or one already was.
+    case created
+    /// Why it could not be made.
+    case failed(String)
+
+    /// Something that is not a folder has its name.
+    static func notAFolder(_ path: String) -> OmniFolderCreation {
+        .failed("“\((path as NSString).lastPathComponent)” is already there, and is not a folder.")
+    }
 }
 
 /// A folder listing asked of a Mac: by the folder as typed ("~/github/").
@@ -156,7 +174,8 @@ extension ProjectSwitcherModel.Machine {
 
 // MARK: - Rows
 
-/// The rows of folder completion, and the Add Project and Open Folder rows.
+/// The rows of folder completion (with New folder “…” for a name no folder
+/// has), and the Add Project and Open Folder rows.
 enum OmniFolderRows {
     /// The Mac a path query lists in `scope`: This Mac at the root and in
     /// Projects, the Mac in a Mac's scope; nil elsewhere.
@@ -332,6 +351,22 @@ enum OmniFolderRows {
                 completion: typed + "/"
             ), matched: matched))
         }
+        // A name no folder there has: New folder “…”, which makes it, then
+        // adds and opens it (Add Project…) or opens it once (Open Folder…).
+        if let name = path.newFolderName,
+           !contents.entries.contains(where: { $0.name.compare(name, options: .caseInsensitive) == .orderedSame }) {
+            let absolute = base + "/" + name
+            rows.append(OmniRow(item: OmniItem(
+                id: "folder-new:\(machine.idComponent):\(absolute)",
+                kind: .folder,
+                title: "New folder “\(path.directory + name)”",
+                symbol: "folder.badge.plus",
+                primaryLabel: "Create & Open",
+                primary: .createFolder(path: absolute, on: machine, intent: intent),
+                machine: machine,
+                recordsUse: false
+            )))
+        }
         return rows
     }
 
@@ -371,7 +406,6 @@ enum OmniUnaddedRows {
     /// The repositories on `machine` (every Mac when nil) that are not
     /// projects, removed or hidden, by name.
     static func repositories(_ sources: OmniSources, on machine: ProjectSwitcherModel.Machine? = nil) -> [OmniUnaddedRepository] {
-        let known = Set(sources.projects.machines.map(\.machine))
         var seen = Set<OmniUnaddedRepository>()
         return sources.unaddedRepositories
             .filter { repository in
@@ -379,9 +413,7 @@ enum OmniUnaddedRows {
                 // A device this Cherry no longer knows (or one whose
                 // projects cannot be opened now) lists none.
                 if case .device = repository.machine {
-                    guard known.contains(repository.machine),
-                          sources.projects.machine(repository.machine)?.allowsOpening == true
-                    else { return false }
+                    guard sources.projects.machine(repository.machine)?.allowsOpening == true else { return false }
                 }
                 if OmniFolderRows.project(at: repository.path, on: repository.machine, in: sources) != nil { return false }
                 if sources.removedProjects[repository.machine]?.contains(repository.path) == true { return false }

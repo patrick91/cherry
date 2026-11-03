@@ -32,8 +32,7 @@ struct BackgroundSession: Equatable, Identifiable, Sendable {
     let kind: TerminalSession.SessionKind
     /// The agent (`cherry.agent`), for its logo.
     let agentKey: String?
-    let commandName: String?
-    /// The worktree its tab ran in (`cherry.project`).
+    /// The project folder its tab ran in (`cherry.project`).
     let projectRoot: String?
     let projectName: String
     /// What a busy terminal runs in its foreground.
@@ -50,10 +49,15 @@ struct BackgroundSession: Equatable, Identifiable, Sendable {
     let createdAt: Date?
     /// The device it runs on (its name); nil for This Mac.
     var machine: String? = nil
-    /// Its agent is known to be at work: its title's spinner is live
-    /// (`AgentTitleHeartbeat`, set by `BackgroundSessionsModel.refresh`).
-    /// Unlike `isAtWork`, never for an agent that merely runs.
-    var isWorking = false
+    /// What its program says about itself: its root program status
+    /// record's state and kind (OSC 7501, from the host's list), nil while
+    /// it reports nothing. Not its message, which changes as it works.
+    var programState: ProgramStatus.State?
+    var programKind: ProgramStatus.Kind?
+
+    /// Its program says it is at work: its program status reports
+    /// `working`. Unlike `isAtWork`, never for an agent that merely runs.
+    var isWorking: Bool { programState == .working }
 
     var isRunning: Bool { exitStatus == nil }
 
@@ -68,14 +72,20 @@ struct BackgroundSession: Equatable, Identifiable, Sendable {
 
 /// How a background session is named and described; pure, for tests.
 enum BackgroundSessionPresentation {
-    /// The status dot: a program at work, an idle one, or none once ended.
+    /// The status dot: a program waiting for the user, one that finished
+    /// or failed (its program said so), one at work, an idle one, or none
+    /// once ended.
     enum Tone: Equatable {
+        case attention
+        case finished
+        case failed
         case active
         case idle
         case ended
     }
 
-    static func session(_ info: HostedSessionInfo, hostID: String) -> BackgroundSession {
+    /// `machine`: the device it runs on (its name); nil for This Mac.
+    static func session(_ info: HostedSessionInfo, hostID: String, machine: String? = nil) -> BackgroundSession {
         let kind = info.tags[PersistentSessionTag.kind].flatMap(TerminalSession.SessionKind.init(rawValue:)) ?? .terminal
         let projectRoot = OrphanedSessionCriteria.projectRoot(of: info)
         return BackgroundSession(
@@ -85,7 +95,6 @@ enum BackgroundSessionPresentation {
             displayTitle: SessionDisplayTitle.background(info, kind: kind, home: nil),
             kind: kind,
             agentKey: kind == .agent ? info.tags[PersistentSessionTag.agent]?.nilIfEmpty : nil,
-            commandName: kind == .command ? info.tags[PersistentSessionTag.command]?.nilIfEmpty : nil,
             projectRoot: projectRoot,
             projectName: projectName(projectRoot: projectRoot),
             foregroundName: info.isBusy ? info.foreground?.name.nilIfEmpty : nil,
@@ -93,7 +102,10 @@ enum BackgroundSessionPresentation {
             exitStatus: info.isRunning ? nil : PersistentLocalSessions.exitStatus(of: info),
             hostCrashed: !info.isRunning && info.end?.isHolderLost == true,
             clients: info.clients,
-            createdAt: info.createdDate
+            createdAt: info.createdDate,
+            machine: machine,
+            programState: info.programStatus.root?.state,
+            programKind: info.programStatus.root?.kind
         )
     }
 
@@ -128,11 +140,19 @@ enum BackgroundSessionPresentation {
         projectRoot.map(MenuBarAgentPresentation.projectName(projectRoot:)) ?? "No project"
     }
 
-    /// "exit N" once ended, "attached" while a client shows it, what a busy
-    /// terminal runs, "running" for a command or agent, else "idle".
+    /// "exit N" once ended, what its program reports (OSC 7501), "attached"
+    /// while a client shows it, what a busy terminal runs, "running" for a
+    /// command or agent, else "idle".
     static func statusText(of session: BackgroundSession) -> String {
         if session.hostCrashed { return "host crashed" }
         if let status = session.exitStatus { return "exit \(status)" }
+        switch session.programState {
+        case .blocked?: return session.programKind == .permission ? "needs permission" : "needs you"
+        case .working?: return "working"
+        case .done?: return "done"
+        case .error?: return "failed"
+        case .idle?, .unknown?, nil: break
+        }
         if session.clients > 0 { return "attached" }
         switch session.kind {
         case .terminal:
@@ -143,7 +163,14 @@ enum BackgroundSessionPresentation {
     }
 
     static func tone(of session: BackgroundSession) -> Tone {
+        // A finished or failed program's record outlives it.
+        switch session.programState {
+        case .error?: return .failed
+        case .done?: return .finished
+        default: break
+        }
         guard session.isRunning else { return .ended }
+        if session.programState == .blocked { return .attention }
         return session.isAtWork ? .active : .idle
     }
 
@@ -161,26 +188,32 @@ enum BackgroundSessions {
     /// This app's sessions in `sessions` (of the local host `hostID`) that
     /// are in the background: `owner`'s, not shown by an open tab
     /// (`isShown`), not being ended (`isEnding`), and not named by a saved
-    /// tab an open window may still restore (`awaitingRestore`). Running
-    /// and ended ones, by project, running first, newest first.
+    /// tab an open window may still restore (`awaitingRestore`, read only
+    /// when a session is neither). Running and ended ones, by project,
+    /// running first, newest first. `machine`: the device they run on (its
+    /// name); nil for This Mac. `row` makes each one's row
+    /// (`BackgroundSessionPresentation.session` when nil).
     static func classify(
         _ sessions: [HostedSessionInfo],
         hostID: String,
         owner: String,
         isShown: (HostedSessionInfo) -> Bool,
         isEnding: (HostedSessionInfo) -> Bool,
-        awaitingRestore: [WorkspaceSessionRecord]
+        awaitingRestore: @autoclosure () -> [WorkspaceSessionRecord],
+        machine: String? = nil,
+        row: ((HostedSessionInfo) -> BackgroundSession)? = nil
     ) -> [BackgroundSession] {
-        sessions
+        lazy var awaiting = awaitingRestore()
+        return sessions
             .filter { info in
                 info.owner == owner
                     && !isShown(info)
                     && !isEnding(info)
-                    && !awaitingRestore.contains { record in
+                    && !awaiting.contains { record in
                         PersistentLocalSessions.record(record, names: info, hostID: hostID, owner: owner, includingAttached: true)
                     }
             }
-            .map { BackgroundSessionPresentation.session($0, hostID: hostID) }
+            .map { row?($0) ?? BackgroundSessionPresentation.session($0, hostID: hostID, machine: machine) }
             .sorted { lhs, rhs in
                 let byProject = lhs.projectName.localizedCaseInsensitiveCompare(rhs.projectName)
                 if byProject != .orderedSame { return byProject == .orderedAscending }
@@ -190,6 +223,28 @@ enum BackgroundSessions {
                 if lhsCreated != rhsCreated { return lhsCreated > rhsCreated }
                 return lhs.id < rhs.id
             }
+    }
+}
+
+/// The rows last made from the host's infos: a row
+/// (`BackgroundSessionPresentation.session`) follows from its info, host and
+/// machine alone, and naming a session anew was most of what a refresh of
+/// an unchanged list did, so one whose info is the same again keeps its row.
+struct BackgroundSessionRows {
+    private var made: [String: (info: HostedSessionInfo, hostID: String, machine: String?, row: BackgroundSession)] = [:]
+
+    mutating func row(for info: HostedSessionInfo, hostID: String, machine: String?) -> BackgroundSession {
+        if let made = made[info.id], made.hostID == hostID, made.machine == machine, made.info == info {
+            return made.row
+        }
+        let row = BackgroundSessionPresentation.session(info, hostID: hostID, machine: machine)
+        made[info.id] = (info, hostID, machine, row)
+        return row
+    }
+
+    /// Forgets the rows of sessions other than `ids`.
+    mutating func keep(_ ids: Set<String>) {
+        made = made.filter { ids.contains($0.key) }
     }
 }
 
@@ -256,6 +311,10 @@ final class BackgroundSessionsModel: ObservableObject {
 
     @Published private(set) var sessions: [BackgroundSession] = []
     let summary = BackgroundSessionsSummary()
+    /// Sent after each of the list's one-second refreshes (`start`): the
+    /// menu bar's agents (`MenuBarAgentsModel`) refresh on the same wakeup,
+    /// after this list, rather than on a timer of their own.
+    let ticks = PassthroughSubject<Void, Never>()
     let localSessions: PersistentLocalSessions
     /// The device these sessions are on (a section of This Mac's model);
     /// nil for This Mac's own model.
@@ -299,6 +358,12 @@ final class BackgroundSessionsModel: ObservableObject {
     /// were (`notificationLimit` per minute).
     private var lastNotification: [String: Date] = [:]
     private var recentNotifications: [Date] = []
+    /// The root program status record each listed session had when last
+    /// looked at (`noteProgramStatus`), nil for one that reported none: what
+    /// a change is measured against. Only sessions in the list have one.
+    private var lastProgramStatus: [String: ProgramStatus?] = [:]
+    /// The rows of the sessions listed (`BackgroundSessionRows`).
+    private var rows = BackgroundSessionRows()
     /// The host whose saved unread marks were read into `unreadSessionIDs`.
     private var unreadLoadedForHost: String?
     /// How long the list has shown each ended session while the app was
@@ -313,6 +378,9 @@ final class BackgroundSessionsModel: ObservableObject {
     /// was suspended) does not count.
     static let endedCountMaximumGap: TimeInterval = 5
     private let postNotification: @MainActor (BackgroundSessionNotificationContent) -> Void
+    /// Whether a program status change to this state posts a notification
+    /// (Settings › Notifications: `blocked`, and `done`/`error`).
+    private let notifiesProgramState: @MainActor (ProgramStatus.State) -> Bool
     /// Removes the staged Ghostty resources no session uses any more, given
     /// the copies running sessions name (`cherry.resources`;
     /// `GhosttyResourceStager.removeStaleCopies`): once per run, from the
@@ -344,6 +412,13 @@ final class BackgroundSessionsModel: ObservableObject {
         postNotification: @escaping @MainActor (BackgroundSessionNotificationContent) -> Void = {
             TerminalNotificationCenter.shared.postBackgroundSession($0)
         },
+        notifiesProgramState: @escaping @MainActor (ProgramStatus.State) -> Bool = { state in
+            switch state {
+            case .blocked: TerminalSettings.shared.notifyWhenBackgroundProgramNeedsInput
+            case .done, .error: TerminalSettings.shared.notifyWhenBackgroundProgramFinishes
+            case .idle, .working, .unknown: false
+            }
+        },
         endedSessionGrace: TimeInterval = BackgroundSessionsModel.defaultEndedSessionGrace,
         now: @escaping @MainActor () -> Date = { Date() },
         isAppActive: @escaping @MainActor () -> Bool = { NSApp?.isActive ?? false },
@@ -364,6 +439,7 @@ final class BackgroundSessionsModel: ObservableObject {
         self.closesTabsOnCleanExit = closesTabsOnCleanExit
         self.presentAlert = presentAlert
         self.postNotification = postNotification
+        self.notifiesProgramState = notifiesProgramState
         self.endedSessionGrace = endedSessionGrace
         self.now = now
     }
@@ -402,7 +478,10 @@ final class BackgroundSessionsModel: ObservableObject {
                 timer.invalidate()
                 return
             }
-            MainActor.assumeIsolated { self.refresh() }
+            MainActor.assumeIsolated {
+                self.refresh()
+                self.ticks.send()
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
@@ -423,7 +502,11 @@ final class BackgroundSessionsModel: ObservableObject {
                 switch event {
                 case .added, .removed, .exited, .resync:
                     self?.scheduleRefresh()
-                case .changed, .bell, .notification, .progress:
+                case .changed(let info):
+                    // Program status at once: the list's tick could miss
+                    // a turn that ends within it.
+                    self?.backgroundSessionDidChange(info)
+                case .bell, .notification, .progress:
                     break
                 }
             }
@@ -477,6 +560,7 @@ final class BackgroundSessionsModel: ObservableObject {
                 closesTabsOnCleanExit: closesTabsOnCleanExit,
                 presentAlert: presentAlert,
                 postNotification: postNotification,
+                notifiesProgramState: notifiesProgramState,
                 endedSessionGrace: endedSessionGrace,
                 now: now,
                 isAppActive: isAppActive,
@@ -522,6 +606,8 @@ final class BackgroundSessionsModel: ObservableObject {
         // Whether `listed` is what the host has now (unread marks of
         // sessions it no longer has go only then).
         var isLive = true
+        // Whether it is the control connection's (not a look's).
+        var isFromControl = false
         if isDevice, control.state != .connected {
             // A device is listed while its control is connected, or while
             // the panel is open from a look that started nothing there.
@@ -536,8 +622,12 @@ final class BackgroundSessionsModel: ObservableObject {
         } else {
             infos = control.sessions
             listed = knownHostID.map { backgroundSessions(in: infos, hostID: $0) } ?? []
+            isFromControl = knownHostID != nil
         }
-        listed = markingWorkingAgents(listed, from: infos)
+        rows.keep(Set(listed.map(\.id)))
+        if isFromControl, let hostID = knownHostID {
+            noteProgramStatus(of: listed, in: infos, hostID: hostID)
+        }
         listed = removeCleanlyEndedTerminals(listed)
         listed = removeExpiredEndedSessions(listed)
         removeStaleResourcesOnce()
@@ -557,21 +647,93 @@ final class BackgroundSessionsModel: ObservableObject {
         updateLease()
     }
 
-    /// Sets `isWorking` of the running agents of `listed` from their titles
-    /// in `infos` (`AgentTitleHeartbeat`).
-    private func markingWorkingAgents(_ listed: [BackgroundSession], from infos: [HostedSessionInfo]) -> [BackgroundSession] {
-        let titles = Dictionary(infos.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first })
-        let now = now()
-        agentHeartbeat.keep(only: Set(listed.map(\.id)))
-        return listed.map { session in
-            guard session.kind == .agent, session.isRunning else { return session }
-            var session = session
-            session.isWorking = agentHeartbeat.isWorking(id: session.id, title: titles[session.id] ?? nil, now: now)
-            return session
+    /// Notes the program status of every session of `listed` (the control
+    /// connection's list) and forgets the sessions no longer in it: one
+    /// that comes back to the background is looked at afresh.
+    private func noteProgramStatus(of listed: [BackgroundSession], in infos: [HostedSessionInfo], hostID: String) {
+        let ids = Set(listed.map(\.id))
+        lastProgramStatus = lastProgramStatus.filter { ids.contains($0.key) }
+        // Each listed session's info (the first `infos` has), found in one
+        // pass rather than a search of `infos` per session.
+        var listedInfos: [String: HostedSessionInfo] = [:]
+        for info in infos where ids.contains(info.id) && listedInfos[info.id] == nil {
+            listedInfos[info.id] = info
+        }
+        for item in listed {
+            guard let info = listedInfos[item.id] else { continue }
+            noteProgramStatus(info, item: item, hostID: hostID)
         }
     }
 
-    private var agentHeartbeat = AgentTitleHeartbeat()
+    /// The host changed a session (`HostSessionEvent.changed`): its program
+    /// status is noted at once when it is in the background, and its row
+    /// follows a new state.
+    private func backgroundSessionDidChange(_ info: HostedSessionInfo) {
+        guard let hostID = localSessions.control.hostID ?? knownHostID,
+              lastProgramStatus.keys.contains(info.id),
+              let item = backgroundSessions(in: [info], hostID: hostID).first
+        else { return }
+        noteProgramStatus(info, item: item, hostID: hostID)
+        let root = info.programStatus.root
+        if let row = sessions.first(where: { $0.id == info.id }),
+           row.programState != root?.state || row.programKind != root?.kind {
+            scheduleRefresh()
+        }
+    }
+
+    /// A background session's program status (OSC 7501, its root record)
+    /// against what it was when last looked at: a program that now waits
+    /// for the user (`blocked`, or blocked on something else), finished
+    /// (`done`) or failed (`error`) marks the session unread, as a bell
+    /// does, and is posted as the app's notification when Settings ›
+    /// Notifications asks for it (`notifiesProgramState`: by default only
+    /// `blocked`), at most every `notificationInterval` per session and
+    /// `notificationLimit` a minute. The first look at a session only notes
+    /// it: what its program reported before it went to the background, or
+    /// before this run, is not news.
+    private func noteProgramStatus(_ info: HostedSessionInfo, item: BackgroundSession, hostID: String) {
+        let root = info.programStatus.root
+        guard let previous = lastProgramStatus.updateValue(root, forKey: info.id),
+              let root, root.state != previous?.state || root.kind != previous?.kind
+        else { return }
+        switch root.state {
+        case .blocked, .done, .error:
+            markUnread(info.id, hostID: hostID)
+            guard notifiesProgramState(root.state) else { return }
+            postLimited(
+                BackgroundSessionNotificationContent(session: item, programStatus: root, machine: device?.name),
+                sessionID: info.id,
+                perSession: true
+            )
+        case .idle, .working, .unknown:
+            break
+        }
+    }
+
+    /// Marks the session unread, saved for its next tab
+    /// (`PersistentLocalSessions.noteUnread`); whether it was already.
+    @discardableResult
+    private func markUnread(_ sessionID: String, hostID: String) -> Bool {
+        let wasUnread = unreadSessionIDs.contains(sessionID)
+        localSessions.noteUnread(hostID: hostID, sessionID: sessionID)
+        unreadSessionIDs.insert(sessionID)
+        return wasUnread
+    }
+
+    /// Posts `content` unless `notificationLimit` were posted in the last
+    /// minute or, `perSession`, the session posted within
+    /// `notificationInterval`.
+    private func postLimited(_ content: BackgroundSessionNotificationContent, sessionID: String, perSession: Bool) {
+        let now = now()
+        if perSession, let last = lastNotification[sessionID], now.timeIntervalSince(last) < Self.notificationInterval {
+            return
+        }
+        recentNotifications.removeAll { now.timeIntervalSince($0) >= 60 }
+        guard recentNotifications.count < Self.notificationLimit else { return }
+        recentNotifications.append(now)
+        lastNotification[sessionID] = now
+        postNotification(content)
+    }
 
     /// The counts the app shows: This Mac's and every device's.
     private func updateSummary() {
@@ -671,25 +833,13 @@ final class BackgroundSessionsModel: ObservableObject {
               let item = backgroundSessions(in: [info], hostID: hostID).first
         else { return false }
         if case .progress = signal { return true }
-        let wasUnread = unreadSessionIDs.contains(info.id)
-        localSessions.noteUnread(hostID: hostID, sessionID: info.id)
-        unreadSessionIDs.insert(info.id)
-        let now = now()
-        switch signal {
-        case .bell:
-            guard !wasUnread else { return true }
-        case .notification:
-            if let last = lastNotification[info.id], now.timeIntervalSince(last) < Self.notificationInterval {
-                return true
-            }
-        case .progress:
-            return true
-        }
-        recentNotifications.removeAll { now.timeIntervalSince($0) >= 60 }
-        guard recentNotifications.count < Self.notificationLimit else { return true }
-        recentNotifications.append(now)
-        lastNotification[info.id] = now
-        postNotification(BackgroundSessionNotificationContent(session: item, signal: signal, machine: device?.name))
+        let wasUnread = markUnread(info.id, hostID: hostID)
+        if case .bell = signal, wasUnread { return true }
+        postLimited(
+            BackgroundSessionNotificationContent(session: item, signal: signal, machine: device?.name),
+            sessionID: info.id,
+            perSession: signal != .bell
+        )
         return true
     }
 
@@ -723,26 +873,23 @@ final class BackgroundSessionsModel: ObservableObject {
         guard localSessions.instanceUnavailableReason == nil,
               sessions.contains(where: { $0.owner == localSessions.owner })
         else { return [] }
-        let attachedTabs = attachedTabs
+        let showing = localSessions.openTabsShowing(hostID: hostID, attachedTabs: attachedTabs)
         let endsRequested = endsRequested
         let machine = device?.name
         return BackgroundSessions.classify(
             sessions,
             hostID: hostID,
             owner: localSessions.owner,
-            isShown: { localSessions.isShownByOpenTab($0, hostID: hostID, attachedTabs: attachedTabs) },
+            isShown: showing.shows,
             isEnding: { info in
                 endsRequested.contains(info.id)
                     || localSessions.isEnding(info.id)
                     || localSessions.isScheduledToEnd(info, hostID: hostID)
             },
-            awaitingRestore: registry.sessionRecordsAwaitingRestore()
+            awaitingRestore: registry.sessionRecordsAwaitingRestore(),
+            machine: machine,
+            row: { self.rows.row(for: $0, hostID: hostID, machine: machine) }
         )
-        .map { session in
-            var session = session
-            session.machine = machine
-            return session
-        }
     }
 
     /// How the Persistent Sessions sheet marks a session of This Mac: this
@@ -1039,11 +1186,11 @@ final class BackgroundSessionsModel: ObservableObject {
     }
 }
 
-/// Settings › Projects › Remove Project: a project removed from the library
-/// whose sessions run in the background (no open tab shows them) offers to
-/// end them first, since no window of it opens again by itself to show
-/// them. "Keep Running" removes the project and leaves them in Background
-/// Sessions.
+/// Remove… of a project (Settings › Projects, a project's page) always
+/// asks first. One whose sessions run in the background (no
+/// open tab shows them) offers to end them too, since no window of it
+/// opens again by itself to show them: Keep Them Running removes the
+/// project and leaves them in Background Sessions.
 @MainActor
 enum ProjectRemoval {
     /// Shows the question and reports which button answered it.
@@ -1053,9 +1200,9 @@ enum ProjectRemoval {
     ) -> Void
 
     /// The background sessions of the project at `root`: those whose
-    /// project (`cherry.project`, a worktree) belongs to it rather than to
+    /// project (`cherry.project`, a folder) belongs to it rather than to
     /// another of `projectRoots` (the registered projects, `root` among
-    /// them): a worktree the settings know goes to its repository
+    /// them): a folder the settings know goes to its project
     /// (`repositoryRoot`, asked before the project is removed), else the
     /// longest registered root that contains it wins, so a project nested
     /// inside another keeps its own sessions.
@@ -1072,7 +1219,7 @@ enum ProjectRemoval {
         }
     }
 
-    /// The registered project a worktree belongs to.
+    /// The registered project a tab's folder belongs to.
     static func owningProject(
         of projectRoot: String,
         among registered: Set<String>,
@@ -1084,9 +1231,9 @@ enum ProjectRemoval {
             .max { $0.count < $1.count }
     }
 
-    /// Removes `project` from `settings`, first asking whether to end its
-    /// background sessions when it has any: End Sessions ends them, Keep
-    /// Running keeps them, Cancel removes nothing.
+    /// Asks, then removes `project` from `settings`. With no background
+    /// session Remove removes it; with some, End Sessions and Remove ends
+    /// them too and Keep Them Running keeps them. Cancel removes nothing.
     static func remove(
         _ project: CherryProject,
         settings: AgentSettings,
@@ -1097,10 +1244,6 @@ enum ProjectRemoval {
         let listed = backgroundSessions(
             ofProject: project.root, in: background.sessions, projectRoots: settings.projects.map(\.root)
         ) { settings.repositoryRoot(for: $0) }
-        guard !listed.isEmpty else {
-            settings.removeProject(project)
-            return
-        }
         let ids = listed.map(\.id)
         let alert = makeAlert(
             projectName: project.name,
@@ -1112,7 +1255,7 @@ enum ProjectRemoval {
             case .alertFirstButtonReturn:
                 settings.removeProject(project)
                 background.endAll(ids)
-            case .alertSecondButtonReturn:
+            case .alertSecondButtonReturn where !ids.isEmpty:
                 settings.removeProject(project)
             default:
                 break
@@ -1120,27 +1263,44 @@ enum ProjectRemoval {
         }
     }
 
-    /// "End the N background sessions of <project>?" with End Sessions,
-    /// Keep Running and Cancel.
+    /// The question Remove… asks. No background session: "Remove “cherry”
+    /// from Cherry?", what goes and what stays, Remove and Cancel. Some:
+    /// "Remove “cherry”? Its 2 background sessions are still running."
+    /// (those whose program ended are told apart in the message), with End
+    /// Sessions and Remove, Keep Them Running and Cancel.
     static func makeAlert(projectName: String, running: Int, ended: Int) -> NSAlert {
         let alert = NSAlert()
         alert.alertStyle = .warning
         let count = running + ended
-        alert.messageText = count == 1
-            ? "End the background session of “\(projectName)”?"
-            : "End the \(count) background sessions of “\(projectName)”?"
-        let state: String
-        if running == 0 {
-            state = count == 1 ? "Its program already ended." : "Their programs already ended."
-        } else if ended == 0 {
-            state = count == 1 ? "Its program is still running." : "Their programs are still running."
-        } else {
-            state = "\(running) of them \(running == 1 ? "is" : "are") still running."
+        guard count > 0 else {
+            alert.messageText = "Remove “\(projectName)” from Cherry?"
+            alert.informativeText = "Its commands, features and color saved on this Mac are deleted. "
+                + "The folder and its cherry.toml stay."
+            alert.addButton(withTitle: "Remove").hasDestructiveAction = true
+            alert.addButton(withTitle: "Cancel")
+            return alert
         }
-        alert.informativeText = state
-            + " Removing the project does not stop them; Keep Running leaves them in Background Sessions."
-        alert.addButton(withTitle: "End Sessions").hasDestructiveAction = true
-        alert.addButton(withTitle: "Keep Running")
+        let sessions: String
+        var state: String?
+        if ended == 0 {
+            sessions = count == 1
+                ? "Its background session is still running."
+                : "Its \(count) background sessions are still running."
+        } else {
+            sessions = count == 1 ? "It has a background session." : "It has \(count) background sessions."
+            if running == 0 {
+                state = count == 1 ? "Its program already ended." : "Their programs already ended."
+            } else {
+                state = "\(running) of them \(running == 1 ? "is" : "are") still running."
+            }
+        }
+        alert.messageText = "Remove “\(projectName)”? " + sessions
+        let them = count == 1 ? "it" : "them"
+        var message = running == 0 ? "" : "Removing the project does not stop \(them); "
+        message += "Keep Them Running leaves \(them) in Background Sessions."
+        alert.informativeText = state.map { "\($0) \(message)" } ?? message
+        alert.addButton(withTitle: "End Sessions and Remove").hasDestructiveAction = true
+        alert.addButton(withTitle: "Keep Them Running")
         alert.addButton(withTitle: "Cancel")
         return alert
     }

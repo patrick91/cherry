@@ -14,7 +14,9 @@ import Foundation
 ///   known, the terminal runs that shell the way `HostedLaunchSpec` runs
 ///   This Mac's: `/bin/bash --noprofile --norc -c 'exec -l <shell…>'` with
 ///   Ghostty's zsh, bash or fish integration (OSC 7 directory, titles,
-///   prompt marks).
+///   prompt marks), and the install's `cherry` first on PATH once the
+///   startup files ran (`RemoteShellBootstrap`, whose lines go before the
+///   `exec -l`).
 /// - A command or an agent runs `[remoteShell, "-l", "-c", line]`, so its
 ///   line sees the other Mac's login PATH. That shell is not interactive, so
 ///   it never reads ~/.zshrc (or ~/.bashrc), where many tools put themselves
@@ -26,15 +28,19 @@ import Foundation
 ///   environment would not reach the program. Its `MANPATH`, `TZ` and
 ///   `XDG_*` are in `env`. A shell whose syntax is not known here gets PATH
 ///   in `env` instead. A terminal gets none of it: its login shell reads its
-///   startup files itself.
+///   startup files itself. An agent's plain `claude`, `codex` or `pi` line,
+///   under an sh-family login shell, asks its CLI's version there and runs
+///   with the `cherry` CLI's flags when it is new enough
+///   (`RemoteAgentLaunch`, while the app's device store connects agents at
+///   launch).
 /// - `env` is what describes the terminal and the tab: `TERM`
 ///   (`xterm-ghostty` with the device's `TERMINFO` and
 ///   `GHOSTTY_RESOURCES_DIR` when it has the resources, else
 ///   `xterm-256color`), `COLORTERM`, the tab's identity (`CHERRY_PROCESS_ID`,
 ///   `CHERRY_AGENT_ID`, `CHERRY_PROJECT_ROOT` as the path there,
-///   `INSIDE_CHERRY`, `CHERRY_TERM_PROGRAM`, `TERM_PROGRAM`), Cherry MCP's
+///   `INSIDE_CHERRY`, `CHERRY_TERM_PROGRAM`, `TERM_PROGRAM`), the `cherry` command's
 ///   (`CHERRY_CONTROL_SOCKET` as the socket forwarded there,
-///   `CHERRY_MCP_TOKEN`, `CHERRY_MCP_HELPER`, `CHERRY_CONTROL_MACHINE`;
+///   `CHERRY_MCP_TOKEN`, `CHERRY_CLI`, `CHERRY_CONTROL_MACHINE`;
 ///   phase 4b), the shell
 ///   integration's variables (paths on the device), the command's own
 ///   variables (cherry.toml), the locale (`LANG`, `LC_*`), and
@@ -77,8 +83,8 @@ enum RemoteLaunchSpec {
         var shell: String?
         var homeDirectory: String?
         var resources: Resources?
-        /// Cherry MCP for its agents (phase 4b): the forwarded control
-        /// socket there, the tab's token, the install's CherryMCP.
+        /// What its tabs' `cherry` needs (phase 4b): the forwarded control
+        /// socket there, the tab's token and the install's `cherry`.
         var mcp: RemoteMCPLaunch?
         /// Its interactive login shell's variables, as Cherry last read them
         /// there (`RemoteLoginEnvironment.isSent` only): its commands and
@@ -87,22 +93,11 @@ enum RemoteLaunchSpec {
         /// Why they are not known (the capture failed, or has not run), for
         /// the message of a command that is then not found.
         var loginEnvironmentProblem: String?
-
-        init(
-            shell: String? = nil,
-            homeDirectory: String? = nil,
-            resources: Resources? = nil,
-            mcp: RemoteMCPLaunch? = nil,
-            loginEnvironment: [String: String]? = nil,
-            loginEnvironmentProblem: String? = nil
-        ) {
-            self.shell = shell
-            self.homeDirectory = homeDirectory
-            self.resources = resources
-            self.mcp = mcp
-            self.loginEnvironment = loginEnvironment
-            self.loginEnvironmentProblem = loginEnvironmentProblem
-        }
+        /// Its agents get the `cherry` CLI's flags on their command line,
+        /// gated on their CLI's version there (`RemoteAgentLaunch`):
+        /// Settings › Agents › Connect agents Cherry starts, for the app's
+        /// device store only (`RemoteDeviceStore.launchDevice(id:)`).
+        var connectsAgentsAtLaunch = false
     }
 
     /// What a command's launch says when the device's login environment
@@ -162,8 +157,15 @@ enum RemoteLaunchSpec {
             for (key, value) in login where RemoteLoginEnvironment.isSent(key) {
                 environment[key] = value
             }
-            if let path = environment["PATH"]?.nilIfEmpty, lineSettingLoginPath("", shell: shell) != nil {
-                // Set by the line itself, after the startup files.
+            if var path = environment["PATH"]?.nilIfEmpty, lineSettingLoginPath("", shell: shell) != nil {
+                // Set by the line itself, after the startup files, with the
+                // install's directory first so its programs run `cherry`
+                // (`TabCLIDirectory` on This Mac). The directory also holds
+                // the install's cherry-host, which nothing
+                // there names otherwise.
+                if let cliPath = device.mcp?.cliPath?.nilIfEmpty {
+                    path = TabCLIDirectory.prepending((cliPath as NSString).deletingLastPathComponent, to: path)
+                }
                 environment["PATH"] = nil
                 environment[loginPathVariable] = path
                 loginPath = path
@@ -191,10 +193,12 @@ enum RemoteLaunchSpec {
             // and the tab's own token.
             environment.merge(mcp.environment(processID: processID)) { _, mcp in mcp }
         }
-        var argv: [String] = if let line = configuration.startupCommand?.nilIfEmpty {
-            [shell, "-l", "-c", loginPath == nil ? line : lineSettingLoginPath(line, shell: shell) ?? line]
-        } else {
-            []
+        var argv: [String] = []
+        if var line = configuration.startupCommand?.nilIfEmpty {
+            if let agentID = configuration.agentID?.nilIfEmpty {
+                line = agentLine(line, agentID: agentID, shell: shell, device: device, environment: environment)
+            }
+            argv = [shell, "-l", "-c", loginPath == nil ? line : lineSettingLoginPath(line, shell: shell) ?? line]
         }
         if let resources = device.resources {
             // Ghostty's own variables, as its termio sets them, with the
@@ -214,8 +218,16 @@ enum RemoteLaunchSpec {
                 )
                 argv = HostedLaunchSpec.argv(
                     command: command,
-                    account: HostedLaunchAccount(userName: "remote", homeDirectory: "", shell: loginShell, hushLogin: false)
+                    account: HostedLaunchAccount(userName: "remote", homeDirectory: "", shell: loginShell)
                 )
+                // The install's `cherry` first on PATH once its startup
+                // files ran (`RemoteShellBootstrap`).
+                if argv.first == HostedLaunchSpec.launchShell,
+                   let line = RemoteShellBootstrap.launchLine(
+                       command: command, loginShell: loginShell, installRoot: resources.root, environment: &environment
+                   ) {
+                    argv[argv.count - 1] = line
+                }
             }
         } else {
             environment["TERM"] = term
@@ -228,6 +240,26 @@ enum RemoteLaunchSpec {
                 ? device.loginEnvironmentProblem ?? loginEnvironmentNotReadYet
                 : nil
         )
+    }
+
+    /// An agent's line there: gated on its CLI's version, so that one new
+    /// enough gets the `cherry` CLI's flags (`RemoteAgentLaunch`), else as
+    /// it is. The log says which, and why.
+    private static func agentLine(
+        _ line: String,
+        agentID: String,
+        shell: String,
+        device: Device,
+        environment: [String: String]
+    ) -> String {
+        switch RemoteAgentLaunch.outcome(line: line, shell: shell, device: device, environment: environment) {
+        case .gated(let gated, let suffix):
+            SessionLog.debug("[agent] device tab \(agentID) starts its agent with the cherry CLI's flags if its CLI is new enough:\(suffix)")
+            return gated
+        case .skipped(let reason):
+            SessionLog.debug("[agent] device tab \(agentID) starts its agent without Cherry's flags: \(reason)")
+            return line
+        }
     }
 
     /// A hosting's launch spec builder for another Mac: the login
@@ -268,7 +300,7 @@ enum RemoteLaunchSpec {
     static func lineSettingLoginPath(_ line: String, shell: String) -> String? {
         let variable = loginPathVariable
         switch URL(fileURLWithPath: shell).lastPathComponent {
-        case "zsh", "bash", "sh", "ksh", "mksh", "dash", "yash", "oksh", "loksh":
+        case let name where shFamilyShellNames.contains(name):
             return "export PATH=\"$\(variable)\"; unset \(variable); \(line)"
         case "fish":
             return "set -gx PATH (string split ':' \"$\(variable)\"); set -e \(variable); \(line)"
@@ -277,6 +309,14 @@ enum RemoteLaunchSpec {
         default:
             return nil
         }
+    }
+
+    /// The login shells, by name, that read a line as the POSIX shell does
+    /// (`lineSettingLoginPath`, `RemoteAgentLaunch`).
+    static let shFamilyShellNames: Set<String> = ["zsh", "bash", "sh", "ksh", "mksh", "dash", "yash", "oksh", "loksh"]
+
+    static func isShFamily(_ shell: String) -> Bool {
+        shFamilyShellNames.contains(URL(fileURLWithPath: shell).lastPathComponent)
     }
 
     static func isLocaleKey(_ key: String) -> Bool {

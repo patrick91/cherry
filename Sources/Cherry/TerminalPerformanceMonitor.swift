@@ -1,3 +1,4 @@
+import CherryControl
 import Foundation
 import OSLog
 
@@ -5,25 +6,6 @@ enum TerminalPerformanceMonitor {
     static let isEnabled = ProcessInfo.processInfo.environment["CHERRY_TERMINAL_PERF"] == "1"
 
     private static let store = Store()
-
-    struct CounterSnapshot: Equatable, Sendable {
-        let ptyChunks: Int
-        let ptyBytes: Int
-        let ghosttyFeedChunks: Int
-        let ghosttyFeedBytes: Int
-        let processorBacklogDropCount: Int
-        let processorBacklogDroppedBytes: Int
-        let backgroundOutputThrottleCount: Int
-        let processorChanges: Int
-        let representableUpdates: Int
-        let containerConfigures: Int
-        let bridgeAttaches: Int
-        let reusedBridgeAttaches: Int
-        let fitToSizeCalls: Int
-        let settingsApplies: Int
-        let settingsReconfigures: Int
-        let renderTicks: Int
-    }
 
     static func recordPTYOutputChunk(bytes: Int) {
         guard isEnabled else { return }
@@ -99,63 +81,24 @@ enum TerminalPerformanceMonitor {
         store.record { $0.renderTicks += 1 }
     }
 
-    static func snapshot() -> CounterSnapshot {
+    /// The counts since launch (MCP's performance status).
+    static func snapshot() -> TerminalPerformanceCounters {
         store.snapshot()
-    }
-
-    private struct Counters {
-        var ptyChunks = 0
-        var ptyBytes = 0
-        var ghosttyFeedChunks = 0
-        var ghosttyFeedBytes = 0
-        var processorBacklogDropCount = 0
-        var processorBacklogDroppedBytes = 0
-        var backgroundOutputThrottleCount = 0
-        var processorChanges = 0
-        var representableUpdates = 0
-        var containerConfigures = 0
-        var bridgeAttaches = 0
-        var reusedBridgeAttaches = 0
-        var fitToSizeCalls = 0
-        var settingsApplies = 0
-        var settingsReconfigures = 0
-        var renderTicks = 0
-
-        var snapshot: CounterSnapshot {
-            CounterSnapshot(
-                ptyChunks: ptyChunks,
-                ptyBytes: ptyBytes,
-                ghosttyFeedChunks: ghosttyFeedChunks,
-                ghosttyFeedBytes: ghosttyFeedBytes,
-                processorBacklogDropCount: processorBacklogDropCount,
-                processorBacklogDroppedBytes: processorBacklogDroppedBytes,
-                backgroundOutputThrottleCount: backgroundOutputThrottleCount,
-                processorChanges: processorChanges,
-                representableUpdates: representableUpdates,
-                containerConfigures: containerConfigures,
-                bridgeAttaches: bridgeAttaches,
-                reusedBridgeAttaches: reusedBridgeAttaches,
-                fitToSizeCalls: fitToSizeCalls,
-                settingsApplies: settingsApplies,
-                settingsReconfigures: settingsReconfigures,
-                renderTicks: renderTicks
-            )
-        }
     }
 
     private struct Snapshot {
         let interval: TimeInterval
-        let counters: Counters
+        let counters: TerminalPerformanceCounters
     }
 
     private final class Store: @unchecked Sendable {
         private let logger = Logger(subsystem: "Cherry", category: "TerminalPerf")
         private let lock = NSLock()
         private var windowStart = Date()
-        private var counters = Counters()
-        private var totalCounters = Counters()
+        private var counters = TerminalPerformanceCounters()
+        private var totalCounters = TerminalPerformanceCounters()
 
-        func record(_ update: (inout Counters) -> Void) {
+        func record(_ update: (inout TerminalPerformanceCounters) -> Void) {
             let snapshot: Snapshot? = lock.withLock {
                 update(&counters)
                 update(&totalCounters)
@@ -166,7 +109,7 @@ enum TerminalPerformanceMonitor {
 
                 let snapshot = Snapshot(interval: interval, counters: counters)
                 windowStart = now
-                counters = Counters()
+                counters = TerminalPerformanceCounters()
                 return snapshot
             }
 
@@ -175,9 +118,9 @@ enum TerminalPerformanceMonitor {
             }
         }
 
-        func snapshot() -> CounterSnapshot {
+        func snapshot() -> TerminalPerformanceCounters {
             lock.withLock {
-                totalCounters.snapshot
+                totalCounters
             }
         }
 

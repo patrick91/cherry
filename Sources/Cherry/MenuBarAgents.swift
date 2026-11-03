@@ -1,11 +1,12 @@
 import AppKit
+import Combine
 import SwiftUI
 
 // A menu-bar (an AppKit NSStatusItem, `MenuBarStatusItem`) summary of every live agent
 // across all project windows, with a glanceable aggregate state on the icon and a
 // click-to-focus list grouped by project. The per-agent state comes from
-// `TerminalSession.agentActivityState`; see the activity state machine for how idle
-// vs working vs permission is decided.
+// `TerminalSession.agentActivityState` (program status, OSC 7501); the icon also
+// counts what background sessions' programs report (`backgroundActivity`).
 
 // MARK: - Snapshot
 
@@ -18,17 +19,36 @@ enum MenuBarAggregateState: Equatable {
     case attention   // at least one agent waits on a permission prompt or a question
     case error
 
-    init(items: [MenuBarAgentItem]) {
-        if items.isEmpty {
+    /// `background`: what background sessions' programs report
+    /// (`backgroundActivity(of:isUnread:)`), counted with the tabs' agents.
+    init(items: [MenuBarAgentItem], background: [AgentActivityState] = []) {
+        let activities = items.map(\.activity) + background
+        if activities.isEmpty {
             self = .none
-        } else if items.contains(where: { $0.activity.awaitsUserAnswer }) {
+        } else if activities.contains(where: \.awaitsUserAnswer) {
             self = .attention
-        } else if items.contains(where: { $0.activity == .error }) {
+        } else if activities.contains(.error) {
             self = .error
-        } else if items.contains(where: { $0.activity == .working }) {
+        } else if activities.contains(.working) {
             self = .working
         } else {
             self = .idle
+        }
+    }
+
+    /// What a background session adds to the icon: its program waiting for
+    /// the user or at work (OSC 7501), or a failure not seen yet. Nothing
+    /// for one that reports nothing, is idle or done, or has ended.
+    static func backgroundActivity(of session: BackgroundSession, isUnread: Bool) -> AgentActivityState? {
+        switch session.programState {
+        case .blocked? where session.isRunning:
+            session.programKind == .permission ? .permission : .needsInput
+        case .working? where session.isRunning:
+            .working
+        case .error? where isUnread:
+            .error
+        default:
+            nil
         }
     }
 
@@ -72,22 +92,6 @@ struct MenuBarAgentPresentation {
 
 // MARK: - Model
 
-struct MenuBarShimmerSettings: Equatable {
-    // Baked from the in-app design panel (Speed 1.9×, Pulse 40%, Peak 93%, Base 59%,
-    // Stagger 5% ≈ 71 ms). All values are fractions of the shimmer cycle except `duration`.
-    var duration: Double = 2.7 / 1.9   // 1.9× the 2.7 s reference cycle
-    var pulseWidth: Double = 0.4       // each layer's highlight lasts 40% of the cycle
-    var peakAlpha: Double = 0.93       // brightest alpha at the pulse peak
-    var baseAlpha: Double = 0.59       // resting alpha
-    var layerStagger: Double = 0.05    // delay between adjacent layers (drives top→bottom sweep)
-
-    var cacheKey: String {
-        [duration, pulseWidth, peakAlpha, baseAlpha, layerStagger]
-            .map { String(Int(($0 * 1_000).rounded())) }
-            .joined(separator: ":")
-    }
-}
-
 /// Drives the working-state shimmer of the menu-bar glyph: small highlight
 /// sweeps across the stack layers.
 ///
@@ -110,7 +114,6 @@ final class MenuBarShimmerModel: ObservableObject {
     static let shared = MenuBarShimmerModel()
 
     @Published private(set) var frame = 0
-    let settings = MenuBarShimmerSettings()
 
     private var timer: Timer?
     private var step = 0
@@ -121,28 +124,30 @@ final class MenuBarShimmerModel: ObservableObject {
     // stable per-frame cache key so the label reuses a small set of NSImages.
     static let frameCount = 18
 
+    // Baked from the in-app design panel (Speed 1.9×, Pulse 40%, Peak 93%, Base 59%,
+    // Stagger 5% ≈ 71 ms). All values are fractions of the shimmer cycle except `duration`.
+    static let duration: Double = 2.7 / 1.9   // 1.9× the 2.7 s reference cycle
+    static let pulseWidth: Double = 0.4       // each layer's highlight lasts 40% of the cycle
+    static let peakAlpha: Double = 0.93       // brightest alpha at the pulse peak
+    static let baseAlpha: Double = 0.59       // resting alpha
+    static let layerStagger: Double = 0.05    // delay between adjacent layers (drives top→bottom sweep)
+
     func setWorkingAgentsActive(_ active: Bool) {
         guard hasWorkingAgents != active else { return }
         hasWorkingAgents = active
-        reconcileTimer(resetFrame: active)
-    }
-
-    private func reconcileTimer(resetFrame: Bool) {
-        if hasWorkingAgents {
-            if resetFrame {
-                step = 0
-                frame = 0
-            }
+        if active {
+            step = 0
+            frame = 0
             if timer == nil {
                 startTimer()
             }
         } else {
-            stopTimer(resetFrame: true)
+            stopTimer()
         }
     }
 
     private func startTimer() {
-        let interval = max(0.05, settings.duration / Double(Self.frameCount))
+        let interval = max(0.05, Self.duration / Double(Self.frameCount))
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] timer in
             guard let self else {
                 timer.invalidate()
@@ -157,13 +162,11 @@ final class MenuBarShimmerModel: ObservableObject {
         self.timer = timer
     }
 
-    private func stopTimer(resetFrame: Bool) {
+    private func stopTimer() {
         timer?.invalidate()
         timer = nil
-        if resetFrame {
-            step = 0
-            frame = 0
-        }
+        step = 0
+        frame = 0
     }
 }
 
@@ -172,68 +175,116 @@ final class MenuBarAgentsModel: ObservableObject {
     @Published private(set) var groups: [MenuBarProjectGroup] = []
     @Published private(set) var aggregate: MenuBarAggregateState = .none
 
-    private var timer: Timer?
+    private let registry: ProjectWindowRegistry
+    private let background: BackgroundSessionsModel
+    private var tick: AnyCancellable?
+    /// What the latest refresh read: a tick that reads the same builds
+    /// nothing.
+    private var lastInputs: Inputs?
 
-    init() {
+    /// The app's windows and Background Sessions list; tests give their own.
+    init(registry: ProjectWindowRegistry = .shared, background: BackgroundSessionsModel = .shared) {
+        self.registry = registry
+        self.background = background
         refresh()
         // A light 1s poll keeps the glanceable icon current without wiring Combine
         // across a set of workspaces/sessions/windows that churns as windows open and
-        // close. It only reads cheap published properties (never probes the process
-        // table) and republishes solely when the deduped snapshot actually changes.
-        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] timer in
-            guard let self else {
-                timer.invalidate()
-                return
-            }
-            MainActor.assumeIsolated { self.refresh() }
+        // close. It rides Background Sessions' tick (`BackgroundSessionsModel.ticks`,
+        // one wakeup a second for both, this list after that one), only reads cheap
+        // published properties (never probes the process table), builds the rows
+        // only when what it read changed (`Inputs`), and republishes solely when the
+        // deduped snapshot actually changes.
+        tick = background.ticks.sink { [weak self] in
+            MainActor.assumeIsolated { self?.refresh() }
         }
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
+    }
+
+    /// What the rows and the icon are made of: each project's running agents
+    /// as their tabs stand, and what background sessions add to the icon.
+    /// Rows, titles, logos and their order follow from these alone.
+    private struct Inputs: Equatable {
+        struct Agent: Equatable {
+            let id: UUID
+            let title: String
+            let titleSource: TerminalSession.TitleSource
+            let agentName: String?
+            let subtitle: String
+            let activity: AgentActivityState
+        }
+
+        struct Project: Equatable {
+            let root: String
+            var agents: [Agent]
+        }
+
+        var projects: [Project] = []
+        var background: [AgentActivityState] = []
     }
 
     func refresh() {
-        var groups: [MenuBarProjectGroup] = []
-        for (root, workspace) in ProjectWindowRegistry.shared.workspacesByProjectRoot() {
-            let agents = workspace.runningAgentSessions
-            guard !agents.isEmpty else { continue }
-            let items = agents.map { session in
-                let brand = AgentToolBrand.detect(
-                    name: session.agentName ?? session.title,
-                    commandLine: session.subtitle
-                )
-                return MenuBarAgentItem(
+        var inputs = Inputs()
+        // One group per project: its windows' agents, window after window.
+        for (root, workspace) in registry.workspacesByProjectRoot() {
+            let agents = workspace.runningAgentSessions.map { session in
+                Inputs.Agent(
                     id: session.id,
-                    projectRoot: root,
-                    title: MenuBarAgentPresentation.agentTitle(
-                        title: session.title,
-                        titleSource: session.titleSource,
-                        agentName: session.agentName,
-                        commandLine: session.subtitle
-                    ),
-                    agentKey: brand?.rawValue
-                        ?? AgentToolDefinition.normalizedName(session.agentName ?? session.title),
+                    title: session.title,
+                    titleSource: session.titleSource,
+                    agentName: session.agentName,
+                    subtitle: session.subtitle,
                     activity: session.agentActivityState
                 )
             }
-            groups.append(MenuBarProjectGroup(
-                projectRoot: root,
-                projectName: MenuBarAgentPresentation.projectName(projectRoot: root),
+            guard !agents.isEmpty else { continue }
+            if let index = inputs.projects.firstIndex(where: { $0.root == root }) {
+                inputs.projects[index].agents += agents
+            } else {
+                inputs.projects.append(Inputs.Project(root: root, agents: agents))
+            }
+        }
+        inputs.background = ([background] + background.devices).flatMap { list in
+            list.sessions.compactMap { session in
+                MenuBarAggregateState.backgroundActivity(of: session, isUnread: list.unreadSessionIDs.contains(session.id))
+            }
+        }
+        guard inputs != lastInputs else { return }
+        lastInputs = inputs
+        var groups = inputs.projects.map { project in
+            let items = project.agents.map { agent in
+                MenuBarAgentItem(
+                    id: agent.id,
+                    projectRoot: project.root,
+                    title: MenuBarAgentPresentation.agentTitle(
+                        title: agent.title,
+                        titleSource: agent.titleSource,
+                        agentName: agent.agentName,
+                        commandLine: agent.subtitle
+                    ),
+                    // As `TerminalSession.agentToolKey`, from what was read.
+                    agentKey: AgentScreenActivity.agentKey(name: agent.agentName ?? agent.title, commandLine: agent.subtitle),
+                    activity: agent.activity
+                )
+            }
+            return MenuBarProjectGroup(
+                projectRoot: project.root,
+                projectName: MenuBarAgentPresentation.projectName(projectRoot: project.root),
                 items: items
-            ))
+            )
         }
         groups.sort { $0.projectName.localizedCaseInsensitiveCompare($1.projectName) == .orderedAscending }
-        apply(groups: groups)
+        apply(groups: groups, background: inputs.background)
     }
 
-    private func apply(groups: [MenuBarProjectGroup]) {
-        let aggregate = MenuBarAggregateState(items: groups.flatMap(\.items))
+    private func apply(groups: [MenuBarProjectGroup], background: [AgentActivityState]) {
+        let aggregate = MenuBarAggregateState(items: groups.flatMap(\.items), background: background)
         if groups != self.groups { self.groups = groups }
         if aggregate != self.aggregate { self.aggregate = aggregate }
         MenuBarShimmerModel.shared.setWorkingAgentsActive(aggregate == .working)
     }
 
+    /// Shows the agent's tab in the window that has it.
     func reveal(_ item: MenuBarAgentItem) {
-        ProjectWindowRegistry.shared.revealSession(id: item.id, projectRoot: item.projectRoot)
+        registry.revealSession(id: item.id)
     }
 }
 
@@ -264,21 +315,8 @@ extension AgentActivityState {
 
 // MARK: - Menu-bar icon (app brandmark + state badge)
 
-struct MenuBarStatusLabel: View {
-    @ObservedObject var model: MenuBarAgentsModel
-    @ObservedObject private var shimmer = MenuBarShimmerModel.shared
-    @Environment(\.colorScheme) private var colorScheme
-
-    var body: some View {
-        Image(nsImage: Self.cachedIcon(
-            for: model.aggregate,
-            dark: colorScheme == .dark,
-            shimmerFrame: shimmer.frame,
-            settings: shimmer.settings
-        ))
-            .accessibilityLabel("Cherry agents")
-    }
-
+@MainActor
+enum MenuBarStatusLabel {
     // Reuse one NSImage per (state, appearance, shimmer frame): the shimmer revisits
     // the same frame table every cycle, and handing AppKit the same instance lets its
     // symbol rasterization cache hit instead of re-rendering a fresh image per frame.
@@ -289,26 +327,14 @@ struct MenuBarStatusLabel: View {
     static func icon(
         for state: MenuBarAggregateState,
         dark: Bool,
-        shimmerFrame: Int,
-        settings: MenuBarShimmerSettings
-    ) -> NSImage {
-        cachedIcon(for: state, dark: dark, shimmerFrame: shimmerFrame, settings: settings)
-    }
-
-    @MainActor
-    private static func cachedIcon(
-        for state: MenuBarAggregateState,
-        dark: Bool,
-        shimmerFrame: Int,
-        settings: MenuBarShimmerSettings
+        shimmerFrame: Int
     ) -> NSImage {
         let normalizedFrame = state == .working ? shimmerFrame % MenuBarShimmerModel.frameCount : 0
-        let settingsKey = state == .working ? settings.cacheKey : "static"
-        let key = "\(state)|\(dark)|\(normalizedFrame)|\(settingsKey)"
+        let key = "\(state)|\(dark)|\(normalizedFrame)"
         if let cached = iconCache[key] { return cached }
         let image: NSImage
         if state == .working {
-            image = workingIcon(dark: dark, frame: normalizedFrame, settings: settings)
+            image = workingIcon(dark: dark, frame: normalizedFrame)
         } else {
             image = glyphImage(layerColors: paletteColors(for: state, dark: dark))
         }
@@ -335,8 +361,7 @@ struct MenuBarStatusLabel: View {
     private static func paletteColors(for state: MenuBarAggregateState, dark: Bool) -> [NSColor] {
         let glyph: NSColor = dark ? .white : NSColor(white: 0.12, alpha: 1)
         switch state {
-        case .none, .idle: return [glyph]
-        case .working: return [glyph]
+        case .none, .idle, .working: return [glyph]
         case .attention: return [.systemOrange]
         case .error: return [.systemRed]
         }
@@ -347,27 +372,23 @@ struct MenuBarStatusLabel: View {
     // up one after another. Purely a palette-alpha modulation — no per-frame
     // compositing — which keeps every frame a cheap symbol re-render.
     @MainActor
-    private static func workingIcon(dark: Bool, frame: Int, settings: MenuBarShimmerSettings) -> NSImage {
+    private static func workingIcon(dark: Bool, frame: Int) -> NSImage {
         let glyph: NSColor = dark ? .white : NSColor(white: 0.12, alpha: 1)
         let phase = CGFloat(frame) / CGFloat(MenuBarShimmerModel.frameCount)
-        let base = CGFloat(settings.baseAlpha)
-        let peak = CGFloat(settings.peakAlpha)
-        let width = CGFloat(settings.pulseWidth)
-        let stagger = CGFloat(settings.layerStagger)
+        let base = CGFloat(MenuBarShimmerModel.baseAlpha)
+        let peak = CGFloat(MenuBarShimmerModel.peakAlpha)
+        let width = CGFloat(MenuBarShimmerModel.pulseWidth)
+        let stagger = CGFloat(MenuBarShimmerModel.layerStagger)
 
+        // Plate 0 is the top of the gem, so pulsing in plate order sweeps the highlight
+        // top → bottom.
         let colors: [NSColor] = (0..<stackLayerCount).map { layer in
-            let layerPhase = wrappedPhase(phase - CGFloat(sweepOrder(layer)) * stagger)
+            let layerPhase = wrappedPhase(phase - CGFloat(layer) * stagger)
             let pulse = layerPulse(layerPhase, width: width)
             let alpha = base + (peak - base) * pulse
             return glyph.withAlphaComponent(min(1, max(0, alpha)))
         }
         return glyphImage(layerColors: colors)
-    }
-
-    // Plate 0 is the top of the gem, so pulsing in plate order sweeps the highlight
-    // top → bottom. Return `stackLayerCount - 1 - layer` to reverse it.
-    private static func sweepOrder(_ layer: Int) -> Int {
-        layer
     }
 
     // The prototype's `layer-wave` curve as a scalar: 0 at rest, ramps to 1 at 40% of
@@ -636,15 +657,19 @@ struct MenuBarAgentsPanel: View {
 
     private var footer: some View {
         VStack(spacing: 1) {
+            MenuBarUpdateRow(status: AppUpdater.shared.status) { title in
+                MenuBarActionLabel(title: title, shortcut: nil)
+            }
+
             SettingsLink {
-                MenuBarActionLabel(title: "Settings…", shortcut: "⌘,")
+                MenuBarActionLabel(title: "Settings…", shortcut: CherryShortcut.settings.display)
             }
             .buttonStyle(.plain)
 
             Button {
                 NSApp.terminate(nil)
             } label: {
-                MenuBarActionLabel(title: "Quit Cherry", shortcut: "⌘Q")
+                MenuBarActionLabel(title: "Quit Cherry", shortcut: CherryShortcut.quit.display)
             }
             .buttonStyle(.plain)
         }
@@ -696,7 +721,8 @@ private struct MenuBarAgentRow: View {
 // same spot, so it ignores clicks for a moment: a double click on End is not a yes.
 private struct MenuBarBackgroundSessionRow: View {
     let item: BackgroundSession
-    /// It had a bell or notification since it went to the background.
+    /// It had a bell or notification, or its program finished, failed or
+    /// waited for the user, since it went to the background.
     let isUnread: Bool
     let open: () -> Void
     let end: () -> Void
@@ -730,7 +756,7 @@ private struct MenuBarBackgroundSessionRow: View {
                         Circle()
                             .fill(Color.blue)
                             .frame(width: 6, height: 6)
-                            .help("Rang its bell or sent a notification")
+                            .help("Rang its bell, sent a notification, or its program finished or needs you")
                     }
                     Spacer(minLength: 8)
                 }
@@ -820,6 +846,9 @@ private struct MenuBarBackgroundSessionRow: View {
 
     private static func color(for tone: BackgroundSessionPresentation.Tone) -> Color? {
         switch tone {
+        case .attention: Color(nsColor: .systemOrange)
+        case .finished: Color.pink
+        case .failed: Color(nsColor: .systemRed)
         case .active: Color(nsColor: .systemBlue)
         case .idle: Color(nsColor: .tertiaryLabelColor)
         case .ended: nil

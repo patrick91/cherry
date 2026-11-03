@@ -7,70 +7,6 @@ import Foundation
 /// `CHERRY_DEBUG_INPUT=1`: trace typed input and the buffer's tail to the
 /// unified log (as private data). Tests switch it on.
 nonisolated(unsafe) var inputDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_DEBUG_INPUT"] == "1"
-private let activityDebugEnabled = ProcessInfo.processInfo.environment["CHERRY_ACTIVITY_DEBUG"] == "1"
-private let ptyTraceDirectory = ProcessInfo.processInfo.environment["CHERRY_TRACE_PTY_DIR"]
-private let prototypeProcessorDisabledForPerf =
-    ProcessInfo.processInfo.environment["CHERRY_DISABLE_PROTOTYPE_PROCESSOR"] == "1"
-
-private final class TerminalTraceRecorder {
-    let outputURL: URL
-
-    private let outputHandle: FileHandle
-
-    init?(sessionID: UUID, title: String) {
-        guard let ptyTraceDirectory, !ptyTraceDirectory.isEmpty else { return nil }
-
-        let directoryPath = NSString(string: ptyTraceDirectory).expandingTildeInPath
-        let directoryURL = URL(fileURLWithPath: directoryPath, isDirectory: true)
-
-        do {
-            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        } catch {
-            SessionLog.debug("[pty trace] failed to create \(directoryURL.path): \(error.localizedDescription)")
-            return nil
-        }
-
-        let filename = "\(Self.timestamp())-\(Self.safeFilename(title))-\(sessionID.uuidString.prefix(8)).pty"
-        outputURL = directoryURL.appendingPathComponent(filename)
-
-        FileManager.default.createFile(atPath: outputURL.path, contents: Data())
-
-        do {
-            outputHandle = try FileHandle(forWritingTo: outputURL)
-        } catch {
-            SessionLog.debug("[pty trace] failed to open \(outputURL.path): \(error.localizedDescription)")
-            return nil
-        }
-
-        SessionLog.debug("[pty trace] writing raw PTY output to \(outputURL.path)")
-    }
-
-    deinit {
-        try? outputHandle.close()
-    }
-
-    func recordOutput(_ data: Data) {
-        guard !data.isEmpty else { return }
-        try? outputHandle.write(contentsOf: data)
-    }
-
-    private static func timestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return formatter.string(from: Date())
-    }
-
-    private static func safeFilename(_ value: String) -> String {
-        let allowed = CharacterSet.alphanumerics
-        let sanitized = value.unicodeScalars
-            .map { allowed.contains($0) ? String($0) : "-" }
-            .joined()
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-
-        return sanitized.isEmpty ? "session" : sanitized
-    }
-}
 
 final class TerminalProcessor: @unchecked Sendable {
     enum BackpressurePolicy {
@@ -87,7 +23,7 @@ final class TerminalProcessor: @unchecked Sendable {
     private let notificationLock = NSLock()
     private let backpressurePolicy: BackpressurePolicy
 
-    private var buffer: any TerminalBuffering
+    private var buffer: LiveTerminalOutputBuffer
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
     private var activeLaunchID: UUID?
     private var outputEpoch = 0
@@ -100,7 +36,7 @@ final class TerminalProcessor: @unchecked Sendable {
 
     init(
         maxScrollback: Int?,
-        buffer: (any TerminalBuffering)? = nil,
+        buffer: LiveTerminalOutputBuffer? = nil,
         backpressurePolicy: BackpressurePolicy = .preserveAll
     ) {
         self.buffer = buffer ?? LiveTerminalOutputBuffer(maxScrollback: maxScrollback)
@@ -109,10 +45,6 @@ final class TerminalProcessor: @unchecked Sendable {
 
     var lineCount: Int {
         locked { buffer.lineCount }
-    }
-
-    var storedLineCount: Int {
-        locked { buffer.storedLineCount }
     }
 
     var cursorState: TerminalCursorState {
@@ -156,18 +88,6 @@ final class TerminalProcessor: @unchecked Sendable {
 
     func snapshot(range: Range<Int>) -> [String] {
         locked { buffer.snapshot(range: range) }
-    }
-
-    func lineLength(at row: Int) -> Int {
-        locked { buffer.lineLength(at: row) }
-    }
-
-    func gridPoint(row: Int, column: Int) -> TerminalGridPoint {
-        locked { buffer.gridPoint(row: row, column: column) }
-    }
-
-    func selectedText(in selection: TerminalSelectionRange) -> String {
-        locked { buffer.selectedText(in: selection) }
     }
 
     func clear() {
@@ -240,6 +160,13 @@ final class TerminalProcessor: @unchecked Sendable {
         guard !data.isEmpty else { return }
 
         let (epoch, droppedPendingBytes) = locked { () -> (Int?, Int) in
+            // Output of a launch that already ended (or another launch's)
+            // is dropped here; output read while its launch ran is kept
+            // even when the launch ends before it is processed (below): a
+            // program's last words come just before its exit.
+            if let launchID, activeLaunchID != launchID {
+                return (nil, 0)
+            }
             if isOutputProcessingSuspended {
                 unreportedSuspendedDroppedBytes += data.count
                 if unreportedSuspendedDroppedBytes >= Self.suspendedDropReportThreshold {
@@ -267,7 +194,10 @@ final class TerminalProcessor: @unchecked Sendable {
                     }
                 }
             }
-            processOutput(data, launchID: launchID, expectedEpoch: epoch, responseWriter: responseWriter)
+            processOutput(
+                data, launchID: launchID, expectedEpoch: epoch, keepsAfterLaunchEnded: true,
+                responseWriter: responseWriter
+            )
         }
     }
 
@@ -316,10 +246,14 @@ final class TerminalProcessor: @unchecked Sendable {
         processOutput(data, launchID: launchID, expectedEpoch: nil, responseWriter: responseWriter)
     }
 
+    /// `keepsAfterLaunchEnded`: the output was taken while its launch was
+    /// active (`enqueueOutput`), so it is processed after that launch ended
+    /// too, unless another launch began since.
     private func processOutput(
         _ data: Data,
         launchID: UUID?,
         expectedEpoch: Int?,
+        keepsAfterLaunchEnded: Bool = false,
         responseWriter: (Data) -> Void
     ) {
         guard !data.isEmpty else { return }
@@ -328,7 +262,8 @@ final class TerminalProcessor: @unchecked Sendable {
             if let expectedEpoch, outputEpoch != expectedEpoch {
                 return []
             }
-            if let launchID, activeLaunchID != launchID {
+            if let launchID, activeLaunchID != launchID,
+               !(keepsAfterLaunchEnded && activeLaunchID == nil) {
                 return []
             }
             return buffer.ingest(data, viewportSize: viewportSize)
@@ -363,17 +298,14 @@ final class TerminalProcessor: @unchecked Sendable {
     }
 }
 
+/// Not Foundation's `NSLocking.withLock`: a closure formed in main-actor
+/// code and given to that one is checked to run on the main actor, and
+/// `TerminalSession.enqueueTerminalMetadata` runs on the PTY's read queue.
 private extension NSLock {
     func withLock<T>(_ body: () -> T) -> T {
         lock()
         defer { unlock() }
         return body()
-    }
-}
-
-extension String {
-    var nilIfEmpty: String? {
-        isEmpty ? nil : self
     }
 }
 
@@ -507,12 +439,9 @@ private final class TerminalRawOutputStore: @unchecked Sendable {
         }
     }
 
-    func observe(replayExistingOutput: Bool, _ observer: @escaping @Sendable (Data) -> Void) -> UUID {
+    func observe(_ observer: @escaping @Sendable (Data) -> Void) -> UUID {
         let id = UUID()
         lock.withLock {
-            if replayExistingOutput, byteCount > 0 {
-                observer(snapshotLocked(maxBytes: maximumBytes).data)
-            }
             observers[id] = observer
         }
         return id
@@ -648,6 +577,7 @@ private enum TerminalMetadataEvent: Equatable {
     case workingDirectory(String)
     case resolvedCommandLine(String)
     case notification(TerminalNotificationRequest)
+    case programStatus(ProgramStatusReport)
     case nixShell(NixShellMetadataEvent)
     case keyboardProtocolPush(Int)
     case keyboardProtocolPop(Int)
@@ -661,7 +591,6 @@ private enum NixShellMetadataEvent: Equatable {
 
 struct TerminalNotificationRequest: Equatable {
     enum Source: Equatable {
-        case bel
         case osc9
         case osc777
     }
@@ -811,6 +740,8 @@ private final class TerminalMetadataParser {
                 body: value,
                 source: .osc9
             ))
+        case "7501":
+            return ProgramStatusReport(osc: String(parts[1])).map(TerminalMetadataEvent.programStatus)
         case "777":
             if let event = cherryCommandEvent(from: value) {
                 return event
@@ -1101,9 +1032,6 @@ final class TerminalWorkspace: ObservableObject {
         didSet {
             updateAuxiliaryProcessingForSelection(previousSelectedSessionID: oldValue)
             clearUnreadNotificationForSelectedSession()
-            if selectedSessionID != oldValue, let selectedSessionID {
-                sessions.first { $0.id == selectedSessionID }?.noteAttentionSampleEvent(.focused, detail: "selected")
-            }
         }
     }
     /// The project's key (`ProjectLocation`): its directory for a project
@@ -1115,6 +1043,11 @@ final class TerminalWorkspace: ObservableObject {
     var launchRoot: String? {
         projectRoot.map(ProjectLocation.launchPath(forKey:))
     }
+    /// Which of the project's windows shows this workspace
+    /// (`ProjectWindowValue.windowID`): its tabs' new sessions are tagged
+    /// with it (`TerminalSession.creatingWindowID`). Nil for a project's
+    /// primary window, whose sessions carry no window tag.
+    let windowID: UUID?
     let backendPolicy: SessionBackendPolicy
     private let launchBackend: TerminalSessionLaunchBackend
     /// Fires for changes workspace persistence saves that the published
@@ -1128,8 +1061,8 @@ final class TerminalWorkspace: ObservableObject {
     /// Set once the workspace's window or the app tore it down; its sessions
     /// are gone and must not be saved as an empty workspace.
     private(set) var isTornDown = false
-    /// Why every tab was last closed at once (window closed, app quit,
-    /// worktree removed): tabs a restore finishes afterwards end the same way.
+    /// Why every tab was last closed at once (window closed, app quit): tabs
+    /// a restore finishes afterwards end the same way.
     private(set) var closeAllIntent: SessionCloseIntent?
     /// Launches restored tabs' attach adapters a few at a time (tests give
     /// a workspace its own).
@@ -1141,13 +1074,22 @@ final class TerminalWorkspace: ObservableObject {
     var closeTabAfterCleanExit: @MainActor (TerminalWorkspace, TerminalSession) -> Void = { workspace, session in
         workspace.close(session, intent: .programExited)
     }
+    /// The workspaces of the project's other open windows, the most
+    /// recently active first (`ProjectWindowRegistry.otherWorkspaces(ofProjectOf:)`):
+    /// a project's commands run in one tab across its windows
+    /// (`projectCommandSession(named:)`). Set by its repository once its
+    /// window claimed the project; none before (tests, a window that never
+    /// claimed).
+    var otherProjectWindows: @MainActor () -> [TerminalWorkspace] = { [] }
 
     init(
         projectRoot: String? = nil,
         createInitialSession: Bool = true,
         launchBackend: TerminalSessionLaunchBackend = .nativePTY,
-        backendPolicy: SessionBackendPolicy = .native
+        backendPolicy: SessionBackendPolicy = .native,
+        windowID: UUID? = nil
     ) {
+        self.windowID = windowID
         // A project on another Mac keeps its key: it is not a directory here.
         self.projectRoot = projectRoot.map { root in
             ProjectLocation.isRemoteKey(root) ? ProjectLocation(key: root).key : Self.resolvedWorkingDirectory(root)
@@ -1235,6 +1177,10 @@ final class TerminalWorkspace: ObservableObject {
                     return self.windowGrid.observation()
                 })
             }
+            session.creatingWindowID = { [weak self, weak session] in
+                guard let self, let session, self.sessions.contains(where: { $0 === session }) else { return nil }
+                return self.windowID
+            }
         }
     }
 
@@ -1242,8 +1188,7 @@ final class TerminalWorkspace: ObservableObject {
     /// (`TerminalWindowGrid`): what a new persistent tab's Create starts its
     /// program at once it settled (`TerminalWindowGridWait`), and what a
     /// restored tab no window shows attaches at (`detachedSurfaceSize`,
-    /// `RestoredTabLaunchQueue`). A repository's worktrees share their
-    /// window's (`RepositoryWorkspace`).
+    /// `RestoredTabLaunchQueue`): its window's (`RepositoryWorkspace`).
     var windowGrid = TerminalWindowGrid()
 
     /// The cell size, in pixels, that a terminal of `grid` in this
@@ -1348,8 +1293,8 @@ final class TerminalWorkspace: ObservableObject {
     /// Running tabs that closing everything for `intent` would end: native
     /// ones, and persistent ones whose close action terminates their session
     /// (tabs that only detach, as in a window close or quit that keeps
-    /// sessions running, are not counted). Drives the quit, window-close and
-    /// worktree-removal confirmations.
+    /// sessions running, are not counted). Drives the quit and window-close
+    /// confirmations.
     func sessionsWithRunningProcess(endingWith intent: SessionCloseIntent) -> [TerminalSession] {
         sessions.filter { session in
             backendPolicy.closeAction(for: session, intent: intent) != .detach && session.hasRunningProcess()
@@ -1441,10 +1386,6 @@ final class TerminalWorkspace: ObservableObject {
         childAgentSessions(parentID: parent.id)
     }
 
-    func childAgentCount(of parent: TerminalSession) -> Int {
-        childAgentSessions(of: parent).count
-    }
-
     func descendantAgentSessions(of parent: TerminalSession) -> [TerminalSession] {
         guard parent.kind == .agent else { return [] }
         return childAgentSessions(of: parent)
@@ -1496,45 +1437,6 @@ final class TerminalWorkspace: ObservableObject {
         sessions = reordered
     }
 
-    func moveSession(id sessionID: UUID, to targetIndex: Int, within kind: TerminalSession.SessionKind) {
-        if kind == .terminal {
-            moveTerminalDisplayItem(containing: sessionID, to: targetIndex)
-            return
-        }
-
-        let scopedSessions = sessions.filter { $0.kind == kind }
-        guard let currentScopedIndex = scopedSessions.firstIndex(where: { $0.id == sessionID }) else { return }
-
-        let clampedScopedIndex = min(max(targetIndex, 0), scopedSessions.count - 1)
-        guard currentScopedIndex != clampedScopedIndex else { return }
-
-        let session = scopedSessions[currentScopedIndex]
-        let remainingScopedIDs = scopedSessions
-            .filter { $0.id != sessionID }
-            .map(\.id)
-        var nextScopedIDs = remainingScopedIDs
-        nextScopedIDs.insert(session.id, at: min(clampedScopedIndex, nextScopedIDs.count))
-
-        let sessionsByID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
-        var scopedIterator = nextScopedIDs.makeIterator()
-        sessions = sessions.map { existing in
-            guard existing.kind == kind, let nextID = scopedIterator.next(),
-                  let replacement = sessionsByID[nextID]
-            else {
-                return existing
-            }
-            return replacement
-        }
-    }
-
-    func moveTerminalDisplayItem(containing sessionID: UUID, to targetIndex: Int) {
-        guard let currentIndex = terminalDisplayItems.firstIndex(where: { displayItemContains($0, sessionID: sessionID) }) else {
-            return
-        }
-
-        moveTerminalDisplayItem(at: currentIndex, to: targetIndex)
-    }
-
     func moveTerminalDisplayItem(id displayItemID: UUID, to targetIndex: Int) {
         guard let currentIndex = terminalDisplayItems.firstIndex(where: { $0.id == displayItemID }) else {
             return
@@ -1562,8 +1464,7 @@ final class TerminalWorkspace: ObservableObject {
     ) -> TerminalSession {
         // Match Ghostty's new-surface behavior: when no cwd is requested,
         // inherit the selected session's last trusted OSC 7 cwd report. In an
-        // empty workspace (worktree spaces start with no sessions) fall back
-        // to the project root rather than the process home directory. A tab
+        // empty workspace fall back to the project root rather than the process home directory. A tab
         // of This Mac's host (persistent, or attached to a local session)
         // seeds it like a native one; an SSH host's directory never seeds a
         // local shell. In a device's window (docs/specs/remote-devices.md,
@@ -1621,7 +1522,8 @@ final class TerminalWorkspace: ObservableObject {
             title: title,
             parentAgentID: normalizedParentAgentID,
             launchBackend: launchBackend,
-            persistentHosting: persistentHostingForNewTab()
+            persistentHosting: persistentHostingForNewTab(),
+            agentLaunch: backendPolicy.agentLaunch
         )
         sessions.append(session)
         if select {
@@ -1835,15 +1737,11 @@ final class TerminalWorkspace: ObservableObject {
         let workingDirectory = (hosting.profile.isThisMac
             ? launch.info.localWorkingDirectory
             : hosting.reportedWorkingDirectory(of: launch.info)) ?? record.workingDirectory
-        let subtitle: String = switch record.kind {
-        case .terminal: "\(ShellProcessController.defaultShellName) login shell"
-        case .agent, .command: record.launchCommand ?? ""
-        }
         let session = TerminalSession(
             id: record.id,
             title: record.title.nilIfEmpty ?? launch.info.displayName,
             titleSource: record.title.isEmpty ? .explicit : record.titleSource,
-            subtitle: subtitle,
+            subtitle: Self.restoredSubtitle(for: record),
             tint: Self.palette[sessions.count % Self.palette.count],
             workingDirectory: Self.startingDirectory(
                 hosting.profile.isThisMac ? workingDirectory : workingDirectory ?? launch.info.cwd.nilIfEmpty,
@@ -1863,7 +1761,8 @@ final class TerminalWorkspace: ObservableObject {
             persistentHosting: hosting,
             adoptingPersistentSession: launch,
             deferredLaunch: deferringLaunch,
-            provisionalRestore: provisional
+            provisionalRestore: provisional,
+            agentLaunch: backendPolicy.agentLaunch
         )
         if record.hasUnreadNotification == true { session.markUnread() }
         return session
@@ -1879,10 +1778,6 @@ final class TerminalWorkspace: ObservableObject {
     /// it started or its project when that is gone. Not added:
     /// `restoreSessions(_:from:)` adds it with the saved layout.
     func makeSystemEndedSession(record: WorkspaceSessionRecord, ended end: SystemSessionEnd) -> TerminalSession {
-        let subtitle: String = switch record.kind {
-        case .terminal: "\(ShellProcessController.defaultShellName) login shell"
-        case .agent, .command: record.launchCommand ?? ""
-        }
         // A device's tab (docs/specs/remote-devices.md): its directories
         // are that Mac's, never looked for here, and Restart starts it on
         // the device again whatever the local setting.
@@ -1896,10 +1791,7 @@ final class TerminalWorkspace: ObservableObject {
         } else {
             let directory = [record.workingDirectory, record.launchWorkingDirectory, record.projectRoot]
                 .compactMap { $0 }
-                .first { path in
-                    var isDirectory: ObjCBool = false
-                    return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
-                }
+                .first(where: isExistingDirectory)
             workingDirectory = Self.resolvedWorkingDirectory(directory)
         }
         let hosting = remoteHosting ?? (launchBackend == .nativePTY && backendPolicy.prefersPersistentLocalSessions
@@ -1909,7 +1801,7 @@ final class TerminalWorkspace: ObservableObject {
             id: record.id,
             title: record.title.nilIfEmpty ?? record.commandName ?? record.agentName ?? "Shell",
             titleSource: record.title.isEmpty ? .explicit : record.titleSource,
-            subtitle: subtitle,
+            subtitle: Self.restoredSubtitle(for: record),
             tint: Self.palette[sessions.count % Self.palette.count],
             workingDirectory: workingDirectory,
             projectRoot: record.projectRoot,
@@ -1922,11 +1814,20 @@ final class TerminalWorkspace: ObservableObject {
             launchEnvironment: record.launchEnvironment,
             restartOnExit: record.restartOnExit,
             launchBackend: launchBackend,
-            persistentHosting: hosting
+            persistentHosting: hosting,
+            agentLaunch: backendPolicy.agentLaunch
         )
         session.showSystemSessionEnd(end, exitStatus: record.exitStatus)
         if record.hasUnreadNotification == true { session.markUnread() }
         return session
+    }
+
+    /// The subtitle of a tab built from a saved record.
+    private static func restoredSubtitle(for record: WorkspaceSessionRecord) -> String {
+        switch record.kind {
+        case .terminal: "\(ShellProcessController.defaultShellName) login shell"
+        case .agent, .command: record.launchCommand ?? ""
+        }
     }
 
     private func hostedSession(attachedTo attachment: HostedSessionAttachment) -> TerminalSession? {
@@ -1957,8 +1858,7 @@ final class TerminalWorkspace: ObservableObject {
     /// them (the restore that opened the workspace).
     /// `launchingAdapters`: restored tabs whose adapter a restore deferred
     /// are attached a few at a time (`restoredTabLaunchQueue`), the shown
-    /// ones first; false leaves them to `launchRestoredAdapters()` (a
-    /// worktree not shown now) or to being shown.
+    /// ones first; false leaves them to being shown.
     @discardableResult
     func restoreSessions(
         _ restoredSessions: [TerminalSession],
@@ -2111,13 +2011,9 @@ final class TerminalWorkspace: ObservableObject {
         return setAside
     }
 
-    /// Queues the attach adapters that restored tabs are still waiting for
+    /// Queues the attach adapters that `tabs` are still waiting for
     /// (`restoredTabLaunchQueue`): the selected tab and the other panes of
-    /// its split first. A worktree's workspace calls this when it is shown.
-    func launchRestoredAdapters() {
-        launchRestoredAdapters(sessions)
-    }
-
+    /// its split first.
     private func launchRestoredAdapters(_ tabs: [TerminalSession]) {
         let waiting = tabs.filter(\.isAwaitingDeferredLaunch)
         guard !waiting.isEmpty else { return }
@@ -2155,20 +2051,45 @@ final class TerminalWorkspace: ObservableObject {
         resumeCommandRestoreWaiters()
     }
 
-    /// Whether a restore under way may bring back a tab for the named
-    /// command (nil: for any command).
+    /// Whether a restore under way, in this window or another window of
+    /// the project, may bring back a tab for the named command (nil: for
+    /// any command).
     func isRestoringCommand(named name: String?) -> Bool {
+        isRestoringCommandHere(named: name)
+            || otherProjectWindows().contains { !$0.isTornDown && $0.isRestoringCommandHere(named: name) }
+    }
+
+    /// Whether this window's restore under way may bring back a tab for
+    /// the named command.
+    private func isRestoringCommandHere(named name: String?) -> Bool {
         guard let name else { return !commandNamesBeingRestored.isEmpty }
         return commandNamesBeingRestored.contains(AgentToolDefinition.normalizedName(name))
     }
 
-    /// Returns once no restore under way may bring back a tab for the named
-    /// command (nil: for any command), or after `timeout`. Sidebar and MCP
-    /// command starts wait here, then find the restored tab
-    /// (`addCommandSession` returns it) instead of starting a second copy.
+    /// Returns once no restore under way in any window of the project may
+    /// bring back a tab for the named command (nil: for any command), or
+    /// after `timeout`. Sidebar and MCP command starts wait here, then find
+    /// the restored tab (`addCommandSession` returns it, in whichever window
+    /// it came back) instead of starting a second copy.
     func waitUntilRestored(commandNamed name: String?, timeout: Duration = TerminalWorkspace.commandRestoreWaitLimit) async {
         let deadline = ContinuousClock.now + timeout
-        while isRestoringCommand(named: name), !isTornDown, ContinuousClock.now < deadline {
+        while !isTornDown, ContinuousClock.now < deadline {
+            if isRestoringCommandHere(named: name) {
+                await waitUntilRestoredHere(commandNamed: name, until: deadline)
+            } else if let other = otherProjectWindows().first(where: {
+                !$0.isTornDown && $0.isRestoringCommandHere(named: name)
+            }) {
+                await other.waitUntilRestoredHere(commandNamed: name, until: deadline)
+            } else {
+                return
+            }
+        }
+    }
+
+    /// Returns once this window's restore may no longer bring back a tab
+    /// for the named command, or at `deadline`.
+    private func waitUntilRestoredHere(commandNamed name: String?, until deadline: ContinuousClock.Instant) async {
+        while isRestoringCommandHere(named: name), !isTornDown, ContinuousClock.now < deadline {
             let id = UUID()
             let timer = Task { @MainActor [weak self] in
                 try? await Task.sleep(until: deadline, clock: .continuous)
@@ -2234,6 +2155,10 @@ final class TerminalWorkspace: ObservableObject {
         )
     }
 
+    /// The command's tab: this window's, else another window's of the
+    /// project (a command runs in one tab across a project's windows),
+    /// else a new tab here. Another window's tab is returned as it is, not
+    /// added here and not selected: its caller shows it in its own window.
     @discardableResult
     func addCommandSession(
         id: UUID = UUID(),
@@ -2247,6 +2172,9 @@ final class TerminalWorkspace: ObservableObject {
             if select {
                 self.select(session)
             }
+            return session
+        }
+        if let session = projectCommandSession(named: command.name) {
             return session
         }
 
@@ -2266,90 +2194,9 @@ final class TerminalWorkspace: ObservableObject {
         return session
     }
 
-    @discardableResult
-    func installPreviewAgentTree() -> [TerminalSession] {
-        guard agentSessions.isEmpty else { return [] }
-
-        let workingDirectory = launchRoot ?? NSHomeDirectory()
-        var previewSessions: [TerminalSession] = []
-
-        func appendPreviewAgent(
-            title: String,
-            subtitle: String,
-            agentName: String,
-            parentAgentID: UUID? = nil
-        ) -> TerminalSession {
-            let session = Self.makePreviewAgentSession(
-                index: previewSessions.count + 1,
-                title: title,
-                subtitle: subtitle,
-                agentName: agentName,
-                workingDirectory: workingDirectory,
-                projectRoot: projectRoot,
-                parentAgentID: parentAgentID,
-                launchBackend: launchBackend
-            )
-            previewSessions.append(session)
-            return session
-        }
-
-        let parent = appendPreviewAgent(
-            title: "Claude",
-            subtitle: "Investigate Profile Cache Loading",
-            agentName: "Claude"
-        )
-        [
-            ("Codex", "tuning sidebar UI", "Codex"),
-            ("Gemini", "no agent process running", "Gemini"),
-            ("Amp", "previewed empty agent tree", "Amp"),
-            ("Codex Review", "check close confirmation", "Codex"),
-            ("Claude Notes", "inspect sidebar spacing", "Claude"),
-            ("Gemini Audit", "", "Gemini"),
-            ("Amp Layout", "", "Amp"),
-            ("Codex MCP", "validate parent_agent_id", "Codex"),
-            ("Claude Cache", "read cached profile data", "Claude"),
-            ("Gemini Trace", "measure row rhythm", "Gemini"),
-            ("Amp Snapshot", "compare guide alignment", "Amp"),
-            ("Codex Docs", "", "Codex")
-        ].forEach { title, subtitle, agentName in
-            _ = appendPreviewAgent(
-                title: title,
-                subtitle: subtitle,
-                agentName: agentName,
-                parentAgentID: parent.id
-            )
-        }
-
-        let designParent = appendPreviewAgent(
-            title: "Codex Design",
-            subtitle: "agent tree preview visible",
-            agentName: "Codex"
-        )
-        [
-            ("Claude Close", "group close prompt", "Claude"),
-            ("Gemini Commands", "shortcut numbering", "Gemini"),
-            ("Amp Icons", "mixed provider logos", "Amp"),
-            ("Codex Empty", "", "Codex"),
-            ("Claude Labels", "longer sidebar details", "Claude")
-        ].forEach { title, subtitle, agentName in
-            _ = appendPreviewAgent(
-                title: title,
-                subtitle: subtitle,
-                agentName: agentName,
-                parentAgentID: designParent.id
-            )
-        }
-
-        _ = appendPreviewAgent(
-            title: "Claude Scratch",
-            subtitle: "",
-            agentName: "Claude"
-        )
-        sessions.append(contentsOf: previewSessions)
-        selectedSessionID = parent.id
-        return previewSessions
-    }
-
+    /// This window's tab of the named command: what its sidebar row shows
+    /// (`projectCommandSession(named:)` looks in the project's other
+    /// windows too).
     func commandSession(named name: String) -> TerminalSession? {
         let normalizedName = AgentToolDefinition.normalizedName(name)
         return commandSessions.first {
@@ -2366,13 +2213,24 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
 
+    /// The named command's tab in this window (a restored one too), else in
+    /// another window of the project (`otherProjectWindows`).
+    func projectCommandSession(named name: String) -> TerminalSession? {
+        commandSession(named: name) ?? restoredSession(forCommandNamed: name)
+            ?? otherProjectWindows().lazy.compactMap {
+                $0.commandSession(named: name) ?? $0.restoredSession(forCommandNamed: name)
+            }.first
+    }
+
+    /// An edited command reaches the one tab it runs in, whichever window
+    /// of the project that is.
     func updateCommandSession(
         named originalName: String?,
         with command: ProjectCommandDefinition,
         projectRoot: String
     ) {
         let lookupName = originalName?.nilIfEmpty ?? command.name
-        guard let session = commandSession(named: lookupName) else { return }
+        guard let session = projectCommandSession(named: lookupName) else { return }
         session.updateManagedCommand(
             command,
             workingDirectory: command.resolvedWorkingDirectory(projectRoot: projectRoot)
@@ -2385,28 +2243,6 @@ final class TerminalWorkspace: ObservableObject {
 
     func splitGroup(containing sessionID: UUID) -> TerminalSplitGroup? {
         terminalSplitGroups.first { $0.paneSessionIDs.contains(sessionID) }
-    }
-
-    func sessions(for displayItem: TerminalDisplayItem) -> [TerminalSession] {
-        switch displayItem {
-        case .single(let sessionID):
-            return sessions.first { $0.id == sessionID }.map { [$0] } ?? []
-        case .split(let groupID):
-            guard let group = splitGroup(id: groupID) else { return [] }
-            return group.paneSessionIDs.compactMap { paneID in
-                sessions.first { $0.id == paneID }
-            }
-        }
-    }
-
-    func activeSession(for displayItem: TerminalDisplayItem) -> TerminalSession? {
-        switch displayItem {
-        case .single(let sessionID):
-            return sessions.first { $0.id == sessionID }
-        case .split(let groupID):
-            guard let group = splitGroup(id: groupID) else { return nil }
-            return sessions.first { $0.id == group.activeSessionID }
-        }
     }
 
     /// A local terminal, native or persistent, can be split: the new pane is
@@ -2491,15 +2327,6 @@ final class TerminalWorkspace: ObservableObject {
         )
     }
 
-    func balanceActiveSplitGroup() {
-        guard let selectedSessionID,
-              let group = splitGroup(containing: selectedSessionID)
-        else {
-            return
-        }
-        balanceSplitGroup(id: group.id)
-    }
-
     func setSplitGroupWidthWeights(id groupID: UUID, weights: [Double]) {
         guard let groupIndex = terminalSplitGroups.firstIndex(where: { $0.id == groupID }),
               let normalizedWeights = Self.normalizedWidthWeights(
@@ -2525,15 +2352,6 @@ final class TerminalWorkspace: ObservableObject {
             displayIndex...displayIndex,
             with: group.paneSessionIDs.map { .single($0) }
         )
-    }
-
-    func separateActiveSplitGroup() {
-        guard let selectedSessionID,
-              let group = splitGroup(containing: selectedSessionID)
-        else {
-            return
-        }
-        separateSplitGroup(id: group.id)
     }
 
     func canCloseSplitGroup(id groupID: UUID) -> Bool {
@@ -2573,11 +2391,6 @@ final class TerminalWorkspace: ObservableObject {
     ) {
         let groupIDs = Set(([session] + descendantAgentSessions(of: session)).map(\.id))
         closeSessions(withIDs: groupIDs, allowEmptyWorkspace: allowEmptyWorkspace, intent: intent)
-    }
-
-    func closeAgentPromotingChildren(_ session: TerminalSession, intent: SessionCloseIntent = .userClosedTab) {
-        promoteChildAgents(of: session)
-        closeSessions(withIDs: Set([session.id]), intent: intent)
     }
 
     /// Closes every tab. The default is a window teardown; production callers
@@ -2647,7 +2460,6 @@ final class TerminalWorkspace: ObservableObject {
     /// only disconnects it (its action detaches, or it is attached to a
     /// session it does not own): that one is left to the app's exit.
     private func finishClosingForQuit(_ session: TerminalSession, intent: SessionCloseIntent, action: SessionCloseAction) {
-        session.noteAttentionSampleClosed(intent: intent)
         guard action == .detach || session.hostedAttachment != nil else {
             finishClosing(session, intent: intent)
             return
@@ -2705,6 +2517,12 @@ final class TerminalWorkspace: ObservableObject {
     /// such a tab: `reopenClosedTab`).
     var awaitsRestoreDecision: (@MainActor (UUID) -> Bool)?
 
+    /// Reopen in a device window's Not open here, as its repository does
+    /// it (`RepositoryWorkspace.reopenNotOpenSession`): false when it did
+    /// nothing and the session is to be attached. None in tests'
+    /// workspaces.
+    var reopenNotOpenSession: (@MainActor (HostedSessionInfo) -> Bool)?
+
     func withdrawRestoredTabs(_ tabs: [TerminalSession]) {
         let ids = Set(tabs.map(\.id)).intersection(sessions.lazy.filter { tab in tabs.contains { $0 === tab } }.map(\.id))
         closeSessions(withIDs: ids, allowEmptyWorkspace: true, intent: .duplicateWindowTeardown)
@@ -2740,11 +2558,6 @@ final class TerminalWorkspace: ObservableObject {
         }
     }
 
-    func closeSelectedSession(intent: SessionCloseIntent = .userClosedTab) {
-        guard let selectedSession else { return }
-        close(selectedSession, intent: intent)
-    }
-
     func closeActivePane(intent: SessionCloseIntent = .userClosedTab) {
         guard let selectedSession else { return }
         close(selectedSession, intent: intent)
@@ -2752,7 +2565,6 @@ final class TerminalWorkspace: ObservableObject {
 
     /// Ends a removed tab's program the way `intent` asks for its backend.
     private func finishClosing(_ session: TerminalSession, intent: SessionCloseIntent) {
-        session.noteAttentionSampleClosed(intent: intent)
         // A persistent tab whose program already ended leaves nothing worth
         // keeping when someone closes or detaches it, or it closes because
         // its shell exited: its session goes whatever the intent.
@@ -2830,6 +2642,28 @@ final class TerminalWorkspace: ObservableObject {
         return left
     }
 
+    /// This window's command tabs whose program runs in a session of this
+    /// app's that a close keeping sessions leaves running, as undo would
+    /// bring them back (`closedTab(for:name:)`), placed after any tabs:
+    /// read before the window's tabs close, so that another window of the
+    /// project shows them once they did
+    /// (`ProjectWindowRegistry.commandTabsHandedOver`).
+    func commandTabsKeptRunning() -> [ClosedTab] {
+        persistentSessionsEnded(by: .windowClosedEndingSessions).compactMap { session in
+            guard session.kind == .command || restoredSessionRecords[session.id]?.kind == .command,
+                  session.isProgramRunning,
+                  let closed = closedTab(for: session, name: session.title)
+            else { return nil }
+            return ClosedTab(
+                record: closed.record,
+                name: closed.name,
+                binding: closed.binding,
+                ownsSession: closed.ownsSession,
+                placement: ClosedTabPlacement(sessionIndex: .max, display: nil, wasSelected: false, subAgentIDs: [])
+            )
+        }
+    }
+
     /// What undoing a user's close or detach of `session` brings back, read
     /// before the tab closes (`ClosedTab`): its record, the host session it
     /// shows and where it is. Nil for a tab no undo brings back: a native
@@ -2882,8 +2716,9 @@ final class TerminalWorkspace: ObservableObject {
     /// owns it (a tab only attached to it leaves it to come back as the
     /// closed tab's own). Nil when the session is gone, being ended, or
     /// another tab owns it, when its command runs in another tab now (a
-    /// command runs in one tab per workspace: it was started again), or
-    /// when the workspace was torn down. Not selected.
+    /// command runs in one tab across the project's windows: it was
+    /// started again, here or in another window), or when the workspace was
+    /// torn down. Not selected.
     func reopenClosedTab(_ closed: ClosedTab) -> TerminalSession? {
         guard !isTornDown else { return nil }
         /// A tab here shows the session as the closed tab did.
@@ -2900,7 +2735,7 @@ final class TerminalWorkspace: ObservableObject {
             return open
         }
         if closed.record.kind == .command, let name = closed.record.commandName,
-           commandSession(named: name) ?? restoredSession(forCommandNamed: name) != nil {
+           projectCommandSession(named: name) != nil {
             return nil
         }
         let tab: TerminalSession
@@ -3039,10 +2874,7 @@ final class TerminalWorkspace: ObservableObject {
     /// was relaunched because an attached session ended.
     @discardableResult
     func restart(_ session: TerminalSession) -> Bool {
-        switch backendPolicy.closeAction(for: session, intent: .restart) {
-        case .stop, .detach, .terminate:
-            return session.restart()
-        }
+        session.restart()
     }
 
     func clearSelectedSessionScrollback() {
@@ -3074,14 +2906,15 @@ final class TerminalWorkspace: ObservableObject {
         session.clearUnreadNotification()
     }
 
-    func acknowledgeAttentionForSelectedSession() {
+    /// The selected tab is on screen in a key window: the result it shows
+    /// is seen.
+    func acknowledgeAgentResultForSelectedSession() {
         guard let selectedSessionID,
               let session = sessions.first(where: { $0.id == selectedSessionID })
         else {
             return
         }
-        session.noteAttentionSampleEvent(.focused, detail: "viewed")
-        session.acknowledgeAttentionAlert()
+        session.acknowledgeAgentResult()
     }
 
     private func commandSessions(orderedBy visibleCommandNames: [String]) -> [TerminalSession] {
@@ -3104,15 +2937,6 @@ final class TerminalWorkspace: ObservableObject {
 
     static let minimumSplitPaneWidth: CGFloat = 280
     private static let maximumSplitPaneCount = 3
-
-    private func displayItemContains(_ item: TerminalDisplayItem, sessionID: UUID) -> Bool {
-        switch item {
-        case .single(let itemSessionID):
-            itemSessionID == sessionID
-        case .split(let groupID):
-            splitGroup(id: groupID)?.paneSessionIDs.contains(sessionID) == true
-        }
-    }
 
     private func addTerminalPane(_ paneSessionID: UUID, after activeSessionID: UUID) -> Bool {
         guard paneSessionID != activeSessionID,
@@ -3367,7 +3191,8 @@ final class TerminalWorkspace: ObservableObject {
         title requestedTitle: String?,
         parentAgentID: UUID?,
         launchBackend: TerminalSessionLaunchBackend,
-        persistentHosting: PersistentLocalSessions?
+        persistentHosting: PersistentLocalSessions?,
+        agentLaunch: AgentLaunchContext?
     ) -> TerminalSession {
         let baseTitle = agent.name.isEmpty ? "Agent" : agent.name
         let explicitTitle = requestedTitle?
@@ -3386,7 +3211,8 @@ final class TerminalWorkspace: ObservableObject {
             parentAgentID: parentAgentID,
             launchCommand: agent.commandLine,
             launchBackend: launchBackend,
-            persistentHosting: persistentHosting
+            persistentHosting: persistentHosting,
+            agentLaunch: agentLaunch
         )
     }
 
@@ -3416,39 +3242,13 @@ final class TerminalWorkspace: ObservableObject {
         )
     }
 
-    private static func makePreviewAgentSession(
-        index: Int,
-        title: String,
-        subtitle: String,
-        agentName: String,
-        workingDirectory: String,
-        projectRoot: String?,
-        parentAgentID: UUID? = nil,
-        launchBackend: TerminalSessionLaunchBackend
-    ) -> TerminalSession {
-        let session = TerminalSession(
-            title: title,
-            subtitle: subtitle,
-            tint: palette[(index - 1) % palette.count],
-            workingDirectory: Self.resolvedWorkingDirectory(workingDirectory),
-            projectRoot: projectRoot,
-            launchShell: false,
-            kind: .agent,
-            agentName: agentName,
-            parentAgentID: parentAgentID,
-            launchBackend: launchBackend
-        )
-        return session
-    }
-
     private static func resolvedWorkingDirectory(_ requestedWorkingDirectory: String?) -> String {
         guard let requestedWorkingDirectory, !requestedWorkingDirectory.isEmpty else {
             return NSHomeDirectory()
         }
 
         let expandedPath = NSString(string: requestedWorkingDirectory).expandingTildeInPath
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: expandedPath, isDirectory: &isDirectory), isDirectory.boolValue else {
+        guard isExistingDirectory(expandedPath) else {
             return NSHomeDirectory()
         }
 
@@ -3462,6 +3262,12 @@ final class TerminalWorkspace: ObservableObject {
         NSColor(calibratedRed: 0.93, green: 0.47, blue: 0.62, alpha: 1),
         NSColor(calibratedRed: 0.70, green: 0.63, blue: 0.97, alpha: 1)
     ]
+}
+
+/// Whether `path` names an existing directory (as it is: no `~`).
+private func isExistingDirectory(_ path: String) -> Bool {
+    var isDirectory: ObjCBool = false
+    return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
 }
 
 /// Production sessions use Ghostty's EXEC backend. The host-managed case is an
@@ -3530,11 +3336,17 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var state: SessionState = .launching
     @Published private(set) var hasUnreadNotification = false
     @Published private(set) var lastNotification: TerminalNotificationRequest?
+    /// What the tab's program says it is doing (OSC 7501 program status),
+    /// the record updated longest ago first: its host's records for a
+    /// persistent tab. A native tab's Ghostty surface neither answers the
+    /// support query nor passes reports on, so it has none.
+    @Published private(set) var programStatus: [ProgramStatus] = []
+    /// The root record's state; `unknown` while the program reports nothing.
     @Published private(set) var agentActivityState: AgentActivityState = .unknown
-    @Published private(set) var attentionClassifierPrediction: TerminalAttentionPrediction?
-    @Published private(set) var attentionAlertGeneration = 0
-    @Published private(set) var hasUnacknowledgedAttention = false
-    @Published private(set) var currentAttentionScreenTag: TerminalAttentionCorrection?
+    /// The program finished a turn (`done` or `error`) the user has not seen
+    /// yet: the tab was not on screen in a key window then, and has not been
+    /// since (`acknowledgeAgentResult`).
+    @Published private(set) var hasUnseenAgentResult = false
     @Published private(set) var startedAt: Date?
     /// When the program the tab runs now started: at its launch
     /// (`startedAt`), or later, once its persistent session's Create
@@ -3543,11 +3355,16 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// `cleanExitMinimumRunTime` is measured from.
     private(set) var programStartedAt: Date?
     @Published private(set) var exitedAt: Date?
-    @Published private(set) var lastOutputAt: Date?
-    @Published private(set) var outputVersion = 0
-    @Published private(set) var lastInputOutputVersion: Int?
-    @Published private(set) var lastContentChangeAt: Date?
-    @Published private(set) var contentVersion = 0
+    // The output and content counters are not published: no view shows
+    // them, and MCP waits, monitors and tasks read them when they poll.
+    // Each would otherwise re-render every view observing the tab (the
+    // pane, its bars, the window title) on every content change, many
+    // times a second while a program writes, and once per typed key.
+    private(set) var lastOutputAt: Date?
+    private(set) var outputVersion = 0
+    private(set) var lastInputOutputVersion: Int?
+    private(set) var lastContentChangeAt: Date?
+    private(set) var contentVersion = 0
     @Published private(set) var childProcessID: Int32?
     @Published private(set) var exitCode: Int32?
     @Published private(set) var nixShellEnvironment: NixShellEnvironment?
@@ -3589,7 +3406,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var hostedLaunchSizeFile: URL?
     private var announcedAdapterWindowSize: HostedAttachmentSizeFile.Content?
     /// The latest adapter's outcome may be resumed by launching it again
-    /// (`HostedAttachmentStatusFile.isRetryable`).
+    /// (`HostedAttachmentStatusFile.readEnding`'s `retryable`).
     private var hostedLaunchRetryable = false
     /// Brings this tab back when its adapter gave up while attached to an
     /// SSH host's session (`HostedReconnects`): the workspace's
@@ -3725,9 +3542,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var surfaceSignalsWhileFollowing: [(key: String, at: Date)] = []
     private static let notificationDeduplicationWindow: TimeInterval = 3
     private static let bellDeduplicationWindow: TimeInterval = 1
-    /// Plays the terminal bell (Ghostty's, or one the host reported).
-    /// Tests replace it.
-    var bellHandler: @MainActor (TerminalSession) -> Void = { _ in NSSound.beep() }
+    /// Plays the terminal bell (Ghostty's, or one the host reported), unless
+    /// Settings › Notifications › Terminal bell is Silent. Tests replace it.
+    var bellHandler: @MainActor (TerminalSession) -> Void = { _ in TerminalBell.ring() }
     /// The screen read from the host is in `nativeContentLines`, read at
     /// this time; nil when it came from the surface.
     private var hostContentReadAt: Date?
@@ -3883,7 +3700,6 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     let projectRoot: String?
     let tint: NSColor
-    let maxScrollback: Int?
     private(set) var launchWorkingDirectory: String
     let kind: SessionKind
     private let launchBackend: TerminalSessionLaunchBackend
@@ -3891,6 +3707,22 @@ final class TerminalSession: ObservableObject, Identifiable {
     @Published private(set) var parentAgentID: UUID?
     private(set) var commandName: String?
     private(set) var launchCommand: String?
+    /// What this launch runs when it is an agent's that gets Cherry's flags
+    /// on its command line (`AgentLaunch`): `launchCommand` and the flags.
+    /// Nil runs `launchCommand`. Decided once per launch (`startShell`),
+    /// so a rebuilt native surface and a Create retry run the same command
+    /// and a restart decides again; never saved (a record keeps
+    /// `launchCommand`).
+    private(set) var launchStartupCommand: String?
+    /// What this launch decided for Cherry's flags on its agent's command
+    /// line (`AgentLaunchContext.outcome`): the flags it appended, or why
+    /// none. Set in `startShell` for every This Mac agent launch whose
+    /// workspace has an `agentLaunch`; nil for any other tab or launch
+    /// (a device's, an attached or adopted session's, a context-less
+    /// workspace's). Never saved.
+    private(set) var lastAgentLaunchOutcome: AgentLaunch.Outcome?
+    /// The workspace policy's `agentLaunch`: nil adds nothing.
+    private let agentLaunch: AgentLaunchContext?
     private(set) var launchEnvironment: [String: String]
     private(set) var restartOnExit: Bool
     /// Set by the owning workspace: called after a rename, a managed command
@@ -3937,6 +3769,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         wait: TerminalWindowGridWait,
         observe: @MainActor () -> TerminalWindowGridWait.Observation?
     )?
+    /// Set by the workspace showing the tab, as `detachedSurfaceSize`: the
+    /// project window a new session of this tab is created for
+    /// (`TerminalWorkspace.windowID`, the `cherry.window` tag), read when
+    /// its Create goes out; nil for a project's primary window.
+    var creatingWindowID: (@MainActor () -> UUID?)?
 
     /// This tab's surface, laid out in `window` at `size` points, has `grid`
     /// (`GhosttySessionBridge.reportWindowGrid`).
@@ -3998,6 +3835,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var automaticTitle: String?
     private var pendingResolvedCommandLine: String?
 
+    /// Advanced (`bumpRevision`) when something the views observing the tab
+    /// show changed with no published property of its own (`isRunning`,
+    /// the bars' messages): re-renders them.
     @Published private(set) var revision = 0
     /// `ghosttyBridge` is launching a restored tab's adapter for a view
     /// being built: `bumpRevision` publishes on the next turn instead.
@@ -4014,6 +3854,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     // from `ghostty_surface_read_text` on a debounced render signal.
     private static let nativeContentDebounceInterval: TimeInterval = 0.12
     private static let nativeContentReadThrottle: TimeInterval = 0.05
+    /// How often `watchContentForChanges` reads the whole text when the
+    /// visible screen shows no change.
+    private static let nativeContentWatchReadInterval: TimeInterval = 0.5
     private var nativeContentLines: [String] = []
     /// The lines a tab closed because its shell exited showed last
     /// (`keepContentAfterClosing`): what a caller still holding it (MCP
@@ -4023,55 +3866,44 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var nativeContentHash = 0
     private var nativeContentRefreshScheduled = false
     private var lastNativeContentReadAt: Date?
+    /// The visible screen's hash when `watchContentForChanges` last read
+    /// the whole text.
+    private var watchedViewportHash: Int?
     /// Unit/integration fixtures can inject a deterministic VT stream even when
     /// the session owns a live native surface. Once injected, data-layer reads use
     /// the processor snapshot and ignore unrelated shell redraws for that fixture.
     private var usesInjectedTestingContent = false
+    /// The tab's Ghostty surface owns its PTY (an EXEC surface, native or
+    /// persistent), and no fixture injected content in its place.
+    private var usesLiveNativeSurface: Bool {
+        ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent
+    }
+    /// The tab's lines are `nativeContentLines` (the surface's, or the
+    /// host's), not the processor's.
+    private var readsNativeContentLines: Bool {
+        readsContentFromHost || usesLiveNativeSurface
+    }
     /// OSC 133 command-end signal (native). A precise "back at prompt / command
-    /// done" marker for non-TUI commands; published so idle detection can use it.
-    @Published private(set) var lastNativeCommandFinishedAt: Date?
-    private(set) var lastNativeCommandExitCode: Int32?
+    /// done" marker for non-TUI commands, which idle detection reads; not
+    /// published, like the output counters.
+    private(set) var lastNativeCommandFinishedAt: Date?
     let hostInputWriter = TerminalInputWriter()
     private var shellProcess: ShellProcessController?
     private var activeLaunchID: UUID?
     private var viewportSize = TerminalViewportSize(columns: 120, rows: 32)
     /// The surface reported its grid (`resize`): a seed no longer applies.
     private var viewportWasReported = false
-    private var traceRecorder: TerminalTraceRecorder?
-    private let attentionObservationDirectoryProvider: @MainActor () -> URL?
-    private let attentionCorrectionDirectoryProvider: @MainActor () -> URL
-    private let attentionNotificationHandler: @MainActor (TerminalAttentionPrediction, TerminalSession) -> Void
-    private var attentionObservationRecorder: TerminalAttentionObservationRecorder?
-    private var attentionCorrectionRecorder: TerminalAttentionObservationRecorder?
-    private var attentionObservationTask: Task<Void, Never>?
-    private var acknowledgedAttentionAlertGeneration = 0
-    private var isAttentionEpisodeActive = false
-    private var hasHarnessNotificationForAttentionEpisode = false
-    private var attentionNotificationGate = TerminalAttentionNotificationGate()
-    private var currentAttentionScreenTagObservationID: UUID?
-    private var latestAttentionObservationEvent: TerminalAttentionObservationEvent = .contentChanged
-    /// Continuous attention sampling (`TerminalAttentionSampler`); nil for
-    /// tabs that are not agents.
-    private let attentionSampler: TerminalAttentionSampler?
-    /// The sampler's pseudonymous ids of this tab and of its program's
-    /// current launch.
-    private lazy var attentionSampleTabID = TerminalAttentionSampling.stableID(id)
-    private var attentionSampleRunID = TerminalAttentionSampling.stableID(UUID())
-    /// Cherry's state when the tab was last sampled for a change of it.
-    private var lastAttentionSampleSignature: String?
-    private var lastViewportResizeAt: Date?
-    /// Where the agent's current turn stands (read by tests).
-    private(set) var agentTurnState: TerminalAttentionTurnState = .notStarted
-    private var outputHoldUntil: Date?
-    private var isOutputPausedForInteraction = false
-    private var isOutputPausedForBackgroundThrottle = false
-    private var backgroundOutputThrottleTask: Task<Void, Never>?
-    private var backgroundOutputBytesSinceThrottle = 0
+    /// Tells the user a program finished or needs them while its tab is
+    /// not in front (`TerminalNotificationCenter.postProgramStatus`).
+    private let programStatusNotificationHandler: @MainActor (ProgramStatus, TerminalSession) -> Void
+    /// The records of output Cherry parses itself (`ingestTerminalMetadata`:
+    /// the host-managed path, tests); a persistent tab's host keeps its own.
+    private var parsedProgramStatus = ProgramStatusRecords()
+    /// Where the program's latest turn stands, from its reports.
+    private(set) var agentTurnState: AgentTurnState = .notStarted
     private var keyboardProtocolFlagStack: [Int] = []
     private var ghosttyBridgeStorage: GhosttySessionBridge?
     private var renderedReplayCache: RenderedReplayCache?
-    private var lastHumanInputLine: Int?
-    private var lastHumanInputAt: Date?
     private var lastHumanKeystrokeAt: Date?
     private var hasUnsubmittedHumanInput = false
     /// Someone is typing into the agent's composer (keys not submitted
@@ -4082,41 +3914,26 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard let lastHumanKeystrokeAt else { return false }
         return Date().timeIntervalSince(lastHumanKeystrokeAt) < interval
     }
-    private var humanInputGeneration = 0
-    private var agentActivitySource: AgentActivitySource = .none
-    private var titleIndicatesAgentWorking = false
-    private var lastTitleSpinnerAt: Date?
-    /// The last working marker or title spinner pulse seen (read by MCP
-    /// waits and monitors: did a turn start after its submit?).
-    private(set) var lastStrongWorkingEvidenceAt: Date?
+    /// The program has sent a program status report since it started:
+    /// Cherry knows its state from its reports, not from its screen.
+    private(set) var reportsProgramStatus = false
+    /// The last time the program reported `working` (read by MCP waits and
+    /// monitors: did a turn start after its submit?).
+    private(set) var lastWorkingReportAt: Date?
     /// Turns Cherry saw submitted to this agent (an Enter typed or sent by
     /// MCP), over the tab's life in this run of Cherry.
     private(set) var agentSubmittedTurnCount = 0
-    /// Turns the agent began by itself after one ended (it answered a
-    /// background agent's or task's result, woke up on a schedule, a hook
-    /// continued it): `AgentResumedWorkDetector`, over the tab's life in
-    /// this run of Cherry.
-    private(set) var agentSelfResumedTurnCount = 0
-    /// MCP's `agent_turn`: every turn Cherry saw start, submitted or begun
-    /// by the agent itself. It only grows.
-    var agentTurnCount: Int { agentSubmittedTurnCount &+ agentSelfResumedTurnCount }
-    /// Watches a finished turn's agent for work it resumes by itself.
-    private var resumedWorkDetector = AgentResumedWorkDetector()
-    /// The last key or input sent to the agent (any key, a paste, MCP
-    /// input): a screen change right after one may be its own effect.
-    private var lastAgentInputAt: Date?
-    /// When the latest of those turns was submitted.
+    /// Turns the program reported starting (`working` after a state that
+    /// was not part of a turn), submitted or begun by itself.
+    private(set) var agentReportedTurnCount = 0
+    /// MCP's `agent_turn`: every turn Cherry saw start, submitted or
+    /// reported. It only grows.
+    var agentTurnCount: Int { max(agentSubmittedTurnCount, agentReportedTurnCount) }
+    /// When the latest of the submitted turns was submitted.
     private(set) var lastAgentSubmitAt: Date?
-    /// The agent showed it was at work (strong evidence) when that turn was
-    /// submitted: a message the CLI queues behind the running turn.
+    /// The program reported `working` when that turn was submitted: a
+    /// message the CLI queues behind the running turn.
     private(set) var agentWasWorkingAtLastSubmit = false
-    /// The agent's screen showed recognizable activity (its composer, a
-    /// working marker, a title spinner or a notification) when that turn
-    /// was submitted: Cherry can read this CLI, so it can tell when the
-    /// turn starts.
-    private(set) var agentWasReadableAtLastSubmit = false
-    private var agentIdleConfirmationTask: Task<Void, Never>?
-    private var agentIdleRecheckTask: Task<Void, Never>?
     private var auxiliaryProcessingSuspensionTask: Task<Void, Never>?
     private var lastContentFingerprint: Int?
     private var pendingMetadataOutput = Data()
@@ -4124,24 +3941,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     private var isMetadataOutputFlushScheduled = false
     private var shouldResetMetadataParserBeforeFlush = false
     private var isAuxiliaryProcessingActive = true
-
-    enum AgentActivitySource {
-        case none
-        case outputActivity
-        case inputSubmit
-        // Idle inferred purely from a quiet content window (no prompt/marker/spinner
-        // to key off) — weak evidence, so fresh output flips straight back to working.
-        case quietWindow
-        case promptMarker
-        case workingMarker
-        case titleSpinner
-        case notification
-        case processExit
-        // A permission or question menu on screen
-        // (`AgentScreenActivity.answerMenu`): the state follows the menu
-        // and ends when it goes.
-        case answerMenu
-    }
 
     private enum AgentDraftInputEffect: Equatable {
         case none
@@ -4165,15 +3964,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     private static let auxiliaryTerminalProcessorStartupGrace: TimeInterval = 3.0
     private static let metadataOutputPendingByteLimit = 512 * 1024
     private static let metadataOutputFlushInterval: TimeInterval = 0.2
-    private static let backgroundOutputThrottleByteInterval = 256 * 1024
-    private static let backgroundOutputThrottleDuration: TimeInterval = 0.5
-    private static let userScrollOutputHoldInterval: TimeInterval = 0.16
-    private static let agentIdleConfirmationEvidenceWindow: TimeInterval = 1.0
-    private static let agentIdleConfirmationDelay: TimeInterval = 0.4
-    private static let agentIdleRecheckQuietInterval: TimeInterval = 4.0
-    private static let attentionObservationInterval: TimeInterval = 1.0
-    private static let attentionObservationMaximumRows = 200
-    private static let attentionObservationMaximumColumns = 512
     private static let contentFingerprintTailLineLimit = 40
 
     init(
@@ -4185,7 +3975,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         workingDirectory: String = NSHomeDirectory(),
         projectRoot: String? = nil,
         maxScrollback: Int? = TerminalSession.defaultMaxScrollback,
-        buffer: (any TerminalBuffering)? = nil,
+        buffer: LiveTerminalOutputBuffer? = nil,
         launchShell: Bool = true,
         kind: SessionKind = .terminal,
         agentName: String? = nil,
@@ -4201,22 +3991,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         adoptingPersistentSession: PersistentSessionLaunch? = nil,
         deferredLaunch: Bool = false,
         provisionalRestore: Bool = false,
-        attentionObservationDirectoryProvider: @escaping @MainActor () -> URL? = {
-            TerminalAttentionObservationRecorder.configuredDirectoryURL
-        },
-        attentionCorrectionDirectoryProvider: @escaping @MainActor () -> URL = {
-            TerminalAttentionStudy.correctionsDirectoryURL()
-        },
-        attentionNotificationHandler: @escaping @MainActor (
-            TerminalAttentionPrediction,
-            TerminalSession
-        ) -> Void = { _, session in
-            TerminalNotificationCenter.shared.postAttention(for: session)
-        },
-        attentionSampler: TerminalAttentionSampler? = .shared
+        agentLaunch: AgentLaunchContext? = nil,
+        programStatusNotificationHandler: @escaping @MainActor (ProgramStatus, TerminalSession) -> Void = { status, session in
+            TerminalNotificationCenter.shared.postProgramStatus(status, for: session)
+        }
     ) {
         self.id = id
-        self.attentionSampler = kind == .agent ? attentionSampler : nil
         self.title = title
         self.titleSource = titleSource
         self.subtitle = subtitle
@@ -4224,7 +4004,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.workingDirectory = workingDirectory
         self.launchWorkingDirectory = workingDirectory
         self.projectRoot = projectRoot
-        self.maxScrollback = maxScrollback
         self.kind = kind
         self.launchBackend = launchBackend
         self.hostedAttachment = hostedAttachment
@@ -4238,11 +4017,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.parentAgentID = kind == .agent ? parentAgentID : nil
         self.commandName = commandName
         self.launchCommand = launchCommand?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.agentLaunch = agentLaunch
         self.launchEnvironment = launchEnvironment
         self.restartOnExit = restartOnExit
-        self.attentionObservationDirectoryProvider = attentionObservationDirectoryProvider
-        self.attentionCorrectionDirectoryProvider = attentionCorrectionDirectoryProvider
-        self.attentionNotificationHandler = attentionNotificationHandler
+        self.programStatusNotificationHandler = programStatusNotificationHandler
         self.systemTitle = title
         let processorMaxScrollback = Self.processorMaxScrollback(for: kind, configuredMaxScrollback: maxScrollback)
         let processorBuffer = buffer ?? LiveTerminalOutputBuffer(maxScrollback: processorMaxScrollback)
@@ -4254,7 +4032,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             buffer: processorBuffer,
             backpressurePolicy: processorBackpressurePolicy
         )
-        self.traceRecorder = TerminalTraceRecorder(sessionID: id, title: title)
         self.processor.setChangeHandler { [weak self] in
             Task { @MainActor [weak self] in
                 self?.handleProcessorDidChange()
@@ -4348,12 +4125,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         isAuxiliaryProcessingActive = isActive
         processor.setOutputProcessingSuspended(!isActive)
 
-        if isActive {
-            cancelBackgroundOutputThrottle()
-        } else {
-            backgroundOutputBytesSinceThrottle = 0
-        }
-
         guard isActive else { return }
 
         processor.clear()
@@ -4361,53 +4132,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard !replay.isEmpty else { return }
 
         ingestTerminalMetadata(replay)
-        guard !prototypeProcessorDisabledForPerf else { return }
         processor.enqueueOutput(replay, launchID: activeLaunchID, responseWriter: { _ in })
-    }
-
-    private func noteProcessOutputForBackgroundThrottle(bytes: Int) {
-        guard kind == .terminal,
-              !isAuxiliaryProcessingActive,
-              bytes > 0,
-              !isOutputPausedForBackgroundThrottle
-        else {
-            return
-        }
-
-        backgroundOutputBytesSinceThrottle += bytes
-        guard backgroundOutputBytesSinceThrottle >= Self.backgroundOutputThrottleByteInterval else { return }
-        backgroundOutputBytesSinceThrottle = 0
-        isOutputPausedForBackgroundThrottle = true
-        TerminalPerformanceMonitor.recordBackgroundOutputThrottle()
-        updateShellOutputPauseState()
-
-        backgroundOutputThrottleTask?.cancel()
-        backgroundOutputThrottleTask = Task { [weak self] in
-            let nanoseconds = UInt64(Self.backgroundOutputThrottleDuration * 1_000_000_000)
-            try? await Task.sleep(nanoseconds: nanoseconds)
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                guard let self else { return }
-                self.isOutputPausedForBackgroundThrottle = false
-                self.updateShellOutputPauseState()
-            }
-        }
-    }
-
-    private func cancelBackgroundOutputThrottle() {
-        backgroundOutputThrottleTask?.cancel()
-        backgroundOutputThrottleTask = nil
-        isOutputPausedForBackgroundThrottle = false
-        backgroundOutputBytesSinceThrottle = 0
-        updateShellOutputPauseState()
-    }
-
-    private func updateShellOutputPauseState() {
-        if isOutputPausedForInteraction || isOutputPausedForBackgroundThrottle {
-            shellProcess?.pauseOutput()
-        } else {
-            shellProcess?.resumeOutput()
-        }
     }
 
     var lineCount: Int {
@@ -4422,7 +4147,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         // Lines read from the host (a persistent tab no surface shows, such
         // as a restored one whose adapter waits) are the ones MCP output
         // numbers, as `lineCount` counts them.
-        return readsContentFromHost || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent)
+        return readsNativeContentLines
             ? nativeContentLines.count
             : processor.lineCount
     }
@@ -4461,6 +4186,20 @@ final class TerminalSession: ObservableObject, Identifiable {
         return application && (info.kittyKeyboardFlags ?? 0) == 0
     }
 
+    /// Whether the program set xterm's modifyOtherKeys to level 2, as its
+    /// host reports it for a hosted tab (`HostedSessionInfo.modifyOtherKeys`;
+    /// Ghostty's surface parses it for the adapter, not for Cherry): keys
+    /// typed while an adapter is away (`HostRoutedKeyEncoder`) are encoded
+    /// as Ghostty's surface would then, unless the kitty keyboard protocol
+    /// is on (it wins, as in Ghostty). False when the host does not report
+    /// it (an older host or holder) or reports nothing now. MCP input needs
+    /// nothing for it: the only keys with modifiers it can name (arrows,
+    /// Home, End, Page Up/Down, Delete, Shift+Tab) are typed the same either
+    /// way.
+    var usesModifyOtherKeys: Bool {
+        hostReportedSessionInfo?.modifyOtherKeys ?? false
+    }
+
     /// Whether the program turned on bracketed paste: as its host reports
     /// it for a hosted tab (`HostedSessionInfo.bracketedPaste`; the surface
     /// parses the mode for the adapter, not for Cherry), else as parsed from
@@ -4481,6 +4220,15 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// program that did not, the markers arrive as input: `cat > file`
     /// writes them into the file, and a vi-mode line editor takes the ESC
     /// as a key. A single line is left as it is.
+    /// Whether MCP sends a multi-line message to this agent as one
+    /// bracketed paste: agent CLIs turn bracketed paste on, so unless the
+    /// host reports the program has it off. A native surface pastes the
+    /// paste's text as the program asks either way
+    /// (`NativeInputTranslator`).
+    var bracketsAgentMessage: Bool {
+        hostReportedSessionInfo?.bracketedPaste ?? true
+    }
+
     func bracketsPaste(_ text: String) -> Bool {
         guard persistentHosting != nil || hostedAttachment != nil else {
             return processor.usesBracketedPasteMode
@@ -4491,10 +4239,6 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     var mouseState: TerminalMouseState {
         processor.mouseState
-    }
-
-    var statusLine: String {
-        "\(state.label) · \(lineSummary)"
     }
 
     /// Whether MCP input (`sendControlInput`) can reach the program: when
@@ -4731,18 +4475,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         viewportSize
     }
 
-    func lineLength(at row: Int) -> Int {
-        processor.lineLength(at: row)
-    }
-
-    func gridPoint(row: Int, column: Int) -> TerminalGridPoint {
-        processor.gridPoint(row: row, column: column)
-    }
-
-    func selectedText(in selection: TerminalSelectionRange) -> String {
-        processor.selectedText(in: selection)
-    }
-
     func setParentAgentID(_ parentAgentID: UUID?) {
         guard kind == .agent else { return }
         let changed = self.parentAgentID != parentAgentID
@@ -4762,7 +4494,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             SessionLog.debugContent("[send text] \(text.debugDescription)")
         }
         if routePersistentInput(data) { return }
-        if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
+        if usesLiveNativeSurface {
             ghosttyBridgeStorage?.sendNativeInput(data)
             return
         }
@@ -4785,8 +4517,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         // the input as sent. Only bytes that reach the program as they are
         // (the host's `SendInput`, a host-managed PTY) are normalized for
         // the kitty flags the program set.
-        let toSurface = ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent
-            && !persistentInputGoesThroughHost
+        let toSurface = usesLiveNativeSurface && !persistentInputGoesThroughHost
         let outboundData = normalize && !toSurface ? normalizedInputData(data) : data
         if !outboundData.isEmpty {
             noteInputBurst(outboundData)
@@ -5140,33 +4871,10 @@ final class TerminalSession: ObservableObject, Identifiable {
         return .notDelivered(inputFailureReason(error))
     }
 
-    func sendInterrupt() {
-        guard acceptsInput else { return }
-        if inputDebugEnabled {
-            SessionLog.debug("[send interrupt] shellProcess=\(shellProcess != nil)")
-        }
-        noteAgentDraftCleared()
-        noteAgentTurnInterrupted()
-        processor.discardPendingOutput()
-        if routePersistentInput(Data([0x03])) { return }
-        if ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent {
-            ghosttyBridgeStorage?.sendNativeInput(Data([0x03]))
-            return
-        }
-        shellProcess?.writeUrgent(Data([0x03]))
-    }
-
     func noteNativeHostInput(event: NSEvent?) {
-        clearCurrentAttentionScreenTag()
         noteInputOutputBaseline()
         guard kind == .agent, let event else { return }
-        if event.type == .keyDown {
-            lastAgentInputAt = Date()
-        }
         applyAgentDraftInputEffect(Self.appKitDraftInputEffect(event))
-        if Self.appKitKeyEventInterruptsAgentTurn(event) {
-            noteAgentTurnInterrupted()
-        }
     }
 
     /// Mirror the kernel tty's flush-on-INTR for Cherry's own pipeline:
@@ -5177,14 +4885,14 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// manage their own interrupt handling.
     private func discardPendingOutputForInterrupt(in outboundData: Data) {
         guard outboundData.contains(0x03) else { return }
-        noteAgentTurnInterrupted()
         processor.discardPendingOutput()
     }
 
-    /// Clear Scrollback (⌘K) and MCP `clear_output`: the tab's screen and
-    /// history, and for a persistent tab its host's copy of the history too
-    /// (`clearHostHistory`), which reads through the host (MCP output and
-    /// search) and the next attach adapter would otherwise bring back.
+    /// Clear Scrollback (⌘K) and the control request `clearOutput`: the
+    /// tab's screen and history, and for a persistent tab its host's copy
+    /// of the history too (`clearHostHistory`), which reads through the host
+    /// (MCP output and search) and the next attach adapter would otherwise
+    /// bring back.
     /// Returns the host's clear, for a caller that waits for it: nil when
     /// the host cleared it, else why it kept it.
     @discardableResult
@@ -5216,8 +4924,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func clearScrollback(preservingTerminalState: Bool) {
-        outputHoldUntil = nil
-        resumeOutputIfPausedForInteraction()
         renderedReplayCache = nil
         rawOutputStore.clear()
         if preservingTerminalState {
@@ -5227,8 +4933,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             processor.clear()
             ghosttyBridgeStorage?.reset()
         }
-        lastHumanInputLine = nil
-        lastHumanInputAt = nil
         lastContentFingerprint = nil
         clearUnreadNotification()
         bumpRevision()
@@ -5377,28 +5081,15 @@ final class TerminalSession: ObservableObject, Identifiable {
         finalScreenRead = nil
         let launchID = activeLaunchID
         activeLaunchID = nil
-        attentionSampler?.unregister(self)
         auxiliaryProcessingSuspensionTask?.cancel()
         auxiliaryProcessingSuspensionTask = nil
-        backgroundOutputThrottleTask?.cancel()
-        backgroundOutputThrottleTask = nil
-        isOutputPausedForBackgroundThrottle = false
-        backgroundOutputBytesSinceThrottle = 0
         nixShellEnvironment = nil
-        cancelAgentIdleConfirmation()
-        cancelAgentIdleRecheck()
-        attentionObservationTask?.cancel()
-        attentionObservationTask = nil
         resetKeyboardProtocolState()
-        lastHumanInputLine = nil
-        lastHumanInputAt = nil
         lastHumanKeystrokeAt = nil
         hasUnsubmittedHumanInput = false
-        outputHoldUntil = nil
         pendingResolvedCommandLine = nil
         resolvedCommandLine = nil
         processor.endLaunch(launchID)
-        updateShellOutputPauseState()
         hostInputWriter.set(nil)
         // Stopping kills only the local adapter. A close reported before the
         // exit callback may follow an outcome the adapter already wrote, so
@@ -5721,11 +5412,16 @@ final class TerminalSession: ObservableObject, Identifiable {
         if state != .exited(0) || exitCode != 0 {
             markStoppedOnRequest()
         }
-        let hideCursor = Data("\u{1B}[?25l".utf8)
-        renderedReplayCache = nil
-        rawOutputStore.append(hideCursor)
-        processor.ingestTestingData(hideCursor)
+        appendLocalOutput(Data("\u{1B}[?25l".utf8))
         bumpRevision()
+    }
+
+    /// Output Cherry writes into the tab itself, not the program: kept with
+    /// its raw output and parsed into the processor's screen.
+    private func appendLocalOutput(_ data: Data) {
+        renderedReplayCache = nil
+        rawOutputStore.append(data)
+        processor.ingestTestingData(data)
     }
 
     func updateManagedCommand(_ command: ProjectCommandDefinition, workingDirectory: String) {
@@ -5758,28 +5454,17 @@ final class TerminalSession: ObservableObject, Identifiable {
         processor.resize(to: size)
     }
 
-    func resize(columns: Int, rows: Int, forceShellResize: Bool = false) {
+    func resize(columns: Int, rows: Int) {
         let nextSize = TerminalViewportSize(columns: columns, rows: rows)
         guard nextSize.columns > 0, nextSize.rows > 0 else { return }
         viewportWasReported = true
-        guard nextSize != viewportSize else {
-            if forceShellResize {
-                shellProcess?.resize(columns: nextSize.columns, rows: nextSize.rows)
-            }
-            return
-        }
+        guard nextSize != viewportSize else { return }
 
         viewportSize = nextSize
-        lastViewportResizeAt = Date()
         renderedReplayCache = nil
         processor.resize(to: nextSize)
         shellProcess?.resize(columns: nextSize.columns, rows: nextSize.rows)
         revision &+= 1
-    }
-
-    func deferOutputForUserInteraction() {
-        outputHoldUntil = Date(timeIntervalSinceNow: Self.userScrollOutputHoldInterval)
-        pauseOutputForInteractionIfNeeded()
     }
 
     func ingestTestingData(_ data: Data) {
@@ -5800,7 +5485,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 #endif
 
     func rawOutput(maxBytes: Int) -> (data: Data, truncated: Bool) {
-        if readsContentFromHost || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
+        if readsNativeContentLines {
             // Native-PTY: the host owns no byte stream, so the surface IS the
             // source of truth. NOTE: this is rendered text, not raw VT bytes — a
             // deliberate semantic change for native panes (no escape sequences, no
@@ -5818,8 +5503,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         return rawOutputStore.snapshot(maxBytes: maxBytes)
     }
 
-    func observeRawOutput(replayExistingOutput: Bool, _ observer: @escaping @Sendable (Data) -> Void) -> UUID {
-        rawOutputStore.observe(replayExistingOutput: replayExistingOutput, observer)
+    func observeRawOutput(_ observer: @escaping @Sendable (Data) -> Void) -> UUID {
+        rawOutputStore.observe(observer)
     }
 
     func removeRawOutputObserver(id: UUID) {
@@ -5875,8 +5560,30 @@ final class TerminalSession: ObservableObject, Identifiable {
             environment: launchEnvironment,
             term: ShellProcessController.preferredTerminfo.term,
             initialSize: viewportSize,
-            startupCommand: launchCommand
+            startupCommand: launchStartupCommand ?? launchCommand
         )
+    }
+
+    /// `launchCommand` and Cherry's flags when this launch is an agent's on
+    /// This Mac (native, or in This Mac's host) that gets them
+    /// (`AgentLaunchContext.outcome`); nil for any other launch, which runs
+    /// `launchCommand`. Another Mac's launches add theirs in
+    /// `RemoteLaunchSpec`. The log says why an agent did or did not get them.
+    /// `outcome` is what was decided, nil when nothing was (not a This Mac
+    /// agent's launch, or no context).
+    private func commandWithAgentFlags() -> (command: String?, outcome: AgentLaunch.Outcome?) {
+        guard kind == .agent, let agentLaunch, let launchCommand, hostedAttachment == nil,
+              persistentHosting?.profile.isThisMac ?? true
+        else { return (nil, nil) }
+        let outcome = agentLaunch.outcome(commandLine: launchCommand, processID: id.uuidString)
+        switch outcome {
+        case .appended(let suffix):
+            SessionLog.debug("[agent] tab \(id.uuidString) starts its agent with the cherry CLI's flags:\(suffix)")
+            return (launchCommand + suffix, outcome)
+        case .skipped(let reason):
+            SessionLog.debug("[agent] tab \(id.uuidString) starts its agent without Cherry's flags: \(reason)")
+            return (nil, outcome)
+        }
     }
 
     /// Native-PTY (EXEC) command + environment for the ghostty surface to spawn,
@@ -5957,15 +5664,12 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         let launchID = UUID()
         activeLaunchID = launchID
-        // Each launch is a new run of samples (a restart starts over).
-        attentionSampleRunID = TerminalAttentionSampling.stableID(launchID)
-        lastAttentionSampleSignature = nil
-        attentionSampler?.register(self)
         // A restored or adopted session (`persistentSessionToAdopt`, taken
         // by `startPersistentLaunch`) and an attached one were running
         // before this launch.
         startedCurrentProgram = hostedAttachment == nil
             && (persistentHosting == nil || persistentSessionToAdopt == nil)
+        (launchStartupCommand, lastAgentLaunchOutcome) = startedCurrentProgram ? commandWithAgentFlags() : (nil, nil)
         cancelPersistentReconnect()
         if let hostedAttachment {
             hostedAttachmentStatus = .active
@@ -5973,14 +5677,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         resetAutomaticTitleForNewAgentLaunch()
         resetKeyboardProtocolState()
-        outputHoldUntil = nil
-        backgroundOutputThrottleTask?.cancel()
-        backgroundOutputThrottleTask = nil
-        isOutputPausedForInteraction = false
-        isOutputPausedForBackgroundThrottle = false
-        backgroundOutputBytesSinceThrottle = 0
         processor.beginLaunch(launchID)
-        updateShellOutputPauseState()
         state = .launching
         if isAutoRestartPaused {
             isAutoRestartPaused = false
@@ -5989,36 +5686,18 @@ final class TerminalSession: ObservableObject, Identifiable {
         programStartedAt = startedAt
         exitedAt = nil
         lastOutputAt = nil
-        lastHumanInputAt = nil
         lastHumanKeystrokeAt = nil
         hasUnsubmittedHumanInput = false
         usesInjectedTestingContent = false
-        attentionClassifierPrediction = nil
-        attentionAlertGeneration = 0
-        acknowledgedAttentionAlertGeneration = 0
-        hasUnacknowledgedAttention = false
-        isAttentionEpisodeActive = false
-        hasHarnessNotificationForAttentionEpisode = false
-        attentionNotificationGate = TerminalAttentionNotificationGate()
-        clearCurrentAttentionScreenTag()
-        latestAttentionObservationEvent = .contentChanged
-        agentTurnState = .notStarted
-        resumedWorkDetector.disarm()
-        lastAgentInputAt = nil
+        // What the program reports from here on is about this launch; a
+        // restored or adopted session's host reports its records again.
+        resetProgramStatus()
         childProcessID = nil
         // A session of This Mac's program, while the adapter runs; never
         // another machine's.
         hostedProgramProcessID = hostedAttachment?.host == .local ? attachedLocalProgramProcessID : nil
         exitCode = nil
         nixShellEnvironment = nil
-        if kind == .agent {
-            cancelAgentIdleConfirmation()
-            cancelAgentIdleRecheck()
-            titleIndicatesAgentWorking = false
-            lastTitleSpinnerAt = nil
-            lastStrongWorkingEvidenceAt = nil
-            setAgentActivityState(.unknown, source: .none)
-        }
         bumpRevision()
 
         if launchBackend == .nativePTY {
@@ -6034,21 +5713,16 @@ final class TerminalSession: ObservableObject, Identifiable {
         // dependency. No app setting or environment variable selects this path.
         do {
             let processor = processor
-            let traceRecorder = traceRecorder
             let process = try ShellProcessController(
                 configuration: shellLaunchConfiguration(),
                 onData: { data in
                     TerminalPerformanceMonitor.recordPTYOutputChunk(bytes: data.count)
-                    traceRecorder?.recordOutput(data)
                     self.renderedReplayCache = nil
                     self.rawOutputStore.append(data)
                     self.enqueueTerminalMetadata(data)
-                    self.noteProcessOutputForBackgroundThrottle(bytes: data.count)
-                    if !prototypeProcessorDisabledForPerf {
-                        processor.enqueueOutput(data, launchID: launchID, responseWriter: { response in
-                            self.hostInputWriter.write(response, normalize: false, notifyInput: false)
-                        })
-                    }
+                    processor.enqueueOutput(data, launchID: launchID, responseWriter: { response in
+                        self.hostInputWriter.write(response, normalize: false, notifyInput: false)
+                    })
                 },
                 onExit: { [weak self] status in
                     DispatchQueue.main.async {
@@ -6179,7 +5853,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             workingDirectory: hosting.profile.isThisMac
                 ? [workingDirectory, launchWorkingDirectory, projectRoot]
                     .compactMap { $0 }
-                    .first(where: Self.isExistingDirectory) ?? NSHomeDirectory()
+                    .first(where: isExistingDirectory) ?? NSHomeDirectory()
                 // Another Mac's directories are not looked for here: its
                 // host refuses one that does not exist.
                 : [workingDirectory, launchWorkingDirectory, projectRoot.map(ProjectLocation.launchPath(forKey:))]
@@ -6214,8 +5888,8 @@ final class TerminalSession: ObservableObject, Identifiable {
                     // run at once (a server releases its port). Bounded: a
                     // host that does not answer delays this launch no more.
                     if let earlierLaunch {
-                        await Self.wait(
-                            for: earlierLaunch,
+                        await waitForTask(
+                            earlierLaunch,
                             upTo: restartExitTimeout * 2 + .seconds(hosting.configuration.creationTimeout)
                         )
                     }
@@ -6230,6 +5904,9 @@ final class TerminalSession: ObservableObject, Identifiable {
                     // asked for only once the host is reached and the launch
                     // spec is ready: a new window settles meanwhile.
                     let startedAt = ContinuousClock.now
+                    // Tagged with the window that shows the tab now.
+                    var request = request
+                    request.windowID = self.creatingWindowID?()
                     launch = try await hosting.create(request, configuration: configuration) { [weak self] in
                         guard let self else { throw CancellationError() }
                         return try await self.persistentCreateGrid(
@@ -6324,7 +6001,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         while let (key, entry) = persistentLaunchesInFlight.first(where: { !$0.value.claim.keepsSession }) {
             let remaining = deadline - ContinuousClock.now
             guard remaining > .zero else { return }
-            await wait(for: entry.task, upTo: remaining)
+            await waitForTask(entry.task, upTo: remaining)
             persistentLaunchesInFlight[key] = nil
         }
     }
@@ -6417,11 +6094,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         // With the pixels its window's terminal of that grid reports, which
         // its adapter will.
         return (grid, windowTerminalCell?(grid))
-    }
-
-    private static func isExistingDirectory(_ path: String) -> Bool {
-        var isDirectory: ObjCBool = false
-        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) && isDirectory.boolValue
     }
 
     private func bindPersistentSession(
@@ -6665,7 +6337,17 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         if case .exited(let code, let signal) = outcome {
             // An exit without a status is never taken for a clean one.
-            finishPersistentProgram(status: code ?? signal.map { 128 + $0 } ?? 1, launchID: launchID)
+            let status = code ?? signal.map { 128 + $0 } ?? 1
+            // The adapter can report the end before the host's event does,
+            // and only the host says whether its holder died (the tab then
+            // says the host crashed, and a command is not restarted): while
+            // its connection still lists the session running, the tab waits
+            // a moment for that report (`awaitHostReportedExit`).
+            if case .running = persistentHosting.programState(of: binding) {
+                awaitHostReportedExit(status: status, launchID: launchID, binding: binding, hosting: persistentHosting)
+                return
+            }
+            finishPersistentProgram(status: status, launchID: launchID)
             return
         }
         // The host's title and directory are the current ones until an
@@ -6731,6 +6413,32 @@ final class TerminalSession: ObservableObject, Identifiable {
         }
         persistentReconnect = item
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    /// The adapter reported the program's exit (`status`) before the host
+    /// did: the tab finishes with the host's report when it comes
+    /// (`persistentProgramDidExit`, whose `finishPersistentProgram` cancels
+    /// this), else with the adapter's status after
+    /// `adapterExitHostReportWait`. It reconnects meanwhile: input goes
+    /// through the host.
+    private func awaitHostReportedExit(
+        status: Int32,
+        launchID: UUID,
+        binding: HostedSessionAttachment,
+        hosting: PersistentLocalSessions
+    ) {
+        persistentReconnect?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.activeLaunchID == launchID,
+                  self.persistentPhase == .reconnecting,
+                  self.persistentSession == binding
+            else { return }
+            self.persistentReconnect = nil
+            self.finishPersistentProgram(status: status, launchID: launchID)
+        }
+        persistentReconnect = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + hosting.configuration.adapterExitHostReportWait, execute: item)
     }
 
     private func cancelPersistentReconnect() {
@@ -6989,7 +6697,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         return info.localWorkingDirectory
     }
 
-    /// Takes the title and directory the host reports for the program when
+    /// Takes the program status records the host keeps, and the title and
+    /// directory it reports for the program when
     /// they changed since its last report, unless the attach adapter passes
     /// them to the surface (which reports them itself, in order with the
     /// program's output). `resynchronizing`: the tab starts following a
@@ -6998,6 +6707,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// whatever was reported before. A directory on another machine (the
     /// program ran ssh) is ignored, as Ghostty ignores such an OSC 7.
     private func applyHostReportedTitleAndDirectory(of info: HostedSessionInfo, resynchronizing: Bool) {
+        // Program status never passes through the adapter: the host keeps
+        // the records (its stream keeps OSC 7501 from every surface).
+        applyProgramStatus(info.programStatus)
         let passesThrough = !resynchronizing && adapterPassesSignalsThrough
         // A device's tab takes its directory from the host even while the
         // adapter passes signals through: the surface ignores an OSC 7 of
@@ -7020,9 +6732,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             lastHostReportedTitle = info.title
             if !passesThrough, let title = info.title?.nilIfEmpty {
                 if kind == .agent {
-                    // A title reported earlier is no sign of what the agent
-                    // does now.
-                    didChange = (resynchronizing ? applyAutomaticAgentTitle(from: title) : recordAgentTitleActivity(title)) || didChange
+                    didChange = applyAutomaticAgentTitle(from: title) || didChange
                 } else if systemTitle != title {
                     updateSystemTitle(title)
                     didChange = true
@@ -7059,7 +6769,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             guard hostSignalMissedTheAdapter(key: "bell"),
                   noteSignalDelivery(key: "bell", fromHost: true, window: Self.bellDeduplicationWindow)
             else { return }
-            noteAttentionSampleEvent(.bell)
             bellHandler(self)
         case .notification(let title, let body):
             let key = Self.notificationKey(title: title, body: body)
@@ -7318,17 +7027,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         exitCode = status
         nixShellEnvironment = nil
         exitedAt = Date()
-        if kind == .agent {
-            cancelAgentIdleConfirmation()
-            cancelAgentIdleRecheck()
-            titleIndicatesAgentWorking = false
-            lastTitleSpinnerAt = nil
-            setAgentActivityState(status == 0 ? .idle : .error, source: .processExit)
-        }
+        // The program is gone: its working, blocked and idle records go (a
+        // persistent tab's host drops them itself).
+        endParsedProgramStatus()
         resetKeyboardProtocolState()
-        outputHoldUntil = nil
         processor.endLaunch(launchID)
-        resumeOutputIfPausedForInteraction()
         if hostedAttachment != nil {
             // The adapter's own exit status does not say whether the hosted
             // program ended; its status file does.
@@ -7344,10 +7047,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             SessionLog.notice("tab \(id.uuidString): \(notFound)")
         }
         if kind == .agent || kind == .command {
-            let hideCursor = Data("\u{1B}[?25l".utf8)
-            renderedReplayCache = nil
-            rawOutputStore.append(hideCursor)
-            processor.ingestTestingData(hideCursor)
+            appendLocalOutput(Data("\u{1B}[?25l".utf8))
             if kind == .command, restartOnExit {
                 if let hostSessionEnd {
                     // Not the command's own failure: restarting it would
@@ -7363,8 +7063,6 @@ final class TerminalSession: ObservableObject, Identifiable {
                 hostSessionEnd.map { "[\($0.message)]" } ?? "[shell exited with status \(status)]"
             ])
         }
-        noteAttentionSampleEvent(.exited, detail: String(status))
-        scheduleAttentionObservation(event: .processExited)
         bumpRevision()
         if isPersistentLocalSession {
             // Saved with its exit (`savedExitStatus`): a relaunch that finds
@@ -7555,7 +7253,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             // daemon heard from its holder again: the adapter finds out.
             launchDeferredAdapterIfNeeded()
         case .bell:
-            noteAttentionSampleEvent(.bell)
             bellHandler(self)
         case .notification(_, let title, let body):
             handleIncomingNotification(TerminalNotificationRequest(title: title.nilIfEmpty, body: body, source: .osc777))
@@ -7605,48 +7302,12 @@ final class TerminalSession: ObservableObject, Identifiable {
                 lines += ["", "[shell exited with status \(status)]"]
             }
             guard !lines.isEmpty else { return }
-            let data = Data(lines.joined(separator: "\r\n").utf8)
-            self.renderedReplayCache = nil
-            self.rawOutputStore.append(data)
-            self.processor.ingestTestingData(data)
+            self.appendLocalOutput(Data(lines.joined(separator: "\r\n").utf8))
             self.outputVersion &+= 1
             self.contentVersion &+= 1
             self.lastContentChangeAt = Date()
             self.bumpRevision()
         }
-    }
-
-    private func pauseOutputForInteractionIfNeeded() {
-        guard !isOutputPausedForInteraction else { return }
-        isOutputPausedForInteraction = true
-        updateShellOutputPauseState()
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.userScrollOutputHoldInterval) { [weak self] in
-            self?.resumeOutputIfScrollHoldExpired()
-        }
-    }
-
-    private func resumeOutputIfScrollHoldExpired() {
-        guard let outputHoldUntil else {
-            resumeOutputIfPausedForInteraction()
-            return
-        }
-
-        let remaining = outputHoldUntil.timeIntervalSinceNow
-        if remaining > 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
-                self?.resumeOutputIfScrollHoldExpired()
-            }
-            return
-        }
-
-        self.outputHoldUntil = nil
-        resumeOutputIfPausedForInteraction()
-    }
-
-    private func resumeOutputIfPausedForInteraction() {
-        guard isOutputPausedForInteraction else { return }
-        isOutputPausedForInteraction = false
-        updateShellOutputPauseState()
     }
 
     private func handleProcessorDidChange() {
@@ -7663,17 +7324,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         outputVersion &+= 1
         let contentChanged = updateContentFingerprint()
         if contentChanged {
-            clearCurrentAttentionScreenTag()
             lastContentChangeAt = Date()
             contentVersion &+= 1
-        }
-        if kind == .agent, contentChanged {
-            noteAttentionSampleContentChange()
-            recordAgentActivitySignal()
-            if agentActivityState == .working {
-                scheduleAgentIdleRecheck()
-            }
-            scheduleAttentionObservation(event: .contentChanged)
         }
         bumpRevision()
     }
@@ -7694,29 +7346,22 @@ final class TerminalSession: ObservableObject, Identifiable {
     }
 
     private func noteInputBurst(_ input: Data) {
-        clearCurrentAttentionScreenTag()
         ghosttyBridgeStorage?.noteHostInputForOutputLatency()
         noteInputOutputBaseline()
         guard kind == .agent else { return }
-        lastAgentInputAt = Date()
         applyAgentDraftInputEffect(Self.agentDraftInputEffect(input))
-        if input == Data([0x1B]) {
-            noteAgentTurnInterrupted()
-        }
     }
 
-    /// Assigns only a changed value: every keystroke comes here, and
-    /// publishing an unchanged one would re-render every view observing
-    /// the tab once per key.
+    /// Where the output was when input last came: every keystroke comes
+    /// here, and publishes nothing.
     private func noteInputOutputBaseline() {
-        guard lastInputOutputVersion != outputVersion else { return }
         lastInputOutputVersion = outputVersion
     }
 
-    private func enqueueTerminalMetadata(_ data: Data, parseMetadata: Bool = true) {
+    private func enqueueTerminalMetadata(_ data: Data) {
         let shouldSchedule = metadataOutputLock.withLock {
             hasPendingOutputActivity = true
-            if parseMetadata, !data.isEmpty {
+            if !data.isEmpty {
                 if pendingMetadataOutput.count + data.count > Self.metadataOutputPendingByteLimit {
                     pendingMetadataOutput.removeAll(keepingCapacity: true)
                     if data.count > Self.metadataOutputPendingByteLimit {
@@ -7787,7 +7432,7 @@ final class TerminalSession: ObservableObject, Identifiable {
                 pendingResolvedCommandLine = nil
 
                 if kind == .agent {
-                    didChange = recordAgentTitleActivity(nextTitle) || didChange
+                    didChange = applyAutomaticAgentTitle(from: nextTitle) || didChange
                 } else {
                     if resolvedCommandLine != nextResolvedCommandLine {
                         resolvedCommandLine = nextResolvedCommandLine
@@ -7810,6 +7455,11 @@ final class TerminalSession: ObservableObject, Identifiable {
             case .notification(let notification):
                 handleIncomingNotification(notification)
                 didChange = true
+
+            case .programStatus(let report):
+                if parsedProgramStatus.apply(report) {
+                    applyProgramStatus(parsedProgramStatus.records)
+                }
 
             case .resolvedCommandLine(let commandLine):
                 pendingResolvedCommandLine = commandLine
@@ -7867,15 +7517,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     private func handleIncomingNotification(_ notification: TerminalNotificationRequest) {
         let isAgentCompletion = kind == .agent
             && Self.notificationBodyIndicatesCompletion(notification.body)
-        if isAgentCompletion {
-            // Completion status is an attention-episode signal, not a second
-            // unread-dot source. Deliver the harness notification first and
-            // remember that it owns this episode so the classifier can avoid a
-            // duplicate fallback even though `hasUnreadNotification` stays false.
-            hasHarnessNotificationForAttentionEpisode = true
-        }
+        // A finished turn is the program status' unseen result
+        // (`hasUnseenAgentResult`), not a second unread dot.
         handleTerminalNotification(notification, marksUnread: !isAgentCompletion)
-        handleAgentNotification(notification)
     }
 
     // MARK: - Native-PTY chrome ingestion
@@ -7889,7 +7533,7 @@ final class TerminalSession: ObservableObject, Identifiable {
 
     func ingestNativeTitle(_ nextTitle: String) {
         if kind == .agent {
-            if recordAgentTitleActivity(nextTitle) { bumpRevision() }
+            if applyAutomaticAgentTitle(from: nextTitle) { bumpRevision() }
         } else {
             guard systemTitle != nextTitle else { return }
             updateSystemTitle(nextTitle)
@@ -7927,7 +7571,6 @@ final class TerminalSession: ObservableObject, Identifiable {
     func ingestNativeBell() {
         guard noteSignalDelivery(key: "bell", fromHost: false, window: Self.bellDeduplicationWindow) else { return }
         noteSurfaceSignalWhileFollowing(key: "bell")
-        noteAttentionSampleEvent(.bell)
         bellHandler(self)
     }
 
@@ -7966,11 +7609,10 @@ final class TerminalSession: ObservableObject, Identifiable {
     func noteNativeCommandFinished(exitCode: Int32?) {
         guard ghosttyBridgeStorage?.isNativePTYBacked == true else { return }
         lastNativeCommandFinishedAt = Date()
-        lastNativeCommandExitCode = exitCode
         // Capture the command's final output and advance the counters so idle
         // detection converges on the real boundary, not a heuristic timeout.
+        // Nothing a view shows changed: nothing is published.
         refreshNativeContentNow()
-        bumpRevision()
     }
 
     // MARK: - Native-PTY content model (search / idle under EXEC)
@@ -7996,35 +7638,11 @@ final class TerminalSession: ObservableObject, Identifiable {
             // Read from the host by `refreshContentFromHostIfNeeded`.
             return nativeContentLines.count
         }
-        guard ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent else {
+        guard usesLiveNativeSurface else {
             return processor.lineCount
         }
         ensureNativeContentFresh()
         return nativeContentLines.count
-    }
-
-    /// `contentLineCount` and `contentSnapshot` without refreshing a native
-    /// surface's lines: what the tab read last.
-    private func lastReadContentLineCount() -> Int {
-        if let closedTabContentLines {
-            return closedTabContentLines.count
-        }
-        if readsContentFromHost
-            || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
-            return nativeContentLines.count
-        }
-        return processor.lineCount
-    }
-
-    private func lastReadContentSnapshot(range: Range<Int>) -> [String] {
-        if let closedTabContentLines {
-            return Array(closedTabContentLines[range.clamped(to: 0..<closedTabContentLines.count)])
-        }
-        if readsContentFromHost
-            || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
-            return nativeContentSnapshot(range: range)
-        }
-        return processor.snapshot(range: range)
     }
 
     private func contentSnapshot(range: Range<Int>) -> [String] {
@@ -8034,7 +7652,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if readsContentFromHost {
             return nativeContentSnapshot(range: range)
         }
-        guard ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent else {
+        guard usesLiveNativeSurface else {
             return processor.snapshot(range: range)
         }
         ensureNativeContentFresh()
@@ -8058,7 +7676,7 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// Render-signal entry point: schedule a debounced content refresh so the
     /// output/idle counters advance even when nothing is actively reading.
     func noteNativeRenderRequest() {
-        guard ghosttyBridgeStorage?.isNativePTYBacked == true, !usesInjectedTestingContent else { return }
+        guard usesLiveNativeSurface else { return }
         guard !nativeContentRefreshScheduled else { return }
         nativeContentRefreshScheduled = true
         // Off-screen sessions (e.g. background agents an orchestrator drives) refresh
@@ -8093,20 +7711,65 @@ final class TerminalSession: ObservableObject, Identifiable {
         refreshNativeContentNow()
     }
 
+    /// For a loop that watches the tab for new output every 50 ms (MCP
+    /// `wait_for_process_idle`; a monitor's samples, for an agent that
+    /// reports no status): advances the output and content counters
+    /// as `lineCount` does, without reading a native surface's whole text
+    /// (about a millisecond for a long history) on every pass. A tab no
+    /// window shows gets no render signal, so a change shows only in what
+    /// is read: its visible screen (the surface's `readViewportText`,
+    /// microseconds) is read first, and the whole text only when that
+    /// changed since the loop's last read, or once that read is older than
+    /// `nativeContentWatchReadInterval` (output the visible screen does not
+    /// show: the tab is scrolled back, or a program repeats the same lines).
+    /// `periodicallyOnly`: the loop does not wait on the screen now (an
+    /// agent that reports working): the whole text is read only that often.
+    /// A loop calls `contentStayedUnchanged` before it calls the tab quiet.
+    func watchContentForChanges(periodicallyOnly: Bool = false) {
+        guard let bridge = ghosttyBridgeStorage, bridge.isNativePTYBacked, !usesInjectedTestingContent,
+              !readsContentFromHost, closedTabContentLines == nil
+        else {
+            _ = contentLineCount()
+            return
+        }
+        let now = Date()
+        let readAge = lastNativeContentReadAt.map { now.timeIntervalSince($0) }
+        if let readAge, readAge < Self.nativeContentReadThrottle { return }
+        let readIsDue = readAge.map { $0 >= Self.nativeContentWatchReadInterval } ?? true
+        if periodicallyOnly {
+            if readIsDue { refreshNativeContentNow() }
+            return
+        }
+        let viewportHash = bridge.terminalView.readViewportText().map { TerminalScreenText.contentHash(of: $0) }
+        if let viewportHash, viewportHash == watchedViewportHash, !readIsDue { return }
+        watchedViewportHash = viewportHash
+        refreshNativeContentNow()
+    }
+
+    /// Reads a native surface's whole text unless it was read moments ago
+    /// (`nativeContentReadThrottle`): what a loop that watched the tab with
+    /// `watchContentForChanges` does before it calls the tab quiet. False
+    /// when the text changed (new output, noted now).
+    func contentStayedUnchanged() -> Bool {
+        let version = outputVersion
+        _ = contentLineCount()
+        return outputVersion == version
+    }
+
     /// Pulls the surface scrollback and, if it changed, rebuilds the native line
     /// model and advances the same counters/hooks `handleProcessorDidChange` drives
     /// in the host path. The change probe hashes the full screen text (the viewport
     /// selection isn't reliably readable), which cursor blink etc. don't alter.
     @discardableResult
     private func refreshNativeContentNow() -> Bool {
-        guard ghosttyBridgeStorage?.isNativePTYBacked == true, !usesInjectedTestingContent else { return false }
+        guard usesLiveNativeSurface else { return false }
         // The surface does not show the program now; its text comes from
         // the host (`refreshContentFromHostIfNeeded`).
         guard !readsContentFromHost else { return false }
-        // recordAgentActivitySignal below re-enters this function through
-        // contentSnapshot → ensureNativeContentFresh. Without
-        // this guard, a session whose screen changes faster than one scan pass
-        // (any working agent repaints its spinner every second) recurses
+        // A reader of the content (`contentSnapshot` →
+        // `ensureNativeContentFresh`) may come back here while it runs.
+        // Without this guard, a session whose screen changes faster than one
+        // pass (any working agent repaints its spinner every second) recurses
         // unboundedly and livelocks the main thread.
         guard !isRefreshingNativeContent else { return false }
         isRefreshingNativeContent = true
@@ -8116,32 +7779,23 @@ final class TerminalSession: ObservableObject, Identifiable {
         return replaceNativeContent(with: text)
     }
 
-    /// Takes `text` as the tab's lines; when it changed, advances the output
-    /// and content counters and runs the agent activity hooks.
+    /// Takes `text` as the tab's lines (`lines`: the caller's split of it,
+    /// if it has one); when it changed, advances the output and content
+    /// counters. An unchanged text costs only its hash. Publishes nothing
+    /// but the first output's `live` state: no view shows the lines or the
+    /// counters, and the surface draws the screen itself.
     @discardableResult
-    private func replaceNativeContent(with text: String) -> Bool {
-        var hasher = Hasher()
-        hasher.combine(text)
-        let hash = hasher.finalize()
+    private func replaceNativeContent(with text: String, lines: [String]? = nil) -> Bool {
+        let hash = TerminalScreenText.contentHash(of: text)
         guard hash != nativeContentHash else { return false }
         nativeContentHash = hash
-        nativeContentLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        nativeContentLines = lines ?? TerminalScreenText.lines(of: text)
 
         lastOutputAt = Date()
         if case .launching = state { state = .live }
         outputVersion &+= 1
-        clearCurrentAttentionScreenTag()
         lastContentChangeAt = Date()
         contentVersion &+= 1
-        if kind == .agent {
-            noteAttentionSampleContentChange()
-            recordAgentActivitySignal()
-            if agentActivityState == .working {
-                scheduleAgentIdleRecheck()
-            }
-            scheduleAttentionObservation(event: .contentChanged)
-        }
-        bumpRevision()
         return true
     }
 
@@ -8218,7 +7872,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             hostContentRead = read
             hostContentReadIsWhole = !recentOnly
         }
-        await Self.wait(for: read, upTo: configuration.hostScreenWait)
+        await waitForTask(read, upTo: configuration.hostScreenWait)
     }
 
     /// Takes a screen read from the host as the tab's lines. `recentLines`:
@@ -8229,7 +7883,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         if hostContentUsesAlternateScreen != screen.alternateScreen {
             hostContentUsesAlternateScreen = screen.alternateScreen
         }
-        let lines = screen.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let lines = TerminalScreenText.lines(of: screen.text)
         let hasHistory = recentLines.map { lines.count < $0 } ?? true
         let tailKey = Self.hostContentChangeKey(
             lines, recentLines: persistentHosting?.configuration.hostScreenRecentLines ?? recentLines ?? lines.count
@@ -8240,13 +7894,11 @@ final class TerminalSession: ObservableObject, Identifiable {
         guard changed || hasHistory else { return }
         hostContentHasHistory = hasHistory
         if changed {
-            replaceNativeContent(with: screen.text)
+            replaceNativeContent(with: screen.text, lines: lines)
         } else {
             // The same last lines, now with the history above them.
             nativeContentLines = lines
-            var hasher = Hasher()
-            hasher.combine(screen.text)
-            nativeContentHash = hasher.finalize()
+            nativeContentHash = TerminalScreenText.contentHash(of: screen.text)
         }
     }
 
@@ -8317,16 +7969,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         return lines
     }
 
-    /// The last lines the tab holds now, without reading the surface or the
-    /// host again (for listings that look at many tabs).
-    var cachedScreenTailLines: [String] {
-        if readsContentFromHost || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
-            return Array(AgentPermissionPrompt.tail(of: nativeContentLines))
-        }
-        let count = processor.lineCount
-        return Array(AgentPermissionPrompt.tail(of: processor.snapshot(range: max(0, count - 200)..<count)))
-    }
-
     private var hostScreenWaitForInput: Duration {
         persistentHosting?.configuration.hostScreenWait ?? .seconds(2)
     }
@@ -8368,7 +8010,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         let task = Task { @MainActor in
             result.screen = try? await read()
         }
-        await wait(for: task, upTo: timeout)
+        await waitForTask(task, upTo: timeout)
         guard let screen = result.screen else { return nil }
         let lines = screen.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         return Array(AgentPermissionPrompt.tail(of: lines).suffix(limit))
@@ -8379,594 +8021,116 @@ final class TerminalSession: ObservableObject, Identifiable {
         var screen: HostScreenText?
     }
 
-    /// Waits for `task`, or until `timeout` passed, whichever comes first.
-    private static func wait(for task: Task<Void, Never>, upTo timeout: Duration) async {
-        let waiter = FirstResume()
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            waiter.continuation = continuation
-            Task { @MainActor in
-                await task.value
-                waiter.resume()
+    // MARK: Program status (OSC 7501)
+
+    /// The program's status records changed: its host's for a persistent
+    /// tab (`applyHostReportedTitleAndDirectory`), or those of output Cherry
+    /// parses itself (`ingestTerminalMetadata`). A native tab has none. The root record sets
+    /// `agentActivityState` and the turn bookkeeping MCP reads; a turn that
+    /// finished or a program that blocks while its tab is not in front is
+    /// unseen and posted as a notification.
+    func applyProgramStatus(_ records: [ProgramStatus]) {
+        guard records != programStatus else { return }
+        let firstReport = !reportsProgramStatus
+        let previousRoot = programStatus.root
+        programStatus = records
+        if !records.isEmpty {
+            reportsProgramStatus = true
+        }
+        let root = records.root
+        switch root?.state {
+        case .working?, .blocked?:
+            if root?.state == .working {
+                lastWorkingReportAt = Date()
             }
-            Task { @MainActor in
-                try? await Task.sleep(for: timeout)
-                waiter.resume()
+            if agentTurnState != .active {
+                agentTurnState = .active
+                agentReportedTurnCount &+= 1
+            }
+        case .done?, .error?:
+            // A result Cherry saw come: after a turn it saw, or a new one
+            // (a whole turn can pass between two of the host's reports). The
+            // records a tab finds when it starts or attaches are not news.
+            let finished = agentTurnState == .active || (!firstReport && previousRoot != root)
+            if finished, agentTurnState != .active {
+                agentReportedTurnCount &+= 1
+            }
+            if finished || agentTurnState == .notStarted {
+                agentTurnState = .completed
+            }
+            if finished {
+                hasUnseenAgentResult = true
+            }
+        case .idle?:
+            if agentTurnState == .active {
+                agentTurnState = .userInterrupted
+            }
+        case .unknown?, nil:
+            break
+        }
+        let nextState = AgentActivityState(root)
+        let stateChanged = agentActivityState != nextState
+        agentActivityState = nextState
+        if let root, !firstReport, previousRoot?.state != root.state || previousRoot?.kind != root.kind {
+            switch root.state {
+            case .blocked, .done, .error:
+                notifyProgramStatus(root)
+            case .idle, .working, .unknown:
+                break
             }
         }
-    }
-
-    @MainActor
-    private final class FirstResume {
-        var continuation: CheckedContinuation<Void, Never>?
-
-        func resume() {
-            continuation?.resume()
-            continuation = nil
+        if stateChanged {
+            bumpRevision()
         }
     }
 
-    @discardableResult
-    func captureAttentionObservation(
-        label: TerminalAttentionLabel,
-        scenarioID: String?,
-        checkpoint: String?,
-        harnessVersion: String?,
-        runID: String?
-    ) throws -> (id: UUID, outputURL: URL) {
-        guard let attentionObservationRecorder = ensureAttentionObservationRecorder() else {
-            throw TerminalAttentionRecordingError.disabled
-        }
-
-        let observation = makeAttentionObservation(
-            event: .labeledCheckpoint,
-            label: label,
-            annotation: nil,
-            scenarioID: scenarioID,
-            checkpoint: checkpoint,
-            harnessVersion: harnessVersion,
-            runID: runID
-        )
-        attentionObservationRecorder.record(observation, synchronously: true)
-        return (observation.id, attentionObservationRecorder.outputURL)
-    }
-
-    @discardableResult
-    func captureAttentionCorrection(
-        _ correction: TerminalAttentionCorrection
-    ) throws -> (id: UUID, outputURL: URL) {
-        guard let attentionObservationRecorder = (
-            ensureAttentionObservationRecorder() ?? ensureAttentionCorrectionRecorder()
-        ) else {
-            throw TerminalAttentionRecordingError.disabled
-        }
-
-        let sourceEvent = latestAttentionObservationEvent
-        let sourceObservation = makeAttentionObservation(
-            event: sourceEvent,
-            label: nil,
-            annotation: nil,
-            scenarioID: nil,
-            checkpoint: nil,
-            harnessVersion: nil,
-            runID: nil
-        )
-        let sourcePrediction = kind == .agent
-            ? TerminalAttentionClassifier.shared.predict(sourceObservation)
-            : nil
-        if let sourcePrediction {
-            attentionClassifierPrediction = sourcePrediction
-        }
-
-        let observation = makeAttentionObservation(
-            event: .labeledCheckpoint,
-            label: correction.label,
-            annotation: .init(
-                schemaVersion: 1,
-                provenance: "cherry_in_app_human_correction",
-                confidence: 1,
-                rationale: "human_corrected_action_label",
-                reason: correction.reason
-            ),
-            scenarioID: "in-app-attention-correction",
-            checkpoint: "human_corrected",
-            harnessVersion: nil,
-            runID: nil,
-            correction: .init(
-                sourceEvent: sourceEvent,
-                modelID: sourcePrediction?.modelID,
-                modelLabel: sourcePrediction?.label,
-                attentionProbability: sourcePrediction?.attentionProbability,
-                threshold: sourcePrediction?.threshold,
-                supersedesObservationID: currentAttentionScreenTagObservationID
-            )
-        )
-        attentionObservationRecorder.record(observation, synchronously: true)
-        currentAttentionScreenTag = correction
-        currentAttentionScreenTagObservationID = observation.id
-        acknowledgeAttentionAlert()
-        return (observation.id, attentionObservationRecorder.outputURL)
-    }
-
-    func acknowledgeAttentionAlert() {
-        guard attentionAlertGeneration > acknowledgedAttentionAlertGeneration else { return }
-        acknowledgedAttentionAlertGeneration = attentionAlertGeneration
-        attentionNotificationGate.acknowledge()
-        guard hasUnacknowledgedAttention else { return }
-        hasUnacknowledgedAttention = false
+    /// The user saw the tab (it was selected in a key window): the result
+    /// it showed is no longer news.
+    func acknowledgeAgentResult() {
+        guard hasUnseenAgentResult else { return }
+        hasUnseenAgentResult = false
         bumpRevision()
     }
 
-    private func scheduleAttentionObservation(event: TerminalAttentionObservationEvent) {
-        guard kind == .agent else { return }
-        latestAttentionObservationEvent = event
+    /// The program whose output Cherry parses itself ended (it exited, or
+    /// its shell finished a command): its `working`, `blocked` and `idle`
+    /// records go. A persistent tab's host drops its own.
+    private func endParsedProgramStatus() {
+        guard !isPersistentLocalSession, parsedProgramStatus.endProgram() else { return }
+        applyProgramStatus(parsedProgramStatus.records)
+    }
 
-        let isDebounced = event == .contentChanged || event == .inputChanged
-        if !isDebounced {
-            attentionObservationTask?.cancel()
-            attentionObservationTask = nil
-            recordAttentionObservation(event: event)
-            return
-        }
-
-        guard attentionObservationTask == nil else { return }
-        attentionObservationTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(Int(Self.attentionObservationInterval * 1_000)))
-            guard let self, !Task.isCancelled else { return }
-            self.attentionObservationTask = nil
-            self.recordAttentionObservation(event: event)
+    /// A new program starts in the tab: nothing it reported before counts.
+    private func resetProgramStatus() {
+        parsedProgramStatus.removeAll()
+        programStatus = []
+        reportsProgramStatus = false
+        lastWorkingReportAt = nil
+        agentTurnState = .notStarted
+        hasUnseenAgentResult = false
+        lastProgramStatusNotificationAt = nil
+        if agentActivityState != .unknown {
+            agentActivityState = .unknown
+            bumpRevision()
         }
     }
 
-    private func recordAttentionObservation(event: TerminalAttentionObservationEvent) {
-        let attentionObservationRecorder = ensureAttentionObservationRecorder()
-        let observation = makeAttentionObservation(
-            event: event,
-            label: nil,
-            annotation: nil,
-            scenarioID: nil,
-            checkpoint: nil,
-            harnessVersion: nil,
-            runID: nil
-        )
-        let prediction = TerminalAttentionClassifier.shared.predict(observation)
-        defer {
-            sampleAttentionIfStateChanged(observation: observation, prediction: prediction)
-        }
-        // Published values change only when they differ: an observation
-        // follows typing (debounced), and republishing an unchanged value
-        // would re-render every view observing the tab.
-        if attentionClassifierPrediction != prediction {
-            attentionClassifierPrediction = prediction
-        }
-        if agentTurnState == .userInterrupted {
-            // The user is already handling this turn. Preserve interruption and
-            // follow-up screen observations for training without surfacing a
-            // new alert until the user submits another turn.
-            isAttentionEpisodeActive = prediction.needsAttention
-            setHasUnacknowledgedAttention(false)
-            attentionNotificationGate.acknowledge()
-            attentionObservationRecorder?.record(observation)
-            return
-        }
-        if prediction.needsAttention {
-            // One continuous run of attention-needed predictions is one alert
-            // episode. Acknowledging the visible result must cover later
-            // debounced observations of that same completed screen.
-            if !isAttentionEpisodeActive, event != .inputChanged {
-                attentionAlertGeneration &+= 1
-                isAttentionEpisodeActive = true
-            }
-            setHasUnacknowledgedAttention(
-                isAttentionEpisodeActive
-                    && attentionAlertGeneration > acknowledgedAttentionAlertGeneration
-            )
-        } else {
-            // Preserve a consumed/completed episode through transient classifier
-            // wobble. Native screen reflow can momentarily make an idle agent
-            // look working without any new turn or agent output. The next active
-            // turn will still clear the episode and allow its result to alert.
-            if prediction.turnState != .completed {
-                isAttentionEpisodeActive = false
-            }
-            setHasUnacknowledgedAttention(false)
-        }
-        updateAttentionNotification(for: prediction)
-        attentionObservationRecorder?.record(observation)
-    }
+    /// At most one notification per tab in this long: a program cannot
+    /// flood the user by flipping its state.
+    private static let programStatusNotificationInterval: TimeInterval = 2
+    private var lastProgramStatusNotificationAt: Date?
 
-    private func setHasUnacknowledgedAttention(_ value: Bool) {
-        guard hasUnacknowledgedAttention != value else { return }
-        hasUnacknowledgedAttention = value
-    }
-
-    private func updateAttentionNotification(for prediction: TerminalAttentionPrediction) {
-        guard attentionNotificationGate.shouldNotify(
-            prediction: prediction,
-            isTopLevelAgent: kind == .agent && parentAgentID == nil,
-            hasUnreadNativeNotification:
-                hasUnreadNotification || hasHarnessNotificationForAttentionEpisode,
-            hasUnacknowledgedAttention: hasUnacknowledgedAttention
-        ) else {
-            return
-        }
-
-        attentionNotificationHandler(prediction, self)
-    }
-
-    // MARK: Attention samples
-
-    /// Records an interaction for attention sampling: its kind and time,
-    /// never content. Does nothing while sampling is off.
-    func noteAttentionSampleEvent(_ kind: TerminalAttentionSampleEvent.Kind, detail: String? = nil) {
-        guard let attentionSampler, attentionSampler.isCollecting else { return }
-        attentionSampler.recordEvent(
-            kind,
-            detail: detail,
-            tab: attentionSampleTabID,
-            run: attentionSampleRunID,
-            at: Date()
-        )
-    }
-
-    /// The tab closed (`intent`): the last event of its run.
-    func noteAttentionSampleClosed(intent: SessionCloseIntent) {
-        guard let attentionSampler else { return }
-        noteAttentionSampleEvent(.closed, detail: intent.rawValue)
-        attentionSampler.unregister(self)
-        attentionSampler.forget(tab: attentionSampleTabID, run: attentionSampleRunID)
-    }
-
-    private func noteAttentionSampleInput(_ effect: AgentDraftInputEffect) {
-        guard let attentionSampler, attentionSampler.isCollecting else { return }
-        if agentIsAtAnswerMenu {
-            noteAttentionSampleEvent(
-                .menuKey,
-                detail: agentActivityState == .permission ? "permission" : "question"
-            )
-            return
-        }
-        switch effect {
-        case .none: return
-        case .inserted, .edited, .cleared: noteAttentionSampleEvent(.typed)
-        case .submitted: noteAttentionSampleEvent(.submitted)
-        }
-    }
-
-    private func noteAttentionSampleContentChange() {
-        guard let attentionSampler, attentionSampler.isCollecting else { return }
+    private func notifyProgramStatus(_ status: ProgramStatus) {
         let now = Date()
-        let window = TerminalAttentionSampling.inputEchoWindow
-        let followsInput = lastAgentInputAt.map { now.timeIntervalSince($0) < window } ?? false
-        let followsResize = lastViewportResizeAt.map { now.timeIntervalSince($0) < window } ?? false
-        attentionSampler.noteContentChange(
-            tab: attentionSampleTabID,
-            run: attentionSampleRunID,
-            selfDriven: !followsInput && !followsResize,
-            at: now
-        )
-    }
-
-    /// Samples the tab when Cherry's view of it changed (activity, its
-    /// evidence, the turn, the prediction), from the observation it just
-    /// classified.
-    private func sampleAttentionIfStateChanged(
-        observation: TerminalAttentionObservation,
-        prediction: TerminalAttentionPrediction
-    ) {
-        guard let attentionSampler, attentionSampler.isCollecting else { return }
-        let signature = [
-            agentActivityState.rawValue,
-            attentionActivityEvidenceName,
-            agentTurnState.rawValue,
-            String(agentTurnCount),
-            prediction.label.rawValue,
-        ].joined(separator: "|")
-        guard signature != lastAttentionSampleSignature else { return }
-        lastAttentionSampleSignature = signature
-        guard let sample = makeAttentionSample(
-            trigger: .stateChanged,
-            observation: observation,
-            prediction: prediction
-        ) else { return }
-        attentionSampler.record(sample)
-    }
-
-    /// The periodic sample (`TerminalAttentionSampler.tick`), from the
-    /// screen as the tab last read it: no surface read, no classifier
-    /// state change. Nil once the program exited (its exit was sampled)
-    /// or while the screen is blank.
-    func makePeriodicAttentionSample() -> TerminalAttentionSample? {
-        guard kind == .agent, exitedAt == nil else { return nil }
-        let observation = makeAttentionObservation(
-            event: latestAttentionObservationEvent,
-            label: nil,
-            annotation: nil,
-            scenarioID: nil,
-            checkpoint: nil,
-            harnessVersion: nil,
-            runID: nil,
-            readsLastContent: true
-        )
-        return makeAttentionSample(
-            trigger: .periodic,
-            observation: observation,
-            prediction: TerminalAttentionClassifier.shared.predict(observation)
-        )
-    }
-
-    private func makeAttentionSample(
-        trigger: TerminalAttentionSample.Trigger,
-        observation: TerminalAttentionObservation,
-        prediction: TerminalAttentionPrediction
-    ) -> TerminalAttentionSample? {
-        let grid = observation.terminal.grid
-        guard let lastLine = grid.lastIndex(where: {
-            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }) else { return nil }
-        let tailEnd = lastLine + 1
-        let tailStart = max(0, tailEnd - TerminalAttentionSampling.screenTailLineLimit)
-        let tail = Array(grid[tailStart..<tailEnd])
-        let agent = screenAgentKey
-        let markerLines = Array(tail.suffix(AgentScreenActivity.markerTailLineLimit))
-        let backend: String
-        if persistentHosting != nil {
-            backend = remoteMachineName == nil ? "persistent" : "device"
-        } else if hostedAttachment != nil {
-            backend = "attached"
-        } else {
-            backend = "native"
-        }
-        let hostSessionID = persistentSession?.sessionID ?? hostedAttachment?.sessionID
-        return TerminalAttentionSample(
-            type: TerminalAttentionSample.recordType,
-            schemaVersion: TerminalAttentionSample.currentSchemaVersion,
-            id: UUID(),
-            recordedAt: observation.recordedAt,
-            trigger: trigger,
-            tab: attentionSampleTabID,
-            run: attentionSampleRunID,
-            hostSession: hostSessionID.map(TerminalAttentionSampling.stableID),
-            agent: agent,
-            backend: backend,
-            observation: observation.sampled(
-                grid: tail,
-                rowOffset: tailStart,
-                sessionID: attentionSampleTabID,
-                runID: attentionSampleRunID
-            ),
-            features: TerminalAttentionClassifier.features(for: observation),
-            prediction: .init(prediction),
-            shownPrediction: attentionClassifierPrediction.map(TerminalAttentionSample.Prediction.init),
-            lifecycle: .init(
-                turnState: agentTurnState,
-                submittedTurns: agentSubmittedTurnCount,
-                selfResumedTurns: agentSelfResumedTurnCount,
-                lastSubmitAt: lastAgentSubmitAt,
-                lastOutputAt: lastOutputAt,
-                lastContentChangeAt: lastContentChangeAt,
-                lastStrongWorkingEvidenceAt: lastStrongWorkingEvidenceAt,
-                lastKeystrokeAt: lastHumanKeystrokeAt,
-                lastInputAt: lastAgentInputAt,
-                alertGeneration: attentionAlertGeneration,
-                hasUnacknowledgedAttention: hasUnacknowledgedAttention
-            ),
-            screen: .init(
-                tailStartRow: tailStart,
-                viewportGridRows: grid.count,
-                liveLines: AgentScreenActivity.workingLines(markerLines, agent: agent),
-                verdict: AgentScreenActivity.verdict(
-                    for: tail,
-                    agent: agent,
-                    includesAnswerMenus: agentTurnState != .notStarted
-                ).rawValue
-            ),
-            changes: .init()
-        )
-    }
-
-    private func ensureAttentionObservationRecorder() -> TerminalAttentionObservationRecorder? {
-        guard let directoryURL = attentionObservationDirectoryProvider() else { return nil }
-        if attentionObservationRecorder == nil {
-            attentionObservationRecorder = TerminalAttentionObservationRecorder(
-                directoryURL: directoryURL,
-                sessionID: id,
-                harness: agentName
-            )
-        }
-        return attentionObservationRecorder
-    }
-
-    private func ensureAttentionCorrectionRecorder() -> TerminalAttentionObservationRecorder? {
-        if attentionCorrectionRecorder == nil {
-            attentionCorrectionRecorder = TerminalAttentionObservationRecorder(
-                directoryURL: attentionCorrectionDirectoryProvider(),
-                sessionID: id,
-                harness: "\(agentName ?? kind.rawValue)-correction"
-            )
-        }
-        return attentionCorrectionRecorder
-    }
-
-    private func makeAttentionObservation(
-        event: TerminalAttentionObservationEvent,
-        label: TerminalAttentionLabel?,
-        annotation: TerminalAttentionObservation.AnnotationContext?,
-        scenarioID: String?,
-        checkpoint: String?,
-        harnessVersion: String?,
-        runID: String?,
-        correction: TerminalAttentionObservation.CorrectionContext? = nil,
-        readsLastContent: Bool = false
-    ) -> TerminalAttentionObservation {
-        let now = Date()
-        // `readsLastContent`: the lines as last read, without reading the
-        // surface again (a periodic sample must not run the activity hooks).
-        let lineCount = readsLastContent ? lastReadContentLineCount() : contentLineCount()
-        let rowLimit = min(max(viewportSize.rows, 1), Self.attentionObservationMaximumRows)
-        let columnLimit = min(max(viewportSize.columns, 1), Self.attentionObservationMaximumColumns)
-        let gridStart = max(0, lineCount - rowLimit)
-        let gridLines = readsLastContent
-            ? lastReadContentSnapshot(range: gridStart..<lineCount)
-            : contentSnapshot(range: gridStart..<lineCount)
-        let grid = gridLines.map { line in
-            String(line.prefix(columnLimit))
-        }
-        // libghostty exposes terminal text but not per-cell styling. Preserve the
-        // optional schema field without maintaining a second terminal parser.
-        let styledGrid: [[TerminalAttentionObservation.TerminalContext.StyledRun]]? = nil
-        let cursor = cursorState
-
-        return TerminalAttentionObservation(
-            schemaVersion: TerminalAttentionObservation.currentSchemaVersion,
-            id: UUID(),
-            recordedAt: now,
-            event: event,
-            label: label,
-            annotation: annotation,
-            scenarioID: Self.attentionRecordingMetadata(scenarioID),
-            checkpoint: Self.attentionRecordingMetadata(checkpoint),
-            session: .init(
-                id: id.uuidString,
-                kind: kind.rawValue,
-                harness: Self.attentionRecordingMetadata(agentName),
-                harnessVersion: Self.attentionRecordingMetadata(harnessVersion),
-                runID: Self.attentionRecordingMetadata(runID)
-            ),
-            terminal: .init(
-                columns: viewportSize.columns,
-                rows: viewportSize.rows,
-                usesAlternateScreen: usesAlternateScreen,
-                cursor: .init(
-                    row: max(0, cursor.row - gridStart),
-                    column: cursor.column,
-                    shape: Self.attentionCursorShapeName(cursor.shape),
-                    isVisible: cursor.isVisible
-                ),
-                grid: grid,
-                styledGrid: styledGrid,
-                scrollbackLinesOmitted: gridStart
-            ),
-            timing: .init(
-                millisecondsSinceStarted: Self.milliseconds(since: startedAt, now: now),
-                millisecondsSinceLastOutput: Self.milliseconds(since: lastOutputAt, now: now),
-                millisecondsSinceLastContentChange: Self.milliseconds(since: lastContentChangeAt, now: now),
-                millisecondsSinceLastHumanInput: Self.milliseconds(since: lastHumanInputAt, now: now)
-            ),
-            activity: .init(
-                state: agentActivityState.rawValue,
-                evidence: attentionActivityEvidenceName,
-                hasUnreadNotification: hasUnreadNotification,
-                processState: state.label,
-                exitCode: exitCode
-            ),
-            interaction: .init(
-                hasUnsubmittedInput: hasUnsubmittedHumanInput,
-                millisecondsSinceLastKeystroke: Self.milliseconds(since: lastHumanKeystrokeAt, now: now),
-                terminalFocused: ghosttyBridgeStorage?.isTerminalFocused ?? false
-            ),
-            turn: kind == .agent ? .init(state: agentTurnState) : nil,
-            correction: correction,
-            outputVersion: outputVersion,
-            contentVersion: contentVersion
-        )
-    }
-
-    private var attentionActivityEvidenceName: String {
-        switch agentActivitySource {
-        case .none: "none"
-        case .outputActivity: "output_activity"
-        case .inputSubmit: "input_submit"
-        case .quietWindow: "quiet_window"
-        case .promptMarker: "prompt_marker"
-        case .workingMarker: "working_marker"
-        case .titleSpinner: "title_spinner"
-        case .notification: "notification"
-        case .processExit: "process_exit"
-        case .answerMenu: TerminalAttentionPrediction.answerMenuEvidence
-        }
-    }
-
-    private static func attentionCursorShapeName(_ shape: TerminalCursorShape) -> String {
-        switch shape {
-        case .block: "block"
-        case .bar: "bar"
-        case .underline: "underline"
-        }
-    }
-
-    private static func milliseconds(since date: Date?, now: Date) -> Int? {
-        guard let date else { return nil }
-        return max(0, Int(now.timeIntervalSince(date) * 1_000))
-    }
-
-    private static func attentionRecordingMetadata(_ value: String?) -> String? {
-        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
-            return nil
-        }
-        return String(value.prefix(160))
-    }
-
-    private func handleAgentNotification(
-        _ notification: TerminalNotificationRequest
-    ) {
-        guard kind == .agent else { return }
-        noteAttentionSampleEvent(.notification)
-        defer {
-            scheduleAttentionObservation(event: .notification)
-        }
-
-        let body = notification.body
-        if Self.notificationBodyIndicatesPermission(body) {
-            setAgentActivityState(.permission, source: .notification)
+        if let lastProgramStatusNotificationAt,
+           now.timeIntervalSince(lastProgramStatusNotificationAt) < Self.programStatusNotificationInterval {
             return
         }
-        // A menu on screen still waits on the user's answer.
-        if Self.notificationBodyIndicatesCompletion(body), !agentIsAtAnswerMenu {
-            setAgentActivityState(.idle, source: .notification)
-        }
+        lastProgramStatusNotificationAt = now
+        programStatusNotificationHandler(status, self)
     }
 
-    private var agentStateHasDirectEvidence: Bool {
-        switch agentActivitySource {
-        case .promptMarker, .workingMarker, .titleSpinner, .notification, .processExit, .answerMenu:
-            true
-        case .none, .outputActivity, .inputSubmit, .quietWindow:
-            false
-        }
-    }
-
-    // Agents without a recognizable prompt/working UI (e.g. plain REPLs) only
-    // ever produce weak evidence; idle waits fall back to quiet windows for them.
-    var agentActivityEvidenceIsStrong: Bool {
-        kind == .agent && agentStateHasDirectEvidence
-    }
-
-    @discardableResult
-    private func recordAgentTitleActivity(_ title: String) -> Bool {
-        guard kind == .agent else { return false }
-
-        var didChange = applyAutomaticAgentTitle(from: title)
-
-        let spinnerActive = Self.titleIndicatesAgentWorking(title)
-        let spinnerCleared = titleIndicatesAgentWorking && !spinnerActive
-        titleIndicatesAgentWorking = spinnerActive
-
-        if spinnerActive {
-            lastTitleSpinnerAt = Date()
-            lastStrongWorkingEvidenceAt = Date()
-            scheduleAgentIdleRecheck()
-            if noteAgentTitleForResumedWork(title, isSpinner: true) {
-                return startSelfResumedAgentTurn(source: .titleSpinner) || didChange
-            }
-            return markAgentWorking(source: .titleSpinner) || didChange
-        }
-        _ = noteAgentTitleForResumedWork(title, isSpinner: false)
-        if spinnerCleared || agentUsesTitleActivitySignals {
-            didChange = recordAgentActivitySignal() || didChange
-        }
-        return didChange
-    }
-
+    /// An agent's title also names its task.
     private func applyAutomaticAgentTitle(from terminalTitle: String) -> Bool {
         let brand = AgentToolBrand.detect(
             name: agentName ?? systemTitle,
@@ -9003,472 +8167,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         return didChange
     }
 
-    private static func titleIndicatesAgentWorking(_ title: String) -> Bool {
-        guard let first = title.trimmingCharacters(in: .whitespaces).unicodeScalars.first else {
-            return false
-        }
-        return (0x2800...0x28FF).contains(Int(first.value))
-    }
-
-    // Codex/Claude pulse the title spinner several times per second while a turn
-    // is in flight, but may leave the last spinner frame behind when they settle,
-    // so the title only counts as working evidence while the pulses are fresh.
-    private static let titleSpinnerFreshnessWindow: TimeInterval = 3.0
-
-    private var titleSpinnerEvidenceIsActive: Bool {
-        guard titleIndicatesAgentWorking, let lastTitleSpinnerAt else { return false }
-        return Date().timeIntervalSince(lastTitleSpinnerAt) < Self.titleSpinnerFreshnessWindow
-    }
-
-    private var agentUsesTitleActivitySignals: Bool {
-        let normalizedName = AgentToolDefinition.normalizedName(agentName ?? title)
-        if normalizedName == "codex" || normalizedName == "amp" {
-            return true
-        }
-
-        let commandName = subtitle
-            .split(whereSeparator: \.isWhitespace)
-            .first
-            .map(String.init)?
-            .lowercased()
-        return commandName == "codex" || commandName == "amp"
-    }
-
-    @discardableResult
-    private func recordAgentActivitySignal() -> Bool {
-        guard kind == .agent else { return false }
-        guard agentActivitySource != .processExit else { return false }
-
-        var didChange = false
-        switch applyAgentAnswerMenu() {
-        case .showing(let changed):
-            return changed
-        case .left(let changed):
-            didChange = changed
-        case .none:
-            break
-        }
-
-        let markerLines = renderedOutputAgentMarkerLines()
-        let workingLineIndices = AgentScreenActivity.workingLineIndices(markerLines, agent: screenAgentKey)
-        if noteAgentScreenForResumedWork(markerLines, workingLineIndices: workingLineIndices) {
-            return startSelfResumedAgentTurn(source: .workingMarker) || didChange
-        }
-        if !workingLineIndices.isEmpty {
-            return markAgentWorking(source: .workingMarker) || didChange
-        }
-        if titleSpinnerEvidenceIsActive {
-            return markAgentWorking(source: .titleSpinner) || didChange
-        }
-        if renderedOutputShowsAgentInputPrompt() {
-            return requestAgentIdleFromRenderedOutput() || didChange
-        }
-        // Full-screen TUIs repaint the composer after every keystroke. If a new
-        // harness version changes its prompt glyph or layout, that repaint must
-        // not look like agent output while Cherry knows the user still has an
-        // unsubmitted draft. Explicit working markers and title spinners above
-        // continue to win, and submitting the draft clears this flag before
-        // marking the agent working.
-        if hasUnsubmittedHumanInput {
-            cancelAgentIdleConfirmation()
-            return setAgentActivityState(.idle, source: .promptMarker) || didChange
-        }
-        guard !agentStateResistsOutputActivity else { return didChange }
-        return setAgentActivityState(.working, source: .outputActivity) || didChange
-    }
-
-    private enum AgentAnswerMenuEffect {
-        /// A menu shows: the state says so, and nothing else applies.
-        case showing(changed: Bool)
-        /// The menu the state followed is gone: the turn goes on.
-        case left(changed: Bool)
-        /// No menu, and the state did not follow one.
-        case none
-    }
-
-    /// Whether the state follows a permission or question menu on screen.
-    private var agentIsAtAnswerMenu: Bool {
-        agentActivitySource == .answerMenu && agentActivityState.awaitsUserAnswer
-    }
-
-    /// A permission or question menu at the bottom of the screen
-    /// (`AgentScreenActivity.answerMenu`, MCP's recognizers) makes the
-    /// agent wait on the user's answer: `.permission` or `.needsInput`, an
-    /// attention alert like a permission prompt. Its state follows the
-    /// menu: when the menu goes (answered, or withdrawn), the turn it
-    /// paused goes on and the agent is working again until its screen says
-    /// otherwise. A startup dialog before this tab's first turn (folder
-    /// trust, resume picker) is not one: the agent has no turn to pause.
-    /// A permission prompt the agent notified is left to the notification.
-    private func applyAgentAnswerMenu() -> AgentAnswerMenuEffect {
-        guard agentActivityState != .error else { return .none }
-        let menu = renderedOutputAgentAnswerMenu()
-        if let menu, agentTurnState != .notStarted || !startedCurrentProgram {
-            if agentActivityState == .permission, agentActivitySource == .notification {
-                return .showing(changed: false)
-            }
-            cancelAgentIdleConfirmation()
-            // An agent this tab follows rather than started (restored or
-            // adopted) asking a question is in a turn submitted before
-            // the tab followed it.
-            if agentTurnState == .notStarted {
-                agentTurnState = .active
-            }
-            let state: AgentActivityState = menu == .permission ? .permission : .needsInput
-            return .showing(changed: setAgentActivityState(state, source: .answerMenu))
-        }
-        guard agentIsAtAnswerMenu else { return .none }
-        // The answer resumes the turn: like fresh working evidence, a
-        // composer drawn before the agent's next working frame is
-        // confirmed before it counts as the turn's end.
-        lastStrongWorkingEvidenceAt = Date()
-        let changed = setAgentActivityState(.working, source: .inputSubmit)
-        scheduleAgentIdleRecheck()
-        return .left(changed: changed)
-    }
-
-    private func renderedOutputAgentAnswerMenu() -> AgentScreenActivity.AnswerMenu? {
-        let lineCount = effectiveAgentContentLineCount()
-        guard lineCount > 0 else { return nil }
-        let start = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-        return AgentScreenActivity.answerMenu(in: contentSnapshot(range: start..<lineCount))
-    }
-
-    private var agentStateResistsOutputActivity: Bool {
-        if agentActivityState == .permission || agentActivityState == .needsInput || agentActivityState == .error {
-            return true
-        }
-        switch agentActivitySource {
-        case .promptMarker, .notification, .processExit, .answerMenu:
-            return true
-        case .none, .outputActivity, .inputSubmit, .workingMarker, .titleSpinner, .quietWindow:
-            return false
-        }
-    }
-
-    @discardableResult
-    private func markAgentWorking(source: AgentActivitySource) -> Bool {
-        guard agentActivitySource != .processExit else { return false }
-        guard !agentActivityState.awaitsUserAnswer, agentActivityState != .error else { return false }
-        cancelAgentIdleConfirmation()
-        if source == .workingMarker || source == .titleSpinner {
-            lastStrongWorkingEvidenceAt = Date()
-            // An agent this tab follows rather than started (restored or
-            // adopted) that shows it is at work is in a turn submitted
-            // before the tab followed it: its end is a finished turn, which
-            // notifies like one this tab saw submitted.
-            if agentTurnState == .notStarted, !startedCurrentProgram {
-                agentTurnState = .active
-            }
-        }
-        return setAgentActivityState(.working, source: source)
-    }
-
-    // MARK: Turns the agent resumes by itself
-
-    /// The agent's turn ended (or, interrupted by the user, it settled at
-    /// its composer), and it neither waits on an answer nor failed or
-    /// exited: work it shows from here on is its own new turn, once
-    /// `AgentResumedWorkDetector` tells it from a stale frame.
-    private var agentMayResumeWorkByItself: Bool {
-        guard resumedWorkDetector.isArmed,
-              agentTurnState == .completed || agentTurnState == .userInterrupted
-        else { return false }
-        return agentActivitySource != .processExit
-            && !agentActivityState.awaitsUserAnswer
-            && agentActivityState != .error
-    }
-
-    private var resumedWorkLayout: AgentResumedWorkDetector.Layout {
-        .init(columns: viewportSize.columns, rows: viewportSize.rows, fromHost: readsContentFromHost)
-    }
-
-    /// The turn ended: what the screen shows now is its past.
-    private func armResumedWorkDetector() {
-        resumedWorkDetector.arm(screenLines: lastReadAgentScreenTail(), layout: resumedWorkLayout)
-    }
-
-    /// Whether `screen` (the marker tail), whose lines at
-    /// `workingLineIndices` show live work, shows the agent back at work by
-    /// itself.
-    private func noteAgentScreenForResumedWork(_ screen: [String], workingLineIndices: [Int]) -> Bool {
-        guard agentMayResumeWorkByItself else { return false }
-        return resumedWorkDetector.noteScreen(
-            screen,
-            workingLineIndices: workingLineIndices,
-            layout: resumedWorkLayout,
-            lastInputAt: lastAgentInputAt,
-            now: Date()
-        )
-    }
-
-    /// Whether the title, now `title`, shows the agent back at work by
-    /// itself.
-    private func noteAgentTitleForResumedWork(_ title: String, isSpinner: Bool) -> Bool {
-        guard agentMayResumeWorkByItself else { return false }
-        return resumedWorkDetector.noteTitle(title, isSpinner: isSpinner, now: Date())
-    }
-
-    /// The agent went back to work by itself after its turn ended (a
-    /// background agent's or task's result, a scheduled wake-up, a hook):
-    /// a new turn, as if one was submitted. The sidebar shows it working,
-    /// MCP counts it (`agent_turn`, `agent_turn_state` active, a monitor's
-    /// `done` when it ends), and its end is a new attention episode that
-    /// can alert once. Nothing was submitted, so `lastAgentSubmitAt` and
-    /// the turn-start rule of MCP waits keep to submitted turns.
-    @discardableResult
-    private func startSelfResumedAgentTurn(source: AgentActivitySource) -> Bool {
-        resumedWorkDetector.disarm()
-        agentSelfResumedTurnCount &+= 1
-        agentTurnState = .active
-        // A harness notification of the turn that ended owned that turn's
-        // episode, not this one's.
-        hasHarnessNotificationForAttentionEpisode = false
-        if activityDebugEnabled {
-            SessionLog.debug("[activity] turn resumed by the agent itself source=\(source)")
-        }
-        if !markAgentWorking(source: source) {
-            // Its first frames already made it working: the observation
-            // that ends the finished turn's episode is due now.
-            scheduleAttentionObservation(event: .activityStateChanged)
-        }
-        scheduleAgentIdleRecheck()
-        bumpRevision()
-        return true
-    }
-
-    @discardableResult
-    private func requestAgentIdleFromRenderedOutput() -> Bool {
-        guard agentActivitySource != .processExit else { return false }
-        guard !agentActivityState.awaitsUserAnswer, agentActivityState != .error else { return false }
-
-        if let lastStrongWorkingEvidenceAt,
-           Date().timeIntervalSince(lastStrongWorkingEvidenceAt) < Self.agentIdleConfirmationEvidenceWindow {
-            scheduleAgentIdleConfirmation()
-            return false
-        }
-        cancelAgentIdleConfirmation()
-        return setAgentActivityState(.idle, source: .promptMarker)
-    }
-
-    private func scheduleAgentIdleConfirmation() {
-        guard agentIdleConfirmationTask == nil else { return }
-        agentIdleConfirmationTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(Int(Self.agentIdleConfirmationDelay * 1_000)))
-            guard let self, !Task.isCancelled else { return }
-            self.agentIdleConfirmationTask = nil
-            self.confirmAgentIdleIfStillAtPrompt()
-        }
-    }
-
-    private func cancelAgentIdleConfirmation() {
-        agentIdleConfirmationTask?.cancel()
-        agentIdleConfirmationTask = nil
-    }
-
-    private func confirmAgentIdleIfStillAtPrompt() {
-        guard kind == .agent, agentActivitySource != .processExit else { return }
-        guard !agentActivityState.awaitsUserAnswer, agentActivityState != .error else { return }
-        guard !renderedOutputShowsAgentWorkingMarker(), !titleSpinnerEvidenceIsActive else { return }
-        guard renderedOutputShowsAgentInputPrompt() else { return }
-        setAgentActivityState(.idle, source: .promptMarker)
-    }
-
-    private func scheduleAgentIdleRecheck() {
-        guard kind == .agent else { return }
-        agentIdleRecheckTask?.cancel()
-        agentIdleRecheckTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(Int(Self.agentIdleRecheckQuietInterval * 1_000)))
-            guard let self, !Task.isCancelled else { return }
-            self.agentIdleRecheckTask = nil
-            self.recheckAgentActivityAfterQuiet()
-        }
-    }
-
-    private func cancelAgentIdleRecheck() {
-        agentIdleRecheckTask?.cancel()
-        agentIdleRecheckTask = nil
-    }
-
-    private func recheckAgentActivityAfterQuiet() {
-        if activityDebugEnabled {
-            SessionLog.debug("[activity] recheck state=\(agentActivityState) source=\(agentActivitySource) marker=\(renderedOutputShowsAgentWorkingMarker()) spinner=\(titleSpinnerEvidenceIsActive) prompt=\(renderedOutputShowsAgentInputPrompt())")
-        }
-        guard kind == .agent, agentActivityState == .working else { return }
-        guard agentActivitySource != .processExit else { return }
-        // A live working marker or a still-pulsing title spinner outranks quiet —
-        // but keep rechecking, so evidence that later disappears (marker scrolls
-        // out of the tail window, spinner stops pulsing) cannot pin "working"
-        // forever on a session that never produces another content change.
-        guard !renderedOutputShowsAgentWorkingMarker(), !titleSpinnerEvidenceIsActive else {
-            scheduleAgentIdleRecheck()
-            return
-        }
-
-        // Prefer a recognized composer prompt — the strongest idle signal. Ignore the
-        // human-input floor so a settled prompt is still found below the last typed line.
-        let lineCount = effectiveAgentContentLineCount()
-        if lineCount > 0 {
-            let normalizedAgentName = screenAgentKey
-            let scanStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-            let scanLines = contentSnapshot(range: scanStart..<lineCount)
-            let promptLines = agentPromptWindowLines(
-                scanStart: scanStart,
-                scanLines: scanLines,
-                applyInputFloor: false
-            )
-            let promptVisible = promptLines.contains { line in
-                AgentScreenActivity.isInputPromptLine(line, agent: normalizedAgentName)
-            } || AgentScreenActivity.showsInputMarker(scanLines, agent: normalizedAgentName)
-            if promptVisible {
-                setAgentActivityState(.idle, source: .promptMarker)
-                return
-            }
-        }
-
-        // No prompt/working UI to key off (amp, bare REPLs, unrecognized agents): the
-        // turn's strong evidence has gone stale and the content has been quiet for the
-        // recheck window, so settle to idle. Mirrors the content-quiet fallback the MCP
-        // wait_for_process_idle loop already applies, lifted into the live UI state so the
-        // sidebar/menu bar stop showing a permanent "working" spinner for these agents.
-        guard hasBeenContentQuiet(for: Self.agentIdleRecheckQuietInterval) else {
-            scheduleAgentIdleRecheck()
-            return
-        }
-        setAgentActivityState(.idle, source: .quietWindow)
-    }
-
-    private func hasBeenContentQuiet(for interval: TimeInterval) -> Bool {
-        guard let lastContentChangeAt else { return true }
-        return Date().timeIntervalSince(lastContentChangeAt) >= interval
-    }
-
-    // TUIs that park the cursor on the bottom screen row materialize dozens of
-    // empty rows below their content, so tail windows must anchor to the last
-    // row that actually holds text.
-    private static let agentTrailingBlankScanLimit = 600
-
-    /// The harness key the screen rules (`AgentScreenActivity`) use.
-    private var screenAgentKey: String {
-        AgentScreenActivity.agentKey(name: agentName ?? title, commandLine: subtitle)
-    }
-
-    private func effectiveAgentContentLineCount() -> Int {
-        let lineCount = contentLineCount()
-        guard lineCount > 0 else { return 0 }
-        let scanStart = max(0, lineCount - Self.agentTrailingBlankScanLimit)
-        let scanLines = contentSnapshot(range: scanStart..<lineCount)
-        var effectiveEnd = lineCount
-        var index = scanLines.count - 1
-        while index >= 0,
-              scanLines[index].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            effectiveEnd -= 1
-            index -= 1
-        }
-        return effectiveEnd
-    }
-
-    /// The screen tail the working and input markers are read from: the
-    /// last `agentInputMarkerTailLineLimit` lines up to the last one with
-    /// text.
-    private func renderedOutputAgentMarkerLines() -> [String] {
-        let lineCount = effectiveAgentContentLineCount()
-        guard lineCount > 0 else { return [] }
-        let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-        return contentSnapshot(range: markerStart..<lineCount)
-    }
-
-    private func renderedOutputShowsAgentWorkingMarker() -> Bool {
-        AgentScreenActivity.showsWorkingMarker(renderedOutputAgentMarkerLines(), agent: screenAgentKey)
-    }
-
-    private static let agentResumedWorkBaselineLineLimit = 200
-
-    /// The tab's last lines with text as it last read them, without reading
-    /// its screen again: a state change can take them (a refresh from there
-    /// would re-enter the activity hooks).
-    private func lastReadAgentScreenTail() -> [String] {
-        let lines: [String]
-        if let closedTabContentLines {
-            lines = closedTabContentLines
-        } else if readsContentFromHost
-                    || (ghosttyBridgeStorage?.isNativePTYBacked == true && !usesInjectedTestingContent) {
-            lines = nativeContentLines
-        } else {
-            let count = processor.lineCount
-            lines = processor.snapshot(range: max(0, count - Self.agentTrailingBlankScanLimit)..<count)
-        }
-        var end = lines.count
-        while end > 0, lines[end - 1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            end -= 1
-        }
-        return Array(lines[max(0, end - Self.agentResumedWorkBaselineLineLimit)..<end])
-    }
-
-    private func renderedOutputShowsAgentInputPrompt() -> Bool {
-        let lineCount = effectiveAgentContentLineCount()
-        guard lineCount > 0 else { return false }
-
-        let normalizedAgentName = screenAgentKey
-        let markerStart = max(0, lineCount - Self.agentInputMarkerTailLineLimit)
-        let markerLines = contentSnapshot(range: markerStart..<lineCount)
-        if AgentScreenActivity.showsWorkingMarker(markerLines, agent: normalizedAgentName) {
-            return false
-        }
-
-        let promptLines = agentPromptWindowLines(
-            scanStart: markerStart,
-            scanLines: markerLines,
-            applyInputFloor: true
-        )
-        if promptLines.contains(where: { line in
-            AgentScreenActivity.isInputPromptLine(line, agent: normalizedAgentName)
-        }) {
-            return true
-        }
-
-        return AgentScreenActivity.showsInputMarker(markerLines, agent: normalizedAgentName)
-    }
-
-    // Alternate-screen grids and PTY echo can leave blank rows below the visible
-    // content, so the prompt window is anchored to the last non-blank row.
-    private func agentPromptWindowLines(
-        scanStart: Int,
-        scanLines: [String],
-        applyInputFloor: Bool
-    ) -> [String] {
-        var effectiveEndOffset = scanLines.count
-        while effectiveEndOffset > 0,
-              scanLines[effectiveEndOffset - 1]
-                  .trimmingCharacters(in: .whitespacesAndNewlines)
-                  .isEmpty {
-            effectiveEndOffset -= 1
-        }
-        guard effectiveEndOffset > 0 else { return [] }
-
-        let effectiveEnd = scanStart + effectiveEndOffset
-        let promptStart = Self.agentInputPromptSearchStart(
-            lineCount: effectiveEnd,
-            lastHumanInputLine: applyInputFloor ? lastHumanInputLine : nil
-        )
-        guard promptStart < effectiveEnd, promptStart >= scanStart else { return [] }
-        return Array(scanLines[(promptStart - scanStart)..<effectiveEndOffset])
-    }
-
-    private static let agentInputPromptTailLineLimit = AgentScreenActivity.promptTailLineLimit
-    private static let agentInputMarkerTailLineLimit = AgentScreenActivity.markerTailLineLimit
-
-    private static func agentInputPromptSearchStart(lineCount: Int, lastHumanInputLine: Int?) -> Int {
-        let tailStart = max(0, lineCount - agentInputPromptTailLineLimit)
-        guard let lastHumanInputLine, lastHumanInputLine < lineCount else {
-            // Fixed-size screens (alternate-screen TUIs) repaint in place, so the
-            // buffer never grows past the line recorded at submit time; a floor
-            // there would disable idle detection permanently.
-            return tailStart
-        }
-        return max(lastHumanInputLine, tailStart)
-    }
-
     private static let agentCompletionPhrases: [String] = [
         "turn complete",
         "task complete",
@@ -9476,27 +8174,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         "agent done"
     ]
 
-    private static let agentPermissionPhrases: [String] = [
-        "permission required",
-        "permission needed",
-        "needs approval",
-        "needs permission",
-        "needs confirmation",
-        "awaiting approval",
-        "awaiting permission",
-        "awaiting confirmation",
-        "approval required",
-        "approval needed",
-        "confirmation required",
-        "confirmation needed"
-    ]
-
     private static func notificationBodyIndicatesCompletion(_ body: String) -> Bool {
         notificationBody(body, containsAnyPhraseAsWord: agentCompletionPhrases)
-    }
-
-    private static func notificationBodyIndicatesPermission(_ body: String) -> Bool {
-        notificationBody(body, containsAnyPhraseAsWord: agentPermissionPhrases)
     }
 
     private static func notificationBody(_ body: String, containsAnyPhraseAsWord phrases: [String]) -> Bool {
@@ -9625,104 +8304,33 @@ final class TerminalSession: ObservableObject, Identifiable {
             : .none
     }
 
-    private static func appKitKeyEventInterruptsAgentTurn(_ event: NSEvent) -> Bool {
-        guard event.type == .keyDown else { return false }
-        let modifiers = event.modifierFlags.intersection([.shift, .control, .option, .command])
-        if event.keyCode == 53, modifiers.isEmpty {
-            return true
-        }
-        return modifiers == [.control]
-            && event.characters?.unicodeScalars.first?.value == 0x03
-    }
-
     private func applyAgentDraftInputEffect(_ effect: AgentDraftInputEffect) {
         guard kind == .agent, effect != .none else { return }
         lastHumanKeystrokeAt = Date()
-        noteAttentionSampleInput(effect)
 
-        if agentIsAtAnswerMenu {
+        if agentActivityState.awaitsUserAnswer {
             // Keys typed into a permission or question menu answer it
-            // (digits, arrows, Enter): no draft and no new turn. The state
-            // follows the screen: another question of the same menu keeps
-            // it, the menu's end resumes the paused turn
-            // (`applyAgentAnswerMenu`).
+            // (digits, arrows, Enter): no draft and no new turn; the
+            // program reports what comes next.
             if effect == .submitted {
                 hasUnsubmittedHumanInput = false
-                noteHumanInputIfNeeded()
             }
             return
         }
 
         switch effect {
-        case .none:
+        case .none, .edited:
             return
         case .inserted:
             hasUnsubmittedHumanInput = true
-            scheduleAttentionObservation(event: .inputChanged)
-        case .edited:
-            scheduleAttentionObservation(event: .inputChanged)
         case .cleared:
             hasUnsubmittedHumanInput = false
-            scheduleAttentionObservation(event: .inputChanged)
         case .submitted:
             hasUnsubmittedHumanInput = false
-            hasHarnessNotificationForAttentionEpisode = false
-            noteHumanInputIfNeeded()
-            agentWasWorkingAtLastSubmit = agentActivityState == .working && agentStateHasDirectEvidence
-            agentWasReadableAtLastSubmit = agentStateHasDirectEvidence
+            agentWasWorkingAtLastSubmit = agentActivityState == .working
             agentSubmittedTurnCount &+= 1
             lastAgentSubmitAt = Date()
-            agentTurnState = .active
-            resumedWorkDetector.disarm()
-            setAgentActivityState(.working, source: .inputSubmit)
-            scheduleAgentIdleRecheck()
-            scheduleAttentionObservation(event: .inputSubmitted)
         }
-    }
-
-    private func noteAgentDraftCleared() {
-        guard kind == .agent else { return }
-        applyAgentDraftInputEffect(.cleared)
-    }
-
-    private func noteAgentTurnInterrupted() {
-        guard kind == .agent, agentTurnState == .active else { return }
-        noteAttentionSampleEvent(.interrupted)
-        agentTurnState = .userInterrupted
-        scheduleAttentionObservation(event: .turnInterrupted)
-    }
-
-    /// Every keystroke clears it: publishes only when there was one.
-    private func clearCurrentAttentionScreenTag() {
-        if currentAttentionScreenTag != nil {
-            currentAttentionScreenTag = nil
-        }
-        currentAttentionScreenTagObservationID = nil
-    }
-
-    @discardableResult
-    private func setAgentActivityState(_ nextState: AgentActivityState, source: AgentActivitySource) -> Bool {
-        guard kind == .agent else { return false }
-        if nextState == .idle || nextState == .error {
-            switch agentTurnState {
-            case .active:
-                agentTurnState = .completed
-                armResumedWorkDetector()
-            case .userInterrupted where nextState == .idle && !resumedWorkDetector.isArmed:
-                // The interrupted turn settled at the composer: work the
-                // agent shows from here on is its own.
-                armResumedWorkDetector()
-            case .userInterrupted, .completed, .notStarted:
-                break
-            }
-        }
-        let stateChanged = agentActivityState != nextState
-        agentActivityState = nextState
-        agentActivitySource = source
-        guard stateChanged else { return false }
-        scheduleAttentionObservation(event: .activityStateChanged)
-        bumpRevision()
-        return true
     }
 
     private func normalizedInputData(_ data: Data) -> Data {
@@ -9769,13 +8377,6 @@ final class TerminalSession: ObservableObject, Identifiable {
         return true
     }
 
-    private func noteHumanInputIfNeeded() {
-        guard kind == .agent else { return }
-        lastHumanInputLine = effectiveAgentContentLineCount()
-        lastHumanInputAt = Date()
-        humanInputGeneration &+= 1
-    }
-
     private func keyboardProtocolFlagsByApplying(flags: Int, mode: Int) -> Int {
         switch mode {
         case 2:
@@ -9784,15 +8385,6 @@ final class TerminalSession: ObservableObject, Identifiable {
             streamKeyboardProtocolFlags & ~flags
         default:
             flags
-        }
-    }
-
-    private var lineSummary: String {
-        let visibleLineCount = max(processor.storedLineCount, 1)
-        if let maxScrollback {
-            return "\(min(visibleLineCount, maxScrollback))/\(maxScrollback) lines"
-        } else {
-            return "\(visibleLineCount) lines · unlimited"
         }
     }
 

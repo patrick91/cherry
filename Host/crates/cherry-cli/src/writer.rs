@@ -428,8 +428,13 @@ mod tests {
                     // The thread may not have taken its first batch yet.
                     let written = writer.written();
                     thread::sleep(Duration::from_millis(100));
-                    if writer.written() == written && writer.push(&chunk).unwrap() == 0 {
-                        return queued;
+                    if writer.written() == written {
+                        // Counted when room came after all: the thread
+                        // took its batch between the two pushes.
+                        match writer.push(&chunk).unwrap() {
+                            0 => return queued,
+                            n => queued += n,
+                        }
                     }
                 }
                 n => queued += n,

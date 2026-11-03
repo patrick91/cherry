@@ -547,6 +547,36 @@ pub fn base64(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `text` in standard base64, padding optional; None for anything else.
+pub fn decode_base64(text: &[u8]) -> Option<Vec<u8>> {
+    let text = text
+        .strip_suffix(b"==")
+        .or_else(|| text.strip_suffix(b"="))
+        .unwrap_or(text);
+    if text.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 4 * 3 + 2);
+    let (mut bits, mut count) = (0u32, 0);
+    for &byte in text {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        bits = (bits << 6) | u32::from(value);
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            out.push((bits >> count) as u8);
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +588,22 @@ mod tests {
         assert_eq!(base64(b"fo"), b"Zm8=");
         assert_eq!(base64(b"foo"), b"Zm9v");
         assert_eq!(base64(b"foobar"), b"Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_decodes_with_or_without_padding() {
+        for bytes in [&b""[..], b"f", b"fo", b"foo", b"foobar"] {
+            let text = base64(bytes);
+            assert_eq!(decode_base64(&text).as_deref(), Some(bytes));
+            let unpadded = text.strip_suffix(b"==").or_else(|| text.strip_suffix(b"="));
+            assert_eq!(
+                decode_base64(unpadded.unwrap_or(&text)).as_deref(),
+                Some(bytes)
+            );
+        }
+        for text in [&b"Z"[..], b"Zg===", b"Zg=A", b"Zm9v\n"] {
+            assert_eq!(decode_base64(text), None, "{text:?}");
+        }
     }
 
     #[test]

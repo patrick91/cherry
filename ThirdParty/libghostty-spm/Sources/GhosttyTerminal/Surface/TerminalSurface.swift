@@ -80,6 +80,20 @@ public final class TerminalSurface {
         }
     }
 
+    func pasteText(_ text: String) {
+        guard let s = surface else {
+            TerminalDebugLog.log(.input, "surface paste ignored: missing surface")
+            return
+        }
+        TerminalDebugLog.log(
+            .input,
+            "surface paste=\(TerminalDebugLog.describe(text))"
+        )
+        text.withCString { cStr in
+            ghostty_surface_paste_text(s, cStr, UInt(text.utf8.count))
+        }
+    }
+
     @discardableResult
     func sendMouseButton(
         state: ghostty_input_mouse_state_e,

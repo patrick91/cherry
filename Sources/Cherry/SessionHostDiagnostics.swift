@@ -1,8 +1,8 @@
 import AppKit
 import Foundation
 
-/// The local session host as `cherry status --json` describes it
-/// (Settings › Sessions, "Session Host").
+/// The local session host as `cherry host status --json` describes it
+/// (Settings › Sessions, its session host header).
 struct SessionHostStatus: Equatable, Sendable {
     var running: Bool
     var socket: String?
@@ -22,7 +22,7 @@ struct SessionHostStatus: Equatable, Sendable {
     /// the code they started with until they end).
     var otherHolderBuilds = 0
 
-    /// Parses `cherry status --json` (running or not); nil for anything else.
+    /// Parses `cherry host status --json` (running or not); nil for anything else.
     static func parse(_ data: Data) -> SessionHostStatus? {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let running = object["running"] as? Bool
@@ -62,12 +62,28 @@ struct SessionHostStatus: Equatable, Sendable {
         return parts.joined(separator: " · ")
     }
 
-    /// "3 sessions (2 running) of 128 · 5 of 1024 connections · 1 holder of
-    /// an older build", or where the host would run.
+    /// "3 sessions (2 running) of 128 · 5 of 1024 connections · 1 session
+    /// runs in a holder of another build · pid 4242", or where the host
+    /// would run.
     var detail: String {
         guard running else {
             return "It starts with the first persistent tab. Socket: \(socket ?? "unknown")."
         }
+        var parts = sessionsParts
+        if let pid { parts.append("pid \(pid)") }
+        return parts.joined(separator: " · ")
+    }
+
+    /// The Sessions row under the host's header: "3 sessions (2 running) of
+    /// 128 · 5 of 1024 connections · 1 session runs in a holder of another
+    /// build"; while the host is not running, when it starts. The socket
+    /// and the log have rows of their own.
+    var sessionsSummary: String {
+        guard running else { return "It starts with the first persistent tab." }
+        return sessionsParts.joined(separator: " · ")
+    }
+
+    private var sessionsParts: [String] {
         var parts: [String] = []
         if let sessions {
             var text = sessions == 1 ? "1 session" : "\(sessions) sessions"
@@ -83,11 +99,10 @@ struct SessionHostStatus: Equatable, Sendable {
                 ? "1 session runs in a holder of another build"
                 : "\(otherHolderBuilds) sessions run in holders of another build")
         }
-        if let pid { parts.append("pid \(pid)") }
-        return parts.joined(separator: " · ")
+        return parts
     }
 
-    /// `12s`, `4m 10s`, `2h 5m`, `3d 4h`, as `cherry status` prints it.
+    /// `12s`, `4m 10s`, `2h 5m`, `3d 4h`, as `cherry host status` prints it.
     static func duration(_ interval: TimeInterval) -> String {
         let seconds = max(0, Int(interval))
         let (days, hours, minutes) = (seconds / 86_400, seconds / 3_600 % 24, seconds / 60 % 60)
@@ -108,11 +123,21 @@ struct HostCommandOutput: Equatable, Sendable {
 /// Runs the bundled `cherry` with the given arguments.
 typealias HostCommandRunner = @Sendable ([String]) async throws -> HostCommandOutput
 
-/// Settings › Sessions' "Session Host" card: the local host's status
-/// (`cherry status --json`), Reveal Log, Copy Diagnostics (`cherry status`
-/// and `cherry doctor`) and Restart Host (`cherry restart`, after the card
-/// asked). It runs only commands that never start a host, except the
-/// restart it was asked for.
+/// The session host's header on Settings › Sessions: its dot and status
+/// line ("Running · build … · up 2h 5m") and, when the status could not be
+/// read, why.
+struct SessionHostHeroState: Equatable, Sendable {
+    var tone: SettingsStatusDot.Tone
+    var title: String
+    var detail: String?
+}
+
+/// Settings › Sessions' session host (its header and rows, and the
+/// sidebar's status item): the local host's status (`cherry host status
+/// --json`), the socket's path to copy, Reveal Log, Copy Diagnostics
+/// (`cherry host status` and `cherry host doctor`) and Restart Host (`cherry host
+/// restart`, after the page asked). It runs only commands that never start
+/// a host, except the restart it was asked for.
 @MainActor
 final class SessionHostDiagnostics: ObservableObject {
     static let shared = SessionHostDiagnostics()
@@ -144,7 +169,7 @@ final class SessionHostDiagnostics: ObservableObject {
         self.copyToPasteboard = copyToPasteboard
     }
 
-    /// Reads the host's status again (`cherry status --json`).
+    /// Reads the host's status again (`cherry host status --json`).
     func refresh() async {
         if let reason = unavailableReason() {
             problem = reason
@@ -152,13 +177,13 @@ final class SessionHostDiagnostics: ObservableObject {
             return
         }
         do {
-            let result = try await runner(["status", "--json"])
+            let result = try await runner(["host", "status", "--json"])
             if let parsed = SessionHostStatus.parse(Data(result.output.utf8)) {
                 status = parsed
                 problem = nil
             } else {
                 status = nil
-                problem = Self.failure(of: "cherry status", result)
+                problem = Self.failure(of: "cherry host status", result)
             }
         } catch {
             status = nil
@@ -166,7 +191,7 @@ final class SessionHostDiagnostics: ObservableObject {
         }
     }
 
-    /// `cherry status` and `cherry doctor`, as a report to paste into an
+    /// `cherry host status` and `cherry host doctor`, as a report to paste into an
     /// issue: the app's version first.
     func diagnostics() async -> String {
         let info = Bundle.main.infoDictionary ?? [:]
@@ -176,7 +201,7 @@ final class SessionHostDiagnostics: ObservableObject {
         if let reason = unavailableReason() {
             report += "Local sessions are unavailable: \(reason)\n"
         }
-        for arguments in [["status"], ["doctor"]] {
+        for arguments in [["host", "status"], ["host", "doctor"]] {
             report += "\n$ cherry \(arguments.joined(separator: " "))\n"
             do {
                 let result = try await runner(arguments)
@@ -194,6 +219,37 @@ final class SessionHostDiagnostics: ObservableObject {
         copyToPasteboard(await diagnostics())
     }
 
+    /// Copies the host's socket path (the Socket row), as `cherry host status`
+    /// last reported it; nothing while it is not known.
+    func copySocketPath() {
+        guard let socket = status?.socket else { return }
+        copyToPasteboard(socket)
+    }
+
+    /// The header's dot and status line, from what is known now.
+    var heroState: SessionHostHeroState {
+        Self.heroState(status: status, problem: problem, isRestarting: isRestarting, restartFailure: restartFailure)
+    }
+
+    /// Green while the host runs, gray when it does not, yellow while
+    /// Cherry checks or restarts it, red when a restart failed or the
+    /// status could not be read (`problem`, under the line, also after a
+    /// failed restart).
+    nonisolated static func heroState(
+        status: SessionHostStatus?,
+        problem: String?,
+        isRestarting: Bool,
+        restartFailure: String?
+    ) -> SessionHostHeroState {
+        if isRestarting { return SessionHostHeroState(tone: .yellow, title: "Restarting…") }
+        if let restartFailure {
+            return SessionHostHeroState(tone: .red, title: "Restart failed: \(restartFailure)", detail: problem)
+        }
+        if let problem { return SessionHostHeroState(tone: .red, title: "Unknown", detail: problem) }
+        guard let status else { return SessionHostHeroState(tone: .yellow, title: "Checking…") }
+        return SessionHostHeroState(tone: status.running ? .green : .gray, title: status.headline)
+    }
+
     /// Shows the host's log in the Finder: the daemon's `host.log`, or
     /// where it would be.
     func revealLog() {
@@ -201,16 +257,16 @@ final class SessionHostDiagnostics: ObservableObject {
         revealInFinder(URL(fileURLWithPath: path))
     }
 
-    /// Restarts the local host (`cherry restart`): its sessions carry on in
+    /// Restarts the local host (`cherry host restart`): its sessions carry on in
     /// their holders and tabs reconnect. The caller asked first.
     func restartHost() async {
         isRestarting = true
         restartFailure = nil
         defer { isRestarting = false }
         do {
-            let result = try await runner(["restart"])
+            let result = try await runner(["host", "restart"])
             if result.status != 0 {
-                restartFailure = Self.failure(of: "cherry restart", result)
+                restartFailure = Self.failure(of: "cherry host restart", result)
             }
         } catch {
             restartFailure = error.localizedDescription
@@ -248,41 +304,24 @@ final class SessionHostDiagnostics: ObservableObject {
         }
     }
 
-    private final class Collected: @unchecked Sendable {
-        var data = Data()
-    }
-
     private nonisolated static func runProcess(
         _ executable: URL,
         arguments: [String],
         environment: [String: String]
     ) throws -> HostCommandOutput {
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = arguments
-        process.environment = environment
-        process.currentDirectoryURL = URL(fileURLWithPath: "/")
-        let output = Pipe()
-        let errors = Pipe()
-        process.standardInput = FileHandle.nullDevice
-        process.standardOutput = output
-        process.standardError = errors
-        try process.run()
-        // Read both to the end before waiting, so neither pipe fills.
-        let group = DispatchGroup()
-        let errorData = Collected()
-        group.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
-            errorData.data = errors.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
-        }
-        let outputData = output.fileHandleForReading.readDataToEndOfFile()
-        group.wait()
-        process.waitUntilExit()
+        let result = CapturedProcess.run(
+            executable: executable,
+            arguments: arguments,
+            environment: environment,
+            input: nil,
+            currentDirectory: URL(fileURLWithPath: "/"),
+            timeout: nil
+        )
+        if let launchError = result.launchError { throw launchError }
         return HostCommandOutput(
-            status: process.terminationStatus,
-            output: String(decoding: outputData, as: UTF8.self),
-            errors: String(decoding: errorData.data, as: UTF8.self)
+            status: result.status,
+            output: String(decoding: result.standardOutput, as: UTF8.self),
+            errors: String(decoding: result.standardError, as: UTF8.self)
         )
     }
 }

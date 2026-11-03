@@ -306,7 +306,7 @@ largest uncertainty is terminal restoration and query compatibility.
 
 - Current Cherry production path: `Sources/Cherry/GhosttySessionBridge.swift`
   (`makeOptions`), `Sources/Cherry/TerminalSession.swift` (native launch and stop),
-  and `docs/native-pty.md`. Older lifecycle notes describe a superseded backend.
+  and `docs/native-pty.md`.
 - [Ghostty library status](https://github.com/ghostty-org/ghostty#cross-platform-libghostty-for-embeddable-terminals)
   and [VT formatter API](https://github.com/ghostty-org/ghostty/blob/main/include/ghostty/vt/formatter.h).
 - [Unpeel PTY architecture](https://github.com/unpeel-com/unpeel/blob/443877b6407cdcd275ace55e1bcda82292bb2178/docs/agents/pty-core.md)

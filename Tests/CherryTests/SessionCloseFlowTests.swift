@@ -373,8 +373,8 @@ private func button(titled title: String, in view: NSView?) -> NSButton? {
     #expect(SessionCloseCoordinator.canDetach(attached))
     #expect(policy.closeAction(for: attached, intent: .userDetachedTab) == .detach)
     // Found again where it was attached from.
-    #expect(ClosedTabNotice.reopenTarget(for: attached, in: "/work/app") == .attach(attachment, worktreeRoot: "/work/app"))
-    let notice = ClosedTabNotice(tabName: "Claude", reopen: .attach(attachment, worktreeRoot: "/work/app"))
+    #expect(ClosedTabNotice.reopenTarget(for: attached, in: "/work/app") == .attach(attachment, projectRoot: "/work/app"))
+    let notice = ClosedTabNotice(tabName: "Claude", reopen: .attach(attachment, projectRoot: "/work/app"))
     #expect(notice.title == "Claude is running in the background")
     #expect(notice.message == "Attach to it again from File › Persistent Sessions.")
     // An SSH host's session: the same.
@@ -510,7 +510,9 @@ private func sessionID(of tab: TerminalSession) throws -> String {
         #"{"outcome":"exited","exit_code":null,"signal":null,"message":null}"#, to: try harness.statusFile(of: call)
     )
     unknown.ingestNativeChildExit(exitCode: 0)
-    #expect(unknown.state == .exited(1))
+    // The host still lists it running: the adapter's report is taken once
+    // the host said nothing more (`adapterExitHostReportWait`).
+    #expect(await harness.fake.wait { unknown.state == .exited(1) })
     try await Task.sleep(for: .milliseconds(200))
     #expect(workspace.sessions.contains { $0 === unknown })
 }
@@ -540,7 +542,7 @@ private func sessionID(of tab: TerminalSession) throws -> String {
     #expect(await harness.fake.wait { command.state == .exited(0) && agent.state == .exited(0) })
     try await Task.sleep(for: .milliseconds(200))
     #expect(workspace.sessions.map(\.id) == [anchor.id, command.id, agent.id])
-    #expect(agent.agentActivityState == .idle)
+    #expect(agent.agentActivityState == .unknown)
     #expect(agent.persistentSessionEndedMessage == "Session ended (exit 0)")
     #expect(harness.fake.requests("remove").isEmpty)
 }
@@ -753,30 +755,17 @@ private func sessionID(of tab: TerminalSession) throws -> String {
     #expect(workspace.closesTabAfterExit(tab))
 
     // Nor does it close without a window, or while a sheet is on it.
-    SessionCloseCoordinator.closeTabAfterCleanExit(tab, in: workspace, repository: nil, window: nil)
+    SessionCloseCoordinator.closeTabAfterCleanExit(tab, in: workspace, window: nil)
     let window = RecordingWindow()
     window.presentedSheet = NSWindow()
-    SessionCloseCoordinator.closeTabAfterCleanExit(tab, in: workspace, repository: nil, window: window)
+    SessionCloseCoordinator.closeTabAfterCleanExit(tab, in: workspace, window: window)
     #expect(workspace.sessions.map(\.id) == [tab.id])
     #expect(window.closeRequests == 0)
     #expect(harness.fake.requests("remove").isEmpty)
 
-    // Nor while the window shows a note: ⌘W would close the note, not the
-    // window, so the window does not vanish under it.
-    window.presentedSheet = nil
-    let chromeState = ProjectWindowChromeState()
-    chromeState.selectedNoteID = UUID()
-    SessionCloseCoordinator.closeTabAfterCleanExit(
-        tab, in: workspace, repository: nil, chromeState: chromeState, window: window
-    )
-    #expect(workspace.sessions.map(\.id) == [tab.id])
-    #expect(window.closeRequests == 0)
-
     // Otherwise the tab closes, and then its window, as ⌘W closes them.
-    chromeState.selectedNoteID = nil
-    SessionCloseCoordinator.closeTabAfterCleanExit(
-        tab, in: workspace, repository: nil, chromeState: chromeState, window: window
-    )
+    window.presentedSheet = nil
+    SessionCloseCoordinator.closeTabAfterCleanExit(tab, in: workspace, window: window)
     #expect(workspace.sessions.isEmpty)
     #expect(window.closeRequests == 1)
     #expect(await harness.fake.wait { harness.requestIDs("remove").contains(tabSession) })
@@ -787,7 +776,7 @@ private func sessionID(of tab: TerminalSession) throws -> String {
     defer { windowed.closeAllSessions(intent: .windowClosed) }
     let otherWindow = RecordingWindow()
     windowed.closeTabAfterCleanExit = { workspace, session in
-        SessionCloseCoordinator.closeTabAfterCleanExit(session, in: workspace, repository: nil, window: otherWindow)
+        SessionCloseCoordinator.closeTabAfterCleanExit(session, in: workspace, window: otherWindow)
     }
     let last = windowed.addSession(title: "Last")
     #expect(await harness.waitUntilAttached(last))
@@ -796,7 +785,7 @@ private func sessionID(of tab: TerminalSession) throws -> String {
     #expect(windowed.sessions.isEmpty)
 }
 
-@Test @MainActor func aProjectWindowsWorktreeClosesATabWhoseShellExitsCleanly() async throws {
+@Test @MainActor func aProjectWindowClosesATabWhoseShellExitsCleanly() async throws {
     let harness = try PersistentHarness()
     harness.cleanExitMinimumRunTime = 0
     let repository = RepositoryWorkspace(
@@ -809,7 +798,7 @@ private func sessionID(of tab: TerminalSession) throws -> String {
         repository.closeAllSessions(intent: .windowClosed)
         harness.cleanUp()
     }
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     let shell = try #require(workspace.sessions.first)
     #expect(await harness.waitUntilAttached(shell))
     let tab = workspace.addSession(title: "Second")

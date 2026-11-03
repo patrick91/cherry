@@ -513,9 +513,9 @@ fn a_holder_reports_its_terminal_state_when_it_changes_and_limits_its_screen() {
             r#"stty -echo
 printf '\033[1mstyled\033[0m \033]2;Styled\007\n'
 while [ ! -e '{enter}' ]; do sleep 0.02; done
-printf 'one\ntwo\n\033[?1049h\033[>3u\033[?1hFULL SCREEN'
+printf 'one\ntwo\n\033[?1049h\033[>3u\033[>4;2m\033[?1hFULL SCREEN'
 while [ ! -e '{leave}' ]; do sleep 0.02; done
-printf '\033[<u\033[?1049l\033[?1lPRIMARY'
+printf '\033[<u\033[?1049l\033[>4m\033[?1lPRIMARY'
 exec sleep 60"#,
             enter = enter.display(),
             leave = leave.display(),
@@ -526,10 +526,12 @@ exec sleep 60"#,
     assert_eq!(hello.meta["session"]["alternate_screen"], false);
     assert_eq!(hello.meta["session"]["kitty_keyboard_flags"], 0);
     assert_eq!(hello.meta["session"]["application_cursor_keys"], false);
-    const STATE: [&str; 3] = [
+    assert_eq!(hello.meta["session"]["modify_other_keys"], false);
+    const STATE: [&str; 4] = [
         "alternate_screen",
         "kitty_keyboard_flags",
         "application_cursor_keys",
+        "modify_other_keys",
     ];
     // What reports the terminal state, until `done` holds for it.
     let reports = |daemon: &mut UnixStream, done: &dyn Fn(&serde_json::Value) -> bool| {
@@ -560,7 +562,10 @@ exec sleep 60"#,
     // DECCKM is set last, so its report comes with or after the others.
     let entered = reports(&mut daemon, &|meta| meta["application_cursor_keys"] == true);
     // Once each, however the output was read.
-    for (key, value) in STATE.iter().zip([json!(true), json!(3), json!(true)]) {
+    for (key, value) in STATE
+        .iter()
+        .zip([json!(true), json!(3), json!(true), json!(true)])
+    {
         assert_eq!(reported(&entered, key), [value], "{key}: {entered:?}");
     }
     // The screen, limited to its last line, with its history: the
@@ -601,13 +606,16 @@ exec sleep 60"#,
     assert_eq!(hello.kind, link::HOLDER_HELLO);
     assert_eq!(
         STATE.map(|key| hello.meta["session"][key].clone()),
-        [json!(true), json!(3), json!(true)]
+        [json!(true), json!(3), json!(true), json!(true)]
     );
     fs::write(&leave, b"").unwrap();
     let left = reports(&mut daemon, &|meta| {
         meta["application_cursor_keys"] == false
     });
-    for (key, value) in STATE.iter().zip([json!(false), json!(0), json!(false)]) {
+    for (key, value) in STATE
+        .iter()
+        .zip([json!(false), json!(0), json!(false), json!(false)])
+    {
         assert_eq!(reported(&left, key), [value], "{key}: {left:?}");
     }
     link::send(&mut daemon, link::KILL, link::VERSION, json!({}), b"");

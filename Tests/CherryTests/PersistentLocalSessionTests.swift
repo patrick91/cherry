@@ -94,7 +94,7 @@ final class PersistentHarness {
         configuration.terminationTimeout = .seconds(3)
         configuration.restartExitTimeout = .seconds(3)
         configuration.reconnectDelay = (0.05, 0.2)
-        configuration.disappearanceConfirmationDelay = .milliseconds(400)
+        configuration.adapterExitHostReportWait = 0.2
         configuration.lostCreateChecks = [.milliseconds(200), .milliseconds(800)]
         return configuration
     }()
@@ -147,6 +147,21 @@ final class PersistentHarness {
         guard let connection = fake.connections.last(where: { !$0.isClosed }) else { return }
         connection.push(.event(.exited(id: sessionID, exitCode: code, signal: signal)))
         if let exited { connection.push(.event(.changed(exited))) }
+    }
+
+    /// Reports that the tab's shell runs `job` in its foreground (a busy
+    /// terminal), and waits until the tab sees it.
+    func makeBusy(_ session: TerminalSession, job: String = "sleep") async -> Bool {
+        guard let id = session.persistentSession?.sessionID,
+              let info = fake.sessions.first(where: { $0.id == id }) else { return false }
+        let busy = HostedSessionInfo(
+            id: id, name: info.name, cwd: info.cwd, command: info.command, pid: info.pid ?? 42,
+            foreground: HostedSessionForeground(pid: 99, name: job),
+            owner: info.owner, tags: info.tags, createdAt: info.createdAt
+        )
+        fake.sessions = fake.sessions.map { $0.id == id ? busy : $0 }
+        fake.connections.last(where: { !$0.isClosed })?.push(.event(.changed(busy)))
+        return await fake.wait { session.hasRunningProcess() }
     }
 
     func statusFile(of call: String) throws -> URL {
@@ -229,7 +244,7 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     // The surface runs the attach adapter for that session.
     #expect(await harness.fake.wait { harness.attachCalls.count == 1 })
     let attach = try #require(harness.attachCalls.first)
-    #expect(attach.hasPrefix("--expected-host-id host-a attach \(sessionID) --detach-key none --client-id \(terminal.id.uuidString) --status-file "))
+    #expect(attach.hasPrefix("--expected-host-id host-a host attach \(sessionID) --detach-key none --client-id \(terminal.id.uuidString) --status-file "))
 
     // Agents and commands keep their kind, name and launch settings.
     let agent = workspace.addAgentSession(
@@ -340,7 +355,8 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     #expect(await harness.fake.wait { agent.state == .exited(3) })
     #expect(!agent.isRunning)
     #expect(agent.exitCode == 3)
-    #expect(agent.agentActivityState == .error)
+    // Its state is what it reported, and it reported nothing.
+    #expect(agent.agentActivityState == .unknown)
     #expect(agent.hostedProgramProcessID == nil)
     // The adapter reports the same exit as it ends: nothing changes.
     agent.ingestNativeChildExit(exitCode: 0)
@@ -438,11 +454,13 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     #expect(session.isRunning)
     #expect(session.acceptsInput)
 
-    // The adapter's outcome says the program ended: that is the exit.
+    // The adapter's outcome says the program ended: that is the exit, once
+    // the host, which still lists the session running, has not said more
+    // within `adapterExitHostReportWait`.
     try Data(#"{"outcome":"exited","exit_code":5,"signal":null,"message":null}"#.utf8)
         .write(to: try harness.statusFile(of: harness.attachCalls[3]))
     session.ingestNativeChildExit(exitCode: 0)
-    #expect(session.state == .exited(5))
+    #expect(await harness.fake.wait { session.state == .exited(5) })
     #expect(!session.isRunning)
     try await Task.sleep(for: .milliseconds(300))
     #expect(harness.attachCalls.count == 4)
@@ -484,12 +502,12 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     harness.fake.connections.last?.push(.event(.changed(busy)))
     #expect(await harness.fake.wait { terminal.hasRunningProcess() })
 
-    // What quitting, closing the window or removing the worktree would end:
-    // a quit or window close keeping sessions ends none of them.
+    // What quitting or closing the window would end: a quit or window
+    // close keeping sessions ends none of them.
     #expect(workspace.sessionsWithRunningProcess(endingWith: .appQuit).isEmpty)
     #expect(workspace.sessionsWithRunningProcess(endingWith: .windowClosed).isEmpty)
     #expect(workspace.persistentSessionsEnded(by: .appQuit).isEmpty)
-    #expect(Set(workspace.sessionsWithRunningProcess(endingWith: .worktreeRemoved).map(\.id)) == [terminal.id, command.id])
+    #expect(Set(workspace.sessionsWithRunningProcess(endingWith: .mcpClose).map(\.id)) == [terminal.id, command.id])
     #expect(Set(workspace.sessionsWithRunningProcess(endingWith: .appQuitEndingSessions).map(\.id)) == [terminal.id, command.id])
     #expect(workspace.persistentSessionsEnded(by: .appQuitEndingSessions).count == 2)
     #expect(workspace.sessionsWithRunningProcess(endingWith: .duplicateWindowTeardown).isEmpty)
@@ -551,14 +569,6 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     workspace.close(ended, intent: .userDetachedTab)
     #expect(await harness.fake.wait { harness.requestIDs("remove").contains(endedSession) })
     #expect(!harness.requestIDs("kill").contains(endedSession))
-
-    // Removing a worktree always ends its sessions.
-    let worktree = TerminalWorkspace(projectRoot: harness.project.path, createInitialSession: false, backendPolicy: harness.policy)
-    let removedTab = worktree.addSession()
-    #expect(await harness.waitUntilAttached(removedTab))
-    let removedSession = try #require(removedTab.persistentSession?.sessionID)
-    worktree.closeAllSessions(intent: .worktreeRemoved)
-    #expect(await harness.fake.wait { harness.requestIDs("remove").contains(removedSession) })
 
     // A window closing or the app quitting keeps them, unless its answer
     // (or Settings › Sessions) ends them; a discarded duplicate window never
@@ -739,7 +749,6 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     let restorer = harness.restorer
     let result = await restorer(WorkspaceRestoreRequest(
         repositoryRoot: harness.project.path,
-        worktreeRoot: harness.project.path,
         records: [running, ended, missing, otherHost],
         workspace: workspace
     ))
@@ -760,7 +769,7 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     // Ended while Cherry was closed: shown ended at once, with no adapter;
     // its final screen comes from the host.
     #expect(agent.state == .exited(2))
-    #expect(agent.agentActivityState == .error)
+    #expect(agent.agentActivityState == .unknown)
     #expect(agent.persistentSessionEndedMessage == "Session ended (exit 2)")
     #expect(!agent.isAwaitingDeferredLaunch)
     #expect(harness.creates().isEmpty)
@@ -779,7 +788,6 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     harness.installationProblem.value = "The cherry session client is missing."
     let kept = await restorer(WorkspaceRestoreRequest(
         repositoryRoot: harness.project.path,
-        worktreeRoot: harness.project.path,
         records: [running],
         workspace: workspace
     ))
@@ -897,7 +905,6 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
         workspaces.append(workspace)
         let result = await restorer(WorkspaceRestoreRequest(
             repositoryRoot: harness.project.path,
-            worktreeRoot: harness.project.path,
             records: record.sessions.filter(\.isRestorable),
             workspace: workspace
         ))
@@ -964,19 +971,26 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
     #expect(await harness.waitUntilAttached(command))
     let sessionID = try #require(command.persistentSession?.sessionID)
     let listed = harness.fake.sessions
+    let withoutIt = listed.filter { $0.id != sessionID }
 
-    // The daemon restarted and listed before the session's holder had
-    // registered again: HostControl reports the session removed.
-    harness.fake.sessions = listed.filter { $0.id != sessionID }
+    // The first list after a reconnect lacks the session: HostControl
+    // reports it removed. The tab takes it as gone only when a later list
+    // agrees, and the next one has it again.
     let connections = harness.fake.connections.count
+    let lists = harness.fake.requests("list").count
+    let missingFromNextList = FakeCountdown(1)
+    harness.fake.respond = { [fake = harness.fake] request, connection in
+        guard request.op == "list", connection.number >= connections, missingFromNextList.take() else { return nil }
+        return .answer(.sessions(HostedSessionList(hostID: fake.hostID, sessions: withoutIt)))
+    }
     harness.fake.dropAll()
     #expect(await harness.fake.wait {
-        harness.fake.connections.count > connections
-            && harness.control.state == .connected
-            && !harness.control.sessions.contains { $0.id == sessionID }
+        harness.fake.connections.count > connections && harness.control.state == .connected
+            && harness.fake.requests("list").count >= lists + 2
+            && harness.control.sessions.contains { $0.id == sessionID }
     })
-    harness.fake.sessions = listed
-    try await Task.sleep(for: .milliseconds(900))
+    harness.fake.respond = nil
+    try await Task.sleep(for: .milliseconds(300))
     #expect(command.isRunning)
     #expect(command.state == .live)
     #expect(command.persistentSession?.sessionID == sessionID)
@@ -987,7 +1001,7 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
 
     // Missing again when checked: the program is gone with its session, and
     // the command starts again in a new one.
-    harness.fake.sessions = listed.filter { $0.id != sessionID }
+    harness.fake.sessions = withoutIt
     harness.fake.dropAll()
     #expect(await harness.fake.wait(timeout: 10) {
         command.persistentSession.map { $0.sessionID != sessionID } ?? false && command.state == .live
@@ -997,8 +1011,6 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
 
 @Test @MainActor func aSessionARestartedDaemonStillExpectsKeepsItsTabAndOneMissingFromACompleteListIsGone() async throws {
     var configuration = PersistentHarness.fastConfiguration
-    // Never waited for: this host says which lists are complete.
-    configuration.disappearanceConfirmationDelay = .seconds(30)
     configuration.pendingHoldersPollInterval = .milliseconds(50)
     let harness = try PersistentHarness(configuration: configuration)
     let workspace = harness.workspace()
@@ -1495,16 +1507,8 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
 
 @Test @MainActor func autoStartStartsARestoredCommandWhoseSessionEndedWhileCherryWasClosed() async throws {
     let harness = try PersistentHarness()
-    func canonicalDirectory(_ prefix: String) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        let resolved = try #require(url.path.withCString { realpath($0, nil) })
-        defer { free(resolved) }
-        return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-    }
-    let root = try canonicalDirectory("cherry-persistent-autostart")
-    let storeDirectory = try canonicalDirectory("cherry-persistent-autostart-store")
+    let root = try canonicalTemporaryDirectory("cherry-persistent-autostart")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-persistent-autostart-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let command = ProjectCommandDefinition(name: "server", command: "serve", autoStart: true)
     let record = WorkspaceSessionRecord(
@@ -1536,7 +1540,7 @@ private func json(_ request: FakeControlHelper.Request, _ key: String) -> [Strin
 
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     let tab = try #require(workspace.session(withID: record.id))
     #expect(tab.isPersistentLocalSession)
     #expect(await harness.fake.wait { tab.state == .exited(1) })

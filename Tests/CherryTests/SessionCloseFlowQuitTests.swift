@@ -30,7 +30,7 @@ private func summary(
     )
 }
 
-@Test @MainActor func aWindowCloseOrQuitAsksOnlyWhenSessionsRunAndThePreferenceAsks() {
+@Test @MainActor func aWindowCloseOrQuitAsksOnlyWhenABusySessionRunsAndThePreferenceAsks() {
     let cases: [(String, SessionTeardownSummary)] = [
         ("nothing", summary()),
         ("idle sessions", summary(running: [false, false])),
@@ -42,17 +42,18 @@ private func summary(
             var summary = base
             summary.stoppedWhenKeeping = nativeBusy
             summary.stoppedWhenEnding = base.stoppedWhenEnding + nativeBusy
-            let running = !summary.runningSessions.isEmpty
+            let busy = summary.runningSessions.contains(where: \.isBusy)
             for mayAsk in [true, false] {
                 let label = Comment(rawValue: "\(name), native busy \(nativeBusy), may ask \(mayAsk)")
                 let keeping: SessionTeardownConfirmation = nativeBusy > 0
                     ? .confirmStopping(count: nativeBusy, endsSessions: false)
                     : .none(endsSessions: false)
 
-                // Asked only when sessions run, the preference asks, and
-                // the quit is the user's.
+                // Asked only when a session is busy (idle shells are kept,
+                // as the question's default answer keeps them), the
+                // preference asks, and the quit is the user's.
                 #expect(SessionTeardownConfirmation.decide(summary, preference: .ask, mayAsk: mayAsk)
-                    == (mayAsk && running ? .askAboutSessions : keeping), label)
+                    == (mayAsk && busy ? .askAboutSessions : keeping), label)
                 #expect(SessionTeardownConfirmation.decide(summary, preference: .keep, mayAsk: mayAsk) == keeping, label)
                 // Ending them stops the busy ones too; a log out, restart,
                 // shut down or update keeps them whatever the preference.
@@ -267,6 +268,11 @@ private func quitEvent(reason: OSType?, asParameter: Bool = false, enumerated: B
     // updater asked.
     #expect(reason(nil, disk: "20260926130000.def5678") == .update)
     #expect(reason(nil, requested: true) == .update)
+    // Sparkle armed its relaunch: its installer's quit event (which names
+    // no reason) relaunches, even soon after a log out was announced; a
+    // quit event naming a restart is still the system's.
+    #expect(reason(quitEvent(reason: nil), announced: true, requested: true) == .update)
+    #expect(reason(quitEvent(reason: OSType(kAERestart)), requested: true) == .powerOff)
     // No bundle (`swift run`), or it was removed: nothing tells.
     #expect(reason(nil, launch: nil, disk: nil) == .user)
     #expect(reason(nil, disk: nil) == .user)
@@ -282,6 +288,88 @@ private func quitEvent(reason: OSType?, asParameter: Bool = false, enumerated: B
     )
     try plist.write(to: contents.appendingPathComponent("Info.plist"))
     #expect(CherryAppDelegate.bundleVersionOnDisk(bundleURL: bundle) == "20260926120000.abc1234")
+}
+
+// MARK: - Restart to Update's quit
+
+@Test @MainActor func updateQuitWithConfirmedStoppingFinishesWithoutAsking() {
+    let plan = SessionQuitPlan.confirmStopping(count: 2, intent: .appQuit)
+    // Restart to Update confirmed the busy programs just before.
+    #expect(plan.forUpdate(reason: .update, stoppingConfirmed: true) == .finish(.appQuit))
+    // Nothing confirmed, or not an update: the quit asks.
+    #expect(plan.forUpdate(reason: .update, stoppingConfirmed: false) == plan)
+    #expect(plan.forUpdate(reason: .user, stoppingConfirmed: true) == plan)
+    #expect(plan.forUpdate(reason: .powerOff, stoppingConfirmed: true) == plan)
+    // Other plans are left as they are.
+    for other: SessionQuitPlan in [.terminateNow, .finish(.appQuit), .askAboutSessions] {
+        #expect(other.forUpdate(reason: .update, stoppingConfirmed: true) == other)
+    }
+
+    // As the quit decides it: an update asks nothing about sessions and
+    // keeps them, so only native tabs' busy programs are confirmed.
+    let busy = summary(running: [true, false], nativeBusy: 2)
+    let decision = SessionTeardownConfirmation.decide(busy, preference: .end, mayAsk: false)
+    #expect(SessionQuitPlan(decision, summary: busy).forUpdate(reason: .update, stoppingConfirmed: true)
+        == .finish(.appQuit))
+    #expect(SessionQuitPlan(decision, summary: busy).forUpdate(reason: .update, stoppingConfirmed: false)
+        == .confirmStopping(count: 2, intent: .appQuit))
+}
+
+@Test @MainActor func cancelledQuitClearsTheConfirmationButNotAnArmedRelaunch() {
+    let request = UpdateQuitRequest()
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    request.confirmStopping(at: now)
+    request.noteRelaunchArmed()
+    #expect(request.isUpdateQuit)
+    #expect(request.stoppingConfirmed(now: now))
+
+    // What `CherryAppDelegate.cancelQuit` does.
+    request.quitWasCancelled()
+    #expect(!request.stoppingConfirmed(now: now))
+    // Sparkle's installer relaunches after any later quit: still an update.
+    #expect(request.isUpdateQuit)
+    #expect(CherryAppDelegate.quitReason(
+        appleEvent: nil, launchBundleVersion: "a", diskBundleVersion: "a", updateRequested: request.isUpdateQuit
+    ) == .update)
+
+    // Only Sparkle's abort clears it.
+    request.updateAborted()
+    #expect(!request.isUpdateQuit)
+}
+
+@Test @MainActor func quitConfirmationTextNamesARestartForAnUpdate() {
+    let update = QuitConfirmationText(count: 2, reason: .update)
+    #expect(update.title == "Restart Cherry to update?")
+    #expect(update.message == "2 running processes will be stopped. Persistent sessions keep running.")
+    #expect(update.confirmButton == "Restart")
+    #expect(update.cancelButton == "Cancel")
+    #expect(QuitConfirmationText(count: 1, reason: .update).message
+        == "1 running process will be stopped. Persistent sessions keep running.")
+
+    for reason: CherryAppDelegate.QuitReason in [.user, .powerOff] {
+        let quit = QuitConfirmationText(count: 3, reason: reason)
+        #expect(quit.title == "Quit Cherry?")
+        #expect(quit.message == "3 running processes will be stopped.")
+        #expect(quit.confirmButton == "Quit")
+    }
+    #expect(QuitConfirmationText(count: 1, reason: .user).message == "1 running process will be stopped.")
+
+    let alert = update.makeAlert()
+    #expect(alert.messageText == "Restart Cherry to update?")
+    #expect(alert.buttons.map(\.title) == ["Restart", "Cancel"])
+}
+
+@Test @MainActor func aQuitOffersARestartOnlyWhenSparkleRelaunchesCherry() {
+    // Sparkle's own Install and Relaunch: its installer reopens Cherry.
+    #expect(QuitConfirmationText.forQuit(count: 2, reason: .update, relaunchArmed: true)
+        == QuitConfirmationText(count: 2, reason: .update))
+    // The bundle was replaced by hand (install-local-app, a disk image): an
+    // update quit, but nothing reopens Cherry.
+    #expect(QuitConfirmationText.forQuit(count: 2, reason: .update, relaunchArmed: false).title == "Quit Cherry?")
+    // A log out, restart or shut down named by the event, even while armed.
+    #expect(QuitConfirmationText.forQuit(count: 2, reason: .powerOff, relaunchArmed: true).title == "Quit Cherry?")
+    #expect(QuitConfirmationText.forQuit(count: 1, reason: .user, relaunchArmed: false)
+        == QuitConfirmationText(count: 1, reason: .user))
 }
 
 // MARK: - Closing a window
@@ -470,8 +558,10 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
         return (workspace, tabs)
     }
 
-    // End Sessions with "Don't ask again".
+    // End Sessions with "Don't ask again" (one shell busy: idle ones are
+    // kept without a question).
     let (workspace, tabs) = try await openWindow(["One", "Two"])
+    #expect(await harness.makeBusy(tabs[0]))
     let ended = try sessionIDs(tabs)
     let window = ClosingWindow()
     let delegate = closeDelegate(for: window, workspace: workspace)
@@ -564,6 +654,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     // every tab and the window, and stores nothing.
     let running = workspace.addSession(title: "Running")
     #expect(await harness.waitUntilAttached(running))
+    #expect(await harness.makeBusy(running))
     #expect(!delegate.windowShouldClose(window))
     #expect(dialogs.questions.map { $0.summary.runningSessions.map(\.id) } == [[running.id]])
     #expect(dialogs.stoppingCounts == [1])
@@ -576,6 +667,40 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     #expect(harness.fake.requests("kill").isEmpty)
     #expect(harness.fake.requests("remove").isEmpty)
     #expect(window.closeCount == 0)
+}
+
+@Test @MainActor func aWindowWithOnlyIdleShellsClosesWithoutAskingAndKeepsThem() async throws {
+    let harness = try PersistentHarness()
+    let dialogs = CloseDialogs()
+    let workspace = harness.workspace()
+    defer {
+        dialogs.restore()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let tabs = [workspace.addSession(title: "One"), workspace.addSession(title: "Two")]
+    for tab in tabs {
+        #expect(await harness.waitUntilAttached(tab))
+    }
+    let sessions = try sessionIDs(tabs)
+    #expect(!tabs.contains { $0.hasRunningProcess() })
+    let summary = workspace.teardownSummary(.windowClose, pathDisplayMode: .repoFocused)
+    #expect(summary.runningSessions.count == 2)
+    // A quit with them asks nothing either.
+    #expect(SessionTeardownConfirmation.decide(summary, preference: .ask, mayAsk: true) == .none(endsSessions: false))
+
+    // Two idle shells: the window closes at once, keeping them, as Keep
+    // Running would, and the launch notice may still name them.
+    let window = ClosingWindow()
+    let delegate = closeDelegate(for: window, workspace: workspace)
+    #expect(delegate.windowShouldClose(window))
+    closeWithoutConfirmation(window, delegate: delegate)
+    #expect(dialogs.questions.isEmpty)
+    #expect(dialogs.stoppingCounts.isEmpty)
+    #expect(dialogs.keptInBackground.isEmpty)
+    #expect(workspace.closeAllIntent == .windowClosed)
+    try await Task.sleep(for: .milliseconds(200))
+    #expect(Set(harness.requestIDs("kill")).isDisjoint(with: sessions))
 }
 
 @Test @MainActor func aWindowCloseQuestionListsBusyAndIdleSessionsAndMentionsNativeProcessesInOneDialog() async throws {
@@ -637,7 +762,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     let window = ClosingWindow()
     let delegate = closeDelegate(for: window, workspace: workspace)
     workspace.closeTabAfterCleanExit = { workspace, session in
-        SessionCloseCoordinator.closeTabAfterCleanExit(session, in: workspace, repository: nil, window: window)
+        SessionCloseCoordinator.closeTabAfterCleanExit(session, in: workspace, window: window)
     }
     let tab = workspace.addSession(title: "Only")
     #expect(await harness.waitUntilAttached(tab))
@@ -655,7 +780,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     let harness = try PersistentHarness()
     harness.cleanExitMinimumRunTime = 0
     let dialogs = CloseDialogs()
-    let root = try canonicalDirectory("cherry-clean-exit-window")
+    let root = try canonicalTemporaryDirectory("cherry-clean-exit-window")
     let repository = RepositoryWorkspace(
         projectRoot: root.path,
         backendPolicy: harness.policy,
@@ -667,7 +792,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     let chromeState = ProjectWindowChromeState()
     let window = ClosingWindow()
     let delegate = ProjectWindowCloseDelegate(window: window)
-    delegate.workspace = repository.activeWorkspace
+    delegate.workspace = repository.workspace
     delegate.repository = repository
     window.delegate = delegate
     defer {
@@ -680,11 +805,11 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     // As the app's window binder does: the window claims the project, and
     // the repository learns its chrome state.
     #expect(registry.register(
-        window: window, projectRoot: root.path, workspace: repository.activeWorkspace, repository: repository,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        window: window, projectRoot: root.path, workspace: repository.workspace, repository: repository,
+        todoStore: nil, chromeState: chromeState
     ))
     repository.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     let shell = try #require(workspace.sessions.first)
     #expect(await harness.waitUntilAttached(shell))
     let sessionID = try #require(shell.persistentSession?.sessionID)
@@ -747,6 +872,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     }
     let shell = workspace.addSession(title: "Shell")
     #expect(await harness.waitUntilAttached(shell))
+    #expect(await harness.makeBusy(shell))
     let other = ClosingWindow()
     let window = ClosingWindow()
     let delegate = closeDelegate(for: window, workspace: workspace)
@@ -775,7 +901,8 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     )
     #expect(await harness.waitUntilAttached(command))
     #expect(!delegate.windowShouldClose(window))
-    #expect(dialogs.stoppingCounts == [1])
+    // The command and the busy shell.
+    #expect(dialogs.stoppingCounts == [2])
     #expect(waiting(.user) === window)
     dialogs.respond(.alertSecondButtonReturn)
     #expect(waiting(.user) == nil)
@@ -803,8 +930,8 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
 
 @Test @MainActor func theQuitSummaryCountsEveryWindowsRunningSessionsAndEndingThemTerminatesThem() async throws {
     let harness = try PersistentHarness()
-    let rootA = try canonicalDirectory("cherry-quit-a")
-    let rootB = try canonicalDirectory("cherry-quit-b")
+    let rootA = try canonicalTemporaryDirectory("cherry-quit-a")
+    let rootB = try canonicalTemporaryDirectory("cherry-quit-b")
     let repository = RepositoryWorkspace(
         projectRoot: rootA.path,
         backendPolicy: harness.policy,
@@ -825,8 +952,8 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
         try? FileManager.default.removeItem(at: rootA)
         try? FileManager.default.removeItem(at: rootB)
     }
-    let shell = try #require(repository.activeWorkspace.sessions.first)
-    let command = repository.activeWorkspace.addCommandSession(
+    let shell = try #require(repository.workspace.sessions.first)
+    let command = repository.workspace.addCommandSession(
         command: ProjectCommandDefinition(name: "server", command: "serve"), projectRoot: rootA.path
     )
     let other = plain.addSession(title: "Other")
@@ -834,12 +961,12 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
         #expect(await harness.waitUntilAttached(tab))
     }
     #expect(registry.register(
-        window: windowA, projectRoot: rootA.path, workspace: repository.activeWorkspace, repository: repository,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        window: windowA, projectRoot: rootA.path, workspace: repository.workspace, repository: repository,
+        todoStore: nil, chromeState: nil
     ))
     #expect(registry.register(
         window: windowB, projectRoot: rootB.path, workspace: plain,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        todoStore: nil, chromeState: nil
     ))
 
     let summary = registry.teardownSummary(pathDisplayMode: .repoFocused)
@@ -856,7 +983,7 @@ private func rememberingWorkspace(_ harness: PersistentHarness, remembered: Reco
     // End Sessions.
     let sessions = try sessionIDs([shell, command, other])
     registry.tearDownForQuit(intent: .appQuitEndingSessions)
-    #expect(repository.activeWorkspace.closeAllIntent == .appQuitEndingSessions)
+    #expect(repository.workspace.closeAllIntent == .appQuitEndingSessions)
     #expect(plain.closeAllIntent == .appQuitEndingSessions)
     #expect(await harness.hosting.waitForPendingEnds(timeout: .seconds(3)))
     #expect(Set(harness.requestIDs("kill")) == Set(sessions))
@@ -899,7 +1026,7 @@ private final class RecordedQuitSteps {
 private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindowRegistry, window: NSWindow) -> Bool {
     registry.register(
         window: window, projectRoot: workspace.projectRoot, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: nil
+        todoStore: nil, chromeState: nil
     )
 }
 
@@ -1158,6 +1285,7 @@ private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindow
         workspaces.append(workspace)
         let tab = workspace.addSession(title: "Shell")
         #expect(await harness.waitUntilAttached(tab), label)
+        #expect(await harness.makeBusy(tab), label)
         let window = ClosingWindow()
         let delegate = closeDelegate(for: window, workspace: workspace)
         var tabsWhenOffScreen: [Int] = []
@@ -1181,18 +1309,17 @@ private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindow
 }
 
 @Test @MainActor func endingAWindowsSessionsAlsoEndsThoseOfItsSavedTabsNoOpenTabShows() async throws {
-    let root = try canonicalDirectory("cherry-end-saved")
-    let storeDirectory = try canonicalDirectory("cherry-end-saved-store")
+    let root = try canonicalTemporaryDirectory("cherry-end-saved")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-end-saved-store")
     defer {
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
     }
-    // A worktree the window has not restored (not discovered yet) saved a
-    // tab whose session still runs.
-    let feature = root.appendingPathComponent("feature", isDirectory: true).path
+    // A saved tab the window has not brought back (the host could not be
+    // reached as it opened) whose session still runs.
     let saved = WorkspaceSessionRecord(
-        id: UUID(), kind: .command, title: "server", commandName: "server", workingDirectory: feature,
-        projectRoot: feature,
+        id: UUID(), kind: .command, title: "server", commandName: "server", workingDirectory: root.path,
+        projectRoot: root.path,
         hosted: HostedSessionBindingRecord(host: "local", hostID: "host-a", sessionID: "s-feature", owned: true)
     )
     let store = WorkspaceStateStore(directory: storeDirectory)
@@ -1201,17 +1328,11 @@ private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindow
         let label = Comment(rawValue: "\(answer)")
         let harness = try PersistentHarness()
         defer { harness.cleanUp() }
-        harness.fake.sessions = [HostedSessionInfo(
-            id: "s-feature", name: "server", cwd: feature, pid: 31, owner: "CherryTests",
-            tags: [PersistentSessionTag.tab: saved.id.uuidString, PersistentSessionTag.kind: "command"]
-        )]
+        harness.fake.launchFailure = "cherry-host is restarting"
         store.saveSynchronously(RepositoryStateRecord(
             repositoryRoot: URL(fileURLWithPath: root.path, isDirectory: true).standardizedFileURL.path,
             activeWorktreeRoot: root.path,
-            worktrees: [
-                WorktreeStateRecord(root: root.path, sessions: []),
-                WorktreeStateRecord(root: feature, sessions: [saved])
-            ]
+            worktrees: [WorktreeStateRecord(root: root.path, sessions: [saved])]
         ))
         let repository = RepositoryWorkspace(
             projectRoot: root.path,
@@ -1228,6 +1349,14 @@ private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindow
         #expect(repository.teardownSummary(.quit, pathDisplayMode: .repoFocused).savedSessionsNotOpen == 1, label)
         repository.flushPersistentState()
         repository.closeAllSessions(intent: answer)
+        // The host comes back.
+        harness.fake.launchFailure = nil
+        harness.fake.pendingHolders = 0
+        harness.fake.sessions = [HostedSessionInfo(
+            id: "s-feature", name: "server", cwd: root.path, pid: 31, owner: "CherryTests",
+            tags: [PersistentSessionTag.tab: saved.id.uuidString, PersistentSessionTag.kind: "command"]
+        )]
+        _ = try await harness.control.connect()
 
         if ends {
             #expect(await harness.fake.wait { harness.requestIDs("remove").contains("s-feature") }, label)
@@ -1247,17 +1376,8 @@ private func register(_ workspace: TerminalWorkspace, in registry: ProjectWindow
         // session is gone.
         store.flush()
         let state = store.load(repositoryRoot: repository.repositoryRoot)
-        #expect(state?.worktree(root: feature)?.sessions.map(\.id) == [saved.id], label)
+        #expect(state?.worktree(root: root.path)?.sessions.contains { $0.id == saved.id } == true, label)
     }
-}
-
-private func canonicalDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    let resolved = try #require(url.path.withCString { realpath($0, nil) })
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
 }
 
 // MARK: - Quits the system ends sessions after
@@ -1297,11 +1417,4 @@ private func canonicalDirectory(_ prefix: String) throws -> URL {
     #expect(store.loadSystemQuits().count == 2)
     #expect(asked.value == 1)
     #expect(store.wasEndedOnPurpose(record))
-
-    // The launch hands the store to the local sessions, which record what
-    // they end.
-    let localSessions = PersistentLocalSessions(owner: "CherryTests", installationUnavailableReason: { "tests" })
-    #expect(localSessions.endedSessionsStore == nil)
-    CherryAppDelegate.configureSessionRecords(localSessions: localSessions, store: store)
-    #expect(localSessions.endedSessionsStore === store)
 }

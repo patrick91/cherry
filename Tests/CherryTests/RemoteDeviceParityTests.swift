@@ -7,7 +7,7 @@ import Testing
 
 // Phase 3 of devices (docs/specs/remote-devices.md), without a real host:
 // project-info parsing and caps, the shell integration a device's tabs get,
-// editor links, `~` labels, Settings › Sessions' device rows, the quit
+// editor links, `~` labels, Settings › Macs' device cards, the quit
 // question, Background Sessions per device (against the in-process fake
 // `cherry control`), dropped files, and Ghostty's resources in the install.
 // Nothing here runs ssh.
@@ -95,23 +95,15 @@ private final class DeviceHarness {
     }
 }
 
-@MainActor
-private func eventually(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return condition()
-}
-
 // MARK: - project-info
 
 private func output(_ text: String, status: Int32 = 0, errors: String = "") -> RemoteDeviceShell.DataOutput {
     RemoteDeviceShell.DataOutput(status: status, standardOutput: Data(text.utf8), standardError: errors)
 }
 
-@Test func RemoteDeviceProjectInfoIsParsedWithItsWorktreesAndCherryToml() throws {
+@Test func RemoteDeviceProjectInfoIsParsedWithItsCherryToml() throws {
+    // A report with git (what the host gives when CHERRY_GIT names one)
+    // still parses; Cherry reads none of it.
     let json = """
     {"version":1,"projects":[{"path":"/Users/me/app","exists":true,"is_directory":true,\
     "git":{"top_level":"/Users/me/app","common_dir":"/Users/me/app/.git",\
@@ -126,14 +118,8 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     #expect(app.isDirectory && app.exists)
     #expect(app.cherryTomlText == "[commands.web]\ncommand = \"npm run\"\n")
     #expect(app.cherryTomlProblem == nil)
-    let snapshot = try #require(app.git).snapshot()
-    #expect(snapshot.commonDirectory == "/Users/me/app/.git")
-    #expect(snapshot.worktrees.map(\.root) == ["/Users/me/app", "/Users/me/wt/feature"])
-    #expect(snapshot.worktrees.map(\.branch) == ["main", "feature"])
-    #expect(snapshot.worktrees[0].isMain && !snapshot.worktrees[1].isMain)
-    #expect(snapshot.worktrees[1].isLocked)
     let missing = try #require(report.project(at: "/Users/me/none"))
-    #expect(!missing.exists && missing.git == nil && missing.cherryTomlText == nil)
+    #expect(!missing.exists && missing.cherryTomlText == nil)
 }
 
 @Test func RemoteDeviceProjectInfoCapsAndFailuresAreReported() throws {
@@ -183,35 +169,13 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     }
 }
 
-@Test func RemoteDeviceProjectInfoAndGitScriptsQuoteEveryPathForSh() throws {
+@Test func RemoteDeviceProjectInfoScriptQuotesEveryPathForSh() throws {
     let script = RemoteProjectAccess.projectInfoScript(
         paths: ["/Users/me/it's here", "/Users/me/$(oops)"],
         remoteHostPath: "~/Library/Application Support/cherry-host/bin/b/cherry-host"
     )
     #expect(script.contains("host=\"$HOME\"/'Library/Application Support/cherry-host/bin/b/cherry-host'"))
     #expect(script.contains("exec \"$host\" project-info --json '/Users/me/it'\\''s here' '/Users/me/$(oops)'"))
-    #expect(script.contains("CHERRY_GIT=$git; export CHERRY_GIT"))
-    // /usr/bin/git only with the command line tools (else it asks to
-    // install them on that Mac's screen).
-    #expect(script.contains("/usr/bin/xcode-select -p"))
-    let git = RemoteProjectAccess.gitScript(["-C", "/Users/me/a b", "worktree", "list", "--porcelain", "-z"], machine: "Studio")
-    #expect(git.hasSuffix("exec \"$git\" '-C' '/Users/me/a b' 'worktree' 'list' '--porcelain' '-z'\n"))
-    #expect(git.contains("GIT_TERMINAL_PROMPT=0"))
-    // Run through sh, the script finds this Mac's git and runs it.
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/sh")
-    process.arguments = ["-s"]
-    let input = Pipe()
-    let out = Pipe()
-    process.standardInput = input
-    process.standardOutput = out
-    try process.run()
-    input.fileHandleForWriting.write(Data(RemoteProjectAccess.gitScript(["--version"], machine: "Studio").utf8))
-    try input.fileHandleForWriting.close()
-    let printed = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-    process.waitUntilExit()
-    #expect(process.terminationStatus == 0)
-    #expect(printed.hasPrefix("git version"))
 }
 
 @Test @MainActor func RemoteDeviceCherryTomlIsReadFromWhatTheDeviceReportedAndNeverWritten() throws {
@@ -253,7 +217,7 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     #expect(CherryProjectFile.remoteReadOnlyNote.contains("on this Mac only"))
 }
 
-@Test func RemoteDeviceProjectInfoWithoutAGitThereRunsNoGit() throws {
+@Test func RemoteDeviceProjectInfoRunsNoGit() throws {
     // A stand-in cherry-host that says whether CHERRY_GIT reached it.
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-nogit-\(UUID().uuidString.prefix(8))")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -261,31 +225,21 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     let host = directory.appendingPathComponent("cherry-host")
     try "#!/bin/sh\nprintf 'git=[%s]\\n' \"${CHERRY_GIT-unset}\"\n".write(to: host, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: host.path)
-    func run(_ candidates: [String]) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-s"]
-        // An inherited CHERRY_GIT is dropped too.
-        process.environment = ["PATH": "/bin", "CHERRY_GIT": "/usr/bin/git"]
-        let input = Pipe()
-        let out = Pipe()
-        process.standardInput = input
-        process.standardOutput = out
-        try process.run()
-        input.fileHandleForWriting.write(Data(RemoteProjectAccess.projectInfoScript(
-            paths: ["/p"], remoteHostPath: host.path, gitCandidates: candidates
-        ).utf8))
-        try input.fileHandleForWriting.close()
-        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        process.waitUntilExit()
-        return text
-    }
-    #expect(try run(["/nonexistent/git", "\"$(command -v git 2>/dev/null)\""]).contains("git=[unset]"))
-    // With one found, it is passed.
-    let git = directory.appendingPathComponent("git")
-    try "#!/bin/sh\n".write(to: git, atomically: true, encoding: .utf8)
-    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: git.path)
-    #expect(try run([git.path]).contains("git=[\(git.path)]"))
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-s"]
+    // An inherited CHERRY_GIT is dropped too.
+    process.environment = ["PATH": "/bin:/usr/bin", "CHERRY_GIT": "/usr/bin/git"]
+    let input = Pipe()
+    let out = Pipe()
+    process.standardInput = input
+    process.standardOutput = out
+    try process.run()
+    input.fileHandleForWriting.write(Data(RemoteProjectAccess.projectInfoScript(paths: ["/p"], remoteHostPath: host.path).utf8))
+    try input.fileHandleForWriting.close()
+    let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    process.waitUntilExit()
+    #expect(text.contains("git=[unset]"))
 }
 
 // MARK: - Shell integration on the device
@@ -312,12 +266,16 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     }
     let terminal = configuration()
     // zsh: its login shell through bash's `exec -l`, with ZDOTDIR on
-    // Ghostty's zsh integration there.
+    // Ghostty's zsh integration there (Cherry's file in front of it,
+    // `RemoteShellBootstrap`).
     let zsh = RemoteLaunchSpec.make(
         for: terminal, device: .init(shell: "/bin/zsh", homeDirectory: "/Users/me", resources: resources),
         cursorBlink: false, localeEnvironment: ["LANG": "en_GB.UTF-8"]
     )
-    #expect(zsh.argv == ["/bin/bash", "--noprofile", "--norc", "-c", "exec -l /bin/zsh"])
+    #expect(Array(zsh.argv.prefix(4)) == ["/bin/bash", "--noprofile", "--norc", "-c"])
+    #expect(zsh.argv.last?.hasSuffix("; exec -l /bin/zsh") == true)
+    #expect(zsh.shellCommand == "/bin/zsh")
+    #expect(zsh.environment["CHERRY_BIN_DIR"] == root)
     #expect(zsh.environment["TERM"] == "xterm-ghostty")
     #expect(zsh.environment["TERMINFO"] == root + "/terminfo")
     #expect(zsh.environment["GHOSTTY_RESOURCES_DIR"] == root + "/Ghostty")
@@ -334,7 +292,7 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
         for: terminal, device: .init(shell: "/opt/homebrew/bin/bash", homeDirectory: "/Users/me", resources: resources),
         localeEnvironment: [:]
     )
-    #expect(bash.argv == ["/bin/bash", "--noprofile", "--norc", "-c", "exec -l /opt/homebrew/bin/bash --posix"])
+    #expect(bash.shellCommand == "/opt/homebrew/bin/bash --posix")
     #expect(bash.environment["ENV"] == root + "/Ghostty/shell-integration/bash/ghostty.bash")
     #expect(bash.environment["HISTFILE"] == "/Users/me/.bash_history")
     // fish: its data directories.
@@ -342,7 +300,7 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
         for: terminal, device: .init(shell: "/opt/homebrew/bin/fish", homeDirectory: "/Users/me", resources: resources),
         localeEnvironment: [:]
     )
-    #expect(fish.argv.last == "exec -l /opt/homebrew/bin/fish")
+    #expect(fish.shellCommand == "/opt/homebrew/bin/fish")
     #expect(fish.environment["XDG_DATA_DIRS"] == root + "/Ghostty/shell-integration:/usr/local/share:/usr/share")
 
     // A command: its line through the login shell, with the terminfo.
@@ -408,6 +366,11 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     #expect(try shellHash(directory.path) == digest)
+    // A CherryMCP an older install left beside them is not counted.
+    let mcp = directory.appendingPathComponent("CherryMCP")
+    try "#!/bin/sh\n".write(to: mcp, atomically: true, encoding: .utf8)
+    #expect(try shellHash(directory.path) == digest)
+    try FileManager.default.removeItem(at: mcp)
     // Changed, or missing: another digest, or `-`.
     try "# changed\n".write(to: directory.appendingPathComponent("Ghostty/shell-integration/bash/ghostty.bash"), atomically: true, encoding: .utf8)
     #expect(try shellHash(directory.path) != digest)
@@ -442,6 +405,7 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
         "-C", installable.resourcesDirectory.deletingLastPathComponent().path, "Ghostty",
         "-C", installable.terminfoDirectory.deletingLastPathComponent().path, "terminfo",
     ])
+    #expect(!arguments.contains("CherryMCP"))
     // The check of a copy compares the digest.
     var verification = RemoteHostInstaller.Verification(fields: [
         ("codesign", "ok"), ("verify_status", "0"),
@@ -467,25 +431,22 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     let zed = editor("zed", "dev.zed.Zed", app: "Zed")
     let sublime = editor("sublime-text", "com.sublimetext.4", app: "Sublime Text")
 
-    #expect(RemoteEditorLink.make(editor: vscode, destination: "me@studio", path: "/Users/me/my app")
-        == .url(URL(string: "vscode://vscode-remote/ssh-remote+me@studio/Users/me/my%20app")!))
-    #expect(RemoteEditorLink.make(editor: insiders, destination: "studio", path: "/p")
-        == .url(URL(string: "vscode-insiders://vscode-remote/ssh-remote+studio/p")!))
-    #expect(RemoteEditorLink.make(editor: cursor, destination: "studio", path: "/p")
-        == .url(URL(string: "cursor://vscode-remote/ssh-remote+studio/p")!))
-    #expect(RemoteEditorLink.make(editor: zed, destination: "studio", path: "/Users/me/app")
-        == .url(URL(string: "zed://ssh/studio/Users/me/app")!))
+    #expect(RemoteEditorLink.url(editor: vscode, destination: "me@studio", path: "/Users/me/my app")
+        == URL(string: "vscode://vscode-remote/ssh-remote+me@studio/Users/me/my%20app")!)
+    #expect(RemoteEditorLink.url(editor: insiders, destination: "studio", path: "/p")
+        == URL(string: "vscode-insiders://vscode-remote/ssh-remote+studio/p")!)
+    #expect(RemoteEditorLink.url(editor: cursor, destination: "studio", path: "/p")
+        == URL(string: "cursor://vscode-remote/ssh-remote+studio/p")!)
+    #expect(RemoteEditorLink.url(editor: zed, destination: "studio", path: "/Users/me/app")
+        == URL(string: "zed://ssh/studio/Users/me/app")!)
     // A path with spaces: percent-encoded, and it decodes (as Zed decodes
     // its hotlink's path) to the path itself; the host stays as typed.
-    guard case .url(let spaced)? = RemoteEditorLink.make(editor: zed, destination: "me@studio.local", path: "/Users/me/my app/ü") else {
-        Issue.record("no Zed link")
-        return
-    }
+    let spaced = try #require(RemoteEditorLink.url(editor: zed, destination: "me@studio.local", path: "/Users/me/my app/ü"))
     #expect(spaced.absoluteString == "zed://ssh/me@studio.local/Users/me/my%20app/%C3%BC")
     #expect(spaced.path(percentEncoded: false) == "/me@studio.local/Users/me/my app/ü")
     #expect(!spaced.absoluteString.contains(" "))
-    #expect(RemoteEditorLink.make(editor: sublime, destination: "studio", path: "/p") == nil)
-    #expect(RemoteEditorLink.make(editor: zed, destination: "studio", path: "relative") == nil)
+    #expect(RemoteEditorLink.url(editor: sublime, destination: "studio", path: "/p") == nil)
+    #expect(RemoteEditorLink.url(editor: zed, destination: "studio", path: "relative") == nil)
 
     // A device's project offers only the editors that can reach it.
     let key = ProjectLocation.remote(deviceID: UUID(), path: "/Users/me/app").key
@@ -493,23 +454,24 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     #expect(ExternalEditorLauncher.editors(installed, forProjectRoot: key).map(\.id) == ["zed", "vscode"])
     #expect(ExternalEditorLauncher.editors(installed, forProjectRoot: "/Users/me/local").map(\.id) == ["zed", "vscode", "sublime-text"])
 
-    // Opening goes through the injected opener, never NSWorkspace here.
-    var opened: [(RemoteEditorLink, String)] = []
-    var localOpens: [URL] = []
+    // Opening goes through the injected opener, never NSWorkspace here: a
+    // device's project as its link, with the editor's app.
+    var opened: [(url: URL, app: URL)] = []
     let launcher = ExternalEditorLauncher(
-        openHandler: { folder, _ in localOpens.append(folder) },
-        remoteOpener: { link, editor in opened.append((link, editor.id)) },
+        openHandler: { url, app in opened.append((url, app)) },
         destination: { $0 == key ? "studio" : nil }
     )
     launcher.open(projectRoot: key, with: vscode)
     launcher.open(projectRoot: key, with: sublime)
     launcher.open(projectRoot: ProjectLocation.remote(deviceID: UUID(), path: "/x").key, with: zed)
     launcher.open(projectRoot: key, with: zed)
-    #expect(opened.map(\.1) == ["vscode", "zed"])
-    #expect(opened.first?.0 == .url(URL(string: "vscode://vscode-remote/ssh-remote+studio/Users/me/app")!))
-    #expect(localOpens.isEmpty)
+    #expect(opened.map(\.app) == [vscode.appURL, zed.appURL])
+    #expect(opened.first?.url == URL(string: "vscode://vscode-remote/ssh-remote+studio/Users/me/app")!)
+    #expect(!opened.contains { $0.url.isFileURL })
     launcher.open(projectRoot: "/Users/me/local", with: sublime)
-    #expect(localOpens == [URL(fileURLWithPath: "/Users/me/local", isDirectory: true)])
+    #expect(opened.last?.url == URL(fileURLWithPath: "/Users/me/local", isDirectory: true))
+    #expect(opened.last?.app == sublime.appURL)
+    #expect(opened.count == 3)
 }
 
 // MARK: - `~` labels
@@ -537,7 +499,7 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     workspace.closeAllSessions(intent: .windowClosed)
 }
 
-// MARK: - Settings › Sessions
+// MARK: - Settings › Macs
 
 @Test @MainActor func RemoteDeviceSettingsListEachMacsStatusAndWhatToDo() throws {
     let device = RemoteDevice(
@@ -576,9 +538,10 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     defer { try? FileManager.default.removeItem(at: directory) }
     let suite = "CherryTests.RemoteSettings.\(UUID().uuidString)"
     defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+    let hostStore = HostedSessionHostStore(defaults: try #require(UserDefaults(suiteName: suite)))
     let store = RemoteDeviceStore(
         fileURL: directory.appendingPathComponent(RemoteDeviceStore.fileName),
-        hostStore: HostedSessionHostStore(defaults: try #require(UserDefaults(suiteName: suite))),
+        hostStore: hostStore,
         installationID: { UUID() },
         registry: PersistentHostingRegistry(local: PersistentHostSessions(installationUnavailableReason: { nil }, status: PersistentSessionsStatus())),
         remoteHostPaths: HostedRemoteHostPaths()
@@ -588,6 +551,7 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     var controls: [HostedSessionHost: HostControl] = [:]
     let model = RemoteDeviceSettingsModel(
         store: store,
+        hostStore: hostStore,
         control: { host in
             if let control = controls[host] { return control }
             let control = RemoteDeviceStore.inertControl(host: host, reason: "test")
@@ -598,8 +562,12 @@ private func output(_ text: String, status: Int32 = 0, errors: String = "") -> R
     )
     #expect(model.rows.map(\.name) == ["Studio", "Mini"])
     #expect(model.rows.first?.statusText().hasSuffix("Update available") == true)
+    #expect(model.rows.first?.statusText(includingUpdate: false).hasSuffix("Update available") == false)
     #expect(model.rows.first?.id == added.id)
     #expect(controls.values.allSatisfy { $0.state == .idle })
+    // Their destinations are saved hosts, listed as Macs, not as SSH hosts.
+    #expect(hostStore.hosts.count == 2)
+    #expect(model.sshHostsNotAdded.isEmpty)
 }
 
 // MARK: - The quit question and End Sessions
@@ -941,12 +909,11 @@ private final class FakePeeks {
     let files = [URL(fileURLWithPath: "/tmp/a b.png"), URL(fileURLWithPath: "/tmp/notes.txt")]
     pasteboard.clearContents()
     pasteboard.writeObjects(files as [NSURL])
-    #expect(RemoteFileDrop.localFiles(from: pasteboard, preferringText: true) == files)
+    #expect(PastedContent(pasteboard: pasteboard) == .files(files))
     // Text is pasted as usual.
     pasteboard.clearContents()
     pasteboard.setString("echo hi", forType: .string)
-    #expect(RemoteFileDrop.localFiles(from: pasteboard, preferringText: true) == nil)
-    #expect(RemoteFileDrop.localFiles(from: pasteboard, preferringText: false) == nil)
+    #expect(PastedContent(pasteboard: pasteboard) == .text)
 
     #expect(RemoteFileDrop.insertionText(remotePaths: ["/var/t/cherry-drop.1/a b.png", "/var/t/cherry-drop.1/notes.txt"])
         == "'/var/t/cherry-drop.1/a b.png' /var/t/cherry-drop.1/notes.txt ")

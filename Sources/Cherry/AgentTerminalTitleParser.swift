@@ -19,7 +19,13 @@ enum AgentTerminalTitleParser {
             candidate = codexTaskTitle(from: rawTitle, projectNames: normalizedProjectNames)
         case .claude:
             candidate = claudeTaskTitle(from: rawTitle)
-        case .amp, .gemini, .openCode, .pi:
+        case .pi:
+            candidate = piTaskTitle(from: rawTitle, agentName: agentName)
+        case .openCode:
+            candidate = openCodeTaskTitle(from: rawTitle)
+        case .amp, .gemini:
+            // Their title formats are not known yet: a title that is only the
+            // program's or the folder's name would replace the agent's name.
             candidate = nil
         }
 
@@ -80,6 +86,47 @@ enum AgentTerminalTitleParser {
         guard let title = normalizedDisplayValue(rawTitle) else { return nil }
         return droppingEdgeActivityGlyphs(title, brand: .claude)
     }
+
+    /// Pi's own title is `π - <session name> - <folder>`, or `π - <folder>`
+    /// while the session has no name (a Pi built under another app name puts
+    /// that name first: taken as such when it is the agent's name). An
+    /// extension can set any other title (`ctx.ui.setTitle`), which is taken
+    /// whole. A spinner extension's braille frame at the start is chrome.
+    private static func piTaskTitle(from rawTitle: String, agentName: String?) -> String? {
+        guard let title = droppingEdgeActivityGlyphs(rawTitle, brand: .pi) else { return nil }
+        let parts = title.components(separatedBy: " - ")
+        let prefixes = piTitlePrefixes.union([normalizedLookupValue(agentName)].compactMap { $0 })
+        guard let first = normalizedLookupValue(parts.first),
+              prefixes.contains(first)
+        else {
+            return title
+        }
+        // `π - <folder>`: the session has no name yet.
+        guard parts.count >= 3 else { return nil }
+        return normalizedDisplayValue(parts.dropFirst().dropLast().joined(separator: " - "))
+    }
+
+    private static let piTitlePrefixes: Set<String> = ["π", "pi"]
+
+    /// OpenCode's title is `OC | <session title>` once the session has a
+    /// title (`oc | …` before 1.0.147; cut to 37 characters and `…` past
+    /// 40), else `OpenCode`. The same prefix names its full-screen views
+    /// (`diff`, `stats`, `storybook`) and, in 1.x, a subagent's session it
+    /// shows (`<description> (@<agent> subagent)`): neither is this tab's
+    /// task. No activity glyphs.
+    private static func openCodeTaskTitle(from rawTitle: String) -> String? {
+        guard let title = normalizedDisplayValue(rawTitle),
+              title.lowercased().hasPrefix(openCodeTitlePrefix)
+        else { return nil }
+        let task = String(title.dropFirst(openCodeTitlePrefix.count))
+        guard !openCodeViewTitles.contains(task.lowercased()),
+              task.range(of: #" \(@[^()]+ subagent\)$"#, options: .regularExpression) == nil
+        else { return nil }
+        return task
+    }
+
+    private static let openCodeTitlePrefix = "oc | "
+    private static let openCodeViewTitles: Set<String> = ["diff", "stats", "storybook"]
 
     private static func droppingEdgeActivityGlyphs(
         _ rawValue: String,

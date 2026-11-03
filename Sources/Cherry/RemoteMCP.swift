@@ -5,8 +5,8 @@ import Darwin
 import Foundation
 import Security
 
-// Cherry MCP for agents running on another Mac (docs/specs/remote-devices.md,
-// phase 4b).
+// The `cherry` command for agents running on another Mac
+// (docs/specs/remote-devices.md, phase 4b).
 //
 // - Transport: the app listens on a socket of its own per device
 //   (`CherryControlServer.addDeviceListener`), and the device's first SSH
@@ -15,12 +15,13 @@ import Security
 //   `CHERRY_CONTROL_SOCKET`.
 // - Identity: every tab of a device gets a capability token in its
 //   environment (`CHERRY_MCP_TOKEN`, with `CHERRY_PROCESS_ID`), which its
-//   CherryMCP sends with every request. The device's listener refuses a
+//   `cherry` sends with every request. The device's listener refuses a
 //   request without a valid one; This Mac's socket keeps identifying its
 //   callers by process.
-// - Setup: Claude Code and Codex on that Mac read their MCP servers from their
-//   own configuration there; "Set Up Cherry MCP on <Mac>…" registers a
-//   stable launcher there, only when the user confirms (`RemoteMCPSetup`).
+// - Setup: the install's `cherry` is first on the PATH of the commands and
+//   agents Cherry starts there, and the Claude Code, Codex and Pi agents
+//   are told about it on their command line, gated on their version there
+//   (`RemoteAgentLaunch`).
 
 // MARK: - Tokens
 
@@ -41,8 +42,7 @@ import Security
 /// with the same program, and its token works again.
 final class RemoteMCPTokens: @unchecked Sendable {
     static let shared = RemoteMCPTokens(
-        keyURL: AppInstanceLock.defaultFileURL().deletingLastPathComponent()
-            .appendingPathComponent("mcp-token-key", isDirectory: false)
+        keyURL: CherryAppIdentity.applicationSupportDirectory().appendingPathComponent("mcp-token-key", isDirectory: false)
     )
 
     private let keyURL: URL?
@@ -127,8 +127,7 @@ final class RemoteMCPTokens: @unchecked Sendable {
     private func loadGenerationsLocked() -> [UUID: Generation] {
         if let generations { return generations }
         var loaded: [UUID: Generation] = [:]
-        if let url = generationsURL, Self.isPrivateFile(url.path),
-           let data = FileManager.default.contents(atPath: url.path),
+        if let url = generationsURL, let data = PrivateFile.contents(of: url),
            let decoded = try? JSONDecoder().decode([String: Generation].self, from: data) {
             let oldest = Date().addingTimeInterval(-Self.generationLifetime)
             for (key, value) in decoded where value.madeAt > oldest {
@@ -144,16 +143,7 @@ final class RemoteMCPTokens: @unchecked Sendable {
         guard let url = generationsURL else { return }
         let encoded = Dictionary(uniqueKeysWithValues: all.map { ($0.key.uuidString, $0.value) })
         guard let data = try? JSONEncoder().encode(encoded) else { return }
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let temporary = url.deletingLastPathComponent().appendingPathComponent(".mcp-generations.\(UUID().uuidString)")
-        guard FileManager.default.createFile(atPath: temporary.path, contents: data, attributes: [.posixPermissions: 0o600]) else { return }
-        if rename(temporary.path, url.path) != 0 { unlink(temporary.path) }
-    }
-
-    private static func isPrivateFile(_ path: String) -> Bool {
-        var status = stat()
-        return lstat(path, &status) == 0 && status.st_mode & S_IFMT == S_IFREG
-            && status.st_uid == geteuid() && status.st_mode & 0o077 == 0
+        try? PrivateFile.write(data, to: url, durable: false)
     }
 
     /// 32 random bytes in a file only this user can read: made with
@@ -162,10 +152,10 @@ final class RemoteMCPTokens: @unchecked Sendable {
     /// read it.
     static func loadOrCreateKey(at url: URL) -> SymmetricKey? {
         let path = url.path
-        if let key = readKey(at: path) { return key }
+        if let key = readKey(at: url) { return key }
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)
-        if fd < 0 { return errno == EEXIST ? readKey(at: path) : nil }
+        if fd < 0 { return errno == EEXIST ? readKey(at: url) : nil }
         defer { close(fd) }
         let key = SymmetricKey(size: .bits256)
         let written = key.withUnsafeBytes { raw in write(fd, raw.baseAddress, raw.count) }
@@ -176,12 +166,8 @@ final class RemoteMCPTokens: @unchecked Sendable {
         return key
     }
 
-    private static func readKey(at path: String) -> SymmetricKey? {
-        var status = stat()
-        guard lstat(path, &status) == 0, status.st_mode & S_IFMT == S_IFREG,
-              status.st_uid == geteuid(), status.st_mode & 0o077 == 0,
-              let data = FileManager.default.contents(atPath: path), data.count == 32
-        else { return nil }
+    private static func readKey(at url: URL) -> SymmetricKey? {
+        guard let data = PrivateFile.contents(of: url), data.count == 32 else { return nil }
         return SymmetricKey(data: data)
     }
 }
@@ -194,7 +180,7 @@ enum RemoteMCPPaths {
 
     /// 16 hex digits of the SHA-256 of `text`.
     static func shortHash(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        sha256Hex(text, bytes: 8)
     }
 
     /// Names a device's listener here (`mcp-<name>.sock`).
@@ -236,7 +222,7 @@ enum RemoteMCPPaths {
     static func validTemporaryDirectory(_ path: String?, source: String) -> String? {
         guard let path = path?.nilIfEmpty else { return nil }
         if let problem = temporaryDirectoryProblem(path) {
-            SessionLog.error("Cherry MCP: ignoring the per-user temporary directory \(source) reported: \(problem)")
+            SessionLog.error("Control socket forward: ignoring the per-user temporary directory \(source) reported: \(problem)")
             return nil
         }
         return path
@@ -245,7 +231,7 @@ enum RemoteMCPPaths {
     /// The directory there, in the account's per-user temporary directory
     /// (`getconf DARWIN_USER_TEMP_DIR`, which only that account can enter;
     /// never the shared /tmp). Nil when that is not a plain absolute path
-    /// (`temporaryDirectoryProblem`: no Cherry MCP for that device), or the
+    /// (`temporaryDirectoryProblem`: no forwarded socket for that device), or the
     /// socket in it would be longer than a socket path may be
     /// (`~/Library/Application Support/…` is, for most homes).
     static func remoteDirectory(temporaryDirectory: String?, installationID: UUID, deviceID: UUID) -> String? {
@@ -262,37 +248,32 @@ enum RemoteMCPPaths {
             .map { $0 + "/control.sock" }
     }
 
-    /// The launcher Set Up Cherry MCP registers with the agents there,
-    /// under the home folder: it runs the CherryMCP of the Cherry build
-    /// that started the tab (`CHERRY_MCP_HELPER`), so a registration never
-    /// names a build directory that an update collects later.
-    static let launcherRelativePath = "Library/Application Support/cherry-host/mcp/cherry-mcp"
+    /// The command-line tool's name in an install.
+    static let cliName = "cherry"
 
-    /// CherryMCP's name in an install (next to cherry and cherry-host).
-    static let helperName = "CherryMCP"
-
-    /// The CherryMCP of the install a device's `remoteHostPath` names,
-    /// under its home; nil when that is not one of ours.
-    static func helperPath(remoteHostPath: String?, homeDirectory: String?) -> String? {
+    /// The `cherry` of the install a device's `remoteHostPath` names, under
+    /// its home; nil when that is not one of ours.
+    static func cliPath(remoteHostPath: String?, homeDirectory: String?) -> String? {
         RemoteLaunchSpec.Resources.of(remoteHostPath: remoteHostPath, homeDirectory: homeDirectory)
-            .map { "\($0.root)/\(helperName)" }
+            .map { "\($0.root)/\(cliName)" }
     }
 }
 
-/// What a tab of a device needs for Cherry MCP (`RemoteLaunchSpec`).
+/// What a tab of a device needs to reach Cherry (`RemoteLaunchSpec`).
 struct RemoteMCPLaunch: Equatable, Sendable {
     var deviceID: UUID
     /// The forwarded control socket there.
     var socketPath: String
-    /// The install's CherryMCP there, when it has one.
-    var helperPath: String?
+    /// The install's `cherry` there, the tab's `CHERRY_CLI` (never This
+    /// Mac's), when it has one.
+    var cliPath: String? = nil
     /// This Mac's name, for "Cherry on <Mac> is not reachable".
     var controlMachine: String
     var tokens: RemoteMCPTokens
 
     static func == (lhs: RemoteMCPLaunch, rhs: RemoteMCPLaunch) -> Bool {
-        lhs.deviceID == rhs.deviceID && lhs.socketPath == rhs.socketPath && lhs.helperPath == rhs.helperPath
-            && lhs.controlMachine == rhs.controlMachine && lhs.tokens === rhs.tokens
+        lhs.deviceID == rhs.deviceID && lhs.socketPath == rhs.socketPath
+            && lhs.cliPath == rhs.cliPath && lhs.controlMachine == rhs.controlMachine && lhs.tokens === rhs.tokens
     }
 
     /// The Cherry variables of a new launch of the tab `processID`.
@@ -305,7 +286,7 @@ struct RemoteMCPLaunch: Equatable, Sendable {
             // Built for each Create (a start or restart): a new generation.
             environment[CherryControl.mcpTokenEnvironmentKey] = tokens.newGeneration(tabID: tabID, deviceID: deviceID)
         }
-        if let helperPath { environment[CherryControl.mcpHelperEnvironmentKey] = helperPath }
+        if let cliPath { environment[CherryControl.cliEnvironmentKey] = cliPath }
         return environment
     }
 
@@ -406,12 +387,7 @@ final class RemoteMCPForwards {
         self.masters = masters
         self.shell = shell
         self.server = server
-        stopObserver = NotificationCenter.default.addObserver(
-            forName: HostSSHMasterManager.masterDidStopNotification, object: masters, queue: .main
-        ) { [weak self] notification in
-            guard let destination = notification.userInfo?[HostSSHMasterManager.destinationKey] as? String else { return }
-            MainActor.assumeIsolated { self?.masterStopped(destination) }
-        }
+        stopObserver = masters.observeStops { [weak self] destination in self?.masterStopped(destination) }
     }
 
     deinit {
@@ -438,7 +414,7 @@ final class RemoteMCPForwards {
                 state = .failed(RemoteMCPForwardError.stopped.localizedDescription)
             } catch {
                 state = .failed(error.localizedDescription)
-                SessionLog.error("Cherry MCP forward to \(target.machine): \(error.localizedDescription)")
+                SessionLog.error("Control socket forward to \(target.machine): \(error.localizedDescription)")
             }
             return state
         }
@@ -495,16 +471,14 @@ final class RemoteMCPForwards {
         temporaryDirectoryFound(deviceID, temporary)
         let remote = directory + "/control.sock"
         let local = try server.addDeviceListener(deviceID: deviceID)
-        let result = await Self.runSSH(
-            shell: shell,
-            arguments: Self.commandArguments("forward", remote: remote, local: local.path, controlPath: controlPath, destination: target.destination)
+        let result = await shell.runMasterCommand(
+            Self.commandArguments("forward", remote: remote, local: local.path, controlPath: controlPath, destination: target.destination)
         )
         guard generations[deviceID, default: 0] == generation else {
             // Stopped meanwhile: the forward just made goes too.
             if result.status == 0 {
-                _ = await Self.runSSH(
-                    shell: shell,
-                    arguments: Self.commandArguments("cancel", remote: remote, local: local.path, controlPath: controlPath, destination: target.destination)
+                _ = await shell.runMasterCommand(
+                    Self.commandArguments("cancel", remote: remote, local: local.path, controlPath: controlPath, destination: target.destination)
                 )
                 _ = await shell.run(Self.cleanupScript(directoryName: name), on: target.destination)
             }
@@ -535,9 +509,8 @@ final class RemoteMCPForwards {
         else { return }
         var shell = await shell()
         shell.controlPath = controlPath
-        _ = await Self.runSSH(
-            shell: shell,
-            arguments: Self.commandArguments("cancel", remote: remote, local: local, controlPath: controlPath, destination: target.destination)
+        _ = await shell.runMasterCommand(
+            Self.commandArguments("cancel", remote: remote, local: local, controlPath: controlPath, destination: target.destination)
         )
         _ = await shell.run(
             Self.cleanupScript(directoryName: RemoteMCPPaths.directoryName(installationID: target.installationID, deviceID: deviceID)),
@@ -561,13 +534,9 @@ final class RemoteMCPForwards {
 
     /// `ssh -o ControlPath=<master> -O forward|cancel -R <there>:<here> -- <destination>`.
     nonisolated static func commandArguments(_ command: String, remote: String, local: String, controlPath: String, destination: String) -> [String] {
-        [
-            "-o", HostSSHMasterManager.controlPathOption(controlPath),
-            "-o", "BatchMode=yes",
-            "-O", command,
-            "-R", "\(remote):\(local)",
-            "--", destination,
-        ]
+        HostSSHMasterManager.commandArguments(
+            command, destination: destination, controlPath: controlPath, extra: ["-R", "\(remote):\(local)"]
+        )
     }
 
     /// Whether ssh's error says the server refused the forward (sshd's
@@ -611,14 +580,5 @@ final class RemoteMCPForwards {
             "if [ -d \"$d\" ] && [ ! -L \"$d\" ] && [ -O \"$d\" ]; then /bin/rm -f \"$d/control.sock\"; /bin/rmdir \"$d\" 2>/dev/null; fi",
             "exit 0",
         ].joined(separator: "\n") + "\n"
-    }
-
-    private static func runSSH(shell: RemoteDeviceShell, arguments: [String]) async -> (status: Int32?, errors: String) {
-        await Task.detached(priority: .userInitiated) {
-            let result = HostSpawnedProcess.run(
-                executable: shell.sshExecutable, arguments: arguments, environment: shell.environment, timeout: 15
-            )
-            return (status: result.exitCode, errors: result.errors)
-        }.value
     }
 }

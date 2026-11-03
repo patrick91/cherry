@@ -33,70 +33,6 @@ private final class ClosingWindow: NSWindow {
     }
 }
 
-/// A project window that never comes on screen.
-@MainActor
-private func testWindow() -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
-        styleMask: [.titled, .closable], backing: .buffered, defer: true
-    )
-    window.isReleasedWhenClosed = false
-    return window
-}
-
-private func temporaryDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    let resolved = try #require(url.path.withCString { realpath($0, nil) })
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-}
-
-/// A clock the test moves, and the checks toasts scheduled on it.
-@MainActor
-private final class ManualClock {
-    let start = Date(timeIntervalSince1970: 1_000)
-    private(set) var now: Date
-    private var scheduled: [(at: Date, work: @MainActor () -> Void)] = []
-
-    init() { now = start }
-
-    var schedule: ProjectWindowToasts.Scheduler {
-        { [unowned self] delay, work in scheduled.append((now.addingTimeInterval(delay), work)) }
-    }
-
-    /// Moves the clock on by `seconds`, running what falls due, in order.
-    func advance(by seconds: TimeInterval) {
-        now = now.addingTimeInterval(seconds)
-        while let next = scheduled.enumerated().filter({ $0.element.at <= now }).min(by: { $0.element.at < $1.element.at }) {
-            scheduled.remove(at: next.offset)
-            next.element.work()
-        }
-    }
-}
-
-/// A window's chrome whose toasts keep time on `clock` (never dismissing by
-/// themselves without one) and announce into `announced`.
-@MainActor
-private func quietChromeState(
-    clock: ManualClock? = nil,
-    announced: Recorder<[String]> = Recorder([])
-) -> ProjectWindowChromeState {
-    let schedule: ProjectWindowToasts.Scheduler
-    if let clock {
-        schedule = clock.schedule
-    } else {
-        schedule = { _, _ in }
-    }
-    return ProjectWindowChromeState(toasts: ProjectWindowToasts(
-        now: { clock?.now ?? Date() },
-        schedule: schedule,
-        announce: { announced.value.append($0) },
-        voiceOverEnabled: { false }
-    ))
-}
-
 /// Toasts on `clock`, whatever VoiceOver does on this Mac.
 @MainActor
 private func manualToasts(
@@ -140,15 +76,10 @@ private func openRepositoryWindow(
         restoredTabLaunchQueue: RestoredTabLaunchQueue()
     )
     #expect(registry.register(
-        window: window, projectRoot: root, workspace: repository.activeWorkspace, repository: repository,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        window: window, projectRoot: root, workspace: repository.workspace, repository: repository,
+        todoStore: nil, chromeState: chromeState
     ))
     return repository
-}
-
-@MainActor
-private func sidebarName(of session: TerminalSession) -> String {
-    SidebarSessionLabel.label(for: session, pathDisplayMode: TerminalSettings.shared.sidebarTerminalPathDisplayMode).title
 }
 
 private let backgroundSessionsLine = "Open or end it from Background Sessions in the Cherry menu bar icon."
@@ -343,10 +274,10 @@ private let persistentSessionsLine = "Attach to it again from File › Persisten
         harness.cleanUp()
     }
     #expect(registry.register(
-        window: window, projectRoot: project, workspace: repository.activeWorkspace, repository: repository,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        window: window, projectRoot: project, workspace: repository.workspace, repository: repository,
+        todoStore: nil, chromeState: chromeState
     ))
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     // The window's default shell.
     #expect(await harness.fake.wait { harness.creates().count == 1 })
     let agent = workspace.addAgentSession(
@@ -467,7 +398,7 @@ private let persistentSessionsLine = "Attach to it again from File › Persisten
     let closing = harness.workspace()
     let window = ClosingWindow()
     let chromeState = quietChromeState()
-    let otherRoots = [try temporaryDirectory("cherry-toast-other"), try temporaryDirectory("cherry-toast-other")]
+    let otherRoots = [try canonicalTemporaryDirectory("cherry-toast-other"), try canonicalTemporaryDirectory("cherry-toast-other")]
     let others = otherRoots.map {
         TerminalWorkspace(projectRoot: $0.path, createInitialSession: false, backendPolicy: harness.policy)
     }
@@ -484,21 +415,21 @@ private let persistentSessionsLine = "Attach to it again from File › Persisten
     }
     #expect(registry.register(
         window: window, projectRoot: harness.project.path, workspace: closing,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        todoStore: nil, chromeState: chromeState
     ))
     for index in others.indices {
         #expect(registry.register(
             window: otherWindows[index], projectRoot: otherRoots[index].path, workspace: others[index],
-            noteStore: nil, todoStore: nil, chromeState: otherChromeStates[index]
+            todoStore: nil, chromeState: otherChromeStates[index]
         ))
     }
     /// `other` was active, then the closing window.
     func activate(_ other: Int) {
-        for (root, workspace, state) in [
-            (otherRoots[other].path, others[other], otherChromeStates[other]),
-            (harness.project.path, closing, chromeState),
+        for (activeWindow, workspace, state) in [
+            (otherWindows[other], others[other], otherChromeStates[other]),
+            (window, closing, chromeState),
         ] {
-            registry.activateWindow(projectRoot: root, workspace: workspace, noteStore: nil, todoStore: nil, chromeState: state)
+            registry.activateWindow(activeWindow, workspace: workspace, todoStore: nil, chromeState: state)
         }
     }
     /// Opens an agent as the closing window's last tab and detaches it with ⌘D.
@@ -991,7 +922,7 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
     #expect(both.message == "Open or end them from Background Sessions in the Cherry menu bar icon.")
     #expect(both.reopen == [.backgroundSession(id: "s-1"), .backgroundSession(id: "s-2")])
 
-    let attached = ClosedTabNotice(tabName: "CLI", reopen: .attach(local, worktreeRoot: "/work"))
+    let attached = ClosedTabNotice(tabName: "CLI", reopen: .attach(local, projectRoot: "/work"))
     let twoAttached = try #require(ClosedTabNotice.combining([attached, attached]))
     #expect(twoAttached.message == "Attach to them again from File › Persistent Sessions.")
     let mixed = try #require(ClosedTabNotice.combining(own + [attached]))
@@ -1025,10 +956,10 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
     // Native panes cannot detach.
     #expect(stops.buttons.map(\.title) == ["Close Split Group", "Cancel"])
     #expect(stops.alertStyle == .warning)
-    #expect(SessionCloseCoordinator.splitGroupCloseAnswer(for: .alertFirstButtonReturn, detachOffered: false) == .close)
-    #expect(SessionCloseCoordinator.splitGroupCloseAnswer(for: .alertSecondButtonReturn, detachOffered: false) == .cancel)
-    #expect(SessionCloseCoordinator.splitGroupCloseAnswer(for: .alertSecondButtonReturn, detachOffered: true) == .detach)
-    #expect(SessionCloseCoordinator.splitGroupCloseAnswer(for: .alertThirdButtonReturn, detachOffered: true) == .cancel)
+    #expect(TabCloseAnswer(response: .alertFirstButtonReturn, detachOffered: false) == .close)
+    #expect(TabCloseAnswer(response: .alertSecondButtonReturn, detachOffered: false) == .cancel)
+    #expect(TabCloseAnswer(response: .alertSecondButtonReturn, detachOffered: true) == .detach)
+    #expect(TabCloseAnswer(response: .alertThirdButtonReturn, detachOffered: true) == .cancel)
     let keeps = SessionCloseCoordinator.splitGroupCloseAlert(for: [attached("a"), attached("b")], policy: policy)
     #expect(keeps.informativeText == "This will close 2 terminal panes. Their programs keep running in the background.")
     #expect(keeps.alertStyle == .informational)
@@ -1092,7 +1023,7 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
         repository.closeAllSessions(intent: .windowClosed)
         harness.cleanUp()
     }
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     #expect(await harness.fake.wait { harness.creates().count == 1 })
     let parent = workspace.addAgentSession(agent: AgentToolDefinition(name: "Claude", command: "claude"), projectRoot: project)
     let child = workspace.addAgentSession(
@@ -1148,13 +1079,13 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
     registry.bringWindowForward = { _ in }
     registry.windowIsOnScreen = { _ in true }
     // Window B, another project, stays open.
-    let otherRoot = try temporaryDirectory("cherry-toast-reopen-other")
+    let otherRoot = try canonicalTemporaryDirectory("cherry-toast-reopen-other")
     let other = TerminalWorkspace(projectRoot: otherRoot.path, createInitialSession: false, backendPolicy: harness.policy)
     let otherWindow = testWindow()
     let otherChromeState = quietChromeState()
     #expect(registry.register(
         window: otherWindow, projectRoot: otherRoot.path, workspace: other,
-        noteStore: nil, todoStore: nil, chromeState: otherChromeState
+        todoStore: nil, chromeState: otherChromeState
     ))
     // Window A, this project, closes with its last tab, then opens again
     // when asked (as the app's `openWindow`).
@@ -1201,13 +1132,13 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
     func closeLastTabAndReopen(_ makeLastTab: (TerminalWorkspace) async throws -> TerminalSession) async throws -> RepositoryWorkspace {
         closeA()
         let repository = openA()
-        let workspace = repository.activeWorkspace
+        let workspace = repository.workspace
         let tab = try await makeLastTab(workspace)
         for shell in workspace.sessions where shell !== tab {
             workspace.close(shell, intent: .windowClosedEndingSessions)
         }
         #expect(workspace.sessions.map(\.id) == [tab.id])
-        registry.activateWindow(projectRoot: otherRoot.path, workspace: other, noteStore: nil, todoStore: nil, chromeState: otherChromeState)
+        registry.activateWindow(otherWindow, workspace: other, todoStore: nil, chromeState: otherChromeState)
         let (window, _) = try #require(windows.last)
         SessionCloseCoordinator.detachSelectedTabOrWindow(
             workspace: workspace, repository: repository, chromeState: nil, window: window, registry: registry
@@ -1233,7 +1164,7 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
         return agent
     }
     let agent = try #require(agentID)
-    #expect(await harness.fake.wait { reopenedA.activeWorkspace.session(withID: agent) != nil })
+    #expect(await harness.fake.wait { reopenedA.workspace.session(withID: agent) != nil })
     #expect(other.session(withID: agent) == nil)
     #expect(opened.count == 1)
 
@@ -1244,11 +1175,11 @@ private func unpromptedToast(dismissed: Recorder<Int>) -> ProjectWindowToast {
         return tab
     }
     #expect(await harness.fake.wait {
-        reopenedAgain.activeWorkspace.sessions.contains { $0.hostedAttachment?.sessionID == "session-cli" }
+        reopenedAgain.workspace.sessions.contains { $0.hostedAttachment?.sessionID == "session-cli" }
     })
     #expect(!other.sessions.contains { $0.hostedAttachment?.sessionID == "session-cli" })
     #expect(opened.count == 2)
-    #expect(reopenedAgain.activeWorkspace.sessions.contains { $0.hostedAttachment?.sessionID == "session-cli" && !$0.isPersistentLocalSession })
+    #expect(reopenedAgain.workspace.sessions.contains { $0.hostedAttachment?.sessionID == "session-cli" && !$0.isPersistentLocalSession })
     // Only the default shells closed here were ended.
     let agentSession = try #require(agentSessionID)
     #expect(!harness.requestIDs("kill").contains(agentSession))

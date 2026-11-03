@@ -48,8 +48,8 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     for invalid in ["", "-oProxyCommand=bad", "host -p 22", "host\nother", "host\u{0}", "host;sh", "$(touch-bad)"] {
         #expect(throws: HostedSessionError.self) { try HostedSessionHost.ssh(invalid) }
     }
-    #expect(try HostedSessionHost.ssh(" user@work ").arguments == ["--host", "user@work"])
-    #expect(HostedSessionHost.local.arguments.isEmpty)
+    #expect(try HostedSessionHost.ssh(" user@work ").arguments(sshControlPath: nil) == ["--host", "user@work"])
+    #expect(HostedSessionHost.local.arguments(sshControlPath: nil).isEmpty)
     #expect(try HostedSessionHost.ssh("local").id != HostedSessionHost.local.id)
 }
 
@@ -94,7 +94,7 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     #expect(session.workingDirectory == NSHomeDirectory())
     // The adapter attaches as the tab (`--client-id`): the host replaces the
     // tab's previous attachment when it launches again.
-    #expect(session.nativeExecLaunch.command == "'/tmp/cherry tools/cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'attach' 'session-123' '--detach-key' 'none' '--client-id' '\(session.id.uuidString)'")
+    #expect(session.nativeExecLaunch.command == "'/tmp/cherry tools/cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'host' 'attach' 'session-123' '--detach-key' 'none' '--client-id' '\(session.id.uuidString)'")
     #expect(session.nativeExecLaunch.environment["CHERRY_STARTUP_COMMAND"] == nil)
     // The adapter runs ssh with the login shell's agent socket.
     #expect(session.nativeExecLaunch.environment["SSH_AUTH_SOCK"] == "/login/agent.sock")
@@ -150,11 +150,11 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
         name: "Editor", remoteWorkingDirectory: "/remote", executablePath: "/tmp/it's cherry"
     )
     let statusFile = URL(fileURLWithPath: "/tmp/it's status/status.json")
-    #expect(attachment.execCommand(statusFile: statusFile, takeover: true) == "'/tmp/it'\\''s cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'attach' 'id'\\'';$(touch bad)' '--takeover' '--detach-key' 'none' '--status-file' '/tmp/it'\\''s status/status.json'")
-    #expect(attachment.arguments(statusFile: nil) == [
-        "--host", "devbox", "--expected-host-id", "host-a", "attach", "id';$(touch bad)", "--detach-key", "none"
+    #expect(attachment.execCommand(statusFile: statusFile, takeover: true, sshControlPath: nil) == "'/tmp/it'\\''s cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'host' 'attach' 'id'\\'';$(touch bad)' '--takeover' '--detach-key' 'none' '--status-file' '/tmp/it'\\''s status/status.json'")
+    #expect(attachment.arguments(statusFile: nil, sshControlPath: nil) == [
+        "--host", "devbox", "--expected-host-id", "host-a", "host", "attach", "id';$(touch bad)", "--detach-key", "none"
     ])
-    #expect(attachment.execCommand(statusFile: nil, clientID: "tab';$(touch bad)") == "'/tmp/it'\\''s cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'attach' 'id'\\'';$(touch bad)' '--detach-key' 'none' '--client-id' 'tab'\\'';$(touch bad)'")
+    #expect(attachment.execCommand(statusFile: nil, sshControlPath: nil, clientID: "tab';$(touch bad)") == "'/tmp/it'\\''s cherry' '--host' 'devbox' '--expected-host-id' 'host-a' 'host' 'attach' 'id'\\'';$(touch bad)' '--detach-key' 'none' '--client-id' 'tab'\\'';$(touch bad)'")
 }
 
 /// The fake CLI takes `--client-id` as the real one does (1 to 128 bytes),
@@ -251,10 +251,10 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     let permissions = try FileManager.default.attributesOfItem(atPath: first.path)[.posixPermissions] as? Int
     #expect(permissions == 0o700)
     // Nothing written yet: the adapter is still running.
-    #expect(HostedAttachmentStatusFile.read(from: first) == nil)
+    #expect(HostedAttachmentStatusFile.readEnding(from: first)?.status == nil)
     try Data(#"{"outcome":"taken_over","exit_code":null,"signal":null,"message":null}"#.utf8)
         .write(to: HostedAttachmentStatusFile.statusFileURL(in: first))
-    #expect(HostedAttachmentStatusFile.read(from: first) == .takenOver)
+    #expect(HostedAttachmentStatusFile.readEnding(from: first)?.status == .takenOver)
     HostedAttachmentStatusFile.removeLaunchDirectory(first, after: 0)
     #expect(!FileManager.default.fileExists(atPath: first.path))
 }
@@ -283,12 +283,12 @@ private let hangupInterruption = "interrupted by signal 1; the host session was 
     let file = HostedAttachmentStatusFile.statusFileURL(in: launch)
     // A running adapter's state is no outcome: it has not ended.
     try HostedSessionFakeCLI.writeStatus(HostedSessionFakeCLI.attachedStatus(reconnecting: true), to: file)
-    #expect(HostedAttachmentStatusFile.read(from: launch) == nil)
+    #expect(HostedAttachmentStatusFile.readEnding(from: launch)?.status == nil)
     #expect(HostedAttachmentStatusFile.readLive(from: launch) == HostedAdapterLiveStatus(reconnecting: true))
     // A live state left behind by an adapter that was killed means it ended.
     #expect(HostedAttachmentStatusFile.status(from: try Data(contentsOf: file)) == .disconnected(nil))
     try HostedSessionFakeCLI.writeStatus(#"{"outcome":"exited","exit_code":2,"signal":null,"message":null}"#, to: file)
-    #expect(HostedAttachmentStatusFile.read(from: launch) == .exited(code: 2, signal: nil))
+    #expect(HostedAttachmentStatusFile.readEnding(from: launch)?.status == .exited(code: 2, signal: nil))
     #expect(HostedAttachmentStatusFile.readLive(from: launch) == nil)
 }
 
@@ -554,7 +554,7 @@ private func fixtureSession() throws -> HostedSessionInfo {
     await controller.refresh(devbox)
     // The fake's identities are not UUIDs, so the helper is not told which
     // one to expect (HostControlTests covers that): the app checks the Welcome.
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "host", "control"])
     #expect(store.trustedHostID(for: devbox) == "host-a")
     #expect(controller.sessions.count == 1)
 
@@ -582,7 +582,7 @@ private func fixtureSession() throws -> HostedSessionInfo {
     #expect(fake.requests("create").isEmpty)
 
     await controller.trustNewHostIdentity(devbox)
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "host", "control"])
     #expect(controller.error == nil)
     #expect(controller.identityMismatchHost == nil)
     #expect(controller.hostID == "host-b")
@@ -595,7 +595,7 @@ private func fixtureSession() throws -> HostedSessionInfo {
     // This Mac is never pinned: the helper already rejects a local socket or
     // peer owned by another user, so a changed identity is still this user's host.
     await controller.refresh(.local)
-    #expect(fake.launches.last?.arguments == ["control"])
+    #expect(fake.launches.last?.arguments == ["host", "control"])
     fake.hostID = "host-c"
     await dropConnections(of: .local)
     await controller.refresh(.local)
@@ -867,7 +867,7 @@ private func fixtureSession() throws -> HostedSessionInfo {
     func writeStatus(_ json: String, for launch: String) throws {
         try Data(json.utf8).write(to: try statusFile(of: launch))
     }
-    let prefix = "--host devbox --expected-host-id host-a attach session-123"
+    let prefix = "--host devbox --expected-host-id host-a host attach session-123"
 
     // Every launch attaches as the tab, so the host replaces the tab's
     // previous attachment instead of keeping a stale one.
@@ -1441,7 +1441,6 @@ private func fixtureSession() throws -> HostedSessionInfo {
     for request in [
         CherryControlRequest.startProcess(.init(processID: processID)),
         .restartProcess(.init(processID: processID)),
-        .restartTerminal(.init(terminalID: processID)),
     ] {
         let response = try await harness.send(request)
         #expect(response.error?.code == "hosted_session_ended")

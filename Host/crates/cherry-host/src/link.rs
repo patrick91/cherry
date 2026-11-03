@@ -50,8 +50,10 @@
 //!   request ID a client sees (`SessionInfo::request_id`) is the hello's
 //!   `receipt`, which every version carries.
 //! - Version 4 adds application cursor keys (DECCKM), as a field:
-//!   `application_cursor_keys` in `Info` and in the hello's session. A
-//!   daemon takes it as off for an older holder, which never reports it.
+//!   `application_cursor_keys` in `Info` and in the hello's session. It is
+//!   the first version a holder was built with (the ones before it never
+//!   left development), and the oldest a daemon serves
+//!   (`MIN_LINK_VERSION`).
 //! - Version 5 adds, daemon to holder, `Attended` (whether any client is
 //!   attached, which the holder serves at interactive priority; see
 //!   `cherry_protocol::priority`), and the snapshot kind `resized`, which
@@ -100,11 +102,18 @@
 //!   them. An older holder is never sent it. A holder of version 9 also
 //!   reads the kitty graphics programs transmit from files and shared
 //!   memory itself (see `media`); that changes nothing on the link.
+//! - Version 10 adds xterm's modifyOtherKeys at level 2 (`CSI > 4 ; 2 m`),
+//!   as a field: `modify_other_keys` in `Info` and in the hello's session,
+//!   which a daemon takes as unknown from an older holder.
+//! - Version 11 adds program status records (OSC 7501) as a field:
+//!   `program_status` in `Info` and in the hello's session; an older
+//!   holder reports none.
 //!
 //! Replies (`SnapshotReply`, `ScreenReply`, `DetachDone`) come in the order
 //! of their requests, and in order with the output: a `SnapshotReply` shows
 //! exactly the output before it, up to its `offset`.
 use anyhow::{bail, Context, Result};
+use cherry_protocol::ProgramStatus;
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -113,10 +122,7 @@ use std::{
 };
 
 /// The link version this build speaks.
-pub const LINK_VERSION: u16 = 9;
-/// The oldest link version whose holders limit screen text themselves
-/// (`ScreenRequest::max_lines`).
-pub const SCREEN_LINES_VERSION: u16 = 3;
+pub const LINK_VERSION: u16 = 11;
 /// The oldest link version whose holders answer the snapshot kind
 /// `resized`.
 pub const RESIZED_SNAPSHOT_VERSION: u16 = 5;
@@ -129,8 +135,9 @@ pub const CLEAR_HISTORY_VERSION: u16 = 7;
 pub const CELL_SIZE_VERSION: u16 = 8;
 /// The oldest link version whose holders take `graphics` in a `Snapshot`.
 pub const VIEWPORT_GRAPHICS_VERSION: u16 = 9;
-/// The oldest link version this daemon adopts holders of.
-pub const MIN_LINK_VERSION: u16 = 1;
+/// The oldest link version this daemon adopts holders of: the first a
+/// holder was ever built with.
+pub const MIN_LINK_VERSION: u16 = 4;
 /// Frames are at most this long (an 8 MiB snapshot with its images, and
 /// room to spare).
 pub const MAX_FRAME: usize = 32 * 1024 * 1024;
@@ -182,10 +189,10 @@ pub mod kind {
     /// Version 7.
     pub const CLEAR_HISTORY: u8 = 77;
 
-    /// The link version that introduced a daemon-to-holder kind.
+    /// The link version that introduced a daemon-to-holder kind; 1 for
+    /// one that every holder a daemon serves (`MIN_LINK_VERSION`) knows.
     pub fn since(kind: u8) -> u16 {
         match kind {
-            SCREEN | UPDATE => 2,
             ATTENDED => 5,
             PACE => 6,
             CLEAR_HISTORY => super::CLEAR_HISTORY_VERSION,
@@ -436,14 +443,7 @@ impl Writer {
             if left.is_zero() {
                 return false;
             }
-            let mut poll = libc::pollfd {
-                fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            unsafe {
-                libc::poll(&mut poll, 1, left.as_millis().max(1) as libc::c_int);
-            }
+            crate::signals::wait_for(fd, libc::POLLOUT, Some(left));
         }
     }
 }
@@ -514,6 +514,14 @@ pub struct SessionState {
     /// older holder, which never reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bracketed_paste: Option<bool>,
+    /// Version 10: whether modifyOtherKeys is at level 2; None from an
+    /// older holder, which never reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modify_other_keys: Option<bool>,
+    /// Version 11: the program status records (OSC 7501); none from an
+    /// older holder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub program_status: Vec<ProgramStatus>,
 }
 
 /// The `Create` that made a session, so that a daemon adopting it keeps
@@ -833,6 +841,13 @@ pub struct Info {
     /// Version 7: whether bracketed paste (DECSET 2004) is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bracketed_paste: Option<bool>,
+    /// Version 10: whether modifyOtherKeys is at level 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modify_other_keys: Option<bool>,
+    /// Version 11: the program status records (OSC 7501), all of them,
+    /// when they changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_status: Option<Vec<ProgramStatus>>,
 }
 
 impl Info {
@@ -1032,9 +1047,19 @@ mod tests {
             .unwrap(),
             r#"{"bracketed_paste":true}"#
         );
+        // Version 10's, likewise.
+        assert_eq!(
+            serde_json::to_string(&Info {
+                modify_other_keys: Some(false),
+                ..Info::default()
+            })
+            .unwrap(),
+            r#"{"modify_other_keys":false}"#
+        );
         let old: Info = serde_json::from_str(r#"{"alternate_screen":true}"#).unwrap();
         assert_eq!(old.application_cursor_keys, None);
         assert_eq!(old.bracketed_paste, None);
+        assert_eq!(old.modify_other_keys, None);
         let old: SessionState = serde_json::from_str(
             r#"{"name":"n","cwd":"/","command":[],"cols":80,"rows":24,"running":true,"pid":7}"#,
         )
@@ -1044,9 +1069,10 @@ mod tests {
                 old.alternate_screen,
                 old.kitty_keyboard_flags,
                 old.application_cursor_keys,
-                old.bracketed_paste
+                old.bracketed_paste,
+                old.modify_other_keys
             ),
-            (false, 0, false, None)
+            (false, 0, false, None, None)
         );
         let request: ScreenRequest =
             serde_json::from_str(r#"{"req":1,"scrollback":true}"#).unwrap();

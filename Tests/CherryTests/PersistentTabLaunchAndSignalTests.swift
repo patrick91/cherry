@@ -1,10 +1,8 @@
 import AppKit
-import CherryControl
+@testable import CherryControl
 import Foundation
-import MCP
 import Testing
 @testable import Cherry
-@testable import CherryMCP
 
 // Persistent tabs (docs/specs/multiplexer-default.md) while their session is
 // created or restarted, after their host restarted, and for MCP input whose
@@ -47,7 +45,7 @@ private func typed(_ harness: PersistentHarness, into sessionID: String? = nil) 
 }
 
 /// Restores a terminal tab whose session the fake host runs, its adapter
-/// left for later (a worktree not shown).
+/// left for later (a tab not shown yet).
 @MainActor
 private func restoreTerminal(
     _ harness: PersistentHarness,
@@ -64,7 +62,7 @@ private func restoreTerminal(
         tags: [PersistentSessionTag.tab: record.id.uuidString]
     ))
     let result = await harness.restorer(WorkspaceRestoreRequest(
-        repositoryRoot: harness.project.path, worktreeRoot: harness.project.path,
+        repositoryRoot: harness.project.path,
         records: [record], workspace: workspace
     ))
     workspace.restoreSessions(
@@ -318,7 +316,7 @@ private func restoreTerminal(
 
     // The next launch's restore finds it by the saved record's request id.
     let restored = await harness.restorer(WorkspaceRestoreRequest(
-        repositoryRoot: harness.project.path, worktreeRoot: harness.project.path,
+        repositoryRoot: harness.project.path,
         records: [], workspace: next, unboundRecords: saved.sessions
     ))
     let back = try #require(restored.sessions.first)
@@ -630,23 +628,23 @@ private func fakeAdapterTurnsOnApplicationCursorKeys(_ harness: PersistentHarnes
 @Test func mcpClientTimeoutsCoverPersistentSessionCreationAndRestoreWaits() {
     // A new agent's first message: its session (8 s), the agent (6 s), the
     // host's answers and the output read, after wait_ms.
-    #expect(CherryMCPTools.clientTimeout(for: "spawn_agent", arguments: ["wait_ms": .int(1_000)]) == 21)
-    #expect(CherryMCPTools.clientTimeout(for: "spawn_process", arguments: [:]) == 20)
-    #expect(CherryMCPTools.clientTimeout(for: "spawn_process", arguments: ["kind": .string("terminal")]) == 20)
+    #expect(CherryToolLayer.clientTimeout(for: "spawn_agent", arguments: ["wait_ms": .int(1_000)]) == 21)
+    #expect(CherryToolLayer.clientTimeout(for: "spawn_process", arguments: [:]) == 20)
+    #expect(CherryToolLayer.clientTimeout(for: "spawn_process", arguments: ["kind": .string("terminal")]) == 20)
     // A command first waits (at most 10 s) for a restore under way, then as
     // a terminal: its session, the host taking its input, the output read.
-    #expect(CherryMCPTools.clientTimeout(
+    #expect(CherryToolLayer.clientTimeout(
         for: "spawn_process", arguments: ["kind": .string("command"), "wait_ms": .int(1_000)]
     ) == 31)
-    #expect(CherryMCPTools.clientTimeout(for: "spawn_process", arguments: ["kind": .string(" Command ")]) == 30)
-    #expect(CherryMCPTools.clientTimeout(for: "send_process_input", arguments: ["wait_ms": .int(9_000)]) == 25)
+    #expect(CherryToolLayer.clientTimeout(for: "spawn_process", arguments: ["kind": .string(" Command ")]) == 30)
+    #expect(CherryToolLayer.clientTimeout(for: "send_process_input", arguments: ["wait_ms": .int(9_000)]) == 25)
     // Starting commands waits (at most 10 s) for a restore under way.
     for tool in ["start_process", "start_all_commands", "restart_all_commands"] {
-        #expect(CherryMCPTools.clientTimeout(for: tool, arguments: ["wait_ms": .int(2_000)]) == 22)
+        #expect(CherryToolLayer.clientTimeout(for: tool, arguments: ["wait_ms": .int(2_000)]) == 22)
     }
     // send_agent_message sends like send_process_input, then waits.
-    #expect(CherryMCPTools.clientTimeout(for: "send_agent_message", arguments: ["timeout_ms": .int(3_000)]) == 20)
-    #expect(CherryMCPTools.clientTimeout(for: "send_agent_message", arguments: ["timeout_ms": .int(60_000)]) == 65)
-    #expect(CherryMCPTools.clientTimeout(for: "wait_for_process_idle", arguments: ["timeout_ms": .int(3_000)]) == 8)
-    #expect(CherryMCPTools.clientTimeout(for: "list_processes", arguments: [:]) == nil)
+    #expect(CherryToolLayer.clientTimeout(for: "send_agent_message", arguments: ["timeout_ms": .int(3_000)]) == 20)
+    #expect(CherryToolLayer.clientTimeout(for: "send_agent_message", arguments: ["timeout_ms": .int(60_000)]) == 65)
+    #expect(CherryToolLayer.clientTimeout(for: "wait_for_process_idle", arguments: ["timeout_ms": .int(3_000)]) == 8)
+    #expect(CherryToolLayer.clientTimeout(for: "list_processes", arguments: [:]) == nil)
 }

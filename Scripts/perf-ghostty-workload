@@ -3,45 +3,18 @@ import argparse
 import json
 import os
 from pathlib import Path
-import shlex
 import signal
 import subprocess
 import sys
 import time
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-WORKLOAD_SCRIPT = REPO_ROOT / "Scripts" / "perf-terminal-workload"
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import perf_common  # noqa: E402
 
-SCALES = {
-    "smoke": {
-        "duration": 20,
-        "lines": 8_000,
-        "frames": 150,
-        "progress_frames": 300,
-        "sleep_ms": 0,
-        "rate_mib_per_second": 4.0,
-        "sample_interval": 2.0,
-    },
-    "standard": {
-        "duration": 180,
-        "lines": 50_000,
-        "frames": 1_000,
-        "progress_frames": 2_000,
-        "sleep_ms": 0,
-        "rate_mib_per_second": 2.0,
-        "sample_interval": 5.0,
-    },
-    "soak": {
-        "duration": 7_200,
-        "lines": 120_000,
-        "frames": 6_000,
-        "progress_frames": 10_000,
-        "sleep_ms": 0,
-        "rate_mib_per_second": 1.0,
-        "sample_interval": 30.0,
-    },
-}
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCALES = perf_common.WORKLOAD_SCALES
 
 
 def parse_args():
@@ -68,11 +41,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def setting(args, key):
-    value = getattr(args, key)
-    return value if value is not None else SCALES[args.scale][key]
-
-
 def ghostty_pids():
     pids = set()
     for name in ("Ghostty", "ghostty"):
@@ -89,120 +57,6 @@ def ghostty_pids():
             if line.strip().isdigit():
                 pids.add(int(line))
     return sorted(pids)
-
-
-def sample_processes(pids):
-    live_pids = [pid for pid in pids if pid_exists(pid)]
-    if not live_pids:
-        return {"processes": [], "total_rss_bytes": 0, "total_cpu_percent": 0.0}
-
-    try:
-        output = subprocess.check_output(
-            [
-                "/bin/ps",
-                "-o",
-                "pid=,rss=,pcpu=,etime=",
-                "-p",
-                ",".join(str(pid) for pid in live_pids),
-            ],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=2,
-        )
-    except Exception as error:
-        return {
-            "processes": [],
-            "total_rss_bytes": 0,
-            "total_cpu_percent": 0.0,
-            "error": str(error),
-        }
-
-    processes = []
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        try:
-            pid = int(parts[0])
-            rss_bytes = int(parts[1]) * 1024
-            cpu_percent = float(parts[2])
-        except ValueError:
-            continue
-        processes.append({
-            "pid": pid,
-            "rss_bytes": rss_bytes,
-            "cpu_percent": cpu_percent,
-            "elapsed": parts[3],
-        })
-
-    return {
-        "processes": processes,
-        "total_rss_bytes": sum(process["rss_bytes"] for process in processes),
-        "total_cpu_percent": sum(process["cpu_percent"] for process in processes),
-    }
-
-
-def summarize_samples(samples):
-    if not samples:
-        return {
-            "sample_count": 0,
-            "first_total_rss_bytes": 0,
-            "last_total_rss_bytes": 0,
-            "min_total_rss_bytes": 0,
-            "max_total_rss_bytes": 0,
-            "rss_delta_bytes": 0,
-            "rss_growth_bytes_per_second": 0.0,
-            "rss_growth_mib_per_hour": 0.0,
-            "max_total_cpu_percent": 0.0,
-            "max_process_rss_bytes": 0,
-        }
-
-    ordered = sorted(samples, key=lambda sample: sample.get("elapsed_seconds", 0.0))
-    first = ordered[0]
-    last = ordered[-1]
-    elapsed = max(0.0, float(last.get("elapsed_seconds", 0.0)) - float(first.get("elapsed_seconds", 0.0)))
-    first_rss = int(first.get("total_rss_bytes", 0))
-    last_rss = int(last.get("total_rss_bytes", 0))
-    rss_delta = last_rss - first_rss
-    rss_growth = (rss_delta / elapsed) if elapsed > 0 else 0.0
-
-    max_process_rss = 0
-    for sample in ordered:
-        for process in sample.get("processes", []):
-            max_process_rss = max(max_process_rss, process.get("rss_bytes", 0))
-
-    return {
-        "sample_count": len(ordered),
-        "first_total_rss_bytes": first_rss,
-        "last_total_rss_bytes": last_rss,
-        "min_total_rss_bytes": min(sample.get("total_rss_bytes", 0) for sample in ordered),
-        "max_total_rss_bytes": max(sample.get("total_rss_bytes", 0) for sample in ordered),
-        "rss_delta_bytes": rss_delta,
-        "rss_growth_bytes_per_second": rss_growth,
-        "rss_growth_mib_per_hour": (rss_growth * 3600) / 1_048_576,
-        "max_total_cpu_percent": max(sample.get("total_cpu_percent", 0.0) for sample in ordered),
-        "max_process_rss_bytes": max_process_rss,
-    }
-
-
-def shell_command(mode, duration, lines, frames, progress_frames, sleep_ms, rate_mib_per_second):
-    command = [
-        str(WORKLOAD_SCRIPT),
-        mode,
-        "--duration",
-        str(max(1, int(duration))),
-        "--lines",
-        str(lines),
-        "--frames",
-        str(frames),
-        "--progress-frames",
-        str(progress_frames),
-        "--sleep-ms",
-        str(max(0, sleep_ms)),
-        "--rate-mib-per-second",
-        str(max(0, rate_mib_per_second)),
-    ]
-    return " ".join(shlex.quote(part) for part in command)
 
 
 def launch_ghostty(command):
@@ -236,14 +90,14 @@ def main():
     if not Path("/usr/bin/open").exists():
         raise SystemExit("open(1) is required on macOS.")
 
-    duration = setting(args, "duration")
-    lines = setting(args, "lines")
-    frames = setting(args, "frames")
-    progress_frames = setting(args, "progress_frames")
-    sleep_ms = setting(args, "sleep_ms")
-    rate_mib_per_second = setting(args, "rate_mib_per_second")
-    sample_interval = setting(args, "sample_interval")
-    command = shell_command(
+    duration = perf_common.setting(args, SCALES, "duration")
+    lines = perf_common.setting(args, SCALES, "lines")
+    frames = perf_common.setting(args, SCALES, "frames")
+    progress_frames = perf_common.setting(args, SCALES, "progress_frames")
+    sleep_ms = perf_common.setting(args, SCALES, "sleep_ms")
+    rate_mib_per_second = perf_common.setting(args, SCALES, "rate_mib_per_second")
+    sample_interval = perf_common.setting(args, SCALES, "sample_interval")
+    command = perf_common.shell_command(
         args.mode,
         duration,
         lines,
@@ -293,7 +147,7 @@ def main():
     }
 
     def add_sample(label):
-        sample = sample_processes(sampled_pids)
+        sample = perf_common.sample_processes(sampled_pids)
         sample["label"] = label
         sample["elapsed_seconds"] = round(time.monotonic() - start_time, 3)
         sample["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -315,7 +169,7 @@ def main():
     add_sample("after_complete")
     report["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     report["pids_after_complete"] = ghostty_pids()
-    report["sample_summary"] = summarize_samples(report["samples"])
+    report["sample_summary"] = perf_common.summarize_samples(report["samples"])
 
     if not args.keep_open:
         terminate_pids(launched_pids)

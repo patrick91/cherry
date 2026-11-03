@@ -1,3 +1,4 @@
+mod agent;
 mod attach;
 mod control;
 mod diagnose;
@@ -5,6 +6,7 @@ mod guard;
 mod handover;
 mod input;
 mod passthrough;
+mod route;
 mod settle;
 mod status;
 mod stderr_relay;
@@ -46,7 +48,8 @@ const MAX_REMOTE_HOST_PATH_BYTES: usize = 1024;
 #[command(
     name = "cherry",
     version = cherry_protocol::VERSION,
-    about = "Persistent Cherry terminal sessions, locally or over SSH"
+    about = "Persistent Cherry terminal sessions, locally or over SSH (cherry host …; \
+             the commands also answer without `host`)"
 )]
 struct Cli {
     /// SSH host alias (uses your normal SSH configuration and authentication).
@@ -261,6 +264,16 @@ impl Cli {
 
 fn main() -> ExitCode {
     let arguments: Vec<OsString> = std::env::args_os().collect();
+    let arguments = match route::route(&arguments) {
+        route::Route::Host(arguments) => arguments,
+        route::Route::Agent(arguments) => {
+            return ExitCode::from(agent::run(&arguments));
+        }
+        route::Route::Overview => {
+            print!("{}", route::OVERVIEW);
+            return ExitCode::SUCCESS;
+        }
+    };
     let cli = match Cli::try_parse_from(&arguments).and_then(Cli::validate) {
         Ok(cli) => cli,
         Err(error) => {
@@ -313,7 +326,7 @@ fn interruption_message(kind: Kind, signal: i32) -> String {
         Kind::Start => "; cherry-host may still be starting",
         Kind::Query => "",
         Kind::Mutation => {
-            "; the request may already have reached the host. Run `cherry list` to check its outcome"
+            "; the request may already have reached the host. Run `cherry host list` to check its outcome"
         }
         Kind::Attach => "; the host session was not terminated",
         Kind::Control => "",
@@ -349,7 +362,9 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
     }
     if let Action::Doctor = cli.command {
         if cli.host.is_some() {
-            bail!("doctor is local only; run it on the remote machine (ssh HOST cherry doctor)");
+            bail!(
+                "doctor is local only; run it on the remote machine (ssh HOST cherry host doctor)"
+            );
         }
         return diagnose::doctor(&transport::local_socket_path(cli.socket.as_deref())?);
     }
@@ -446,19 +461,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
                     executable: if_executable,
                     build: if_build,
                 };
-                transport.send(&ClientMessage::Status)?;
-                let status = match transport.receive(RPC_TIMEOUT)? {
-                    ServerMessage::Status { status } => Some(status),
-                    ServerMessage::Error { code, .. }
-                        if code == cherry_protocol::error_code::UNSUPPORTED_OPERATION =>
-                    {
-                        None
-                    }
-                    message => {
-                        unexpected("status", message)?;
-                        unreachable!()
-                    }
-                };
+                let status = diagnose::request_status(transport)?;
                 if let Err(why) = condition.check(status.as_ref()) {
                     eprintln!("cherry: not restarting the host, which keeps running: {why}");
                     return Ok(RESTART_CONDITION_UNMET);
@@ -502,10 +505,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
                     print(&text)?;
                     Ok(0)
                 }
-                message => {
-                    unexpected("session list", message)?;
-                    unreachable!()
-                }
+                message => Err(unexpected("session list", message)),
             }
         }
         Action::New {
@@ -538,10 +538,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
                     print(&format!("{}\n", serde_json::to_string(&session)?))?;
                     Ok(0)
                 }
-                message => {
-                    unexpected("created session", message)?;
-                    unreachable!()
-                }
+                message => Err(unexpected("created session", message)),
             }
         }
         Action::Kill { id } => {
@@ -847,10 +844,7 @@ fn handshake(
                 "host rejected request ({code}): {message}; this cherry speaks protocol version {PROTOCOL_VERSION}. Install the same Cherry version on both machines"
             )))
         }
-        message => {
-            unexpected("welcome", message)?;
-            unreachable!()
-        }
+        message => Err(unexpected("welcome", message)),
     }
 }
 
@@ -876,7 +870,7 @@ fn replace(transport: &mut Transport, version: u32) -> Result<()> {
         Some(message) => Err(unresolvable(format!(
             "{}: {:#}",
             context(),
-            unexpected("replace acknowledgement", message).unwrap_err()
+            unexpected("replace acknowledgement", message)
         ))),
     }
 }
@@ -958,10 +952,7 @@ impl RestartCondition {
 fn expect_ok(transport: &mut Transport, expected: &str) -> Result<u32> {
     match transport.receive(RPC_TIMEOUT)? {
         ServerMessage::Ok => Ok(0),
-        message => {
-            unexpected(expected, message)?;
-            unreachable!()
-        }
+        message => Err(unexpected(expected, message)),
     }
 }
 
@@ -1008,12 +999,12 @@ fn session_environment(
     environment
 }
 
-pub(crate) fn unexpected(expected: &str, message: ServerMessage) -> Result<()> {
+pub(crate) fn unexpected(expected: &str, message: ServerMessage) -> anyhow::Error {
     match message {
         ServerMessage::Error { code, message } => {
-            bail!("host rejected request ({code}): {message}")
+            anyhow!("host rejected request ({code}): {message}")
         }
-        other => bail!("expected {expected}, received {}", message_kind(&other)),
+        other => anyhow!("expected {expected}, received {}", message_kind(&other)),
     }
 }
 

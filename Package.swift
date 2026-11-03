@@ -10,11 +10,12 @@ let package = Package(
     ],
     products: [
         .executable(name: "Cherry", targets: ["Cherry"]),
-        .executable(name: "CherryMCP", targets: ["CherryMCPStdio"]),
     ],
     dependencies: [
         .package(path: "ThirdParty/libghostty-spm"),
-        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", from: "0.12.0"),
+        // Exact: the framework, its tools (sign_update), the launchd job labels Cherry removes and
+        // the delegate behaviour Cherry relies on (docs/releasing.md) move together; upgrade deliberately.
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"),
     ],
     targets: [
         .target(
@@ -27,21 +28,6 @@ let package = Package(
                 .linkedFramework("AppKit"),
             ]
         ),
-        .target(
-            name: "CherryMCP",
-            dependencies: [
-                "CherryControl",
-                .product(name: "MCP", package: "swift-sdk"),
-            ]
-        ),
-        .executableTarget(
-            name: "CherryMCPStdio",
-            dependencies: [
-                "CherryControl",
-                "CherryMCP",
-                .product(name: "MCP", package: "swift-sdk"),
-            ]
-        ),
         .executableTarget(
             name: "Cherry",
             dependencies: [
@@ -50,9 +36,20 @@ let package = Package(
                 .product(name: "GhosttyKit", package: "libghostty-spm"),
                 .product(name: "GhosttyTerminal", package: "libghostty-spm"),
                 .product(name: "GhosttyTheme", package: "libghostty-spm"),
+                .product(name: "Sparkle", package: "Sparkle"),
+            ],
+            // The Icon Composer source: Scripts/install-local-app compiles it
+            // with actool from here, and the app bundle never reads it.
+            exclude: [
+                "Resources/AppIcon.icon"
             ],
             resources: [
                 .process("Resources")
+            ],
+            // Sparkle.framework is embedded in Contents/Frameworks (Scripts/install-local-app,
+            // script/build_and_run.sh). SwiftPM's own @loader_path keeps `swift run` and tests working.
+            linkerSettings: [
+                .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])
             ]
         ),
         .testTarget(
@@ -60,8 +57,6 @@ let package = Package(
             dependencies: [
                 "Cherry",
                 "CherryControl",
-                "CherryMCP",
-                .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "GhosttyKit", package: "libghostty-spm"),
                 .product(name: "GhosttyTerminal", package: "libghostty-spm"),
             ],

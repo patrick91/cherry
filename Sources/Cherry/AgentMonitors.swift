@@ -7,13 +7,17 @@ import Foundation
 // done, needs_input, permission, error, exited, closed, output_match. A
 // sampler on the main actor looks at every watched process while any
 // subscription exists, numbers each subscription's events, and keeps them
-// until `wait_for_events` reads them. When the subscriber is an agent tab
-// Cherry confirmed is the caller, Cherry types one wake line into it once
-// events are ready and the subscriber is idle: no MCP client shows the
-// model a server's notifications, and typed input is what every agent
-// CLI takes. The line names only the subscription and event counts, never
-// a watched process's text. Subscriptions live in memory: a relaunch of
-// Cherry ends them (`unknown_subscription`), and callers subscribe again.
+// until `wait_for_events` reads them. An agent that reports no status is
+// `done` once its output went quiet after a submitted turn (the event's
+// `basis` says so); a task's worker also gets one `done` of its own when
+// its task settled (`task_id`), apart from its turns' dones. When the
+// subscriber is an agent tab Cherry confirmed is the caller, Cherry types
+// one wake line into it once events are ready and the subscriber is idle:
+// no MCP client shows the model a server's notifications, and typed input
+// is what every agent CLI takes. The line names only the subscription and
+// event counts, never a watched process's text. Subscriptions live in
+// memory: a relaunch of Cherry ends them (`unknown_subscription`), and
+// callers subscribe again.
 
 /// A subscription's state (main actor only).
 @MainActor
@@ -37,6 +41,14 @@ final class MonitorSubscription {
     var ackCursor = 0
     var droppedEvents = 0
     var lastWokenSeq = 0
+    /// Per watched process, what the subscriber last learned of it from
+    /// Cherry itself (its input refused at the process's question or
+    /// permission, or it read the process's status or screen): the last seq
+    /// then, and the status it learned while the process keeps it.
+    /// `needs_input` and `permission` events up to it, and one after it of
+    /// the status it learned (the sampler had not noticed it yet), are not
+    /// news to it.
+    var processSeen: [String: (seq: Int, status: String?)] = [:]
     var lastWakeAt: Date?
     var isWaking = false
     var activeWaits = 0
@@ -80,6 +92,31 @@ final class WatchedProcess {
     let kind: String
     /// The status the last sample saw; nil before the first.
     var lastStatus: String?
+    /// The agent's `agentTurnCount` at the last sample: a turn that began
+    /// and ended between two samples (its reports came within one) is
+    /// done too.
+    var lastTurn: Int?
+    /// The agent's `agentSubmittedTurnCount` at its last quiet `done` (it
+    /// reports no status): the next comes after a later submit
+    /// (`awaitsOutputQuiet`).
+    var quietDoneSubmittedTurn = 0
+    /// When the first turn the next quiet `done` waits for was submitted
+    /// (to the program that runs now): its screen must change after that
+    /// one, not after a later Enter that drew nothing (Return on an empty
+    /// composer is a submit too, and Codex and Amp draw nothing for it).
+    var quietTurnSubmittedAt: Date?
+    /// The agent's reported and submitted turn counts at its last turn
+    /// `done` (it reports its status): the same counts again are the same
+    /// turn, whose last frame was noticed after its report (screen and
+    /// status come separately), not another `done`.
+    var turnDoneReportedTurn: Int?
+    var turnDoneSubmittedTurn: Int?
+    /// The worker's task, once seen: found by its id after the task
+    /// followed its worker to a tab under another id (`locateWorker`).
+    var taskID: String?
+    /// Tasks of the worker whose settle was a `done`, or that the
+    /// subscriber cancelled itself: each is told once.
+    var settledTaskIDs: Set<String> = []
     var finished = false
     var lastMatchContentVersion = -1
     var recentMatches: [Int] = []
@@ -107,8 +144,11 @@ final class WatchedProcess {
 /// The monitors of one control server.
 @MainActor
 final class AgentMonitorRegistry {
-    /// Settings › MCP › Wake idle agents (default on).
+    /// Settings › Agents › Monitors › Wake idle agents.
     nonisolated static let wakeLinesDefaultsKey = "mcp.monitorWakeLines"
+    /// Whether wake lines are on while nothing is stored: the registry and
+    /// Settings read this one default.
+    nonisolated static let wakeLinesDefault = true
     static let maximumSubscriptionsPerCaller = 32
     static let maximumWatchedProcesses = 64
     static let maximumPendingEvents = 200
@@ -123,6 +163,12 @@ final class AgentMonitorRegistry {
     var sampleInterval: Duration = .milliseconds(250)
     /// How long an agent's screen must be still before idle counts as done.
     var settleInterval: TimeInterval = 1.5
+    /// How long the screen of an agent that reports no status must stay
+    /// still after a submitted turn before the turn counts as done: as
+    /// long as a wake line waits for such a subscriber, longer than
+    /// `wait_for_process_idle`'s default quiet period (1 s), and never
+    /// shorter than `settleInterval`.
+    var outputQuietInterval: TimeInterval = 2
     /// How long the subscriber's screen must be still before a wake line.
     var wakeQuietInterval: TimeInterval = 2
     /// At most one wake line per subscription this often.
@@ -139,7 +185,7 @@ final class AgentMonitorRegistry {
     }
 
     var wakeLinesEnabled: Bool {
-        defaults.object(forKey: Self.wakeLinesDefaultsKey) as? Bool ?? true
+        defaults.object(forKey: Self.wakeLinesDefaultsKey) as? Bool ?? Self.wakeLinesDefault
     }
 
     func add(_ subscription: MonitorSubscription) {
@@ -169,6 +215,9 @@ final class AgentMonitorRegistry {
         session: TerminalSession?,
         exitCode: Int32? = nil,
         matchedLine: String? = nil,
+        basis: String? = nil,
+        task: AgentTask? = nil,
+        prompt: AgentPromptInfo? = nil,
         initial: Bool
     ) {
         guard subscription.events.contains(type) else { return }
@@ -182,6 +231,10 @@ final class AgentMonitorRegistry {
             agentTurn: session.flatMap { $0.kind == .agent ? $0.agentTurnCount : nil },
             exitCode: exitCode,
             matchedLine: matchedLine.map { String($0.prefix(300)) },
+            basis: basis,
+            taskID: task?.id,
+            taskState: task?.state.rawValue,
+            prompt: prompt,
             initial: initial
         )
         subscription.nextSeq += 1
@@ -208,7 +261,8 @@ final class AgentMonitorRegistry {
             counts[type].map { "\($0) \(type.rawValue)" }
         }
         let noun = unread.count == 1 ? "event" : "events"
-        return "[cherry] Monitor \(subscription.id): \(unread.count) \(noun) ready (\(parts.joined(separator: ", "))). Call the cherry wait_for_events tool with subscription_id \"\(subscription.id)\" to read them."
+        return "[cherry] Monitor \(subscription.id): \(unread.count) \(noun) ready (\(parts.joined(separator: ", ")))."
+            + " Run cherry events \(subscription.id) to read them."
     }
 }
 
@@ -323,7 +377,7 @@ extension CherryControlServer {
         startMonitorSamplerIfNeeded()
         return SubscribeResult(
             subscription: info(for: subscription),
-            watching: subscription.watched.map { status(of: $0) }
+            watching: subscription.watched.map { status(of: $0, device: subscription.device) }
         )
     }
 
@@ -353,10 +407,9 @@ extension CherryControlServer {
             monitors.acknowledge(subscription, upTo: cursor)
         }
         let after = max(request.cursor ?? subscription.ackCursor, subscription.ackCursor)
-        let timeout = min(
-            max(request.timeoutMilliseconds ?? CherryControl.maximumEventWaitMilliseconds, 0),
-            CherryControl.maximumEventWaitMilliseconds
-        )
+        // A tool call's client may allow a longer wait than a typed
+        // request's (`callerWaitCapMilliseconds`); the default stays 50 s.
+        let timeout = Self.callerWaitMilliseconds(request.timeoutMilliseconds, typedMaximum: CherryControl.maximumEventWaitMilliseconds)
         let maxEvents = min(max(request.maxEvents ?? 50, 1), 200)
         let deadline = Date().addingTimeInterval(TimeInterval(timeout) / 1_000)
         subscription.activeWaits += 1
@@ -383,7 +436,7 @@ extension CherryControlServer {
                     timedOut: events.isEmpty,
                     droppedEvents: subscription.droppedEvents,
                     moreEvents: available.count - events.count,
-                    watching: subscription.watched.map { status(of: $0) }
+                    watching: subscription.watched.map { status(of: $0, device: subscription.device) }
                 )
             }
             try? await Task.sleep(for: .milliseconds(100))
@@ -393,8 +446,10 @@ extension CherryControlServer {
     // MARK: Identity and scope
 
     /// The caller's own tab: the token's tab for a caller on another Mac;
-    /// for This Mac's, the tab whose program is an ancestor of the
-    /// connecting process (its CherryMCP). Nil when none is.
+    /// for This Mac's, the tab whose program is one of the connecting
+    /// process's (its CherryMCP's) ancestors, as they were when it
+    /// connected (`callerProcessChain`, `callerSession(matching:in:)`). Nil
+    /// when none is.
     @MainActor
     func verifiedCallerSession() -> TerminalSession? {
         let workspaces = allOpenWorkspaces()
@@ -405,18 +460,8 @@ extension CherryControlServer {
         if let resolver = callerSessionResolverForTesting {
             return resolver(Self.callerPeerPID)
         }
-        guard let peerPID = Self.callerPeerPID else { return nil }
-        let ancestry = Set(Self.processAncestry(of: peerPID))
-        for attached in [false, true] {
-            for workspace in workspaces {
-                for session in workspace.sessions where (session.hostedAttachment != nil) == attached {
-                    if let pid = session.programProcessID, ancestry.contains(pid) {
-                        return session
-                    }
-                }
-            }
-        }
-        return nil
+        guard let chain = Self.callerProcessChain else { return nil }
+        return Self.callerSession(matching: chain, in: workspaces)?.session
     }
 
     @MainActor
@@ -487,6 +532,7 @@ extension CherryControlServer {
         let now = Date()
         if monitors.lastRefreshAt.count > 256 { monitors.lastRefreshAt.removeAll() }
         var refreshed = Set<ObjectIdentifier>()
+        var watchedForQuiet = Set<ObjectIdentifier>()
         for subscription in monitors.ordered {
             guard monitors.subscriptions[subscription.id] === subscription else { continue }
             if subscription.subscriberID != nil {
@@ -510,11 +556,15 @@ extension CherryControlServer {
                 continue
             }
             for watched in subscription.watched where !watched.finished {
-                if let session = watched.session, refreshed.insert(ObjectIdentifier(session)).inserted {
+                // A closed tab kept for its task's settle has no screen.
+                if let session = watched.session, watched.lastStatus != "closed" {
                     let key = ObjectIdentifier(session)
-                    if monitors.lastRefreshAt[key].map({ now.timeIntervalSince($0) >= monitors.refreshInterval }) ?? true {
-                        monitors.lastRefreshAt[key] = now
-                        await refreshForMonitor(session)
+                    if awaitsOutputQuiet(watched, in: subscription) {
+                        // Its turn ends when its screen goes still: looked
+                        // at every sample, as an idle wait looks.
+                        if watchedForQuiet.insert(key).inserted { await watchForOutputQuiet(session) }
+                    } else if refreshed.insert(key).inserted {
+                        await refreshForMonitorIfDue(session, now: now)
                     }
                 }
                 evaluate(watched, in: subscription, now: Date())
@@ -529,6 +579,92 @@ extension CherryControlServer {
     func refreshForMonitor(_ session: TerminalSession) async {
         await session.refreshContentFromHostIfNeeded(maximumAge: session.hostContentPollInterval, recentOnly: true)
         _ = session.lineCount
+    }
+
+    /// `refreshForMonitor`, at most once per `monitors.refreshInterval` for
+    /// a session (monitors and tasks share the stamp).
+    @MainActor
+    func refreshForMonitorIfDue(_ session: TerminalSession, now: Date) async {
+        let key = ObjectIdentifier(session)
+        guard monitors.lastRefreshAt[key].map({ now.timeIntervalSince($0) >= monitors.refreshInterval }) ?? true else {
+            return
+        }
+        monitors.lastRefreshAt[key] = now
+        await refreshForMonitor(session)
+    }
+
+    /// What an idle wait reads on each pass: the host's last lines at most
+    /// once per `hostContentPollInterval`, and a surface's visible screen,
+    /// its whole text only when that changed or every 0.5 s
+    /// (`watchContentForChanges`; a tab no window shows gets no render
+    /// signal).
+    @MainActor
+    func watchForOutputQuiet(_ session: TerminalSession) async {
+        await session.refreshContentFromHostIfNeeded(maximumAge: session.hostContentPollInterval, recentOnly: true)
+        session.watchContentForChanges()
+    }
+
+    /// An agent that sends no program status reports: its output going
+    /// quiet is all Cherry has to go on (its status stays `unknown`).
+    @MainActor
+    static func reportsNoStatus(_ session: TerminalSession) -> Bool {
+        session.kind == .agent && !session.reportsProgramStatus && session.agentActivityState == .unknown
+    }
+
+    /// The watched agent reports no status, and its latest submitted turn
+    /// (submitted to the program that runs now) has no quiet `done` yet:
+    /// its screen going still will end that turn. A task's settle never
+    /// stands for it.
+    @MainActor
+    func awaitsOutputQuiet(_ watched: WatchedProcess, in subscription: MonitorSubscription) -> Bool {
+        guard subscription.events.contains(.done), let session = watched.session,
+              Self.reportsNoStatus(session), session.isRunning, Self.submittedToRunningProgram(session)
+        else { return false }
+        return watched.quietDoneSubmittedTurn < session.agentSubmittedTurnCount
+    }
+
+    /// The turn submitted at `submittedAt` (the latest one when nil) went
+    /// to the program that runs now: one submitted before the tab started
+    /// its program again (`programStartedAt`, a restart) died with the
+    /// program it went to. A launch that follows a program already running
+    /// (an attached tab's reconnect, a restored session) started none.
+    @MainActor
+    static func submittedToRunningProgram(_ session: TerminalSession, at submittedAt: Date? = nil) -> Bool {
+        guard let submittedAt = submittedAt ?? session.lastAgentSubmitAt else { return false }
+        guard session.startedCurrentProgram, let startedAt = session.programStartedAt else { return true }
+        return submittedAt >= startedAt
+    }
+
+    /// Whether the turns of an agent that reports no status submitted since
+    /// `submittedAt` (its latest submit when nil) may be taken as ended, as
+    /// `wait_for_process_idle` and a wake line take such an agent's: they
+    /// went to the program that runs now, its screen changed after
+    /// `submittedAt` (so after that program started) and has been still
+    /// since for `outputQuietInterval` (at least `settleInterval`), also by
+    /// a last read (`contentStayedUnchanged`).
+    @MainActor
+    func outputWentQuiet(_ session: TerminalSession, since submittedAt: Date? = nil, now: Date) -> Bool {
+        guard Self.reportsNoStatus(session), session.isRunning, session.agentTurnCount > 0,
+              let submittedAt = submittedAt ?? session.lastAgentSubmitAt,
+              Self.submittedToRunningProgram(session, at: submittedAt),
+              let changedAt = session.lastContentChangeAt, changedAt > submittedAt,
+              Self.agentTurnMayHaveEnded(session, now: now)
+        else { return false }
+        let quietInterval = max(monitors.outputQuietInterval, monitors.settleInterval)
+        return now.timeIntervalSince(changedAt) >= quietInterval && session.contentStayedUnchanged()
+    }
+
+    /// The watched process's task, when it is the worker of a Cherry task
+    /// the subscription's caller may see (made from its Mac): its latest,
+    /// else the one it was seen with, which follows its worker to a tab
+    /// under another id (`locateWorker`: ⌘D, then shown again).
+    @MainActor
+    func watchedTask(_ watched: WatchedProcess, device: UUID?) -> AgentTask? {
+        let latest = (watched.session?.id ?? UUID(uuidString: watched.id)).flatMap { tasks.latestTask(forWorker: $0) }
+        guard let task = latest ?? watched.taskID.flatMap({ tasks.task($0, device: device) }), task.device == device
+        else { return nil }
+        watched.taskID = task.id
+        return task
     }
 
     /// The watched process's status now (`MonitorProcessStatus.status`).
@@ -554,7 +690,7 @@ extension CherryControlServer {
             break
         }
         guard session.kind == .agent else { return "running" }
-        let reported = reportedAgentActivityState(of: session) ?? "unknown"
+        let reported = session.agentActivityState.rawValue
         switch reported {
         case "idle":
             let quietSince = session.lastContentChangeAt ?? session.startedAt ?? now
@@ -566,9 +702,10 @@ extension CherryControlServer {
     }
 
     @MainActor
-    func status(of watched: WatchedProcess) -> MonitorProcessStatus {
+    func status(of watched: WatchedProcess, device: UUID?) -> MonitorProcessStatus {
         let session = watched.session
         if let session { watched.name = processName(for: session) }
+        let task = watchedTask(watched, device: device)
         return MonitorProcessStatus(
             processID: watched.id,
             name: watched.name,
@@ -576,7 +713,9 @@ extension CherryControlServer {
             status: monitorStatus(of: watched),
             state: session?.programStateLabel ?? "closed",
             agentTurn: session.flatMap { $0.kind == .agent ? $0.agentTurnCount : nil },
-            exitCode: session?.exitCode
+            exitCode: session?.exitCode,
+            taskID: task?.id,
+            taskState: task?.state.rawValue
         )
     }
 
@@ -589,10 +728,57 @@ extension CherryControlServer {
         let previous = watched.lastStatus
         let initial = previous == nil
         watched.lastStatus = current
+        // What the subscriber learned of it holds while it stays so.
+        if let seen = subscription.processSeen[watched.id], let status = seen.status, status != current {
+            subscription.processSeen[watched.id] = (seq: seen.seq, status: nil)
+        }
         let session = watched.session
         if let session { watched.name = processName(for: session) }
+        let turn = session?.agentTurnCount
+        let previousTurn = watched.lastTurn
+        watched.lastTurn = turn
+        let task = watchedTask(watched, device: subscription.device)
 
-        if current != previous {
+        // A worker whose task settled (and whose settle was told): only the
+        // turns submitted to it are news. A turn it began by itself (more
+        // turns reported than submitted, none submitted since the last
+        // `done`: a finished tab's background work) is not; its own
+        // orchestrator's next message, or another task, is. An agent that
+        // reports no status is `done` only per submitted turn anyway.
+        let selfStartedTurnOfSettledWorker: Bool = {
+            guard let task, task.state.isSettled, watched.settledTaskIDs.contains(task.id),
+                  let session, session.reportsProgramStatus,
+                  watched.turnDoneSubmittedTurn == session.agentSubmittedTurnCount
+            else { return false }
+            return session.agentReportedTurnCount > session.agentSubmittedTurnCount
+        }()
+
+        // Every turn an agent reports ended is a `done`, a task's worker's
+        // too (but for a settled worker's self-started turns, above). Once
+        // per turn: a report applied before its last frame was noticed
+        // reads idle, working (the frame), then idle again, with no new
+        // turn reported or submitted in between.
+        func tellTurnDone(initial: Bool) {
+            guard !selfStartedTurnOfSettledWorker else { return }
+            // The latest submit's turn never started (no working report
+            // since: a message it has not picked up yet, slow to report
+            // over a slow link past the start grace, an empty Return): the
+            // idle it reads is the previous turn's, not this one's end. Its
+            // `done` comes once it reports that turn ended.
+            if let session, Self.agentTurnStarted(session) == false { return }
+            if let session, session.reportsProgramStatus,
+               watched.turnDoneReportedTurn == session.agentReportedTurnCount,
+               watched.turnDoneSubmittedTurn == session.agentSubmittedTurnCount {
+                return
+            }
+            watched.turnDoneReportedTurn = session?.agentReportedTurnCount
+            watched.turnDoneSubmittedTurn = session?.agentSubmittedTurnCount
+            monitors.append(.done, to: subscription, process: watched, session: session, initial: initial)
+        }
+        if current == "idle", previous == "idle", let turn, let previousTurn, turn > previousTurn {
+            // A whole turn between two samples.
+            tellTurnDone(initial: false)
+        } else if current != previous {
             switch current {
             case "closed":
                 // A tab that closed because its program ended (a terminal
@@ -600,8 +786,8 @@ extension CherryControlServer {
                 if previous != "exited", let session, session.state.hasEnded {
                     monitors.append(.exited, to: subscription, process: watched, session: session, exitCode: session.exitCode, initial: initial)
                 }
+                // No longer watched (below: but for its task's settle).
                 monitors.append(.closed, to: subscription, process: watched, session: session, initial: initial)
-                watched.finished = true
             case "exited":
                 monitors.append(.exited, to: subscription, process: watched, session: session, exitCode: session?.exitCode, initial: initial)
             case "idle":
@@ -609,17 +795,56 @@ extension CherryControlServer {
                 // whose last turn completed. An agent never given a turn
                 // is not done with anything.
                 if !initial || session?.agentTurnState == .completed {
-                    monitors.append(.done, to: subscription, process: watched, session: session, initial: initial)
+                    tellTurnDone(initial: initial)
                 }
             case "needs_input":
-                monitors.append(.needsInput, to: subscription, process: watched, session: session, initial: initial)
+                monitors.append(
+                    .needsInput, to: subscription, process: watched, session: session,
+                    prompt: session.flatMap { Self.shownPrompt(of: $0) }, initial: initial
+                )
             case "permission":
-                monitors.append(.permission, to: subscription, process: watched, session: session, initial: initial)
+                monitors.append(
+                    .permission, to: subscription, process: watched, session: session,
+                    prompt: session.flatMap { Self.shownPrompt(of: $0) }, initial: initial
+                )
             case "error":
                 monitors.append(.error, to: subscription, process: watched, session: session, initial: initial)
             default:
                 break
             }
+        }
+
+        // An agent that reports no status stays `unknown`: its submitted
+        // turns are done once its output went quiet after the first of
+        // them (or, first sample, had), once per submitted turn. That first
+        // submit is the latest one the first look sees, taken again when
+        // the program it went to was restarted.
+        if current == "unknown", let session, awaitsOutputQuiet(watched, in: subscription) {
+            if !(watched.quietTurnSubmittedAt.map { Self.submittedToRunningProgram(session, at: $0) } ?? false) {
+                watched.quietTurnSubmittedAt = session.lastAgentSubmitAt
+            }
+            if outputWentQuiet(session, since: watched.quietTurnSubmittedAt, now: now) {
+                watched.quietDoneSubmittedTurn = session.agentSubmittedTurnCount
+                watched.quietTurnSubmittedAt = nil
+                monitors.append(.done, to: subscription, process: watched, session: session, basis: MonitorEvent.outputQuietBasis, initial: initial)
+            }
+        }
+
+        // A worker's task settled: one `done` of its own, with the task,
+        // once per task, whatever its turns' dones or its `exited` told;
+        // none when the subscriber cancelled it itself (`cancel_tasks`).
+        if let task, task.state.isSettled, subscription.events.contains(.done),
+           watched.settledTaskIDs.insert(task.id).inserted, !Self.subscriberCancelled(task, subscription) {
+            monitors.append(.done, to: subscription, process: watched, session: session, task: task, initial: initial)
+        }
+
+        // A worker whose tab closed while its task is open, watched for
+        // `done` but not `closed`: looked at for its task's settle alone,
+        // until it settled or the registry dropped it. With `closed`, the
+        // close ends the watch.
+        if current == "closed" {
+            watched.finished = !(subscription.events.contains(.done) && !subscription.events.contains(.closed)
+                && task.map { !$0.state.isSettled } == true)
         }
 
         if let pattern = subscription.outputPattern, let session, current != "closed",
@@ -639,6 +864,13 @@ extension CherryControlServer {
         }
     }
 
+    /// The subscriber cancelled the task itself (`cancel_tasks`): it knows.
+    @MainActor
+    static func subscriberCancelled(_ task: AgentTask, _ subscription: MonitorSubscription) -> Bool {
+        guard task.state == .cancelled, let canceller = task.cancelledBy else { return false }
+        return subscription.subscriberID == canceller.uuidString
+    }
+
     // MARK: Wake lines
 
     /// Types the wake line into the subscriber when events it was not woken
@@ -653,7 +885,14 @@ extension CherryControlServer {
               let subscriber = subscription.subscriber
         else { return }
         let unread = subscription.pending.filter { $0.seq > subscription.ackCursor }
-        guard let newest = unread.last, newest.seq > subscription.lastWokenSeq else { return }
+        // A turn's `done` whose agent began another turn since, and a
+        // question the subscriber already knows of or that is gone, are old
+        // news: they stay readable and counted, but wake nobody.
+        guard let newest = unread.last(where: {
+                  !Self.turnDoneIsSuperseded($0, in: subscription) && !Self.questionIsOldNews($0, in: subscription)
+              }),
+              newest.seq > subscription.lastWokenSeq
+        else { return }
         let now = Date()
         if let lastWakeAt = subscription.lastWakeAt,
            now.timeIntervalSince(lastWakeAt) < monitors.wakeMinimumInterval {
@@ -680,21 +919,82 @@ extension CherryControlServer {
         }
     }
 
+    /// The event is the `done` of an agent's turn (not a task's settle)
+    /// and that agent's turn counter has gone past the turn it ended: a
+    /// message sent to it, or a turn it began by itself, followed.
+    @MainActor
+    static func turnDoneIsSuperseded(_ event: MonitorEvent, in subscription: MonitorSubscription) -> Bool {
+        guard event.type == .done, event.taskID == nil, let turn = event.agentTurn,
+              let session = subscription.watched.first(where: { $0.id == event.processID })?.session,
+              session.kind == .agent
+        else { return false }
+        return session.agentTurnCount > turn
+    }
+
+    /// The event is a `needs_input` or `permission` the subscriber needs no
+    /// wake for: Cherry told it of the process's question since (its input
+    /// was refused there, or it read the process), or the process no longer
+    /// waits on it (answered, or it moved on).
+    @MainActor
+    static func questionIsOldNews(_ event: MonitorEvent, in subscription: MonitorSubscription) -> Bool {
+        guard event.type == .needsInput || event.type == .permission else { return false }
+        if let seen = subscription.processSeen[event.processID] {
+            if event.seq <= seen.seq || seen.status == event.type.rawValue { return true }
+        }
+        guard let watched = subscription.watched.first(where: { $0.id == event.processID }) else { return false }
+        return watched.lastStatus != event.type.rawValue
+    }
+
+    /// The caller learned from Cherry how `session` stands now: its input
+    /// was refused at the session's question or permission (`status`), or
+    /// it read the session's status or screen (its monitor status now). Its
+    /// subscriptions' `needs_input` and `permission` events about the
+    /// session so far, or about that state, wake it no more.
+    @MainActor
+    func callerLearnedState(of session: TerminalSession, status: MonitorEventType? = nil) {
+        guard let caller = verifiedCallerSession(), caller !== session else { return }
+        let processID = session.id.uuidString
+        for subscription in monitors.subscriptions.values where subscription.subscriber === caller {
+            guard let watched = subscription.watched.first(where: { $0.id == processID }) else { continue }
+            subscription.processSeen[processID] = (
+                seq: subscription.nextSeq - 1,
+                status: status?.rawValue ?? monitorStatus(of: watched)
+            )
+        }
+    }
+
+    /// The subscriber is idle: it reports `idle` (OSC 7501), or, when it
+    /// reports nothing (a CLI that does not speak the protocol), its
+    /// output went quiet (below); its turn ended, and nobody types into it.
     @MainActor
     func subscriberTakesWakeLine(_ subscriber: TerminalSession, now: Date) -> Bool {
-        guard subscriber.kind == .agent, subscriber.isRunning, subscriber.acceptsControlInput,
-              reportedAgentActivityState(of: subscriber) == AgentActivityState.idle.rawValue,
-              Self.agentTurnMayHaveEnded(subscriber, now: now),
-              !subscriber.humanIsComposing(within: monitors.humanTypingInterval)
-        else { return false }
+        wakeLineHoldReason(subscriber, now: now) == nil
+    }
+
+    /// Why `subscriberTakesWakeLine` says no, for the log; nil when it
+    /// takes the line.
+    @MainActor
+    func wakeLineHoldReason(_ subscriber: TerminalSession, now: Date) -> String? {
+        guard subscriber.kind == .agent else { return "not an agent" }
+        guard subscriber.isRunning else { return "not running" }
+        guard subscriber.acceptsControlInput else { return "takes no input" }
+        let idle = subscriber.reportsProgramStatus
+            ? subscriber.agentActivityState == .idle
+            : subscriber.agentActivityState == .unknown
+        guard idle else {
+            return "not idle (\(subscriber.agentActivityState.rawValue), reports status: \(subscriber.reportsProgramStatus))"
+        }
+        guard Self.agentTurnMayHaveEnded(subscriber, now: now) else { return "its turn may not have ended" }
+        guard !subscriber.humanIsComposing(within: monitors.humanTypingInterval) else { return "someone is typing" }
         let quietSince = subscriber.lastContentChangeAt ?? subscriber.startedAt ?? now
-        return now.timeIntervalSince(quietSince) >= monitors.wakeQuietInterval
+        guard now.timeIntervalSince(quietSince) >= monitors.wakeQuietInterval else { return "its screen is not quiet" }
+        return nil
     }
 
     @MainActor
     func info(for subscription: MonitorSubscription) -> SubscriptionInfo {
         let reason = subscription.wakeUnavailableReason
-            ?? (monitors.wakeLinesEnabled ? nil : "Wake lines are turned off in Cherry's Settings › MCP; poll with wait_for_events.")
+            ?? (monitors.wakeLinesEnabled ? nil : "Wake lines are turned off in Cherry's Settings › Agents › Monitors; poll with wait_for_events.")
         return SubscriptionInfo(
             subscriptionID: subscription.id,
             subscriberProcessID: subscription.subscriberID,

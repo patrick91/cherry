@@ -542,7 +542,7 @@ final class UpdateDeviceHostModel: ObservableObject {
             case .sameProtocol(_, let newer):
                 lines.append(newer
                     ? "Its session host is a newer build and keeps running; this one relays to it."
-                    : "Its session host keeps its sessions. When it runs an older install of this Cherry's, it moves to this build (`cherry restart`), and its sessions carry on.")
+                    : "Its session host keeps its sessions. When it runs an older install of this Cherry's, it moves to this build (`cherry host restart`), and its sessions carry on.")
             case .olderProtocol(let version):
                 lines.append("Its session host speaks protocol \(version): the next connection replaces it, and its sessions carry on.")
             case .unknown(let reason):
@@ -564,10 +564,8 @@ final class UpdateDeviceHostModel: ObservableObject {
         switch control.state {
         case .connected, .connecting:
             return
-        case .waitingToReconnect:
-            control.reconnectNow()
-        case .idle, .failed:
-            Task { _ = try? await control.connect(retryingLoginEnvironment: true) }
+        case .waitingToReconnect, .idle, .failed:
+            control.reconnectAsked()
         }
     }
 }
@@ -638,14 +636,14 @@ struct UpdateDeviceHostSheet: View {
     }
 }
 
-/// Shows Update Session Host… for a device as a sheet on the key window
-/// (the device menu, and the Update… of a tab's or window's bar).
+/// Shows a device's sheet (Update Session Host…, Connect Agents…) on
+/// the key window, else as a window of its own; `content` is given what
+/// closes it.
 @MainActor
-enum RemoteDeviceUpdatePresenter {
-    static func present(deviceID: UUID, store: RemoteDeviceStore = .shared) {
-        guard store.device(id: deviceID) != nil else { return }
+enum RemoteDeviceSheet {
+    static func present<Content: View>(size: NSSize, content: (_ close: @escaping () -> Void) -> Content) {
         let panel = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 240),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.titled], backing: .buffered, defer: true
         )
         weak let weakPanel = panel
@@ -653,9 +651,7 @@ enum RemoteDeviceUpdatePresenter {
             guard let panel = weakPanel else { return }
             if let parent = panel.sheetParent { parent.endSheet(panel) } else { panel.close() }
         }
-        panel.contentViewController = NSHostingController(
-            rootView: UpdateDeviceHostSheet(model: UpdateDeviceHostModel(deviceID: deviceID, store: store), close: close)
-        )
+        panel.contentViewController = NSHostingController(rootView: content(close))
         if let parent = NSApp.keyWindow ?? NSApp.mainWindow {
             parent.beginSheet(panel)
         } else {
@@ -663,10 +659,22 @@ enum RemoteDeviceUpdatePresenter {
             panel.makeKeyAndOrderFront(nil)
         }
     }
+}
+
+/// Shows Update Session Host… for a device as a sheet on the key window
+/// (the device menu, and the Update… of a tab's or window's bar).
+@MainActor
+enum RemoteDeviceUpdatePresenter {
+    static func present(deviceID: UUID, store: RemoteDeviceStore = .shared) {
+        guard store.device(id: deviceID) != nil else { return }
+        RemoteDeviceSheet.present(size: NSSize(width: 520, height: 240)) { close in
+            UpdateDeviceHostSheet(model: UpdateDeviceHostModel(deviceID: deviceID, store: store), close: close)
+        }
+    }
 
     /// The device a hosting runs on.
     static func deviceID(for host: HostedSessionHost, store: RemoteDeviceStore = .shared) -> UUID? {
-        store.devices.first { $0.host == host }?.id
+        store.device(for: host)?.id
     }
 }
 
@@ -749,15 +757,52 @@ enum RemoteDeviceAlerts {
 
     static func confirmRemove(_ id: UUID, store: RemoteDeviceStore) {
         guard store.canModify, let device = store.device(id: id) else { return }
+        guard makeRemoveAlert(device: device).runModal() == .alertFirstButtonReturn else { return }
+        store.remove(id)
+    }
+
+    /// Remove…'s question (Settings › Macs, the Omni bar, the title-bar
+    /// menu): Remove, which is destructive, and Cancel.
+    static func makeRemoveAlert(device: RemoteDevice) -> NSAlert {
         let alert = NSAlert()
         alert.messageText = "Remove \(device.name)?"
         alert.informativeText = device.createdHostEntry
             ? "Its sessions keep running on that Mac, and its saved SSH host and trusted identity are forgotten. Windows of its projects stop opening until you add it again."
             : "Its sessions keep running on that Mac, and your saved SSH host \(device.sshDestination) stays. Windows of its projects stop opening until you add it again."
-        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Remove").hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        store.remove(id)
+        return alert
+    }
+
+    /// Forget… of a saved SSH host no Mac uses (Settings › Macs › SSH
+    /// hosts): Forget, which is destructive, and Cancel.
+    static func forgetHostConfirmation(destination: String, forget: @escaping @MainActor () -> Void) -> SettingsConfirmation {
+        SettingsConfirmation(
+            title: "Forget \(destination)?",
+            message: "Its sessions keep running there. Cherry forgets the saved host and its trusted identity.",
+            choices: [
+                SettingsConfirmation.Choice("Forget", role: .destructive, perform: forget),
+                .cancel(),
+            ]
+        )
+    }
+
+    /// Remove… of a folder added on a Mac (Settings › Macs): the project
+    /// picker leaves it out from then on, and Show Again brings it back.
+    /// `path` as the row shows it ("~/code/api-server").
+    static func removeProjectConfirmation(
+        path: String,
+        deviceName: String,
+        remove: @escaping @MainActor () -> Void
+    ) -> SettingsConfirmation {
+        SettingsConfirmation(
+            title: "Remove \(path) from \(deviceName)'s projects?",
+            message: "It's hidden from the project picker; Show Again brings it back.",
+            choices: [
+                SettingsConfirmation.Choice("Remove", role: .destructive, perform: remove),
+                .cancel(),
+            ]
+        )
     }
 
     static func confirmTrustNewIdentity(of id: UUID, store: RemoteDeviceStore) {
@@ -875,12 +920,7 @@ enum RemoteDeviceAvailability: Equatable {
         case .reconnectNow, .retryLogin:
             // Retry: looks at it (Background Sessions, the picker) may run
             // again too.
-            RemoteDevicePeeks.shared.retry(hosting.profile.host)
-            if case .waitingToReconnect = control.state {
-                control.reconnectNow()
-            } else {
-                Task { _ = try? await control.connect(retryingLoginEnvironment: true) }
-            }
+            control.reconnectAsked()
         case .trustNewIdentity:
             RemoteDeviceAlerts.confirmTrustNewIdentity(of: hosting.profile.host, name: hosting.profile.displayName)
         case .update, .reinstall:
@@ -963,16 +1003,7 @@ private struct RemoteHostStateBarContent: View {
                 }
             }
             .help(availability.detail ?? "")
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
-            .frame(maxWidth: 460)
-            .projectWindowToastObstacle()
+            .floatingBarChrome()
         }
     }
 }
@@ -996,16 +1027,7 @@ struct RemoteLaunchFailureBar: View {
                 Button("Retry") { session.retryPersistentSession() }
                     .controlSize(.small)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
-            .frame(maxWidth: 520)
-            .projectWindowToastObstacle()
+            .floatingBarChrome(maxWidth: 520)
         }
     }
 }
@@ -1035,12 +1057,11 @@ private struct RemoteWindowWaitingBarContent: View {
             control.state,
             installationProblem: hosting.profile.isKnownDevice ? nil : hosting.installationProblem()
         )
-        let waiting = count == 1 ? "1 tab waits" : "\(count) tabs wait"
         HStack(spacing: 10) {
-            Image(systemName: "network.slash")
+            Image(systemName: availability == .online ? "arrow.clockwise" : "network.slash")
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.orange)
-            Text("\(availability.text(machine: hosting.profile.displayName)) (\(waiting))")
+                .foregroundStyle(availability == .online ? Color.secondary : Color.orange)
+            Text(Self.text(availability, count: count, machine: hosting.profile.displayName))
                 .font(.system(size: 12, weight: .medium))
                 .lineLimit(2)
                 .help(availability.detail ?? "")
@@ -1055,29 +1076,15 @@ private struct RemoteWindowWaitingBarContent: View {
         .frame(maxWidth: 520)
         .projectWindowToastObstacle()
     }
-}
 
-// MARK: - The device chip
-
-/// "􀙗 Studio": which Mac a tab or window runs on.
-struct RemoteDeviceChip: View {
-    let name: String
-    var isSelected = false
-
-    var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: "desktopcomputer")
-                .font(.system(size: 8, weight: .semibold))
-            Text(name)
-                .font(.system(size: 9, weight: .semibold))
-                .lineLimit(1)
+    /// While the device answers its tabs are on their way back (the retry
+    /// its connection fired), not waiting for it.
+    static func text(_ availability: RemoteDeviceAvailability, count: Int, machine: String) -> String {
+        if availability == .online {
+            return count == 1 ? "Reopening 1 tab on \(machine)…" : "Reopening \(count) tabs on \(machine)…"
         }
-        .padding(.horizontal, 5)
-        .padding(.vertical, 2)
-        .foregroundStyle(.secondary)
-        .background(Color.primary.opacity(isSelected ? 0.12 : 0.07), in: Capsule())
-        .help("Runs on \(name)")
-        .accessibilityLabel("Runs on \(name)")
+        let waiting = count == 1 ? "1 tab waits" : "\(count) tabs wait"
+        return "\(availability.text(machine: machine)) (\(waiting))"
     }
 }
 
@@ -1092,6 +1099,7 @@ struct RemoteNotOpenSection: View {
     @ObservedObject var workspace: TerminalWorkspace
     let hosting: PersistentHostSessions
     @ObservedObject var control: HostControl
+    @State private var sessionToEnd: HostedSessionInfo?
 
     init(workspace: TerminalWorkspace, hosting: PersistentHostSessions) {
         self.workspace = workspace
@@ -1105,7 +1113,7 @@ struct RemoteNotOpenSection: View {
             in: control.sessions,
             projectPath: ProjectLocation.launchPath(forKey: key),
             owner: hosting.owner,
-            isShown: { hosting.isShownByOpenTab($0, hostID: hostID) },
+            isShown: hosting.openTabsShowing(hostID: hostID).shows,
             isEnding: { hosting.isEnding($0.id) }
         )
     }
@@ -1124,6 +1132,16 @@ struct RemoteNotOpenSection: View {
                 ForEach(notOpen.others, id: \.id) { info in
                     row(info, action: "Attach", help: "Attach — may resize it on \(hosting.profile.displayName) while both show it. Closing the tab only disconnects it.")
                 }
+            }
+            .alert(
+                "End “\(sessionToEnd?.displayName ?? "")” on \(hosting.profile.displayName)?",
+                isPresented: Binding(get: { sessionToEnd != nil }, set: { if !$0 { sessionToEnd = nil } }),
+                presenting: sessionToEnd
+            ) { info in
+                Button("End Session", role: .destructive) { end(info) }
+                Button("Cancel", role: .cancel) {}
+            } message: { info in
+                Text(Self.endMessage(info, ownOwner: hosting.owner))
             }
         }
     }
@@ -1144,8 +1162,39 @@ struct RemoteNotOpenSection: View {
             Button(action) { open(info) }
                 .controlSize(.mini)
                 .help(help)
+            Button {
+                sessionToEnd = info
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("End this session on \(hosting.profile.displayName)")
+            .accessibilityLabel("End Session")
         }
         .padding(.horizontal, 6)
+        .contextMenu {
+            Button(action) { open(info) }
+            Divider()
+            Button("End Session…", role: .destructive) { sessionToEnd = info }
+        }
+    }
+
+    /// What ending a not-open session stops: another owner's is still
+    /// shown elsewhere (the other Mac's Cherry, another installation, the
+    /// CLI), which loses it too.
+    static func endMessage(_ info: HostedSessionInfo, ownOwner: String) -> String {
+        let stops = info.isRunning ? "Its program stops." : "Its output is removed."
+        guard info.owner != ownOwner else { return stops }
+        return "\(stops) It is not this Cherry's (\(ownerLabel(info, ownOwner: ownOwner))): wherever else it is open, it ends there too."
+    }
+
+    private func end(_ info: HostedSessionInfo) {
+        guard let attachment = hosting.attachment(for: info) else { return }
+        hosting.end(attachment)
     }
 
     static func ownerLabel(_ info: HostedSessionInfo, ownOwner: String) -> String {
@@ -1156,6 +1205,7 @@ struct RemoteNotOpenSection: View {
     }
 
     private func open(_ info: HostedSessionInfo) {
+        if info.owner == hosting.owner, workspace.reopenNotOpenSession?(info) == true { return }
         guard let attachment = hosting.attachment(for: info) else { return }
         workspace.attachHostedSession(attachment, info: info)
     }

@@ -31,20 +31,13 @@ final class OmniFrecencyStore: ObservableObject {
     @Published private(set) var entries: [String: Entry]
 
     private let defaults: UserDefaults
-    private let storageKey: String
 
-    init(
-        defaults: UserDefaults = .standard,
-        storageKey: String = OmniFrecencyStore.storageKey,
-        legacyStorageKey: String? = OmniFrecencyStore.legacyStorageKey
-    ) {
+    init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.storageKey = storageKey
-        if let data = defaults.data(forKey: storageKey),
+        if let data = defaults.data(forKey: Self.storageKey),
            let decoded = try? JSONDecoder().decode([String: Entry].self, from: data) {
             entries = decoded
-        } else if let legacyStorageKey,
-                  let data = defaults.data(forKey: legacyStorageKey),
+        } else if let data = defaults.data(forKey: Self.legacyStorageKey),
                   let decoded = try? JSONDecoder().decode([String: Entry].self, from: data) {
             entries = decoded
             persist()
@@ -100,7 +93,7 @@ final class OmniFrecencyStore: ObservableObject {
 
     private func persist() {
         guard let data = try? JSONEncoder().encode(entries) else { return }
-        defaults.set(data, forKey: storageKey)
+        defaults.set(data, forKey: Self.storageKey)
     }
 }
 
@@ -252,8 +245,6 @@ enum OmniBarGathering {
         sources.projects = projects
         sources.devices = devices
         sources.canModifyDevices = deviceStore.canModify
-        // Minutes: a finer clock would change the sources every second.
-        sources.now = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 / 60).rounded(.down) * 60)
 
         sources.tabs = tabs(registry: registry, current: window.workspace) { machine in
             switch machine {
@@ -262,21 +253,6 @@ enum OmniBarGathering {
             }
         }
         sources.backgroundSessions = background(backgroundSessions)
-
-        let repository = window.repository
-        sources.repositoryName = repository.repositoryName
-        if repository.supportsWorktrees {
-            sources.worktrees = repository.worktrees.map { worktree in
-                OmniWorktree(
-                    root: worktree.root,
-                    name: worktree.displayName,
-                    branch: worktree.branch,
-                    isActive: worktree.root == repository.activeWorktreeRoot,
-                    canRename: repository.canRename(worktree),
-                    canRemove: repository.canRemove(worktree)
-                )
-            }
-        }
         sources.window = context(for: window, settings: settings)
 
         sources.listedLocalProjects = Set(settings.projects.map(\.root).filter { !ProjectLocation.isRemoteKey($0) })
@@ -287,12 +263,8 @@ enum OmniBarGathering {
             if let home = entry.device.homeDirectory?.nilIfEmpty { sources.homes[machine] = home }
             sources.removedProjects[machine] = Set(entry.device.hiddenProjects)
         }
-        let worktreeRoots = Set(registry.allRepositories.filter(\.supportsWorktrees).map(\.repositoryRoot))
         let installed = editorDiscovery.installedEditors
         for location in projects.locations {
-            if worktreeRoots.contains(registry.canonicalProjectRoot(for: location.key)) {
-                sources.worktreeProjectKeys.insert(location.key)
-            }
             let editors = ExternalEditorLauncher.editors(installed, forProjectRoot: location.key)
             if let editor = ExternalEditorDiscovery.resolveDefault(editors: editors, preferredID: terminalSettings.defaultEditorID) {
                 sources.editorsByProjectKey[location.key] = OmniEditor(id: editor.id, name: editor.displayName, appPath: editor.appURL.path)
@@ -318,9 +290,8 @@ enum OmniBarGathering {
     }
 
     /// The tabs of every open window, the bar's own window's first. Each
-    /// one's detail is its window's project, or for a window at the home
-    /// folder its directory (`OmniTab.detail`; `home` is each Mac's home
-    /// folder when known).
+    /// one's detail is its window's project, "Home" in a Mac's Home
+    /// (`OmniTab.detail`; `home` is each Mac's home folder when known).
     static func tabs(
         registry: ProjectWindowRegistry,
         current: TerminalWorkspace?,
@@ -333,7 +304,7 @@ enum OmniBarGathering {
         return windows.flatMap { projectRoot, workspace in
             let canonical = registry.canonicalProjectRoot(for: projectRoot)
             let location = ProjectLocation(key: canonical)
-            let machine: ProjectSwitcherModel.Machine = location.deviceID.map { .device($0) } ?? .thisMac
+            let machine = ProjectSwitcherModel.Machine(projectKey: canonical)
             let windowPath = location.isRemote ? location.path : canonical
             let machineHome = home(machine)
             return workspace.sessions.map { session in
@@ -342,7 +313,9 @@ enum OmniBarGathering {
                 return OmniTab(
                     id: session.id,
                     title: title(of: session, workingDirectory: directory, home: machineHome),
-                    projectName: OmniTab.detail(windowPath: windowPath, workingDirectory: directory, home: machineHome),
+                    projectName: OmniTab.detail(
+                        windowPath: windowPath, workingDirectory: directory, home: machineHome, isHome: HomePlace.isHome(canonical)
+                    ),
                     machine: machine,
                     isWorking: session.agentActivityState == .working,
                     canDetach: SessionCloseCoordinator.canDetach(session),
@@ -371,11 +344,9 @@ enum OmniBarGathering {
     }
 
     /// An agent tab's tool, as the menu-bar agent list names it
-    /// (`MenuBarAgentsModel.refresh`); nil for other tabs.
+    /// (`TerminalSession.agentToolKey`); nil for other tabs.
     static func agentKey(of session: TerminalSession) -> String? {
-        guard session.kind == .agent else { return nil }
-        let brand = AgentToolBrand.detect(name: session.agentName ?? session.title, commandLine: session.subtitle)
-        return brand?.rawValue ?? AgentToolDefinition.normalizedName(session.agentName ?? session.title)
+        session.kind == .agent ? session.agentToolKey : nil
     }
 
     /// This Mac's background sessions, then each device's.
@@ -414,11 +385,14 @@ enum OmniBarGathering {
         context.canSplit = selected.map { $0.kind == .terminal && workspace.canAddSplitPane(to: $0.id) } ?? false
         context.canDetach = chromeState.isShowingTerminalContent && selected.map(SessionCloseCoordinator.canDetach) == true
         context.canReopenClosedTab = !chromeState.closedTabs.entries.isEmpty
+        context.canOpenAnotherWindow = window.repository.allowsAnotherWindow
         context.hasProject = settings.resolvedProject(for: window.projectRoot).validProjectRoot != nil
-        context.supportsWorktrees = window.repository.supportsWorktrees
         context.isSidebarHidden = chromeState.isSidebarHidden
         context.detachTitle = inSplit ? "Detach Pane" : "Detach Tab"
-        context.closeTitle = chromeState.selectedNoteID != nil ? "Close Note" : (inSplit ? "Close Pane" : "Close Tab")
+        context.closeTitle = inSplit ? "Close Pane" : "Close Tab"
+        context.finishedWorkerCount = selected.map {
+            workspace.finishedWorkers(of: $0, summaries: AgentTaskBoard.shared.workerSummaries).count
+        } ?? 0
         return context
     }
 }
@@ -443,6 +417,8 @@ struct OmniBarPerformer {
     let openSettings: () -> Void
     let toggleAppearance: () -> Void
     var pasteboard: NSPasteboard = .general
+    /// Forgets a Mac's folder listings once a folder is made there.
+    var folderBrowser: OmniFolderBrowser = .shared
 
     private var chromeState: ProjectWindowChromeState { window.chromeState }
     private var backgroundSessions: BackgroundSessionsModel { backgroundSessionsModel() }
@@ -452,14 +428,15 @@ struct OmniBarPerformer {
     // swiftlint:disable:next cyclomatic_complexity function_body_length
     func perform(_ command: OmniCommand) {
         switch command {
-        case .drill, .removeWorktree, .configureAgentPreset, .browseFolders, .enterFolder:
-            // The bar itself: a scope, folder completion, or its own alert
-            // and sheet.
+        case .drill, .configureAgentPreset, .browseFolders, .enterFolder:
+            // The bar itself: a scope, folder completion, or its own sheet.
             break
         case .connectDevice(let id):
             switcher.perform(.reconnectDevice(id))
         case .addFolder(let path, let machine, let open):
             addFolder(path, on: machine, open: open)
+        case .createFolder(let path, let machine, let intent):
+            createFolder(path, on: machine, intent: intent)
         case .newTerminalAt(let path, let machine):
             newTerminal(on: machine, at: path)
         case .openProject(let key):
@@ -479,22 +456,11 @@ struct OmniBarPerformer {
         case .copyPath(let path):
             pasteboard.clearContents()
             pasteboard.setString(path, forType: .string)
-        case .newWorktreeInProject(let key):
-            let root = registry.canonicalProjectRoot(for: key)
-            if root == repository.repositoryRoot {
-                chromeState.presentNewWorktree()
-            } else if registry.focus(projectRoot: key), let other = registry.chromeState(for: key) {
-                other.presentNewWorktree()
-            }
         case .removeProject(let key):
             guard let project = settings.projects.first(where: { $0.root == key }) else { return }
             settings.removeProject(project)
         case .switcher(let action):
             switcher.perform(action)
-        case .openFolder(let machine):
-            switcher.openFolder(on: machine)
-        case .addProject(let machine):
-            switcher.addProject(on: machine)
         case .newTerminal(let machine):
             newTerminal(on: machine)
         case .endBackgroundSessions(let machine):
@@ -508,17 +474,15 @@ struct OmniBarPerformer {
             promptRenameSession(tab.session)
         case .detachTab(let id):
             guard let tab = tab(id) else { return }
-            let context = closeContext(tab.workspace, projectRoot: tab.projectRoot)
+            let context = closeContext(tab.workspace)
             SessionCloseCoordinator.detach(
-                tab.session, in: tab.workspace, chromeState: context.chromeState,
-                allowEmptyWorkspace: context.allowEmptyWorkspace, closingWindow: context.closingWindow
+                tab.session, in: tab.workspace, chromeState: context.chromeState, closingWindow: context.closingWindow
             )
         case .closeTab(let id):
             guard let tab = tab(id) else { return }
-            let context = closeContext(tab.workspace, projectRoot: tab.projectRoot)
+            let context = closeContext(tab.workspace)
             SessionCloseCoordinator.close(
-                tab.session, in: tab.workspace, chromeState: context.chromeState,
-                allowEmptyWorkspace: context.allowEmptyWorkspace, closingWindow: context.closingWindow
+                tab.session, in: tab.workspace, chromeState: context.chromeState, closingWindow: context.closingWindow
             )
         case .openBackgroundSession(let id):
             let model = backgroundSessions.model(listing: id) ?? backgroundSessions
@@ -526,13 +490,6 @@ struct OmniBarPerformer {
             model.open(item)
         case .endBackgroundSession(let id):
             (backgroundSessions.model(listing: id) ?? backgroundSessions).end(sessionID: id)
-        case .activateWorktree(let root):
-            _ = repository.activate(worktreeRoot: root, chromeState: chromeState)
-        case .createWorktree(let name):
-            chromeState.presentNewWorktree(branchName: name)
-        case .renameWorktree(let root):
-            guard let worktree = repository.worktrees.first(where: { $0.root == root }) else { return }
-            chromeState.presentRenameWorktree(worktree)
         case .menu(let command):
             perform(command)
         case .launchAgent(let id):
@@ -541,7 +498,7 @@ struct OmniBarPerformer {
                   let agent = project.launchableAgents.first(where: { $0.id == id })
             else { return NSSound.beep() }
             chromeState.selectTerminal()
-            workspace.addAgentSession(agent: agent.definition, projectRoot: root)
+            workspace.addAgentSession(agent: agent, projectRoot: root)
         case .openInEditor(let editorID):
             guard let root = settings.resolvedProject(for: window.projectRoot).validProjectRoot else { return }
             let editors = ExternalEditorLauncher.editors(editorDiscovery.installedEditors, forProjectRoot: root)
@@ -558,6 +515,13 @@ struct OmniBarPerformer {
         case .newTab:
             chromeState.selectTerminal()
             workspace.addSession()
+        case .newWindow:
+            // This window's project, never the project window active last.
+            guard let appWindow, registry.openAnotherWindow(from: appWindow) else { return NSSound.beep() }
+        case .newHomeTerminal:
+            if !registry.newTerminalInHome() { NSSound.beep() }
+        case .goHome:
+            if !registry.showHome() { NSSound.beep() }
         case .splitRight:
             _ = workspace.splitDuplicateActiveTerminal()
         case .detachTab:
@@ -582,14 +546,14 @@ struct OmniBarPerformer {
             chromeState.isHostedSessionsPresented = true
         case .toggleSidebar:
             chromeState.toggleSidebar()
-        case .addProject:
-            switcher.chooseProjectRoot()
-        case .newWorktree:
-            chromeState.presentNewWorktree()
-        case .manageWorktrees:
-            chromeState.presentWorktreeManager()
         case .toggleAppearance:
             toggleAppearance()
+        case .connectAgents:
+            ConnectAgentsPresenter.present()
+        case .closeFinishedWorkers:
+            guard let session = workspace.selectedSession,
+                  SessionCloseCoordinator.closeFinishedWorkers(of: session, in: workspace, chromeState: chromeState) > 0
+            else { return NSSound.beep() }
         }
     }
 
@@ -633,87 +597,96 @@ struct OmniBarPerformer {
         }
     }
 
-    /// New Terminal Here: a terminal in `path` on `machine`, in this window
-    /// when it is that Mac's, else in the window of that Mac active last,
-    /// else in a new window of that folder.
-    private func newTerminal(on machine: ProjectSwitcherModel.Machine, at path: String) {
-        func machineOf(_ key: String?) -> ProjectSwitcherModel.Machine {
-            key.flatMap { ProjectLocation(key: $0).deviceID }.map { .device($0) } ?? .thisMac
+    /// New folder “…”: makes the folder at `path` (absolute; never its
+    /// parents) on `machine`, This Mac's with FileManager and another Mac's
+    /// over its SSH master (`OmniRemoteFolders.create`), forgets that Mac's
+    /// folder listings, then adds and opens it (Add Project…) or opens it
+    /// once (Open Folder…); says why not in a toast when it cannot be made.
+    private func createFolder(_ path: String, on machine: ProjectSwitcherModel.Machine, intent: OmniFolderIntent) {
+        let toasts = chromeState.toasts
+        let name = (path as NSString).lastPathComponent
+        let failed = { (message: String) in
+            toasts.show(ProjectWindowToast(
+                name: name, predicate: " could not be created", message: message,
+                symbolName: "exclamationmark.triangle.fill"
+            ))
+        }
+        let created = { [self] in
+            folderBrowser.forgetListings(on: machine)
+            switch intent {
+            case .add: addFolder(path, on: machine, open: true)
+            case .openOnce: if !switcher.openPath(path, on: machine) { NSSound.beep() }
+            }
+        }
+        switch machine {
+        case .thisMac:
+            switch OmniLocalFolders.create(path) {
+            case .created: created()
+            case .failed(let message): failed(message)
+            }
+        case .device(let id):
+            let store = RemoteDeviceStore.shared
+            guard let device = store.device(id: id) else { return failed("That Mac is no longer one of your Macs.") }
+            // Not made when it could not be added.
+            if intent == .add, !store.canModify { return failed(RemoteDeviceStore.readOnlyReason) }
+            Task { @MainActor in
+                let shell = await OmniRemoteFolders.shell(for: device)
+                switch await OmniRemoteFolders.create(path, on: device.sshDestination, shell: shell) {
+                case .created: created()
+                case .failed(let message): failed(message)
+                }
+            }
+        }
+    }
+
+    /// A new terminal on `machine`: with no `path`, in its Home
+    /// (`HomePlace`), never in a project's window; in `path` (New Terminal
+    /// Here) in this window when it is that Mac's, else in a window of that
+    /// Mac, else in a new window of that folder.
+    private func newTerminal(on machine: ProjectSwitcherModel.Machine, at path: String? = nil) {
+        guard let path else {
+            if !registry.newTerminalInHome(on: machine) { NSSound.beep() }
+            return
         }
         let home: String? = switch machine {
         case .thisMac: NSHomeDirectory()
         case .device(let id): RemoteDeviceStore.shared.device(id: id)?.homeDirectory
         }
         let directory = ProjectSwitcherModel.expandedPath(path, home: home) ?? path
-        if machineOf(window.projectRoot ?? workspace.projectRoot) == machine {
+        if ProjectSwitcherModel.Machine(projectKey: window.projectRoot ?? workspace.projectRoot) == machine {
             chromeState.selectTerminal()
             workspace.addSession(workingDirectory: directory)
             return
         }
-        if let (root, other) = registry.workspacesByProjectRoot().first(where: { machineOf($0.projectRoot) == machine }),
-           registry.focus(projectRoot: root) {
-            registry.chromeState(for: root)?.selectTerminal()
+        let target = registry.workspacesByProjectRoot()
+            .first { ProjectSwitcherModel.Machine(projectKey: $0.projectRoot) == machine }?.workspace
+        // That workspace's own window, never another window of its project.
+        if let other = target, registry.focus(workspace: other) {
+            registry.chromeState(for: other)?.selectTerminal()
             other.addSession(workingDirectory: directory)
         } else if !switcher.openPath(directory, on: machine) {
             NSSound.beep()
         }
     }
 
-    /// A new terminal on `machine`: in this window when it is that Mac's,
-    /// else in the window of that Mac active last, else in a new window of
-    /// its home folder.
-    private func newTerminal(on machine: ProjectSwitcherModel.Machine) {
-        func machineOf(_ key: String?) -> ProjectSwitcherModel.Machine {
-            key.flatMap { ProjectLocation(key: $0).deviceID }.map { .device($0) } ?? .thisMac
-        }
-        if machineOf(window.projectRoot ?? workspace.projectRoot) == machine {
-            chromeState.selectTerminal()
-            workspace.addSession()
-            return
-        }
-        switch machine {
-        case .thisMac:
-            if let other = registry.frontmostLocalWorkspace(), let root = other.projectRoot, registry.focus(projectRoot: root) {
-                registry.chromeState(for: root)?.selectTerminal()
-                other.addSession()
-            } else if !switcher.openPath("~", on: .thisMac) {
-                NSSound.beep()
-            }
-        case .device(let id):
-            if let (root, other) = registry.workspacesByProjectRoot().first(where: { machineOf($0.projectRoot) == machine }),
-               registry.focus(projectRoot: root) {
-                registry.chromeState(for: root)?.selectTerminal()
-                other.addSession()
-            } else {
-                switcher.perform(.openDeviceHome(id))
-            }
-        }
-    }
-
-    private func tab(_ id: UUID) -> (session: TerminalSession, workspace: TerminalWorkspace, projectRoot: String)? {
-        for (root, workspace) in registry.workspacesByProjectRoot() {
+    private func tab(_ id: UUID) -> (session: TerminalSession, workspace: TerminalWorkspace)? {
+        for (_, workspace) in registry.workspacesByProjectRoot() {
             if let session = workspace.sessions.first(where: { $0.id == id }) {
-                return (session, workspace, root)
+                return (session, workspace)
             }
         }
         return nil
     }
 
-    /// As ⌘W and ⌘D work out for the selected tab: the tab's window's
-    /// chrome, whether its workspace may empty, and the window that closes
-    /// after its last tab.
+    /// As ⌘W and ⌘D work out for the selected tab: the chrome of the
+    /// tab's own window (its close question, toast and ⌘Z; never another
+    /// window of its project's), and that window when it closes after its
+    /// last tab.
     private func closeContext(
-        _ workspace: TerminalWorkspace,
-        projectRoot: String
-    ) -> (chromeState: ProjectWindowChromeState?, allowEmptyWorkspace: Bool, closingWindow: NSWindow?) {
-        let chromeState = registry.chromeState(for: projectRoot)
-        let repository = chromeState.flatMap { registry.repository(for: $0) }
-        let window = chromeState.flatMap { registry.window(for: $0) }
-        let closesWindow = SessionCloseCoordinator.shouldCloseWindow(for: workspace, repository: repository)
-        return (
-            chromeState,
-            SessionCloseCoordinator.hasOpenSessionsInOtherWorktrees(than: workspace, repository: repository),
-            closesWindow ? window : nil
-        )
+        _ workspace: TerminalWorkspace
+    ) -> (chromeState: ProjectWindowChromeState?, closingWindow: NSWindow?) {
+        let chromeState = registry.chromeState(for: workspace)
+        let window = registry.window(for: workspace)
+        return (chromeState, SessionCloseCoordinator.shouldCloseWindow(for: workspace) ? window : nil)
     }
 }

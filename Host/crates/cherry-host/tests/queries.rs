@@ -16,7 +16,9 @@ use std::{
 };
 use support::*;
 
-const CURSOR_QUERY: &[u8] = b"\x1b[?6n";
+/// The window's position (XTWINOPS 13), which only a client's terminal
+/// can report.
+const POSITION_QUERY: &[u8] = b"\x1b[13t";
 
 /// What a client received, in order.
 #[derive(Debug, PartialEq)]
@@ -206,11 +208,12 @@ fn touch(dir: &Path, name: &str) {
 
 #[test]
 fn the_client_that_typed_last_answers_each_query_alone() {
-    const FIRST: &[u8] = b"\x1b[?11;1R";
-    const SECOND: &[u8] = b"\x1b[?22;1R";
+    const FIRST: &[u8] = b"\x1b[3;1;1t";
+    const SECOND: &[u8] = b"\x1b[3;2;2t";
     let host = Host::new();
-    // Each round asks for the cursor and reads one reply; a second reply
-    // would be read as the next round's go byte, or land in `extra`.
+    // Each round asks for the window's position and reads one reply; a
+    // second reply would be read as the next round's go byte, or land in
+    // `extra`.
     let session = host.create(shell_in(
         host.dir(),
         r#"stty raw -echo
@@ -218,12 +221,12 @@ printf 'READY\r\n'
 while [ ! -e "$CHERRY_TEST_DIR/go0" ]; do sleep 0.02; done
 for round in 0 1 2 3; do
   [ "$round" = 0 ] || dd bs=1 count=1 >/dev/null 2>&1
-  printf 'ASK%s\033[?6n' "$round"
+  printf 'ASK%s\033[13t' "$round"
   dd bs=1 count=8 2>/dev/null > "$CHERRY_TEST_DIR/reply$round"
   printf '\r\nROUND%s\r\n' "$round"
 done
 while [ ! -e "$CHERRY_TEST_DIR/go4" ]; do sleep 0.02; done
-printf 'ASK4\033[?6n\033]52;c;?\007'
+printf 'ASK4\033[13t\033]52;c;?\007'
 stty min 0 time 5
 dd bs=1 count=64 2>/dev/null > "$CHERRY_TEST_DIR/extra"
 touch "$CHERRY_TEST_DIR/finished"
@@ -266,7 +269,7 @@ exec sleep 60"#,
             "round {round}"
         );
         let responder = if first_answers { &first } else { &second };
-        assert_eq!(responder.queries().last(), Some(&CURSOR_QUERY));
+        assert_eq!(responder.queries().last(), Some(&POSITION_QUERY));
         // In its place in the output.
         assert!(responder
             .output_before_query(responder.queries().len() - 1)
@@ -295,7 +298,7 @@ exec sleep 60"#,
     // all of it, contiguously (`Screen` checks every offset).
     for term in [&first, &second, &third] {
         let output = term.output();
-        assert!(!contains(&output, CURSOR_QUERY));
+        assert!(!contains(&output, POSITION_QUERY));
         assert!(!contains(&output, b"\x1b]52;c;?"));
     }
     assert_eq!(first.screen.offset, second.screen.offset);
@@ -303,9 +306,9 @@ exec sleep 60"#,
 
 #[test]
 fn a_client_without_a_terminal_is_never_asked() {
-    const FIRST: &[u8] = b"\x1b[?11;1R";
-    const SECOND: &[u8] = b"\x1b[?22;1R";
-    const SCRIPT: &[u8] = b"\x1b[?33;1R";
+    const FIRST: &[u8] = b"\x1b[3;1;1t";
+    const SECOND: &[u8] = b"\x1b[3;2;2t";
+    const SCRIPT: &[u8] = b"\x1b[3;3;3t";
     let host = Host::new();
     let session = host.create(shell_in(
         host.dir(),
@@ -314,12 +317,12 @@ printf 'READY\r\n'
 while [ ! -e "$CHERRY_TEST_DIR/go0" ]; do sleep 0.02; done
 for round in 0 1 2; do
   [ "$round" = 0 ] || dd bs=1 count=1 >/dev/null 2>&1
-  printf 'ASK%s\033[?6n' "$round"
+  printf 'ASK%s\033[13t' "$round"
   dd bs=1 count=8 2>/dev/null > "$CHERRY_TEST_DIR/reply$round"
   printf '\r\nROUND%s\r\n' "$round"
 done
 while [ ! -e "$CHERRY_TEST_DIR/go3" ]; do sleep 0.02; done
-printf 'ASK3\033[?6n'
+printf 'ASK3\033[13t'
 stty min 0 time 5
 dd bs=1 count=64 2>/dev/null > "$CHERRY_TEST_DIR/extra"
 touch "$CHERRY_TEST_DIR/finished"
@@ -375,7 +378,7 @@ exec sleep 60"#,
     assert_eq!(fs::read(host.dir().join("extra")).unwrap(), b"");
     wait_all(&mut [&mut script], "ROUND3");
     assert!(script.queries().is_empty());
-    assert!(!contains(&script.output(), CURSOR_QUERY));
+    assert!(!contains(&script.output(), POSITION_QUERY));
 }
 
 /// Bytes waiting in a socket's receive buffer.
@@ -390,7 +393,7 @@ fn queued(socket: &UnixStream) -> usize {
 
 #[test]
 fn a_query_queued_for_a_responder_that_falls_behind_follows_its_resync_once() {
-    const REPLY: &[u8] = b"\x1b[?33;1R";
+    const REPLY: &[u8] = b"\x1b[3;3;3t";
     let host = Host::new();
     // Output until told to stop, a query, then output until told to stop
     // again, and the reply.
@@ -403,7 +406,7 @@ flood() {
   done
 }
 flood before
-printf '\r\nASK-QUERY\033[?6n'
+printf '\r\nASK-QUERY\033[13t'
 flood after
 dd bs=1 count=8 2>/dev/null > "$CHERRY_TEST_DIR/reply"
 printf '\r\nREPLIED\r\n'
@@ -412,7 +415,7 @@ dd bs=1 count=64 2>/dev/null > "$CHERRY_TEST_DIR/extra"
 printf 'DONE\r\n'
 exec sleep 60"#,
     ));
-    let mut watcher = Term::attach(&host, &session.id, b"\x1b[?44;1R");
+    let mut watcher = Term::attach(&host, &session.id, b"\x1b[3;4;4t");
     let mut responder = Term::attach(&host, &session.id, REPLY);
     watcher.read();
     // The responder typed last and then stops reading. Output frames are at
@@ -450,7 +453,7 @@ exec sleep 60"#,
     responder.read();
     wait_all(&mut [&mut watcher, &mut responder], "DONE");
 
-    assert_eq!(responder.queries(), [CURSOR_QUERY]);
+    assert_eq!(responder.queries(), [POSITION_QUERY]);
     assert!(watcher.queries().is_empty());
     assert_eq!(fs::read(host.dir().join("reply")).unwrap(), REPLY);
     assert_eq!(fs::read(host.dir().join("extra")).unwrap(), b"");
@@ -465,7 +468,7 @@ exec sleep 60"#,
         responder.events[..query].contains(&Event::Attached(AttachReason::Resync)),
         "the query arrived before the resync"
     );
-    assert!(!contains(&responder.output(), CURSOR_QUERY));
-    assert!(!contains(&watcher.output(), CURSOR_QUERY));
+    assert!(!contains(&responder.output(), POSITION_QUERY));
+    assert!(!contains(&watcher.output(), POSITION_QUERY));
     assert_eq!(responder.screen.offset, watcher.screen.offset);
 }

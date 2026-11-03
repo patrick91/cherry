@@ -41,16 +41,20 @@ fn a_killed_daemon_leaves_its_sessions_running_with_their_exact_screens() {
     // Output is flowing when the daemon dies: a counter redrawn in place,
     // which keeps the history short. The rest comes while no daemon runs,
     // up to a status query that the holder answers: then it has taken in
-    // everything before it.
+    // everything before it. The program writes its own CR LF, with the
+    // terminal's output processing off: a macOS terminal whose output
+    // queue fills at a newline (the holder fell behind) sends the CR that
+    // ONLCR adds there twice, output the transcript would not have.
     let session = host.create(shell_in(
         &dir,
-        r#"printf 'START\n'
+        r#"stty -opost
+printf 'START\r\n'
 i=0
 while [ ! -e "$CHERRY_TEST_DIR/crashed" ]; do printf '\033[2;1Hcount %07d' $i; i=$((i+1)); done
-printf '\n'
+printf '\r\n'
 j=0
-while [ $j -lt 150 ]; do printf 'down %04d\n' $j; j=$((j+1)); done
-printf 'END\n'
+while [ $j -lt 150 ]; do printf 'down %04d\r\n' $j; j=$((j+1)); done
+printf 'END\r\n'
 stty raw -echo
 printf '\033[5n'
 dd bs=1 count=4 >/dev/null 2>&1
@@ -475,10 +479,11 @@ fn hello(id: &str, extra: serde_json::Value) -> serde_json::Value {
 #[test]
 fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know() {
     let host = Host::new();
-    // Link version 1: the base set of messages, no metadata.
+    // The oldest link version a daemon serves (4), which knows none of what
+    // later versions added.
     let mut old = FakeHolder::register(
         &host,
-        1,
+        4,
         hello(
             &Uuid::new_v4().to_string(),
             json!({"future": {"nested": true}, "events": [{"kind": "sparkle"}, {"kind": "bell"}]}),
@@ -505,9 +510,10 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
             info.kitty_keyboard_flags,
             info.application_cursor_keys,
             info.bracketed_paste,
+            info.modify_other_keys,
             info.request_id.clone()
         ),
-        (false, 0, false, None, None)
+        (false, 0, false, None, None, None)
     );
     let old_id = old.id.clone();
     thread::scope(|scope| {
@@ -532,39 +538,30 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
         assert_eq!(request.meta["kind"], "limited");
         // Frames of kinds it does not know, and fields it does not know,
         // change nothing.
-        old.send(200, 1, json!({"whatever": 1}), b"ignored");
+        old.send(200, 4, json!({"whatever": 1}), b"ignored");
         old.send(
             link::SNAPSHOT_REPLY,
-            1,
+            4,
             json!({"req": request.meta["req"], "kind": "limited", "offset": 5, "cols": 80, "rows": 24, "later": [1, 2]}),
             b"SNAP",
         );
-        old.send(link::OUTPUT, 1, json!({"offset": 5, "later": "x"}), b"LIVE");
+        old.send(link::OUTPUT, 4, json!({"offset": 5, "later": "x"}), b"LIVE");
         let input = old.expect(link::INPUT);
         assert_eq!(input.data, b"typed");
         let lease = input.meta["lease"].clone();
         assert!(lease.is_u64(), "{:?}", input.meta);
-        old.send(link::INPUT_ACK, 1, json!({"lease": lease, "bytes": 5}), b"");
+        old.send(link::INPUT_ACK, 4, json!({"lease": lease, "bytes": 5}), b"");
         let detach = old.expect(link::DETACH);
         assert_eq!(detach.meta["lease"], lease);
         old.send(
             link::DETACH_DONE,
-            1,
+            4,
             json!({"req": detach.meta["req"]}),
             b"",
         );
         client.join().unwrap();
     });
-    // What version 1 cannot do: read its screen, clear its history, or
-    // keep a new name for the next daemon (this one keeps it).
-    match host.call(ClientMessage::Screen {
-        id: old.id.clone(),
-        scrollback: false,
-        max_lines: None,
-    }) {
-        ServerMessage::Error { code, .. } => assert_eq!(code, error_code::UNSUPPORTED_OPERATION),
-        other => panic!("{other:?}"),
-    }
+    // What version 4 cannot do: clear its history.
     match host.call(ClientMessage::ClearHistory { id: old.id.clone() }) {
         ServerMessage::Error { code, .. } => assert_eq!(code, error_code::UNSUPPORTED_OPERATION),
         other => panic!("{other:?}"),
@@ -578,11 +575,13 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
         ServerMessage::Ok
     );
     assert_eq!(host.session(&old.id).name, "renamed");
+    // It keeps the new name for the next daemon.
+    assert_eq!(old.expect(link::UPDATE).meta["name"], "renamed");
     host.kill(&old.id);
     old.expect(link::KILL);
     old.send(
         link::EXITED,
-        1,
+        4,
         json!({"exit_code": 3, "signal": null}),
         b"",
     );
@@ -594,11 +593,12 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
     ));
     old.expect(link::REMOVE);
     assert!(link::read(&mut old.link).unwrap().is_none());
-    // Only what version 1 knows was sent to it.
+    // Only what version 4 knows was sent to it: none of the kinds later
+    // versions added (`Attended`, `Pace`, `ClearHistory`).
     assert!(
         old.received
             .iter()
-            .all(|kind| (link::LAUNCH..=link::REMOVE).contains(kind)),
+            .all(|kind| (link::LAUNCH..=link::REFUSED).contains(kind)),
         "{:?}",
         old.received
     );
@@ -625,6 +625,7 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
                 "kitty_keyboard_flags": 7,
                 "application_cursor_keys": true,
                 "bracketed_paste": true,
+                "modify_other_keys": true,
             }, "receipt": {"request_id": request_id, "fingerprint": "f", "extra": 1}}),
         ),
     );
@@ -651,9 +652,17 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
             info.kitty_keyboard_flags,
             info.application_cursor_keys,
             info.bracketed_paste,
+            info.modify_other_keys,
             info.request_id.as_deref()
         ),
-        (true, 7, true, Some(true), Some(request_id.as_str()))
+        (
+            true,
+            7,
+            true,
+            Some(true),
+            Some(true),
+            Some(request_id.as_str())
+        )
     );
     new.send(
         link::INFO,
@@ -676,6 +685,10 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
     new.send(link::INFO, newer, json!({"bracketed_paste": false}), b"");
     let changed = host.wait(&new.id, |s| s.bracketed_paste == Some(false));
     assert!(!changed.application_cursor_keys);
+    assert_eq!(changed.modify_other_keys, Some(true));
+    new.send(link::INFO, newer, json!({"modify_other_keys": false}), b"");
+    let changed = host.wait(&new.id, |s| s.modify_other_keys == Some(false));
+    assert_eq!(changed.bracketed_paste, Some(false));
     // It is asked to clear its history, and the client hears how that went.
     let new_id = new.id.clone();
     thread::scope(|scope| {
@@ -711,8 +724,9 @@ fn the_link_serves_holders_of_older_versions_and_ignores_what_it_does_not_know()
     let lost = host.wait(&info.id, |s| s.state == SessionState::Exited);
     assert_eq!(lost.exit_code, Some(1));
 
-    // A holder older than any this daemon adopts is told so, for good.
-    let mut ancient = FakeHolder::register(&host, 0, hello(&Uuid::new_v4().to_string(), json!({})));
+    // A holder older than any this daemon adopts (no holder was ever built
+    // with link version 3) is told so, for good.
+    let mut ancient = FakeHolder::register(&host, 3, hello(&Uuid::new_v4().to_string(), json!({})));
     let refused = ancient.expect(link::REFUSED);
     assert_eq!(refused.meta["retry"], false);
     assert!(refused.meta["reason"].as_str().unwrap().contains("version"));
@@ -953,7 +967,7 @@ fn screen_reply(request: &link::Frame, cursor_row: u16, alternate: bool) -> serd
 }
 
 #[test]
-fn screens_are_limited_by_holders_that_can_and_for_those_that_cannot() {
+fn screens_are_limited_by_their_holders() {
     let host = Host::new();
     let session = json!({"session": {
         "name": "fake",
@@ -964,24 +978,14 @@ fn screens_are_limited_by_holders_that_can_and_for_those_that_cannot() {
         "running": true,
         "pid": 4242,
     }});
-    // Link version 2: screen text, but no `max_lines`.
-    let older_version = 2;
-    let mut older = FakeHolder::register(
-        &host,
-        older_version,
-        hello(&Uuid::new_v4().to_string(), session.clone()),
-    );
     let mut current = FakeHolder::register(
         &host,
         link::VERSION,
         hello(&Uuid::new_v4().to_string(), session),
     );
-    let (older_id, current_id) = (older.id.clone(), current.id.clone());
-    wait_until("both sessions", || {
-        let sessions = host.sessions();
-        [&older_id, &current_id]
-            .iter()
-            .all(|id| sessions.iter().any(|s| &&s.id == id))
+    let current_id = current.id.clone();
+    wait_until("the session", || {
+        host.sessions().iter().any(|s| s.id == current_id)
     });
     let text =
         |id: &str, text: &str, cursor_row: u16, alternate_screen: bool| ServerMessage::ScreenText {
@@ -992,32 +996,8 @@ fn screens_are_limited_by_holders_that_can_and_for_those_that_cannot() {
             alternate_screen,
         };
     thread::scope(|scope| {
-        // A holder of link version 2 is asked for the whole text, and the
-        // daemon keeps its last lines. With the history, the screen (three
-        // rows) is taken to end the text.
-        let asked = scope.spawn(|| screen_of(&host, &older_id, true, Some(2)));
-        let request = older.expect(link::SCREEN);
-        assert_eq!(request.meta.get("max_lines"), None, "{:?}", request.meta);
-        older.send(
-            link::SCREEN_REPLY,
-            older_version,
-            screen_reply(&request, 2, false),
-            b"h1\nh2\ns1\ns2\ns3",
-        );
-        assert_eq!(asked.join().unwrap(), text(&older_id, "s2\ns3", 1, false));
-        // Without it, the cursor's row on the screen is its line.
-        let asked = scope.spawn(|| screen_of(&host, &older_id, false, Some(2)));
-        let request = older.expect(link::SCREEN);
-        older.send(
-            link::SCREEN_REPLY,
-            older_version,
-            screen_reply(&request, 0, true),
-            b"s1\ns2\ns3",
-        );
-        assert_eq!(asked.join().unwrap(), text(&older_id, "s2\ns3", 0, true));
-        // A holder of this version limits the text itself, and its answer
-        // is passed on. Requests for different limits are different
-        // requests.
+        // The holder limits the text itself, and its answer is passed on.
+        // Requests for different limits are different requests.
         let two = scope.spawn(|| screen_of(&host, &current_id, true, Some(2)));
         let first = current.expect(link::SCREEN);
         let three = scope.spawn(|| screen_of(&host, &current_id, true, Some(3)));

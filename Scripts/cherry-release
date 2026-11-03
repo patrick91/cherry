@@ -1,0 +1,33 @@
+#!/usr/bin/env -S python3 -I
+"""Cherry's release tooling (docs/releasing.md), over Scripts/cherry_release.py.
+
+  cherry-release conf KEY
+  cherry-release version next --date YYYY.MM.DD            # tags on stdin -> YYYY.MM.DD.N
+  cherry-release version newest --kind prerelease|stable   # tags on stdin -> newest tag or an empty line
+  cherry-release version check VERSION                     # exit 0 or 1
+  cherry-release version compare A B                       # prints -1, 0 or 1
+  cherry-release stamp --sha SHA --now EPOCH [--prev-build BUILD]   # prints build_id= and day=
+  cherry-release notes --repo R --tag T [--prev-tag P] --build B --md OUT --html OUT
+  cherry-release appcast empty --output OUT
+  cherry-release appcast item --manifest M --channel prerelease|stable --tag T --repo R --notes HTML
+                              [--sign-update PATH] [--pub-date RFC2822] --output OUT
+  cherry-release appcast promote ITEM --tag T --repo R [--zip Z] --output OUT
+  cherry-release appcast merge FEED|- ITEM --output OUT [--keep-prereleases K] [--keep-stable M]
+  cherry-release appcast remove FEED VERSION|BUILD --output OUT
+  cherry-release appcast restore FEED VERSION|BUILD --output OUT
+  cherry-release appcast check FEED
+  cherry-release appcast is-pulled FEED|- BUILD            # exit 0 when pulled
+  cherry-release appcast field ITEM version|short-version|url|length|channel
+
+Packaging/release.conf is read from CHERRY_RELEASE_CONF when that is set.
+`appcast item` reads the Sparkle key from SPARKLE_ED_PRIVATE_KEY and runs on
+macOS only (sign_update, Scripts/sparkle-key.swift).
+"""
+import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import cherry_release  # noqa: E402
+
+sys.exit(cherry_release.main(sys.argv[1:]))

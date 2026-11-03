@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Promotes a pre-release to stable (docs/releasing.md): tags vV, annotated, on
+# the commit of vV-pre and pushes that one tag, which runs
+# .github/workflows/promote.yml (Scripts/promote-release). Run by hand, in a
+# clone whose origin is the GitHub repository; needs gh and git.
+#
+#   Scripts/promote [VERSION] [--yes]
+#
+# With no VERSION it takes the newest published pre-release. It asks before
+# pushing unless --yes. A tag vV that is already on that commit is not pushed
+# again; it says how to run the workflow again instead.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+CONF=${CHERRY_RELEASE_CONF:-$root/Packaging/release.conf}
+conf() { sed -n "s/^$1=//p" "$CONF" | tail -n 1; }
+cherry_release() { "$root/Scripts/cherry-release" "$@"; }
+
+usage() { echo "Usage: Scripts/promote [VERSION] [--yes]" >&2; exit 2; }
+fail() { echo "error: $*" >&2; exit 1; }
+
+requested=""
+yes=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --yes|-y) yes=true; shift ;;
+    -h|--help) usage ;;
+    -*) usage ;;
+    *) [ -z "$requested" ] || usage; requested=$1; shift ;;
+  esac
+done
+
+# 1.
+command -v gh >/dev/null 2>&1 || fail "Scripts/promote needs the GitHub CLI (gh)"
+command -v git >/dev/null 2>&1 || fail "Scripts/promote needs git"
+repo=${GH_REPO:-$(conf GITHUB_REPOSITORY)}
+[ -n "$repo" ] || fail "no GITHUB_REPOSITORY in $CONF"
+
+# 2. The version.
+if [ -z "$requested" ]; then
+  newest=$(gh release list -R "$repo" --exclude-drafts -L 100 --json tagName,isPrerelease \
+    --jq '.[] | select(.isPrerelease) | .tagName' | cherry_release version newest --kind prerelease)
+  [ -n "$newest" ] || fail "$repo has no published pre-release"
+  version=${newest#v}
+  version=${version%-pre}
+else
+  version=${requested#v}
+  version=${version%-pre}
+  cherry_release version check "$version" || fail "\`$requested\` is not vYYYY.MM.DD.N"
+fi
+pre="v$version-pre"
+tag="v$version"
+
+# 3. The pre-release's commit.
+git fetch --quiet origin "refs/tags/$pre:refs/tags/$pre" || fail "origin has no tag $pre"
+commit=$(git rev-parse "$pre^{commit}")
+
+# 4. A stable tag that exists already.
+local_commit=$(git rev-parse -q --verify "refs/tags/$tag^{commit}" || true)
+remote_commit=$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}" \
+  | awk '{ print $1 }' | tail -n 1)
+for existing in "$local_commit" "$remote_commit"; do
+  [ -n "$existing" ] || continue
+  if [ "$existing" != "$commit" ]; then
+    fail "$tag is on $existing, but $pre is on $commit. Delete $tag (git tag -d $tag; git push origin :refs/tags/$tag) and run Scripts/promote $version again."
+  fi
+done
+if [ -n "$remote_commit" ]; then
+  echo "$tag is already on $pre's commit ($commit) on origin."
+  echo "To run the promotion again: gh workflow run promote.yml -R $repo -f version=$version"
+  exit 0
+fi
+
+# 5. What is about to be promoted.
+title=$(gh release view "$pre" -R "$repo" --json name --jq .name 2>/dev/null || echo "$pre")
+echo "Promote $title to stable as $tag:"
+git log -1 --format='  %h %s (%an, %ad)' --date=short "$commit"
+if [ "$yes" != true ]; then
+  printf 'Push %s? [y/N] ' "$tag"
+  read -r answer
+  case "$answer" in y|Y|yes|YES|Yes) ;; *) echo "Nothing was pushed."; exit 1 ;; esac
+fi
+
+# 6. Exactly one tag: GitHub sends no events for a push of more than three.
+[ -n "$local_commit" ] || git tag -a "$tag" "$commit" -m "Cherry $version"
+git push origin "refs/tags/$tag"
+
+# 7.
+echo "Pushed $tag; .github/workflows/promote.yml publishes it. Follow it with:"
+echo "  gh run list -R $repo --workflow promote.yml -L 1"

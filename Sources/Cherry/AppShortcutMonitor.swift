@@ -3,22 +3,13 @@ import SwiftUI
 
 struct AppShortcutMonitor: NSViewRepresentable {
     @ObservedObject private var agentSettings = AgentSettings.shared
-    @AppStorage(WorktreeSwipeTuning.settleDurationKey)
-    private var worktreeSettleDuration = WorktreeSwipeTuning.defaultSettleDuration
 
     @ObservedObject var repository: RepositoryWorkspace
-    @ObservedObject var worktreeSwipeState: WorktreeSidebarSwipeState
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var todoStore: ProjectTodoStore
     let projectRoot: String?
-    let sidebarWidth: CGFloat
     let openSettings: () -> Void
-
-    private var visibleCommandNames: [String] {
-        visibleCommands.map(\.name)
-    }
 
     private var visibleCommands: [ProjectCommandDefinition] {
         agentSettings.launchableProjectCommands(for: projectRoot)
@@ -35,6 +26,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
         case toggleOmniBarActions
         case toggleSidebar
         case addSession
+        case openAnotherWindow
         case splitDuplicate
         case focusPreviousPane
         case focusNextPane
@@ -48,15 +40,17 @@ struct AppShortcutMonitor: NSViewRepresentable {
     /// The app shortcut a key press in a project window is, taken here so
     /// that the terminal never sees it (Ghostty's own ⌘D and ⌘⇧D split its
     /// surface). `charactersIgnoringModifiers` keeps Shift: ⌘⇧D arrives as
-    /// "D". ⌘Z brings back the window's latest closed or detached tab
-    /// (`ClosedTabHistory`) unless a text view has the keyboard
-    /// (`textHasKeyboard`: the notes editor, a search or name field), whose
-    /// own undo it is then; the terminal program never gets it. Caps Lock,
-    /// and the keypad and function flags AppKit adds to some keys, are not
-    /// held modifiers: with Caps Lock on, ⌘D is still Detach Tab. ⌘P opens
-    /// or closes the Omni bar and ⌘O opens it on Projects; ⌘K is the Omni
-    /// bar's action list only while it is open (`omniBarIsOpen`), else it
-    /// is left to the menu (Clear Scrollback) and the terminal.
+    /// "D". ⌘N is New Window (`ProjectWindowRegistry.openAnotherWindow`),
+    /// never Ghostty's own new window. ⌘Z brings back the window's latest
+    /// closed or detached tab (`ClosedTabHistory`) unless a text view has
+    /// the keyboard (`textHasKeyboard`: a to-do's editor, a search or name
+    /// field), whose own undo it is then; the terminal program never gets
+    /// it. Caps Lock, and the keypad and function flags AppKit adds to some
+    /// keys, are not held modifiers: with Caps Lock on, ⌘D is still Detach
+    /// Tab. ⌘P opens or closes the Omni bar and ⌘O opens it on Projects; ⌘K
+    /// is the Omni bar's action list only while it is open
+    /// (`omniBarIsOpen`), else it is left to the menu (Clear Scrollback) and
+    /// the terminal.
     nonisolated static func shortcutAction(
         charactersIgnoringModifiers: String?,
         modifiers: NSEvent.ModifierFlags,
@@ -88,6 +82,8 @@ struct AppShortcutMonitor: NSViewRepresentable {
             return .toggleSidebar
         case "t":
             return .addSession
+        case "n":
+            return .openAnotherWindow
         case "d":
             return .detachSelectedSessionOrWindow
         case "[":
@@ -110,17 +106,12 @@ struct AppShortcutMonitor: NSViewRepresentable {
     func makeCoordinator() -> Coordinator {
         Coordinator(
             repository: repository,
-            worktreeSwipeState: worktreeSwipeState,
             workspace: workspace,
             chromeState: chromeState,
-            noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: projectRoot,
-            visibleCommandNames: visibleCommandNames,
             visibleCommands: visibleCommands,
             projectFeatures: projectFeatures,
-            sidebarWidth: sidebarWidth,
-            worktreeSettleDuration: worktreeSettleDuration,
             openSettings: openSettings
         )
     }
@@ -134,16 +125,11 @@ struct AppShortcutMonitor: NSViewRepresentable {
     func updateNSView(_ nsView: ShortcutMonitorView, context: Context) {
         context.coordinator.workspace = workspace
         context.coordinator.repository = repository
-        context.coordinator.worktreeSwipeState = worktreeSwipeState
         context.coordinator.chromeState = chromeState
-        context.coordinator.noteStore = noteStore
         context.coordinator.todoStore = todoStore
         context.coordinator.projectRoot = projectRoot
-        context.coordinator.visibleCommandNames = visibleCommandNames
         context.coordinator.visibleCommands = visibleCommands
         context.coordinator.projectFeatures = projectFeatures
-        context.coordinator.sidebarWidth = sidebarWidth
-        context.coordinator.worktreeSettleDuration = worktreeSettleDuration
         context.coordinator.openSettings = openSettings
         nsView.coordinator = context.coordinator
     }
@@ -161,54 +147,38 @@ struct AppShortcutMonitor: NSViewRepresentable {
         case session(TerminalSession)
         case command(ProjectCommandDefinition)
         case todoBoard
-        case note(UUID)
     }
 
     @MainActor
     final class Coordinator {
         weak var repository: RepositoryWorkspace?
-        weak var worktreeSwipeState: WorktreeSidebarSwipeState?
         weak var workspace: TerminalWorkspace?
         weak var chromeState: ProjectWindowChromeState?
-        weak var noteStore: ProjectNoteStore?
         weak var todoStore: ProjectTodoStore?
         var projectRoot: String?
-        var visibleCommandNames: [String]
         var visibleCommands: [ProjectCommandDefinition]
         var projectFeatures: ProjectFeatureSettings
-        var sidebarWidth: CGFloat
-        var worktreeSettleDuration: Double
         var openSettings: () -> Void
         weak var window: NSWindow?
         private nonisolated(unsafe) var monitor: Any?
 
         init(
             repository: RepositoryWorkspace? = nil,
-            worktreeSwipeState: WorktreeSidebarSwipeState? = nil,
             workspace: TerminalWorkspace,
             chromeState: ProjectWindowChromeState,
-            noteStore: ProjectNoteStore,
             todoStore: ProjectTodoStore,
             projectRoot: String?,
-            visibleCommandNames: [String],
             visibleCommands: [ProjectCommandDefinition],
             projectFeatures: ProjectFeatureSettings,
-            sidebarWidth: CGFloat = 320,
-            worktreeSettleDuration: Double = WorktreeSwipeTuning.defaultSettleDuration,
             openSettings: @escaping () -> Void
         ) {
             self.repository = repository
-            self.worktreeSwipeState = worktreeSwipeState
             self.workspace = workspace
             self.chromeState = chromeState
-            self.noteStore = noteStore
             self.todoStore = todoStore
             self.projectRoot = projectRoot
-            self.visibleCommandNames = visibleCommandNames
             self.visibleCommands = visibleCommands
             self.projectFeatures = projectFeatures
-            self.sidebarWidth = sidebarWidth
-            self.worktreeSettleDuration = worktreeSettleDuration
             self.openSettings = openSettings
             install()
         }
@@ -243,12 +213,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
                modifiers.isDisjoint(with: [.control, .shift])
             {
                 switch event.keyCode {
-                case 123:
-                    animateAdjacentWorktree(offset: -1)
-                    return repository?.supportsWorktrees == true
-                case 124:
-                    animateAdjacentWorktree(offset: 1)
-                    return repository?.supportsWorktrees == true
                 case 126:
                     cycleSidebarSelection(offset: -1)
                     return true
@@ -273,30 +237,6 @@ struct AppShortcutMonitor: NSViewRepresentable {
             return true
         }
 
-        private func animateAdjacentWorktree(offset: Int) {
-            guard let repository,
-                  repository.supportsWorktrees,
-                  let worktreeSwipeState,
-                  let target = repository.adjacentWorktree(offset: offset),
-                  repository.prepareWorkspace(worktreeRoot: target.root) != nil
-            else {
-                return
-            }
-
-            _ = worktreeSwipeState.animateSwitch(
-                sourceRoot: repository.activeWorktreeRoot,
-                targetRoot: target.root,
-                direction: offset,
-                sidebarWidth: sidebarWidth,
-                duration: worktreeSettleDuration
-            ) { [weak repository, weak chromeState] in
-                _ = repository?.activate(
-                    worktreeRoot: target.root,
-                    chromeState: chromeState
-                )
-            }
-        }
-
         private func perform(_ action: ShortcutAction) {
             switch action {
             case .selectVisibleSidebarItem(let number):
@@ -311,6 +251,10 @@ struct AppShortcutMonitor: NSViewRepresentable {
                 chromeState?.toggleSidebar()
             case .addSession:
                 workspace?.addSession()
+            case .openAnotherWindow:
+                if !ProjectWindowRegistry.shared.openAnotherWindow(from: window) {
+                    NSSound.beep()
+                }
             case .splitDuplicate:
                 workspace?.splitDuplicateActiveTerminal()
             case .focusPreviousPane:
@@ -377,20 +321,11 @@ struct AppShortcutMonitor: NSViewRepresentable {
             if projectFeatures.todosEnabled {
                 items.append(.todoBoard)
             }
-            if projectFeatures.notesEnabled, let noteStore {
-                items += noteStore.notes.map { .note($0.id) }
-            }
             return items
         }
 
         private func currentSidebarIndex(in items: [SidebarItem]) -> Int? {
             if let chromeState {
-                if let selectedNoteID = chromeState.selectedNoteID {
-                    return items.firstIndex {
-                        if case .note(let id) = $0 { return id == selectedNoteID }
-                        return false
-                    }
-                }
                 if chromeState.isTodoPanePresented {
                     return items.firstIndex {
                         if case .todoBoard = $0 { return true }
@@ -411,7 +346,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
                         return s.id == selectedID
                     case .command(let def):
                         return workspace?.commandSession(named: def.name)?.id == selectedID
-                    case .todoBoard, .note:
+                    case .todoBoard:
                         return false
                     }
                 }
@@ -433,11 +368,7 @@ struct AppShortcutMonitor: NSViewRepresentable {
                     chromeState.focusIdleCommand(name: command.name)
                 }
             case .todoBoard:
-                let firstSelectableTodoID = todoStore?.todos.first { $0.status != .done }?.id
-                    ?? todoStore?.todos.first?.id
-                chromeState.selectTodo(id: chromeState.selectedTodoID ?? firstSelectableTodoID)
-            case .note(let id):
-                chromeState.selectNote(id: id)
+                chromeState.selectTodo(id: chromeState.selectedTodoID ?? todoStore?.firstSelectableTodo?.id)
             }
         }
     }

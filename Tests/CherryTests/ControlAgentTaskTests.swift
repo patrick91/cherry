@@ -1,16 +1,14 @@
-import CherryControl
-@testable import CherryMCP
+@testable import CherryControl
 import Darwin
 import Foundation
-import MCP
 import Testing
 @testable import Cherry
 
-// Tasks and results (docs/mcp.md): spawn_agent with a task, the worker's
+// Tasks and results (docs/cli.md): spawn_agent with a task, the worker's
 // get_my_task and report_result (its own tab, never a selector), the
 // orchestrator's wait_for_tasks, the nudge and no_report fallback, and the
 // run's wake line. Agents are `/bin/cat` (screens injected) or fake agent
-// scripts; the end-to-end test drives the real CherryMCP `--call`.
+// scripts; the end-to-end test drives the real `cherry tool`.
 
 @MainActor
 private extension ControlAgentWaitHarness {
@@ -35,7 +33,8 @@ private extension ControlAgentWaitHarness {
         phase: String? = nil,
         runID: String? = nil,
         resultSchema: JSONValue? = nil,
-        parentAgentID: String? = nil
+        parentAgentID: String? = nil,
+        allowSubagents: Bool? = nil
     ) async throws -> (session: TerminalSession, result: SpawnProcessResult) {
         try settings.upsertAgent(AgentToolDefinition(name: name, command: command))
         let response = try await send(.spawnProcess(.init(
@@ -46,7 +45,8 @@ private extension ControlAgentWaitHarness {
             label: label,
             phase: phase,
             runID: runID,
-            resultSchema: resultSchema
+            resultSchema: resultSchema,
+            allowSubagents: allowSubagents
         )))
         guard case .spawnProcess(let spawned)? = response.result else {
             throw CherryControlError(code: "spawn_failed", message: "Expected spawnProcess result, got \(String(describing: response))")
@@ -159,27 +159,37 @@ private func json(_ text: String) throws -> JSONValue {
     #expect(text.contains(#""value":{"fileName":"a","nested":{"camelCase":[1,2.5,null]}}"#), "\(text)")
     #expect(text.contains(#""reported_at""#))
 
-    let arguments: [String: Value] = [
+    let arguments: [String: JSONValue] = [
         "value": .object(["count": .int(2), "ok": .bool(true), "items": .array([.string("x")])]),
         "result_schema": .string(#"{"type":"object"}"#),
     ]
-    #expect(try CherryMCPTools.jsonArgument("value", in: arguments) == json(#"{"count":2,"ok":true,"items":["x"]}"#))
-    #expect(try CherryMCPTools.schemaArgument("result_schema", in: arguments) == json(#"{"type":"object"}"#))
-    #expect(throws: CherryControlError.self) { try CherryMCPTools.schemaArgument("bad", in: ["bad": .string("not json")]) }
+    #expect(try CherryToolLayer.jsonArgument("value", in: arguments) == json(#"{"count":2,"ok":true,"items":["x"]}"#))
+    #expect(try CherryToolLayer.schemaArgument("result_schema", in: arguments) == json(#"{"type":"object"}"#))
+    #expect(throws: CherryControlError.self) { try CherryToolLayer.schemaArgument("bad", in: ["bad": .string("not json")]) }
 }
 
+@MainActor
 @Test func ControlAgentTaskToolsAreAdvertisedAndWaitsFitASixtySecondTimeout() async throws {
-    let advertised = Set(CherryMCPTools.all.map(\.name))
+    let advertised = Set(CherryToolCatalog.tools(for: .unknown).map(\.name))
     #expect(advertised.isSuperset(of: ["get_my_task", "report_result", "report_progress", "wait_for_tasks", "get_task", "list_tasks", "cancel_tasks"]))
-    let wait = try #require(CherryMCPTools.clientTimeout(for: "wait_for_tasks", arguments: [:]))
+    let wait = try #require(CherryToolLayer.clientTimeout(for: "wait_for_tasks", arguments: [:]))
     #expect(wait <= 55)
-    #expect(CherryMCPTools.clientTimeout(for: "wait_for_tasks", arguments: ["timeout_ms": .int(300_000)]) == wait)
-    // task and message together are refused before anything is sent.
-    let both = await CherryMCPTools.call(name: "spawn_agent", arguments: [
+    #expect(CherryToolLayer.clientTimeout(for: "wait_for_tasks", arguments: ["timeout_ms": .int(300_000)]) == wait)
+    // task and message together are refused before anything is sent: the
+    // app runs the tool (`callTool`), so it needs one.
+    let harness = try ControlAgentWaitHarness()
+    defer { harness.stop() }
+    harness.server.start()
+    var sent: [CherryControlRequest] = []
+    harness.server.toolDispatchWillSendForTesting = { sent.append($0) }
+    let both = await ToolCalls.call(name: "spawn_agent", arguments: [
         "name": .string("Claude"), "task": .string("Review"), "message": .string("hi"),
-    ])
-    #expect(both.isError == true)
-    let spawnAgent = try #require(CherryMCPTools.all.first { $0.name == "spawn_agent" })
+    ], socketURL: harness.socketURL)
+    #expect(both.isError)
+    #expect(both.structured?.objectValue?["error"]?.objectValue?["code"]?.stringValue == "invalid_argument", "\(both.text)")
+    #expect(both.toolsDigest != nil, "the app answered it")
+    #expect(sent.isEmpty)
+    let spawnAgent = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "spawn_agent" })
     let properties = spawnAgent.inputSchema.objectValue?["properties"]?.objectValue ?? [:]
     #expect(Set(properties.keys).isSuperset(of: ["task", "label", "phase", "run_id", "result_schema"]))
 }
@@ -209,10 +219,9 @@ struct ControlAgentTaskTests {
         #expect(spawned.sentBytes > 0)
         #expect(worker.parentAgentID == orchestrator.id)
         #expect(worker.title == "Parser review")
-        let kickoff = try await harness.waitForOutput("You are Cherry task \(task.taskID): call get_my_task", in: worker)
-        #expect(kickoff.contains("You are Cherry task \(task.taskID): call get_my_task (Cherry MCP) for your brief, do it, then call report_result."))
-        #expect(kickoff.contains("\"$CHERRY_MCP_HELPER\" --call get_my_task"))
-        #expect(!kickoff.contains("Review the parser"), "the brief is read with get_my_task, never typed")
+        let kickoff = try await harness.waitForOutput("You are Cherry task \(task.taskID): run cherry task mine", in: worker)
+        #expect(kickoff.contains("You are Cherry task \(task.taskID): run cherry task mine for your brief, do it, then report with cherry task report"))
+        #expect(!kickoff.contains("Review the parser"), "the brief is read with cherry task mine, never typed")
 
         let summary = try await harness.status(of: worker)
         #expect(summary.taskID == task.taskID)
@@ -298,7 +307,7 @@ struct ControlAgentTaskTests {
         #expect(assignment.taskID == taskA && assignment.brief == "Brief A" && assignment.label == "A")
         #expect(assignment.resultSchema == findingsSchema)
         #expect(assignment.state == .working)
-        #expect(assignment.rules.contains { $0.contains("report_result") })
+        #expect(assignment.rules.contains { $0.contains("cherry task report") })
 
         let mismatch = try await harness.send(.reportResult(.init(value: try json(#"{"severity":"medium","files":[1]}"#), summary: "x")))
         #expect(mismatch.error?.code == "schema_mismatch")
@@ -540,29 +549,209 @@ struct ControlAgentTaskTests {
         harness.server.callerSessionResolverForTesting = { _ in workerB }
         _ = try await harness.send(.reportResult(.init(value: .null, status: "failed", summary: "SECRET-SUMMARY-B")))
         let woken = try await harness.waitForOutput("handled [cherry] Run \(runID)", in: orchestrator, seconds: 10)
-        #expect(woken.contains("[cherry] Run \(runID): 2 tasks settled (1 reported, 1 failed). Call the cherry wait_for_tasks tool with run_id \"\(runID)\" to read them, and get_task for each result."), "\(woken)")
+        #expect(woken.contains("[cherry] Run \(runID): 2 tasks settled (1 reported, 1 failed). Run cherry task wait \(runID) to read them, and cherry task get for each result."), "\(woken)")
         #expect(!woken.contains("SECRET-SUMMARY"), "the wake line carries no worker text")
         try await Task.sleep(for: .milliseconds(1_000))
         #expect(try await harness.output(of: orchestrator).components(separatedBy: "handled [cherry] Run").count - 1 == 1)
         #expect(harness.server.tasks.board.runProgress[orchestrator.id] == nil, "a settled run shows no progress")
     }
 
-    // MARK: End to end
+    // MARK: The sidebar
 
-    /// A fake orchestrator spawns two fake workers through the real
-    /// CherryMCP; each reads its brief and reports with `CherryMCP --call`,
-    /// identified by its tab's process tree alone; the settled run wakes
-    /// the orchestrator, and the results are there to read.
-    @Test func fakeOrchestratorRunsTwoWorkersThroughCherryMCP() async throws {
-        let repository = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let helper = repository.appendingPathComponent(".build/debug/CherryMCP")
-        try #require(FileManager.default.isExecutableFile(atPath: helper.path), "Build CherryMCP first: swift build --build-tests")
+    /// The board sums an orchestrator's workers by their latest tasks: its
+    /// collapsed row reads "1 done · 1 failed" once both settled, the
+    /// window folds the group on that settle, and Close Finished Workers
+    /// closes both workers together, the orchestrator staying.
+    @Test func settledWorkersAreSummedFoldedAndClosedTogether() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.start()
+        let orchestrator = try await harness.spawnAgent(named: "Lead")
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        let (workerA, _) = try await harness.spawnTask(agent: "Worker", task: "A", parentAgentID: orchestrator.id.uuidString)
+        let (workerB, _) = try await harness.spawnTask(agent: "Worker", task: "B", parentAgentID: orchestrator.id.uuidString)
+        let board = harness.server.tasks.board
+        let chromeState = ProjectWindowChromeState()
+        let sessionIDs = Set(harness.workspace.sessions.map(\.id))
+
+        let open = try #require(board.workerSummaries[orchestrator.id])
+        #expect(open.total == 2 && open.open == 2 && !open.allSettled)
+        #expect(harness.workspace.finishedWorkers(of: orchestrator, summaries: board.workerSummaries).isEmpty)
+        chromeState.applyWorkerSummaries(from: [:], to: board.workerSummaries, sessionIDs: sessionIDs)
+        #expect(chromeState.collapsedAgentGroupIDs.isEmpty)
+
+        let before = board.workerSummaries
+        harness.server.callerSessionResolverForTesting = { _ in workerA }
+        _ = try await harness.send(.reportResult(.init(value: .string("x"), summary: "A")))
+        harness.server.callerSessionResolverForTesting = { _ in workerB }
+        _ = try await harness.send(.reportResult(.init(value: .null, status: "failed", summary: "B")))
+        let settled = try #require(board.workerSummaries[orchestrator.id])
+        #expect(settled.allSettled && settled.text == "1 done · 1 failed")
+        #expect(Set(settled.finishedWorkerIDs) == [workerA.id, workerB.id])
+        chromeState.applyWorkerSummaries(from: before, to: board.workerSummaries, sessionIDs: sessionIDs)
+        #expect(chromeState.collapsedAgentGroupIDs == [orchestrator.id], "the settle folds the group")
+
+        var asked = false
+        let closed = SessionCloseCoordinator.closeFinishedWorkers(
+            of: orchestrator, in: harness.workspace, chromeState: chromeState,
+            summaries: board.workerSummaries, confirm: { _ in asked = true; return true }
+        )
+        #expect(closed == 2 && !asked, "idle workers close without asking")
+        #expect(harness.workspace.session(id: workerA.id.uuidString) == nil)
+        #expect(harness.workspace.session(id: workerB.id.uuidString) == nil)
+        #expect(harness.workspace.session(id: orchestrator.id.uuidString) != nil)
+        // (Native tabs never come back, so ⌘Z has nothing here; persistent
+        // workers go into one entry, as any closeTabs.)
+        #expect(chromeState.closedTabs.entries.count <= 1)
+        chromeState.closedTabs.endAll()
+    }
+
+    // MARK: Approval
+
+    /// A worker that asks its orchestrator for approval and ends its turn
+    /// is neither nudged nor settled: its task awaits approval, wait_for_tasks
+    /// returns at once with its question, its idle orchestrator gets one
+    /// wake line (no worker text), and the orchestrator's message puts it
+    /// back to work, after which an idle worker is asked to report again.
+    @Test func workerAwaitingApprovalIsNotNudgedAndResumesOnItsAnswer() async throws {
         let harness = try ControlAgentWaitHarness()
         defer { harness.stop() }
         harness.useFastTaskSampling()
         harness.server.start()
-        let call = "CHERRY_CONTROL_SOCKET='\(harness.socketURL.path)' '\(helper.path)' --call"
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        try await Task.sleep(for: .milliseconds(600))
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        let (worker, spawned) = try await harness.spawnTask(agent: "Fakeworker", command: script, task: "Plan, then wait for my OK")
+        let taskID = try #require(spawned.task?.taskID)
+        let runID = try #require(spawned.task?.runID)
+
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+        #expect(try await harness.send(.getMyTask).error == nil)
+        let asked = try await harness.send(.reportProgress(.init(message: "SECRET-PLAN: step 1, step 2. OK?", awaitingApproval: true)))
+        guard case .reportProgress(let progress)? = asked.result else {
+            Issue.record("Expected reportProgress, got \(asked)")
+            return
+        }
+        #expect(progress.recorded && progress.state == .awaitingApproval)
+        // Another one right away is not dropped by the progress interval.
+        let again = try await harness.send(.reportProgress(.init(message: "Still: OK?", awaitingApproval: true)))
+        guard case .reportProgress(let second)? = again.result else {
+            Issue.record("Expected reportProgress, got \(again)")
+            return
+        }
+        #expect(second.recorded)
+
+        // Its kickoff turn ends: no nudge, no no_report.
+        _ = try await harness.waitForOutput("handled You are Cherry task \(taskID)", in: worker, seconds: 10)
+        let woken = try await harness.waitForOutput("handled [cherry] Run \(runID)", in: orchestrator, seconds: 10)
+        #expect(woken.contains("[cherry] Run \(runID): 1 task awaits your approval."), "\(woken)")
+        #expect(!woken.contains("SECRET-PLAN"), "the wake line carries no worker text")
+        try await Task.sleep(for: .milliseconds(800))
+        #expect(!(try await harness.output(of: worker)).contains(AgentTaskRegistry.nudgeLine), "nudged while it awaits approval")
+        #expect(try await harness.task(taskID).task.state == .awaitingApproval)
+        #expect(try await harness.status(of: worker).taskState == "awaiting_approval")
+        // One wake line for that request.
+        #expect(try await harness.output(of: orchestrator).components(separatedBy: "handled [cherry] Run").count - 1 == 1)
+
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        let quick = Date()
+        let read = try await harness.waitForTasks(.init(runID: runID, timeoutMilliseconds: 5_000))
+        #expect(!read.timedOut && Date().timeIntervalSince(quick) < 2)
+        #expect(read.events.last { $0.kind == .awaitingApproval }?.text == "Still: OK?")
+        #expect(read.pending.first?.state == .awaitingApproval)
+        #expect(read.runs.first?.counts.awaitingApproval == 1 && read.runs.first?.settled == false)
+        let listed = try await harness.send(.listTasks(.init(runID: runID, state: "awaiting_approval")))
+        guard case .listTasks(let list)? = listed.result else {
+            Issue.record("Expected listTasks, got \(listed)")
+            return
+        }
+        #expect(list.tasks.map(\.taskID) == [taskID])
+
+        // The answer: back to work, and its next idle turn is asked to report.
+        #expect(try await harness.send(.sendProcessInput(.init(processID: worker.id.uuidString, text: "Approved", submit: true))).error == nil)
+        #expect(try await harness.task(taskID).task.state == .working)
+        let nudged = try await harness.waitForOutput("handled \(AgentTaskRegistry.nudgeLine)", in: worker, seconds: 15)
+        #expect(nudged.contains("handled Approved"), "\(nudged)")
+        let after = try await harness.waitForTasks(.init(taskIDs: [taskID], cursor: read.cursor, timeoutMilliseconds: 0))
+        #expect(after.events.map(\.kind).contains(.resumed))
+    }
+
+    /// An approval request carries the whole plan, its lines kept, up to
+    /// its own limit; plain progress stays one short line.
+    @Test func approvalRequestKeepsTheWholePlan() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.tasks.progressInterval = 0
+        harness.server.start()
+        let (worker, spawned) = try await harness.spawnTask(agent: "Worker", task: "Plan it")
+        let taskID = try #require(spawned.task?.taskID)
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+
+        let plan = (1...11).map { "\($0). Step \($0): " + String(repeating: "x", count: 150) }.joined(separator: "\n")
+        #expect(plan.count > CherryControl.maximumTaskProgressCharacters)
+        _ = try await harness.send(.reportProgress(.init(message: plan + "\n\nOK?\n", awaitingApproval: true)))
+        #expect(try await harness.task(taskID).task.progress == plan + "\n\nOK?")
+
+        let huge = String(repeating: "y", count: CherryControl.maximumTaskApprovalRequestCharacters + 500)
+        _ = try await harness.send(.reportProgress(.init(message: huge, awaitingApproval: true)))
+        let cut = try #require(try await harness.task(taskID).task.progress)
+        #expect(cut.count <= CherryControl.maximumTaskApprovalRequestCharacters)
+
+        // Back to work: progress is one line, cut at its own limit.
+        _ = try await harness.send(.reportProgress(.init(message: plan)))
+        let line = try #require(try await harness.task(taskID).task.progress)
+        #expect(!line.contains("\n") && line.count <= CherryControl.maximumTaskProgressCharacters)
+    }
+
+    /// allow_subagents changes the rules get_my_task gives, goes only with
+    /// a task, and still leaves the worker unable to hand out Cherry tasks.
+    @Test func allowSubagentsChangesTheWorkersRules() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.start()
+        let (plain, _) = try await harness.spawnTask(agent: "Worker", task: "A")
+        let (free, _) = try await harness.spawnTask(agent: "Worker", task: "B", allowSubagents: true)
+
+        harness.server.callerSessionResolverForTesting = { _ in plain }
+        guard case .getMyTask(let plainTask)? = try await harness.send(.getMyTask).result else {
+            Issue.record("Expected getMyTask")
+            return
+        }
+        #expect(plainTask.rules.first?.contains("Don't hand parts of it to other agents") == true)
+        #expect(plainTask.rules.contains { $0.contains("cherry task progress --awaiting-approval") })
+        #expect(!plainTask.rules.contains { $0.contains("rather than waiting for an answer") })
+
+        harness.server.callerSessionResolverForTesting = { _ in free }
+        guard case .getMyTask(let freeTask)? = try await harness.send(.getMyTask).result else {
+            Issue.record("Expected getMyTask")
+            return
+        }
+        #expect(freeTask.rules.first?.contains("You may use your own CLI's subagents") == true)
+        #expect(freeTask.rules.first?.contains("not cherry spawn agent with --task") == true)
+        // Still one level deep.
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "Worker", command: "/bin/cat"))
+        let nested = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Worker", task: "C")))
+        #expect(nested.error?.code == "nested_task")
+
+        harness.server.callerSessionResolverForTesting = nil
+        let bare = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Worker", allowSubagents: true)))
+        #expect(bare.error?.code == "invalid_process_request")
+    }
+
+    // MARK: End to end
+
+    /// A fake orchestrator spawns two fake workers through the real
+    /// `cherry`; each reads its brief and reports with `cherry tool`,
+    /// identified by its tab's process tree alone; the settled run wakes
+    /// the orchestrator, and the results are there to read.
+    @Test func fakeOrchestratorRunsTwoWorkersThroughCherry() async throws {
+        let cli = try builtCherryCLI()
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastTaskSampling()
+        harness.server.start()
+        let call = "CHERRY_CONTROL_SOCKET='\(harness.socketURL.path)' '\(cli.path)' tool"
 
         let worker = harness.projectRoot.appendingPathComponent("fake-worker.sh")
         try """
@@ -887,6 +1076,68 @@ struct ControlAgentTaskLimitTests {
     #expect(AgentTaskRegistry.kickoffCopies(taskID: id, in: ["> " + start, "x", "\u{276F} " + start]) == 2)
 }
 
+/// Amp's composer is a box at the bottom of its screen whose rows have no
+/// prompt glyph: a kickoff between its borders is unsent, one above it
+/// was sent. Other agents read the same screen as before.
+@Test func ControlAgentTaskKickoffPlacementReadsAmpsComposerBox() {
+    let id = "task-0123456789ab"
+    let start = String(AgentTaskRegistry.kickoffLine(taskID: id).prefix(60))
+    func placement(_ lines: [String], agent: String = "amp", before: Int = 0) -> KickoffPlacement {
+        AgentTaskRegistry.kickoffPlacement(taskID: id, in: lines, agent: agent, copiesBefore: before)
+    }
+    // As AgentScreenActivityTests' Amp box, with what is typed in its rows.
+    func ampBox(_ rows: [String], status: String = "") -> [String] {
+        ["\u{256D}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} $0.004 \u{2500} high \u{2500}\u{256E}"]
+            + rows.map { "\u{2502} " + $0.padding(toLength: 62, withPad: " ", startingAt: 0) + " \u{2502}" }
+            + ["\u{2570} \(status)\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} ~/project (main) \u{2500}\u{256F}", ""]
+    }
+    let typed = ["Welcome to Amp", ""] + ampBox([start, "for your brief, do it, then call report_result.", ""])
+    // Typed, its Enter lost: inside the box.
+    #expect(placement(typed) == .composer)
+    #expect(placement(["\u{2503} " + start, "", "\u{2713} Thinking", ""] + ampBox([start]), before: 1) == .composer)
+    // Sent: above the box, among the messages; the box below it is empty.
+    #expect(placement(["\u{2503} " + start, "", "\u{2713} Ran 2 commands", ""] + ampBox([""])) == .submitted)
+    #expect(placement(["\u{2503} " + start, ""] + ampBox([""], status: "\u{223C} Thinking 27 tok ")) == .submitted)
+    // Dropped: an empty box.
+    #expect(placement(["Welcome to Amp", ""] + ampBox([""])) == .absent)
+    // No box at the bottom (a box higher up is no composer).
+    #expect(placement(ampBox([start]) + ["", "\u{2713} Ran 2 commands", "", "Done.", "", "Next?"]) == .submitted)
+    // Another agent's screen with the same box: as before.
+    #expect(placement(typed, agent: "codex") == .submitted)
+    #expect(placement(typed, agent: "claude") == .submitted)
+}
+
+/// A narrow tab: what the box holds wraps over more rows than the last 12
+/// lines (the kickoff, 38 columns wide so its mark stays on one row, below
+/// a draft typed there before), and the kickoff is still inside it, unsent,
+/// at a composer (so `checkKickoff` presses its Enter).
+@Test func ControlAgentTaskKickoffPlacementFindsTheKickoffInATallAmpBox() {
+    let id = "task-0123456789ab"
+    let width = 38
+    var wrapped: [String] = []
+    for word in AgentTaskRegistry.kickoffLine(taskID: id).split(separator: " ") {
+        if let last = wrapped.last, last.count + 1 + word.count <= width {
+            wrapped[wrapped.count - 1] = last + " " + word
+        } else {
+            wrapped.append(String(word))
+        }
+    }
+    let draft = ["notes from earlier:", "- the parser", "- the lexer", "- the checker", "- the emitter", "- the runner", ""]
+    let rows = draft + wrapped + [""]
+    #expect(wrapped.count >= 5 && rows.count >= 14, "\(wrapped.count) rows")
+    #expect(wrapped.first?.contains(AgentTaskRegistry.kickoffMarker(taskID: id)) == true)
+    let box = ["\u{256D}" + String(repeating: "\u{2500}", count: width + 2) + "\u{256E}"]
+        + rows.map { "\u{2502} " + $0.padding(toLength: width, withPad: " ", startingAt: 0) + " \u{2502}" }
+        + ["\u{2570}" + String(repeating: "\u{2500}", count: width + 2) + "\u{256F}", ""]
+    let screen = ["Welcome to Amp", ""] + box
+    #expect(box.count > 13, "taller than the last 12 lines")
+    #expect(AgentTaskRegistry.kickoffPlacement(taskID: id, in: screen, agent: "amp") == .composer)
+    #expect(AgentScreenActivity.verdict(for: screen, agent: "amp") == .prompt)
+    // Sent: above the box, which is empty again.
+    let sent = ["\u{2503} " + wrapped[0]] + Array(wrapped.dropFirst()) + [""] + Array(box.prefix(2)) + Array(box.suffix(2))
+    #expect(AgentTaskRegistry.kickoffPlacement(taskID: id, in: sent, agent: "amp") == .submitted)
+}
+
 @MainActor
 private extension ControlAgentWaitHarness {
     /// Fast sampling, and short kickoff checks; a worker's turn that ends
@@ -1004,6 +1255,80 @@ struct ControlAgentTaskKickoffTests {
 
         let handled = try await harness.waitForOutput("handled You are Cherry task \(taskID)", in: worker, seconds: 20)
         #expect(handled.contains("handled You are Cherry task \(taskID)"), "the kickoff stayed in the composer: \(handled)")
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+        #expect(try await harness.send(.getMyTask).error == nil)
+        try await Task.sleep(for: .milliseconds(1_000))
+        #expect(try await harness.count("handled You are Cherry task \(taskID)", in: worker) == 1)
+        let task = try #require(harness.server.tasks.tasks[taskID])
+        #expect(task.kickoffAttempts == 1, "the text was never typed again")
+        #expect(task.kickoffEnterPresses == 1)
+        let events = try await harness.waitForTasks(.init(taskIDs: [taskID], timeoutMilliseconds: 0))
+        #expect(events.events.contains { $0.kind == .kickoffRetry && $0.text?.contains("Enter") == true })
+    }
+
+    /// Amp, which reports no status, shows what is typed inside its
+    /// composer box, rows without a prompt glyph: a kickoff left there
+    /// with its Enter lost is unsent, gets its Enter, and is never typed a
+    /// second time. Also in a narrow tab, where the box (a draft typed
+    /// there before, then the kickoff) is taller than the last 12 lines.
+    @Test(arguments: [false, true])
+    func ampKickoffLeftInItsComposerBoxGetsItsEnter(tall: Bool) async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastKickoffChecks(wakeQuiet: 3)
+        harness.server.start()
+        // A box drawn below the transcript, what is typed word-wrapped
+        // inside it (38 columns keep the kickoff's mark on one row) below
+        // the draft; its first Enter is lost.
+        let width = tall ? 38 : 60
+        let draft = tall ? "\"notes from earlier:\", \"- the parser\", \"- the lexer\", \"\"" : ""
+        let script = try harness.script("amp-box.pl", """
+        #!/usr/bin/perl
+        use strict;
+        use warnings;
+        $| = 1;
+        system("stty raw -echo 2>/dev/null");
+        my @transcript = ("Welcome to Amp", "");
+        my @draft = (\(draft));
+        my $buffer = "";
+        my $lost = 0;
+        sub wrap {
+          my @rows = ("");
+          for my $word (split / /, $_[0]) {
+            if ($rows[-1] ne "" && length($rows[-1]) + 1 + length($word) > \(width)) { push @rows, $word; }
+            else { $rows[-1] .= ($rows[-1] eq "" ? "" : " ") . $word; }
+          }
+          return @rows;
+        }
+        sub draw {
+          my @rows = (@draft, wrap($buffer));
+          print "\\033[H\\033[J";
+          print map { "$_\\r\\n" } @transcript;
+          print "\\xe2\\x95\\xad" . ("\\xe2\\x94\\x80" x \(width - 8)) . " high \\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x95\\xae\\r\\n";
+          printf "\\xe2\\x94\\x82 %-\(width)s \\xe2\\x94\\x82\\r\\n", $_ for @rows;
+          print "\\xe2\\x95\\xb0" . ("\\xe2\\x94\\x80" x \(width - 16)) . " ~/project \\xe2\\x94\\x80\\xe2\\x94\\x80\\xe2\\x95\\xaf";
+        }
+        draw();
+        while (sysread(STDIN, my $byte, 1)) {
+          if ($byte eq "\\r" || $byte eq "\\n") {
+            if (!$lost) { $lost = 1; next; }
+            next if $buffer eq "";
+            push @transcript, "\\xe2\\x94\\x83 " . substr($buffer, 0, 60), "", "handled " . substr($buffer, 0, 60), "";
+            $buffer = "";
+            @draft = ();
+          } else {
+            $buffer .= $byte;
+          }
+          draw();
+        }
+        """)
+        let (worker, spawned) = try await harness.spawnTask(agent: "Amp", command: script, task: "Lose the Enter in the box")
+        let taskID = try #require(spawned.task?.taskID)
+        #expect(spawned.sentBytes > 0)
+        #expect(spawned.inputError == nil)
+
+        let handled = try await harness.waitForOutput("handled You are Cherry task \(taskID)", in: worker, seconds: 20)
+        #expect(handled.contains("handled You are Cherry task \(taskID)"), "the kickoff stayed in the box: \(handled)")
         harness.server.callerSessionResolverForTesting = { _ in worker }
         #expect(try await harness.send(.getMyTask).error == nil)
         try await Task.sleep(for: .milliseconds(1_000))

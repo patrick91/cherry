@@ -1,0 +1,265 @@
+#!/usr/bin/env -S python3 -I
+"""Write or check the third-party notices of Cherry.app's Swift package graph.
+
+    Scripts/app-notices --write | --check
+
+--write regenerates Packaging/THIRD_PARTY_NOTICES.txt (shipped as
+Contents/Resources/Licenses/App-THIRD_PARTY_NOTICES.txt): each Package.resolved
+pin with its LICENSE*, NOTICE* and COPYING* files from .build/checkouts (run
+`swift package resolve` first), Sparkle with the license of its binary
+distribution, libghostty-spm, GhosttyTheme, Ghostty, and GhosttyKit's own
+third-party code from the hand-curated Packaging/notices/GhosttyKit.txt.
+
+--check needs no build. It fails when the file's header names another
+Package.resolved (by SHA-256) or another GhosttyKit binary than
+ThirdParty/libghostty-spm/Package.swift, and warns about TODO: lines.
+Scripts/install-local-app runs it in release mode.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+REPOSITORY = Path(__file__).resolve().parent.parent
+RESOLVED = REPOSITORY / "Package.resolved"
+GHOSTTY_MANIFEST = REPOSITORY / "ThirdParty/libghostty-spm/Package.swift"
+NOTICES = REPOSITORY / "Packaging/THIRD_PARTY_NOTICES.txt"
+GHOSTTYKIT_NOTICES = REPOSITORY / "Packaging/notices/GhosttyKit.txt"
+CHECKOUTS = REPOSITORY / ".build/checkouts"
+# Pins whose binary distribution is what the app embeds: its own license file
+# is the one that ships (Sparkle's includes the bsdiff and ed25519 notices).
+ARTIFACT_LICENSES = {"sparkle": REPOSITORY / ".build/artifacts/sparkle/Sparkle/LICENSE"}
+LICENSE_PREFIXES = ("LICENSE", "NOTICE", "COPYING")
+HASH_PREFIX = "Package.resolved SHA-256: "
+URL_PREFIX = "GhosttyKit: "
+CURATED_PREFIX = "Curated for: "
+RULE = "=" * 72
+
+
+class NoticesError(Exception):
+    pass
+
+
+def relative(path):
+    try:
+        return str(path.relative_to(REPOSITORY))
+    except ValueError:
+        return str(path)
+
+
+def warn(message):
+    print(f"warning: {message}", file=sys.stderr)
+
+
+def read_text(path):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        raise NoticesError(f"cannot read {relative(path)}: {error}") from None
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip("\n") + "\n"
+
+
+def resolved_sha256():
+    try:
+        return hashlib.sha256(RESOLVED.read_bytes()).hexdigest()
+    except OSError as error:
+        raise NoticesError(f"cannot read {relative(RESOLVED)}: {error}") from None
+
+
+def ghosttykit_url():
+    """The URL of the libghostty binary target (GhosttyKit.xcframework)."""
+    manifest = read_text(GHOSTTY_MANIFEST)
+    match = re.search(r'\.binaryTarget\(\s*name:\s*"libghostty",\s*url:\s*"([^"]+)"', manifest)
+    if not match:
+        raise NoticesError(f"no libghostty binaryTarget URL in {relative(GHOSTTY_MANIFEST)}")
+    return match.group(1)
+
+
+def header_values(text):
+    """The Package.resolved hash and GhosttyKit URL a notices file names."""
+    values = {}
+    for line in text.splitlines()[:12]:
+        for prefix in (HASH_PREFIX, URL_PREFIX):
+            if line.startswith(prefix):
+                values.setdefault(prefix, line[len(prefix):].strip())
+    return values.get(HASH_PREFIX), values.get(URL_PREFIX)
+
+
+def curated_url(text):
+    for line in text.splitlines()[:12]:
+        if line.startswith(CURATED_PREFIX):
+            return line[len(CURATED_PREFIX):].strip()
+    return None
+
+
+def todo_lines(text):
+    return [line for line in text.splitlines() if line.startswith("TODO:")]
+
+
+def pins():
+    try:
+        resolved = json.loads(RESOLVED.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise NoticesError(f"cannot read {relative(RESOLVED)}: {error}") from None
+    found = resolved.get("pins")
+    if not isinstance(found, list):
+        raise NoticesError(f"{relative(RESOLVED)} has no pins")
+    return found
+
+
+def checkout_directory(pin):
+    """SwiftPM checks a pin out under its repository's name."""
+    location = pin.get("location", "").rstrip("/")
+    names = [location.rsplit("/", 1)[-1].removesuffix(".git"), pin.get("identity", "")]
+    if CHECKOUTS.is_dir():
+        entries = {entry.name.lower(): entry for entry in CHECKOUTS.iterdir() if entry.is_dir()}
+        for name in names:
+            if name and name.lower() in entries:
+                return entries[name.lower()]
+    raise NoticesError(f"no checkout of {pin.get('identity')} in {relative(CHECKOUTS)}: "
+                       "run `swift package resolve` first")
+
+
+def check_revision(directory, pin):
+    revision = pin.get("state", {}).get("revision")
+    if not revision or not (directory / ".git").exists():
+        return
+    try:
+        head = subprocess.run(["git", "-C", str(directory), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        warn(f"could not read the revision of {relative(directory)}: {error}")
+        return
+    if head != revision:
+        raise NoticesError(f"{relative(directory)} is at {head}, but Package.resolved pins {revision}: "
+                           "run `swift package resolve` first")
+
+
+def license_files(directory):
+    files = [entry for entry in directory.iterdir()
+             if entry.is_file() and entry.name.upper().startswith(LICENSE_PREFIXES)]
+    return sorted(files, key=lambda entry: (
+        next(index for index, prefix in enumerate(LICENSE_PREFIXES) if entry.name.upper().startswith(prefix)),
+        entry.name))
+
+
+def section(title, text):
+    return f"{RULE}\n{title}\n{RULE}\n{text}"
+
+
+def render():
+    resolved_hash = resolved_sha256()
+    url = ghosttykit_url()
+    sections = []
+    for pin in pins():
+        identity = pin.get("identity", "")
+        state = pin.get("state", {})
+        location = pin.get("location", "")
+        revision = state.get("revision", "")
+        described = f"{state['version']}, {revision[:12]}" if state.get("version") else revision[:12]
+        if identity in ARTIFACT_LICENSES:
+            path = ARTIFACT_LICENSES[identity]
+            if not path.is_file():
+                raise NoticesError(f"missing {relative(path)}: run `swift package resolve` first")
+            name = location.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") or identity
+            sections.append(section(f"{name} ({location} {described}) — {relative(path)}", read_text(path)))
+            continue
+        directory = checkout_directory(pin)
+        check_revision(directory, pin)
+        files = license_files(directory)
+        if not files:
+            raise NoticesError(f"no LICENSE, NOTICE or COPYING file in {relative(directory)}")
+        for path in files:
+            sections.append(section(f"{directory.name} ({location} {described}) — {path.name}", read_text(path)))
+    sections.append(section("libghostty-spm (the GhosttyKit, GhosttyTerminal and GhosttyTheme packages) — "
+                            "ThirdParty/libghostty-spm/LICENSE",
+                            read_text(REPOSITORY / "ThirdParty/libghostty-spm/LICENSE")))
+    sections.append(section("GhosttyTheme's themes (iTerm2-Color-Schemes) — "
+                            "ThirdParty/libghostty-spm/Sources/GhosttyTheme/LICENSE",
+                            read_text(REPOSITORY / "ThirdParty/libghostty-spm/Sources/GhosttyTheme/LICENSE")))
+    sections.append(section("Ghostty (https://github.com/ghostty-org/ghostty) — LICENSE",
+                            read_text(REPOSITORY / "Host/vendor/ghostty-vt/LICENSE")))
+    ghosttykit = read_text(GHOSTTYKIT_NOTICES)
+    curated = curated_url(ghosttykit)
+    if curated != url:
+        warn(f"{relative(GHOSTTYKIT_NOTICES)} was curated for {curated or 'an unnamed GhosttyKit'}, "
+             f"but GhosttyKit is now {url}: curate it again")
+    sections.append(section(f"GhosttyKit's third-party code — {relative(GHOSTTYKIT_NOTICES)}", ghosttykit))
+    header = (
+        "Third-party notices for Cherry.app: the Swift packages it is built from and GhosttyKit.\n"
+        "Generated by Scripts/app-notices --write; do not edit by hand.\n"
+        f"{HASH_PREFIX}{resolved_hash}\n"
+        f"{URL_PREFIX}{url}\n"
+        "\n"
+        "The session helpers' notices are beside this file (Ghostty-VT-THIRD_PARTY_NOTICES.txt,\n"
+        "Rust-THIRD_PARTY_NOTICES.txt).\n"
+    )
+    return header + "\n" + "\n".join(sections)
+
+
+def write():
+    text = render()
+    NOTICES.parent.mkdir(parents=True, exist_ok=True)
+    handle, staged = tempfile.mkstemp(prefix=".THIRD_PARTY_NOTICES.", dir=NOTICES.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as file:
+            file.write(text)
+        os.chmod(staged, 0o644)
+        os.replace(staged, NOTICES)
+    except BaseException:
+        Path(staged).unlink(missing_ok=True)
+        raise
+    for line in todo_lines(text):
+        warn(f"{relative(NOTICES)}: {line}")
+    print(f"Wrote {relative(NOTICES)}", file=sys.stderr)
+
+
+def check():
+    if not NOTICES.is_file():
+        raise NoticesError(f"missing {relative(NOTICES)}: run Scripts/app-notices --write")
+    text = read_text(NOTICES)
+    written_hash, written_url = header_values(text)
+    resolved_hash = resolved_sha256()
+    url = ghosttykit_url()
+    stale = []
+    if written_hash != resolved_hash:
+        stale.append(f"it was written for Package.resolved {written_hash or '(none)'}, "
+                     f"which is now {resolved_hash}")
+    if written_url != url:
+        stale.append(f"it names GhosttyKit {written_url or '(none)'}, which is now {url}")
+    curated = curated_url(read_text(GHOSTTYKIT_NOTICES)) if GHOSTTYKIT_NOTICES.is_file() else None
+    if curated != url:
+        warn(f"{relative(GHOSTTYKIT_NOTICES)} was curated for {curated or 'an unnamed GhosttyKit'}, "
+             f"but GhosttyKit is now {url}: curate it again")
+    for line in todo_lines(text):
+        warn(f"{relative(NOTICES)}: {line}")
+    if stale:
+        raise NoticesError(f"{relative(NOTICES)} is stale: " + "; ".join(stale)
+                           + ". Run `swift package resolve`, then Scripts/app-notices --write, and commit it.")
+    print(f"{relative(NOTICES)} matches Package.resolved and GhosttyKit", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--write", action="store_true", help="Regenerate Packaging/THIRD_PARTY_NOTICES.txt")
+    mode.add_argument("--check", action="store_true", help="Fail when Packaging/THIRD_PARTY_NOTICES.txt is stale")
+    args = parser.parse_args()
+    try:
+        write() if args.write else check()
+    except NoticesError as error:
+        print(f"error: {error}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

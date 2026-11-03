@@ -2,7 +2,7 @@
 
 Status: phase 0 (groundwork), phase 1 (devices and remote project
 windows), phase 2 (Add Mac… installs the session host), phase 3 (parity:
-worktrees, cherry.toml, shell integration, editors, background sessions,
+cherry.toml, shell integration, editors, background sessions,
 dropped files, master shards), phase 4a (ports, URLs and forwards for
 device tabs, and pasted images) and phase 4b (Cherry MCP for agents running
 on another Mac) implemented on `codex/persistent-sessions`; the rest of
@@ -62,11 +62,10 @@ choosing a project folder, remote previews without SSH port forwarding.
 
 1. **Keys, not paths.** A remote project's root is its key everywhere a
    project is identified: `ProjectWindowRegistry`, `WorkspaceStateStore`
-   (`sha256(key).json`), notes and todos (`ProjectNoteStore`,
-   `ProjectTodoStore`: `sha256(key).json`), `CherryDeepLink.projectKey`
-   (the SHA-256 of the key, never of a path resolved against the current
-   directory), `AgentSettings` (projects, commands, overrides, hidden and
-   last active worktrees). No code treats a remote key as a local path: no
+   (`sha256(key).json`), todos (`ProjectTodoStore`: `sha256(key).json`),
+   `CherryDeepLink.projectKey` (the SHA-256 of the key, never of a path
+   resolved against the current directory), `AgentSettings` (projects,
+   commands, overrides). No code treats a remote key as a local path: no
    `FileManager` check, no `URL(fileURLWithPath:)` standardisation, no
    `cherry.toml` read or write, no `NSWorkspace` open.
 2. **Never run a remote tab locally.** A remote hosting has
@@ -246,24 +245,25 @@ What exists (`Sources/Cherry/RemoteDevices.swift`, `RemoteDeviceCheck.swift`,
   **Add**, for exactly what was checked (editing the host or its
   cherry-host path asks for a new check). A cherry-host found in a known
   install place is kept as `remoteHostPath` (`~/…`).
-- **Picker** (`TitlebarProjectMenuModel`, pure and tested by snapshot;
-  `TitlebarProjectMenuController` builds the `NSMenu`): after This Mac's
-  projects (remote keys never listed there), **Devices**, each Mac with a
-  status dot and subtitle (`RemoteDeviceConnectionState`: not checked /
-  last seen, connecting, connected · N sessions, offline, identity changed,
-  login refused, another protocol) and a submenu: its projects, which are
-  the `cherry.project` tags of every owner's sessions on its host (a device
-  key's path, or a plain path from that Mac's own Cherry) with counts, plus
-  `addedProjects`, minus `hiddenProjects` (an Option-alternate item hides
-  one); **Other sessions** (untagged; the Persistent Sessions sheet on that
-  host); **Open Home Folder**; **Add Project on <Mac>…** (a path, checked
-  there with `test -d` and `pwd -P`; there is no remote folder browser and
-  no `ListDir` request); a state row with **Reconnect** / **Trust New
-  Identity…**; **Persistent Sessions on <Mac>…**; **Rename…**;
-  **Remove…**. Then **Add Mac…**. The menu is built from what the hosts'
-  `HostControl`s last listed and, while open, lists each host again without
-  a lease (never one whose SSH login was refused, nor one another identity
-  or protocol answers) and updates each device's item in place.
+- **Picker** (phase 1's title-bar menu; the Omni bar has replaced it):
+  each Mac is a row of the bar (`OmniProviders.macs`) with a status dot
+  (`RemoteDeviceConnectionState`: not checked / last seen, connecting,
+  connected · N sessions, offline, identity changed, login refused, another
+  protocol), and its projects are among the bar's projects
+  (`ProjectSwitcherModel.make`): the `cherry.project` tags of every owner's
+  sessions on its host (a device key's path, or a plain path from that
+  Mac's own Cherry), plus `addedProjects`, minus `hiddenProjects` (a device
+  project's Remove from Projects hides it). A Mac row's ⌘K actions
+  (`OmniProviders.macActions`, from `TitlebarProjectMenuModel.Device`):
+  **Open Home Folder**; **Add Project on <Mac>…** (folder completion there)
+  and **New Terminal on <Mac>**; **Reconnect** / **Trust New Identity…** /
+  **Update Session Host…**; **Persistent Sessions on <Mac>…**; **Set Up
+  Cherry MCP on <Mac>…**; **Rename…**; **Remove…**. **Add Mac…** is one of
+  the bar's commands. The bar is built from what the hosts' `HostControl`s
+  last listed and, while open, lists each host again
+  (`OmniBarLiveModel.lookAtHosts`: a connected one over its connection, any
+  other with a look that starts nothing there, never one whose SSH login
+  was refused, nor one another identity or protocol answers).
 - **Remote windows**: `ProjectWorkspaceView` gives a `device:` key the
   device's hosting (`SessionBackendPolicy.remote`) and
   `hostedByDefault(localSessions: device hosting)`. A key of a device the
@@ -272,12 +272,22 @@ What exists (`Sources/Cherry/RemoteDevices.swift`, `RemoteDeviceCheck.swift`,
   tabs fail ("Couldn't start on an unknown Mac: …"), never local ones; its
   window keeps its saved tabs exactly as saved (no restore, no lease) until
   the device is known again. `RepositoryWorkspace` keeps the key
-  (`isRemote`: no git, no worktrees, no auto-start commands; the sidebar
+  (`isRemote`: no git, no auto-start commands; the sidebar
   hides project commands; Open in an editor is hidden), marks the hosting
   in use while open, holds a lease on the device's control connection
-  while the window has tabs, and starts `HostedReconnects` wake/network
-  monitoring. Title "<project> — <Mac>" with a computer glyph in the picker
-  (and the window title); each tab row has a device chip. The restore
+  while the window has tabs (from the tab a window with no saved tabs
+  opens with), and starts `HostedReconnects` wake/network monitoring. A
+  device's project can have several windows (File › New Window, ⌘N, from
+  the window's own key, never This Mac's last project): they share the
+  device's hosting, each marks it in use and holds its own lease, and
+  closing one leaves the others' connection up; a window of a device the
+  store no longer knows has no New Window
+  (`RepositoryWorkspace.allowsAnotherWindow`). The sidebar header reads
+  "<project> @ <Mac>" on one line, the Mac's name in its colour
+  (`RemoteDeviceHeaderAddress`), dimmed while its control reconnects and
+  grey with a warning when the user has to act
+  (`RemoteDeviceHeaderStatus`); the window title is the same. Tab rows do
+  not repeat the Mac (every tab of the window runs there). The restore
   routes records of the window's own host (`localSessions.profile.host`,
   not only `.local`) to the owning restore, so a device's tabs come back as
   its own; unbound records are looked for only on the host their `hostKey`
@@ -327,8 +337,8 @@ What exists (`Sources/Cherry/RemoteDevices.swift`, `RemoteDeviceCheck.swift`,
   sessions to end and the restore use it. `wasEndedOnPurpose` and the ended
   and lost session files are keyed by host identity for every host.
 - **Tests**: `RemoteDeviceTests` (store, SSH config, check parsing and
-  checklist, SSH error mapping, picker snapshots per state and the live
-  `NSMenu` update, discovery grouping, restore wording, reopen, records,
+  checklist, SSH error mapping, each device's state and its Omni bar
+  actions, discovery grouping, restore wording, reopen, records,
   offline adapter wait and keys, ends recorded offline, detach/⌘Z/quit
   count) and `RemoteDeviceRealHost*` (real helpers through
   `Scripts/fake-remote-mac`: Add Mac check and its SSH failures, a bare Mac
@@ -347,7 +357,7 @@ Deviations from the plan below: Add Mac… (connect and check) is in phase
 1; projects come from the device's session tags and added folders, not
 `AgentSettings.projects`, and "Open Folder on <Mac>…" is Open Home Folder
 plus Add Project on <Mac>… (no `ListDir`). The phase 1 leftovers (sidebar
-labels with the device's home, each device in Settings › Sessions, the
+labels with the device's home, each device in Settings › Macs, the
 quit question naming Macs, dropped files) were done in phase 3.
 
 ## Phase 2 as built
@@ -551,31 +561,21 @@ of `BackgroundSessions.swift`, `HostControlSSHMaster.swift`'s shards,
   an `error`, no text). It runs only the git `CHERRY_GIT` names (unset or
   empty: no git at all, `git_error: "git not found"`, never one from PATH,
   which on a Mac without the command line tools would pop their install
-  prompt), reads only, and never starts or talks to a daemon. The app runs it as a one-shot `sh -s`
+  prompt), reads only, and never starts or talks to a daemon. Since
+  worktree spaces were removed (2026-10-13) the app unsets `CHERRY_GIT`,
+  so no git runs there. The app runs it as a one-shot `sh -s`
   script over the device's ssh (`RemoteProjectAccess`: the master's
-  `ControlPath` while it is up, else its own BatchMode ssh), which finds a
-  git that will not ask to install the command line tools (`command -v
-  git`, Homebrew's, `/usr/bin/git` only when `xcode-select -p` answers) and
-  runs the device's cherry-host (`remoteHostPath`, else `PATH`), with
-  `CHERRY_GIT` unset when it found none. The answer
+  `ControlPath` while it is up, else its own BatchMode ssh), which runs the
+  device's cherry-host (`remoteHostPath`, else `PATH`) with `CHERRY_GIT`
+  unset. The answer
   is versioned (`version: 1`); an older cherry-host without the subcommand,
   or another version, is `RemoteProjectError.unsupported` ("update it").
   The app re-checks the cap (a text over 256 KiB is not used) and reads at
   most 4 MiB.
-- **Remote git worktrees.** `GitWorktreeService` takes a runner
-  (`GitWorktreeService(runner:isLocal:)`); a device window's is
-  `RemoteProjectAccess.gitRunner`, which runs `exec "$git" '<arg>'…` in a
-  `sh -s` script there (so any login shell runs it; an ssh failure is a
-  `GitWorktreeCommandError` with the ssh message). `RepositoryWorkspace`
-  (given `remoteProject`, the app passes `RemoteProjectAccess.app(device)`
-  for a known device) names worktrees by key (`device:<id>:<path>`) and
-  converts to the device's paths for git (`gitPath`); its refresh is one
-  `project-info` for the project, then one for the other worktrees'
-  cherry.toml; discovery, dirty status, New Worktree… (under the device's
-  `~/.cherry/worktrees`, `managedWorktreeDestination`; git makes the
-  folders), branch references, fetch, rename, remove, remove all and prune
-  run there. Hidden and last active worktrees are kept by key.
-  `GitWorktree.displayPath` shows the path, never the key.
+- **Remote git worktrees** were removed with worktree spaces
+  (2026-10-13). `RepositoryWorkspace` (given `remoteProject`, the app
+  passes `RemoteProjectAccess.app(device)` for a known device) refreshes
+  with one `project-info` for the project.
 - **cherry.toml on devices.** `RemoteProjectFiles` keeps each device
   project's text by key (from `project-info`), and `CherryProjectFile`
   parses it (commands, features, appearance) as it parses a local file.
@@ -588,8 +588,7 @@ of `BackgroundSessions.swift`, `HostControlSSHMaster.swift`'s shards,
   for This Mac; restart on exit is unchanged. A device that cannot be
   reached when its window opens is read again once its control connects
   (`refreshRemoteProjectOnConnection`), and auto-start keeps waiting until
-  then. New Worktree… asks a device whose home is not recorded for it
-  (`printf "$HOME"`, then recorded) and refuses when it cannot say.
+  then.
 - **Shell integration there.** The installer copies Ghostty's terminfo and
   shell integration (this Cherry's bundled resources, `RemoteHostResources`)
   next to the helpers as `<build>/terminfo` and `<build>/Ghostty`, in the
@@ -664,7 +663,7 @@ of `BackgroundSessions.swift`, `HostControlSSHMaster.swift`'s shards,
   keeps the told ids of a host that did not answer.
 - **Phase 1 leftovers.** Sidebar and context bar paths use the device's
   home for `~` (`TerminalSession.pathHomeDirectory`; not known: nothing is
-  shortened, never with This Mac's). Settings › Sessions › Other Macs lists
+  shortened, never with This Mac's). Settings › Macs lists
   each device (`RemoteDeviceSettingsRow`: connected, connecting, not
   connected, offline, needs attention, "Update available") with Reconnect
   (or Trust New Identity…), Update Session Host… and Remove…. The quit
@@ -688,8 +687,7 @@ of `BackgroundSessions.swift`, `HostControlSSHMaster.swift`'s shards,
   dropped files and scp's options) and `HostControlSSHMasterTests` (shards,
   a shard that cannot log in stopping further shards for its backoff, an
   idle shard kept as the spare) and `RemoteDeviceRealHostParityTests`
-  through `Scripts/fake-remote-mac` (worktrees created, dirty and removed on
-  the device through the runner; cherry.toml commands auto-started and
+  through `Scripts/fake-remote-mac` (cherry.toml commands auto-started and
   restarted there, local overrides, the 256 KiB cap, an old cherry-host;
   the terminfo and zsh integration installed, `TERM=xterm-ghostty` with a
   working `infocmp`, OSC 7 reaching the tab, the next tab's directory;
@@ -698,8 +696,7 @@ of `BackgroundSessions.swift`, `HostControlSSHMaster.swift`'s shards,
   directly when the master refuses every session; a look at a device
   without a daemon starting none, and listing one that runs; a window
   opened while its device is offline reading its project and starting its
-  commands once it connects; New Worktree… asking the device for its
-  home). The fake Mac's shim gained
+  commands once it connects). The fake Mac's shim gained
   stand-in masters (`DIR/masters`) and a MaxSessions stand-in
   (`DIR/max-sessions`). `Scripts/test-remote-mac-loopback`'s sshd has
   `MaxSessions 3` and runs the shard test over real SSH (a fourth session
@@ -719,7 +716,7 @@ Deviations from the plan below:
   protocol (`-O`), which any sshd serves.
 - Background Sessions per device, their notifications and unread marks, and
   the launch notice naming devices (phase 4 in the plan) are done here.
-- Settings › Sessions shows each device's connection state, not a
+- Settings › Macs shows each device's connection state, not a
   per-device `PersistentSessionsStatus`.
 
 ## Phase 4a as built
@@ -877,6 +874,17 @@ Deviations from the plan below:
 
 ## Phase 4b as built
 
+> **2026-10-20:** Cherry MCP is gone (docs/specs/agent-cli.md, phase 6).
+> What follows about the stdio server, launch-time `--mcp-config`, the Pi
+> extension in the install and Set Up Cherry MCP on <Mac>… is history:
+> device agents now get the `cherry` CLI's flags, gated the same way
+> (`RemoteAgentLaunch`, docs/cli.md › Agents On Another Mac), and the
+> install carries no Pi extension. Since phase 7 of docs/specs/agent-cli.md
+> the install carries no CherryMCP either: its `cherry` sends each command
+> to the app over the forward itself (`runCommand`), and its tabs get no
+> `CHERRY_MCP_HELPER`. The forward, the tokens and every bound below are
+> unchanged.
+
 Cherry MCP for agents running in a device's tabs (Claude Code, Codex): the
 same tools as a local agent in that window, but bounded to that Mac: a
 caller on device D reaches only sessions, windows and projects whose
@@ -939,7 +947,8 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
 - **Identity: per-tab capability tokens.** `RemoteLaunchSpec` gives every
   device tab `CHERRY_CONTROL_SOCKET` (the path there), `CHERRY_MCP_TOKEN`,
   `CHERRY_MCP_HELPER` (the install's CherryMCP, when the install has the
-  resources) and `CHERRY_CONTROL_MACHINE` (This Mac's name), next to
+  resources, with `CHERRY_MCP_SERVER_NAME`, the identity's scheme) and
+  `CHERRY_CONTROL_MACHINE` (This Mac's name), next to
   `CHERRY_PROCESS_ID`; This Mac's values of these are never sent
   (`localOnlyKeys`). The token is 64 hex digits: HMAC-SHA256 of
   `cherry-mcp-v2`, the device id, the tab id and the tab's launch
@@ -983,9 +992,10 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
     `device:` key of its Mac, refused with `invalid_project_root` when it
     has a `.` or `..` component (in the raw key too) or is not absolute, and
     with `outside_caller_mac` when it is another device's key; the window
-    is the device window with that path, or the one whose path contains it;
-    never through `standardizedProjectRoot`;
-  - Open Project (`activate_worktree`) opens only a known key of its Mac,
+    is a window of that device with that path (the caller's own when it is
+    one, else the one active most recently), or one whose path contains
+    it; never through `standardizedProjectRoot`;
+  - Open Project (`open_project`) opens only a known key of its Mac,
     matched exactly;
   - the one choke point, `requireOnRemoteDevice`, at the top of
     `handleUnscoped` (which every tool runs through after all mapping),
@@ -996,7 +1006,7 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
     windows, so another window's id is `terminal_not_found`; links resolve
     only to its Mac's projects (`found: false` otherwise, no output);
   - `list_projects` lists only its Mac's projects; the other listings
-    (processes, terminals, agents' counts, services, notes, todos, status)
+    (processes, terminals, agents' counts, services, todos, status)
     are of its window, which the choke point checks;
   - (second review) a session must itself be on its Mac, not only its
     window: Persistent Sessions could attach a This Mac session, or a saved
@@ -1030,16 +1040,20 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
 - **CherryMCP on the device.** The installer copies CherryMCP with the
   Ghostty resources (`RemoteHostHelpers.mcpHelper`: next to the app's
   helpers, else next to the running executable), as `<build>/CherryMCP`,
-  immutable per build. It is part of the resources digest
-  (`resources_hash` hashes it with the trees), so a build without it is
-  copied again, and `xattr -c` clears it. `Scripts/build-mcp-helper` builds
+  immutable per build, and with it Cherry's Pi extension
+  (`RemoteHostHelpers.piExtension`: the bundle's `cherry-pi-mcp.ts`, only
+  with a CherryMCP) as `<build>/cherry-pi-mcp.ts`. Both are part of the
+  resources digest (`resources_hash` hashes them with the trees, the
+  extension only when the directory has it, so an install made before
+  Cherry had it hashes as it did), so a build without them is copied
+  again, and `xattr -c` clears them. `Scripts/build-mcp-helper` builds
   it universal (one SwiftPM build per triple, joined with `lipo`);
   `install-local-app` and `package-dmg` check its architectures. It needs
   the macOS the package declares on that Mac too; Set Up says when it does
   not run there. CherryMCP gained `--version` and `--call TOOL [JSON]` (one
   call, for checks and tests).
 - **Agent configuration there: "Set Up Cherry MCP on <Mac>…"** (the
-  device's menu, and Settings › Sessions › Other Macs), never done
+  device's menu, and Settings › Macs), never done
   silently. The sheet shows the exact commands and first runs only a check
   (`command -v claude`, `command -v codex` on the login PATH, CherryMCP
   `--version`; no agent CLI runs, no configuration is read). **Set Up**
@@ -1060,6 +1074,46 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
   `claude mcp remove --scope user cherry` and `codex mcp remove cherry`
   (the launcher stays: another Cherry may use it). The server's name is
   the identity's URL scheme (`cherry`).
+- **Later: the app runs the tools, and agents Cherry starts need no Set
+  Up** (docs/cli.md › Versions, Agents On Another Mac). A device install's
+  CherryMCP from control protocol 2 on is a pipe: its `tools/list` is the
+  app's `listTools` and each call one `callTool`, sent in the envelope
+  through the same listener. The app runs the tool layer with the token's
+  tab as the caller and dispatches each of the tool's requests through
+  `handle(_:remoteCaller:)`, checking the token again before each one, so
+  `requireOnRemoteDevice`, `callerSessions`, `callerReaches`, `probeURL`
+  and `unattributed_not_available` apply exactly as to typed requests (no
+  pid crosses machines: `callerProcessChain` is nil there); `appInfo` and
+  `listTools` need a valid token too, and `get_status` reports the
+  forward, never a path of This Mac. An older install's helper keeps
+  sending typed requests. Device tabs also get `CHERRY_CLI`, the install's
+  `cherry` (`RemoteMCPPaths.cliPath`, only with `installedResources` and
+  Cherry MCP). An agent tab's plain `claude`, `codex` or `pi` line, under
+  an sh-family login shell and with the forwarded socket and the install's
+  CherryMCP, is gated on its CLI's version there
+  (`RemoteAgentMCPLaunch`: `if [ -x <helper> ] && cherry_v=$(<cli>
+  --version …) && <awk: at least the minimum>; then exec <line> <flags>; else exec <line>; fi`,
+  and for Pi also `[ -r <build>/cherry-pi-mcp.ts ]` after the helper's
+  check): a new enough CLI gets `--mcp-config`/`-c mcp_servers.<scheme>=…`
+  naming `<build>/CherryMCP` (Codex's `env_vars` with the token's name,
+  never its value), or for Pi 0.99.2 or later `-e
+  <build>/cherry-pi-mcp.ts` (an install without the file, until Update
+  Session Host…, runs the line as before), both branches `exec` so the
+  session's program stays the agent (a shell function of that name is not
+  used), and fish, csh and tcsh keep today's line. It follows Settings ›
+  Agents & MCP › Connect agents Cherry starts through the app's store only
+  (`RemoteLaunchSpec.Device.connectsAgentsAtLaunch`); a test's store never
+  connects agents. Set Up stays for agents started there by hand; Pi's
+  registers with `--exposure deferred --description …` only after `pi
+  --version` there shows 0.99.2 or later on its standard output (no direct
+  fallback); any other Pi is skipped (`pi_skipped`), in Set Up and Remove
+  alike, since an older one would take `mcp add …` as prompts (Pi 0.62.0
+  prints its version on standard error, so it is skipped too; the script
+  reads that, `pi_version_errors`, only for the sheet's "Pi 0.62.0: no MCP,
+  update Pi there"). A Pi agent
+  Cherry starts there uses Set Up's registration instead of the
+  extension's server when Pi has one (its file entry wins); it names the
+  launcher, so it never goes stale.
 - **Offline.** When the forwarded socket does not answer (Cherry quit, the
   Mac slept, the master is being made again) or closes without an answer,
   CherryMCP's tools fail with `cherry_unreachable`: "Cherry on <This Mac>
@@ -1076,8 +1130,8 @@ first cut, see *Scope boundary*) (`Sources/Cherry/RemoteMCP.swift`, `RemoteMCPSe
   refused, with no spawn in and no input to the This Mac window (whose
   command a local caller shows live); a nested scoped JSON line refused;
   a This Mac tab's and another device's tab's ids `terminal_not_found`
-  for status, output, input, send_input, restart, stop, close, ports and
-  terminal output, and a link to it not found; another device's key and
+  for status, output, input, restart, stop, close and ports, and a link
+  to it not found; another device's key and
   This Mac's root refused, its own path, key and a folder inside resolving;
   list_projects, list_processes, list_terminals and status of its Mac only;
   the envelope; the unreachable message; the launch environment in the
@@ -1216,6 +1270,25 @@ store's reads in `RemoteDevices.swift`, `RemoteLaunchSpec`):
   shell whose syntax is not known here (nushell) gets PATH in `env` instead.
   A terminal tab gets none of this: its login shell reads its own startup
   files. `CHERRY_LOGIN_PATH` from a tab's own variables is never sent.
+- **`cherry` in a terminal there**: the install's directory first on PATH
+  once the startup files ran, as Cherry's zsh bootstrap puts This Mac's
+  first after `.zshrc`, so `cherry` is the install's even when that Mac's
+  own (an older Cherry.app's `~/.local/bin/cherry`) comes first
+  (`RemoteShellBootstrap`). The terminal gets it as `CHERRY_BIN_DIR`, and
+  a file of Cherry's goes in front of Ghostty's integration: zsh's
+  `.zshenv` (ZDOTDIR; it runs Ghostty's `.zshenv`, then prepends at the
+  first prompt), bash's ENV file (it runs Ghostty's `ghostty.bash`, which
+  reads the startup files, then prepends) and fish's `vendor_conf.d` (it
+  takes its directory back out of `XDG_DATA_DIRS` and prepends at the
+  first prompt). The launch line writes the shell's file there itself,
+  through a temporary file and a rename, into
+  `~/Library/Application Support/cherry-host/shell/<digest>/`, named by
+  the files' contents, so older installs get it too and a launch never
+  reads other contents; when it cannot write it the terminal starts with
+  Ghostty's alone. Only terminals with Ghostty's integration there (a
+  device with `installedResources` and a known login shell); Apple's
+  /bin/bash (which Ghostty does not integrate) and other shells keep that
+  Mac's PATH.
 - **When it cannot be read**: today's launch (the host's PATH, the
   account's). The launch records why (`HostedLaunchSpec.loginPathProblem`,
   `PersistentSessionLaunch.loginPathProblem`,
@@ -1274,8 +1347,8 @@ the device.
    additive, or `cherry list-dir` over the control connection; not SFTP).
    A device that cannot be reached shows its projects disabled with the
    reason.
-3. **Remote windows.** `RepositoryWorkspace` for a remote key: no git or
-   worktree scan (a single worktree whose root is the key), its
+3. **Remote windows.** `RepositoryWorkspace` for a remote key: no git, its
+   one workspace's root is the key, its
    `SessionBackendPolicy.localSessions` is the device's hosting, restore
    uses `WorkspaceSessionRestorers.hostedByDefault(localSessions: device
    hosting, …)`, and the orphan scan runs against that host with the
@@ -1286,12 +1359,12 @@ the device.
    remote tab's signals through, its directory still comes from the host's
    `changed` events (`hostReportedWorkingDirectory`); restoring and
    system-ended tabs (`makeSystemEndedSession`) must not check directories
-   on this Mac either. Notes and todos
-   work unchanged (keyed by the key). Open in editor is hidden (phase 3).
+   on this Mac either. Todos work unchanged (keyed by the key). Open in
+   editor is hidden (phase 3).
 4. **Failure UI.** A failed remote tab shows a bar like
    `PersistentSessionFallbackBar`: "Couldn't start on <Mac>: <reason>" with
    **Retry** (`retryPersistentSession`), never "Not a persistent session".
-   Settings › Sessions shows each device's `PersistentSessionsStatus`.
+   Settings › Macs shows each device's `PersistentSessionsStatus`.
 5. **Records.** `WorkspaceSessionRecord` gains `hostKey` (the
    `HostedSessionHost.id` a record without a binding was being created on),
    so a remote tab saved while its Create was under way is looked for on

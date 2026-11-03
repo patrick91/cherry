@@ -10,7 +10,7 @@ import Foundation
 // `wait_for_tasks` (or ends its turn: Cherry types one line into its tab
 // once the run settled) and reads results with `get_task`. Task records
 // are kept by the app, which saves them (`agent-tasks.json`) so they
-// survive its relaunch (docs/mcp.md, Tasks and results).
+// survive its relaunch (docs/cli.md, Tasks and results).
 
 extension CherryControl {
     /// The longest `wait_for_tasks` call, as `wait_for_events`.
@@ -19,6 +19,9 @@ extension CherryControl {
     public static let maximumTaskSummaryCharacters = 400
     /// A `report_progress` message, in characters; a longer one is cut.
     public static let maximumTaskProgressCharacters = 200
+    /// A `report_progress` message that asks for approval (the plan or the
+    /// question, its lines kept), in characters; a longer one is cut.
+    public static let maximumTaskApprovalRequestCharacters = 4_000
 }
 
 /// Any JSON value: a task's result and its schema.
@@ -117,21 +120,6 @@ public enum JSONValue: Codable, Equatable, Sendable {
         default: nil
         }
     }
-
-    /// Equal as JSON: numbers compare by value (1 equals 1.0).
-    public func isJSONEqual(to other: JSONValue) -> Bool {
-        if let left = numberValue, let right = other.numberValue { return left == right }
-        switch (self, other) {
-        case (.array(let left), .array(let right)):
-            return left.count == right.count && zip(left, right).allSatisfy { $0.isJSONEqual(to: $1) }
-        case (.object(let left), .object(let right)):
-            return left.count == right.count && left.allSatisfy { key, value in
-                right[key].map { value.isJSONEqual(to: $0) } ?? false
-            }
-        default:
-            return self == other
-        }
-    }
 }
 
 /// A task's state, as `get_task`, `wait_for_tasks` and the process
@@ -143,6 +131,10 @@ public enum AgentTaskState: String, Codable, CaseIterable, Equatable, Sendable {
     case working
     /// Its worker waits for the user: a permission prompt or a question.
     case needsInput = "needs_input"
+    /// Its worker asked its orchestrator for approval or an answer
+    /// (`report_progress` with `awaiting_approval`) and ended its turn:
+    /// open, never nudged, until input is sent to it or it reports again.
+    case awaitingApproval = "awaiting_approval"
     /// Its worker reported a result with status ok.
     case reported
     /// Its worker went idle without reporting, even after Cherry asked
@@ -158,7 +150,7 @@ public enum AgentTaskState: String, Codable, CaseIterable, Equatable, Sendable {
     /// result, except for a cancelled task).
     public var isSettled: Bool {
         switch self {
-        case .queued, .working, .needsInput: false
+        case .queued, .working, .needsInput, .awaitingApproval: false
         case .reported, .noReport, .failed, .cancelled: true
         }
     }
@@ -271,7 +263,10 @@ public enum AgentTaskEventKind: String, Codable, CaseIterable, Equatable, Sendab
     case started
     case progress
     case needsInput = "needs_input"
-    /// Back at work after `needs_input`.
+    /// The worker asks its orchestrator for approval or an answer (the
+    /// event's text is its question).
+    case awaitingApproval = "awaiting_approval"
+    /// Back at work after `needs_input` or `awaiting_approval`.
     case resumed
     /// Cherry asked the idle worker once to report.
     case nudged
@@ -285,8 +280,8 @@ public enum AgentTaskEventKind: String, Codable, CaseIterable, Equatable, Sendab
     case noReport = "no_report"
     case cancelled
 
-    /// A task settles with it (`until: any` returns on these and
-    /// `needs_input`).
+    /// A task settles with it (`until: any` returns on these,
+    /// `needs_input` and `awaiting_approval`).
     public var settles: Bool {
         switch self {
         case .reported, .failed, .noReport, .cancelled: true
@@ -347,12 +342,31 @@ public struct AgentRunCounts: Codable, Equatable, Sendable {
     public var queued = 0
     public var working = 0
     public var needsInput = 0
+    public var awaitingApproval = 0
     public var reported = 0
     public var noReport = 0
     public var failed = 0
     public var cancelled = 0
 
     public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case total, queued, working, needsInput, awaitingApproval, reported, noReport, failed, cancelled
+    }
+
+    // `awaitingApproval` came later: an older app's counts lack it.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        total = try container.decode(Int.self, forKey: .total)
+        queued = try container.decode(Int.self, forKey: .queued)
+        working = try container.decode(Int.self, forKey: .working)
+        needsInput = try container.decode(Int.self, forKey: .needsInput)
+        awaitingApproval = try container.decodeIfPresent(Int.self, forKey: .awaitingApproval) ?? 0
+        reported = try container.decode(Int.self, forKey: .reported)
+        noReport = try container.decode(Int.self, forKey: .noReport)
+        failed = try container.decode(Int.self, forKey: .failed)
+        cancelled = try container.decode(Int.self, forKey: .cancelled)
+    }
 
     public init(states: [AgentTaskState]) {
         for state in states { add(state) }
@@ -364,6 +378,7 @@ public struct AgentRunCounts: Codable, Equatable, Sendable {
         case .queued: queued += 1
         case .working: working += 1
         case .needsInput: needsInput += 1
+        case .awaitingApproval: awaitingApproval += 1
         case .reported: reported += 1
         case .noReport: noReport += 1
         case .failed: failed += 1
@@ -465,9 +480,14 @@ public struct ReportResultResult: Codable, Equatable, Sendable {
 
 public struct ReportProgressRequest: Codable, Equatable, Sendable {
     public let message: String
+    /// The worker asks its orchestrator for approval or an answer (the
+    /// message is its question) and ends its turn: the task waits
+    /// (`awaiting_approval`) instead of being asked to report.
+    public let awaitingApproval: Bool?
 
-    public init(message: String) {
+    public init(message: String, awaitingApproval: Bool? = nil) {
         self.message = message
+        self.awaitingApproval = awaitingApproval
     }
 }
 
@@ -477,11 +497,14 @@ public struct ReportProgressResult: Codable, Equatable, Sendable {
     public let recorded: Bool
     /// When not recorded: how long until the next one is.
     public let retryAfterMilliseconds: Int?
+    /// The task's state after it (absent from an older app).
+    public let state: AgentTaskState?
 
-    public init(taskID: String, recorded: Bool, retryAfterMilliseconds: Int? = nil) {
+    public init(taskID: String, recorded: Bool, retryAfterMilliseconds: Int? = nil, state: AgentTaskState? = nil) {
         self.taskID = taskID
         self.recorded = recorded
         self.retryAfterMilliseconds = retryAfterMilliseconds
+        self.state = state
     }
 }
 
@@ -838,8 +861,8 @@ public enum TaskResultSchema {
         }
     }
 
-    /// A key equal for values `isJSONEqual` takes as equal (numbers by
-    /// value, object keys in any order), counting one step per node.
+    /// A key equal for values equal as JSON (numbers by value, so 1 equals
+    /// 1.0; object keys in any order), counting one step per node.
     static func canonicalKey(_ value: JSONValue, steps: inout Int) -> String {
         steps += 1
         switch value {

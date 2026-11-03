@@ -4,6 +4,14 @@ import Foundation
 import Testing
 @testable import Cherry
 
+/// A flag the fake helper's reply closures set and read off the main actor.
+private final class HostControlFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+    func set() { lock.withLock { storage = true } }
+    var value: Bool { lock.withLock { storage } }
+}
+
 @MainActor
 private final class EventRecorder {
     private(set) var events: [HostSessionEvent] = []
@@ -23,16 +31,6 @@ private final class EventRecorder {
     }
 }
 
-@MainActor
-private func waitFor(_ timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return condition()
-}
-
 @Test @MainActor func HostControlStartsTheHelperVerifiesTheHostSubscribesAndLists() async throws {
     let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
     defer { defaults.removePersistentDomain(forName: suite) }
@@ -46,13 +44,13 @@ private func waitFor(_ timeout: TimeInterval = 5, _ condition: () -> Bool) async
     #expect(list.sessions.map(\.id) == ["s1", "s2"])
     #expect(local.state == .connected)
     #expect(local.hostID == "host-a")
-    #expect(local.isSubscribed)
+    #expect(fake.requests("subscribe").count == 1)
     #expect(local.sessions == list.sessions)
     // The helper is `cherry control`, with the login shell's variables and
     // none of a Cherry tab's identity (the test may run inside a Cherry tab).
     let launch = try #require(fake.launches.first)
     #expect(launch.executableURL.path == "/fake/bin/cherry")
-    #expect(launch.arguments == ["control"])
+    #expect(launch.arguments == ["host", "control"])
     #expect(launch.environment["SSH_AUTH_SOCK"] == "/login/agent.sock")
     #expect(launch.environment["PATH"] == "/login/bin:/usr/bin")
     #expect(launch.environment["CHERRY_PROCESS_ID"] == nil)
@@ -71,7 +69,7 @@ private func waitFor(_ timeout: TimeInterval = 5, _ condition: () -> Bool) async
     let remote = makeFakeHostControl(fake, host: devbox, hostStore: store)
     defer { remote.disconnect() }
     _ = try await remote.list()
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "host", "control"])
     #expect(store.trustedHostID(for: devbox) == "host-a")
 }
 
@@ -129,7 +127,6 @@ private final class HeldRequests: @unchecked Sendable {
     let control = makeFakeHostControl(fake, hostStore: store)
     defer { control.disconnect() }
     let recorder = EventRecorder(control)
-    let stream = control.eventStream()
     try await control.connect()
     let connection = try #require(fake.connections.last)
 
@@ -152,17 +149,11 @@ private final class HeldRequests: @unchecked Sendable {
 
     #expect(await recorder.wait { $0.count == sent.count + 1 })
     #expect(recorder.events == sent + [.bell(id: "last")])
-    var streamed: [HostSessionEvent] = []
-    for await event in stream {
-        streamed.append(event)
-        if streamed.count == sent.count + 1 { break }
-    }
-    #expect(streamed == recorder.events)
     // added → listed, changed → replaced, exited → exited, removed → gone.
     #expect(control.sessions == [titled])
 
     connection.push(.event(.exited(id: "s1", exitCode: 130, signal: 2)))
-    #expect(await waitFor { control.sessions.first?.state == .exited })
+    #expect(await eventually { control.sessions.first?.state == .exited })
     #expect(control.sessions.first?.exitCode == 130)
     #expect(control.sessions.first?.exitSignal == 2)
     #expect(control.sessions.first?.title == "vim")
@@ -222,7 +213,7 @@ private final class HeldRequests: @unchecked Sendable {
     let recorder = EventRecorder(control)
     let lease = control.retain()
     defer { lease.release() }
-    #expect(await waitFor { control.state == .connected })
+    #expect(await eventually { control.state == .connected })
     #expect(fake.launches.count == 1)
 
     // A request in flight when the connection drops may or may not have
@@ -241,7 +232,7 @@ private final class HeldRequests: @unchecked Sendable {
     #expect(failure?.localizedDescription.contains("connection to devbox closed") == true)
 
     // Leased: it reconnects on its own, lists again and reports the difference.
-    #expect(await waitFor { control.state == .connected && fake.launches.count == 2 })
+    #expect(await eventually { control.state == .connected && fake.launches.count == 2 })
     #expect(await recorder.wait { $0.last == .resync })
     #expect(control.sessions.map(\.id) == ["keep", "ends", "new"])
     #expect(recorder.events.contains(.removed(id: "gone")))
@@ -254,21 +245,21 @@ private final class HeldRequests: @unchecked Sendable {
     // Helpers that fail to start are retried with backoff while leased.
     fake.launchFailure = "helper missing"
     fake.dropAll()
-    #expect(await waitFor { fake.launches.count >= 5 })
+    #expect(await eventually { fake.launches.count >= 5 })
     guard case .waitingToReconnect(let error) = control.state else {
         Issue.record("Expected a reconnect wait, got \(control.state)")
         return
     }
     #expect(error.isUnavailable)
     fake.launchFailure = nil
-    #expect(await waitFor { control.state == .connected })
+    #expect(await eventually { control.state == .connected })
 
     // Without a lease, a lost connection is not reopened until it is used.
     lease.release()
     try await Task.sleep(for: .milliseconds(20))
     let launches = fake.launches.count
     fake.dropAll()
-    #expect(await waitFor { control.state == .idle })
+    #expect(await eventually { control.state == .idle })
     try await Task.sleep(for: .milliseconds(100))
     #expect(fake.launches.count == launches)
     _ = try await control.list()
@@ -542,7 +533,7 @@ private final class HeldRequests: @unchecked Sendable {
     #expect(updates[1]["name"] == nil)
     #expect(updates[1]["tags"] as? [String: String] == ["cherry.kind": "agent"])
     try await control.terminate("s1")
-    #expect(await waitFor { control.sessions.first?.isRunning == false })
+    #expect(await eventually { control.sessions.first?.isRunning == false })
     try await control.remove("s1")
     #expect(control.sessions.isEmpty)
 }
@@ -558,7 +549,7 @@ private final class HeldRequests: @unchecked Sendable {
     defer { control.disconnect() }
     let lease = control.retain()
     defer { lease.release() }
-    #expect(await waitFor { control.state == .connected })
+    #expect(await eventually { control.state == .connected })
     #expect(await fake.wait { fake.requests("ping").count >= 3 })
     #expect(fake.launches.count == 1)
 
@@ -570,30 +561,8 @@ private final class HeldRequests: @unchecked Sendable {
         guard request.op == "ping", silenced.value, connection.number == 0 else { return nil }
         return .silence
     }
-    #expect(await waitFor { fake.launches.count == 2 && control.state == .connected })
+    #expect(await eventually { fake.launches.count == 2 && control.state == .connected })
     #expect(fake.connections.first?.isClosed == true)
-
-    // Without events the idle limit applies, so pings come more often than
-    // the heartbeat interval.
-    #expect(HostProtocol.idleTimeout / 2 < HostProtocol.heartbeatInterval)
-}
-
-@Test @MainActor func HostControlWithoutEventsPollsForASessionToEnd() async throws {
-    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
-    defer { defaults.removePersistentDomain(forName: suite) }
-    let fake = FakeControlHelper(sessions: [hostedSession("s1")])
-    fake.supportsSubscribe = false
-    let control = makeFakeHostControl(fake, hostStore: store)
-    defer { control.disconnect() }
-    try await control.connect()
-    #expect(!control.isSubscribed)
-    #expect(control.state == .connected)
-
-    fake.sessions = [hostedSession("s1", state: .exited, exitCode: 0)]
-    let lists = fake.requests("list").count
-    #expect(try await control.waitForSession("s1", timeout: .seconds(5)) { $0?.isRunning == false })
-    #expect(fake.requests("list").count > lists)
-    #expect(try await !control.waitForSession("s1", timeout: .milliseconds(80)) { $0 == nil })
 }
 
 @Test @MainActor func HostControlWaitingForEventsFallsBackToPollingWhenTheConnectionDrops() async throws {
@@ -603,7 +572,7 @@ private final class HeldRequests: @unchecked Sendable {
     let control = makeFakeHostControl(fake, hostStore: store)
     defer { control.disconnect() }
     try await control.connect()
-    #expect(control.isSubscribed)
+    #expect(fake.requests("subscribe").count == 1)
 
     let waiting = Task { try await control.waitForSession("s1", timeout: .seconds(5)) { $0?.isRunning == false } }
     try await Task.sleep(for: .milliseconds(50))
@@ -623,16 +592,16 @@ private final class HeldRequests: @unchecked Sendable {
     let control = makeFakeHostControl(fake, hostStore: store, configuration: configuration)
     _ = try await control.list()
     // The helper sees the end of its input and exits.
-    #expect(await waitFor { control.state == .idle })
+    #expect(await eventually { control.state == .idle })
     #expect(await fake.wait { fake.connections.first?.isClosed == true })
 
     // A lease keeps it open.
     let lease = control.retain()
-    #expect(await waitFor { control.state == .connected })
+    #expect(await eventually { control.state == .connected })
     try await Task.sleep(for: .milliseconds(250))
     #expect(control.state == .connected)
     lease.release()
-    #expect(await waitFor { control.state == .idle })
+    #expect(await eventually { control.state == .idle })
     #expect(await fake.wait { fake.connections.allSatisfy { $0.isClosed } })
 }
 
@@ -649,7 +618,7 @@ private final class HeldRequests: @unchecked Sendable {
     _ = try await control.list()
 
     // Pings keep a connection alive; they do not use it.
-    #expect(await waitFor { control.state == .idle })
+    #expect(await eventually { control.state == .idle })
     #expect(fake.requests("ping").count >= 2)
     #expect(await fake.wait { fake.connections.first?.isClosed == true })
     #expect(fake.launches.count == 1)
@@ -657,7 +626,7 @@ private final class HeldRequests: @unchecked Sendable {
     // A request someone makes restarts the countdown; the next heartbeat does not.
     _ = try await control.list()
     #expect(fake.launches.count == 2)
-    #expect(await waitFor { control.state == .idle })
+    #expect(await eventually { control.state == .idle })
 }
 
 @Test @MainActor func HostControlRetriesACreateThatWentUnansweredOnANewConnection() async throws {
@@ -699,7 +668,7 @@ private final class HeldRequests: @unchecked Sendable {
     let control = makeFakeHostControl(fake, host: devbox, hostStore: store)
     defer { control.disconnect() }
     _ = try await control.list()
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "--expected-host-id", trusted, "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "--expected-host-id", trusted, "host", "control"])
 
     // Another host answers for the destination. The helper refuses it before
     // using it (or replacing an older one), and the app reports a mismatch,
@@ -721,11 +690,11 @@ private final class HeldRequests: @unchecked Sendable {
 
     // Trusting the new identity is the user's decision: that helper expects none.
     try await control.trustNewIdentity()
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "host", "control"])
     #expect(store.trustedHostID(for: devbox) == other)
     control.disconnect()
     _ = try await control.list()
-    #expect(fake.launches.last?.arguments == ["--host", "devbox", "--expected-host-id", other, "control"])
+    #expect(fake.launches.last?.arguments == ["--host", "devbox", "--expected-host-id", other, "host", "control"])
 
     // Identities the helper would not accept are left to the app's own check.
     #expect(HostControl.expectedHostIDArguments("host-a").isEmpty)
@@ -745,7 +714,7 @@ private final class HeldRequests: @unchecked Sendable {
     defer { control.disconnect() }
     let lease = control.retain()
     defer { lease.release() }
-    #expect(await waitFor { control.state == .connected && control.sessions.count == 1 })
+    #expect(await eventually { control.state == .connected && control.sessions.count == 1 })
 
     let waiting = Task { try await control.waitForSession("s1", timeout: .seconds(10)) { $0?.isRunning != true } }
     try await Task.sleep(for: .milliseconds(50))
@@ -820,7 +789,7 @@ private final class HeldRequests: @unchecked Sendable {
     #expect(list.hostID == "host-real")
     #expect(list.sessions.map(\.id) == ["real-1"])
     func read(_ name: String) -> String? { try? String(contentsOf: root.appendingPathComponent(name), encoding: .utf8) }
-    #expect(read("arguments") == "control\n")
+    #expect(read("arguments") == "host\ncontrol\n")
     #expect(read("agent") == "/login/agent.sock")
     #expect(read("tab") == "unset")
     try await control.sendInput("real-1", Data("hi".utf8))
@@ -921,7 +890,7 @@ private final class FakeHostSocketServer: @unchecked Sendable {
     let recorder = EventRecorder(control)
     let lease = control.retain()
     defer { lease.release() }
-    #expect(await waitFor { control.state == .connected && control.sessions.count == 3 })
+    #expect(await eventually { control.state == .connected && control.sessions.count == 3 })
 
     // The daemon restarted: only one holder registered again so far, and
     // it still expects others. The sessions it lacks keep their state
@@ -975,7 +944,7 @@ private final class FakeHostSocketServer: @unchecked Sendable {
     let recorder = EventRecorder(control)
     let lease = control.retain()
     defer { lease.release() }
-    #expect(await waitFor { control.state == .connected && control.sessions.count == 2 })
+    #expect(await eventually { control.state == .connected && control.sessions.count == 2 })
     #expect(!control.expectsHolders)
     // Known as current only from the host it names, while connected.
     #expect(control.currentSession("stuck", hostID: "host-a")?.id == "stuck")

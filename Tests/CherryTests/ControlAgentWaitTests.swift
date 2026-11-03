@@ -1,14 +1,13 @@
-import CherryControl
-@testable import CherryMCP
+@testable import CherryControl
 import Darwin
 import Foundation
-import MCP
 import Testing
 @testable import Cherry
 
-/// A control server on a private socket with one host-managed workspace,
-/// for the agent wait tests: agents run `/bin/cat` (screens are injected
-/// with `ingestTestingData`) or a fake agent script.
+/// A control server on a private socket with one workspace, host-managed
+/// unless a test asks for native tabs, for the agent wait tests (and
+/// ControlActivityTests): agents run `/bin/cat` (screens are injected with
+/// `ingestTestingData`) or a fake agent script.
 @MainActor
 final class ControlAgentWaitHarness {
     let defaultsName: String
@@ -19,7 +18,7 @@ final class ControlAgentWaitHarness {
     let socketURL: URL
     let server: CherryControlServer
 
-    init() throws {
+    init(launchBackend: TerminalSessionLaunchBackend = .hostManaged) throws {
         defaultsName = "CherryTests.ControlAgentWait.\(UUID().uuidString)"
         defaults = try #require(UserDefaults(suiteName: defaultsName))
         projectRoot = FileManager.default.temporaryDirectory
@@ -32,7 +31,7 @@ final class ControlAgentWaitHarness {
         socketURL = socketDirectory.appendingPathComponent("control.sock")
         settings = AgentSettings(defaults: defaults)
         _ = settings.addProject(path: projectRoot.path)
-        workspace = TerminalWorkspace(projectRoot: projectRoot.path, launchBackend: .hostManaged)
+        workspace = TerminalWorkspace(projectRoot: projectRoot.path, launchBackend: launchBackend)
         server = CherryControlServer(
             workspace: workspace,
             socketURL: socketURL,
@@ -51,23 +50,37 @@ final class ControlAgentWaitHarness {
         return try #require(workspace.session(id: spawned.process.id))
     }
 
-    /// A fake agent CLI: shows a composer, and for each submitted line
+    /// Starts `script` as the project command `name`; returns its process id.
+    func startScript(named name: String, _ script: String) async throws -> String {
+        let scriptURL = projectRoot.appendingPathComponent("\(name).sh")
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        chmod(scriptURL.path, 0o755)
+        try settings.upsertCommand(ProjectCommandDefinition(name: name, command: scriptURL.path), for: projectRoot.path)
+        let response = try await send(.startProcess(.init(processName: name, kind: "command")))
+        guard case .startProcess(let started)? = response.result else {
+            throw CherryControlError(code: "start_failed", message: "Expected startProcess result, got \(String(describing: response))")
+        }
+        return started.process.id
+    }
+
+    /// A fake agent CLI that reports its status as Claude Code does
+    /// (OSC 7501): `idle` at its composer; for each submitted line it
     /// echoes it into the transcript with the composer still visible,
-    /// thinks for `thinking` seconds without any working marker (as a
-    /// CLI does before its first spinner frame), works for `working`
-    /// seconds with Claude's "esc to interrupt" status, then answers.
+    /// thinks for `thinking` seconds before it reports `working` (as a CLI
+    /// takes a moment to start a turn), works for `working` seconds, then
+    /// answers and reports `done`.
     func fakeAgentScript(thinking: Double, working: Double) throws -> String {
         let script = projectRoot.appendingPathComponent("fake-agent.sh")
         let body = """
         #!/bin/sh
         stty -echo 2>/dev/null
-        printf '\\342\\235\\257 \\n'
+        printf '\\342\\235\\257 \\n\\033]7501;state=idle:app=fake\\033\\\\'
         while IFS= read -r line; do
           printf '> %s\\n\\n\\342\\235\\257 \\n' "$line"
           sleep \(thinking)
-          printf '\\342\\234\\266 Reticulating\\342\\200\\246 (esc to interrupt)'
+          printf '\\033]7501;state=working:app=fake\\033\\\\\\342\\234\\266 Reticulating\\342\\200\\246'
           sleep \(working)
-          printf '\\r\\033[2K\\342\\217\\272 handled %s\\n\\n\\342\\235\\257 \\n' "$line"
+          printf '\\r\\033[2K\\342\\217\\272 handled %s\\n\\n\\342\\235\\257 \\n\\033]7501;state=done:app=fake\\033\\\\' "$line"
         done
         """
         try body.write(to: script, atomically: true, encoding: .utf8)
@@ -100,6 +113,11 @@ final class ControlAgentWaitHarness {
             throw CherryControlError(code: "wait_failed", message: "Expected waitForProcessIdle result, got \(String(describing: response))")
         }
         return waited
+    }
+
+    /// The agent sends an OSC 7501 program status report with `body`.
+    func report(_ body: String, on session: TerminalSession) {
+        session.ingestTestingData(Data("\u{1B}]7501;\(body)\u{1B}\\".utf8))
     }
 
     func stop() {
@@ -165,9 +183,10 @@ struct ControlAgentWaitTests {
         defer { harness.stop() }
         harness.server.start()
         let session = try await harness.spawnAgent(named: "Claude")
-        session.ingestTestingData(Data("✶ Reticulating… (esc to interrupt)\n".utf8))
+        harness.report("state=working:app=claude-code", on: session)
         try await Task.sleep(for: .milliseconds(150))
         session.ingestTestingData(Data("\u{1B}[2J\u{1B}[H".utf8) + Data(claudeQuestionScreen.replacingOccurrences(of: "\n", with: "\r\n").utf8))
+        harness.report("state=blocked:app=claude-code:kind=question:msg=V2hpY2ggc3RvcmFnZSBiYWNrZW5kPw==", on: session)
 
         let startedAt = Date()
         let waited = try await harness.wait(session, quietMilliseconds: 500, timeoutMilliseconds: 8_000)
@@ -177,7 +196,60 @@ struct ControlAgentWaitTests {
     }
 
     /// Typing a message into a question menu answers it (Enter picks the
-    /// highlighted option): MCP refuses, as at a permission prompt.
+    /// highlighted option): MCP refuses, as at a permission prompt, when
+    /// the agent reports it is blocked on a question, and quotes it.
+    @Test func messageIsNotTypedIntoAQuestionTheAgentReports() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.start()
+        let session = try await harness.spawnAgent(named: "Claude")
+        harness.report("state=blocked:app=claude-code:kind=question:msg=V2hpY2ggc3RvcmFnZSBiYWNrZW5kPw==", on: session)
+
+        let response = try await harness.send(.sendProcessInput(.init(
+            processID: session.id.uuidString, text: "use sqlite", submit: true
+        )))
+        #expect(response.error?.code == "agent_awaiting_input")
+        #expect(response.error?.message.contains("Which storage backend?") == true)
+    }
+
+    /// A spawned agent whose first message is refused (it reports a
+    /// permission prompt) runs, and the spawn says why nothing was sent;
+    /// one whose message arrived says nothing.
+    @Test func spawnSaysWhyItsFirstMessageWasNotSent() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.start()
+        let script = harness.projectRoot.appendingPathComponent("blocked-agent.sh")
+        try """
+        #!/bin/sh
+        stty -echo 2>/dev/null
+        printf 'Run the migration?\\n\\033]7501;state=blocked:app=fake:kind=permission:msg=UnVuIHRoZSBtaWdyYXRpb24/\\033\\\\'
+        exec cat
+        """.write(to: script, atomically: true, encoding: .utf8)
+        chmod(script.path, 0o755)
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: script.path))
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "Worker", command: "/bin/cat"))
+
+        let refused = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Claude", text: "go ahead", submit: true)))
+        guard case .spawnProcess(let blocked)? = refused.result else {
+            Issue.record("Expected spawnProcess, got \(String(describing: refused))")
+            return
+        }
+        #expect(blocked.sentBytes == 0)
+        #expect(blocked.inputError?.code == "agent_awaiting_permission")
+        #expect(blocked.inputError?.message.contains("Run the migration?") == true, "\(String(describing: blocked.inputError))")
+        #expect(harness.workspace.session(id: blocked.process.id) != nil, "the agent runs either way")
+
+        let delivered = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Worker", text: "hello", submit: true)))
+        guard case .spawnProcess(let sent)? = delivered.result else {
+            Issue.record("Expected spawnProcess, got \(String(describing: delivered))")
+            return
+        }
+        #expect(sent.sentBytes > 0)
+        #expect(sent.inputError == nil)
+    }
+
+    /// An agent that reports nothing: its screen is read for the menu.
     @Test func messageIsNotTypedIntoAQuestionMenu() async throws {
         let harness = try ControlAgentWaitHarness()
         defer { harness.stop() }
@@ -198,7 +270,7 @@ struct ControlAgentWaitTests {
         defer { harness.stop() }
         harness.server.start()
         let session = try await harness.spawnAgent(named: "Claude")
-        session.ingestTestingData(Data("✶ Reticulating… (esc to interrupt)\n".utf8))
+        harness.report("state=working:app=claude-code", on: session)
         try await Task.sleep(for: .milliseconds(150))
 
         let processID = session.id.uuidString
@@ -215,15 +287,15 @@ struct ControlAgentWaitTests {
     /// Codex gives an MCP tool call 60 s by default: a wait with the
     /// default timeout must answer well before that.
     @Test func defaultWaitsFitInASixtySecondToolTimeout() throws {
-        let wait = try #require(CherryMCPTools.clientTimeout(for: "wait_for_process_idle", arguments: [:]))
+        let wait = try #require(CherryToolLayer.clientTimeout(for: "wait_for_process_idle", arguments: [:]))
         #expect(wait <= 55)
-        let message = try #require(CherryMCPTools.clientTimeout(for: "send_agent_message", arguments: [:]))
+        let message = try #require(CherryToolLayer.clientTimeout(for: "send_agent_message", arguments: [:]))
         #expect(message <= 55)
-        let events = try #require(CherryMCPTools.clientTimeout(for: "wait_for_events", arguments: [:]))
+        let events = try #require(CherryToolLayer.clientTimeout(for: "wait_for_events", arguments: [:]))
         #expect(events <= 55)
         // wait_for_events never waits longer, whatever it is asked.
-        #expect(CherryMCPTools.clientTimeout(for: "wait_for_events", arguments: ["timeout_ms": .int(300_000)]) == events)
-        let advertised = Set(CherryMCPTools.all.map(\.name))
+        #expect(CherryToolLayer.clientTimeout(for: "wait_for_events", arguments: ["timeout_ms": .int(300_000)]) == events)
+        let advertised = Set(CherryToolCatalog.tools(for: .unknown).map(\.name))
         #expect(advertised.isSuperset(of: ["subscribe", "unsubscribe", "wait_for_events", "list_subscriptions"]))
     }
 }

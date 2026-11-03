@@ -60,7 +60,7 @@ rm -rf "$SOURCE_DIR/zig-out"
 
 ZIG_BUILD_COMMAND=(
     zig build
-    -Doptimize=${ZIG_OPTIMIZE:-ReleaseFast}
+    -Doptimize=${ZIG_OPTIMIZE:-fast}
     -Dapp-runtime=none
     -Demit-exe=false
     -Demit-xcframework=false

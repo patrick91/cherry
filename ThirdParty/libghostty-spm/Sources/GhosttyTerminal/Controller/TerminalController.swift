@@ -249,7 +249,7 @@ public final class TerminalController {
         ghostty_app_tick(app)
     }
 
-    private static func initializeRuntimeIfNeeded() {
+    static func initializeRuntimeIfNeeded() {
         guard !runtimeInitialized else { return }
         runtimeInitialized = true
         GhosttyRuntimeResources.configureEnvironment()

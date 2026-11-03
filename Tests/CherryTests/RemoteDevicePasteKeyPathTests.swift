@@ -108,16 +108,6 @@ private func screen(_ tab: TerminalSession) -> String {
     (tab.ghosttyBridge.readNativeScreenText() ?? "").replacingOccurrences(of: "\n", with: "")
 }
 
-@MainActor
-private func waitFor(_ timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(25))
-    }
-    return condition()
-}
-
 @Test @MainActor func RemoteDevicePasteOfAnImageIntoAPersistentTabOfThisMacPastesItsSavedPath() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()
@@ -133,15 +123,15 @@ private func waitFor(_ timeout: TimeInterval = 5, _ condition: () -> Bool) async
     #expect(await harness.fake.wait { harness.attachCalls.count == 1 })
     #expect(tab.ghosttyBridge.isNativePTYBacked)
     #expect(stage.window.makeFirstResponder(tab.ghosttyBridge.terminalView))
-    #expect(await waitFor { screen(tab).contains("Attached") })
+    #expect(await eventually(interval: .milliseconds(25)) { screen(tab).contains("Attached") })
 
     // ⌘V of a screenshot (image data alone): saved, its quoted path typed.
     stage.putImage()
     try stage.commandV()
-    #expect(await waitFor { stage.saved.count == 1 })
+    #expect(await eventually(interval: .milliseconds(25)) { stage.saved.count == 1 })
     let first = try #require(stage.saved.first)
     #expect(try Data(contentsOf: first) == onePixelPNG)
-    #expect(await waitFor { screen(tab).contains("'\(first.path)'") })
+    #expect(await eventually(interval: .milliseconds(25)) { screen(tab).contains("'\(first.path)'") })
 
     // A screenshot tool's copy (the image's file and data, no text): the
     // file's path, not nothing.
@@ -149,23 +139,23 @@ private func waitFor(_ timeout: TimeInterval = 5, _ condition: () -> Bool) async
     try onePixelPNG.write(to: shot)
     stage.putScreenshotToolCopy(shot)
     try stage.commandV()
-    #expect(await waitFor { screen(tab).contains("'\(shot.path)'") })
+    #expect(await eventually(interval: .milliseconds(25)) { screen(tab).contains("'\(shot.path)'") })
     #expect(stage.saved.count == 1)
 
     // Edit › Paste of an image: the same as ⌘V.
     stage.putImage()
     #expect(stage.menuPaste())
-    #expect(await waitFor { stage.saved.count == 2 })
+    #expect(await eventually(interval: .milliseconds(25)) { stage.saved.count == 2 })
     let second = try #require(stage.saved.first { $0 != first })
-    #expect(await waitFor { screen(tab).contains("'\(second.path)'") })
+    #expect(await eventually(interval: .milliseconds(25)) { screen(tab).contains("'\(second.path)'") })
 
     // Text pastes as text, from the key and the menu (the surface's paste).
     stage.putText("plain-words-by-key")
     try stage.commandV()
-    #expect(await waitFor { screen(tab).contains("plain-words-by-key") })
+    #expect(await eventually(interval: .milliseconds(25)) { screen(tab).contains("plain-words-by-key") })
     stage.putText("plain-words-by-menu")
     #expect(stage.menuPaste())
-    #expect(await waitFor { screen(tab).contains("plain-words-by-menu") })
+    #expect(await eventually(interval: .milliseconds(25)) { screen(tab).contains("plain-words-by-menu") })
     #expect(stage.saved.count == 2)
 }
 
@@ -182,7 +172,7 @@ private func waitFor(_ timeout: TimeInterval = 5, _ condition: () -> Bool) async
     #expect(await harness.waitUntilAttached(tab))
     stage.show(tab)
     #expect(await harness.fake.wait { harness.attachCalls.count == 1 })
-    #expect(await waitFor { screen(tab).contains("Attached") })
+    #expect(await eventually(interval: .milliseconds(25)) { screen(tab).contains("Attached") })
 
     // An input view inside the terminal's (as an input method may add)
     // has the keyboard.
@@ -201,9 +191,9 @@ private func waitFor(_ timeout: TimeInterval = 5, _ condition: () -> Bool) async
 
     stage.putImage()
     try stage.commandV()
-    #expect(await waitFor { stage.saved.count == 1 })
+    #expect(await eventually(interval: .milliseconds(25)) { stage.saved.count == 1 })
     let file = try #require(stage.saved.first)
-    #expect(await waitFor { screen(tab).contains("'\(file.path)'") })
+    #expect(await eventually(interval: .milliseconds(25)) { screen(tab).contains("'\(file.path)'") })
 }
 
 @Test @MainActor func RemoteDevicePasteOfAnImageIntoANativeTabPastesItsSavedPath() async throws {
@@ -223,19 +213,19 @@ private func waitFor(_ timeout: TimeInterval = 5, _ condition: () -> Bool) async
     #expect(tab.ghosttyBridge.isNativePTYBacked)
     #expect(tab.persistentSession == nil)
     #expect(stage.window.makeFirstResponder(tab.ghosttyBridge.terminalView))
-    #expect(await waitFor(10) { screen(tab).contains("ready") })
+    #expect(await eventually(timeout: 10, interval: .milliseconds(25)) { screen(tab).contains("ready") })
 
     stage.putImage()
     try stage.commandV()
-    #expect(await waitFor { stage.saved.count == 1 })
+    #expect(await eventually(interval: .milliseconds(25)) { stage.saved.count == 1 })
     let first = try #require(stage.saved.first)
-    #expect(await waitFor { screen(tab).contains("'\(first.path)'") })
+    #expect(await eventually(interval: .milliseconds(25)) { screen(tab).contains("'\(first.path)'") })
 
     stage.putImage()
     #expect(stage.menuPaste())
-    #expect(await waitFor { stage.saved.count == 2 })
+    #expect(await eventually(interval: .milliseconds(25)) { stage.saved.count == 2 })
     let second = try #require(stage.saved.first { $0 != first })
-    #expect(await waitFor { screen(tab).contains("'\(second.path)'") })
+    #expect(await eventually(interval: .milliseconds(25)) { screen(tab).contains("'\(second.path)'") })
 }
 
 @Test @MainActor func RemoteDevicePasteOfCopiedFilesWithoutTextPastesTheirPaths() throws {

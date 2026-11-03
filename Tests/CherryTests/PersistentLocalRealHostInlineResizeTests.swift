@@ -166,13 +166,13 @@ private func resizeInlineTabs(_ host: RealLocalHost, _ tabs: [InlineTab], height
         let first = makeRepository()
         first.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await first.waitForPendingRestores()
-        let shell = try #require(first.activeWorkspace.sessions.first)
+        let shell = try #require(first.workspace.sessions.first)
         host.show(shell)
         try await host.waitFor("the shell to be on screen") { shell.mountedTerminalGrid != nil }
         let grid = try #require(shell.mountedTerminalGrid)
         let windowSize = "\(grid.rows)x\(grid.columns)"
         let log = host.root.appendingPathComponent("restored.log")
-        let mimic = first.activeWorkspace.addCommandSession(
+        let mimic = first.workspace.addCommandSession(
             command: ProjectCommandDefinition(
                 name: "mimic", command: "/usr/bin/python3",
                 arguments: "'\(inlineMimic.path)' claude-cursor 120 '\(log.path)'"
@@ -191,7 +191,7 @@ private func resizeInlineTabs(_ host: RealLocalHost, _ tabs: [InlineTab], height
         try await host.waitFor("the mimic to redraw full screen") { mimicSizes(log).count == 2 }
         let fullScreenSize = mimicSizes(log)[1]
         // The shell tab is selected when the window comes back.
-        first.activeWorkspace.select(shell)
+        first.workspace.select(shell)
         first.flushPersistentState()
         first.closeAllSessions(intent: .appQuit)
 
@@ -201,9 +201,9 @@ private func resizeInlineTabs(_ host: RealLocalHost, _ tabs: [InlineTab], height
         let second = makeRepository()
         second.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await second.waitForPendingRestores()
-        let restoredShell = try #require(second.activeWorkspace.session(withID: shell.id))
-        let restored = try #require(second.activeWorkspace.session(withID: mimic.id))
-        #expect(second.activeWorkspace.selectedSession === restoredShell)
+        let restoredShell = try #require(second.workspace.session(withID: shell.id))
+        let restored = try #require(second.workspace.session(withID: mimic.id))
+        #expect(second.workspace.selectedSession === restoredShell)
         host.show(restoredShell)
         host.resize(restoredShell, to: window)
         // At the window's grid, not only on screen: until Ghostty reports
@@ -232,7 +232,7 @@ private func resizeInlineTabs(_ host: RealLocalHost, _ tabs: [InlineTab], height
         // scrollback.
         host.settings.value.persistLocalSessions = false
         let nativeLog = host.root.appendingPathComponent("native.log")
-        let native = second.activeWorkspace.addCommandSession(
+        let native = second.workspace.addCommandSession(
             command: ProjectCommandDefinition(
                 name: "native", command: "/usr/bin/python3",
                 arguments: "'\(inlineMimic.path)' claude-cursor 120 '\(nativeLog.path)'"
@@ -302,12 +302,12 @@ private func resizeInlineTabs(_ host: RealLocalHost, _ tabs: [InlineTab], height
         let first = makeRepository(host.policy)
         first.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await first.waitForPendingRestores()
-        let shell = try #require(first.activeWorkspace.sessions.first)
+        let shell = try #require(first.workspace.sessions.first)
         host.show(shell)
         try await host.waitFor("the shell to be on screen") { shell.mountedTerminalGrid != nil }
         let firstGrid = try #require(shell.mountedTerminalGrid)
         let log = host.root.appendingPathComponent("background.log")
-        let mimic = first.activeWorkspace.addCommandSession(
+        let mimic = first.workspace.addCommandSession(
             command: ProjectCommandDefinition(
                 name: "mimic", command: "/usr/bin/python3",
                 arguments: "'\(inlineMimic.path)' claude-cursor 120 '\(log.path)'"
@@ -324,7 +324,7 @@ private func resizeInlineTabs(_ host: RealLocalHost, _ tabs: [InlineTab], height
         try await host.waitFor("the mimic to redraw full screen") { mimicSizes(log).count == 2 }
         let lastRun = mimicSizes(log)
         #expect(lastRun.first == "\(firstGrid.rows)x\(firstGrid.columns)")
-        first.activeWorkspace.select(shell)
+        first.workspace.select(shell)
         first.flushPersistentState()
         first.closeAllSessions(intent: .appQuit)
 
@@ -335,9 +335,9 @@ private func resizeInlineTabs(_ host: RealLocalHost, _ tabs: [InlineTab], height
         let second = makeRepository(waiting)
         second.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await second.waitForPendingRestores()
-        let restoredShell = try #require(second.activeWorkspace.session(withID: shell.id))
-        let restored = try #require(second.activeWorkspace.session(withID: mimic.id))
-        #expect(second.activeWorkspace.selectedSession === restoredShell)
+        let restoredShell = try #require(second.workspace.session(withID: shell.id))
+        let restored = try #require(second.workspace.session(withID: mimic.id))
+        #expect(second.workspace.selectedSession === restoredShell)
         host.show(restoredShell, size: firstFrame)
         try await host.waitFor("the shell to be on screen at the window's first grid") {
             restoredShell.mountedTerminalGrid == firstGrid

@@ -42,6 +42,22 @@ final class RealLocalHost {
         var value = 0
     }
 
+    /// Pids recorded from the helpers' launcher, which runs off the main
+    /// thread.
+    final class ProcessIDs: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pids: [pid_t] = []
+
+        var values: [pid_t] { lock.withLock { pids } }
+
+        func append(_ pid: pid_t) { lock.withLock { pids.append(pid) } }
+    }
+
+    /// The pids of `control`'s helpers (`cherry control`, the tabs' control
+    /// connection), in the order they started.
+    var controlHelperProcessIDs: [pid_t] { controlHelpers.values }
+    private let controlHelpers: ProcessIDs
+
     /// `shellPath`: the shell tabs run (the user's own startup files are
     /// never read: HOME is private). `adapterTerminalStartsAt`: each attach
     /// adapter finds its terminal at this size (rows, columns) when it
@@ -130,7 +146,7 @@ final class RealLocalHost {
         daemonExecutable = binaries.appendingPathComponent("cherry-host")
         host = try RealHostTestDaemon(executable: daemonExecutable, environment: daemonEnvironment, socket: socket)
 
-        func makeControl() throws -> HostControl {
+        func makeControl(recordingHelpersIn helpers: ProcessIDs? = nil) throws -> HostControl {
             HostControl(
                 host: .local,
                 clientProvider: {
@@ -138,10 +154,13 @@ final class RealLocalHost {
                 },
                 hostStore: HostedSessionHostStore(defaults: try #require(UserDefaults(suiteName: "CherryTests.RealLocal.\(UUID().uuidString)"))),
                 masters: disabledSSHMasters,
+                launcher: { launch in try HostControlChannel.process(launch) { helpers?.append($0) } },
                 localHostUnavailableReason: nil
             )
         }
-        control = try makeControl()
+        let controlHelpers = ProcessIDs()
+        self.controlHelpers = controlHelpers
+        control = try makeControl(recordingHelpersIn: controlHelpers)
         observer = try makeControl()
         let control = control
         let home = home
@@ -223,6 +242,11 @@ final class RealLocalHost {
         TerminalWorkspace(projectRoot: home.path, createInitialSession: false, backendPolicy: policy)
     }
 
+    /// The container that shows `session` (see `show`).
+    func container(showing session: TerminalSession) -> GhosttyTerminalContainerView? {
+        shownSessions.first { $0.1 === session }?.0
+    }
+
     /// Shows `session` in a window of `size` points, so its surface renders.
     func show(_ session: TerminalSession, size: NSSize = NSSize(width: 800, height: 500)) {
         let container = GhosttyTerminalContainerView(frame: NSRect(origin: .zero, size: size))
@@ -256,13 +280,8 @@ final class RealLocalHost {
         }
     }
 
-    func waitFor(_ description: String, timeout: TimeInterval = 15, _ predicate: () async throws -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if try await predicate() { return }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        throw HostedSessionError.message("Timed out waiting for \(description)")
+    func waitFor(_ description: String, timeout: TimeInterval = 15, _ predicate: @MainActor () async throws -> Bool) async throws {
+        try await poll(description, timeout: timeout, predicate)
     }
 
     func screen(_ session: TerminalSession) -> String {
@@ -753,6 +772,54 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
     await host.tearDown()
 }
 
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostKeysReachAnUnattachedProgramInItsModifyOtherKeysForm() async throws {
+    var configuration = PersistentLocalSessions.Configuration()
+    // Once lost, the adapter stays lost for the test.
+    configuration.reconnectDelay = (120, 120)
+    let host = try await RealLocalHost(configuration: configuration)
+    let workspace = host.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    do {
+        let tab = workspace.addSession(title: "Keys")
+        host.show(tab)
+        let container = try #require(host.container(showing: tab))
+        try await host.waitFor("the tab to attach to its session") {
+            tab.persistentSession != nil && tab.state == .live && tab.usesNativePTYBackendAdapterAttached
+        }
+        let sessionID = try #require(tab.persistentSession?.sessionID)
+        #expect(try await host.hostSession(sessionID)?.modifyOtherKeys == false)
+
+        // A program that sets modifyOtherKeys to level 2 (as Vim does),
+        // prints the key it reads, then resets it.
+        tab.send(text: #"printf '\033[>4;2m'; IFS= read -rsn10 k; printf '\033[>4m'; echo "KEY_${k:1}_""# + "\n")
+        try await host.waitFor("the host to report modifyOtherKeys") { tab.usesModifyOtherKeys }
+        #expect(try await host.observedSession(sessionID)?.modifyOtherKeys == true)
+
+        // No adapter takes the key: Control+Return goes through the host as
+        // Ghostty's surface would type it then, not as a CR.
+        try await loseAdapter(of: tab, host: host)
+        try await host.waitFor("keys to go through the host") { tab.keyboardInputGoesThroughHost }
+        let controlReturn = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .control, timestamp: 0, windowNumber: 0,
+            context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36
+        ))
+        #expect(container.sendKeyThroughHostWhileAdapterIsAway(controlReturn))
+        try await host.waitFor("the program to read ESC [ 27 ; 5 ; 13 ~") {
+            try await processOutput(control, tab).contains { $0.contains("KEY_[27;5;13~_") }
+        }
+        try await host.waitFor("the host to report it reset") { !tab.usesModifyOtherKeys }
+    } catch {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    control.stop()
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
 @Test(.enabled(if: realHostEnabled && FileManager.default.isExecutableFile(atPath: "/usr/bin/python3")))
 @MainActor func PersistentLocalRealHostFindsAHostedServersPortByItsProgramPid() async throws {
     let host = try await RealLocalHost()
@@ -919,7 +986,7 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         let first = makeRepository()
         first.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await first.waitForPendingRestores()
-        let workspace = first.activeWorkspace
+        let workspace = first.workspace
         let terminal = try #require(workspace.sessions.first)
         #expect(terminal.isPersistentLocalSession)
         host.show(terminal)
@@ -944,7 +1011,7 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         #expect(workspace.sessions.isEmpty)
         #expect(try await host.hostSession(terminalSession)?.isRunning == true)
         #expect(try await host.hostSession(commandSession)?.isRunning == true)
-        let saved = try #require(store.load(repositoryRoot: first.repositoryRoot)?.worktree(root: first.initialWorktreeRoot))
+        let saved = try #require(store.load(repositoryRoot: first.repositoryRoot)?.worktree(root: first.workspaceRoot))
         #expect(saved.sessions.map(\.id) == [terminal.id, command.id])
 
         // Relaunch: a new window from the same saved state brings both tabs
@@ -952,7 +1019,7 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         let second = makeRepository()
         second.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await second.waitForPendingRestores()
-        let restored = second.activeWorkspace
+        let restored = second.workspace
         #expect(restored.sessions.map(\.id) == [terminal.id, command.id])
         #expect(restored.sessions.map(\.kind) == [.terminal, .command])
         let restoredTerminal = try #require(restored.session(withID: terminal.id))
@@ -1028,7 +1095,7 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         let first = makeRepository()
         first.beginRestoringSavedStateIfNeeded(chromeState: nil)
         await first.waitForPendingRestores()
-        let workspace = first.activeWorkspace
+        let workspace = first.workspace
         let terminal = try #require(workspace.sessions.first)
         let ended = workspace.addSession(title: "Ended")
         try await host.waitFor("both sessions") { terminal.persistentSession != nil && ended.persistentSession != nil }
@@ -1064,10 +1131,10 @@ private func processOutput(_ control: ParityControlServer, _ tab: TerminalSessio
         ))
         second.beginRestoringSavedStateIfNeeded(chromeState: chromeState)
         await second.waitForPendingRestores()
-        let restored = second.activeWorkspace
+        let restored = second.workspace
         #expect(restored.sessions.map(\.id) == [terminal.id])
         #expect(restored.session(withID: ended.id) == nil)
-        #expect(store.wasEndedOnPurpose(try #require(savedState.worktree(root: first.initialWorktreeRoot)?.sessions.first { $0.id == ended.id })))
+        #expect(store.wasEndedOnPurpose(try #require(savedState.worktree(root: first.workspaceRoot)?.sessions.first { $0.id == ended.id })))
         let back = try #require(restored.session(withID: terminal.id))
         #expect(back.systemSessionEnd == .logout)
         #expect(back.persistentSessionEndedMessage == "Ended when you logged out")
@@ -1313,6 +1380,61 @@ private func parentProcess(of pid: pid_t) throws -> (pid: pid_t, command: String
     await host.tearDown()
 }
 
+@Test(.enabled(if: realHostEnabled))
+@MainActor func PersistentLocalRealHostAHolderThatDiesSaysTheHostCrashedWhenItsAdapterHearsFirst() async throws {
+    // Long enough that only the host's report ends the tab's wait here.
+    var configuration = PersistentLocalSessions.Configuration()
+    configuration.adapterExitHostReportWait = 30
+    let host = try await RealLocalHost(configuration: configuration)
+    let workspace = host.workspace()
+    var stoppedHelper: pid_t?
+    do {
+        let anchor = workspace.addSession(title: "Anchor")
+        let tab = workspace.addSession(title: "Shell 1")
+        host.show(tab)
+        try await host.waitFor("the tabs to attach") {
+            anchor.persistentSession != nil && anchor.state == .live && tab.persistentSession != nil && tab.state == .live
+        }
+        let sessionID = try #require(tab.persistentSession?.sessionID)
+        let info = try #require(try await host.hostSession(sessionID))
+        let program = try #require(info.pid.map { pid_t(bitPattern: $0) })
+        let holder = try parentProcess(of: program)
+        try #require(
+            holder.command.contains("cherry-host") && holder.command.contains("hold"), Comment(rawValue: holder.command)
+        )
+
+        // The tabs' control helper is stopped, so the host's `exited` event
+        // (the only report that says its holder died) waits in its socket
+        // while the adapter hears of the end and exits: the order a busy
+        // Mac sometimes takes.
+        let helper = try #require(host.controlHelperProcessIDs.last)
+        #expect(kill(helper, SIGSTOP) == 0)
+        stoppedHelper = helper
+        #expect(kill(holder.pid, SIGKILL) == 0)
+        try await host.waitFor("the adapter to report the end") {
+            tab.keyboardInputGoesThroughHost || !tab.isRunning
+        }
+        // The host still lists the session running: the tab waits for it.
+        #expect(tab.isRunning)
+        #expect(tab.hostSessionEnd == nil)
+
+        #expect(kill(helper, SIGCONT) == 0)
+        stoppedHelper = nil
+        try await host.waitFor("the tab to say its host crashed", timeout: 20) {
+            tab.hostSessionEnd?.isHolderLost == true && !tab.isRunning
+        }
+        #expect(tab.persistentSessionEndedMessage?.hasPrefix("The session host crashed") == true)
+        #expect(tab.state == .exited(1))
+    } catch {
+        if let stoppedHelper { kill(stoppedHelper, SIGCONT) }
+        workspace.closeAllSessions(intent: .windowClosed)
+        await host.tearDown()
+        throw error
+    }
+    workspace.closeAllSessions(intent: .windowClosed)
+    await host.tearDown()
+}
+
 /// `ps -o command=` of `pid`.
 private func commandLine(of pid: pid_t) throws -> String {
     let process = Process()
@@ -1488,7 +1610,6 @@ private struct StopMeasureContentHost: View {
     @ObservedObject var repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    let noteStore: ProjectNoteStore
     let todoStore: ProjectTodoStore
     @State private var storedSidebarWidth = 320.0
 
@@ -1497,7 +1618,6 @@ private struct StopMeasureContentHost: View {
             repository: repository,
             workspace: workspace,
             chromeState: chromeState,
-            noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: workspace.projectRoot,
             openProject: { _ in },
@@ -1529,11 +1649,10 @@ private struct StopMeasureContentHost: View {
     let workspace = host.workspace()
     let repository = RepositoryWorkspace(projectRoot: root, autoStartCommands: { _ in [] })
     let chromeState = ProjectWindowChromeState()
-    let notes = host.home.appendingPathComponent(".notes", isDirectory: true)
+    let stores = host.home.appendingPathComponent(".stores", isDirectory: true)
     let hostingView = NSHostingView(rootView: StopMeasureContentHost(
         repository: repository, workspace: workspace, chromeState: chromeState,
-        noteStore: ProjectNoteStore(projectRoot: root, storageDirectory: notes),
-        todoStore: ProjectTodoStore(projectRoot: root, storageDirectory: notes)
+        todoStore: ProjectTodoStore(projectRoot: root, storageDirectory: stores)
     ))
     hostingView.frame = NSRect(x: 0, y: 0, width: 1100, height: 700)
     let window = NSWindow(contentRect: hostingView.frame, styleMask: [.titled, .resizable], backing: .buffered, defer: false)

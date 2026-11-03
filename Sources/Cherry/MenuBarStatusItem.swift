@@ -74,10 +74,20 @@ final class MenuBarStatusItem: NSObject, NSWindowDelegate {
         let image = MenuBarStatusLabel.icon(
             for: model.aggregate,
             dark: dark,
-            shimmerFrame: MenuBarShimmerModel.shared.frame,
-            settings: MenuBarShimmerModel.shared.settings
+            shimmerFrame: MenuBarShimmerModel.shared.frame
         )
         if button.image !== image { button.image = image }
+    }
+
+    /// Shows the panel, unless it shows (Settings › Sessions › Show List:
+    /// its background sessions are listed there). False while the item is
+    /// not installed, or when the panel could not show.
+    @discardableResult
+    func openPanel() -> Bool {
+        guard statusItem != nil else { return false }
+        if let panel, panel.isVisible { return true }
+        showPanel()
+        return panel?.isVisible == true
     }
 
     @objc private func togglePanel(_ sender: Any?) {

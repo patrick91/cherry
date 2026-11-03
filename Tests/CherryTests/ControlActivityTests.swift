@@ -5,87 +5,17 @@ import Testing
 @testable import Cherry
 
 @MainActor
-private final class ControlActivityHarness {
-    let defaultsName: String
-    let defaults: UserDefaults
-    let settings: AgentSettings
-    let projectRoot: URL
-    let workspace: TerminalWorkspace
-    let socketURL: URL
-    let server: CherryControlServer
-
-    init() throws {
-        defaultsName = "CherryTests.ControlActivity.\(UUID().uuidString)"
-        defaults = try #require(UserDefaults(suiteName: defaultsName))
-
-        projectRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
-
-        let socketDirectory = URL(
-            fileURLWithPath: "/tmp/cherry-control-\(UUID().uuidString.prefix(8))",
-            isDirectory: true
-        )
-        socketURL = socketDirectory.appendingPathComponent("control.sock")
-
-        settings = AgentSettings(defaults: defaults)
-        _ = settings.addProject(path: projectRoot.path)
-        workspace = TerminalWorkspace(projectRoot: projectRoot.path, launchBackend: .hostManaged)
-        server = CherryControlServer(
-            workspace: workspace,
-            socketURL: socketURL,
-            agentSettings: settings
-        )
-    }
-
-    func spawnAgentSession(named name: String) async throws -> TerminalSession {
-        let response = try await send(.spawnProcess(.init(kind: "agent", name: name)))
-        guard case .spawnProcess(let spawned)? = response.result else {
-            Issue.record("Expected spawnProcess result, got \(String(describing: response))")
-            throw CherryControlError(code: "spawn_failed", message: "Expected spawnProcess result.")
-        }
-        return try #require(workspace.session(id: spawned.process.id))
-    }
-
-    func send(_ request: CherryControlRequest) async throws -> CherryControlResponse {
-        let socketURL = socketURL
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    let response = try CherryControlClient(socketURL: socketURL).send(request)
-                    continuation.resume(returning: response)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-    }
-
-    func stop() {
-        server.stop()
-        workspace.sessions.forEach { $0.stop() }
-        defaults.removePersistentDomain(forName: defaultsName)
-        try? FileManager.default.removeItem(at: projectRoot)
-        try? FileManager.default.removeItem(at: socketURL.deletingLastPathComponent())
-    }
-}
-
-@MainActor
 @Suite(.serialized)
 struct ControlActivityTests {
     @Test func processStatusExposesAgentActivityFields() async throws {
-        let harness = try ControlActivityHarness()
+        let harness = try ControlAgentWaitHarness()
         defer {
             harness.stop()
         }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "/bin/cat"))
         harness.server.start()
 
-        let session = try await harness.spawnAgentSession(named: "Claude")
-        session.ingestTestingData(Data("""
-        ❯ Try "fix lint errors"
-          ⏵⏵ bypass permissions on (shift+tab to cycle)
-        """.utf8))
+        let session = try await harness.spawnAgent(named: "Claude")
+        session.ingestTestingData(Data("❯ \(programStatus("state=idle:app=claude-code"))".utf8))
         try await Task.sleep(for: .milliseconds(150))
 
         let response = try await harness.send(.getProcessStatus(.init(processID: session.id.uuidString)))
@@ -94,13 +24,69 @@ struct ControlActivityTests {
             return
         }
         #expect(status.process.agentActivityState == "idle")
+        #expect(status.process.programStatus == ProcessProgramStatus(state: "idle", app: "claude-code"))
+        #expect(status.process.agentTurnState == "not_started")
         #expect(status.process.usesAlternateScreen == false)
         #expect((status.process.contentVersion ?? 0) >= 1)
         #expect(status.process.lastContentChangeAt != nil)
     }
 
+    /// `submit: true` into a terminal tab types the text and then, on its
+    /// own, the Enter: in one write a program that tells typing from pasting
+    /// (Claude Code in a terminal tab) takes the line as a paste and never
+    /// runs it.
+    @Test func aTerminalsSubmitSendsItsEnterOnItsOwnAfterTheText() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer {
+            harness.stop()
+        }
+        harness.server.start()
+        let session = try #require(harness.workspace.sessions.first)
+        let log = harness.projectRoot.appendingPathComponent("reads.log")
+        let script = harness.projectRoot.appendingPathComponent("reads.sh")
+        // Each read it gets, as hex, one per line.
+        try """
+        #!/bin/sh
+        stty raw -echo
+        printf 'reading\\r\\n'
+        exec /usr/bin/perl -e 'open(my $log, ">>", $ARGV[0]) or die; $log->autoflush(1); while (sysread(STDIN, my $chunk, 4096)) { print $log unpack("H*", $chunk), "\\n"; }' '\(log.path)'
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let started = try await harness.send(.sendProcessInput(.init(
+            processID: session.id.uuidString, text: "exec '\(script.path)'\n"
+        )))
+        #expect(started.error == nil)
+        let deadline = Date().addingTimeInterval(10)
+        while !session.snapshot(range: 0..<session.lineCount).joined().contains("reading"), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        try Data().write(to: log)
+
+        let sent = try await harness.send(.sendProcessInput(.init(
+            processID: session.id.uuidString, text: "hello", submit: true
+        )))
+        guard case .sendProcessInput(let result)? = sent.result else {
+            Issue.record("Expected sendProcessInput, got \(String(describing: sent))")
+            return
+        }
+        #expect(result.sentBytes == 6)
+        var reads: [String] = []
+        for _ in 0..<100 {
+            reads = (try? String(contentsOf: log, encoding: .utf8))?.split(separator: "\n").map(String.init) ?? []
+            if reads.joined().hasSuffix("0d") { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(reads == [Data("hello".utf8).map { String(format: "%02x", $0) }.joined(), "0d"])
+
+        // Without submit a terminal's text is only typed.
+        _ = try await harness.send(.sendProcessInput(.init(processID: session.id.uuidString, text: "abc")))
+        try await Task.sleep(for: .milliseconds(400))
+        let after = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+        #expect(after.hasSuffix("616263\n"))
+    }
+
     @Test func processOutputReportsScreenMode() async throws {
-        let harness = try ControlActivityHarness()
+        let harness = try ControlAgentWaitHarness()
         defer {
             harness.stop()
         }
@@ -131,68 +117,21 @@ struct ControlActivityTests {
         #expect(alternate.screen == "alternate")
     }
 
-    @Test func controlCapturesHumanLabeledAttentionCheckpoint() async throws {
-        let recordingDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("cherry-attention-control-\(UUID().uuidString)", isDirectory: true)
-        let previousRecordingDirectory = ProcessInfo.processInfo.environment[
-            TerminalAttentionObservationRecorder.environmentKey
-        ]
-        setenv(TerminalAttentionObservationRecorder.environmentKey, recordingDirectory.path, 1)
-        defer {
-            if let previousRecordingDirectory {
-                setenv(TerminalAttentionObservationRecorder.environmentKey, previousRecordingDirectory, 1)
-            } else {
-                unsetenv(TerminalAttentionObservationRecorder.environmentKey)
-            }
-            try? FileManager.default.removeItem(at: recordingDirectory)
-        }
-
-        let harness = try ControlActivityHarness()
-        defer {
-            harness.stop()
-        }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "Fixture", command: "/bin/cat"))
-        harness.server.start()
-
-        let session = try await harness.spawnAgentSession(named: "Fixture")
-        session.ingestTestingData(Data("Choose alpha or beta\n❯ \n".utf8))
-        try await Task.sleep(for: .milliseconds(150))
-
-        let response = try await harness.send(.captureAttentionObservation(.init(
-            processID: session.id.uuidString,
-            label: "waiting_for_input",
-            scenarioID: "waiting-for-input",
-            checkpoint: "human_verified",
-            harnessVersion: "fixture 1.0",
-            runID: "control-run"
-        )))
-        guard case .captureAttentionObservation(let capture)? = response.result else {
-            Issue.record("Expected captureAttentionObservation result, got \(String(describing: response))")
-            return
-        }
-
-        #expect(capture.processID == session.id.uuidString)
-        #expect(FileManager.default.fileExists(atPath: capture.outputPath))
-        let data = try Data(contentsOf: URL(fileURLWithPath: capture.outputPath))
-        #expect(String(decoding: data, as: UTF8.self).contains("\"label\":\"waiting_for_input\""))
-        #expect(String(decoding: data, as: UTF8.self).contains("\"runID\":\"control-run\""))
-    }
-
     @Test func waitForProcessIdleReturnsPermissionImmediately() async throws {
         TerminalNotificationCenter.shared.isDeliveryEnabled = false
         defer {
             TerminalNotificationCenter.shared.isDeliveryEnabled = true
         }
 
-        let harness = try ControlActivityHarness()
+        let harness = try ControlAgentWaitHarness()
         defer {
             harness.stop()
         }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "/bin/cat"))
         harness.server.start()
 
-        let session = try await harness.spawnAgentSession(named: "Claude")
-        session.ingestTestingData(Data("\u{1B}]9;Permission required\u{7}".utf8))
+        let session = try await harness.spawnAgent(named: "Claude")
+        // "approve Bash: ls", as Claude Code 2.1.295 sends it.
+        session.ingestTestingData(Data(programStatus("state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiBscw==").utf8))
         #expect(session.agentActivityState == .permission)
 
         let startedAt = Date()
@@ -211,19 +150,21 @@ struct ControlActivityTests {
         #expect(waited.timedOut == false)
         #expect(waited.agentActivityState == "permission")
         #expect(waited.process.agentActivityState == "permission")
+        #expect(waited.process.programStatus?.kind == "permission")
+        #expect(waited.process.programStatus?.message == "approve Bash: ls")
         #expect(Date().timeIntervalSince(startedAt) < 5)
     }
 
     @Test func waitForProcessIdleTimesOutWhileAgentIsWorking() async throws {
-        let harness = try ControlActivityHarness()
+        let harness = try ControlAgentWaitHarness()
         defer {
             harness.stop()
         }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "/bin/cat"))
         harness.server.start()
 
-        let session = try await harness.spawnAgentSession(named: "Claude")
-        session.ingestTestingData(Data("✶ Reticulating… (esc to interrupt)\n".utf8))
+        let session = try await harness.spawnAgent(named: "Claude")
+        // Its screen looks idle; what it reports is what counts.
+        session.ingestTestingData(Data("❯ \n\(programStatus("state=working:app=claude-code"))".utf8))
         try await Task.sleep(for: .milliseconds(150))
         #expect(session.agentActivityState == .working)
 
@@ -244,114 +185,164 @@ struct ControlActivityTests {
         #expect(waited.agentActivityState == "working")
     }
 
-    // Agents with no recognizable composer prompt or working footer (amp, bare REPLs,
-    // unrecognized tools) used to stay pinned to "working" forever once they emitted
-    // any output. The quiet-window recheck now settles them to idle so the sidebar /
-    // menu bar report the truth. See the recheckAgentActivityAfterQuiet fallback.
-    @Test func unrecognizedAgentSettlesToIdleAfterQuietWindow() async throws {
-        let harness = try ControlActivityHarness()
+    /// An agent that reports nothing (Codex, Amp, older versions) shows no
+    /// state, however its screen looks; MCP's idle wait falls back to its
+    /// output going quiet.
+    @Test func anAgentThatReportsNothingIsUnknownAndItsWaitEndsWhenItGoesQuiet() async throws {
+        let harness = try ControlAgentWaitHarness()
         defer {
             harness.stop()
         }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "customrepl", command: "/bin/cat"))
         harness.server.start()
 
-        let session = try await harness.spawnAgentSession(named: "customrepl")
-        // Plain output with no prompt glyph, no "esc to interrupt", no title spinner.
-        session.ingestTestingData(Data("building module graph...\n".utf8))
+        let session = try await harness.spawnAgent(named: "Codex")
+        session.ingestTestingData(Data("\u{1B}]0;⠋ project\u{7}• Working (3s • esc to interrupt)\n› \n".utf8))
         try await Task.sleep(for: .milliseconds(150))
-        #expect(session.agentActivityState == .working)
-        #expect(session.agentActivityEvidenceIsStrong == false)
+        #expect(session.agentActivityState == .unknown)
+        #expect(!session.reportsProgramStatus)
 
-        // The recheck fires one quiet window (4s) after the last content change; wait
-        // past it with margin, then the weak-evidence fallback should mark it idle.
-        try await Task.sleep(for: .milliseconds(4_600))
+        let waitResponse = try await harness.send(.waitForProcessIdle(.init(
+            processID: session.id.uuidString,
+            requireNewOutput: false,
+            quietMilliseconds: 100,
+            timeoutMilliseconds: 5_000,
+            lineLimit: 20
+        )))
+        guard case .waitForProcessIdle(let waited)? = waitResponse.result else {
+            Issue.record("Expected waitForProcessIdle result, got \(String(describing: waitResponse))")
+            return
+        }
+        #expect(waited.reason == .idle)
+        #expect(waited.agentActivityState == "unknown")
+        #expect(waited.process.programStatus == nil)
+    }
+
+#if DEBUG
+    /// A turn as Claude Code reports it: `working` at the submit, `done`
+    /// at its end. A result that comes while the tab is not seen stays
+    /// unseen until it is; an `idle` straight after `working` is a turn the
+    /// user cancelled. (`noteTestingInput` is DEBUG only: release builds,
+    /// such as Scripts/perf-terminal-stress's, compile without this test.)
+    @Test func reportedTurnsAreCountedAndTheirResultsAreUnseenUntilViewed() async throws {
+        TerminalNotificationCenter.shared.isDeliveryEnabled = false
+        defer {
+            TerminalNotificationCenter.shared.isDeliveryEnabled = true
+        }
+        let harness = try ControlAgentWaitHarness()
+        defer {
+            harness.stop()
+        }
+        harness.server.start()
+
+        let session = try await harness.spawnAgent(named: "Claude")
+        session.ingestTestingData(Data(programStatus("state=idle:app=claude-code").utf8))
+        #expect(session.agentTurnState == .notStarted)
+        #expect(session.agentTurnCount == 0)
+
+        session.noteTestingInput(Data("fix the tests\r".utf8))
+        #expect(session.agentSubmittedTurnCount == 1)
+        session.ingestTestingData(Data(programStatus("state=working:app=claude-code").utf8))
+        #expect(session.agentActivityState == .working)
+        #expect(session.agentTurnState == .active)
+        #expect(CherryControlServer.agentTurnStarted(session) == true)
+        #expect(session.agentTurnCount == 1)
+        #expect(!session.hasUnseenAgentResult)
+
+        session.ingestTestingData(Data(programStatus("state=done:app=claude-code").utf8))
         #expect(session.agentActivityState == .idle)
-        #expect(session.agentActivityEvidenceIsStrong == false)
-    }
+        #expect(session.agentTurnState == .completed)
+        #expect(session.hasUnseenAgentResult)
+        session.acknowledgeAgentResult()
+        #expect(!session.hasUnseenAgentResult)
 
-    // The quiet-window fallback must not override a genuinely working agent: Claude's
-    // "esc to interrupt" footer persists on screen through the whole turn, so a quiet
-    // stretch (slow tool call, no new output) must stay "working".
-    @Test func persistentWorkingMarkerSurvivesQuietWindow() async throws {
-        let harness = try ControlActivityHarness()
+        // A turn the agent began by itself counts too.
+        session.ingestTestingData(Data(programStatus("state=working:app=claude-code").utf8))
+        #expect(session.agentTurnCount == 2)
+        session.ingestTestingData(Data(programStatus("state=idle:app=claude-code").utf8))
+        #expect(session.agentTurnState == .userInterrupted)
+        #expect(!session.hasUnseenAgentResult)
+
+        // A question: needs input, with its words.
+        session.ingestTestingData(Data(programStatus("state=working:app=claude-code").utf8))
+        session.ingestTestingData(Data(programStatus("state=blocked:app=claude-code:kind=question:msg=VGVhIG9yIGNvZmZlZT8=").utf8))
+        #expect(session.agentActivityState == .needsInput)
+        #expect(session.programStatus.root?.message == "Tea or coffee?")
+        #expect(session.agentTurnCount == 3)
+
+        // The program exits: what it was doing is over.
+        session.ingestTestingData(Data(programStatus("state=clear").utf8))
+        #expect(session.agentActivityState == .unknown)
+        #expect(session.programStatus.isEmpty)
+    }
+#endif
+
+    /// An idle wait on a native tab reads its surface (a tab no window
+    /// shows gets no render signal), its whole text only when the visible
+    /// screen changed: output that screen does not show, such as a program
+    /// repeating the same line, still keeps the wait from calling it quiet.
+    @Test func aNativeTabsWaitSeesOutputItsVisibleScreenDoesNotShow() async throws {
+        let harness = try ControlAgentWaitHarness(launchBackend: .nativePTY)
         defer {
             harness.stop()
         }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "/bin/cat"))
         harness.server.start()
+        let processID = try await harness.startScript(named: "Repeater", """
+            #!/bin/sh
+            while :; do echo same; sleep 0.02; done
+            """)
+        // The visible screen fills with the line, and then stays the same.
+        try await Task.sleep(for: .milliseconds(1_500))
 
-        let session = try await harness.spawnAgentSession(named: "Claude")
-        session.ingestTestingData(Data("✶ Reticulating… (esc to interrupt)\n".utf8))
-        try await Task.sleep(for: .milliseconds(150))
-        #expect(session.agentActivityState == .working)
-
-        // Past the quiet window the marker is still on screen, so it stays working.
-        try await Task.sleep(for: .milliseconds(4_600))
-        #expect(session.agentActivityState == .working)
+        let waitResponse = try await harness.send(.waitForProcessIdle(.init(
+            processID: processID,
+            requireNewOutput: false,
+            quietMilliseconds: 300,
+            timeoutMilliseconds: 1_500,
+            lineLimit: 5
+        )))
+        guard case .waitForProcessIdle(let waited)? = waitResponse.result else {
+            Issue.record("Expected waitForProcessIdle result, got \(String(describing: waitResponse))")
+            return
+        }
+        #expect(waited.reason == .timedOut)
+        #expect(waited.observedNewOutput)
+        #expect(waited.outputVersion > waited.sinceOutputVersion)
+        #expect(waited.output.lines.contains("same"))
     }
 
-    @Test func piSpinnerWorkingMarkerOutranksVisibleComposer() async throws {
-        let harness = try ControlActivityHarness()
+    /// The output a wait on a native tab waits for ends it once quiet.
+    @Test func aNativeTabsWaitEndsOnceItsNewOutputWentQuiet() async throws {
+        let harness = try ControlAgentWaitHarness(launchBackend: .nativePTY)
         defer {
             harness.stop()
         }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "Pi", command: "/bin/cat"))
         harness.server.start()
+        let processID = try await harness.startScript(named: "Answer", """
+            #!/bin/sh
+            echo ready
+            read line
+            echo "got $line"
+            exec sleep 30
+            """)
+        try await Task.sleep(for: .milliseconds(300))
+        let sent = try await harness.send(.sendProcessInput(.init(processID: processID, text: "go\n", rawBase64: nil)))
+        #expect(sent.error == nil)
 
-        let session = try await harness.spawnAgentSession(named: "Pi")
-        session.noteTestingInput(Data("run the tests\r".utf8))
-        session.ingestTestingData(Data("⠏ Working...\n> \n".utf8))
-        try await Task.sleep(for: .milliseconds(150))
-
-        #expect(session.agentActivityState == .working)
-        #expect(session.agentActivityEvidenceIsStrong == true)
-    }
-
-    @Test func piProseMentioningWorkingDoesNotOutrankComposer() async throws {
-        let harness = try ControlActivityHarness()
-        defer {
-            harness.stop()
+        let waitResponse = try await harness.send(.waitForProcessIdle(.init(
+            processID: processID,
+            requireNewOutput: true,
+            quietMilliseconds: 400,
+            timeoutMilliseconds: 5_000,
+            lineLimit: 20
+        )))
+        guard case .waitForProcessIdle(let waited)? = waitResponse.result else {
+            Issue.record("Expected waitForProcessIdle result, got \(String(describing: waitResponse))")
+            return
         }
-        try harness.settings.upsertAgent(AgentToolDefinition(name: "Pi", command: "/bin/cat"))
-        harness.server.start()
-
-        let session = try await harness.spawnAgentSession(named: "Pi")
-        session.ingestTestingData(Data("The service is working...\n> \n".utf8))
-        try await Task.sleep(for: .milliseconds(150))
-
-        #expect(session.agentActivityState == .idle)
-        #expect(session.agentActivityEvidenceIsStrong == true)
-    }
-
-    // Real screen captured live on 2026-07-08: the agent's own FINAL MESSAGE contains
-    // the prose "~3–5% while working (0% idle)", which the old bare "working ("
-    // substring match treated as a working status marker. With that sentence pinned
-    // inside the 32-line tail window of a viewport-height buffer, the session
-    // reported "working" forever despite an idle ❯ composer two rows above the
-    // footer. Markers must come from status chrome, never transcript prose.
-    @Test func agentProseMentioningWorkingDoesNotPinWorkingState() async throws {
-        let fixtureURL = try #require(Bundle.module.url(
-            forResource: "claude-idle-screen-prose-working-marker",
-            withExtension: "txt",
-            subdirectory: "Fixtures"
-        ))
-        let screen = try String(contentsOf: fixtureURL, encoding: .utf8)
-
-        let session = TerminalSession(
-            title: "Claude",
-            subtitle: "claude --dangerously-skip-permissions",
-            tint: .systemBlue,
-            launchShell: false,
-            kind: .agent,
-            agentName: "Claude"
-        )
-        session.ingestTestingData(Data(screen.utf8))
-        try await Task.sleep(for: .milliseconds(150))
-
-        // The empty ❯ composer near the bottom is the truth; the prose upstream
-        // must not outrank it.
-        #expect(session.agentActivityState == .idle)
+        #expect(waited.reason == .idle)
+        #expect(waited.observedNewOutput)
+        #expect(waited.output.lines.contains("got go"))
+        #expect(waited.outputVersion > waited.sinceOutputVersion)
     }
 
     @Test func trimmedRawOutputSuffixSkipsPartialUTF8AndEscapeTails() async throws {
@@ -374,4 +365,9 @@ struct ControlActivityTests {
         let parameterOnly = Data("38;5;1".utf8)
         #expect(CherryControlServer.trimmedRawOutputSuffix(parameterOnly) == parameterOnly)
     }
+}
+
+/// An OSC 7501 program status report with `body`.
+private func programStatus(_ body: String) -> String {
+    "\u{1B}]7501;\(body)\u{1B}\\"
 }

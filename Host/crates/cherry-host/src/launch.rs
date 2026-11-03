@@ -59,22 +59,9 @@ impl Probe {
 /// Ask whoever listens at `path` for its protocol version. The socket and its
 /// directory are verified before anything is sent or trusted.
 pub fn probe(path: &Path) -> Result<Probe> {
-    cherry_protocol::verify_socket_path(path).map_err(|error| untrusted(path, error))?;
-    let mut stream = match UnixStream::connect(path) {
-        Ok(stream) => stream,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Ok(Probe::Absent)
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("connecting to {}", path.display()))
-        }
+    let Some(mut stream) = connect(path)? else {
+        return Ok(Probe::Absent);
     };
-    cherry_protocol::verify_peer(&stream).map_err(|error| peer_refused(path, error))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     if let Err(error) = write_frame(&mut stream, &ClientMessage::hello()) {
@@ -134,6 +121,28 @@ fn peer_refused(path: &Path, error: io::Error) -> anyhow::Error {
         "refusing to use {}: {error}; another account is listening on this socket",
         path.display()
     )
+}
+
+/// Connect to whoever listens at `path`, once the socket and its directory
+/// are verified, and verify its account; None when nothing listens.
+fn connect(path: &Path) -> Result<Option<UnixStream>> {
+    cherry_protocol::verify_socket_path(path).map_err(|error| untrusted(path, error))?;
+    let stream = match UnixStream::connect(path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("connecting to {}", path.display()))
+        }
+    };
+    cherry_protocol::verify_peer(&stream).map_err(|error| peer_refused(path, error))?;
+    Ok(Some(stream))
 }
 
 /// A host that cannot be replaced (`Probe::OtherVersion`). Every report
@@ -225,6 +234,10 @@ pub fn start(path: &Path) -> Result<()> {
         .open(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
     let log_start = log.seek(io::SeekFrom::End(0))?;
+    // The daemon writes a byte to its end once it listens, and closes it
+    // without one when it gives up.
+    let (ready, ready_end) = UnixStream::pair()?;
+    let ready_fd = ready_end.as_raw_fd();
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("serve")
@@ -234,6 +247,7 @@ pub fn start(path: &Path) -> Result<()> {
         // keeps only neutral variables and does not pin this directory.
         .env_clear()
         .envs(environment::inherited_vars())
+        .env(crate::daemon::READY_FD_VAR, ready_fd.to_string())
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -248,17 +262,25 @@ pub fn start(path: &Path) -> Result<()> {
     if let Some(build) = std::env::var_os("CHERRY_HOST_TEST_SERVE_BUILD") {
         command.env("CHERRY_HOST_TEST_BUILD", build);
     }
+    let mut fds = environment::FdList::before_fork();
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
-            environment::cloexec_from_3();
+            fds.cloexec_from_3();
+            if libc::fcntl(ready_fd, libc::F_SETFD, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
             Ok(())
         });
     }
     let mut child = command.spawn().context("starting detached host")?;
+    drop(ready_end);
     let deadline = Instant::now() + Duration::from_secs(10);
+    // However the wait ends, look: the daemon that answers may be one
+    // another client started at the same time.
+    wait_ready(&ready, deadline);
     let mut exited = None;
     loop {
         match probe(path)? {
@@ -301,6 +323,15 @@ pub fn start(path: &Path) -> Result<()> {
     }
 }
 
+/// Wait until the daemon `start` started says it listens, ends its side of
+/// `ready` without saying so, or `deadline` passes.
+fn wait_ready(mut ready: &UnixStream, deadline: Instant) {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if !left.is_zero() && ready.set_read_timeout(Some(left)).is_ok() {
+        let _ = ready.read(&mut [0u8; 1]);
+    }
+}
+
 /// How long a host asked to make way may take to release its socket and
 /// lock and answer.
 const REPLACE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -320,21 +351,10 @@ fn replace(path: &Path, version: u32) -> Result<()> {
             path.display()
         )
     };
-    cherry_protocol::verify_socket_path(path).map_err(|error| untrusted(path, error))?;
-    let mut stream = match UnixStream::connect(path) {
-        Ok(stream) => stream,
+    let Some(mut stream) = connect(path)? else {
         // Gone since the probe: another client replaced it.
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Ok(())
-        }
-        Err(error) => return Err(error).with_context(failed),
+        return Ok(());
     };
-    cherry_protocol::verify_peer(&stream).map_err(|error| peer_refused(path, error))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     write_frame(&mut stream, &ClientMessage::hello()).with_context(failed)?;
@@ -408,23 +428,10 @@ pub fn gateway(path: &Path, start_host: bool, expected_host_id: Option<&str>) ->
             found => serving(path, found)?,
         }
     }
-    cherry_protocol::verify_socket_path(path).map_err(|error| untrusted(path, error))?;
-    let socket = match UnixStream::connect(path) {
-        Ok(socket) => socket,
+    let Some(socket) = connect(path)? else {
         // It stopped since it answered the probe.
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Err(not_running(path))
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("connecting to {}", path.display()))
-        }
+        return Err(not_running(path));
     };
-    cherry_protocol::verify_peer(&socket).map_err(|error| peer_refused(path, error))?;
     // Sessions use a stable agent path; point it at the agent forwarded to
     // this connection. The CLI forwards one only for an attachment. The
     // daemon takes it back a moment after this process's connection ends,

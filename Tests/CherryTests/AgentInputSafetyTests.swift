@@ -1,16 +1,21 @@
-import CherryControl
-@testable import CherryMCP
+@testable import CherryControl
 import Foundation
-import MCP
 import Testing
 @testable import Cherry
 
-// MCP input to an agent never answers a permission prompt on its screen.
-// A restored agent (Cherry quit or crashed while it asked for permission)
-// is followed through its host: its screen is read from there before any
-// input goes, no startup prompt of it is ever acknowledged, and MCP reports
-// it waiting for permission rather than idle. Against the fake `cherry
-// control` (FakeControlHelper); nothing reaches a real cherry-host.
+// MCP input to an agent never answers a permission prompt. A restored agent
+// (Cherry quit or crashed while it asked for permission) is followed through
+// its host: one that reports its status (OSC 7501) is blocked by its host's
+// records, and MCP reports it waiting for permission rather than idle; for
+// one that reports nothing its screen is read from there before any input
+// goes. No startup prompt of a restored agent is ever acknowledged. Against
+// the fake `cherry control` (FakeControlHelper); nothing reaches a real
+// cherry-host.
+
+/// Claude Code's report while it asks to run `rm -rf build`.
+private let claudeBashPermissionStatus = [ProgramStatus(
+    state: .blocked, kind: .permission, app: "claude-code", message: "approve Bash: rm -rf build"
+)]
 
 /// Claude Code asking to run a command.
 private let claudeBashPermissionScreen = """
@@ -53,13 +58,14 @@ private func safetyConfiguration() -> PersistentLocalSessions.Configuration {
 }
 
 /// Restores a Claude agent tab whose session the fake host still runs,
-/// with its attach adapter left for later (a worktree not shown, or a tab
-/// not shown yet). `owned` false restores it only attached (a viewer).
+/// with its attach adapter left for later (a tab not shown yet). `owned` false restores it only attached (a viewer).
 @MainActor
 private func restoreAgent(
     _ harness: PersistentHarness,
     into workspace: TerminalWorkspace,
     screen: String,
+    programStatus: [ProgramStatus] = [],
+    bracketedPaste: Bool? = nil,
     owned: Bool = true
 ) async throws -> TerminalSession {
     let record = WorkspaceSessionRecord(
@@ -73,11 +79,13 @@ private func restoreAgent(
             PersistentSessionTag.tab: record.id.uuidString,
             PersistentSessionTag.kind: "agent",
             PersistentSessionTag.agent: "Claude"
-        ]
+        ],
+        bracketedPaste: bracketedPaste,
+        programStatus: programStatus
     )]
     harness.fake.screenText = screen
     let result = await harness.restorer(WorkspaceRestoreRequest(
-        repositoryRoot: harness.project.path, worktreeRoot: harness.project.path,
+        repositoryRoot: harness.project.path,
         records: [record], workspace: workspace
     ))
     workspace.restoreSessions(
@@ -101,7 +109,113 @@ private func typed(_ harness: PersistentHarness) -> [String] {
     }
 }
 
+// MARK: - Messages of several lines
+
+/// A message of several lines reaches the agent as one message: its lines
+/// in one bracketed paste, then one Enter on its own, never an Enter per
+/// line (which sent the first paragraph and queued the rest).
+@Test @MainActor func aMessageOfSeveralLinesIsOnePasteAndOneEnter() async throws {
+    let harness = try PersistentHarness(configuration: safetyConfiguration())
+    let workspace = harness.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    defer {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let agent = try await restoreAgent(harness, into: workspace, screen: claudeComposerScreen)
+    let sent = try await control.send(.sendProcessInput(.init(
+        processID: agent.id.uuidString, text: "Review:\r\n1. fix a\n2. fix b\n", submit: true
+    )))
+    #expect(sent.error == nil)
+    #expect(typed(harness) == ["\u{1B}[200~Review:\n1. fix a\n2. fix b\u{1B}[201~", "\r"])
+
+    // A trailing newline submits it, as a one-line message's does; a
+    // message the caller does not submit is only pasted.
+    let unsubmitted = try await control.send(.sendProcessInput(.init(
+        processID: agent.id.uuidString, text: "draft\nmore", submit: false
+    )))
+    #expect(unsubmitted.error == nil)
+    #expect(typed(harness).last == "\u{1B}[200~draft\nmore\u{1B}[201~")
+    let trailing = try await control.send(.sendProcessInput(.init(
+        processID: agent.id.uuidString, text: "a\nb\n", submit: false
+    )))
+    #expect(trailing.error == nil)
+    #expect(Array(typed(harness).suffix(2)) == ["\u{1B}[200~a\nb\u{1B}[201~", "\r"])
+
+    // One line is typed as before.
+    let single = try await control.send(.sendProcessInput(.init(processID: agent.id.uuidString, text: "go on", submit: true)))
+    #expect(single.error == nil)
+    #expect(Array(typed(harness).suffix(2)) == ["go on", "\r"])
+}
+
+/// An agent whose host reports bracketed paste off gets the lines with LF
+/// between them (a newline in a composer, not Enter), then one Enter.
+@Test @MainActor func aMessageOfSeveralLinesToAnAgentWithoutBracketedPasteKeepsItsNewlines() async throws {
+    let harness = try PersistentHarness(configuration: safetyConfiguration())
+    let workspace = harness.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    defer {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let agent = try await restoreAgent(harness, into: workspace, screen: claudeComposerScreen, bracketedPaste: false)
+    let sent = try await control.send(.sendProcessInput(.init(
+        processID: agent.id.uuidString, text: "one\ntwo", submit: true
+    )))
+    #expect(sent.error == nil)
+    #expect(typed(harness) == ["one\ntwo", "\r"])
+}
+
+@Test func agentMessagePasteLeavesOneLineAloneAndStripsWhatWouldEndThePaste() throws {
+    #expect(CherryControlServer.agentMessagePaste("hello", bracketed: true) == nil)
+    #expect(CherryControlServer.agentMessagePaste("hello\n", bracketed: true) == nil)
+    let paste = try #require(CherryControlServer.agentMessagePaste("a\u{1B}[201~\nb\r\n", bracketed: true))
+    #expect(String(decoding: paste.payload, as: UTF8.self) == "\u{1B}[200~a [201~\nb\u{1B}[201~")
+    #expect(paste.endsWithNewline)
+}
+
 // MARK: - A restored agent at a permission prompt
+
+@Test @MainActor func aRestoredAgentThatReportsItWaitsForPermissionIsNeverAnswered() async throws {
+    let harness = try PersistentHarness(configuration: safetyConfiguration())
+    let workspace = harness.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    defer {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    let agent = try await restoreAgent(
+        harness, into: workspace, screen: claudeBashPermissionScreen, programStatus: claudeBashPermissionStatus
+    )
+
+    // The orchestrator's view: waiting for permission, not idle.
+    let status = try await control.process(agent)
+    #expect(status.agentActivityState == "permission")
+    #expect(status.programStatus?.message == "approve Bash: rm -rf build")
+    let waited = try await control.send(.waitForProcessIdle(.init(
+        processID: agent.id.uuidString, requireNewOutput: false, quietMilliseconds: 100, timeoutMilliseconds: 3_000
+    )))
+    guard case .waitForProcessIdle(let idle)? = waited.result else {
+        Issue.record("Expected waitForProcessIdle, got \(String(describing: waited))")
+        return
+    }
+    #expect(idle.reason == .permission)
+    #expect(idle.agentActivityState == "permission")
+
+    // Refused on its report, quoting it; its screen is not needed.
+    let screenReads = harness.fake.requests("screen").count
+    let message = try await control.send(.sendProcessInput(.init(
+        processID: agent.id.uuidString, text: "please also run the tests", submit: true
+    )))
+    #expect(message.error?.code == "agent_awaiting_permission")
+    #expect(message.error?.message.contains("approve Bash: rm -rf build") == true)
+    #expect(harness.fake.requests("screen").count == screenReads)
+    try await Task.sleep(for: .milliseconds(500))
+    #expect(typed(harness).isEmpty)
+}
 
 @Test @MainActor func mcpInputNeverAnswersTheRestoredAgentsPermissionPrompt() async throws {
     let harness = try PersistentHarness(configuration: safetyConfiguration())
@@ -112,21 +226,11 @@ private func typed(_ harness: PersistentHarness) -> [String] {
         workspace.closeAllSessions(intent: .windowClosed)
         harness.cleanUp()
     }
+    // An agent that reports nothing: its state is unknown, and only its
+    // screen can say it waits for permission.
     let agent = try await restoreAgent(harness, into: workspace, screen: claudeBashPermissionScreen)
     #expect(agent.lastInputOutputVersion == nil)
-
-    // The orchestrator's view: waiting for permission, not idle.
-    let status = try await control.process(agent)
-    #expect(status.agentActivityState == "permission")
-    let waited = try await control.send(.waitForProcessIdle(.init(
-        processID: agent.id.uuidString, requireNewOutput: false, quietMilliseconds: 100, timeoutMilliseconds: 3_000
-    )))
-    guard case .waitForProcessIdle(let idle)? = waited.result else {
-        Issue.record("Expected waitForProcessIdle, got \(String(describing: waited))")
-        return
-    }
-    #expect(idle.reason == .permission)
-    #expect(idle.agentActivityState == "permission")
+    #expect(try await control.process(agent).agentActivityState == "unknown")
 
     // send_agent_message (text, submitted): refused, nothing typed; above
     // all no Enter, which would approve `rm -rf build`.
@@ -165,7 +269,6 @@ private func typed(_ harness: PersistentHarness) -> [String] {
     )))
     #expect(later.error == nil)
     #expect(typed(harness) == ["\u{1B}", "run the tests", "\r"])
-    #expect(try await control.process(agent).agentActivityState != "permission")
 }
 
 @Test @MainActor func sendAgentMessageThroughMCPLeavesTheRestoredAgentsPermissionPromptAlone() async throws {
@@ -183,29 +286,25 @@ private func typed(_ harness: PersistentHarness) -> [String] {
         workspace.closeAllSessions(intent: .windowClosed)
         harness.cleanUp()
     }
-    let agent = try await restoreAgent(harness, into: workspace, screen: claudeBashPermissionScreen)
+    let agent = try await restoreAgent(
+        harness, into: workspace, screen: claudeBashPermissionScreen, programStatus: claudeBashPermissionStatus
+    )
 
     // The original report: wait_for_process_idle, then send_agent_message.
-    let idle = await CherryMCPTools.call(
+    let idle = await ToolCalls.call(
         name: "wait_for_process_idle",
         arguments: ["process_id": .string(agent.id.uuidString), "require_new_output": .bool(false), "timeout_ms": .int(3_000)]
     )
     #expect(idle.isError != true)
-    let idleText = idle.content.compactMap { content -> String? in
-        if case .text(let text, _, _) = content { return text }
-        return nil
-    }.joined()
+    let idleText = idle.text
     #expect(idleText.contains("permission"), Comment(rawValue: idleText))
 
-    let sent = await CherryMCPTools.call(
+    let sent = await ToolCalls.call(
         name: "send_agent_message",
         arguments: ["process_id": .string(agent.id.uuidString), "message": .string("carry on"), "timeout_ms": .int(2_000)]
     )
     #expect(sent.isError == true)
-    let sentText = sent.content.compactMap { content -> String? in
-        if case .text(let text, _, _) = content { return text }
-        return nil
-    }.joined()
+    let sentText = sent.text
     #expect(sentText.contains("agent_awaiting_permission"), Comment(rawValue: sentText))
     try await Task.sleep(for: .milliseconds(1_000))
     #expect(typed(harness).isEmpty)

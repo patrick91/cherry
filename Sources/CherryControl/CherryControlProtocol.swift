@@ -36,14 +36,15 @@ public enum CherryControl {
             return URL(fileURLWithPath: socketPath)
         }
 
-        let uid = getuid()
-        return URL(fileURLWithPath: "/tmp/cherry-\(uid)", isDirectory: true)
+        return sharedSocketRoot
             .appendingPathComponent(socketNamespace(environment: environment, executableURL: executableURL), isDirectory: true)
             .appendingPathComponent("control.sock", isDirectory: false)
     }
 
-    public static var socketDirectoryURL: URL {
-        socketURL.deletingLastPathComponent()
+    /// The directory every derived socket path's namespace is in,
+    /// `/tmp/cherry-<uid>`: one per user, shared by the copies of Cherry.
+    public static var sharedSocketRoot: URL {
+        URL(fileURLWithPath: "/tmp/cherry-\(getuid())", isDirectory: true)
     }
 
     public static func socketNamespace(
@@ -109,6 +110,17 @@ public enum CherryControl {
         }
         return String(format: "%016llx", hash)
     }
+
+    /// A This Mac project root (or a path in one) as the app and CherryMCP
+    /// compare them: standardized, `.` and `..` resolved.
+    public static func standardizedProjectRoot(_ path: String) -> String {
+        URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+    }
+
+    /// Whether `path` is `projectRoot` or inside it (both standardized).
+    public static func path(_ path: String, isInsideProjectRoot projectRoot: String) -> Bool {
+        path == projectRoot || path.hasPrefix(projectRoot.hasSuffix("/") ? projectRoot : projectRoot + "/")
+    }
 }
 
 public enum CherryControlRequest: Codable, Equatable, Sendable {
@@ -149,24 +161,15 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case renameProcess(RenameProcessRequest)
     case selectProcess(ProcessSelectorRequest)
     case sendProcessInput(SendProcessInputRequest)
-    case captureAttentionObservation(CaptureAttentionObservationRequest)
+    /// Picks an option of the permission or question menu an agent shows
+    /// (`AgentPromptInfo`), read off its screen again first.
+    case answerPrompt(AnswerPromptRequest)
     case startAllCommands(ProcessBulkCommandRequest)
     case stopAllCommands(ProcessBulkCommandRequest)
     case restartAllCommands(ProcessBulkCommandRequest)
     case listTerminals
     case listAgents
-    case listNotes
     case listTodos
-    case createTerminal(CreateTerminalRequest)
-    case runAgent(RunAgentRequest)
-    case createNote(CreateNoteRequest)
-    case getNote(NoteIDRequest)
-    case updateNote(UpdateNoteRequest)
-    case appendNote(AppendNoteRequest)
-    case renameNote(RenameNoteRequest)
-    case searchNotes(SearchNotesRequest)
-    case deleteNote(NoteIDRequest)
-    case selectNote(NoteIDRequest)
     case createTodo(CreateTodoRequest)
     case getTodo(TodoIDRequest)
     case updateTodo(UpdateTodoRequest)
@@ -177,15 +180,23 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     case listTodoComments(TodoIDRequest)
     case updateTodoComment(UpdateTodoCommentRequest)
     case deleteTodoComment(DeleteTodoCommentRequest)
-    case renameTerminal(RenameTerminalRequest)
-    case selectTerminal(TerminalIDRequest)
-    case sendInput(SendInputRequest)
-    case getTerminalOutput(GetTerminalOutputRequest)
-    case getTerminalRawOutput(GetTerminalRawOutputRequest)
-    case searchOutput(SearchOutputRequest)
     case clearOutput(TerminalIDRequest)
-    case restartTerminal(TerminalIDRequest)
-    case closeTerminal(CloseTerminalRequest)
+    /// Control protocol 2 (`CherryToolProtocol.swift`): the app that
+    /// answers, its tools for a client, and one MCP tool run in the app as
+    /// its caller. Never inside `scoped`: a tool call names its project in
+    /// its arguments.
+    case appInfo
+    case listTools(ListToolsRequest)
+    case callTool(CallToolRequest)
+    /// Control protocol 3: one `cherry` agent command, run in the app as
+    /// its caller. Never inside `scoped`.
+    case runCommand(RunCommandRequest)
+    /// The Macs (devices) the caller may reach, This Mac first, with their
+    /// projects (`ListDevicesResult`).
+    case listDevices
+    /// Adds a folder of a device (or This Mac) as a project, making it
+    /// first when asked, and opens it.
+    case addProject(AddProjectRequest)
 }
 
 public struct ScopedControlRequest: Codable, Equatable, Sendable {
@@ -368,6 +379,9 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
     public let runID: String?
     /// The JSON Schema (`TaskResultSchema`'s subset) the result must match.
     public let resultSchema: JSONValue?
+    /// With `task`: the worker may use its own CLI's subagents in its tab
+    /// (it still cannot hand out Cherry tasks).
+    public let allowSubagents: Bool?
 
     public init(
         kind: String,
@@ -386,7 +400,8 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
         label: String? = nil,
         phase: String? = nil,
         runID: String? = nil,
-        resultSchema: JSONValue? = nil
+        resultSchema: JSONValue? = nil,
+        allowSubagents: Bool? = nil
     ) {
         self.kind = kind
         self.name = name
@@ -405,6 +420,7 @@ public struct SpawnProcessRequest: Codable, Equatable, Sendable {
         self.phase = phase
         self.runID = runID
         self.resultSchema = resultSchema
+        self.allowSubagents = allowSubagents
     }
 }
 
@@ -492,41 +508,35 @@ public struct SendProcessInputRequest: Codable, Equatable, Sendable {
     }
 }
 
-public struct CaptureAttentionObservationRequest: Codable, Equatable, Sendable {
+public struct AnswerPromptRequest: Codable, Equatable, Sendable {
     public let processID: String?
     public let processName: String?
-    public let label: String
-    public let scenarioID: String?
-    public let checkpoint: String?
-    public let harnessVersion: String?
-    public let runID: String?
+    /// An option's number ("2") or its label, matched without regard to
+    /// case: the whole label first, then a unique start, then a unique part.
+    public let choice: String
+    public let waitMilliseconds: Int?
+    public let lineLimit: Int?
 
     public init(
         processID: String? = nil,
         processName: String? = nil,
-        label: String,
-        scenarioID: String? = nil,
-        checkpoint: String? = nil,
-        harnessVersion: String? = nil,
-        runID: String? = nil
+        choice: String,
+        waitMilliseconds: Int? = nil,
+        lineLimit: Int? = nil
     ) {
         self.processID = processID
         self.processName = processName
-        self.label = label
-        self.scenarioID = scenarioID
-        self.checkpoint = checkpoint
-        self.harnessVersion = harnessVersion
-        self.runID = runID
+        self.choice = choice
+        self.waitMilliseconds = waitMilliseconds
+        self.lineLimit = lineLimit
     }
 }
 
 public struct ProcessBulkCommandRequest: Codable, Equatable, Sendable {
     public let waitMilliseconds: Int?
-    public let lineLimit: Int?
 
-    public init(waitMilliseconds: Int? = nil, lineLimit: Int? = nil) {
+    public init(waitMilliseconds: Int? = nil) {
         self.waitMilliseconds = waitMilliseconds
-        self.lineLimit = lineLimit
     }
 }
 
@@ -535,14 +545,6 @@ public struct TerminalIDRequest: Codable, Equatable, Sendable {
 
     public init(terminalID: String) {
         self.terminalID = terminalID
-    }
-}
-
-public struct NoteIDRequest: Codable, Equatable, Sendable {
-    public let noteID: String
-
-    public init(noteID: String) {
-        self.noteID = noteID
     }
 }
 
@@ -568,77 +570,17 @@ public struct ResolveDeepLinkRequest: Codable, Equatable, Sendable {
     }
 }
 
-public struct CreateNoteRequest: Codable, Equatable, Sendable {
-    public let title: String
-    public let markdown: String
-    public let open: Bool?
-
-    public init(title: String, markdown: String, open: Bool? = nil) {
-        self.title = title
-        self.markdown = markdown
-        self.open = open
-    }
-}
-
-public struct UpdateNoteRequest: Codable, Equatable, Sendable {
-    public let noteID: String
-    public let title: String?
-    public let markdown: String?
-    public let open: Bool?
-
-    public init(noteID: String, title: String? = nil, markdown: String? = nil, open: Bool? = nil) {
-        self.noteID = noteID
-        self.title = title
-        self.markdown = markdown
-        self.open = open
-    }
-}
-
-public struct AppendNoteRequest: Codable, Equatable, Sendable {
-    public let noteID: String
-    public let markdown: String
-
-    public init(noteID: String, markdown: String) {
-        self.noteID = noteID
-        self.markdown = markdown
-    }
-}
-
-public struct RenameNoteRequest: Codable, Equatable, Sendable {
-    public let noteID: String
-    public let title: String
-
-    public init(noteID: String, title: String) {
-        self.noteID = noteID
-        self.title = title
-    }
-}
-
-public struct SearchNotesRequest: Codable, Equatable, Sendable {
-    public let query: String
-    public let caseSensitive: Bool?
-    public let maxMatches: Int?
-
-    public init(query: String, caseSensitive: Bool? = nil, maxMatches: Int? = nil) {
-        self.query = query
-        self.caseSensitive = caseSensitive
-        self.maxMatches = maxMatches
-    }
-}
-
 public struct CreateTodoRequest: Codable, Equatable, Sendable {
     public let title: String
     public let markdown: String
     public let status: TodoStatus?
     public let tags: [String]?
-    public let open: Bool?
 
-    public init(title: String, markdown: String = "", status: TodoStatus? = nil, tags: [String]? = nil, open: Bool? = nil) {
+    public init(title: String, markdown: String = "", status: TodoStatus? = nil, tags: [String]? = nil) {
         self.title = title
         self.markdown = markdown
         self.status = status
         self.tags = tags
-        self.open = open
     }
 }
 
@@ -648,22 +590,19 @@ public struct UpdateTodoRequest: Codable, Equatable, Sendable {
     public let markdown: String?
     public let status: TodoStatus?
     public let tags: [String]?
-    public let open: Bool?
 
     public init(
         todoID: String,
         title: String? = nil,
         markdown: String? = nil,
         status: TodoStatus? = nil,
-        tags: [String]? = nil,
-        open: Bool? = nil
+        tags: [String]? = nil
     ) {
         self.todoID = todoID
         self.title = title
         self.markdown = markdown
         self.status = status
         self.tags = tags
-        self.open = open
     }
 }
 
@@ -671,13 +610,11 @@ public struct MoveTodoRequest: Codable, Equatable, Sendable {
     public let todoID: String
     public let status: TodoStatus?
     public let afterTodoID: String?
-    public let open: Bool?
 
-    public init(todoID: String, status: TodoStatus? = nil, afterTodoID: String? = nil, open: Bool? = nil) {
+    public init(todoID: String, status: TodoStatus? = nil, afterTodoID: String? = nil) {
         self.todoID = todoID
         self.status = status
         self.afterTodoID = afterTodoID
-        self.open = open
     }
 }
 
@@ -686,20 +623,17 @@ public struct AddTodoCommentRequest: Codable, Equatable, Sendable {
     public let markdown: String
     public let author: String?
     public let terminalID: String?
-    public let open: Bool?
 
     public init(
         todoID: String,
         markdown: String,
         author: String? = nil,
-        terminalID: String? = nil,
-        open: Bool? = nil
+        terminalID: String? = nil
     ) {
         self.todoID = todoID
         self.markdown = markdown
         self.author = author
         self.terminalID = terminalID
-        self.open = open
     }
 }
 
@@ -722,133 +656,6 @@ public struct DeleteTodoCommentRequest: Codable, Equatable, Sendable {
     public init(todoID: String, commentID: String) {
         self.todoID = todoID
         self.commentID = commentID
-    }
-}
-
-public struct CreateTerminalRequest: Codable, Equatable, Sendable {
-    public let title: String?
-    public let workingDirectory: String?
-    public let command: String?
-
-    public init(title: String?, workingDirectory: String?, command: String?) {
-        self.title = title
-        self.workingDirectory = workingDirectory
-        self.command = command
-    }
-}
-
-public struct RunAgentRequest: Codable, Equatable, Sendable {
-    public let agentName: String
-    public let model: String?
-    public let title: String?
-    public let text: String?
-    public let rawBase64: String?
-    public let waitMilliseconds: Int?
-    public let lineLimit: Int?
-    public let submit: Bool?
-    public let parentAgentID: String?
-    public let select: Bool?
-
-    public init(
-        agentName: String,
-        model: String? = nil,
-        title: String? = nil,
-        text: String? = nil,
-        rawBase64: String? = nil,
-        waitMilliseconds: Int? = nil,
-        lineLimit: Int? = nil,
-        submit: Bool? = nil,
-        parentAgentID: String? = nil,
-        select: Bool? = nil
-    ) {
-        self.agentName = agentName
-        self.model = model
-        self.title = title
-        self.text = text
-        self.rawBase64 = rawBase64
-        self.waitMilliseconds = waitMilliseconds
-        self.lineLimit = lineLimit
-        self.submit = submit
-        self.parentAgentID = parentAgentID
-        self.select = select
-    }
-}
-
-public struct CloseTerminalRequest: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let agentClosePolicy: AgentClosePolicy?
-
-    public init(terminalID: String, agentClosePolicy: AgentClosePolicy? = nil) {
-        self.terminalID = terminalID
-        self.agentClosePolicy = agentClosePolicy
-    }
-}
-
-public struct RenameTerminalRequest: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let title: String?
-
-    public init(terminalID: String, title: String?) {
-        self.terminalID = terminalID
-        self.title = title
-    }
-}
-
-public struct SendInputRequest: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let text: String?
-    public let rawBase64: String?
-    public let waitMilliseconds: Int?
-    public let lineLimit: Int?
-
-    public init(
-        terminalID: String,
-        text: String?,
-        rawBase64: String?,
-        waitMilliseconds: Int?,
-        lineLimit: Int?
-    ) {
-        self.terminalID = terminalID
-        self.text = text
-        self.rawBase64 = rawBase64
-        self.waitMilliseconds = waitMilliseconds
-        self.lineLimit = lineLimit
-    }
-}
-
-public struct GetTerminalOutputRequest: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let startLine: Int?
-    public let lineLimit: Int?
-
-    public init(terminalID: String, startLine: Int?, lineLimit: Int?) {
-        self.terminalID = terminalID
-        self.startLine = startLine
-        self.lineLimit = lineLimit
-    }
-}
-
-public struct GetTerminalRawOutputRequest: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let maxBytes: Int?
-
-    public init(terminalID: String, maxBytes: Int?) {
-        self.terminalID = terminalID
-        self.maxBytes = maxBytes
-    }
-}
-
-public struct SearchOutputRequest: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let query: String
-    public let caseSensitive: Bool?
-    public let maxMatches: Int?
-
-    public init(terminalID: String, query: String, caseSensitive: Bool?, maxMatches: Int?) {
-        self.terminalID = terminalID
-        self.query = query
-        self.caseSensitive = caseSensitive
-        self.maxMatches = maxMatches
     }
 }
 
@@ -901,24 +708,13 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case renameProcess(ProcessStatusResult)
     case selectProcess(ProcessStatusResult)
     case sendProcessInput(SendProcessInputResult)
-    case captureAttentionObservation(CaptureAttentionObservationResult)
+    case answerPrompt(AnswerPromptResult)
     case startAllCommands(ListProcessesResult)
     case stopAllCommands(ListProcessesResult)
     case restartAllCommands(ListProcessesResult)
     case listTerminals(ListTerminalsResult)
     case listAgents(ListAgentsResult)
-    case listNotes(ListNotesResult)
     case listTodos(ListTodosResult)
-    case createTerminal(TerminalSummaryResult)
-    case runAgent(RunAgentResult)
-    case createNote(NoteDetailResult)
-    case getNote(NoteDetailResult)
-    case updateNote(NoteDetailResult)
-    case appendNote(NoteDetailResult)
-    case renameNote(NoteDetailResult)
-    case searchNotes(SearchNotesResult)
-    case deleteNote(DeleteNoteResult)
-    case selectNote(SelectNoteResult)
     case createTodo(TodoDetailResult)
     case getTodo(TodoDetailResult)
     case updateTodo(TodoDetailResult)
@@ -929,15 +725,15 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case listTodoComments(ListTodoCommentsResult)
     case updateTodoComment(TodoDetailResult)
     case deleteTodoComment(TodoDetailResult)
-    case renameTerminal(TerminalSummaryResult)
-    case selectTerminal(SelectTerminalResult)
-    case sendInput(SendInputResult)
-    case getTerminalOutput(TerminalOutputResult)
-    case getTerminalRawOutput(TerminalRawOutputResult)
-    case searchOutput(SearchOutputResult)
     case clearOutput(ClearOutputResult)
-    case restartTerminal(TerminalSummaryResult)
-    case closeTerminal(CloseTerminalResult)
+    /// Control protocol 2 (`CherryToolProtocol.swift`).
+    case appInfo(AppInfoResult)
+    case listTools(ListToolsResult)
+    case callTool(CallToolResult)
+    /// Control protocol 3.
+    case runCommand(RunCommandResult)
+    case listDevices(ListDevicesResult)
+    case addProject(AddProjectResult)
 }
 
 public struct CherryControlError: Codable, Equatable, Error, Sendable {
@@ -947,12 +743,22 @@ public struct CherryControlError: Codable, Equatable, Error, Sendable {
     /// Each problem, when there are several (`schema_mismatch`: where the
     /// value does not match the task's result schema).
     public let details: [String]?
+    /// `agent_awaiting_permission`, `agent_awaiting_input` and answer_prompt's
+    /// errors: the menu the agent shows, when its screen shows one.
+    public let prompt: AgentPromptInfo?
 
-    public init(code: String, message: String, serviceCandidates: [ServiceRecord]? = nil, details: [String]? = nil) {
+    public init(
+        code: String,
+        message: String,
+        serviceCandidates: [ServiceRecord]? = nil,
+        details: [String]? = nil,
+        prompt: AgentPromptInfo? = nil
+    ) {
         self.code = code
         self.message = message
         self.serviceCandidates = serviceCandidates
         self.details = details
+        self.prompt = prompt
     }
 }
 
@@ -966,7 +772,6 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
     public let lineCount: Int
     public let kind: String?
     public let agentName: String?
-    public let summary: String?
     public let parentAgentID: String?
     public let childAgentCount: Int?
 
@@ -980,7 +785,6 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
         link: String? = nil,
         kind: String? = nil,
         agentName: String? = nil,
-        summary: String? = nil,
         parentAgentID: String? = nil,
         childAgentCount: Int? = nil
     ) {
@@ -993,7 +797,6 @@ public struct TerminalInfo: Codable, Equatable, Sendable {
         self.lineCount = lineCount
         self.kind = kind
         self.agentName = agentName
-        self.summary = summary
         self.parentAgentID = parentAgentID
         self.childAgentCount = childAgentCount
     }
@@ -1017,99 +820,64 @@ public struct OpenProjectRequest: Codable, Equatable, Sendable {
     }
 }
 
-public struct WorktreeInfo: Codable, Equatable, Sendable {
-    public let root: String
-    public let branch: String?
-    public let head: String
-    public let main: Bool
-    public let detached: Bool
-    public let locked: Bool
-    public let hidden: Bool
-    public let loaded: Bool
-    public let active: Bool
-
-    public init(
-        root: String,
-        branch: String?,
-        head: String,
-        main: Bool,
-        detached: Bool,
-        locked: Bool,
-        hidden: Bool,
-        loaded: Bool,
-        active: Bool
-    ) {
-        self.root = root
-        self.branch = branch
-        self.head = head
-        self.main = main
-        self.detached = detached
-        self.locked = locked
-        self.hidden = hidden
-        self.loaded = loaded
-        self.active = active
-    }
-}
-
 public struct ProjectInfo: Codable, Equatable, Sendable {
     public let root: String
     public let name: String
     public let active: Bool
     public let open: Bool
     public let features: ProjectFeatureAvailability
-    public let worktrees: [WorktreeInfo]
-    public let activeWorktreeRoot: String?
 
     public init(
         root: String,
         name: String,
         active: Bool,
         open: Bool,
-        features: ProjectFeatureAvailability = .init(notesEnabled: false, todosEnabled: false),
-        worktrees: [WorktreeInfo] = [],
-        activeWorktreeRoot: String? = nil
+        features: ProjectFeatureAvailability = .init(todosEnabled: false)
     ) {
         self.root = root
         self.name = name
         self.active = active
         self.open = open
         self.features = features
-        self.worktrees = worktrees
-        self.activeWorktreeRoot = activeWorktreeRoot
+    }
+}
+
+extension CodingUserInfoKey {
+    /// True on an encoder that writes what agents read (CherryMCP's tool
+    /// results), not the control wire: fields the wire keeps only for older
+    /// helpers stay out of it.
+    public static let cherryAgentFacingOutput = CodingUserInfoKey(rawValue: "cherry.agentFacingOutput")!
+}
+
+/// A project's optional features. The wire still carries `notesEnabled`,
+/// always false: CherryMCP helpers from before notes were removed (an agent's
+/// helper in a persistent session an update kept, a build installed on another
+/// Mac) decode it as required, and without it their `list_projects` and
+/// `get_project_status` answers would not decode. Agents never see it
+/// (`cherryAgentFacingOutput`).
+public struct ProjectFeatureAvailability: Codable, Equatable, Sendable {
+    public let todosEnabled: Bool
+
+    public init(todosEnabled: Bool) {
+        self.todosEnabled = todosEnabled
     }
 
     private enum CodingKeys: String, CodingKey {
-        case root
-        case name
-        case active
-        case open
-        case features
-        case worktrees
-        case activeWorktreeRoot
+        case notesEnabled
+        case todosEnabled
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        root = try container.decode(String.self, forKey: .root)
-        name = try container.decode(String.self, forKey: .name)
-        active = try container.decode(Bool.self, forKey: .active)
-        open = try container.decode(Bool.self, forKey: .open)
-        features = try container.decodeIfPresent(
-            ProjectFeatureAvailability.self,
-            forKey: .features
-        ) ?? .init(notesEnabled: false, todosEnabled: false)
-        worktrees = try container.decodeIfPresent([WorktreeInfo].self, forKey: .worktrees) ?? []
-        activeWorktreeRoot = try container.decodeIfPresent(String.self, forKey: .activeWorktreeRoot)
+        todosEnabled = try container.decode(Bool.self, forKey: .todosEnabled)
     }
-}
 
-public struct ProjectFeatureAvailability: Codable, Equatable, Sendable {
-    public let notesEnabled: Bool
-    public let todosEnabled: Bool
-
-    public init(notesEnabled: Bool, todosEnabled: Bool) {
-        self.notesEnabled = notesEnabled
-        self.todosEnabled = todosEnabled
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if encoder.userInfo[.cherryAgentFacingOutput] as? Bool != true {
+            try container.encode(false, forKey: .notesEnabled)
+        }
+        try container.encode(todosEnabled, forKey: .todosEnabled)
     }
 }
 
@@ -1120,6 +888,156 @@ public struct ListProjectsResult: Codable, Equatable, Sendable {
     public init(activeProjectRoot: String?, projects: [ProjectInfo]) {
         self.activeProjectRoot = activeProjectRoot
         self.projects = projects
+    }
+}
+
+/// A machine Cherry runs tabs on (`list_devices`): This Mac, or one of the
+/// user's other machines it reaches over SSH (docs/specs/remote-devices.md).
+public struct DeviceInfo: Codable, Equatable, Sendable {
+    /// This Mac's id; a device's is its UUID, lowercased.
+    public static let thisMacID = "this-mac"
+    public static let thisMacName = "This Mac"
+
+    public let id: String
+    public let name: String
+    /// Its operating system: "macOS" (every device is a Mac for now).
+    public let os: String
+    /// The machine the caller runs on.
+    public let caller: Bool
+    public let homeDirectory: String?
+    public let projects: [DeviceProject]
+
+    public init(
+        id: String,
+        name: String,
+        os: String = "macOS",
+        caller: Bool,
+        homeDirectory: String?,
+        projects: [DeviceProject]
+    ) {
+        self.id = id
+        self.name = name
+        self.os = os
+        self.caller = caller
+        self.homeDirectory = homeDirectory
+        self.projects = projects
+    }
+
+    public var isThisMac: Bool { id == Self.thisMacID }
+
+    /// The device `name` names among `devices`: its id (a UUID in any
+    /// case), its name (ignoring case), or "this-mac"/"This Mac"/"local"
+    /// for This Mac. Throws `device_not_found` or `device_ambiguous`.
+    public static func named(_ name: String, in devices: [DeviceInfo]) throws -> DeviceInfo {
+        let wanted = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let folded = wanted.lowercased()
+        if ["this-mac", "this mac", "local", "localhost"].contains(folded) {
+            if let thisMac = devices.first(where: \.isThisMac) { return thisMac }
+        }
+        if let byID = devices.first(where: { $0.id == folded }) { return byID }
+        let byName = devices.filter { $0.name.compare(wanted, options: [.caseInsensitive]) == .orderedSame }
+        if byName.count == 1 { return byName[0] }
+        let names = devices.map { "\($0.name) (\($0.id))" }.joined(separator: ", ")
+        if byName.count > 1 {
+            throw CherryControlError(
+                code: "device_ambiguous",
+                message: "Several devices are named \(wanted.debugDescription); give its id: \(byName.map(\.id).joined(separator: ", "))."
+            )
+        }
+        throw CherryControlError(
+            code: "device_not_found",
+            message: "No device named \(wanted.debugDescription). Devices: \(names.isEmpty ? "none" : names). Run cherry devices."
+        )
+    }
+
+    /// The project key of `path` on this device: the path itself on This
+    /// Mac, else `device:<uuid>:<path>`. `~` and `~/…` are its home's.
+    public func projectKey(path: String) throws -> String {
+        let expanded = try expandedPath(path)
+        guard !isThisMac else { return expanded }
+        guard let deviceID = UUID(uuidString: id) else {
+            throw CherryControlError(code: "device_not_found", message: "Not a device id: \(id).")
+        }
+        return ProjectLocation.remote(deviceID: deviceID, path: expanded).key
+    }
+
+    /// `path` with `~` expanded to its home; an absolute path as it is.
+    public func expandedPath(_ path: String) throws -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix(ProjectLocation.remoteKeyPrefix) {
+            throw CherryControlError(code: "invalid_project_root", message: "Give a path on \(name), not a project key: \(path).")
+        }
+        if trimmed == "~" || trimmed.hasPrefix("~/") {
+            guard let home = homeDirectory?.nilIfEmpty else {
+                throw CherryControlError(code: "invalid_project_root", message: "Cherry does not know \(name)'s home folder yet; give an absolute path.")
+            }
+            return trimmed == "~" ? home : (home.hasSuffix("/") ? home : home + "/") + trimmed.dropFirst(2)
+        }
+        guard trimmed.hasPrefix("/") else {
+            throw CherryControlError(code: "invalid_project_root", message: "A path on \(name) must be absolute or start with ~/: \(path).")
+        }
+        return trimmed
+    }
+}
+
+/// A project of a device: its key (what `project_root` takes), its path
+/// there, and whether a window of it is open.
+public struct DeviceProject: Codable, Equatable, Sendable {
+    public let root: String
+    public let path: String
+    public let open: Bool
+
+    public init(root: String, path: String, open: Bool) {
+        self.root = root
+        self.path = path
+        self.open = open
+    }
+}
+
+public struct ListDevicesResult: Codable, Equatable, Sendable {
+    public let devices: [DeviceInfo]
+
+    public init(devices: [DeviceInfo]) {
+        self.devices = devices
+    }
+}
+
+public struct AddProjectRequest: Codable, Equatable, Sendable {
+    /// Absolute, or `~/…` on its device.
+    public let path: String
+    /// A device's id or name (`DeviceInfo.named`); nil: the caller's.
+    public let device: String?
+    /// Make the folder first (only it, never its parents).
+    public let create: Bool?
+    /// Open its window (default true).
+    public let open: Bool?
+
+    public init(path: String, device: String? = nil, create: Bool? = nil, open: Bool? = nil) {
+        self.path = path
+        self.device = device
+        self.create = create
+        self.open = open
+    }
+}
+
+public struct AddProjectResult: Codable, Equatable, Sendable {
+    /// The project's key: `project_root` of spawn_agent and open_project.
+    public let projectRoot: String
+    public let device: String
+    public let path: String
+    /// The folder was made now.
+    public let created: Bool
+    /// It was a project already.
+    public let alreadyAdded: Bool
+    public let opened: Bool
+
+    public init(projectRoot: String, device: String, path: String, created: Bool, alreadyAdded: Bool, opened: Bool) {
+        self.projectRoot = projectRoot
+        self.device = device
+        self.path = path
+        self.created = created
+        self.alreadyAdded = alreadyAdded
+        self.opened = opened
     }
 }
 
@@ -1150,7 +1068,6 @@ public struct ProcessCounts: Codable, Equatable, Sendable {
 public struct ProjectStatusResult: Codable, Equatable, Sendable {
     public let projectRoot: String?
     public let processCounts: ProcessCounts
-    public let noteCount: Int?
     public let todoCount: Int?
     public let features: ProjectFeatureAvailability
     public let selectedProcessID: String?
@@ -1160,16 +1077,14 @@ public struct ProjectStatusResult: Codable, Equatable, Sendable {
     public init(
         projectRoot: String?,
         processCounts: ProcessCounts,
-        noteCount: Int?,
         todoCount: Int?,
-        features: ProjectFeatureAvailability = .init(notesEnabled: false, todosEnabled: false),
+        features: ProjectFeatureAvailability = .init(todosEnabled: false),
         selectedProcessID: String?,
         selectedProcessName: String?,
         health: String
     ) {
         self.projectRoot = projectRoot
         self.processCounts = processCounts
-        self.noteCount = noteCount
         self.todoCount = todoCount
         self.features = features
         self.selectedProcessID = selectedProcessID
@@ -1179,22 +1094,22 @@ public struct ProjectStatusResult: Codable, Equatable, Sendable {
 }
 
 public struct TerminalPerformanceCounters: Codable, Equatable, Sendable {
-    public let ptyChunks: Int
-    public let ptyBytes: Int
-    public let ghosttyFeedChunks: Int
-    public let ghosttyFeedBytes: Int
-    public let processorBacklogDropCount: Int
-    public let processorBacklogDroppedBytes: Int
-    public let backgroundOutputThrottleCount: Int
-    public let processorChanges: Int
-    public let representableUpdates: Int
-    public let containerConfigures: Int
-    public let bridgeAttaches: Int
-    public let reusedBridgeAttaches: Int
-    public let fitToSizeCalls: Int
-    public let settingsApplies: Int
-    public let settingsReconfigures: Int
-    public let renderTicks: Int
+    public var ptyChunks: Int
+    public var ptyBytes: Int
+    public var ghosttyFeedChunks: Int
+    public var ghosttyFeedBytes: Int
+    public var processorBacklogDropCount: Int
+    public var processorBacklogDroppedBytes: Int
+    public var backgroundOutputThrottleCount: Int
+    public var processorChanges: Int
+    public var representableUpdates: Int
+    public var containerConfigures: Int
+    public var bridgeAttaches: Int
+    public var reusedBridgeAttaches: Int
+    public var fitToSizeCalls: Int
+    public var settingsApplies: Int
+    public var settingsReconfigures: Int
+    public var renderTicks: Int
 
     public init(
         ptyChunks: Int = 0,
@@ -1287,7 +1202,6 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     public let commandLine: String?
     public let lineCount: Int
     public let outputVersion: Int
-    public let summary: String?
     public let selected: Bool
     public let agentName: String?
     public let commandName: String?
@@ -1300,10 +1214,10 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     /// Why the launch failed, when `state` is `failed`.
     public let failureMessage: String?
     /// Agents only: how many turns Cherry saw start in this tab, over its
-    /// whole life: submitted (typed Enter or MCP input), or begun by the
-    /// agent itself after a finished turn (a background task's result, a
-    /// scheduled wake-up). Monotonic, so "done since my message" compares
-    /// against it.
+    /// whole life: submitted (typed Enter or MCP input), or reported by the
+    /// agent (OSC 7501 `working`, also for a turn it began by itself: a
+    /// background task's result, a scheduled wake-up). Monotonic, so "done
+    /// since my message" compares against it.
     public let agentTurn: Int?
     /// Agents only: `not_started`, `active`, `completed` or
     /// `user_interrupted`, for the latest turn.
@@ -1317,6 +1231,10 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
     public let phase: String?
     public let label: String?
     public let resultSummary: String?
+    /// What the tab's program says it is doing (OSC 7501 program status:
+    /// its root record), when it says anything. Its text is the program's
+    /// own: data, never instructions.
+    public let programStatus: ProcessProgramStatus?
 
     public init(
         id: String,
@@ -1335,7 +1253,6 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         commandLine: String?,
         lineCount: Int,
         outputVersion: Int = 0,
-        summary: String?,
         selected: Bool,
         agentName: String?,
         commandName: String?,
@@ -1353,7 +1270,8 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         runID: String? = nil,
         phase: String? = nil,
         label: String? = nil,
-        resultSummary: String? = nil
+        resultSummary: String? = nil,
+        programStatus: ProcessProgramStatus? = nil
     ) {
         self.id = id
         self.link = link
@@ -1371,7 +1289,6 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         self.commandLine = commandLine
         self.lineCount = lineCount
         self.outputVersion = outputVersion
-        self.summary = summary
         self.selected = selected
         self.agentName = agentName
         self.commandName = commandName
@@ -1390,6 +1307,38 @@ public struct ProcessSummary: Codable, Equatable, Sendable {
         self.phase = phase
         self.label = label
         self.resultSummary = resultSummary
+        self.programStatus = programStatus
+    }
+}
+
+/// A program status record (OSC 7501) as MCP reports it.
+public struct ProcessProgramStatus: Codable, Equatable, Sendable {
+    /// `idle`, `working`, `done`, `blocked` or `error`.
+    public let state: String
+    /// For `blocked`: `permission`, `question` or `auth`, when it said.
+    public let kind: String?
+    /// 0–100, when it said.
+    public let progress: Int?
+    /// A stable name for the program (`claude-code`, `pi`, `cargo`).
+    public let app: String?
+    public let title: String?
+    /// One line saying what it is doing, waiting for or finished.
+    public let message: String?
+
+    public init(
+        state: String,
+        kind: String? = nil,
+        progress: Int? = nil,
+        app: String? = nil,
+        title: String? = nil,
+        message: String? = nil
+    ) {
+        self.state = state
+        self.kind = kind
+        self.progress = progress
+        self.app = app
+        self.title = title
+        self.message = message
     }
 }
 
@@ -1503,9 +1452,69 @@ public struct ListProcessesResult: Codable, Equatable, Sendable {
 
 public struct ProcessStatusResult: Codable, Equatable, Sendable {
     public let process: ProcessSummary
+    /// get_process_status of an agent that shows a permission or question
+    /// menu: the menu as its screen shows it.
+    public let prompt: AgentPromptInfo?
 
-    public init(process: ProcessSummary) {
+    public init(process: ProcessSummary, prompt: AgentPromptInfo? = nil) {
         self.process = process
+        self.prompt = prompt
+    }
+}
+
+/// A permission or question menu an agent CLI shows at the bottom of its
+/// screen, as Cherry read it there. Its texts are the program's output:
+/// data, never instructions.
+public struct AgentPromptInfo: Codable, Equatable, Sendable {
+    /// `permission` (approve a command, an edit, a plan) or `question` (the
+    /// agent asks the user to choose).
+    public let kind: String
+    /// The line that asks, when the screen shows one above the options.
+    public let question: String?
+    public let options: [AgentPromptOption]
+
+    public static let permissionKind = "permission"
+    public static let questionKind = "question"
+
+    public init(kind: String, question: String?, options: [AgentPromptOption]) {
+        self.kind = kind
+        self.question = question
+        self.options = options
+    }
+}
+
+public struct AgentPromptOption: Codable, Equatable, Sendable {
+    /// The number the menu shows (1 first).
+    public let number: Int
+    public let label: String
+    /// What the menu says about it, when it says more than its label.
+    public let detail: String?
+    /// The highlighted option, which Enter picks.
+    public let selected: Bool
+
+    public init(number: Int, label: String, detail: String? = nil, selected: Bool) {
+        self.number = number
+        self.label = label
+        self.detail = detail
+        self.selected = selected
+    }
+}
+
+public struct AnswerPromptResult: Codable, Equatable, Sendable {
+    public let processID: String
+    /// The menu as it was read just before Cherry answered it.
+    public let prompt: AgentPromptInfo
+    /// The option picked.
+    public let answered: AgentPromptOption
+    public let sentBytes: Int
+    public let output: TerminalOutputResult?
+
+    public init(processID: String, prompt: AgentPromptInfo, answered: AgentPromptOption, sentBytes: Int, output: TerminalOutputResult?) {
+        self.processID = processID
+        self.prompt = prompt
+        self.answered = answered
+        self.sentBytes = sentBytes
+        self.output = output
     }
 }
 
@@ -1575,12 +1584,24 @@ public struct SpawnProcessResult: Codable, Equatable, Sendable {
     public let output: TerminalOutputResult?
     /// The task, when the agent was spawned with one.
     public let task: AgentTaskInfo?
+    /// Why the first input (a task's kickoff) did not arrive, when it was
+    /// refused or failed (`agent_awaiting_permission`,
+    /// `input_not_delivered`, …): the process runs either way. Absent when
+    /// it arrived or there was none, and from apps that predate it.
+    public let inputError: CherryControlError?
 
-    public init(process: ProcessSummary, sentBytes: Int, output: TerminalOutputResult?, task: AgentTaskInfo? = nil) {
+    public init(
+        process: ProcessSummary,
+        sentBytes: Int,
+        output: TerminalOutputResult?,
+        task: AgentTaskInfo? = nil,
+        inputError: CherryControlError? = nil
+    ) {
         self.process = process
         self.sentBytes = sentBytes
         self.output = output
         self.task = task
+        self.inputError = inputError
     }
 }
 
@@ -1603,18 +1624,6 @@ public struct SendProcessInputResult: Codable, Equatable, Sendable {
         self.processID = processID
         self.sentBytes = sentBytes
         self.output = output
-    }
-}
-
-public struct CaptureAttentionObservationResult: Codable, Equatable, Sendable {
-    public let processID: String
-    public let observationID: String
-    public let outputPath: String
-
-    public init(processID: String, observationID: String, outputPath: String) {
-        self.processID = processID
-        self.observationID = observationID
-        self.outputPath = outputPath
     }
 }
 
@@ -1666,117 +1675,6 @@ public struct ListAgentsResult: Codable, Equatable, Sendable {
     public init(activeProjectRoot: String?, agents: [AgentInfo]) {
         self.activeProjectRoot = activeProjectRoot
         self.agents = agents
-    }
-}
-
-public struct ProjectNote: Codable, Equatable, Identifiable, Sendable {
-    public let id: UUID
-    public let projectRoot: String
-    public var title: String
-    public var markdown: String
-    public let createdAt: Date
-    public var updatedAt: Date
-
-    public init(
-        id: UUID,
-        projectRoot: String,
-        title: String,
-        markdown: String,
-        createdAt: Date,
-        updatedAt: Date
-    ) {
-        self.id = id
-        self.projectRoot = projectRoot
-        self.title = title
-        self.markdown = markdown
-        self.createdAt = createdAt
-        self.updatedAt = updatedAt
-    }
-}
-
-public struct NoteInfo: Codable, Equatable, Sendable {
-    public let id: String
-    public let link: String?
-    public let projectRoot: String
-    public let title: String
-    public let createdAt: Date
-    public let updatedAt: Date
-
-    public init(id: String, link: String? = nil, projectRoot: String, title: String, createdAt: Date, updatedAt: Date) {
-        self.id = id
-        self.link = link
-        self.projectRoot = projectRoot
-        self.title = title
-        self.createdAt = createdAt
-        self.updatedAt = updatedAt
-    }
-}
-
-public struct ListNotesResult: Codable, Equatable, Sendable {
-    public let activeProjectRoot: String
-    public let notes: [NoteInfo]
-    public let selectedNoteID: String?
-
-    public init(activeProjectRoot: String, notes: [NoteInfo], selectedNoteID: String?) {
-        self.activeProjectRoot = activeProjectRoot
-        self.notes = notes
-        self.selectedNoteID = selectedNoteID
-    }
-}
-
-public struct NoteDetailResult: Codable, Equatable, Sendable {
-    public let note: ProjectNote
-    public let link: String?
-    public let selected: Bool
-
-    public init(note: ProjectNote, link: String? = nil, selected: Bool) {
-        self.note = note
-        self.link = link
-        self.selected = selected
-    }
-}
-
-public struct NoteSearchMatch: Codable, Equatable, Sendable {
-    public let noteID: String
-    public let title: String
-    public let lineNumber: Int?
-    public let text: String
-
-    public init(noteID: String, title: String, lineNumber: Int?, text: String) {
-        self.noteID = noteID
-        self.title = title
-        self.lineNumber = lineNumber
-        self.text = text
-    }
-}
-
-public struct SearchNotesResult: Codable, Equatable, Sendable {
-    public let activeProjectRoot: String
-    public let matches: [NoteSearchMatch]
-
-    public init(activeProjectRoot: String, matches: [NoteSearchMatch]) {
-        self.activeProjectRoot = activeProjectRoot
-        self.matches = matches
-    }
-}
-
-public struct SelectNoteResult: Codable, Equatable, Sendable {
-    public let noteID: String
-    public let selected: Bool
-
-    public init(noteID: String, selected: Bool) {
-        self.noteID = noteID
-        self.selected = selected
-    }
-}
-
-public struct DeleteNoteResult: Codable, Equatable, Sendable {
-    public let noteID: String
-    public let deleted: Bool
-
-    public init(noteID: String, deleted: Bool) {
-        self.noteID = noteID
-        self.deleted = deleted
     }
 }
 
@@ -1982,105 +1880,6 @@ public struct DeleteTodoResult: Codable, Equatable, Sendable {
     }
 }
 
-public struct TerminalSummaryResult: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let link: String?
-    public let title: String
-    public let state: String
-    public let kind: String?
-    public let agentName: String?
-    public let summary: String?
-    public let parentAgentID: String?
-    public let childAgentCount: Int?
-
-    public init(
-        terminalID: String,
-        link: String? = nil,
-        title: String,
-        state: String,
-        kind: String? = nil,
-        agentName: String? = nil,
-        summary: String? = nil,
-        parentAgentID: String? = nil,
-        childAgentCount: Int? = nil
-    ) {
-        self.terminalID = terminalID
-        self.link = link
-        self.title = title
-        self.state = state
-        self.kind = kind
-        self.agentName = agentName
-        self.summary = summary
-        self.parentAgentID = parentAgentID
-        self.childAgentCount = childAgentCount
-    }
-}
-
-public struct RunAgentResult: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let link: String?
-    public let title: String
-    public let state: String
-    public let kind: String?
-    public let agentName: String?
-    public let summary: String?
-    public let parentAgentID: String?
-    public let childAgentCount: Int?
-    public let projectRoot: String
-    public let sentBytes: Int
-    public let output: TerminalOutputResult?
-
-    public init(
-        terminalID: String,
-        link: String? = nil,
-        title: String,
-        state: String,
-        kind: String?,
-        agentName: String?,
-        summary: String?,
-        parentAgentID: String? = nil,
-        childAgentCount: Int? = nil,
-        projectRoot: String,
-        sentBytes: Int,
-        output: TerminalOutputResult?
-    ) {
-        self.terminalID = terminalID
-        self.link = link
-        self.title = title
-        self.state = state
-        self.kind = kind
-        self.agentName = agentName
-        self.summary = summary
-        self.parentAgentID = parentAgentID
-        self.childAgentCount = childAgentCount
-        self.projectRoot = projectRoot
-        self.sentBytes = sentBytes
-        self.output = output
-    }
-}
-
-public struct SelectTerminalResult: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let selected: Bool
-
-    public init(terminalID: String, selected: Bool) {
-        self.terminalID = terminalID
-        self.selected = selected
-    }
-}
-
-public struct SendInputResult: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let sentBytes: Int
-    public let output: TerminalOutputResult?
-
-    public init(terminalID: String, sentBytes: Int, output: TerminalOutputResult?) {
-        self.terminalID = terminalID
-        self.sentBytes = sentBytes
-        self.output = output
-    }
-}
-
 public struct TerminalOutputResult: Codable, Equatable, Sendable {
     public let terminalID: String
     public let startLine: Int
@@ -2119,8 +1918,6 @@ public struct ResolveDeepLinkResult: Codable, Equatable, Sendable {
     public let targetID: String
     public let found: Bool
     public let projectRoot: String?
-    public let note: ProjectNote?
-    public let noteLink: String?
     public let todo: ProjectTodo?
     public let todoLink: String?
     public let process: ProcessSummary?
@@ -2133,8 +1930,6 @@ public struct ResolveDeepLinkResult: Codable, Equatable, Sendable {
         targetID: String,
         found: Bool,
         projectRoot: String?,
-        note: ProjectNote? = nil,
-        noteLink: String? = nil,
         todo: ProjectTodo? = nil,
         todoLink: String? = nil,
         process: ProcessSummary? = nil,
@@ -2146,8 +1941,6 @@ public struct ResolveDeepLinkResult: Codable, Equatable, Sendable {
         self.targetID = targetID
         self.found = found
         self.projectRoot = projectRoot
-        self.note = note
-        self.noteLink = noteLink
         self.todo = todo
         self.todoLink = todoLink
         self.process = process
@@ -2206,22 +1999,15 @@ public struct ClearOutputResult: Codable, Equatable, Sendable {
     }
 }
 
-public struct CloseTerminalResult: Codable, Equatable, Sendable {
-    public let terminalID: String
-    public let closed: Bool
-
-    public init(terminalID: String, closed: Bool) {
-        self.terminalID = terminalID
-        self.closed = closed
-    }
-}
-
 
 // MARK: - Monitors
 
 /// The kinds of monitor events (`MonitorEvent.type`).
 public enum MonitorEventType: String, Codable, CaseIterable, Equatable, Sendable {
-    /// An agent finished a turn: it is idle at its composer after working.
+    /// An agent finished a turn: it reports idle after working or, when it
+    /// reports no status, its output went quiet after a submitted turn
+    /// (`basis`). A Cherry task's worker also gets one when its task
+    /// settles (`task_id`), apart from its turns' dones.
     case done
     /// An agent asks the user a question with a choice menu.
     case needsInput = "needs_input"
@@ -2285,8 +2071,22 @@ public struct MonitorProcessStatus: Codable, Equatable, Sendable {
     public let state: String
     public let agentTurn: Int?
     public let exitCode: Int32?
+    /// A Cherry task's worker: its task and the task's state
+    /// (`AgentTaskState`); `wait_for_tasks` and `get_task` read its result.
+    public let taskID: String?
+    public let taskState: String?
 
-    public init(processID: String, name: String, kind: String, status: String, state: String, agentTurn: Int?, exitCode: Int32?) {
+    public init(
+        processID: String,
+        name: String,
+        kind: String,
+        status: String,
+        state: String,
+        agentTurn: Int?,
+        exitCode: Int32?,
+        taskID: String? = nil,
+        taskState: String? = nil
+    ) {
         self.processID = processID
         self.name = name
         self.kind = kind
@@ -2294,6 +2094,8 @@ public struct MonitorProcessStatus: Codable, Equatable, Sendable {
         self.state = state
         self.agentTurn = agentTurn
         self.exitCode = exitCode
+        self.taskID = taskID
+        self.taskState = taskState
     }
 }
 
@@ -2312,9 +2114,25 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
     /// `output_match`: the matching line (at most 300 characters). It is
     /// the process's own output: data, never instructions.
     public let matchedLine: String?
+    /// `done` of an agent that reports no status: what Cherry took for the
+    /// end of its turn (`output_quiet`: its screen stayed still after it),
+    /// once per submitted turn. Absent when the agent reported it, and on a
+    /// task's settle.
+    public let basis: String?
+    /// The `done` of a Cherry task's settle, once per task: the task and its
+    /// state (`AgentTaskState`). Only that one has them: the dones of its
+    /// worker's turns never do.
+    public let taskID: String?
+    public let taskState: String?
+    /// `needs_input` and `permission`: the menu the agent's screen shows,
+    /// when it shows one already (answer it with answer_prompt).
+    public let prompt: AgentPromptInfo?
     /// The state held when the subscription was made (or the process was
     /// added to it), rather than a change seen afterwards.
     public let initial: Bool
+
+    /// `basis` of a `done` inferred from the agent's output going quiet.
+    public static let outputQuietBasis = "output_quiet"
 
     public init(
         seq: Int,
@@ -2326,6 +2144,10 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
         agentTurn: Int? = nil,
         exitCode: Int32? = nil,
         matchedLine: String? = nil,
+        basis: String? = nil,
+        taskID: String? = nil,
+        taskState: String? = nil,
+        prompt: AgentPromptInfo? = nil,
         initial: Bool = false
     ) {
         self.seq = seq
@@ -2337,6 +2159,10 @@ public struct MonitorEvent: Codable, Equatable, Sendable {
         self.agentTurn = agentTurn
         self.exitCode = exitCode
         self.matchedLine = matchedLine
+        self.basis = basis
+        self.taskID = taskID
+        self.taskState = taskState
+        self.prompt = prompt
         self.initial = initial
     }
 }

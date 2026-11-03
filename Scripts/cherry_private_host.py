@@ -10,12 +10,15 @@ outside the private HOME.
 
 `make_private_directory`, `layout`, `isolated_environment` and
 `stop_private_run` are the pieces for a run from one private directory
-(`home/`, `control.sock`, `host.sock`). To end a run that was left open:
+(`home/`, `control.sock`, `host.sock`), `is_private_run_directory` tells one
+apart, and `control_request` talks to its Cherry. To end a run that was left
+open:
 
     python3 Scripts/cherry_private_host.py stop DIRECTORY [--cli CHERRY]
 """
 
 import argparse
+import errno
 import json
 import os
 import pwd
@@ -73,17 +76,29 @@ def state_dir(home, socket_path):
     return Path(home) / "Library/Application Support/cherry-host" / f"{key:016x}"
 
 
-def processes(matches):
-    """(pid, command line) of every other process whose command line `matches`."""
-    listing = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,command="],
+def process_table():
+    """(pid, parent pid, command line) of every process."""
+    listing = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,ppid=,command="],
                              capture_output=True, text=True, check=False).stdout
-    found = []
+    table = []
     for line in listing.splitlines():
-        pid, _, command = line.strip().partition(" ")
-        command = command.strip()
-        if pid.isdigit() and int(pid) != os.getpid() and matches(command):
-            found.append((int(pid), command))
-    return found
+        fields = line.split(None, 2)
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+            table.append((int(fields[0]), int(fields[1]), fields[2].strip() if len(fields) > 2 else ""))
+    return table
+
+
+def processes(matches):
+    """(pid, command line) of every process whose command line `matches`,
+    except this one and the ones it descends from: the shell or script that
+    runs it can name the same directory."""
+    table = process_table()
+    parents = {pid: parent for pid, parent, _ in table}
+    spared, pid = {os.getpid()}, os.getppid()
+    while pid > 1 and pid not in spared:
+        spared.add(pid)
+        pid = parents.get(pid, 0)
+    return [(pid, command) for pid, _, command in table if pid not in spared and matches(command)]
 
 
 def terminate(matches, grace=3.0):
@@ -265,16 +280,63 @@ def stop_private_run(directory, cli, cwd=None):
     return problems
 
 
+def is_private_run_directory(directory):
+    """Whether `directory` is one `make_private_directory` could have made:
+    this user's, private (0700), with a private HOME in it."""
+    try:
+        status = Path(directory).stat()
+    except OSError:
+        return False
+    return (stat.S_ISDIR(status.st_mode) and status.st_uid == os.getuid()
+            and stat.S_IMODE(status.st_mode) == 0o700 and layout(directory)[0].is_dir())
+
+
+def enum_case(name, payload=None):
+    """A case of Cherry's control requests (an enum as Swift's Codable
+    writes it): `{name: {"_0": payload}}`, or `{name: {}}` without one."""
+    return {name: {"_0": payload} if payload is not None else {}}
+
+
+def control_request(socket_path, request, timeout=15):
+    """Send one request to the Cherry listening on `socket_path` and return
+    the response's `result`. Raises RuntimeError on an error or an empty
+    response, and OSError when Cherry cannot be reached or does not answer
+    in `timeout` seconds."""
+    payload = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout)
+        connection.connect(str(socket_path))
+        connection.sendall(payload)
+        try:
+            connection.shutdown(socket.SHUT_WR)
+        except OSError as error:
+            # Cherry can have answered and closed already.
+            if error.errno != errno.ENOTCONN:
+                raise
+        data = bytearray()
+        while not data.endswith(b"\n"):
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            data.extend(chunk)
+    if not data:
+        raise RuntimeError("Cherry returned an empty control response.")
+    response = json.loads(data.decode("utf-8"))
+    if response.get("error"):
+        error = response["error"]
+        raise RuntimeError(f"{error.get('code')}: {error.get('message')}")
+    return response["result"]
+
+
 def _private_run_directory(value):
-    """Only a directory `make_private_directory` could have made: this user's,
-    private (0700), with a private HOME in it. The command deletes it."""
+    """Only a directory `make_private_directory` could have made (see
+    `is_private_run_directory`). The command deletes it."""
     directory = Path(value).resolve()
     try:
-        status = directory.stat()
+        directory.stat()
     except OSError as error:
         raise argparse.ArgumentTypeError(f"{value}: {error.strerror}")
-    if (not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid()
-            or stat.S_IMODE(status.st_mode) != 0o700 or not layout(directory)[0].is_dir()):
+    if not is_private_run_directory(directory):
         raise argparse.ArgumentTypeError(
             f"{value} is not a private Cherry run directory (0700, yours, with home/ in it)")
     return directory

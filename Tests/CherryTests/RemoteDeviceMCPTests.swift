@@ -35,7 +35,7 @@ func inertDeviceHosting(_ destination: String, name: String) -> PersistentHostSe
 /// the device's project (the caller's), one of another device's project,
 /// and a This Mac window whose "Echo" command is a live `/bin/cat`.
 @MainActor
-private final class DeviceMCPHarness {
+final class DeviceMCPHarness {
     let defaultsName = "CherryTests.RemoteMCP.\(UUID().uuidString)"
     let defaults: UserDefaults
     let settings: AgentSettings
@@ -57,6 +57,7 @@ private final class DeviceMCPHarness {
     /// This Mac's port detection, as the server calls it.
     let localServices = RecordingLocalServices()
     private var windows: [(NSWindow, String)] = []
+    private var otherWindowWorkspaces: [TerminalWorkspace] = []
 
     static func inertHosting(_ destination: String, name: String) -> PersistentHostSessions {
         inertDeviceHosting(destination, name: name)
@@ -114,7 +115,7 @@ private final class DeviceMCPHarness {
             window.isReleasedWhenClosed = false
             #expect(ProjectWindowRegistry.shared.register(
                 window: window, projectRoot: root, workspace: workspace,
-                noteStore: nil, todoStore: nil, chromeState: nil
+                todoStore: nil, chromeState: nil
             ))
             windows.append((window, root))
         }
@@ -191,10 +192,33 @@ private final class DeviceMCPHarness {
         return Set(result.processes.map(\.id))
     }
 
+    /// Another window of the device's project (File › New Window), on the
+    /// same hosting, registered as the app registers it, with one tab.
+    func openAnotherDeviceWindow() -> (workspace: TerminalWorkspace, tab: TerminalSession) {
+        let workspace = TerminalWorkspace(
+            projectRoot: deviceKey, createInitialSession: false, launchBackend: .nativePTY,
+            backendPolicy: .remote(deviceHosting, settings: { .native }, hostReconnects: nil),
+            windowID: UUID()
+        )
+        let tab = workspace.addSession(title: "Agent in another window")
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 200),
+            styleMask: [.titled, .closable], backing: .buffered, defer: true
+        )
+        window.isReleasedWhenClosed = false
+        #expect(ProjectWindowRegistry.shared.register(
+            window: window, projectRoot: deviceKey, windowID: workspace.windowID, workspace: workspace,
+            todoStore: nil, chromeState: nil
+        ))
+        windows.append((window, deviceKey))
+        otherWindowWorkspaces.append(workspace)
+        return (workspace, tab)
+    }
+
     func stop() {
         server.stop()
         for (window, root) in windows { ProjectWindowRegistry.shared.unregister(window: window, projectRoot: root) }
-        for workspace in [localWorkspace, deviceWorkspace, otherDeviceWorkspace] {
+        for workspace in [localWorkspace, deviceWorkspace, otherDeviceWorkspace] + otherWindowWorkspaces {
             workspace.sessions.forEach { $0.stop() }
             workspace.closeAllSessions(intent: .windowClosed)
         }
@@ -264,7 +288,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
 @Test @MainActor func RemoteDeviceMCPTokenChangesWhenTheTabsProgramRestarts() throws {
     let tokens = RemoteMCPTokens(key: SymmetricKey(size: .bits256))
     let deviceID = UUID(), tab = UUID()
-    let mcp = RemoteMCPLaunch(deviceID: deviceID, socketPath: "/var/folders/x/T/cherry-mcp-1/control.sock", helperPath: nil, controlMachine: "Laptop", tokens: tokens)
+    let mcp = RemoteMCPLaunch(deviceID: deviceID, socketPath: "/var/folders/x/T/cherry-mcp-1/control.sock", controlMachine: "Laptop", tokens: tokens)
     let configuration = ShellProcessController.Configuration(
         shellPath: "/bin/zsh", workingDirectory: "/Users/them/app", processID: tab.uuidString,
         term: "xterm-ghostty", initialSize: TerminalViewportSize(columns: 80, rows: 24)
@@ -406,12 +430,10 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         .getProcessStatus(.init(processID: id, processName: nil)),
         .getProcessOutput(.init(processID: id)),
         .sendProcessInput(.init(processID: id, text: "remote-input\n")),
-        .sendInput(.init(terminalID: id, text: "remote-send-input\n", rawBase64: nil, waitMilliseconds: nil, lineLimit: nil)),
         .restartProcess(.init(processID: id)),
         .closeProcess(.init(processID: id)),
         .stopProcess(.init(processID: id)),
         .getProcessPorts(.init(processID: id)),
-        .getTerminalOutput(.init(terminalID: id, startLine: nil, lineLimit: nil)),
         .getProcessStatus(.init(processID: otherDeviceTab, processName: nil)),
     ]
     for request in requests {
@@ -429,7 +451,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     try await Task.sleep(for: .milliseconds(300))
     #expect(echo.isRunning)
     let echoed = try await harness.output(of: echo)
-    #expect(!echoed.contains("remote-input") && !echoed.contains("remote-send-input"))
+    #expect(!echoed.contains("remote-input"))
 }
 
 /// (d) Another device's key, or a This Mac root, as a project: refused.
@@ -506,6 +528,31 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     let status = try await harness.send(.getProjectStatus, to: listener, credentials: harness.credentials)
     guard case .getProjectStatus(let project)? = status.result else { return }
     #expect(project.projectRoot == harness.deviceKey)
+}
+
+/// A device project's second window (#22): its tab's token is accepted,
+/// though the project's most recently active window is the first, and its
+/// requests, scoped ones too, go to its own window; the first window's tab
+/// still reaches its own.
+@Test @MainActor func RemoteDeviceMCPReachesATabOfAProjectsSecondWindow() async throws {
+    let harness = try DeviceMCPHarness()
+    defer { harness.stop() }
+    let listener = try harness.server.addDeviceListener(deviceID: harness.deviceID)
+    let (second, tab) = harness.openAnotherDeviceWindow()
+    #expect(ProjectWindowRegistry.shared.workspace(for: harness.deviceKey) === harness.deviceWorkspace)
+    let token = harness.tokens.newGeneration(tabID: tab.id, deviceID: harness.deviceID)
+    let credentials = CherryControlCredentials(token: token, processID: tab.id.uuidString)
+    let secondIDs = Set(second.sessions.map(\.id.uuidString))
+    let firstIDs = Set(harness.deviceWorkspace.sessions.map(\.id.uuidString))
+    let scoped = CherryControlRequest.scoped(.init(projectRoot: harness.remotePath, request: .listProcesses(.init())))
+
+    let unscoped = try await harness.send(.listProcesses(.init()), to: listener, credentials: credentials)
+    #expect(unscoped.error == nil)
+    #expect(harness.processIDs(unscoped) == secondIDs)
+    let inItsWindow = try await harness.send(scoped, to: listener, credentials: credentials)
+    #expect(inItsWindow.error == nil)
+    #expect(harness.processIDs(inItsWindow) == secondIDs)
+    #expect(harness.processIDs(try await harness.send(scoped, to: listener, credentials: harness.credentials)) == firstIDs)
 }
 
 /// Monitors keep to the caller's Mac: a caller on another Mac watches only
@@ -685,7 +732,7 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     #expect(RemoteMCPPaths.remoteSocket(temporaryDirectory: "/" + String(repeating: "x", count: 70), installationID: installation, deviceID: deviceID) == nil)
     let mcp = RemoteMCPLaunch(
         deviceID: deviceID, socketPath: socket,
-        helperPath: "/Users/them/Library/Application Support/cherry-host/bin/b1/CherryMCP",
+        cliPath: "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry",
         controlMachine: "Laptop", tokens: tokens
     )
     // This Mac's own values never travel.
@@ -696,28 +743,60 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         environment: [
             "CHERRY_CONTROL_SOCKET": "/tmp/cherry-501/x/control.sock",
             "CHERRY_MCP_TOKEN": "local", "CHERRY_MCP_HELPER": "/Applications/Cherry.app/x", "CHERRY_CONTROL_MACHINE": "x",
+            "CHERRY_CLI": "/Applications/Cherry.app/Contents/MacOS/cherry", "CHERRY_MCP_SERVER_NAME": "local",
         ],
         term: "xterm-ghostty", initialSize: TerminalViewportSize(columns: 80, rows: 24)
     )
     let spec = RemoteLaunchSpec.make(for: configuration, device: .init(mcp: mcp), localeEnvironment: [:])
     #expect(spec.environment["CHERRY_CONTROL_SOCKET"] == socket)
     #expect(spec.environment["CHERRY_MCP_TOKEN"] == tokens.currentToken(tabID: tab, deviceID: deviceID))
-    #expect(spec.environment["CHERRY_MCP_HELPER"] == "/Users/them/Library/Application Support/cherry-host/bin/b1/CherryMCP")
+    // No CherryMCP or MCP server name: `cherry` sends its commands itself.
+    #expect(spec.environment["CHERRY_MCP_HELPER"] == nil)
+    #expect(spec.environment["CHERRY_MCP_SERVER_NAME"] == nil)
     #expect(spec.environment["CHERRY_CONTROL_MACHINE"] == "Laptop")
+    // The install's own `cherry`.
+    #expect(spec.environment["CHERRY_CLI"] == "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry")
     #expect(spec.environment["CHERRY_PROCESS_ID"] == tab.uuidString)
     #expect(spec.environment["CHERRY_PROJECT_ROOT"] == "/Users/them/app")
-    // Without Cherry MCP (a device store with no installation id): none of it.
+    // Without a forwarded socket (a device store with no installation id): none of it.
     let plain = RemoteLaunchSpec.make(for: configuration, localeEnvironment: [:])
-    for key in ["CHERRY_CONTROL_SOCKET", "CHERRY_MCP_TOKEN", "CHERRY_MCP_HELPER", "CHERRY_CONTROL_MACHINE"] {
+    for key in ["CHERRY_CONTROL_SOCKET", "CHERRY_MCP_TOKEN", "CHERRY_MCP_HELPER", "CHERRY_CONTROL_MACHINE", "CHERRY_CLI", "CHERRY_MCP_SERVER_NAME"] {
         #expect(plain.environment[key] == nil)
     }
-    // The helper there is the install's.
-    #expect(RemoteMCPPaths.helperPath(remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host", homeDirectory: "/Users/them")
-        == "/Users/them/Library/Application Support/cherry-host/bin/b1/CherryMCP")
-    #expect(RemoteMCPPaths.helperPath(remoteHostPath: "/usr/local/bin/cherry-host", homeDirectory: "/Users/them") == nil)
+    // The CLI there is the install's.
+    #expect(RemoteMCPPaths.cliPath(remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host", homeDirectory: "/Users/them")
+        == "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry")
+    #expect(RemoteMCPPaths.cliPath(remoteHostPath: "/usr/local/bin/cherry-host", homeDirectory: "/Users/them") == nil)
+
+    // The device store names them for a device whose install has its
+    // resources, else none.
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ch-mcpcli-\(UUID().uuidString.prefix(8))")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let suite = "CherryTests.RemoteMCPCLI.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let store = RemoteDeviceStore(
+        fileURL: directory.appendingPathComponent("devices.json"),
+        hostStore: HostedSessionHostStore(defaults: defaults),
+        installationID: { installation },
+        registry: PersistentHostingRegistry(local: PersistentHostSessions(installationUnavailableReason: { nil }, status: PersistentSessionsStatus())),
+        remoteHostPaths: HostedRemoteHostPaths()
+    )
+    let device = try store.add(
+        name: "Studio", sshDestination: "studio",
+        remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host",
+        homeDirectory: "/Users/them", installedBuild: "b1", installedResources: true,
+        userTemporaryDirectory: temporary
+    )
+    let stored = try #require(store.launchDevice(id: device.id)?.mcp)
+    #expect(stored.cliPath == "/Users/them/Library/Application Support/cherry-host/bin/b1/cherry")
+    store.update(device.id) { $0.installedResources = false }
+    let withoutResources = try #require(store.launchDevice(id: device.id)?.mcp)
+    #expect(withoutResources.cliPath == nil)
 }
 
-@Test @MainActor func RemoteDeviceMCPDeviceStoreGivesItsTabsCherryMCP() throws {
+@Test @MainActor func RemoteDeviceMCPDeviceStoreGivesItsTabsTheForwardedSocket() throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ch-mcpstore-\(UUID().uuidString.prefix(8))")
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -737,14 +816,14 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
         remoteHostPath: "~/Library/Application Support/cherry-host/bin/b1/cherry-host",
         homeDirectory: "/Users/them", installedBuild: "b1"
     ))
-    // Its per-user temporary directory not known yet: no Cherry MCP (never
-    // a socket in the shared /tmp).
+    // Its per-user temporary directory not known yet: no forwarded socket
+    // (never one in the shared /tmp).
     #expect(store.launchDevice(id: device.id)?.mcp == nil)
     store.update(device.id) { $0.userTemporaryDirectory = "/var/folders/ab/cd/T/" }
     let launch = try #require(store.launchDevice(id: device.id)?.mcp)
     #expect(launch.socketPath == RemoteMCPPaths.remoteSocket(temporaryDirectory: "/var/folders/ab/cd/T/", installationID: installation, deviceID: device.id))
-    // No resources recorded: no CherryMCP there to name.
-    #expect(launch.helperPath == nil)
+    // No resources recorded: no `cherry` there to name.
+    #expect(launch.cliPath == nil)
 }
 
 // MARK: - The forward's scripts
@@ -803,186 +882,6 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
     #expect(RemoteMCPForwardError.refused(machine: "Studio", reason: "r").localizedDescription.contains("AllowTcpForwarding"))
 }
 
-// MARK: - Set Up Cherry MCP
-
-@Test func RemoteDeviceMCPSetupRegistersTheLauncherIdempotentlyAndRemovesIt() throws {
-    let root = FileManager.default.temporaryDirectory.appendingPathComponent("ch-mcpsetup-\(UUID().uuidString.prefix(8))")
-    let home = root.appendingPathComponent("home")
-    let stubs = root.appendingPathComponent("stubs")
-    try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
-    try FileManager.default.createDirectory(at: stubs, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: root) }
-    // Stand-in agent CLIs: each logs its arguments and keeps a registry;
-    // codex's add and remove also write its config.toml as Codex does.
-    // (g) The config is a link into a dotfiles folder, as many keep it.
-    let codexConfig = home.appendingPathComponent(".codex/config.toml")
-    let dotfiles = root.appendingPathComponent("dotfiles")
-    let realConfig = dotfiles.appendingPathComponent("codex-config.toml")
-    try FileManager.default.createDirectory(at: codexConfig.deletingLastPathComponent(), withIntermediateDirectories: true)
-    try FileManager.default.createDirectory(at: dotfiles, withIntermediateDirectories: true)
-    try "model = \"o3\"\n\n[mcp_servers.other]\ncommand = \"other\"\n".write(to: realConfig, atomically: true, encoding: .utf8)
-    chmod(realConfig.path, 0o640)
-    try FileManager.default.createSymbolicLink(at: codexConfig, withDestinationURL: realConfig)
-    for tool in ["claude", "codex", "pi"] {
-        let config = tool == "codex" ? """
-          add) printf '\\n[mcp_servers.%s]\\ncommand = "%s"\\nenv_vars = [\\n  "OLD",\\n]\\nargs = []\\n' "$3" "$5" >> "$HOME/.codex/config.toml" ;;
-        """ : ""
-        let unconfig = tool == "codex" ? """
-        /usr/bin/awk -v t="[mcp_servers.$3]" '/^\\[/ { skip = ($0 == t) } !skip { print }' "$HOME/.codex/config.toml" > "$HOME/.codex/x" && cat "$HOME/.codex/x" > "$HOME/.codex/config.toml" && rm "$HOME/.codex/x";
-        """ : ""
-        let script = """
-        #!/bin/sh
-        printf '%s\\n' "$*" >> '\(root.path)/\(tool).log'
-        printf '%s\\n' "${PI_CODING_AGENT_DIR:-}" > '\(root.path)/\(tool).pidir'
-        case "$2" in
-          add) printf '%s\\n' "$*" > '\(root.path)/\(tool).registered' ;;
-          remove) [ -f '\(root.path)/\(tool).registered' ] || { echo "No MCP server named cherry" >&2; exit 1; }; rm -f '\(root.path)/\(tool).registered'; \(unconfig) ;;
-        esac
-        case "$2" in
-        \(config)
-        esac
-        exit 0
-        """
-        let url = stubs.appendingPathComponent(tool)
-        try script.write(to: url, atomically: true, encoding: .utf8)
-        chmod(url.path, 0o755)
-    }
-    // The login shell only reports the stubs' PATH (never the real CLIs),
-    // after a Pi agent directory its startup files set.
-    let loginShell = stubs.appendingPathComponent("login-shell")
-    let piDirectory = root.appendingPathComponent("pi-agent").path
-    try "#!/bin/sh\nprintf 'cherry_pi_dir=%s\\n%s' '\(piDirectory)' '\(stubs.path):/usr/bin:/bin'\n".write(to: loginShell, atomically: true, encoding: .utf8)
-    chmod(loginShell.path, 0o755)
-    let helper = root.appendingPathComponent("CherryMCP")
-    try "#!/bin/sh\n[ \"$1\" = --version ] && { echo '{\"name\":\"CherryMCP\"}'; exit 0; }\necho \"ran $*\"\n".write(to: helper, atomically: true, encoding: .utf8)
-    chmod(helper.path, 0o755)
-    func run(_ mode: RemoteMCPSetup.Mode) throws -> RemoteMCPSetup.Report {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-s"]
-        process.environment = ["HOME": home.path, "SHELL": loginShell.path, "PATH": "/usr/bin:/bin"]
-        let input = Pipe(), output = Pipe()
-        process.standardInput = input
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        input.fileHandleForWriting.write(Data(RemoteMCPSetup.script(mode: mode, name: "cherry", helperPath: helper.path).utf8))
-        try input.fileHandleForWriting.close()
-        let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        process.waitUntilExit()
-        let fields = try #require(RemoteHostInstaller.fields(.init(status: process.terminationStatus, standardOutput: text, standardError: "")))
-        return RemoteMCPSetup.Report(fields: fields)
-    }
-    let launcher = home.appendingPathComponent(RemoteMCPPaths.launcherRelativePath).path
-    // The check reads no agent configuration and changes nothing.
-    let checked = try run(.check)
-    #expect(checked.claude == stubs.appendingPathComponent("claude").path)
-    #expect(checked.codex == stubs.appendingPathComponent("codex").path)
-    #expect(checked.pi == stubs.appendingPathComponent("pi").path)
-    #expect(checked.helperVersion == "{\"name\":\"CherryMCP\"}")
-    #expect(!checked.launcherInstalled)
-    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("claude.log").path))
-    func inode(_ url: URL) -> ino_t {
-        var status = stat()
-        return lstat(url.path, &status) == 0 ? status.st_ino : 0
-    }
-    let inodeBefore = inode(realConfig)
-    // Set Up: the launcher, then each CLI's add with it; twice gives the same.
-    for _ in 0..<2 {
-        let report = try run(.install)
-        #expect(report.failures.isEmpty, "\(report.failures)")
-        #expect(report.claudeResult == "ok" && report.codexResult == "ok" && report.piResult == "ok" && report.launcherInstalled)
-        // Pi: direct exposure, so the model sees Cherry's tools themselves,
-        // run with the agent directory the login shell names.
-        #expect(try String(contentsOf: root.appendingPathComponent("pi.registered"), encoding: .utf8)
-            == "mcp add cherry --exposure direct -- \(launcher)\n")
-        #expect(try String(contentsOf: root.appendingPathComponent("pi.pidir"), encoding: .utf8) == piDirectory + "\n")
-        #expect(try String(contentsOf: root.appendingPathComponent("claude.registered"), encoding: .utf8)
-            == "mcp add --scope user --transport stdio cherry -- \(launcher)\n")
-        #expect(try String(contentsOf: root.appendingPathComponent("codex.registered"), encoding: .utf8)
-            == "mcp add cherry -- \(launcher)\n")
-    }
-    #expect(FileManager.default.isExecutableFile(atPath: launcher))
-    // Codex's table got the variables it must pass, once; the rest is kept.
-    let envVars = "env_vars = [\"CHERRY_MCP_TOKEN\", \"CHERRY_CONTROL_SOCKET\", \"CHERRY_PROCESS_ID\", \"CHERRY_AGENT_ID\", \"CHERRY_PROJECT_ROOT\", \"CHERRY_MCP_HELPER\", \"CHERRY_CONTROL_MACHINE\"]"
-    let config = try String(contentsOf: codexConfig, encoding: .utf8)
-    // Codex's own multi-line env_vars is replaced whole; the keys after it
-    // stay.
-    #expect(config.contains("[mcp_servers.cherry]\n\(envVars)\ncommand = \"\(launcher)\"\nargs = []\n"), "\(config)")
-    #expect(config.components(separatedBy: "env_vars").count == 2)
-    #expect(!config.contains("OLD"))
-    // Replaced atomically (a new file renamed over it), through the link:
-    // the link stays a link to the same file, which keeps its mode, and no
-    // temporary file is left.
-    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: codexConfig.path) == realConfig.path)
-    #expect(inode(realConfig) != inodeBefore)
-    #expect((try FileManager.default.attributesOfItem(atPath: realConfig.path)[.posixPermissions] as? Int) == 0o640)
-    #expect(try FileManager.default.contentsOfDirectory(atPath: dotfiles.path) == ["codex-config.toml"])
-    #expect(config.hasPrefix("model = \"o3\"\n\n[mcp_servers.other]\ncommand = \"other\"\n"))
-    // The launcher runs the tab's CherryMCP (CHERRY_MCP_HELPER), else says why.
-    func launch(_ environment: [String: String]) throws -> (Int32, String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: launcher)
-        process.arguments = ["--call", "x"]
-        process.environment = environment
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = output
-        try process.run()
-        let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        process.waitUntilExit()
-        return (process.terminationStatus, text)
-    }
-    #expect(try launch(["HOME": home.path, "CHERRY_MCP_HELPER": helper.path]) == (0, "ran --call x\n"))
-    let (status, message) = try launch(["HOME": home.path])
-    #expect(status == 1 && message.contains("no CherryMCP on this Mac"))
-    // Without CHERRY_MCP_HELPER: the newest installed build by its build
-    // id, not the name that sorts last.
-    for build in ["20250101000000.b", "20200101000000.a", "zzz-dev"] {
-        let installed = home.appendingPathComponent("Library/Application Support/cherry-host/bin/\(build)")
-        try FileManager.default.createDirectory(at: installed, withIntermediateDirectories: true)
-        let copy = installed.appendingPathComponent("CherryMCP")
-        try "#!/bin/sh\necho \"\(build) $*\"\n".write(to: copy, atomically: true, encoding: .utf8)
-        chmod(copy.path, 0o755)
-    }
-    #expect(try launch(["HOME": home.path]) == (0, "20250101000000.b --call x\n"))
-    // Remove: both registrations go.
-    let removed = try run(.remove)
-    #expect(removed.claudeResult == "ok" && removed.codexResult == "ok" && removed.piResult == "ok")
-    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("pi.registered").path))
-    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("claude.registered").path))
-    #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("codex.registered").path))
-    #expect(try String(contentsOf: codexConfig, encoding: .utf8).contains("[mcp_servers.other]"))
-    #expect(!(try String(contentsOf: codexConfig, encoding: .utf8)).contains("mcp_servers.cherry"))
-    let claudeLog = try String(contentsOf: root.appendingPathComponent("claude.log"), encoding: .utf8)
-    #expect(claudeLog.components(separatedBy: "\n").filter { $0.hasPrefix("mcp add") }.count == 2)
-    // The sheet shows exactly these commands.
-    #expect(RemoteMCPSetup.commands(mode: .install, name: "cherry").contains(
-        "claude mcp remove --scope user cherry; claude mcp add --scope user --transport stdio cherry -- \"$HOME/Library/Application Support/cherry-host/mcp/cherry-mcp\""
-    ))
-}
-
-@Test @MainActor func RemoteDeviceMCPSetupIsInTheDeviceMenu() throws {
-    let device = RemoteDevice(name: "Studio", sshDestination: "studio")
-    let item = TitlebarProjectMenuModel.deviceItem(
-        .init(device: device, state: RemoteDeviceConnectionState(control: .connected, sessionCount: 0, lastSeen: nil), sessions: []),
-        currentProjectKey: nil, now: Date()
-    )
-    let actions = (item.children ?? []).compactMap { entry -> TitlebarProjectMenuModel.Item? in
-        if case .item(let item) = entry { return item }
-        return nil
-    }
-    let setUp = try #require(actions.first { $0.action == .setUpDeviceMCP(device.id) })
-    #expect(setUp.title == "Set Up Cherry MCP on Studio…")
-    #expect(setUp.isEnabled)
-}
-
-// MARK: - Second review: sessions of other hosts, local scans, the directory there, request limits
-
-/// A session of This Mac, or of another SSH host, attached into the
-/// device's window (Persistent Sessions): not on the caller's Mac, so it
-/// is neither listed nor found by id or name, and its token is refused. A
-/// session of the device's own host attached there is its Mac's.
 @Test @MainActor func RemoteDeviceMCPSessionsOfAnotherHostInTheDevicesWindowAreNotItsMacs() async throws {
     let harness = try DeviceMCPHarness()
     defer { harness.stop() }
@@ -1036,12 +935,8 @@ final class RecordingLocalServices: ServiceDetecting, @unchecked Sendable {
             .getProcessOutput(.init(processID: id)),
             .sendProcessInput(.init(processID: id, text: "remote-input\n")),
             .sendProcessInput(.init(processName: foreign.title, text: "remote-input\n")),
-            .sendInput(.init(terminalID: id, text: "x\n", rawBase64: nil, waitMilliseconds: nil, lineLimit: nil)),
-            .getTerminalOutput(.init(terminalID: id, startLine: nil, lineLimit: nil)),
             .restartProcess(.init(processID: id)),
-            .restartTerminal(.init(terminalID: id)),
             .closeProcess(.init(processID: id)),
-            .closeTerminal(.init(terminalID: id)),
             .stopProcess(.init(processID: id)),
             .selectProcess(.init(processID: id)),
             .waitForProcessIdle(.init(processID: id, timeoutMilliseconds: 50)),

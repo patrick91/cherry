@@ -3,28 +3,16 @@ import Foundation
 import GhosttyTerminal
 import SwiftUI
 
-// Set `CHERRY_DEBUG_SIDEBAR_RESIZE=1` in the environment to see the
-// terminal-resize diagnostics in stderr / Console.app. Off by default so
-// the logs don't pollute normal runs.
+// Set `CHERRY_DEBUG_SIDEBAR_RESIZE=1` in the environment to trace the
+// terminal resizes in the unified log at debug level (`SessionLog.debug`).
+// Off by default so the logs don't pollute normal runs.
 private let sidebarResizeDebugEnabled =
     ProcessInfo.processInfo.environment["CHERRY_DEBUG_SIDEBAR_RESIZE"] == "1"
 
 @inline(__always)
 private func sidebarResizeLog(_ message: @autoclosure () -> String) {
     guard sidebarResizeDebugEnabled else { return }
-    let line = "[sidebar.resize] \(message())"
-    print(line)
-    if let data = (line + "\n").data(using: .utf8) {
-        let url = URL(fileURLWithPath: "/tmp/cherry-sidebar-resize.log")
-        if FileManager.default.fileExists(atPath: url.path),
-           let handle = try? FileHandle(forWritingTo: url) {
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-            try? handle.close()
-        } else {
-            try? data.write(to: url)
-        }
-    }
+    SessionLog.debug("[sidebar.resize] \(message())")
 }
 
 final class GhosttyOutputSink: @unchecked Sendable {
@@ -55,8 +43,11 @@ final class GhosttyOutputSink: @unchecked Sendable {
     private var lastDrainUptimeNanoseconds: UInt64?
     private var lastHostInputUptimeNanoseconds: UInt64?
 
+    /// Feeds `session` (`setSession` changes it); tests pass
+    /// `receiveForTesting` instead, which gets what a session would.
     init(
-        session: InMemoryTerminalSession,
+        session: InMemoryTerminalSession? = nil,
+        receiveForTesting: ((Data) -> Void)? = nil,
         hostInputSuppressor: @escaping (@escaping () -> Void) -> Void = { operation in operation() },
         burstCoalescingDelay: DispatchTimeInterval = GhosttyOutputSink.defaultBurstCoalescingDelay,
         promptMarkCoalescingDelay: DispatchTimeInterval = GhosttyOutputSink.defaultPromptMarkCoalescingDelay,
@@ -69,27 +60,10 @@ final class GhosttyOutputSink: @unchecked Sendable {
         self.promptMarkCoalescingDelay = promptMarkCoalescingDelay
         self.burstDetectionWindowNanoseconds = burstDetectionWindowNanoseconds
         self.inputLatencyBypassWindowNanoseconds = inputLatencyBypassWindowNanoseconds
-        self.receiveData = { session, data in
-            session?.receive(data)
-        }
-    }
-
-    init(
-        receiveForTesting: @escaping (Data) -> Void,
-        hostInputSuppressor: @escaping (@escaping () -> Void) -> Void = { operation in operation() },
-        burstCoalescingDelay: DispatchTimeInterval = GhosttyOutputSink.defaultBurstCoalescingDelay,
-        promptMarkCoalescingDelay: DispatchTimeInterval = GhosttyOutputSink.defaultPromptMarkCoalescingDelay,
-        burstDetectionWindowNanoseconds: UInt64 = GhosttyOutputSink.defaultBurstDetectionWindowNanoseconds,
-        inputLatencyBypassWindowNanoseconds: UInt64 = GhosttyOutputSink.defaultInputLatencyBypassWindowNanoseconds
-    ) {
-        self.session = nil
-        self.hostInputSuppressor = hostInputSuppressor
-        self.burstCoalescingDelay = burstCoalescingDelay
-        self.promptMarkCoalescingDelay = promptMarkCoalescingDelay
-        self.burstDetectionWindowNanoseconds = burstDetectionWindowNanoseconds
-        self.inputLatencyBypassWindowNanoseconds = inputLatencyBypassWindowNanoseconds
-        self.receiveData = { _, data in
-            receiveForTesting(data)
+        if let receiveForTesting {
+            self.receiveData = { _, data in receiveForTesting(data) }
+        } else {
+            self.receiveData = { session, data in session?.receive(data) }
         }
     }
 
@@ -319,10 +293,8 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     /// behavior); `unlimitedLiveSurfaceLimit` never evicts (keep every surface
     /// alive forever, the pure-Ghostty model — memory grows with tab count).
     /// Override at runtime with `CHERRY_LIVE_SURFACE_LIMIT=N` (`=0` to disable,
-    /// `=unlimited` or a negative value to never evict), or build the old behavior
-    /// with `-DCHERRY_REPLAY_ON_SWITCH` (`CHERRY_KEEP_SURFACES_WARM=0
-    /// Scripts/install-local-app`). The active surface is always live; this only
-    /// bounds how many *inactive* ones stay warm.
+    /// `=unlimited` or a negative value to never evict). The active surface is
+    /// always live; this only bounds how many *inactive* ones stay warm.
     static var liveSurfaceLimit: Int? = resolveInitialLiveSurfaceLimit()
 
     /// Sentinel for "never evict" — large enough that the eviction loop never
@@ -347,11 +319,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
                 return value < 0 ? unlimitedLiveSurfaceLimit : value
             }
         }
-        #if CHERRY_REPLAY_ON_SWITCH
-        return nil
-        #else
         return defaultLiveSurfaceLimit
-        #endif
     }
 
     /// Parked (detached-but-alive) bridges in least-recently-used order. A parked
@@ -421,10 +389,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     private var isReleased = false
     private(set) var isNativePTYBacked: Bool
     private var detachedSurfaceReleaseTask: Task<Void, Never>?
-    private var settledRenderHandler: (() -> Void)?
-    private var settledRenderTask: Task<Void, Never>?
-    private var settledRenderGeneration: UInt64 = 0
-    private var hasRenderedSinceSettledRenderRequest = false
     private var isScrollbarSynchronizationScheduled = false
     private var didLogLaunchContent = false
     private var launchContentCheck = LaunchContentCheck()
@@ -438,11 +402,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
         self.proxy = proxy
         self.inMemorySession = inMemorySession
-        self.outputSink = GhosttyOutputSink(session: inMemorySession) { operation in
+        self.outputSink = GhosttyOutputSink(session: inMemorySession, hostInputSuppressor: { operation in
             proxy.withHostInputSuppressed {
                 operation()
             }
-        }
+        })
         self.controller = TerminalController(configuration: terminalConfiguration, theme: terminalTheme)
         // A surface built while no view shows it (a restored tab's adapter
         // launching in the background) takes the size its window's terminal
@@ -470,7 +434,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
         terminalView.onPostRender = { [weak self] in
             TerminalPerformanceMonitor.recordRenderTick()
-            self?.handlePostRender()
             self?.noteLaunchContentFrame()
             if let self { LaunchInteractivity.noteFrame(of: self) }
         }
@@ -562,7 +525,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     func detach(from container: GhosttyTerminalContainerView, preservingSurface: Bool = false) {
         guard !isReleased, scrollContainer === container else { return }
-        cancelSettledRenderHandler()
         let canPreserveSurface = preservingSurface
             && container.bounds.width > 0
             && container.bounds.height > 0
@@ -597,11 +559,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func focus(in window: NSWindow?) {
         guard let window, window.firstResponder !== terminalView else { return }
         window.makeFirstResponder(terminalView)
-    }
-
-    var isTerminalFocused: Bool {
-        guard let window = terminalView.window else { return false }
-        return NSApp.isActive && window.isKeyWindow && window.firstResponder === terminalView
     }
 
     func applyTerminalSettings(colorScheme: ColorScheme) {
@@ -714,21 +671,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
         terminalView.delegate = nil
         terminalView.onPostRender = nil
-        cancelSettledRenderHandler()
         searchState = nil
         searchPresentationHandler = nil
         searchDismissalHandler = nil
         terminalView.freeSurface()
         terminalView.controller = nil
-    }
-
-    func finish(exitCode: UInt32) {
-        inMemorySession.finish(exitCode: exitCode, runtimeMilliseconds: 0)
-    }
-
-    func performAfterRenderedViewportSettles(_ handler: @escaping () -> Void) {
-        cancelSettledRenderHandler()
-        settledRenderHandler = handler
     }
 
     /// Logs, once per surface and only during the launch, the first frame
@@ -752,40 +699,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         LaunchContentFrames.noteContentFrame(in: window)
     }
 
-    private func handlePostRender() {
-        hasRenderedSinceSettledRenderRequest = true
-        scheduleSettledRenderCompletionIfPossible()
-    }
-
-    private func scheduleSettledRenderCompletionIfPossible() {
-        guard settledRenderHandler != nil,
-              hasRenderedSinceSettledRenderRequest,
-              isMountedViewportReadyForReveal
-        else { return }
-
-        // A fit first paints Ghostty's resized grid, then the foreground TUI
-        // reacts to SIGWINCH and paints its new layout. Debounce render ticks so
-        // the outgoing snapshot is only removed once that short redraw burst has
-        // gone quiet, rather than exposing the intermediate composition.
-        settledRenderTask?.cancel()
-        settledRenderGeneration &+= 1
-        let generation = settledRenderGeneration
-        settledRenderTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(80))
-            guard !Task.isCancelled,
-                  let self,
-                  generation == self.settledRenderGeneration,
-                  self.isMountedViewportReadyForReveal,
-                  let handler = self.settledRenderHandler
-            else { return }
-
-            self.settledRenderHandler = nil
-            self.settledRenderTask = nil
-            self.hasRenderedSinceSettledRenderRequest = false
-            handler()
-        }
-    }
-
     private var isMountedViewportReadyForReveal: Bool {
         guard let gridMetrics,
               gridMetrics.columns > 0,
@@ -800,18 +713,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             cellWidthPixels: Int(gridMetrics.cellWidthPixels),
             cellHeightPixels: Int(gridMetrics.cellHeightPixels)
         )
-    }
-
-    private func cancelSettledRenderHandler() {
-        settledRenderGeneration &+= 1
-        settledRenderTask?.cancel()
-        settledRenderTask = nil
-        settledRenderHandler = nil
-        hasRenderedSinceSettledRenderRequest = false
-    }
-
-    func simulatePostRenderForTesting() {
-        handlePostRender()
     }
 
     /// Respawn the native (EXEC) child in place. ghostty only rebuilds a
@@ -829,18 +730,10 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func relaunchNativeSurface() {
         guard !isReleased, let session = proxy.session else { return }
         isNativePTYBacked = true
-        // First: the previous adapter must be gone before the next one of
-        // this tab attaches with the same client id (`nativeExecLaunch`).
-        terminalView.freeSurface()
-        terminalView.controller?.tick()
-        terminalView.relaunchSurface(
-            configuration: Self.makeOptions(
-                for: session,
-                inMemorySession: inMemorySession,
-                useNativePTY: true
-            )
-        )
-        scrollContainer?.synchronizeScrollState()
+        // The rebuild frees the surface first: the previous adapter must be
+        // gone before the next one of this tab attaches with the same client
+        // id (`nativeExecLaunch`).
+        rebuildSurface(for: session, useNativePTY: true)
     }
 
     /// Replaces the EXEC surface with an in-memory one, which runs no
@@ -852,13 +745,20 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func relaunchInMemorySurface() {
         guard !isReleased, isNativePTYBacked, let session = proxy.session else { return }
         isNativePTYBacked = false
+        rebuildSurface(for: session, useNativePTY: false)
+    }
+
+    /// Frees the surface, drains Ghostty's app mailbox so the old surface's
+    /// queued messages are dropped (`relaunchNativeSurface`), and builds
+    /// the next surface.
+    private func rebuildSurface(for session: TerminalSession, useNativePTY: Bool) {
         terminalView.freeSurface()
         terminalView.controller?.tick()
         terminalView.relaunchSurface(
             configuration: Self.makeOptions(
                 for: session,
                 inMemorySession: inMemorySession,
-                useNativePTY: false
+                useNativePTY: useNativePTY
             )
         )
         scrollContainer?.synchronizeScrollState()
@@ -972,15 +872,9 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         terminalView.readScreenText()
     }
 
-    /// Visible viewport text — cheaper than the full scrollback; used to detect
-    /// content changes under native PTY.
-    func readNativeViewportText() -> String? {
-        terminalView.readViewportText()
-    }
-
     func terminalDidRingBell() {
         guard let session = proxy.session else {
-            NSSound.beep()
+            TerminalBell.ring()
             return
         }
         // A persistent tab's host may have rung this bell already.
@@ -993,12 +887,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             "pixels=\(size.widthPixels)x\(size.heightPixels) " +
             "terminalBounds=\(terminalView.bounds.size)"
         )
-        // A resize invalidates any render that was about to reveal this
-        // surface. Require a fresh post-render at the new mounted grid.
-        settledRenderGeneration &+= 1
-        settledRenderTask?.cancel()
-        settledRenderTask = nil
-        hasRenderedSinceSettledRenderRequest = false
         gridMetrics = size
         announceAdapterWindowSize()
         reportWindowGrid()
@@ -1009,10 +897,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     func terminalDidUpdateScrollbar(_ metrics: TerminalScrollbarMetrics) {
         scrollbarMetrics = metrics
         scheduleScrollbarSynchronization()
-        // Scrollbar metrics reposition the document-hosted surface even when
-        // Ghostty does not need another paint. Treat that layout update as part
-        // of the same settling burst before revealing the incoming viewport.
-        scheduleSettledRenderCompletionIfPossible()
     }
 
     private func scheduleScrollbarSynchronization() {
@@ -1123,8 +1007,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
     deinit {
         MainActor.assumeIsolated {
             releaseResources()
-            uninstallSettingsObserver()
-            uninstallWindowSettlingObserver()
         }
     }
 
@@ -1170,29 +1052,11 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         } else {
             sidebarResizeLog("prepare replay skipped: missing grid metrics bounds=\(terminalView.bounds.size)")
         }
-        guard let gridMetrics,
-              gridMetrics.columns > 0,
-              gridMetrics.rows > 0,
-              isViewportConsistentWithMountedSurface(
-                  columns: Int(gridMetrics.columns),
-                  rows: Int(gridMetrics.rows),
-                  widthPixels: Int(gridMetrics.widthPixels),
-                  heightPixels: Int(gridMetrics.heightPixels),
-                  cellWidthPixels: Int(gridMetrics.cellWidthPixels),
-                  cellHeightPixels: Int(gridMetrics.cellHeightPixels)
-              )
-        else {
+        guard isMountedViewportReadyForReveal, let gridMetrics else {
             return false
         }
 
-        if shouldIgnoreTransientStartupShrink(
-            columns: Int(gridMetrics.columns),
-            rows: Int(gridMetrics.rows)
-        ) {
-            return true
-        }
-
-        resizeSessionIfNeededToMountedGrid(columns: Int(gridMetrics.columns), rows: Int(gridMetrics.rows))
+        resizeSessionToMountedGridUnlessTransient(gridMetrics)
         return true
     }
 
@@ -1223,7 +1087,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
         replayCurrentFrameForMountedGrid(force: true)
 
-        outputObserverID = session.observeRawOutput(replayExistingOutput: false) { [outputSink] data in
+        outputObserverID = session.observeRawOutput { [outputSink] data in
             outputSink.receive(data)
         }
         Self.installedOutputObserverCount += 1
@@ -1245,36 +1109,28 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         }
     }
 
-    private func refreshMountedGeometryAndForceShellResize() {
+    func refreshMountedGeometryAndForceShellResize() {
         guard !isReleased, outputObserverID != nil else { return }
         scrollContainer?.synchronizeScrollState(forceTerminalFrame: true)
         synchronizeMountedSurfaceGeometry()
-        guard let gridMetrics,
-              gridMetrics.columns > 0,
-              gridMetrics.rows > 0,
-              isViewportConsistentWithMountedSurface(
-                  columns: Int(gridMetrics.columns),
-                  rows: Int(gridMetrics.rows),
-                  widthPixels: Int(gridMetrics.widthPixels),
-                  heightPixels: Int(gridMetrics.heightPixels),
-                  cellWidthPixels: Int(gridMetrics.cellWidthPixels),
-                  cellHeightPixels: Int(gridMetrics.cellHeightPixels)
-              )
+        guard isMountedViewportReadyForReveal, let gridMetrics,
+              resizeSessionToMountedGridUnlessTransient(gridMetrics)
         else {
             return
         }
-        if shouldIgnoreTransientStartupShrink(
-            columns: Int(gridMetrics.columns),
-            rows: Int(gridMetrics.rows)
-        ) {
-            return
-        }
-        resizeSessionIfNeededToMountedGrid(columns: Int(gridMetrics.columns), rows: Int(gridMetrics.rows))
         replayCurrentFrameForMountedGrid(force: true)
     }
 
-    func refreshMountedGeometryAndReplayForSidebarAnimation() {
-        refreshMountedGeometryAndForceShellResize()
+    /// Resizes the session to the mounted grid unless that grid is a
+    /// transient startup shrink (`shouldIgnoreTransientStartupShrink`), and
+    /// says whether it did not ignore it.
+    @discardableResult
+    private func resizeSessionToMountedGridUnlessTransient(_ gridMetrics: TerminalGridMetrics) -> Bool {
+        let columns = Int(gridMetrics.columns)
+        let rows = Int(gridMetrics.rows)
+        guard !shouldIgnoreTransientStartupShrink(columns: columns, rows: rows) else { return false }
+        resizeSessionIfNeededToMountedGrid(columns: columns, rows: rows)
+        return true
     }
 
     private func replayCurrentFrameForMountedGrid(force: Bool) {
@@ -1316,7 +1172,7 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
             return cachedOutput
         }
 
-        let snapshot = renderedReplaySnapshot(for: session, maxBytes: maxBytes, maxLines: maxLines)
+        let snapshot = renderedReplaySnapshot(for: session, maxLines: maxLines)
         guard !snapshot.lines.isEmpty else {
             session.cacheRenderedReplayOutput(Data(), maxBytes: maxBytes, maxLines: maxLines)
             return Data()
@@ -1368,7 +1224,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     private static func renderedReplaySnapshot(
         for session: TerminalSession,
-        maxBytes _: Int,
         maxLines: Int
     ) -> RenderedReplaySnapshot {
         let totalLines = session.lineCount
@@ -1469,65 +1324,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         terminalView.freeSurface()
         gridMetrics = nil
         scrollbarMetrics = nil
-    }
-
-    nonisolated static func sanitizeReplayOutputForHostManagedTerminal(_ data: Data) -> Data {
-        guard !data.isEmpty else { return data }
-
-        let bytes = Array(data)
-        var sanitized: [UInt8] = []
-        sanitized.reserveCapacity(bytes.count)
-
-        var index = 0
-        while index < bytes.count {
-            if bytes[index] == 0x1B, index + 1 < bytes.count {
-                switch bytes[index + 1] {
-                case UInt8(ascii: "]"):
-                    if let bounds = oscSequenceBounds(in: bytes, payloadStart: index + 2) {
-                        let payload = bytes[index + 2..<bounds.payloadEnd]
-                        if isResponseGeneratingOSCQuery(payload) {
-                            index = bounds.endIndex
-                            continue
-                        }
-                        sanitized.append(contentsOf: bytes[index..<bounds.endIndex])
-                        index = bounds.endIndex
-                        continue
-                    }
-                case UInt8(ascii: "["):
-                    if let finalIndex = csiFinalIndex(in: bytes, payloadStart: index + 2) {
-                        let payload = bytes[index + 2..<finalIndex]
-                        let finalByte = bytes[finalIndex]
-                        if isResponseGeneratingCSIQuery(payload, finalByte: finalByte) {
-                            index = finalIndex + 1
-                            continue
-                        }
-                        sanitized.append(contentsOf: bytes[index..<(finalIndex + 1)])
-                        index = finalIndex + 1
-                        continue
-                    }
-                case UInt8(ascii: "P"):
-                    if let bounds = oscSequenceBounds(in: bytes, payloadStart: index + 2) {
-                        let payload = bytes[index + 2..<bounds.payloadEnd]
-                        if isResponseGeneratingDCSQuery(payload) {
-                            index = bounds.endIndex
-                            continue
-                        }
-                        sanitized.append(contentsOf: bytes[index..<bounds.endIndex])
-                        index = bounds.endIndex
-                        continue
-                    }
-                default:
-                    break
-                }
-            }
-
-            sanitized.append(bytes[index])
-            index += 1
-        }
-
-        let querySanitized = sanitized.count == bytes.count ? data : Data(sanitized)
-        let promptSanitized = stripZshPromptEndOfLineMarks(querySanitized)
-        return collapseOverwrittenProgressFramesForTerminalFeed(promptSanitized)
     }
 
     nonisolated fileprivate static func stripZshPromptEndOfLineMarks(_ data: Data) -> Data {
@@ -1782,33 +1578,12 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         in bytes: [UInt8],
         at index: Int
     ) -> (endIndex: Int, containsInverse: Bool, containsResetOrInverseOff: Bool)? {
-        guard index + 2 < bytes.count,
-              bytes[index] == 0x1B,
-              bytes[index + 1] == UInt8(ascii: "[")
+        guard case let .complete(endIndex, containsInverse, containsResetOrInverseOff) =
+            sgrSequencePrefix(in: bytes, at: index)
         else {
             return nil
         }
-
-        var scan = index + 2
-        while scan < bytes.count {
-            let byte = bytes[scan]
-            if byte == UInt8(ascii: "m") {
-                let payload = bytes[(index + 2)..<scan]
-                let codes = String(decoding: payload, as: UTF8.self)
-                    .split(whereSeparator: { $0 == ";" || $0 == ":" })
-                let normalizedCodes = codes.isEmpty ? ["0"] : codes.map(String.init)
-                let flags = sgrFlags(in: normalizedCodes)
-                return (
-                    endIndex: scan + 1,
-                    containsInverse: flags.containsInverse,
-                    containsResetOrInverseOff: flags.containsResetOrInverseOff
-                )
-            }
-            guard (0x30...0x3F).contains(byte) else { return nil }
-            scan += 1
-        }
-
-        return nil
+        return (endIndex, containsInverse, containsResetOrInverseOff)
     }
 
     nonisolated private static func sgrFlags(
@@ -1911,38 +1686,27 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     nonisolated private static var eraseLineCarriageReturnMarkerLength: Int { 5 }
 
+    /// `ESC [ 2 K CR`, the bytes `isEraseLineCarriageReturnMarker` matches.
+    nonisolated private static let eraseLineCarriageReturnMarker: [UInt8] = [
+        0x1B, UInt8(ascii: "["), UInt8(ascii: "2"), UInt8(ascii: "K"), UInt8(ascii: "\r"),
+    ]
+
+    /// Runs on every output chunk, so it searches the bytes in place.
     nonisolated fileprivate static func containsOverwrittenProgressFrameMarker(_ data: Data) -> Bool {
         guard data.count >= eraseLineCarriageReturnMarkerLength else { return false }
 
         return data.withUnsafeBytes { rawBytes in
-            let bytes = rawBytes.bindMemory(to: UInt8.self)
-            guard bytes.count >= eraseLineCarriageReturnMarkerLength else { return false }
-
-            var index = 0
-            while index + eraseLineCarriageReturnMarkerLength <= bytes.count {
-                if isEraseLineCarriageReturnMarker(in: bytes, at: index) {
-                    return true
-                }
-                index += 1
-            }
-            return false
+            memmem(
+                rawBytes.baseAddress,
+                rawBytes.count,
+                eraseLineCarriageReturnMarker,
+                eraseLineCarriageReturnMarkerLength
+            ) != nil
         }
     }
 
     nonisolated private static func isEraseLineCarriageReturnMarker(
         in bytes: [UInt8],
-        at index: Int
-    ) -> Bool {
-        index + eraseLineCarriageReturnMarkerLength <= bytes.count
-            && bytes[index] == 0x1B
-            && bytes[index + 1] == UInt8(ascii: "[")
-            && bytes[index + 2] == UInt8(ascii: "2")
-            && bytes[index + 3] == UInt8(ascii: "K")
-            && bytes[index + 4] == UInt8(ascii: "\r")
-    }
-
-    nonisolated private static func isEraseLineCarriageReturnMarker(
-        in bytes: UnsafeBufferPointer<UInt8>,
         at index: Int
     ) -> Bool {
         index + eraseLineCarriageReturnMarkerLength <= bytes.count
@@ -2047,22 +1811,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         return nil
     }
 
-    nonisolated private static func isResponseGeneratingOSCQuery(_ payload: ArraySlice<UInt8>) -> Bool {
-        let fields = String(decoding: payload, as: UTF8.self)
-            .split(separator: ";", omittingEmptySubsequences: false)
-            .map(String.init)
-        guard let command = fields.first else { return false }
-
-        switch command {
-        case "4":
-            return fields.dropFirst().contains("?")
-        case "10", "11", "12", "13", "17", "19":
-            return fields.indices.contains(1) && fields[1] == "?"
-        default:
-            return false
-        }
-    }
-
     nonisolated private static func isTerminalGeneratedOSCResponse(_ payload: ArraySlice<UInt8>) -> Bool {
         let fields = String(decoding: payload, as: UTF8.self)
             .split(separator: ";", omittingEmptySubsequences: false)
@@ -2078,14 +1826,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         default:
             return false
         }
-    }
-
-    nonisolated private static func isResponseGeneratingDCSQuery(_ payload: ArraySlice<UInt8>) -> Bool {
-        guard payload.starts(with: [UInt8(ascii: "+"), UInt8(ascii: "q")]) else {
-            return false
-        }
-
-        return isXTGETTCAPPayload(payload.dropFirst(2), allowsValue: false)
     }
 
     nonisolated private static func isTerminalGeneratedDCSResponse(_ payload: ArraySlice<UInt8>) -> Bool {
@@ -2157,26 +1897,6 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
         (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte)
             || (UInt8(ascii: "A")...UInt8(ascii: "F")).contains(byte)
             || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains(byte)
-    }
-
-    nonisolated private static func isResponseGeneratingCSIQuery(
-        _ payloadBytes: ArraySlice<UInt8>,
-        finalByte: UInt8
-    ) -> Bool {
-        let payload = String(decoding: payloadBytes, as: UTF8.self)
-
-        switch finalByte {
-        case UInt8(ascii: "c"):
-            return true
-        case UInt8(ascii: "n"):
-            return payload == "5" || payload == "6"
-        case UInt8(ascii: "p"):
-            return payload.hasPrefix("?") && payload.hasSuffix("$")
-        case UInt8(ascii: "u"):
-            return payload.first == "?"
-        default:
-            return false
-        }
     }
 
     nonisolated private static func isTerminalGeneratedCSIResponse(
@@ -2624,15 +2344,16 @@ extension GhosttySessionBridge {
     }
 
     /// Pastes `text` into the tab as the tab pastes: through the surface
-    /// (which brackets it while the program asks for it), or, when the
-    /// host takes the tab's input now, bracketed as the host reports the
-    /// program's mode (`TerminalSession.bracketsPaste`).
+    /// (which brackets it while the program asks for it and asks first, under
+    /// Ghostty's paste protection, about text that could run a command), or,
+    /// when the host takes the tab's input now, bracketed as the host reports
+    /// the program's mode (`TerminalSession.bracketsPaste`).
     func insertPastedText(_ text: String) {
         guard let session = proxy.session, session.acceptsInput else { return }
         if session.keyboardInputGoesThroughHost || !isNativePTYBacked {
             session.send(data: TerminalInputEncoder.pastedTextData(text, bracketedPasteMode: session.bracketsPaste(text)))
         } else {
-            terminalView.sendText(text)
+            terminalView.pasteText(text)
         }
     }
 }
@@ -2665,9 +2386,6 @@ final class GhosttyTerminalContainerView: NSView {
     private var isSidebarAnimating = false
     private var isSyncFrozen = false
     private var snapshotLayer: CALayer?
-    private var surfaceTransitionSnapshotLayer: CALayer?
-    private var surfaceTransitionFallbackTask: Task<Void, Never>?
-    private var surfaceTransitionGeneration: UInt64 = 0
     private var activeColorScheme: ColorScheme = .dark
     private var appliedDocumentBackgroundScheme: ColorScheme?
     private var appliedDocumentBackgroundRevision: UInt64?
@@ -2715,7 +2433,6 @@ final class GhosttyTerminalContainerView: NSView {
         colorScheme: ColorScheme,
         allowsAutoFocus: Bool = true,
         isActivePane: Bool = true,
-        usesWorktreeSurfaceTransition: Bool = false,
         onActivate: (() -> Void)? = nil
     ) {
         TerminalPerformanceMonitor.recordContainerConfigure()
@@ -2728,18 +2445,6 @@ final class GhosttyTerminalContainerView: NSView {
         }
 
         if activeSession !== session {
-            // Terminal selection is intentionally immediate. Only worktree
-            // navigation keeps the outgoing pixels briefly while the incoming
-            // surface fits and its foreground TUI redraws.
-            let transitionGeneration: UInt64? = activeSession.flatMap { source -> UInt64? in
-                guard usesWorktreeSurfaceTransition
-                    || isWorktreeTransition(from: source, to: session)
-                else {
-                    cancelSurfaceTransition()
-                    return nil
-                }
-                return beginSurfaceTransitionIfPossible()
-            } ?? nil
             resetSidebarAnimationStateForSurfaceChange()
             if let activeSession {
                 if GhosttySessionBridge.liveSurfaceLimit != nil {
@@ -2753,16 +2458,7 @@ final class GhosttyTerminalContainerView: NSView {
                 }
             }
             activeSession = session
-            let bridge = session.ghosttyBridge
-            if let transitionGeneration {
-                bridge.performAfterRenderedViewportSettles { [weak self] in
-                    Task { @MainActor [weak self] in
-                        await Task.yield()
-                        self?.completeSurfaceTransition(generation: transitionGeneration)
-                    }
-                }
-            }
-            bridge.attach(to: self)
+            session.ghosttyBridge.attach(to: self)
             if isActivePane {
                 requestTerminalFocus()
             }
@@ -2770,7 +2466,6 @@ final class GhosttyTerminalContainerView: NSView {
             // Disconnecting a hosted session releases its bridge while this
             // container still displays the same session. Mount the replacement
             // after reconnecting; session identity alone cannot detect it.
-            cancelSurfaceTransition()
             resetSidebarAnimationStateForSurfaceChange()
             session.ghosttyBridge.attach(to: self)
             if isActivePane {
@@ -2896,7 +2591,6 @@ final class GhosttyTerminalContainerView: NSView {
         releasesBridge: Bool = true,
         preservingSurface: Bool = false
     ) {
-        cancelSurfaceTransition()
         guard let session = activeSession else {
             activeBridge = nil
             pendingTerminalFocus = false
@@ -3004,7 +2698,7 @@ final class GhosttyTerminalContainerView: NSView {
         // eventually fades there's no pending fit and no flash to reveal.
         applyEarlyFitIfPossible()
         if didApplyEarlyFit {
-            activeBridge?.refreshMountedGeometryAndReplayForSidebarAnimation()
+            activeBridge?.refreshMountedGeometryAndForceShellResize()
             refreshSnapshotContentsAfterEarlyFitIfPossible()
         }
     }
@@ -3023,7 +2717,7 @@ final class GhosttyTerminalContainerView: NSView {
             updateDocumentViewMetrics()
         }
 
-        activeBridge?.refreshMountedGeometryAndReplayForSidebarAnimation()
+        activeBridge?.refreshMountedGeometryAndForceShellResize()
         refreshSnapshotContentsAfterEarlyFitIfPossible()
 
         // Hand a runloop tick to Core Animation / Metal so the live
@@ -3042,66 +2736,6 @@ final class GhosttyTerminalContainerView: NSView {
         didApplyEarlyFit = false
         pendingPostAnimationDelta = 0
         removeSnapshotLayer(animated: false)
-    }
-
-    private func beginSurfaceTransitionIfPossible() -> UInt64? {
-        guard scrollView.frame.width > 0,
-              scrollView.frame.height > 0,
-              let capture = captureTerminalLayerContents()
-        else {
-            cancelSurfaceTransition()
-            return nil
-        }
-
-        cancelSurfaceTransition()
-        surfaceTransitionGeneration &+= 1
-        let generation = surfaceTransitionGeneration
-        surfaceTransitionSnapshotLayer = makeSnapshotLayer(
-            capture: capture,
-            frame: scrollView.frame,
-            zPosition: 1_100
-        )
-        surfaceTransitionFallbackTask = Task { @MainActor [weak self] in
-            // Safety valve for a stopped or otherwise non-rendering surface.
-            // Normal transitions complete through the stable-render callback.
-            try? await Task.sleep(for: .milliseconds(240))
-            guard !Task.isCancelled else { return }
-            self?.completeSurfaceTransition(generation: generation)
-        }
-        return generation
-    }
-
-    private func completeSurfaceTransition(generation: UInt64) {
-        guard generation == surfaceTransitionGeneration,
-              let fadingLayer = surfaceTransitionSnapshotLayer
-        else { return }
-
-        surfaceTransitionFallbackTask?.cancel()
-        surfaceTransitionFallbackTask = nil
-        fadingLayer.removeFromSuperlayer()
-        surfaceTransitionSnapshotLayer = nil
-    }
-
-    private func cancelSurfaceTransition() {
-        surfaceTransitionFallbackTask?.cancel()
-        surfaceTransitionFallbackTask = nil
-        surfaceTransitionSnapshotLayer?.removeFromSuperlayer()
-        surfaceTransitionSnapshotLayer = nil
-    }
-
-    private func isWorktreeTransition(
-        from source: TerminalSession,
-        to target: TerminalSession
-    ) -> Bool {
-        guard let sourceRoot = source.projectRoot,
-              let targetRoot = target.projectRoot,
-              sourceRoot != targetRoot,
-              let sourceRepositoryRoot = AgentSettings.shared.repositoryRoot(for: sourceRoot),
-              let targetRepositoryRoot = AgentSettings.shared.repositoryRoot(for: targetRoot)
-        else {
-            return false
-        }
-        return sourceRepositoryRoot == targetRepositoryRoot
     }
 
     private func applyEarlyFitIfPossible() {
@@ -3300,7 +2934,7 @@ final class GhosttyTerminalContainerView: NSView {
     }
 
     private func updateSnapshotLayerFrame() {
-        guard snapshotLayer != nil || surfaceTransitionSnapshotLayer != nil else { return }
+        guard snapshotLayer != nil else { return }
         // Track the current visible area so the snapshot stays aligned with
         // the underlying scroll view as the container resizes during the
         // animation. Disable implicit layer animations or the snapshot will
@@ -3308,7 +2942,6 @@ final class GhosttyTerminalContainerView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         snapshotLayer?.frame = scrollView.frame
-        surfaceTransitionSnapshotLayer?.frame = scrollView.frame
         CATransaction.commit()
     }
 
@@ -3523,8 +3156,7 @@ final class GhosttyTerminalContainerView: NSView {
             keyCode: event.keyCode,
             characters: event.characters,
             charactersIgnoringModifiers: event.charactersIgnoringModifiers,
-            modifiers: event.modifierFlags,
-            keyboardProtocolFlags: activeSession.keyboardProtocolFlags
+            modifiers: event.modifierFlags
         ) {
             activeBridge?.scrollToBottomForHostInput()
             activeSession.send(data: data)
@@ -3557,7 +3189,8 @@ final class GhosttyTerminalContainerView: NSView {
     /// takes it there, so it goes through the host (`send(data:)`), and
     /// the surface keeps showing the last screen. Cursor keys are encoded
     /// for the program's cursor key mode as its host reports it
-    /// (`TerminalSession.usesApplicationCursorKeys`). True when it was
+    /// (`TerminalSession.usesApplicationCursorKeys`), and every key for its
+    /// modifyOtherKeys (`TerminalSession.usesModifyOtherKeys`). True when it was
     /// sent; false leaves the event to the surface (Command shortcuts,
     /// which the menu handles; keys `HostRoutedKeyEncoder` has no encoding
     /// for; text being composed with an input method).
@@ -3621,6 +3254,10 @@ final class GhosttyTerminalContainerView: NSView {
         else {
             return false
         }
+        let optionAsAlt = HostRoutedKeyEncoder.OptionAsAlt.nativeSurfaces
+        // Ghostty's modifyOtherKeys encoding applies in legacy key encoding
+        // only.
+        let modifyOtherKeys = activeSession.usesModifyOtherKeys && !activeSession.isEnhancedKeyboardProtocolActive
         let data: Data
         if isPasteShortcut(event) {
             // Bracketed as the host reports the program's mode: the
@@ -3635,15 +3272,18 @@ final class GhosttyTerminalContainerView: NSView {
             modifiers: event.modifierFlags,
             characters: event.characters,
             charactersIgnoringModifiers: event.charactersIgnoringModifiers,
-            // Only the kitty keyboard protocol's codes use it.
-            unshiftedCharacters: activeSession.isEnhancedKeyboardProtocolActive
+            // Only the kitty keyboard protocol's codes, and under
+            // modifyOtherKeys an Alt key that types no single character,
+            // use it.
+            unshiftedCharacters: activeSession.isEnhancedKeyboardProtocolActive || modifyOtherKeys
                 ? event.characters(byApplyingModifiers: []) : nil,
+            typedText: modifyOtherKeys ? HostRoutedKeyEncoder.surfaceText(for: event, optionAsAlt: optionAsAlt) : nil,
             usesApplicationCursorKeys: activeSession.usesApplicationCursorKeys,
             isEnhancedKeyboardProtocolActive: activeSession.isEnhancedKeyboardProtocolActive,
-            keyboardProtocolFlags: activeSession.keyboardProtocolFlags,
             sendsModifiedArrowKeys: activeSession.usesAlternateScreen
                 || activeSession.isEnhancedKeyboardProtocolActive,
-            optionAsAlt: .nativeSurfaces
+            modifyOtherKeys: modifyOtherKeys,
+            optionAsAlt: optionAsAlt
         ) {
             data = encoded
         } else {
@@ -3820,10 +3460,6 @@ final class GhosttyTerminalContainerView: NSView {
         snapshotLayer?.superlayer != nil
     }
 
-    var hasSurfaceTransitionSnapshotForTesting: Bool {
-        surfaceTransitionSnapshotLayer?.superlayer != nil
-    }
-
     var activeSessionIDForTesting: UUID? {
         activeSession?.id
     }
@@ -3924,14 +3560,6 @@ private extension TerminalPointerStyle {
     }
 }
 
-private extension NSLock {
-    func withLock<T>(_ body: () -> T) -> T {
-        lock()
-        defer { unlock() }
-        return body()
-    }
-}
-
 /// Encodes a key typed into a persistent tab whose attach adapter is away
 /// (`GhosttyTerminalContainerView.sendKeyThroughHostWhileAdapterIsAway`),
 /// for its host to type: Ghostty's surface would encode it, but its
@@ -3960,6 +3588,11 @@ private extension NSLock {
 /// path only turns a lone Tab into `CSI 9 u` then, `normalizedInputData`),
 /// alternate keys (flag 4) and associated text (flag 16).
 ///
+/// While the program set xterm's modifyOtherKeys to level 2 and uses no
+/// kitty flags (`modifyOtherKeys`, as its host reports it), every key goes
+/// as Ghostty's surface types it then (`modifyOtherKeysData`): keys with
+/// modifiers mostly as `CSI 27 ; m ; code ~`.
+///
 /// Nil for Command shortcuts (the menu's) and keys it has no encoding for
 /// (F13 and above, keys with no character).
 enum HostRoutedKeyEncoder {
@@ -3980,6 +3613,14 @@ enum HostRoutedKeyEncoder {
         static let up: UInt16 = 126
         static let f3: UInt16 = 99
     }
+
+    /// The keypad keys (`kVK_ANSI_Keypad…`) Ghostty types as their character
+    /// whatever the modifiers, as the numeric keypad does by default (mode
+    /// 1035 on, so never in application keypad form), and keypad Enter as CR.
+    private static let keypadKeys: [UInt16: String] = [
+        65: ".", 67: "*", 69: "+", 75: "/", 76: "\r", 78: "-",
+        82: "0", 83: "1", 84: "2", 85: "3", 86: "4", 87: "5", 88: "6", 89: "7", 91: "8", 92: "9",
+    ]
 
     /// F1–F12 (`kVK_F1`…) as xterm types them: F1–F4 as `ESC O P`…`S`
     /// (`ESC [ 1 ; m P` with modifiers), the others as `ESC [ n ~`
@@ -4043,35 +3684,40 @@ enum HostRoutedKeyEncoder {
     /// (`NSEvent.characters(byApplyingModifiers: [])`), the code of a
     /// Control or Alt key under the kitty keyboard protocol; nil uses
     /// `charactersIgnoringModifiers` in lowercase.
+    /// `modifyOtherKeys`: the program set xterm's modifyOtherKeys to level 2
+    /// (`TerminalSession.usesModifyOtherKeys`); it applies only while the
+    /// kitty keyboard protocol does not, as in Ghostty.
+    /// `typedText`: the text Ghostty's surface takes the key to type
+    /// (`surfaceText(for:optionAsAlt:)`), used only with `modifyOtherKeys`;
+    /// nil works it out from `characters` and `charactersIgnoringModifiers`.
     static func data(
         keyCode: UInt16,
         modifiers eventModifiers: NSEvent.ModifierFlags,
         characters: String?,
         charactersIgnoringModifiers: String?,
         unshiftedCharacters: String? = nil,
+        typedText: String? = nil,
         usesApplicationCursorKeys: Bool,
         isEnhancedKeyboardProtocolActive: Bool,
-        keyboardProtocolFlags: Int,
         sendsModifiedArrowKeys: Bool,
+        modifyOtherKeys: Bool = false,
         optionAsAlt: OptionAsAlt = .both
     ) -> Data? {
         let modifiers = eventModifiers.intersection(.deviceIndependentFlagsMask)
         guard !modifiers.contains(.command) else { return nil }
-        if let sequence = TerminalInputEncoder.shiftEnterSequence(
-            keyCode: keyCode, modifiers: modifiers, isEnhancedKeyboardProtocolActive: isEnhancedKeyboardProtocolActive
-        ) ?? TerminalInputEncoder.shiftTabSequence(
-            keyCode: keyCode, modifiers: modifiers, isEnhancedKeyboardProtocolActive: isEnhancedKeyboardProtocolActive
-        ) ?? TerminalInputEncoder.appKitOptionBackspaceSequence(
-            keyCode: keyCode, modifiers: modifiers
-        ) ?? TerminalInputEncoder.appKitOptionArrowSequence(
-            keyCode: keyCode, modifiers: modifiers, sendsModifiedArrowKeys: sendsModifiedArrowKeys
-        ) ?? TerminalInputEncoder.appKitOptionDigitTextData(
-            keyCode: keyCode, characters: characters, charactersIgnoringModifiers: charactersIgnoringModifiers,
-            modifiers: modifiers, keyboardProtocolFlags: keyboardProtocolFlags
-        ) ?? TerminalInputEncoder.appKitUnmodifiedArrowSequence(
-            keyCode: keyCode, modifiers: modifiers, usesApplicationCursorKeys: usesApplicationCursorKeys
-        ) {
-            return sequence
+        if modifyOtherKeys, !isEnhancedKeyboardProtocolActive {
+            return modifyOtherKeysData(
+                keyCode: keyCode,
+                modifiers: eventModifiers,
+                text: typedText ?? surfaceText(
+                    characters: characters,
+                    charactersIgnoringModifiers: charactersIgnoringModifiers,
+                    optionActsAsAlt: optionAsAlt.applies(to: eventModifiers)
+                ),
+                unshiftedCharacters: unshiftedCharacters,
+                usesApplicationCursorKeys: usesApplicationCursorKeys,
+                optionAsAlt: optionAsAlt
+            )
         }
         let held = modifiers.intersection([.shift, .control, .option])
         let alt = optionAsAlt.applies(to: eventModifiers)
@@ -4079,6 +3725,27 @@ enum HostRoutedKeyEncoder {
         // (Alt), 4 for Control.
         let parameter = 1 + (held.contains(.shift) ? 1 : 0) + (held.contains(.option) ? 2 : 0)
             + (held.contains(.control) ? 4 : 0)
+        if isEnhancedKeyboardProtocolActive, keyCode == KeyCode.keypadEnter {
+            // The kitty keyboard protocol's own code for it (KP_ENTER), as
+            // Ghostty types it.
+            return csi(held.isEmpty ? "57414u" : "57414;\(parameter)u")
+        }
+        if let sequence = TerminalInputEncoder.shiftEnterSequence(
+            keyCode: keyCode, modifiers: modifiers, isEnhancedKeyboardProtocolActive: isEnhancedKeyboardProtocolActive
+        ) ?? TerminalInputEncoder.shiftTabSequence(
+            keyCode: keyCode, modifiers: modifiers, isEnhancedKeyboardProtocolActive: isEnhancedKeyboardProtocolActive
+        ) ?? (isEnhancedKeyboardProtocolActive ? nil : TerminalInputEncoder.appKitOptionBackspaceSequence(
+            keyCode: keyCode, modifiers: modifiers
+        )) ?? TerminalInputEncoder.appKitOptionArrowSequence(
+            keyCode: keyCode, modifiers: modifiers, sendsModifiedArrowKeys: sendsModifiedArrowKeys
+        ) ?? TerminalInputEncoder.appKitOptionDigitTextData(
+            keyCode: keyCode, characters: characters, charactersIgnoringModifiers: charactersIgnoringModifiers,
+            modifiers: modifiers
+        ) ?? TerminalInputEncoder.appKitUnmodifiedArrowSequence(
+            keyCode: keyCode, modifiers: modifiers, usesApplicationCursorKeys: usesApplicationCursorKeys
+        ) {
+            return sequence
+        }
 
         /// Return, Tab or Backspace (`byte`, kitty's `code`) with modifiers.
         func modifiedKey(_ byte: UInt8, code: Int) -> Data {
@@ -4116,13 +3783,15 @@ enum HostRoutedKeyEncoder {
         case KeyCode.forwardDelete:
             return csi(held.isEmpty ? "3~" : "3;\(parameter)~")
         case KeyCode.returnKey, KeyCode.keypadEnter:
-            // Shift alone: encoded above.
+            // Shift alone, and Keypad Enter under the kitty keyboard
+            // protocol: encoded above.
             return modifiedKey(0x0D, code: 13)
         case KeyCode.tab:
             // Shift alone: encoded above.
             return modifiedKey(0x09, code: 9)
         case KeyCode.backspace:
-            // Option alone: encoded above. Control+Backspace is ^H.
+            // Option alone: encoded above but under the kitty keyboard
+            // protocol. Control+Backspace is ^H.
             return modifiedKey(held.contains(.control) ? 0x08 : 0x7F, code: 127)
         case KeyCode.escape:
             if isEnhancedKeyboardProtocolActive { return csi(held.isEmpty ? "27u" : "27;\(parameter)u") }
@@ -4151,6 +3820,153 @@ enum HostRoutedKeyEncoder {
         // Text, as the key composed it (Option's characters included).
         guard let text = printableText(characters) else { return nil }
         return Data(text.utf8)
+    }
+
+    /// What Ghostty's surface types for a key while the program set xterm's
+    /// modifyOtherKeys to level 2 (`CSI > 4 ; 2 m`) and uses legacy key
+    /// encoding: Ghostty's legacy encoder in that state (`input/key_encode.zig`
+    /// `legacy`, with its `function_keys.zig` table), for the event the
+    /// surface gets (`text` as `surfaceText(for:optionAsAlt:)` gives it). `m`
+    /// is xterm's modifier parameter, 1 plus 1 for Shift, 2 for Alt and 4
+    /// for Control:
+    /// - Return, Tab, Escape and Backspace with modifiers as
+    ///   `CSI 27 ; m ; code ~` (Shift+Return `CSI 27 ; 2 ; 13 ~`, Option+Escape
+    ///   `CSI 27 ; 3 ; 27 ~`), Option counted whatever `optionAsAlt` says;
+    ///   Control+Backspace stays ^H, and Shift+Tab is `CSI Z`, Cherry's
+    ///   `shift+tab=csi:Z` binding (`TerminalSettings.nativeUserKeyboardConfig`);
+    /// - a key that types one character, with Control or Option as Alt, or
+    ///   with Shift when that character is in `@`…`~` (letters among them)
+    ///   or a space, as `CSI 27 ; m ; character ~`: Control+P is
+    ///   `CSI 27 ; 5 ; 112 ~`, Control+Shift+H `CSI 27 ; 6 ; 72 ~`, Shift+A
+    ///   `CSI 27 ; 2 ; 65 ~`; Option that composes is not counted (Option+8
+    ///   as `[` types `[`);
+    /// - arrows, Home, End, Page Up/Down, Forward Delete and F1–F12 as
+    ///   without it, with `m` (F3 with modifiers is `CSI 13 ; m ~`, as in
+    ///   Ghostty); keypad keys as their character; other text as typed.
+    /// A key whose text is not one character goes as in legacy encoding:
+    /// Control with a letter key as its C0 byte, Alt as ESC and the key.
+    private static func modifyOtherKeysData(
+        keyCode: UInt16,
+        modifiers eventModifiers: NSEvent.ModifierFlags,
+        text: String?,
+        unshiftedCharacters: String?,
+        usesApplicationCursorKeys: Bool,
+        optionAsAlt: OptionAsAlt
+    ) -> Data? {
+        let held = eventModifiers.intersection(.deviceIndependentFlagsMask).intersection([.shift, .control, .option])
+        let alt = optionAsAlt.applies(to: eventModifiers)
+        func parameter(_ modifiers: NSEvent.ModifierFlags) -> Int {
+            1 + (modifiers.contains(.shift) ? 1 : 0) + (modifiers.contains(.option) ? 2 : 0)
+                + (modifiers.contains(.control) ? 4 : 0)
+        }
+        let m = parameter(held)
+        /// Return, Tab, Escape or Backspace with modifiers.
+        func otherKey(_ code: Int) -> Data { csi("27;\(m);\(code)~") }
+
+        if let key = functionKeys[keyCode] {
+            if held.isEmpty {
+                return key.final == "~" ? csi("\(key.number)~") : Data("\u{1B}O\(key.final)".utf8)
+            }
+            if keyCode == KeyCode.f3 { return csi("13;\(m)~") }
+            return key.final == "~" ? csi("\(key.number);\(m)~") : csi("1;\(m)\(key.final)")
+        }
+        if let keypad = keypadKeys[keyCode] {
+            return Data(keypad.utf8)
+        }
+        switch keyCode {
+        case KeyCode.up, KeyCode.down, KeyCode.right, KeyCode.left, KeyCode.home, KeyCode.end:
+            let final = [
+                KeyCode.up: "A", KeyCode.down: "B", KeyCode.right: "C", KeyCode.left: "D",
+                KeyCode.home: "H", KeyCode.end: "F",
+            ][keyCode] ?? "A"
+            guard held.isEmpty else { return csi("1;\(m)\(final)") }
+            return Data(((usesApplicationCursorKeys ? "\u{1B}O" : "\u{1B}[") + final).utf8)
+        case KeyCode.pageUp:
+            return csi(held.isEmpty ? "5~" : "5;\(m)~")
+        case KeyCode.pageDown:
+            return csi(held.isEmpty ? "6~" : "6;\(m)~")
+        case KeyCode.forwardDelete:
+            return csi(held.isEmpty ? "3~" : "3;\(m)~")
+        case KeyCode.returnKey:
+            return held.isEmpty ? Data([0x0D]) : otherKey(13)
+        case KeyCode.tab:
+            if held.isEmpty { return Data([0x09]) }
+            return held == .shift ? csi("Z") : otherKey(9)
+        case KeyCode.escape:
+            return held.isEmpty ? Data([0x1B]) : otherKey(27)
+        case KeyCode.backspace:
+            if held.isEmpty { return Data([0x7F]) }
+            return held == .control ? Data([0x08]) : otherKey(127)
+        default:
+            break
+        }
+        // Option that composes the text is not a modifier here.
+        var textModifiers = held
+        if !alt { textModifiers.remove(.option) }
+        if let scalars = text?.unicodeScalars, scalars.count == 1, let scalar = scalars.first {
+            let modifies = (0x40...0x7F).contains(scalar.value) || scalar.value == 0x20
+                || !textModifiers.subtracting(.shift).isEmpty
+            if modifies, !textModifiers.isEmpty {
+                return csi("27;\(parameter(textModifiers));\(scalar.value)~")
+            }
+            guard let typed = printableText(text) else { return nil }
+            return Data(typed.utf8)
+        }
+        // No single character: as without modifyOtherKeys.
+        if held.subtracting(.option) == .control, let letter = letterKeys[keyCode] {
+            return (alt ? Data([0x1B]) : Data()) + Data([letter - 0x60])
+        }
+        guard let typed = printableText(text) ?? (alt ? printableText(unshiftedCharacters) : nil) else { return nil }
+        return alt ? Data([0x1B]) + Data(typed.utf8) : Data(typed.utf8)
+    }
+
+    /// The text Ghostty's surface takes a key to type, as libghostty-spm
+    /// gives it (`TerminalKeyEventHandler`, `filteredCharacters`): the
+    /// characters with the key's modifiers, but without Option when it acts
+    /// as Alt (`ghostty_surface_key_translation_mods`), and without Control
+    /// when that makes a control character (Control+Shift+H types `H`); none
+    /// for a function key, or when that is still a control character
+    /// (Return, Tab, Escape, Backspace), as in Ghostty's macOS app
+    /// (`keyEventText`).
+    static func surfaceText(for event: NSEvent, optionAsAlt: OptionAsAlt) -> String? {
+        var modifiers = event.modifierFlags
+        let translated = optionAsAlt.applies(to: modifiers)
+        if translated { modifiers.remove(.option) }
+        var text = translated ? event.characters(byApplyingModifiers: modifiers) : event.characters
+        if let scalars = text?.unicodeScalars, scalars.count == 1, let scalar = scalars.first, scalar.value < 0x20 {
+            modifiers.remove(.control)
+            text = event.characters(byApplyingModifiers: modifiers)
+        }
+        return keyEventText(text)
+    }
+
+    /// `text` as the text of a key event in Ghostty's macOS app
+    /// (`NSEvent.ghosttyCharacters`, `String.keyEventText`): none for a
+    /// function key's character (U+F700–U+F8FF: F13 and above, Help, Clear)
+    /// or a text that begins with a control character (C0 or DEL).
+    private static func keyEventText(_ text: String?) -> String? {
+        guard let text, let first = text.unicodeScalars.first, first.value >= 0x20, first.value != 0x7F,
+              text.unicodeScalars.count > 1 || !(0xF700...0xF8FF).contains(first.value)
+        else { return nil }
+        return text
+    }
+
+    /// `surfaceText(for:optionAsAlt:)` from an event's characters alone:
+    /// `charactersIgnoringModifiers` (Shift only) when Option acts as Alt
+    /// or Control made a control character, else `characters`. Unlike the
+    /// event's own, it cannot tell what Control+Option types when Option
+    /// composes, and takes the key without both.
+    private static func surfaceText(
+        characters: String?,
+        charactersIgnoringModifiers: String?,
+        optionActsAsAlt: Bool
+    ) -> String? {
+        if optionActsAsAlt { return keyEventText(charactersIgnoringModifiers) }
+        if let scalars = characters?.unicodeScalars, scalars.count == 1, let scalar = scalars.first,
+           scalar.value < 0x20 || scalar.value == 0x7F {
+            return keyEventText(charactersIgnoringModifiers)
+        }
+        return keyEventText(characters)
     }
 
     /// What Control and a key type: its C0 byte (Control+A is 0x01,

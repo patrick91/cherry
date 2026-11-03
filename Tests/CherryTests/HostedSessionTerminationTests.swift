@@ -17,9 +17,8 @@ private func terminationController(
 }
 
 /// "exit": the host reports the exit as events. "removed": another client
-/// removed the exited session. "polled": a host without events, whose list
-/// is polled.
-@Test(arguments: ["exit", "removed", "polled"])
+/// removed the exited session.
+@Test(arguments: ["exit", "removed"])
 @MainActor func HostedSessionTerminationWaitsForItsSessionWithoutRetryingKill(behavior: String) async throws {
     let fake = terminationFixture()
     switch behavior {
@@ -30,16 +29,6 @@ private func terminationController(
             DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
                 fake.sessions.removeAll { $0.id == "session-a" }
                 connection.push(.event(.removed(id: "session-a")))
-            }
-            return nil
-        }
-    case "polled":
-        fake.supportsSubscribe = false
-        fake.killEndsSession = false
-        fake.respond = { [weak fake] request, _ in
-            guard request.op == "kill", let fake else { return nil }
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
-                fake.sessions = fake.sessions.map { $0.id == "session-a" ? $0.exited(code: 129, signal: 1) : $0 }
             }
             return nil
         }
@@ -62,9 +51,6 @@ private func terminationController(
     #expect(controller.sessions.first { $0.id == "session-a" }?.isRunning != true)
     #expect(controller.sessions.first { $0.id == "session-b" }?.isRunning == true)
     #expect(fake.requests("kill").map { $0.string("id") } == ["session-a"])
-    if behavior == "polled" {
-        #expect(fake.requests("list").count >= 3)
-    }
 }
 
 /// "local": This Mac is never pinned, so the other host connects. "ssh": the

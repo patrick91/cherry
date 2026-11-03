@@ -8,8 +8,8 @@ import Foundation
 /// input. Given `--expected-host-id` for another identity it exits before
 /// the Welcome with the CLI's message.
 ///
-/// Defaults: subscribe → ok, list → the sessions (with `pendingHolders`, nil
-/// for a host that does not report it), create → a running session
+/// Defaults: subscribe → ok, list → the sessions (with `pendingHolders`, 0
+/// unless set), create → a running session
 /// `session-<request id>` that reports its `request_id`, kill → ok and,
 /// after `exitDelay`, `exited` + `changed` events (unless `killEndsSession`
 /// is false), remove → ok, ping → pong, send_input/update → ok, screen → a
@@ -95,7 +95,6 @@ final class FakeControlHelper: @unchecked Sendable {
     private var _hostID = "host-a"
     private var _version: UInt32 = HostProtocol.version
     private var _sessions: [HostedSessionInfo] = []
-    private var _supportsSubscribe = true
     private var _killEndsSession = true
     private var _welcome = true
     private var _launchFailure: String?
@@ -106,7 +105,7 @@ final class FakeControlHelper: @unchecked Sendable {
     private var _respond: ((Request, Connection) -> Reply?)?
     private var _screenText = "fake screen"
     private var _screenIsAlternate = false
-    private var _pendingHolders: Int?
+    private var _pendingHolders = 0
     private var _lostSessionIDs: Set<String> = []
     let exitDelay: TimeInterval
 
@@ -128,11 +127,6 @@ final class FakeControlHelper: @unchecked Sendable {
     var sessions: [HostedSessionInfo] {
         get { lock.withLock { _sessions } }
         set { lock.withLock { _sessions = newValue } }
-    }
-
-    var supportsSubscribe: Bool {
-        get { lock.withLock { _supportsSubscribe } }
-        set { lock.withLock { _supportsSubscribe = newValue } }
     }
 
     var killEndsSession: Bool {
@@ -163,9 +157,9 @@ final class FakeControlHelper: @unchecked Sendable {
         set { lock.withLock { _screenIsAlternate = newValue } }
     }
 
-    /// What `list` reports as `pending_holders`; nil leaves it out (a host
-    /// from before it was reported).
-    var pendingHolders: Int? {
+    /// What `list` reports as `pending_holders`: holders a daemon that just
+    /// restarted still expects (0, a complete list, unless set).
+    var pendingHolders: Int {
         get { lock.withLock { _pendingHolders } }
         set { lock.withLock { _pendingHolders = newValue } }
     }
@@ -275,7 +269,7 @@ final class FakeControlHelper: @unchecked Sendable {
     func defaultReply(to request: Request, on connection: Connection) -> Reply {
         switch request.op {
         case "subscribe":
-            return .answer(supportsSubscribe ? .ok : .error(code: "unsupported_operation", message: "not supported"))
+            return .answer(.ok)
         case "list":
             return .answer(.sessions(HostedSessionList(
                 hostID: hostID, sessions: sessions, pendingHolders: pendingHolders, lostSessionIDs: lostSessionIDs
@@ -337,12 +331,7 @@ final class FakeControlHelper: @unchecked Sendable {
     /// Waits (polling) until `condition` holds; false after `timeout`.
     @MainActor
     func wait(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if condition() { return true }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        return condition()
+        await eventually(timeout: timeout, condition)
     }
 }
 

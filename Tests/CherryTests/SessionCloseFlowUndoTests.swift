@@ -39,26 +39,6 @@ private final class KeyView: NSView {
     override var acceptsFirstResponder: Bool { true }
 }
 
-/// A clock the test moves, and the checks scheduled on it.
-@MainActor
-private final class ManualClock {
-    private(set) var now = Date(timeIntervalSince1970: 1_000)
-    private var scheduled: [(at: Date, work: @MainActor () -> Void)] = []
-
-    var schedule: ProjectWindowToasts.Scheduler {
-        { [unowned self] delay, work in scheduled.append((now.addingTimeInterval(delay), work)) }
-    }
-
-    /// Moves the clock on by `seconds`, running what falls due, in order.
-    func advance(by seconds: TimeInterval) {
-        now = now.addingTimeInterval(seconds)
-        while let next = scheduled.enumerated().filter({ $0.element.at <= now }).min(by: { $0.element.at < $1.element.at }) {
-            scheduled.remove(at: next.offset)
-            next.element.work()
-        }
-    }
-}
-
 /// A window's chrome whose toasts and closed tabs keep time on `clock`
 /// (never running out by themselves without one) and announce nothing.
 @MainActor
@@ -75,32 +55,6 @@ private func windowChrome(clock: ManualClock? = nil, voiceOver: Bool = false) ->
         announce: { _ in },
         voiceOverEnabled: { voiceOver }
     ))
-}
-
-private func temporaryDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    let resolved = try #require(url.path.withCString { realpath($0, nil) })
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-}
-
-@MainActor
-private func sidebarName(of session: TerminalSession) -> String {
-    SidebarSessionLabel.label(for: session, pathDisplayMode: TerminalSettings.shared.sidebarTerminalPathDisplayMode).title
-}
-
-/// Waits (polling the main loop) until `condition` holds; false after
-/// `timeout`.
-@MainActor
-private func eventually(timeout: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline {
-        if condition() { return true }
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    return condition()
 }
 
 /// A session this app (CherryTests) started for tab `tab` of `project`,
@@ -138,7 +92,7 @@ private func syntheticTab(_ name: String) -> ClosedTab {
 @Test @MainActor func commandWLeavesAPersistentTabsSessionRunningAndCommandZBringsTheTabBackWhereItWas() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()
-    let storeDirectory = try temporaryDirectory("cherry-undo-store")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-undo-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let registry = ProjectWindowRegistry()
     registry.setWorkspaceStateStoreForTesting(store)
@@ -214,7 +168,7 @@ private func syntheticTab(_ name: String) -> ClosedTab {
 @Test @MainActor func aClosedTabsSessionEndsWhenItsUndoRunsOutWhichWaitsWhileItsToastIsHoveredOrItsWindowIsNotKey() async throws {
     let harness = try PersistentHarness()
     let workspace = harness.workspace()
-    let storeDirectory = try temporaryDirectory("cherry-undo-expiry-store")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-undo-expiry-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let registry = ProjectWindowRegistry()
     registry.setWorkspaceStateStoreForTesting(store)
@@ -281,7 +235,7 @@ private func syntheticTab(_ name: String) -> ClosedTab {
     // shows it. A detach's time, whose session nothing ends, stays stopped.
     SessionCloseCoordinator.close(forgotten, in: workspace, chromeState: chromeState, registry: registry)
     chromeState.closedTabs.setAttended(false)
-    chromeState.closedTabs.record([syntheticTab("Detached")], action: .detach, workspace: workspace, repository: nil)
+    chromeState.closedTabs.record([syntheticTab("Detached")], action: .detach, workspace: workspace)
     #expect(chromeState.closedTabs.entries.count == 2)
     clock.advance(by: ClosedTabHistory.longestUnattendedWait - 0.1)
     #expect(harness.hosting.hasDeferredEnds)
@@ -359,11 +313,11 @@ private func syntheticTab(_ name: String) -> ClosedTab {
         #expect(!history.undoManager.canRedo)
         #expect(history.undoManager.undoMenuItemTitle == "Undo")
 
-        history.record([syntheticTab("One")], action: .close, workspace: workspace, repository: nil)
+        history.record([syntheticTab("One")], action: .close, workspace: workspace)
         #expect(history.undoManager.undoMenuItemTitle == "Undo Close Tab")
-        history.record([syntheticTab("Two"), syntheticTab("Three")], action: .close, workspace: workspace, repository: nil)
+        history.record([syntheticTab("Two"), syntheticTab("Three")], action: .close, workspace: workspace)
         #expect(history.undoManager.undoMenuItemTitle == "Undo Close Tabs")
-        history.record([syntheticTab("Four")], action: .detach, workspace: workspace, repository: nil)
+        history.record([syntheticTab("Four")], action: .detach, workspace: workspace)
         #expect(history.undoManager.undoMenuItemTitle == "Undo Detach Tab")
         #expect(history.undoManager.canUndo)
         #expect(!history.undoManager.canRedo)
@@ -704,8 +658,8 @@ private func syntheticTab(_ name: String) -> ClosedTab {
     let harness = try PersistentHarness()
     harness.fake.pendingHolders = 0
     let root = harness.project.path
-    let storeDirectory = try temporaryDirectory("cherry-undo-hidden-store")
-    let otherStoreDirectory = try temporaryDirectory("cherry-undo-hidden-other-store")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-undo-hidden-store")
+    let otherStoreDirectory = try canonicalTemporaryDirectory("cherry-undo-hidden-other-store")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let registry = ProjectWindowRegistry()
     registry.setWorkspaceStateStoreForTesting(store)
@@ -720,7 +674,7 @@ private func syntheticTab(_ name: String) -> ClosedTab {
     let window = ClosingWindow()
     let chromeState = windowChrome()
     #expect(registry.register(
-        window: window, projectRoot: root, workspace: workspace, noteStore: nil, todoStore: nil, chromeState: chromeState
+        window: window, projectRoot: root, workspace: workspace, todoStore: nil, chromeState: chromeState
     ))
     let model = BackgroundSessionsModel(localSessions: harness.hosting, registry: registry)
     var opened: RepositoryWorkspace?
@@ -789,7 +743,7 @@ private func syntheticTab(_ name: String) -> ClosedTab {
     #expect(await eventually { harness.hosting.owningTab(of: "s-orphan") != nil })
     try await Task.sleep(for: .milliseconds(200))
     #expect(harness.hosting.owningTab(of: "s-closed") == nil)
-    #expect(!repository.activeWorkspace.sessions.contains { $0.id == closedTabID })
+    #expect(!repository.workspace.sessions.contains { $0.id == closedTabID })
 
     // Nor would the next launch: the closed tab is recorded as one whose
     // session is to end.
@@ -831,7 +785,7 @@ private func quitSteps(_ harness: PersistentHarness, events: Recorder<[String]>)
     }
     #expect(registry.register(
         window: window, projectRoot: harness.project.path, workspace: workspace,
-        noteStore: nil, todoStore: nil, chromeState: chromeState
+        todoStore: nil, chromeState: chromeState
     ))
     let kept = workspace.addSession(title: "Kept")
     let closed = workspace.addSession(title: "Closed")
@@ -958,7 +912,7 @@ private func quitSteps(_ harness: PersistentHarness, events: Recorder<[String]>)
     #expect(!window.validateMenuItem(undoItem))
     #expect(undoItem.title == "Undo")
     let workspace = TerminalWorkspace(createInitialSession: false)
-    chromeState.closedTabs.record([syntheticTab("Shell")], action: .close, workspace: workspace, repository: nil)
+    chromeState.closedTabs.record([syntheticTab("Shell")], action: .close, workspace: workspace)
     #expect(window.validateMenuItem(undoItem))
     #expect(undoItem.title == "Undo Close Tab")
 
@@ -974,7 +928,7 @@ private func quitSteps(_ harness: PersistentHarness, events: Recorder<[String]>)
 
 // MARK: - Cherry tasks
 
-/// A Cherry task follows its worker's tab by id (docs/mcp.md, Tasks And
+/// A Cherry task follows its worker's tab by id (docs/cli.md, Tasks And
 /// Results): a ⌘W that is undone, or a ⌘D, leaves it the task's worker (the
 /// tab that comes back is a new object with the same id); only a close that
 /// can no longer be undone, whose session ends, cancels the task.

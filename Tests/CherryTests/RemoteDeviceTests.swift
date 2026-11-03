@@ -396,9 +396,9 @@ private func session(
     #expect(RemoteNotOpenSection.ownerLabel(sessions[5], ownOwner: ours) == "Another client's")
 }
 
-// MARK: - The picker
+// MARK: - Devices in the Omni bar
 
-@Test func thePickerModelListsDevicesWithTheirStateProjectsAndActions() throws {
+@Test @MainActor func theOmniBarListsDevicesWithTheirStateProjectsAndActions() throws {
     let now = Date(timeIntervalSince1970: 1_800_000_000)
     let studioID = try #require(UUID(uuidString: "00000000-0000-0000-0000-00000000A001"))
     let miniID = try #require(UUID(uuidString: "00000000-0000-0000-0000-00000000A002"))
@@ -416,96 +416,59 @@ private func session(
         session("c", owner: "Cherry", project: "/Users/me/secret"),
         session("d", owner: nil, project: nil),
     ]
-    let model = TitlebarProjectMenuModel(
-        worktrees: nil,
-        projects: [
-            .init(root: "/Users/local/site", name: "site", isSelected: false),
-        ],
-        devices: [
-            .init(device: studio, state: .connected(sessionCount: 4), sessions: studioSessions),
-            .init(device: mini, state: RemoteDeviceConnectionState(
-                control: .waitingToReconnect(.unavailable("ssh: connect to host mini port 22: Connection timed out")),
-                sessionCount: 0, lastSeen: mini.lastSeen
-            ), sessions: []),
-            .init(device: laptop, state: .identityChanged(reason: "Expected host identity a, received b."), sessions: []),
-        ],
+    let devices: [TitlebarProjectMenuModel.Device] = [
+        .init(device: studio, state: .connected(sessionCount: 4), sessions: studioSessions),
+        .init(device: mini, state: RemoteDeviceConnectionState(
+            control: .waitingToReconnect(.unavailable("ssh: connect to host mini port 22: Connection timed out")),
+            sessionCount: 0, lastSeen: mini.lastSeen
+        ), sessions: []),
+        .init(device: laptop, state: .identityChanged(reason: "Expected host identity a, received b."), sessions: []),
+    ]
+    var sources = OmniSources()
+    sources.devices = devices
+    sources.projects = ProjectSwitcherModel.make(
+        localProjects: [.init(root: "/Users/local/site", name: "site")],
+        devices: devices,
+        openWindows: [:],
+        recency: [:],
         currentProjectKey: studio.projectKey(path: "/Users/me/app"),
-        now: now
+        thisMac: ProjectSwitcherModel.thisMacInfo(sessionCount: nil, symbol: "laptopcomputer"),
+        localHome: "/Users/local"
     )
-    #expect(model.snapshot == """
-    ## Projects
-    site
-    ---
-    Add Project...
-    Edit Projects...
-    ---
-    ## Devices
-    [x] ●green Studio — Connected · 4 sessions
-      [x] app — 2 sessions · /Users/me/app
-      ⌥ Hide app — /Users/me/app
-      notes — /Users/me/notes
-      ⌥ Hide notes — /Users/me/notes
-      Other sessions — 1 session
-      ---
-      Open Home Folder — /Users/me
-      Add Project on Studio…
-      ---
-      ●green Connected (off)
-      Persistent Sessions on Studio…
-      Set Up Cherry MCP on Studio…
-      ---
-      Rename…
-      Remove…
-    ●gray Mini — Offline
-      No Projects (off)
-      ---
-      Open Home Folder (off)
-      Add Project on Mini…
-      ---
-      ●gray Offline: ssh: connect to host mini port 22: Connection timed out (off)
-      Reconnect
-      Persistent Sessions on Mini…
-      Set Up Cherry MCP on Mini…
-      ---
-      Rename…
-      Remove…
-    ●red Laptop — Its identity changed
-      No Projects (off)
-      ---
-      Open Home Folder (off)
-      Add Project on Laptop… (off)
-      ---
-      ●red Identity changed: Expected host identity a, received b. (off)
-      Trust New Identity…
-      Persistent Sessions on Laptop…
-      Set Up Cherry MCP on Laptop… (off)
-      ---
-      Rename…
-      Remove…
-    Add Mac…
-    """)
-    // Each item says what it does.
-    let studioItem = try #require(model.deviceItems[studioID])
-    let actions = (studioItem.children ?? []).compactMap { entry -> TitlebarProjectMenuModel.Action? in
-        if case .item(let item) = entry { return item.action }
-        return nil
-    }
-    #expect(actions == [
-        .openDeviceProject(deviceID: studioID, path: "/Users/me/app"),
-        .hideDeviceProject(deviceID: studioID, path: "/Users/me/app"),
-        .openDeviceProject(deviceID: studioID, path: "/Users/me/notes"),
-        .hideDeviceProject(deviceID: studioID, path: "/Users/me/notes"),
-        .openDeviceSessions(studioID),
-        .openDeviceHome(studioID),
-        .addDeviceProject(studioID),
-        .openDeviceSessions(studioID),
-        .setUpDeviceMCP(studioID),
-        .renameDevice(studioID),
-        .removeDevice(studioID),
+    let macs = OmniProviders.macs(sources)
+    try #require(macs.count == 4)
+    #expect(macs.map(\.title) == ["This Mac", "Studio", "Mini", "Laptop"])
+    #expect(macs.map(\.detail) == ["", "4 sessions", "Offline", "Offline"])
+    #expect(macs[1].status == .idle && macs[2].status == .offline && macs[3].status == .offline)
+    // Its projects: its sessions' (every owner's), the added ones, not the
+    // hidden one.
+    #expect(OmniProviders.projects(sources, on: .device(studioID)).map(\.title) == ["app", "notes"])
+    #expect(sources.projects.locations.first { $0.isCurrent }?.key == studio.projectKey(path: "/Users/me/app"))
+
+    // Each Mac's actions, as it answers now.
+    #expect(macs[1].actions.map(\.title) == [
+        "Go to Home", "Add Project on Studio…", "New Terminal on Studio",
+        "Persistent Sessions on Studio…", "Rename…", "Remove…",
     ])
+    #expect(macs[1].actions.map(\.command) == [
+        .switcher(.openDeviceHome(studioID)),
+        .browseFolders(on: .device(studioID), intent: .add),
+        .newTerminal(on: .device(studioID)),
+        .switcher(.openDeviceSessions(studioID)),
+        .switcher(.renameDevice(studioID)),
+        .switcher(.removeDevice(studioID)),
+    ])
+    // Its home is not known yet: no Go to Home.
+    #expect(macs[2].actions.map(\.title) == [
+        "Add Project on Mini…", "New Terminal on Mini", "Reconnect",
+        "Persistent Sessions on Mini…", "Rename…", "Remove…",
+    ])
+    // Another identity answers: nothing to open there.
+    #expect(macs[3].actions.map(\.title) == ["Trust New Identity…", "Persistent Sessions on Laptop…", "Rename…", "Remove…"])
+    #expect(macs[3].actions.first?.command == .switcher(.trustDeviceIdentity(laptopID)))
 }
 
-@Test func thePickerModelSaysHowEachDeviceStands() {
+@Test func eachDeviceSaysHowItStands() {
     let now = Date(timeIntervalSince1970: 1_800_000_000)
     let states: [(RemoteDeviceConnectionState, String, RemoteDeviceConnectionState.Dot)] = [
         (.unknown(lastSeen: nil), "Not checked yet", .gray),
@@ -526,28 +489,6 @@ private func session(
     #expect(RemoteDeviceConnectionState.failure(.identityMismatch("x")) == .identityChanged(reason: "x"))
     #expect(RemoteDeviceConnectionState.failure(.unavailable("The session host speaks protocol 6, but this Cherry speaks 7.")).offersReconnect)
     #expect(!RemoteDeviceConnectionState.connected(sessionCount: 0).offersReconnect)
-    // This Mac's projects and the worktrees are listed as before.
-    let model = TitlebarProjectMenuModel(
-        worktrees: [.init(root: "/p", name: "main", isActive: true, isHidden: false), .init(root: "/p-x", name: "x", isActive: false, isHidden: true)],
-        projects: [],
-        devices: [],
-        currentProjectKey: "/p"
-    )
-    #expect(model.snapshot == """
-    ## Worktrees
-    [x] main
-    x — Hidden
-    New Worktree...
-    Manage Worktrees...
-    ---
-    No Projects (off)
-    ---
-    Add Project...
-    Edit Projects...
-    ---
-    ## Devices
-    Add Mac…
-    """)
 }
 
 // MARK: - Saved records and restore wording
@@ -634,15 +575,14 @@ private func session(
     defer { repository.closeAllSessions(intent: .windowClosed) }
     #expect(repository.isRemote)
     #expect(repository.repositoryRoot == key)
-    #expect(repository.initialWorktreeRoot == key)
+    #expect(repository.workspaceRoot == key)
     #expect(repository.repositoryName == "app")
     #expect(repository.remoteHosting === hosting)
-    #expect(!repository.supportsWorktrees)
-    #expect(repository.activeWorkspace.projectRoot == key)
-    #expect(repository.activeWorkspace.launchRoot == "/Users/me/work/app")
+    #expect(repository.workspace.projectRoot == key)
+    #expect(repository.workspace.launchRoot == "/Users/me/work/app")
     // A device's policy runs tabs there whatever the local setting.
-    #expect(repository.activeWorkspace.backendPolicy.prefersPersistentLocalSessions)
-    #expect(repository.activeWorkspace.backendPolicy.persistentHostingForNewTab() === hosting)
+    #expect(repository.workspace.backendPolicy.prefersPersistentLocalSessions)
+    #expect(repository.workspace.backendPolicy.persistentHostingForNewTab() === hosting)
 }
 
 // MARK: - Ends and keys while a device is offline (fake control)
@@ -842,7 +782,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
             openWindows: [:],
             recency: [:],
             currentProjectKey: nil,
-            thisMac: ProjectSwitcherModel.thisMacInfo(computerName: nil, sessionCount: 3, projectCount: 0, symbol: "laptopcomputer"),
+            thisMac: ProjectSwitcherModel.thisMacInfo(sessionCount: 3, symbol: "laptopcomputer"),
             localHome: "/Users/me"
         )
         return sources
@@ -864,8 +804,8 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     #expect(connected.detail == "1 session" && connected.status == .idle)
     #expect(connected.primary == .drill(.mac(.device(studioID), name: "Studio")))
     #expect(connected.actions.map(\.title) == [
-        "Open Home Folder", "Add Project on Studio…", "New Terminal on Studio",
-        "Persistent Sessions on Studio…", "Set Up Cherry MCP on Studio…",
+        "Go to Home", "Add Project on Studio…", "New Terminal on Studio",
+        "Persistent Sessions on Studio…",
         "End Background Sessions…", "Rename…", "Remove…",
     ])
     #expect(connected.actions[2].command == .newTerminal(on: .device(studioID)))
@@ -880,7 +820,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     // Another identity answers: Trust New Identity…, nothing to open.
     let changed = OmniProviders.macs(sources(.identityChanged(reason: "Expected a, received b.")))[1]
     #expect(changed.actions.contains { $0.title == "Trust New Identity…" })
-    #expect(!changed.actions.contains { $0.title == "Open Home Folder" })
+    #expect(!changed.actions.contains { $0.title == "Go to Home" })
 }
 
 // MARK: - Close, detach, undo and quit of a device's tab (fake control)
@@ -980,16 +920,23 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     writable = true
     store.remove(mini.id)
     #expect(!hostStore.hosts.contains(try HostedSessionHost.ssh("mini")))
-    // The picker offers no change to a copy that cannot make it.
+    // The Omni bar offers no change to a copy that cannot make it.
     let device = RemoteDevice(id: UUID(), name: "Studio", sshDestination: "studio", homeDirectory: "/Users/me")
-    let menu = TitlebarProjectMenuModel(
-        worktrees: nil, projects: [],
-        devices: [.init(device: device, state: .identityChanged(reason: "x"), sessions: [session("a", owner: "Cherry", project: "/Users/me/app")])],
-        currentProjectKey: nil, canModifyDevices: false
+    let entry = TitlebarProjectMenuModel.Device(
+        device: device, state: .identityChanged(reason: "x"), sessions: [session("a", owner: "Cherry", project: "/Users/me/app")]
     )
-    for line in ["⌥ Hide app — /Users/me/app (off)", "Trust New Identity… (off)", "Rename… (off)", "Remove… (off)", "Add Mac… (off)"] {
-        #expect(menu.snapshot.contains(line), "\(line)")
-    }
+    var sources = OmniSources()
+    sources.devices = [entry]
+    sources.canModifyDevices = false
+    sources.projects = ProjectSwitcherModel.make(
+        localProjects: [], devices: [entry], openWindows: [:], recency: [:], currentProjectKey: nil,
+        thisMac: ProjectSwitcherModel.thisMacInfo(sessionCount: nil, symbol: "desktopcomputer"), localHome: "/Users/me"
+    )
+    let project = try #require(OmniProviders.projects(sources, on: .device(device.id)).first)
+    #expect(project.title == "app")
+    #expect(!project.actions.contains { $0.title == "Remove from Projects" })
+    #expect(OmniProviders.macActions(.device(device.id), sources: sources).map(\.title) == ["Persistent Sessions on Studio…"])
+    #expect(!OmniProviders.commands(sources).contains { $0.id == "command:addMac" })
 }
 
 @Test @MainActor func aMacsHostingStaysTheSameAcrossRenamesRemovalsInUseAndAddingItAgain() throws {
@@ -1110,15 +1057,24 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
         instanceLock: nil, terminalColors: { nil }, configuration: configuration
     )
     #expect(PersistentHostSessions.Configuration.remote.relaunchBatchSize == HostSSHMasterManager.Configuration().maxChannelsPerMaster)
-    var ran = 0
-    for _ in 0..<8 { hosting.enqueueAdapterRelaunch { ran += 1 } }
-    #expect(ran == 0)
-    try await Task.sleep(for: .milliseconds(60))
-    #expect(ran == 3)
-    #expect(hosting.pendingAdapterRelaunches == 5)
-    let deadline = Date().addingTimeInterval(5)
-    while ran < 8, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
-    #expect(ran == 8)
+    // Each relaunch notes how many still wait and when it ran. A batch runs
+    // in one turn, after it left the queue, so its relaunches see the same
+    // count, and the next batch comes an interval later, however late a
+    // loaded runner gets to it (a count after a fixed sleep was flaky).
+    var runs: [(pending: Int, at: UInt64)] = []
+    for _ in 0..<8 {
+        hosting.enqueueAdapterRelaunch {
+            runs.append((hosting.pendingAdapterRelaunches, DispatchTime.now().uptimeNanoseconds))
+        }
+    }
+    #expect(runs.isEmpty)
+    let deadline = Date().addingTimeInterval(10)
+    while runs.count < 8, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+    #expect(runs.map { $0.pending } == [5, 5, 5, 2, 2, 2, 0, 0])
+    try #require(runs.count == 8)
+    let interval = UInt64(configuration.relaunchBatchInterval * 1_000_000_000)
+    #expect(runs[3].at >= runs[2].at + interval)
+    #expect(runs[6].at >= runs[5].at + interval)
 }
 
 @Test @MainActor func aWindowOfAnUnknownMacNeitherConnectsNorRewritesItsSavedTabs() async throws {
@@ -1152,7 +1108,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     #expect(repository.deviceHosting === hosting)
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
-    #expect(repository.activeWorkspace.sessions.isEmpty)
+    #expect(repository.workspace.sessions.isEmpty)
     #expect(repository.remoteTabsWaitingCount == 1)
     repository.flushPersistentState()
     let after = try #require(store.load(repositoryRoot: key)?.worktrees.first?.sessions.first)
@@ -1186,7 +1142,7 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
     try await Task.sleep(for: .milliseconds(500))
-    #expect(repository.activeWorkspace.session(withID: orphanTab) == nil)
+    #expect(repository.workspace.session(withID: orphanTab) == nil)
     #expect(!repository.isRestoringSessions)
 }
 
@@ -1340,13 +1296,41 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
 
 @Test func RemoteDeviceWindowTitleNamesTheMacOnlyForDeviceWindows() {
     #expect(ProjectWindowTitle.title(project: "cherry") == "cherry")
-    #expect(ProjectWindowTitle.title(project: "cherry", worktree: "main", tab: "zsh") == "cherry / main — zsh")
+    #expect(ProjectWindowTitle.title(project: "cherry", tab: "zsh") == "cherry — zsh")
     #expect(ProjectWindowTitle.title(project: "cherry", tab: "  ") == "cherry")
-    #expect(ProjectWindowTitle.title(project: "fizzup.club", deviceName: "patstudio") == "fizzup.club — patstudio")
+    #expect(ProjectWindowTitle.title(project: "fizzup.club", deviceName: "patstudio") == "fizzup.club @ patstudio")
     #expect(ProjectWindowTitle.title(project: "fizzup.club", deviceName: "patstudio", tab: "claude")
-        == "fizzup.club — patstudio — claude")
-    #expect(ProjectWindowTitle.title(project: "fizzup.club", worktree: "feature", deviceName: "patstudio")
-        == "fizzup.club / feature — patstudio")
+        == "fizzup.club @ patstudio — claude")
+}
+
+@Test func RemoteDeviceHeaderDimsWhileItsMacReconnectsAndWarnsWhenItNeedsYou() {
+    typealias S = RemoteDeviceHeaderStatus
+    func status(_ state: HostControl.ConnectionState, problem: String? = nil) -> S {
+        S.of(state, installationProblem: problem, machine: "Studio")
+    }
+    #expect(status(.connected) == .normal)
+    // A window with no tabs leases no connection: idle says nothing.
+    #expect(status(.idle) == .normal)
+    #expect(status(.connecting) == .reconnecting)
+    #expect(status(.waitingToReconnect(.unavailable("ssh: connect to host s port 22: Connection timed out"))) == .reconnecting)
+    #expect(status(.waitingToReconnect(.unavailable("s: Permission denied (publickey)."))) == .needsYou("Studio refused the SSH login"))
+    #expect(status(.failed(.identityMismatch("x"))) == .needsYou("Another identity answers for Studio"))
+    #expect(status(.failed(.unavailable("boom"))) == .needsYou("boom"))
+    // A device Cherry no longer knows: its stand-in's reason, even idle.
+    #expect(status(.idle, problem: "This Mac is not among your devices.") == .needsYou("This Mac is not among your devices."))
+
+    #expect(S.normal.detail(machine: "Studio") == nil)
+    #expect(S.reconnecting.detail(machine: "Studio") == "Reconnecting to Studio…")
+    #expect(S.needsYou("Studio refused the SSH login").detail(machine: "Studio") == "Studio refused the SSH login")
+
+    // The warning widens the address; the name is measured whole.
+    let badge = RemoteDeviceBadge(deviceID: UUID(), name: "patstudio", color: .teal)
+    let normal = RemoteDeviceHeaderAddress.width(of: badge, status: .normal, fontSize: 14)
+    #expect(RemoteDeviceHeaderAddress.width(of: badge, status: .reconnecting, fontSize: 14) == normal)
+    #expect(RemoteDeviceHeaderAddress.width(of: badge, status: .needsYou("x"), fontSize: 14)
+        == normal + RemoteDeviceHeaderAddress.spacing + RemoteDeviceHeaderAddress.warningWidth)
+    let longer = RemoteDeviceBadge(deviceID: UUID(), name: "Patrick’s MacBook Pro", color: .teal)
+    #expect(RemoteDeviceHeaderAddress.width(of: longer, status: .normal, fontSize: 14) > normal)
 }
 
 @Test @MainActor func RemoteDeviceBreadcrumbStartsWithTheMacOnlyForDeviceTabs() {
@@ -1355,19 +1339,20 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
         subtitle: "zsh login shell",
         tint: .systemBlue,
         workingDirectory: NSHomeDirectory() + "/github/farbun-dev/fizzup.club",
-        launchShell: false,
-        attentionObservationDirectoryProvider: { nil }
+        launchShell: false
     )
     defer { session.stop() }
     let local = TerminalContextBarContent(session: session)
     #expect(local.devicePrefix == nil)
-    #expect(local.breadcrumb == "~/github/farbun-dev/fizzup.club  ›  zsh")
+    #expect(local.displayPath == "~/github/farbun-dev/fizzup.club")
+    #expect(local.sessionLabel == "zsh")
 
     let deviceID = UUID()
     let badge = RemoteDeviceBadge(deviceID: deviceID, name: "patstudio", color: .teal)
     let remote = TerminalContextBarContent(session: session, device: badge)
     #expect(remote.devicePrefix == "patstudio:")
-    #expect(remote.breadcrumb == "patstudio: ~/github/farbun-dev/fizzup.club  ›  zsh")
+    #expect(remote.displayPath == "~/github/farbun-dev/fizzup.club")
+    #expect(remote.sessionLabel == "zsh")
     // A rename or a new colour re-renders the bar.
     #expect(remote != local)
     #expect(TerminalContextBarContent(session: session, device: RemoteDeviceBadge(deviceID: deviceID, name: "patstudio", color: .red)) != remote)
@@ -1385,10 +1370,10 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
     #expect(unknown?.color == .automatic(for: gone))
 }
 
-/// The sidebar header (`TitlebarProjectPicker`) shows the Mac chip only
-/// in a device window. Laid out in a window that is never put on screen.
-@Test @MainActor func RemoteDeviceSidebarHeaderShowsTheMacChipOnlyForDeviceWindows() async throws {
-    let directory = try temporaryDirectory("device-chip")
+/// The sidebar header (`TitlebarProjectPicker`) shows "@ <Mac>" only in a
+/// device window. Laid out in a window that is never put on screen.
+@Test @MainActor func RemoteDeviceSidebarHeaderShowsTheMacOnlyForDeviceWindows() async throws {
+    let directory = try temporaryDirectory("device-header")
     defer { try? FileManager.default.removeItem(at: directory) }
     let (hostStore, _, suite) = try makeIsolatedHostedSessionHostStore()
     defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
@@ -1420,10 +1405,8 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
             settings: AgentSettings.shared,
             repository: repository,
             chromeState: ProjectWindowChromeState(),
-            swipeState: WorktreeSidebarSwipeState(),
             projectRoot: repository.repositoryRoot,
             presentation: .docked,
-            sidebarWidth: 320,
             maximumWidth: 240
         )
         // As a device window sets it (`RemoteDeviceStore.shared` there).
@@ -1448,11 +1431,62 @@ private func keyDown(_ characters: String, keyCode: UInt16) throws -> NSEvent {
 
     let localHeader = try await header(for: local)
     #expect(contains(.titlebarProjectPickerAnchor, in: localHeader))
-    #expect(!contains(.remoteDeviceChipAnchor, in: localHeader))
+    #expect(!contains(.remoteDeviceHeaderAnchor, in: localHeader))
 
     let remoteHeader = try await header(for: remote)
     #expect(contains(.titlebarProjectPickerAnchor, in: remoteHeader))
-    #expect(contains(.remoteDeviceChipAnchor, in: remoteHeader))
-    // Two lines (name over the chip) fit the header the worktree line uses.
-    #expect(remoteHeader.fittingSize.height <= 40)
+    #expect(contains(.remoteDeviceHeaderAnchor, in: remoteHeader))
+    // One line, as tall as This Mac's.
+    #expect(remoteHeader.fittingSize.height == localHeader.fittingSize.height)
+    // "fizzup.club @ patstudio" is wider than the project alone would be.
+    #expect(remoteHeader.fittingSize.width > localHeader.fittingSize.width)
+}
+
+/// add_project on a device (`ControlDeviceDirectory.add`): a folder that
+/// is there is added as Add Project on <Mac>… adds it; a missing one only
+/// with create, made first by the Omni bar's New folder script, then added.
+@Test @MainActor func RemoteDeviceControlDirectoryAddsAndMakesADevicesFolder() async throws {
+    let directory = try temporaryDirectory("devices-control-add")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let (hostStore, _, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+    let store = makeStore(directory: directory, hostStore: hostStore)
+    let studio = try store.add(name: "Studio", sshDestination: "me@studio.local", homeDirectory: "/Users/me")
+    var folders: Set<String> = ["/Users/me/app"]
+    var made: [String] = []
+    let resolve: RemoteDeviceProjectAdding.Resolver = { path, _ in
+        folders.contains(path) ? .success(path) : .failure(.message("There is no folder at \(path) on that Mac."))
+    }
+    let makeFolder: @MainActor (String, RemoteDevice) async -> OmniFolderCreation = { path, device in
+        #expect(device.id == studio.id)
+        made.append(path)
+        folders.insert(path)
+        return .created
+    }
+
+    let existing = try await ControlDeviceDirectory.add("/Users/me/app", to: studio.id, create: true, store: store, resolve: resolve, makeFolder: makeFolder)
+    #expect(existing == .init(path: "/Users/me/app", created: false, alreadyAdded: false))
+    let again = try await ControlDeviceDirectory.add("/Users/me/app", to: studio.id, create: false, store: store, resolve: resolve, makeFolder: makeFolder)
+    #expect(again.alreadyAdded)
+    #expect(made.isEmpty)
+
+    await #expect(throws: CherryControlError.self) {
+        try await ControlDeviceDirectory.add("/Users/me/new", to: studio.id, create: false, store: store, resolve: resolve, makeFolder: makeFolder)
+    }
+    #expect(made.isEmpty)
+    let new = try await ControlDeviceDirectory.add("/Users/me/new", to: studio.id, create: true, store: store, resolve: resolve, makeFolder: makeFolder)
+    #expect(new == .init(path: "/Users/me/new", created: true, alreadyAdded: false))
+    #expect(made == ["/Users/me/new"])
+    #expect(store.device(id: studio.id)?.addedProjects == ["/Users/me/app", "/Users/me/new"])
+
+    // A folder that cannot be made says why, and adds nothing.
+    let refusing: @MainActor (String, RemoteDevice) async -> OmniFolderCreation = { _, _ in .failed("Permission denied") }
+    do {
+        _ = try await ControlDeviceDirectory.add("/nope", to: studio.id, create: true, store: store, resolve: resolve, makeFolder: refusing)
+        Issue.record("added a folder that could not be made")
+    } catch let error as CherryControlError {
+        #expect(error.code == "folder_not_created")
+        #expect(error.message.contains("Permission denied"))
+    }
+    #expect(store.device(id: studio.id)?.addedProjects.count == 2)
 }

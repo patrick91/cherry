@@ -376,16 +376,18 @@ fn a_window_that_waits_for_other_windows_still_gets_its_new_grid() {
 /// history takes a while), which repaints its screen for every new size.
 /// The first thing it writes, at once, is a mark in the last column of the
 /// first row, which wraps onto the second only at the width the terminal
-/// has then; then the size, numbered rows filled nearly to the width, and
-/// `DONE` last. Output made for one width and fed to a copy of another
-/// shows.
+/// has then, with the last repaint's `DONE` blanked (it stays where this
+/// repaint writes its own, so a screen showing it would pass for a whole
+/// repaint while this one is still under way); then the size, numbered
+/// rows filled nearly to the width, and `DONE` last. Output made for one
+/// width and fed to a copy of another shows.
 fn repainting_program(host: &Host) -> SessionInfo {
     host.create(shell(
         r#"stty -echo
 i=0
 while [ $i -lt 12000 ]; do echo "history line $i ........................................................................"; i=$((i+1)); done
 repaint() {
-  printf '\033[1;999H<>'
+  printf '\033[1;16H    \033[1;999H<>'
   set -- $(stty size)
   printf '\033[1;1H%-15s' "SIZE $2x$1"
   dots=$(printf "%$(($2 - 6))s" "" | tr ' ' '.')

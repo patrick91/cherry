@@ -4,7 +4,7 @@ import Foundation
 import Testing
 @testable import Cherry
 
-// MCP tasks across a relaunch (docs/mcp.md › Tasks And Results): the saved
+// MCP tasks across a relaunch (docs/cli.md › Tasks And Results): the saved
 // file (`AgentTaskStore`, `agent-tasks.json`) and what a new registry does
 // with it. A relaunch is a second control server whose registry reads the
 // first one's file, with its tabs brought back (same ids, as a restore
@@ -135,6 +135,74 @@ struct ControlAgentTaskPersistenceTests {
         // The sidebar shows the restored workers' tasks.
         #expect(other.board.badges[workerA.id]?.state == .reported)
         #expect(other.board.badges[workerB.id]?.label == "B")
+    }
+
+    /// A task awaiting approval, its approval seq, a run's approval wake
+    /// and read seqs and a task's allow_subagents come back after a
+    /// relaunch; a file saved before they existed still reads.
+    @Test func approvalStateAndAllowSubagentsReadBack() async throws {
+        let directory = try privateDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = AgentTaskStore(directory: directory)
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.server.tasks.store = store
+        harness.server.start()
+        let lead = try await harness.spawnAgent(named: "Lead")
+        harness.server.callerSessionResolverForTesting = { _ in lead }
+        try harness.settings.upsertAgent(AgentToolDefinition(name: "Worker", command: "/bin/cat"))
+        let response = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Worker", task: "Plan first", allowSubagents: true)))
+        guard case .spawnProcess(let spawned)? = response.result, let info = spawned.task else {
+            Issue.record("Expected a task spawn, got \(response)")
+            return
+        }
+        let worker = try #require(harness.workspace.session(id: spawned.process.id))
+        harness.server.callerSessionResolverForTesting = { _ in worker }
+        #expect(try await harness.send(.reportProgress(.init(message: "OK to go?", awaitingApproval: true))).error == nil)
+        let original = try #require(harness.server.tasks.tasks[info.taskID])
+        #expect(original.state == .awaitingApproval && original.awaitingApprovalSeq != nil)
+        let run = try #require(harness.server.tasks.runs[info.runID])
+        run.approvalReadSeq = original.awaitingApprovalSeq ?? 0
+
+        harness.server.tasks.saveNow()
+        let saved = try #require(store.load())
+        let other = AgentTaskRegistry(board: AgentTaskBoard())
+        other.restore(from: saved)
+        let restored = try #require(other.tasks[info.taskID])
+        #expect(restored.state == .awaitingApproval)
+        #expect(restored.allowSubagents)
+        #expect(restored.awaitingApprovalSeq == original.awaitingApprovalSeq)
+        #expect(other.runs[info.runID]?.approvalReadSeq == run.approvalReadSeq)
+        #expect(other.info(for: try #require(other.runs[info.runID])).counts.awaitingApproval == 1)
+        // Seqs go on past the approval's.
+        #expect(other.nextSeq > (restored.awaitingApprovalSeq ?? 0))
+
+        // An older file: none of the new keys.
+        var json = try #require(try JSONSerialization.jsonObject(with: try JSONEncoder().encode(saved)) as? [String: Any])
+        json["tasks"] = (json["tasks"] as? [[String: Any]])?.map { task in
+            var task = task
+            task["allowSubagents"] = nil
+            task["awaitingApprovalSeq"] = nil
+            task["state"] = "working"
+            return task
+        }
+        json["runs"] = (json["runs"] as? [[String: Any]])?.map { run in
+            var run = run
+            run["approvalWokenSeq"] = nil
+            run["approvalReadSeq"] = nil
+            return run
+        }
+        let old = try JSONDecoder().decode(AgentTasksFileRecord.self, from: try JSONSerialization.data(withJSONObject: json))
+        let older = AgentTaskRegistry(board: AgentTaskBoard())
+        older.restore(from: old)
+        #expect(older.tasks[info.taskID]?.allowSubagents == false)
+        #expect(older.runs[info.runID]?.approvalReadSeq == 0)
+        // Counts from an app before awaiting_approval decode too.
+        let counts = try JSONDecoder().decode(
+            AgentRunCounts.self,
+            from: Data(#"{"total":1,"queued":0,"working":1,"needsInput":0,"reported":0,"noReport":0,"failed":0,"cancelled":0}"#.utf8)
+        )
+        #expect(counts.working == 1 && counts.awaitingApproval == 0)
     }
 
     /// After a relaunch the worker's and orchestrator's tabs come back with
@@ -454,15 +522,23 @@ struct ControlAgentTaskPersistenceTests {
         let startedBack = try after.restoreTab(id: startedID, name: "Fakeworker", command: script)
         let restoredAt = Date()
 
+        // The worker asks for its task during the turn its kickoff starts,
+        // as a real one does: once that turn ends without it, the kickoff
+        // is typed again.
         var freshOutput = ""
-        for _ in 0..<100 {
+        for _ in 0..<200 {
             freshOutput = try await after.outputText(of: freshBack)
-            if freshOutput.contains("handled You are Cherry task \(freshTask.taskID)") { break }
-            try await Task.sleep(for: .milliseconds(100))
+            if freshOutput.contains("> You are Cherry task \(freshTask.taskID)") { break }
+            try await Task.sleep(for: .milliseconds(50))
         }
-        #expect(freshOutput.contains("handled You are Cherry task \(freshTask.taskID)"), "\(freshOutput)")
+        #expect(freshOutput.contains("> You are Cherry task \(freshTask.taskID)"), "\(freshOutput)")
         after.server.callerSessionResolverForTesting = { _ in freshBack }
         #expect(try await after.send(.getMyTask).error == nil)
+        for _ in 0..<100 where !freshOutput.contains("handled You are Cherry task \(freshTask.taskID)") {
+            try await Task.sleep(for: .milliseconds(100))
+            freshOutput = try await after.outputText(of: freshBack)
+        }
+        #expect(freshOutput.contains("handled You are Cherry task \(freshTask.taskID)"), "\(freshOutput)")
 
         // Not nudged within its grace (its turn counts start over).
         try await Task.sleep(for: .seconds(max(0, 2 - Date().timeIntervalSince(restoredAt))))
@@ -492,7 +568,7 @@ struct ControlAgentTaskPersistenceTests {
         harness.server.callerSessionResolverForTesting = { _ in leadA }
         let (worker, settledTask) = try await harness.spawnWorker(task: "Done soon", label: "done")
         harness.server.callerSessionResolverForTesting = { _ in leadB }
-        let (_, openTask) = try await harness.spawnWorker(task: "Still open", label: "open")
+        let (openWorker, openTask) = try await harness.spawnWorker(task: "Still open", label: "open")
         harness.server.callerSessionResolverForTesting = { _ in worker }
         #expect(try await harness.send(.reportResult(.init(value: .null, summary: "ok"))).error == nil)
         let tasks = harness.server.tasks
@@ -517,9 +593,18 @@ struct ControlAgentTaskPersistenceTests {
         let (other, goneTask) = try await harness.spawnWorker(task: "Gone soon", label: "gone")
         harness.server.callerSessionResolverForTesting = { _ in other }
         #expect(try await harness.send(.reportResult(.init(value: .null, summary: "ok"))).error == nil)
-        for tab in [other, leadA] {
-            #expect(try await harness.send(.closeProcess(.init(processID: tab.id.uuidString))).error == nil)
-        }
+        // Its owner closed: its settled task no longer marks its worker's
+        // row; an open task's mark stays whatever became of its owner.
+        #expect(tasks.board.badges[other.id] != nil)
+        #expect(try await harness.send(.closeProcess(.init(processID: leadA.id.uuidString))).error == nil)
+        harness.server.pruneSettledRuns()
+        #expect(tasks.runs[goneTask.runID]?.ownerIsGone == true)
+        #expect(tasks.board.badges[other.id] == nil)
+        #expect(tasks.runs[goneTask.runID]?.tabsGoneSince == nil, "its worker is still open")
+        #expect(try await harness.send(.closeProcess(.init(processID: leadB.id.uuidString))).error == nil)
+        harness.server.pruneSettledRuns()
+        #expect(tasks.board.badges[openWorker.id].map { !$0.state.isSettled } == true)
+        #expect(try await harness.send(.closeProcess(.init(processID: other.id.uuidString))).error == nil)
         harness.server.pruneSettledRuns()
         #expect(tasks.runs[goneTask.runID] != nil && tasks.runs[goneTask.runID]?.tabsGoneSince != nil)
         harness.server.pruneSettledRuns(now: Date().addingTimeInterval(tasks.goneRunLifetime + 1))

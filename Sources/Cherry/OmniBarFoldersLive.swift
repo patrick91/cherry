@@ -43,14 +43,10 @@ enum OmniLocalFolders {
             return lhs < rhs
         }
         var entries: [OmniFolderEntry] = []
-        var truncated = false
         for name in ordered {
             var isFolder: ObjCBool = false
             guard fileManager.fileExists(atPath: base + "/" + name, isDirectory: &isFolder), isFolder.boolValue else { continue }
-            guard entries.count < OmniFolderListingLimits.entries else {
-                truncated = true
-                break
-            }
+            guard entries.count < OmniFolderListingLimits.entries else { break }
             let isProtected = base == home && privacyProtectedHomeFolders.contains(name)
             entries.append(OmniFolderEntry(
                 name: name,
@@ -60,9 +56,23 @@ enum OmniLocalFolders {
         return .listed(OmniFolderContents(
             path: path,
             isRepository: fileManager.fileExists(atPath: base + "/.git"),
-            entries: entries,
-            truncated: truncated
+            entries: entries
         ))
+    }
+
+    /// Makes the folder at `path` (absolute), not its parents. A folder
+    /// already there is fine (made since the listing). Blocking.
+    static func create(_ path: String, fileManager: FileManager = .default) -> OmniFolderCreation {
+        do {
+            try fileManager.createDirectory(atPath: path, withIntermediateDirectories: false)
+            return .created
+        } catch {
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: path, isDirectory: &isDirectory) {
+                return isDirectory.boolValue ? .created : .notAFolder(path)
+            }
+            return .failed(error.localizedDescription)
+        }
     }
 
     /// Where repositories are looked for, under the home folder: each
@@ -98,8 +108,9 @@ enum OmniLocalFolders {
 
 // MARK: - Another Mac
 
-/// The scripts that list a folder and find repositories on another Mac,
-/// run with `sh -s` over its SSH master. The folder asked for is never in
+/// The scripts that list a folder, make one and find repositories on
+/// another Mac, run with `sh -s` over its SSH master. The folder asked for
+/// (or made) is never in
 /// the script as text a shell reads: it goes in as octal escapes that only
 /// `printf` turns back into bytes (`octalBytes`), so no name, quote,
 /// `$(…)`, backquote or newline in it runs anything. What the Mac prints is
@@ -107,6 +118,7 @@ enum OmniLocalFolders {
 enum OmniRemoteFolders {
     static let listMarker = "CHERRY-FOLDERS 1"
     static let scanMarker = "CHERRY-REPOS 1"
+    static let createMarker = "CHERRY-MKDIR 1"
     /// How long a listing may take there.
     static let timeout: TimeInterval = 3
 
@@ -159,7 +171,6 @@ enum OmniRemoteFolders {
         var path: String?
         var isRepository = false
         var entries: [OmniFolderEntry] = []
-        var truncated = false
         var ended = false
         for record in records {
             guard let tag = record.first else { continue }
@@ -172,7 +183,6 @@ enum OmniRemoteFolders {
                       entries.count < OmniFolderListingLimits.entries
                 else { continue }
                 entries.append(OmniFolderEntry(name: value, isRepository: tag == "G"))
-            case "T": truncated = true
             case "E": ended = true
             default: continue
             }
@@ -180,7 +190,50 @@ enum OmniRemoteFolders {
         guard ended, let path, path.hasPrefix("/") else {
             return .failed(output.timedOut ? "it did not answer in time" : "the listing was cut short")
         }
-        return .listed(OmniFolderContents(path: path, isRepository: isRepository, entries: entries, truncated: truncated))
+        return .listed(OmniFolderContents(path: path, isRepository: isRepository, entries: entries))
+    }
+
+    /// Makes the folder `path` (absolute) there, not its parents: `K` when
+    /// a folder is there now (made, or one already was), `F` when something
+    /// else has its name, `X<mkdir's error>` when it could not be made.
+    static func createScript(path: String) -> String {
+        """
+        dir=$(printf \(octalBytes(path)); printf x)
+        dir=${dir%x}
+        printf '%s\\n' '\(createMarker)'
+        if [ -d "$dir" ]; then printf 'K\\0'
+        elif [ -e "$dir" ] || [ -L "$dir" ]; then printf 'F\\0'
+        elif err=$(mkdir -- "$dir" 2>&1); then printf 'K\\0'
+        else printf 'X%s\\0' "$err"; fi
+
+        """
+    }
+
+    /// Reads what `createScript` printed.
+    static func parseCreation(_ output: RemoteDeviceShell.DataOutput, path: String) -> OmniFolderCreation {
+        guard let records = records(output.standardOutput, after: createMarker) else {
+            if output.status == 255 || output.timedOut {
+                return .failed(RemoteDeviceSSHFailure.classify(output.standardError, timedOut: output.timedOut).message)
+            }
+            return .failed("mkdir did not run (exit \(output.status))")
+        }
+        guard let record = records.first, let tag = record.first else {
+            return .failed(output.timedOut ? "it did not answer in time" : "mkdir was cut short")
+        }
+        switch tag {
+        case "K":
+            return .created
+        case "F":
+            return .notAFolder(path)
+        default:
+            // "mkdir: <the path, or its missing parent>: Permission denied":
+            // the reason.
+            var message = record.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+            if message.hasPrefix("mkdir: "), let colon = message.range(of: ": ", options: .backwards) {
+                message = String(message[colon.upperBound...])
+            }
+            return .failed(message.isEmpty ? "mkdir failed" : message)
+        }
     }
 
     /// Finds the repositories under the home folder there at
@@ -227,25 +280,25 @@ enum OmniRemoteFolders {
     /// The app's shell to `device`: through its SSH master while that is
     /// up, with a short timeout.
     static func shell(for device: RemoteDevice, masters: HostSSHMasterManager = .shared) async -> RemoteDeviceShell {
-        var shell = await RemoteDeviceShell.app()
-        shell.controlPath = masters.controlPathIfUp(for: device.sshDestination)
+        var shell = await RemoteDeviceShell.app(through: device.sshDestination, masters: masters, timeout: timeout)
         shell.connectTimeout = Int(timeout)
-        shell.timeout = timeout
         return shell
     }
 
     static func list(_ directory: String, on destination: String, shell: RemoteDeviceShell) async -> OmniFolderListing {
-        let script = listScript(directory: directory)
-        let output = await RemoteDeviceShell.onOwnThread { shell.runSynchronously(script, on: destination) }
+        let output = await shell.runData(listScript(directory: directory), on: destination)
         return parseListing(output)
+    }
+
+    static func create(_ path: String, on destination: String, shell: RemoteDeviceShell) async -> OmniFolderCreation {
+        let output = await shell.runData(createScript(path: path), on: destination)
+        return parseCreation(output, path: path)
     }
 
     static func scan(on destination: String, shell: RemoteDeviceShell) async -> [String]? {
         var shell = shell
         shell.timeout = max(shell.timeout, 10)
-        let script = scanScript()
-        let captured = shell
-        let output = await RemoteDeviceShell.onOwnThread { captured.runSynchronously(script, on: destination) }
+        let output = await shell.runData(scanScript(), on: destination)
         return parseScan(output)
     }
 }
@@ -354,6 +407,15 @@ final class OmniFolderBrowser {
         }
     }
 
+    /// Forgets the listings kept of `machine`'s folders (a folder was made
+    /// there): the next request of each lists it again.
+    func forgetListings(on machine: ProjectSwitcherModel.Machine) {
+        for request in Array(listings.keys) where request.machine == machine && !inFlight.contains(request) {
+            listings[request] = nil
+            listedAt[request] = nil
+        }
+    }
+
     private func lifetime(of listing: OmniFolderListing, on machine: ProjectSwitcherModel.Machine) -> TimeInterval {
         switch listing {
         case .listed, .missing: machine == .thisMac ? Self.localLifetime : Self.remoteLifetime
@@ -412,7 +474,7 @@ final class OmniFolderBrowser {
 @MainActor
 final class OmniRepositoryScanner {
     static let shared = OmniRepositoryScanner(
-        cacheURL: AppInstanceLock.defaultFileURL().deletingLastPathComponent()
+        cacheURL: CherryAppIdentity.applicationSupportDirectory()
             .appendingPathComponent(OmniRepositoryScanner.fileName, isDirectory: false),
         canWrite: { AppInstanceLock.shared.isHeld }
     )
@@ -556,8 +618,7 @@ enum RemoteDeviceProjectAdding {
     /// The app's: `RemoteDeviceProbe.resolveDirectory` over the device's
     /// master while it is up.
     static func resolveOverSSH(_ path: String, _ device: RemoteDevice) async -> Result<String, RemoteDeviceProbe.RemoteDirectoryError> {
-        var shell = await RemoteDeviceShell.app()
-        shell.controlPath = HostSSHMasterManager.shared.controlPathIfUp(for: device.sshDestination)
+        let shell = await RemoteDeviceShell.app(through: device.sshDestination)
         return await RemoteDeviceProbe.resolveDirectory(path, on: device.sshDestination, shell: shell)
     }
 

@@ -3,7 +3,6 @@ import CherryControl
 import Combine
 import Foundation
 import IOKit.ps
-import SystemConfiguration
 
 extension TitlebarProjectMenuModel {
     /// Each device and what is known of it now, from cached state: its
@@ -33,7 +32,7 @@ extension TitlebarProjectMenuModel {
                 bundledBuild: RemoteHostHelpers.cachedAppBuild
             )
         }
-        // Read once in the background: the next menu offers Update Session
+        // Read once in the background: the next look offers Update Session
         // Host… for a device whose install is older.
         if !store.devices.isEmpty { RemoteHostHelpers.preloadApp() }
         return devices
@@ -47,10 +46,7 @@ extension TitlebarProjectMenuModel {
 @MainActor
 enum ProjectSwitcherLive {
     /// The model from the app's state now.
-    static func build(
-        currentProjectKey: String?,
-        devices: [TitlebarProjectMenuModel.Device] = TitlebarProjectMenuModel.liveDevices()
-    ) -> ProjectSwitcherModel {
+    static func build(currentProjectKey: String?, devices: [TitlebarProjectMenuModel.Device]) -> ProjectSwitcherModel {
         let registry = ProjectWindowRegistry.shared
         let settings = AgentSettings.shared
         let recency = ProjectRecencyStore.shared
@@ -73,12 +69,7 @@ enum ProjectSwitcherLive {
 
         let localControl = HostControlRegistry.shared.all.first { $0.host.id == HostedSessionHost.local.id }
         let localSessions = localControl?.state == .connected ? localControl?.sessions.count : nil
-        let thisMac = ProjectSwitcherModel.thisMacInfo(
-            computerName: Self.computerName,
-            sessionCount: localSessions,
-            projectCount: localProjects.count,
-            symbol: Self.thisMacSymbol
-        )
+        let thisMac = ProjectSwitcherModel.thisMacInfo(sessionCount: localSessions, symbol: Self.thisMacSymbol)
         var canonical: [String: String] = [:]
         return ProjectSwitcherModel.make(
             localProjects: localProjects,
@@ -92,11 +83,10 @@ enum ProjectSwitcherLive {
                 let value = registry.canonicalProjectRoot(for: key)
                 canonical[key] = value
                 return value
-            }
+            },
+            listsHomes: true
         )
     }
-
-    private static let computerName: String? = SCDynamicStoreCopyComputerName(nil, nil) as String?
 
     /// A laptop's glyph for a Mac with a built-in battery, else a desktop's.
     private static let thisMacSymbol: String = {
@@ -111,37 +101,27 @@ enum ProjectSwitcherLive {
     }()
 }
 
-/// What the picker menu's items and the Omni bar's project and Mac rows
-/// do: the same code path for each (a device's project opens through its
-/// key, window reuse through `openProject`). Worktree actions stay the
-/// window's.
+/// What the Omni bar's project and Mac rows do: the same code path for
+/// each (a device's project opens through its key, window reuse through
+/// `openProject`).
 @MainActor
 struct ProjectSwitcherActions {
     let settings: AgentSettings
     let chromeState: ProjectWindowChromeState
     let openProject: (CherryProject) -> Void
-    let openSettings: () -> Void
 
-    /// Handles every action but the worktree ones (false for those).
-    @discardableResult
-    func perform(_ action: TitlebarProjectMenuModel.Action) -> Bool {
+    func perform(_ action: TitlebarProjectMenuModel.Action) {
         let store = RemoteDeviceStore.shared
         switch action {
-        case .activateWorktree, .newWorktree, .manageWorktrees:
-            return false
         case .openProject(let root):
             openProject(settings.projects.first(where: { $0.root == root }) ?? CherryProject(root: root))
-        case .addProject:
-            chooseProjectRoot()
-        case .editProjects:
-            openSettings()
         case .openDeviceProject(let deviceID, let path):
             openProject(CherryProject(root: ProjectLocation.remote(deviceID: deviceID, path: path).key))
         case .openDeviceHome(let deviceID):
-            guard let home = store.device(id: deviceID)?.homeDirectory else { return true }
+            guard let home = store.device(id: deviceID)?.homeDirectory else { return }
             openProject(CherryProject(root: ProjectLocation.remote(deviceID: deviceID, path: home).key))
         case .openDeviceSessions(let deviceID):
-            guard let host = store.device(id: deviceID)?.host else { return true }
+            guard let host = store.device(id: deviceID)?.host else { return }
             chromeState.hostedSessionsInitialHost = host
             chromeState.isHostedSessionsPresented = true
         case .addDeviceProject(let deviceID):
@@ -149,53 +129,18 @@ struct ProjectSwitcherActions {
         case .hideDeviceProject(let deviceID, let path):
             store.hideProject(path: path, on: deviceID)
         case .reconnectDevice(let deviceID):
-            guard let host = store.device(id: deviceID)?.host else { return true }
-            RemoteDevicePeeks.shared.retry(host)
-            let control = HostControlRegistry.shared.control(for: host)
-            if case .waitingToReconnect = control.state {
-                control.reconnectNow()
-            } else {
-                Task { _ = try? await control.connect(retryingLoginEnvironment: true) }
-            }
+            guard let host = store.device(id: deviceID)?.host else { return }
+            HostControlRegistry.shared.control(for: host).reconnectAsked()
         case .trustDeviceIdentity(let deviceID):
             RemoteDeviceAlerts.confirmTrustNewIdentity(of: deviceID, store: store)
         case .updateDeviceHost(let deviceID):
             RemoteDeviceUpdatePresenter.present(deviceID: deviceID, store: store)
-        case .setUpDeviceMCP(let deviceID):
-            RemoteMCPSetupPresenter.present(deviceID: deviceID, store: store)
         case .renameDevice(let deviceID):
             RemoteDeviceAlerts.rename(deviceID, store: store)
         case .removeDevice(let deviceID):
             RemoteDeviceAlerts.confirmRemove(deviceID, store: store)
         case .addMac:
             chromeState.isAddDevicePresented = true
-        }
-        return true
-    }
-
-    /// Add Project…: a folder on This Mac, added to the list and opened;
-    /// on a device, Add Project on <Mac>… (a path checked there).
-    func addProject(on machine: ProjectSwitcherModel.Machine) {
-        switch machine {
-        case .thisMac: chooseProjectRoot()
-        case .device(let id): perform(.addDeviceProject(id))
-        }
-    }
-
-    /// Open Folder…: a folder on This Mac, opened without adding it; on a
-    /// device, Add Project on <Mac>… (there is no remote folder browser).
-    func openFolder(on machine: ProjectSwitcherModel.Machine) {
-        switch machine {
-        case .thisMac:
-            let panel = NSOpenPanel()
-            panel.canChooseFiles = false
-            panel.canChooseDirectories = true
-            panel.allowsMultipleSelection = false
-            panel.prompt = "Open"
-            guard panel.runModal() == .OK, let url = panel.url else { return }
-            openProject(CherryProject(root: url.path))
-        case .device(let id):
-            perform(.addDeviceProject(id))
         }
     }
 
@@ -216,19 +161,5 @@ struct ProjectSwitcherActions {
             perform(.openDeviceProject(deviceID: id, path: path))
         }
         return true
-    }
-
-    func chooseProjectRoot() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Add"
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        settings.addProject(path: url.path)
-        if let project = settings.selectedProject(for: url.path) {
-            openProject(project)
-        }
     }
 }

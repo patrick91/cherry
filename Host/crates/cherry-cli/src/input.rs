@@ -61,8 +61,9 @@ pub struct DetachInput {
     /// An unfinished escape sequence, held until it is complete.
     pending: Vec<u8>,
     pending_since: Option<Instant>,
-    /// Inside a bracketed paste: how much of the end marker has matched.
-    paste_end: Option<usize>,
+    /// Inside a bracketed paste, which `Token::PasteStart` opens, until its
+    /// end marker.
+    paste: PasteMarkers,
     /// The detach key was pressed once.
     armed_since: Option<Instant>,
 }
@@ -74,7 +75,7 @@ impl DetachInput {
             escape_wait: crate::timing::timing().escape_wait,
             pending: Vec::new(),
             pending_since: None,
-            paste_end: None,
+            paste: PasteMarkers::default(),
             armed_since: None,
         }
     }
@@ -147,10 +148,10 @@ impl DetachInput {
     }
 
     fn byte(&mut self, byte: u8, now: Instant, parsed: &mut Parsed) {
-        if let Some(matched) = self.paste_end {
+        if self.paste.open {
             // Pasted text is never a key press.
             parsed.data.push(byte);
-            self.paste_end = paste_end_step(matched, byte);
+            self.paste.feed(&[byte]);
             return;
         }
         if !self.pending.is_empty() {
@@ -210,22 +211,49 @@ impl DetachInput {
             Token::DetachPress => self.armed_since = Some(now),
             Token::PasteStart => {
                 parsed.data.extend_from_slice(bytes);
-                self.paste_end = Some(0);
+                self.paste.open = true;
             }
             Token::Neutral | Token::Other => parsed.data.extend_from_slice(bytes),
         }
     }
 }
 
-fn paste_end_step(matched: usize, byte: u8) -> Option<usize> {
-    let matched = if byte == PASTE_END[matched] {
-        matched + 1
-    } else if byte == 0x1b {
-        1
-    } else {
-        0
-    };
-    (matched < PASTE_END.len()).then_some(matched)
+/// Whether input leaves a bracketed paste open: its start marker came, and
+/// its end marker not yet.
+#[derive(Default)]
+pub struct PasteMarkers {
+    pub open: bool,
+    /// How much of the marker awaited has matched.
+    matched: usize,
+}
+
+impl PasteMarkers {
+    /// Feed `data` while a paste is open: how much of it the paste takes,
+    /// its end marker included, once the paste ends in it.
+    pub fn until_closed(&mut self, data: &[u8]) -> Option<usize> {
+        for (index, byte) in data.iter().enumerate() {
+            if !self.open {
+                return Some(index);
+            }
+            self.feed(std::slice::from_ref(byte));
+        }
+        (!self.open).then_some(data.len())
+    }
+
+    pub fn feed(&mut self, data: &[u8]) {
+        for &byte in data {
+            let marker = if self.open { PASTE_END } else { PASTE_START };
+            self.matched = if byte == marker[self.matched] {
+                self.matched + 1
+            } else {
+                usize::from(byte == 0x1b)
+            };
+            if self.matched == marker.len() {
+                self.open = !self.open;
+                self.matched = 0;
+            }
+        }
+    }
 }
 
 /// Only `ESC [` followed by digits, `;` and `:` can become the detach key

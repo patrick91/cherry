@@ -87,6 +87,12 @@ private func rawOps(_ bytes: [UInt8]) -> [NativeInputOp] {
     // the translator maps: not an Escape key and a pasted tail.
     #expect(ops(Array("\u{1B}[101;5u".utf8)) == [.bytes(Data("\u{1B}[101;5u".utf8))])
     #expect(rawOps(Array("\u{1B}[200~x\u{1B}[201~".utf8)) == [.bytes(Data("\u{1B}[200~x\u{1B}[201~".utf8))])
+    // In text input a whole bracketed paste is one pasted text, its
+    // newlines kept (an agent's message of several lines), then its Enter.
+    #expect(ops(Array("\u{1B}[200~one\ntwo\u{1B}[201~\r".utf8)) == [
+        .text("one\ntwo"),
+        .key(keycode: 36, shift: false, control: false, option: false),
+    ])
     #expect(ops(Array("\u{1B}[97;5:1u".utf8)) == [.bytes(Data("\u{1B}[97;5:1u".utf8))])
     // Incomplete: a lone Escape, then text.
     #expect(ops(Array("\u{1B}[".utf8)) == [
@@ -315,6 +321,20 @@ func textInputIsPastedAndItsEnterIsAKey(kittyFlags: Int) async throws {
 
     probe.session.send(data: Data("hi there\r".utf8))
     let expected = Data("\u{1B}[200~hi there\u{1B}[201~\r".utf8)
+    let received = try await probe.receive(atLeast: expected.count)
+    #expect(hex(received) == hex(expected), "kitty flags \(kittyFlags)")
+}
+
+/// A bracketed paste (an agent's message of several lines) reaches the
+/// program as one paste with its newlines, then Enter as the key.
+@Test(arguments: [0, 1]) @MainActor
+func aBracketedPasteIsOnePasteWithItsNewlines(kittyFlags: Int) async throws {
+    let probe = try InputProbe(kittyFlags: kittyFlags)
+    defer { probe.cleanUp() }
+    try await probe.waitUntilReady()
+
+    probe.session.send(data: Data("\u{1B}[200~one\ntwo\u{1B}[201~\r".utf8))
+    let expected = Data("\u{1B}[200~one\ntwo\u{1B}[201~\r".utf8)
     let received = try await probe.receive(atLeast: expected.count)
     #expect(hex(received) == hex(expected), "kitty flags \(kittyFlags)")
 }

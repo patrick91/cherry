@@ -11,6 +11,28 @@ Small native macOS prototype for a `libghostty`-style shell with left-side tabs.
   (see [Persistent Sessions](#persistent-sessions)), or on a native PTY when
   that is turned off or unavailable.
 
+## Install
+
+Download [Cherry.dmg](https://github.com/patrick91/cherry/releases/latest/download/Cherry.dmg),
+the newest stable release, open it and drag **Cherry** to Applications.
+Cherry requires macOS 26 or later and runs on Apple silicon and Intel Macs.
+
+Updates arrive by themselves. Cherry checks for them every hour and
+downloads a new version in the background; the sidebar then shows **Restart
+to Update** (so do the Cherry menu and the menu bar icon's panel), and
+persistent sessions keep running across the restart. If you don't click it,
+the update installs when Cherry quits. **Settings › Updates** shows the
+version and build, has the switches for checking and installing
+automatically, and **Get pre-release builds**: every change on main, once its
+tests pass. Turning that off never goes back to an older build.
+
+Until the first stable release exists, install the newest pre-release from
+the [Releases](https://github.com/patrick91/cherry/releases) page and turn
+that switch on. Keep one copy of Cherry: each copy updates itself in place,
+and `cherry://` links, the control socket and the CLI symlinks become ambiguous with
+two. How releases are made is described in
+[docs/releasing.md](docs/releasing.md).
+
 ## Run
 
 ```bash
@@ -23,14 +45,16 @@ Cherry's app data: while Cherry.app runs it is a second copy with native tabs
 and no saved tabs, and otherwise it restores and saves Cherry.app's tabs. See
 [Host/README.md](Host/README.md#use-in-the-mac-app) for running it apart.
 
-Enable worktree spaces in **Cherry > Settings > General**. Cherry then discovers
-every Git worktree for a project and keeps them
-inside one project window. Switch with the worktree rail, an interactive
-horizontal two-finger swipe over the sidebar, or `Cmd-Option-Left/Right`. The
-rail's `+` and `...` buttons create, show/hide, prune, and safely remove clean
-worktrees. The sliders button opens a temporary dogfooding panel for tuning the
-swipe trigger distance and settle duration. Quick flicks can commit below the
-distance threshold based on their velocity.
+A project window shows one folder. Cherry has no Git worktree support of its
+own: open a worktree's folder as a project (the Omni bar completes paths
+typed with `~/` or `/`). Tabs saved by a build that had worktree spaces come
+back in their project's window.
+
+**File › New Window** (**Cmd-N**) opens another window of the front window's
+project, with its own tabs, splits and selection and one new terminal in the
+project's folder; its to-dos and commands are the project's, shared by its
+windows, and every window comes back when Cherry opens again. A project on
+another Mac can have several windows too.
 
 ### Pasting images
 
@@ -42,6 +66,19 @@ for bracketed paste), which agents such as Claude Code and Codex attach.
 Images there are removed a week later. Text wins when the clipboard has
 text too, and files copied in Finder paste as before. Edit › Paste and
 dropping image data do the same.
+
+### Keyboard Settings
+
+**Settings › Terminal › Ghostty config** lists the Ghostty config files
+Cherry read when it opened (every file Ghostty loads, and the files their
+`config-file` lines name; with **Open** and **Reveal in Finder**), the lines
+left out because Ghostty rejects them, and **Copy Report**, which copies
+what Cherry does with each keyboard line, the lines its terminals apply,
+the TERM a new tab gets, the input source and the front tab's keyboard
+modes as text, for an issue. **Settings › Shortcuts** lists Cherry's own
+keys and the terminal key bindings from your Ghostty config, with whether
+Cherry's terminals apply each one and which ones a Cherry shortcut takes
+first.
 
 ## Persistent Sessions
 
@@ -77,7 +114,7 @@ as long as its notice ("Closed <name>", with **Undo**) would stay: about 6
 seconds, longer while the pointer rests on it or the window is in the
 background (a minute at most for a closed tab, whose program keeps running
 meanwhile). A closed tab's program stops only once that has passed (or when
-its window closes or Cherry quits). In a text field or the notes editor,
+its window closes or Cherry quits). In a text field or a to-do's editor,
 Cmd-Z undoes typing as usual. Quitting Cherry
 or closing a project window with local sessions still running asks once:
 **Keep Running** (the default) leaves them running and brings their tabs back
@@ -89,7 +126,7 @@ disappear at once, and it stops those programs and ends the sessions before it
 exits (within 10 s). A log out, restart or shut down does not ask about
 sessions and ends none itself (the system then ends them), but warns about
 programs still running in them, as it does for native tabs, and an update keeps them
-without asking. Removing a worktree ends its sessions. A
+without asking. A
 terminal tab whose shell exits with status 0 closes by itself, and the window
 closes with its last tab; turn off **Close a tab when its shell exits** to
 keep such tabs. Turn off **Run local terminals as persistent sessions** to
@@ -104,33 +141,37 @@ delays, and at once when the Mac wakes or a network comes back. Tabs of a
 host that was unreachable when their window opened come back once it
 answers.
 
-**Settings › Sessions › Session Host** shows the local host's build, uptime
-and sessions, and offers **Reveal Log**, **Copy Diagnostics** (what `cherry
+**Settings › Sessions** shows the local host's build, uptime and sessions at
+its top, and offers **Reveal Log**, **Copy Diagnostics** (what `cherry
 status` and `cherry doctor` report, for a bug report) and **Restart Host…**
 (your programs keep running). In a terminal, `cherry status` describes the
 host and `cherry doctor` checks it for problems and says how to fix them.
 
 Sessions of windows or tabs you closed that keep running are listed under
 **Background sessions** in the Cherry menu bar icon: click one to show it in a
-tab (its project's window opens again with its other tabs), or hover and click
+tab (in its project's window, which opens again with its other tabs when you
+had closed it), or hover and click
 **End** twice to stop it (**Remove** for one that already ended). **Cherry →
-End Background Sessions…**, **End All…** in that list and **Settings ›
-Sessions › Background Sessions** end them all after asking. When Cherry opens
+End Background Sessions…**, **End All…** in that list and in **Settings ›
+Sessions** end them all after asking. When Cherry opens
 and agents, commands or busy terminals among them still run, a notice at the
 bottom of a window says so once, with **Reopen** and **End…** (its time runs
 only while that window is in front); sessions you kept running when you closed
 their tab or window, and idle shells, are not mentioned. Turn that off with
-**Tell me about background sessions when Cherry opens**. Only Cherry's own sessions are listed there; sessions made with the
+**Tell me about background sessions when Cherry opens** (Settings ›
+Notifications). Only Cherry's own sessions are listed there; sessions made with the
 `cherry` CLI or by another app are in Persistent Sessions. A bell or
 notification from a background session (an agent that finished or needs
 input) shows as a Cherry notification naming the session and its project
 (a shell's bell only once until you open it, and a few a minute at most);
-click it to open the session, whose tab then shows it unread. **Clear
+click it to open the session, whose tab then shows it unread. **Bell**
+(Settings › Notifications › Terminal bell) is Beep or Silent: Silent stops
+the sound of a tab's bell, and a background session's bell still notifies. **Clear
 Ended** in that list removes the sessions whose programs ended, and ended
 ones that no saved tab brings back are removed by themselves after they
 have been listed for 10 minutes while Cherry was in use (never one you have
-not seen, or one whose host crashed). Removing a project in **Settings › Projects** offers to end its
-background sessions first.
+not seen, or one whose host crashed). Removing a project in **Settings ›
+Projects** asks first, and offers to end its background sessions.
 
 Open **File → Persistent Sessions…** (`Cmd-Shift-R`) to see every session on
 **This Mac** or an SSH destination, and to create, attach to, or terminate
@@ -198,8 +239,7 @@ Its terminals get Cherry's terminal type (`xterm-ghostty`) and Ghostty's
 zsh, bash or fish integration there, installed next to its `cherry-host`,
 so the directory, title and prompt marks follow the shell there, paths in
 the sidebar show that Mac's home as `~`, and a new tab starts in the
-selected tab's directory. Its git worktrees (the Worktrees section, **New
-Worktree…**, **Manage Worktrees…**) run git on that Mac, its `cherry.toml`
+selected tab's directory. Its `cherry.toml`
 commands are read there (read-only: a command you edit is saved on this Mac
 only), auto-start and restart on exit as usual, and **Open in** offers the
 editors that reach it over SSH (VS Code and Cursor through Remote - SSH,
@@ -214,26 +254,27 @@ is logged in there), the copy's path is pasted instead; when the image
 cannot be copied, Ctrl-V goes on anyway; a notice says why either way. A
 `localhost` link in its tab (Cmd-click) opens through a port forwarded from
 that Mac over its SSH connection to `127.0.0.1` on this Mac ("Forwarded from
-Studio"). Cherry's MCP tools (`get_process_ports`, `services_list`,
-`wait_for_bound_port`) report the ports its programs listen on there,
+Studio"). Cherry's tools (`cherry ports`, `cherry services`,
+`cherry wait-port`) report the ports its programs listen on there,
 naming the Mac (`machine`, `remoteURL`); they forward nothing, except
 `wait_for_bound_port` with `probe_http`, which forwards the port it probes
 (`url` is then the forwarded one). Forwards end when their tab or window
-closes. Agents in its tabs (Claude Code, Codex) can use Cherry's MCP tools
-too, scoped to their window and never reaching beyond that Mac's projects
-and tabs: Cherry forwards its control socket to that Mac over the SSH
-connection and gives each tab a token of its own, renewed whenever its
-program restarts. **Set Up Cherry MCP on Studio…** (in its menu and in
-Settings › Sessions › Other Macs) shows the commands that register Cherry
-MCP with Claude Code and Codex there and runs them only when you confirm;
-**Remove** takes them away again. While Cherry cannot be reached from there
+closes. Agents in its tabs (Claude Code, Codex, Pi) can use the `cherry`
+command too, scoped to their window and never reaching beyond that Mac's
+projects and tabs: Cherry forwards its control socket to that Mac over the
+SSH connection and gives each tab a token of its own, renewed whenever its
+program restarts. The agents Cherry starts there (under zsh, bash or
+another sh-family login shell) are told about it on their command line
+when their CLI there is new enough. While Cherry cannot be reached from there
 (it quit, or the connection is being made again) the tools say "Cherry on
 <this Mac> is not reachable". Its
 sessions no tab shows are listed under its name in Background Sessions
 (while Cherry is connected to it, or while the menu is open; looking at a
 Mac, there or in the project picker, never starts its session host), and
-**Settings › Sessions › Other Macs** shows how each Mac stands, with
-**Reconnect**, **Update Session Host…**, **Set Up Cherry MCP…** and **Remove…**. A tab that cannot
+**Settings › Macs** shows how each Mac stands, with
+**Reconnect**, **Update Session Host…** and **Remove…**;
+there you also rename a Mac, see its projects and add one
+(**Add Project on Studio…**). A tab that cannot
 start there says so ("Couldn't start on Studio: …", with **Retry**), never
 running a shell on this Mac instead. **Not open here** in the sidebar lists
 that project's sessions on the Mac that no tab shows: **Reopen** for this
@@ -267,7 +308,8 @@ helpers; no separate CLI installation is needed for **This Mac**. Open a
 project, start a command or an editor in a tab, quit Cherry Sessions, and
 reopen it: the tab comes back with the same process and screen. Multiple
 devices can stay attached and type into one session. This is a local test
-build, signed ad-hoc by default and not notarized. The disk image always
+build, signed as the installer signs (below) and not notarized; it never
+updates itself. The disk image always
 includes the helpers, so building it needs the same tools as the installer
 below.
 
@@ -302,11 +344,23 @@ Scripts/install-local-app
 open ~/Applications/Cherry.app
 ```
 
+The installer builds the release identity, `dev.patrick.cherry`: the app the
+releases ship, with the same settings, data (`~/Library/Application
+Support/Cherry`) and `cherry://` scheme. It embeds Sparkle
+(`Contents/Frameworks/Sparkle.framework`), so once `SPARKLE_PUBLIC_ED_KEY` is
+set in `Packaging/release.conf` a local build updates itself like a release: a
+newer release replaces it when Cherry quits, or at **Restart to Update**. To
+keep a local build, turn off **Check for updates automatically** in Settings ›
+Updates. Running the installer again discards an update Cherry had
+downloaded, so that update never overwrites the new build. Coming from a
+local build made before releases (`dev.patrick.cherry.local`): see [Moving
+from a local build](docs/releasing.md#moving-from-a-local-build).
+
 The installer also builds the `cherry` and `cherry-host` helpers that
 persistent sessions use and bundles them inside the app. That needs Rust
 (`cargo` and `rustc`, from [rustup.rs](https://rustup.rs)) and the Xcode
 command-line tools. The first build also needs network access:
-`Scripts/build-host-vt` downloads a checksum-pinned Zig 0.16.0 and fetches a
+`Scripts/build-host-vt` downloads a checksum-pinned Zig 0.17.0 and fetches a
 pinned Ghostty revision, and Cargo fetches crates. Later builds reuse them.
 The helpers are built into `CARGO_TARGET_DIR` (or `CARGO_BUILD_TARGET_DIR`)
 when set, otherwise `Host/target`. They are universal (arm64 and x86_64),
@@ -331,18 +385,14 @@ beside it, else one on your login shell's `PATH`. The lookup is described in
 [Host/README.md](Host/README.md#use-in-the-mac-app).
 
 Run the installer again after making changes to replace the installed copy.
-You can customize the destination and name:
-
-```bash
-CHERRY_APP_NAME="Cherry Local" CHERRY_INSTALL_DIR="$HOME/Applications" Scripts/install-local-app
-```
-
-That copy keeps the default bundle identifier, so it shares the installed
-Cherry's settings and data. For a separate dogfood build, also set its own
-`CHERRY_BUNDLE_ID`, `CHERRY_APPLICATION_SUPPORT_NAME` (the folder in
-`~/Library/Application Support`), and `CHERRY_URL_SCHEME` (its deep links and
-MCP server name); the installer warns when a non-default bundle identifier
-still shares Cherry's data folder or `cherry://` scheme:
+`CHERRY_INSTALL_DIR` sets the destination. A copy under another name is a
+separate app, and it must set its own `CHERRY_BUNDLE_ID`,
+`CHERRY_APPLICATION_SUPPORT_NAME` (the folder in `~/Library/Application
+Support`) and `CHERRY_URL_SCHEME` (its deep links): the
+installer refuses `dev.patrick.cherry`, which updates itself, under another
+name, data folder or scheme, and warns when another bundle identifier still
+shares Cherry's data folder or `cherry://` scheme. Such a copy never updates
+itself:
 
 ```bash
 CHERRY_APP_NAME="Cherry Local" CHERRY_BUNDLE_ID=com.example.cherry-local \
@@ -359,25 +409,34 @@ from `Cherry` only by case. `CHERRY_ICON_PATH` sets an `.icns` icon; a relative
 path is relative to your current directory. A build whose Info.plist holds an
 invalid folder name or scheme logs a warning and uses Cherry's.
 
-Installed builds keep recently-used Ghostty terminal surfaces alive across tab
-switches (no per-switch replay). To build the older replay-on-switch behavior
-instead, opt out:
-
-```bash
-CHERRY_KEEP_SURFACES_WARM=0 Scripts/install-local-app
-```
-
-By default the installer uses ad-hoc signing, which can make macOS privacy
-permissions reset after each rebuild because the code identity changes. To keep
-Desktop/Documents/etc. permissions stable, sign local builds with a persistent
-certificate:
+The installer signs with the first Developer ID Application certificate of
+Cherry's team (`TEAM_ID` in `Packaging/release.conf`) in your keychain, else
+the first Apple Development one, else ad hoc, and says which it chose; a
+certificate with a Team ID (Developer ID, Apple Development) signs with the
+hardened runtime and `Packaging/Cherry.entitlements`. macOS keeps privacy
+permissions (Desktop, Documents, …) for the app's code identity: with a
+certificate they carry across rebuilds, and a Developer ID build has the
+releases' designated requirement, so they also carry across between it and
+releases. An ad hoc signature changes with every build, so macOS asks again
+after each one. To pick the identity:
 
 ```bash
 CHERRY_CODESIGN_IDENTITY="Apple Development: Your Name (TEAMID)" Scripts/install-local-app
 ```
 
-If you do not have an Apple development certificate, create a local code-signing
-certificate in Keychain Access and pass its common name as `CHERRY_CODESIGN_IDENTITY`.
+`CHERRY_CODESIGN_IDENTITY=-` forces ad hoc. If you do not have an Apple
+certificate, create a local code-signing certificate in Keychain Access and
+pass its common name as `CHERRY_CODESIGN_IDENTITY`. Permissions carry across
+rebuilds with it too, but it has no Team ID, so `Scripts/sign-app` warns and
+signs as it signs ad hoc, without the hardened runtime and the entitlements:
+under the hardened runtime, library validation loads only code of the app's
+own team, and dyld would refuse Sparkle.framework at launch.
+`CHERRY_GET_TASK_ALLOW=1` adds the entitlement lldb and Instruments need to
+attach to a build signed with an Apple certificate (never in a release; an
+ad hoc or self-signed build has no hardened runtime, so debuggers attach
+anyway). `CHERRY_APP_ARCHS=universal` builds the app itself for arm64 and
+x86_64, as releases are; by default it is built for this Mac only (the
+helpers follow `CHERRY_HOST_ARCHS`, above).
 
 Inside the prototype:
 
@@ -386,23 +445,34 @@ Inside the prototype:
 - Click inside the terminal to type directly.
 - Use the `Prototype` menu commands for interrupt, restart, and clearing scrollback.
 
-## MCP Control
+## Agent Control
 
-Cherry installs a stdio MCP helper next to the app executable. After installing
-and opening the local app, register the helper with your agent harness:
+Agents in Cherry's tabs drive it with the `cherry` command, first on every
+tab's PATH: `cherry ls`, `cherry read ID`, `cherry send ID <<'EOF'`,
+`cherry spawn agent NAME --task -`, `cherry task report`, … (`cherry skill
+show` prints the guide). The app runs the commands over its
+instance-scoped Unix control socket under `/tmp/cherry-$UID/` (each tab
+names its app's in `CHERRY_CONTROL_SOCKET`, and the `cherry` of its build
+in `CHERRY_CLI`); `cherry` connects only to a socket private to your
+account. The tools are process-first: terminals, agents, configured
+project commands, output reads, idle waiting, service readiness, tasks
+and todos.
 
-```bash
-codex mcp add cherry -- "$HOME/Applications/Cherry.app/Contents/MacOS/CherryMCP"
-claude mcp add --transport stdio --scope user cherry -- "$HOME/Applications/Cherry.app/Contents/MacOS/CherryMCP"
-```
+The Claude Code (2.1.0 or later), Codex (0.162.0 or later) and Pi (0.99.2
+or later) agents Cherry starts need nothing set up: Cherry gives Claude
+Code and Pi the `cherry` skill for that run and tells each one, in a line
+of its instructions, that `cherry` reaches its tab and the others, here
+and on your other Macs, and writes no agent configuration. **Settings ›
+Agents › The cherry command › Connect agents Cherry starts** turns that
+off. Codex's default sandbox blocks the socket, so Codex asks before each
+`cherry` runs outside it, unless Cherry's rules for Codex are installed or
+the agent's Approvals is **Auto review**.
 
-Run the Cherry app first. The helper forwards MCP tool calls to Cherry's
-instance-scoped Unix control socket under `/tmp/cherry-$UID/`. The MCP server
-exposes process-first tools for terminals, agents, configured project commands,
-output reads, idle waiting, service readiness, notes, and todos. Agents on
-your other Macs reach it through **Set Up Cherry MCP on <Mac>…** (see
-Devices above). See
-[docs/mcp.md](docs/mcp.md) for the tool guide and recommended agent workflows.
+For agents you start yourself, install the skill: `cherry skill setup`,
+or **Connect Agents to Cherry…** (the Omni bar, or **Settings › Agents ›
+The cherry command**), which shows every file it writes and writes them
+only when you confirm. See [docs/cli.md](docs/cli.md) for the tool guide
+and recommended agent workflows.
 
 ## Rendering Debug
 
@@ -414,26 +484,6 @@ Scripts/terminal-hell-test
 
 The most useful panels for background rendering bugs are `256-color and truecolor full-row backgrounds`, `Reset boundaries and inverse video`, and `Codex-style prompt paint`.
 
-To capture the actual PTY stream while reproducing a rendering bug:
-
-```bash
-CHERRY_TRACE_PTY_DIR=/tmp/cherry-traces swift run
-```
-
-Then inspect the latest trace for palette queries and background SGR:
-
-```bash
-Scripts/analyze-terminal-trace /tmp/cherry-traces/*.pty --show-erase
-```
-
-Raw traces can include terminal output and prompt text, so treat them like logs.
-
-For opt-in collection of labeled terminal-grid observations used by the local
-attention-classifier experiment, see
-[docs/attention-classifier.md](docs/attention-classifier.md). The interactive
-scenario runner supports controlled captures across configured agent harnesses,
-and `attention-web/` contains the private Astro/Cloudflare dataset viewer.
-
 ## Performance Stress
 
 Run the opt-in terminal stress suite:
@@ -443,11 +493,13 @@ Scripts/perf-terminal-stress --standard
 ```
 
 Use `--smoke` for a quick check and `--soak` before perf-sensitive changes. For
-real app UI soak runs, start Cherry and run `Scripts/perf-app-soak --scale
-standard`. `Scripts/perf-app-report` summarizes peak RSS, end-to-start RSS
-drift, MiB/hour growth, Ghostty bridge/observer counts, and raw replay
-retention, with hard gates for CPU, memory drift, retained output, and PTY
-callback density so long-session leaks are visible. Use paced TUI soaks such as
+real app UI soak runs, run `Scripts/perf-run-emulator-comparison --cherry-only`,
+which runs Cherry from a private directory and drives it with
+`Scripts/perf-app-soak` (which refuses to drive your own Cherry unless forced).
+`Scripts/perf-app-report` summarizes peak RSS, end-to-start RSS drift, MiB/hour
+growth and Ghostty bridge/observer counts of Cherry's processes (the app, its
+helpers and its session host), with hard gates for CPU and memory drift so
+long-session leaks are visible. Use paced TUI soaks such as
 `--mode tui --sleep-ms 4` for long-session stability, and keep unpaced `mixed`
 runs as overload/flood stress. `Scripts/perf-ghostty-workload` and
 `Scripts/perf-ghostty-report` capture the same workload in Ghostty as a control

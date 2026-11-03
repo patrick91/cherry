@@ -4,8 +4,9 @@ import Foundation
 /// the user to approve a command, an edit or a fetch) at the bottom of its
 /// screen. Typing into such a menu answers it: Enter (and, for some CLIs,
 /// letters such as `y`) approves the pending action. MCP input to an agent
-/// therefore never goes into one (`CherryControlServer`), and MCP reports
-/// the agent as waiting for permission while one shows.
+/// that reports no status (one that does says it is blocked on a
+/// permission, OSC 7501) therefore never goes into one
+/// (`CherryControlServer.refuseInputIntoPermissionPrompt`).
 ///
 /// Only the menu counts, not prose about one: the last lines must hold a
 /// numbered "Yes…" option and a numbered "No…" option, plus a phrase only
@@ -54,7 +55,7 @@ enum AgentPermissionPrompt {
         for line in tail {
             let normalized = normalize(line)
             guard !normalized.isEmpty else { continue }
-            if let option = optionText(normalized) {
+            if let option = optionText(Substring(normalized)) {
                 if option.hasPrefix("yes") { hasYesOption = true }
                 if option == "no" || option.hasPrefix("no,") || option.hasPrefix("no ") || option.hasPrefix("no(") {
                     hasNoOption = true
@@ -87,19 +88,20 @@ enum AgentPermissionPrompt {
         return plain.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
-    /// The text of a numbered menu option ("2. yes, and don't ask again" →
-    /// "yes, and don't ask again"); nil for any other line.
-    private static func optionText(_ normalized: String) -> String? {
-        var index = normalized.startIndex
+    /// The text of a numbered menu option, "1. Text" or "2) Text" ("2. yes,
+    /// and don't ask again" → "yes, and don't ask again"); nil for any other
+    /// line. `AgentQuestionPrompt` reads its options with it too.
+    static func optionText(_ text: Substring) -> String? {
+        var index = text.startIndex
         var digits = 0
-        while index < normalized.endIndex, normalized[index].isASCII, normalized[index].isNumber, digits < 2 {
-            index = normalized.index(after: index)
+        while index < text.endIndex, text[index].isASCII, text[index].isNumber, digits < 2 {
+            index = text.index(after: index)
             digits += 1
         }
-        guard digits > 0, index < normalized.endIndex,
-              normalized[index] == "." || normalized[index] == ")"
+        guard digits > 0, index < text.endIndex,
+              text[index] == "." || text[index] == ")"
         else { return nil }
-        let rest = normalized[normalized.index(after: index)...]
+        let rest = text[text.index(after: index)...]
         guard rest.first == " " else { return nil }
         return String(rest.dropFirst())
     }

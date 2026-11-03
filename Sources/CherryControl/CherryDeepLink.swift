@@ -1,9 +1,7 @@
-import CryptoKit
 import Foundation
 
 public struct CherryDeepLink: Codable, Equatable, Sendable {
     public enum TargetKind: String, Codable, Equatable, Sendable {
-        case note
         case todo
         case terminal
     }
@@ -37,10 +35,6 @@ public struct CherryDeepLink: Codable, Equatable, Sendable {
         url.absoluteString
     }
 
-    public static func noteURL(projectRoot: String, noteID: UUID) -> String {
-        CherryDeepLink(projectRoot: projectRoot, kind: .note, targetID: noteID.uuidString).absoluteString
-    }
-
     public static func todoURL(projectRoot: String, todoID: UUID) -> String {
         CherryDeepLink(projectRoot: projectRoot, kind: .todo, targetID: todoID.uuidString).absoluteString
     }
@@ -57,8 +51,7 @@ public struct CherryDeepLink: Codable, Equatable, Sendable {
         let path = location.isRemote
             ? location.key
             : URL(fileURLWithPath: projectRoot, isDirectory: true).standardizedFileURL.path
-        let digest = SHA256.hash(data: Data(path.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
+        return sha256Hex(path)
     }
 
     public static func parse(_ value: String) throws -> CherryDeepLink {
@@ -85,7 +78,11 @@ public struct CherryDeepLink: Codable, Equatable, Sendable {
         }
 
         guard let kind = TargetKind(rawValue: pathComponents[1].lowercased()) else {
-            throw CherryControlError(code: "invalid_deep_link_kind", message: "Cherry link kind must be note, todo, or terminal.")
+            // A note's link, from before notes were removed.
+            if pathComponents[1].lowercased() == "note" {
+                throw CherryControlError(code: "notes_removed", message: "Cherry no longer has notes; this is a link to a note.")
+            }
+            throw CherryControlError(code: "invalid_deep_link_kind", message: "Cherry link kind must be todo or terminal.")
         }
 
         let targetID = pathComponents[2]

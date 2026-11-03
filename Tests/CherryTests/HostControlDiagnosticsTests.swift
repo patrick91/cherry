@@ -5,8 +5,8 @@ import os
 import Testing
 @testable import Cherry
 
-// Settings › Sessions' "Session Host" card (`SessionHostDiagnostics`, which
-// runs `cherry status`, `cherry doctor` and `cherry restart`) and the app's
+// Settings › Sessions' session host (`SessionHostDiagnostics`, which runs
+// `cherry status`, `cherry doctor` and `cherry restart`) and the app's
 // session diagnostics in the unified log (`SessionLog`).
 
 private let runningStatus = #"""
@@ -72,10 +72,10 @@ private final class ScriptedCherry: @unchecked Sendable {
 
 @Test @MainActor func HostControlDiagnosticsShowCopyRevealAndRestart() async throws {
     let cherry = ScriptedCherry()
-    cherry.answer(["status", "--json"], HostCommandOutput(status: 0, output: runningStatus, errors: ""))
-    cherry.answer(["status"], HostCommandOutput(status: 0, output: "cherry-host 20260927101500.abc1234, protocol 7, pid 4242, up 2h 5m\n", errors: ""))
-    cherry.answer(["doctor"], HostCommandOutput(status: 1, output: "PROBLEM  stale PID file /state/host.pid\n         fix: remove it\n1 problem found.\n", errors: ""))
-    cherry.answer(["restart"], HostCommandOutput(status: 0, output: "", errors: ""))
+    cherry.answer(["host", "status", "--json"], HostCommandOutput(status: 0, output: runningStatus, errors: ""))
+    cherry.answer(["host", "status"], HostCommandOutput(status: 0, output: "cherry-host 20260927101500.abc1234, protocol 7, pid 4242, up 2h 5m\n", errors: ""))
+    cherry.answer(["host", "doctor"], HostCommandOutput(status: 1, output: "PROBLEM  stale PID file /state/host.pid\n         fix: remove it\n1 problem found.\n", errors: ""))
+    cherry.answer(["host", "restart"], HostCommandOutput(status: 0, output: "", errors: ""))
     var revealed: [URL] = []
     var copied: [String] = []
     let diagnostics = SessionHostDiagnostics(
@@ -93,20 +93,112 @@ private final class ScriptedCherry: @unchecked Sendable {
 
     await diagnostics.copyDiagnostics()
     let report = try #require(copied.last)
-    #expect(report.contains("$ cherry status\ncherry-host 20260927101500.abc1234, protocol 7, pid 4242, up 2h 5m\n"), "\(report)")
-    #expect(report.contains("$ cherry doctor\nPROBLEM  stale PID file /state/host.pid\n"), "\(report)")
+    #expect(report.contains("$ cherry host status\ncherry-host 20260927101500.abc1234, protocol 7, pid 4242, up 2h 5m\n"), "\(report)")
+    #expect(report.contains("$ cherry host doctor\nPROBLEM  stale PID file /state/host.pid\n"), "\(report)")
     #expect(report.contains("(exit status 1)"), "\(report)")
 
     await diagnostics.restartHost()
     #expect(diagnostics.restartFailure == nil)
     #expect(!diagnostics.isRestarting)
     // Only these commands ran: none of them starts a host by itself.
-    #expect(cherry.calls == [["status", "--json"], ["status"], ["doctor"], ["restart"], ["status", "--json"]])
+    #expect(cherry.calls == [["host", "status", "--json"], ["host", "status"], ["host", "doctor"], ["host", "restart"], ["host", "status", "--json"]])
 
     // A restart that fails says why.
-    cherry.answer(["restart"], HostCommandOutput(status: 1, output: "", errors: "cherry: refusing to restart the host; it keeps running: no cherry-host to start\n"))
+    cherry.answer(["host", "restart"], HostCommandOutput(status: 1, output: "", errors: "cherry: refusing to restart the host; it keeps running: no cherry-host to start\n"))
     await diagnostics.restartHost()
     #expect(diagnostics.restartFailure == "cherry: refusing to restart the host; it keeps running: no cherry-host to start")
+}
+
+@Test func HostControlStatusSummarizesSessionsForTheSessionsRow() throws {
+    let status = try #require(SessionHostStatus.parse(Data(runningStatus.utf8)))
+    // The socket and the log have rows of their own; the pid is in the
+    // diagnostics.
+    #expect(status.sessionsSummary == "3 sessions (2 running) of 128 · 5 of 1024 connections · 1 session runs in a holder of another build")
+
+    var single = status
+    single.sessions = 1
+    single.runningSessions = 1
+    single.otherHolderBuilds = 2
+    #expect(single.sessionsSummary == "1 session (1 running) of 128 · 5 of 1024 connections · 2 sessions run in holders of another build")
+
+    let stopped = try #require(SessionHostStatus.parse(Data(stoppedStatus.utf8)))
+    #expect(stopped.sessionsSummary == "It starts with the first persistent tab.")
+    #expect(stopped.socket == "/tmp/cherry-host-501/host.sock")
+}
+
+@Test @MainActor func HostControlDiagnosticsCopyTheSocketPathOnlyOnceItIsKnown() async throws {
+    let cherry = ScriptedCherry()
+    cherry.answer(["host", "status", "--json"], HostCommandOutput(status: 0, output: stoppedStatus, errors: ""))
+    var copied: [String] = []
+    let diagnostics = SessionHostDiagnostics(
+        runner: cherry.runner,
+        unavailableReason: { nil },
+        revealInFinder: { _ in },
+        copyToPasteboard: { copied.append($0) }
+    )
+
+    // Nothing is known before the first status.
+    diagnostics.copySocketPath()
+    #expect(copied.isEmpty)
+
+    // A host that is not running still says where it would listen.
+    await diagnostics.refresh()
+    diagnostics.copySocketPath()
+    #expect(copied == ["/tmp/cherry-host-501/host.sock"])
+    #expect(cherry.calls == [["host", "status", "--json"]])
+
+    // Where sessions cannot run there is no status, so no socket.
+    let unavailable = SessionHostDiagnostics(
+        runner: ScriptedCherry().runner,
+        unavailableReason: { "Cherry is running from a disk image." },
+        revealInFinder: { _ in },
+        copyToPasteboard: { copied.append($0) }
+    )
+    await unavailable.refresh()
+    unavailable.copySocketPath()
+    #expect(copied == ["/tmp/cherry-host-501/host.sock"])
+}
+
+@Test @MainActor func HostControlDiagnosticsHeroSaysHowTheHostIs() async throws {
+    let running = try #require(SessionHostStatus.parse(Data(runningStatus.utf8)))
+    let stopped = try #require(SessionHostStatus.parse(Data(stoppedStatus.utf8)))
+    func hero(
+        _ status: SessionHostStatus?,
+        problem: String? = nil,
+        isRestarting: Bool = false,
+        restartFailure: String? = nil
+    ) -> SessionHostHeroState {
+        SessionHostDiagnostics.heroState(
+            status: status, problem: problem, isRestarting: isRestarting, restartFailure: restartFailure
+        )
+    }
+
+    #expect(hero(nil) == SessionHostHeroState(tone: .yellow, title: "Checking…"))
+    #expect(hero(running) == SessionHostHeroState(tone: .green, title: "Running · build 20260927101500.abc1234 · up 2h 5m"))
+    #expect(hero(stopped) == SessionHostHeroState(tone: .gray, title: "Not running"))
+    #expect(hero(running, isRestarting: true) == SessionHostHeroState(tone: .yellow, title: "Restarting…"))
+    #expect(hero(running, restartFailure: "no cherry-host to start")
+        == SessionHostHeroState(tone: .red, title: "Restart failed: no cherry-host to start"))
+    // A status that could not be read after the failed restart says why.
+    #expect(hero(nil, problem: "cherry status failed (exit status 1).", restartFailure: "no cherry-host to start")
+        == SessionHostHeroState(
+            tone: .red, title: "Restart failed: no cherry-host to start", detail: "cherry status failed (exit status 1)."
+        ))
+    #expect(hero(nil, problem: "Cherry is running from a disk image.")
+        == SessionHostHeroState(tone: .red, title: "Unknown", detail: "Cherry is running from a disk image."))
+
+    // The diagnostics' own state, as `cherry status` answered.
+    let cherry = ScriptedCherry()
+    cherry.answer(["host", "status", "--json"], HostCommandOutput(status: 0, output: runningStatus, errors: ""))
+    cherry.answer(["host", "restart"], HostCommandOutput(status: 1, output: "", errors: "cherry: no cherry-host to start\n"))
+    let diagnostics = SessionHostDiagnostics(
+        runner: cherry.runner, unavailableReason: { nil }, revealInFinder: { _ in }, copyToPasteboard: { _ in }
+    )
+    #expect(diagnostics.heroState.title == "Checking…")
+    await diagnostics.refresh()
+    #expect(diagnostics.heroState == SessionHostHeroState(tone: .green, title: running.headline))
+    await diagnostics.restartHost()
+    #expect(diagnostics.heroState == SessionHostHeroState(tone: .red, title: "Restart failed: cherry: no cherry-host to start"))
 }
 
 @Test @MainActor func HostControlDiagnosticsRunNothingWhereSessionsCannotRun() async throws {
@@ -128,7 +220,7 @@ private final class ScriptedCherry: @unchecked Sendable {
     )
     await broken.refresh()
     #expect(broken.status == nil)
-    #expect(broken.problem == "error: unexpected [\"status\", \"--json\"]")
+    #expect(broken.problem == "error: unexpected [\"host\", \"status\", \"--json\"]")
 }
 
 @Test @MainActor func HostControlSessionDiagnosticsGoToTheUnifiedLog() async throws {
@@ -250,7 +342,7 @@ private final class ScriptedCherry: @unchecked Sendable {
     #expect(status.maxSessions == 128)
 
     let report = await diagnostics.diagnostics()
-    #expect(report.contains("$ cherry status\ncherry-host \(status.build ?? "?"), protocol "), "\(report)")
+    #expect(report.contains("$ cherry host status\ncherry-host \(status.build ?? "?"), protocol "), "\(report)")
     #expect(report.contains("the host runs this cherry's build and protocol"), "\(report)")
 
     await diagnostics.restartHost()
@@ -320,6 +412,32 @@ private func runProcessSync(_ executable: URL, _ arguments: [String], _ environm
     let launches = fake.launches.count
     try await Task.sleep(for: .milliseconds(300))
     #expect(fake.launches.count == launches)
+}
+
+@Test @MainActor func HostControlAvailabilityOrLaterConnectionFiresForAConnectionAfterItGaveUp() async throws {
+    let fake = FakeControlHelper()
+    let (hostStore, _, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+    let control = makeFakeHostControl(fake, host: try .ssh("devbox"), hostStore: hostStore)
+    defer { control.disconnect() }
+    fake.version = HostProtocol.version + 1
+    let fired = Recorder(false)
+    let subscription = control.availabilityOrLaterConnection().sink { fired.value = true }
+    defer { subscription.cancel() }
+    // A failure nothing retries ends `availability()`'s lease...
+    #expect(await fake.wait {
+        if case .failed = control.state { return true }
+        return false
+    })
+    let launches = fake.launches.count
+    try await Task.sleep(for: .milliseconds(300))
+    #expect(fake.launches.count == launches)
+    #expect(!fired.value)
+    // ...but a connection something else makes later (Retry, a new tab)
+    // still brings a restore's kept tabs back.
+    fake.version = HostProtocol.version
+    _ = try await control.connect()
+    #expect(await fake.wait { fired.value })
 }
 
 @Test @MainActor func HostControlAvailabilityFiresForAConnectionUpWhenItIsSubscribed() async throws {

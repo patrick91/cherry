@@ -60,8 +60,6 @@ struct HostedLaunchSpec: Equatable, Sendable {
 
     /// The shell layer between the host and the user's login shell.
     static let launchShell = "/bin/bash"
-    /// Native tabs' login(1) wrapper, which hosted sessions leave out.
-    static let loginProgram = "/usr/bin/login"
     /// The TERM a session gets when no staged terminfo describes
     /// `xterm-ghostty`, as Ghostty itself does without its resources.
     static let fallbackTerm = "xterm-256color"
@@ -119,7 +117,9 @@ struct HostedLaunchSpec: Equatable, Sendable {
             shellIntegration: isZsh ? context.zshBootstrap : nil,
             inheritedEnvironment: context.processEnvironment,
             terminfoDirectories: resources?.terminfoDirectory,
-            mcpHelperPath: context.mcpHelperPath
+            controlSocketPath: context.controlSocketPath,
+            cliPath: context.cliPath,
+            cliDirectory: context.cliDirectory
         )
         let command = if let resources {
             ghosttyShellIntegration(
@@ -132,8 +132,20 @@ struct HostedLaunchSpec: Equatable, Sendable {
             cherry.command
         }
 
-        // Cherry's environment overrides everything, as Ghostty's env_override.
+        // Cherry's environment overrides everything, as Ghostty's env_override,
+        // but for PATH: the session's own (the login environment's), with
+        // `cherry`'s directory first (`TabCLIDirectory`).
+        let sessionPath = environment["PATH"]
         environment.merge(cherry.environment) { _, cherry in cherry }
+        if let cliDirectory = context.cliDirectory, !cliDirectory.isEmpty {
+            environment["PATH"] = TabCLIDirectory.prepending(cliDirectory, to: sessionPath)
+        }
+        // An empty CHERRY_CONTROL_SOCKET hides Cherry's own from a Ghostty
+        // surface; the host's environment never had that one (see
+        // `inheritedTerminalKeys`).
+        if environment[CherryControl.socketEnvironmentKey]?.isEmpty == true {
+            environment[CherryControl.socketEnvironmentKey] = nil
+        }
         if resources == nil, environment["TERM"] == ShellProcessController.ghosttyTerm {
             environment["TERM"] = fallbackTerm
         }
@@ -159,6 +171,9 @@ struct HostedLaunchSpec: Equatable, Sendable {
         executableDirectory: String? = Bundle.main.executableURL?.deletingLastPathComponent().path,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         parentProcessID: pid_t = getppid(),
+        controlSocketPath: String? = CherryControlServer.appSocketPath,
+        cliPath: String? = ShellProcessController.appCLIPath,
+        cliDirectory: String? = TabCLIDirectory.current,
         stager: GhosttyResourceStager = .shared
     ) async -> HostedLaunchSpec {
         let context = await HostedLaunchContext.prepare(
@@ -169,6 +184,9 @@ struct HostedLaunchSpec: Equatable, Sendable {
             executableDirectory: executableDirectory,
             homeDirectory: homeDirectory,
             parentProcessID: parentProcessID,
+            controlSocketPath: controlSocketPath,
+            cliPath: cliPath,
+            cliDirectory: cliDirectory,
             stager: stager
         )
         return make(for: configuration, context: context)
@@ -193,11 +211,15 @@ struct HostedLaunchSpec: Equatable, Sendable {
     }
 
     /// The launch command inside the shell layer: the last argument without
-    /// its `exec -l ` prefix, or the `/bin/sh -c` command.
+    /// its `exec -l ` prefix (and a device terminal's lines before it,
+    /// `RemoteShellBootstrap`), or the `/bin/sh -c` command.
     var shellCommand: String? {
         guard let last = argv.last else { return nil }
         let prefix = "exec -l "
-        return argv.first == Self.launchShell && last.hasPrefix(prefix) ? String(last.dropFirst(prefix.count)) : last
+        guard argv.first == Self.launchShell else { return last }
+        if last.hasPrefix(prefix) { return String(last.dropFirst(prefix.count)) }
+        if let range = last.range(of: "; " + prefix, options: .backwards) { return String(last[range.upperBound...]) }
+        return last
     }
 
     // MARK: - Environment
@@ -264,7 +286,11 @@ struct HostedLaunchSpec: Equatable, Sendable {
         // Cherry is a colour terminal (the forkpty launch drops it too).
         "NO_COLOR",
         // Set explicitly from the login environment.
-        "SSH_AUTH_SOCK"
+        "SSH_AUTH_SOCK",
+        // The control socket of the Cherry (or the private run) that started
+        // this one: a tab names the socket this app answers, when it has one
+        // (`HostedLaunchContext.controlSocketPath`).
+        CherryControl.socketEnvironmentKey
     ])
 
     /// What Ghostty removes when Cherry runs from Xcode (it also drops
@@ -402,13 +428,22 @@ extension ShellProcessController {
 /// runs inside a Cherry tab, nothing may pass them on from its own
 /// environment as if they described a new session. `HostedLaunchSpec` and
 /// `HostedSessionLoginEnvironment` both drop exactly these.
+///
+/// `CHERRY_CONTROL_SOCKET` is a tab's too, but not one of them: a private
+/// run gives the app its socket that way, which must survive
+/// `removeFromProcess` (`CherryControlServer.appSocketURL` never takes over
+/// a live one). Both drop an inherited one as well, and the launches name
+/// the app's own.
 enum CherryTabEnvironment {
     static let keys: Set<String> = [
         CherryControl.projectRootEnvironmentKey, CherryControl.processIDEnvironmentKey,
         CherryControl.agentIDEnvironmentKey, CherryControl.mcpHelperEnvironmentKey,
+        CherryControl.mcpServerNameEnvironmentKey,
+        CherryControl.cliEnvironmentKey, CherryControl.mcpTokenEnvironmentKey,
+        CherryControl.controlMachineEnvironmentKey,
         "CHERRY_SESSION_ID", "CHERRY_BOOTSTRAP_ZDOTDIR",
         "CHERRY_ORIGINAL_ZDOTDIR", "CHERRY_STARTUP_COMMAND", "CHERRY_EMIT_OSC133",
-        "CHERRY_TERM_PROGRAM", "INSIDE_CHERRY"
+        "CHERRY_TERM_PROGRAM", "INSIDE_CHERRY", TabCLIDirectory.environmentKey
     ]
 
     /// What an agent CLI sets for the programs it runs (Claude Code's Bash
@@ -440,15 +475,11 @@ struct HostedLaunchAccount: Equatable, Sendable {
     var userName: String
     var homeDirectory: String
     var shell: String
-    /// `~/.hushlogin` exists. Ghostty checks it itself and passes `-q` to
-    /// login(1) for native tabs; hosted sessions run no login(1), so they
-    /// print no banner either way.
-    var hushLogin: Bool
 
     /// The current user's passwd entry, or nil when there is none (Ghostty
     /// then runs the command without the login wrapper, and a hosted
     /// session through `/bin/sh`).
-    static func current(fileManager: FileManager = .default) -> HostedLaunchAccount? {
+    static func current() -> HostedLaunchAccount? {
         let suggested = sysconf(_SC_GETPW_R_SIZE_MAX)
         var capacity = suggested > 0 ? max(Int(suggested), 1024) : 16384
         while capacity <= 1 << 20 {
@@ -471,12 +502,7 @@ struct HostedLaunchAccount: Equatable, Sendable {
                 continue
             }
             guard let entry = lookup.entry, !entry.name.isEmpty else { return nil }
-            return HostedLaunchAccount(
-                userName: entry.name,
-                homeDirectory: entry.home,
-                shell: entry.shell,
-                hushLogin: !entry.home.isEmpty && fileManager.fileExists(atPath: "\(entry.home)/.hushlogin")
-            )
+            return HostedLaunchAccount(userName: entry.name, homeDirectory: entry.home, shell: entry.shell)
         }
         return nil
     }
@@ -503,16 +529,23 @@ struct HostedLaunchContext: Equatable, Sendable {
     /// belongs to the configuration it was prepared for.
     var zshBootstrap: ShellIntegrationBootstrap?
     /// Cherry.app/Contents/MacOS: Ghostty's GHOSTTY_BIN_DIR, appended to
-    /// PATH so the bundled `cherry` and `CherryMCP` are found, as in a
+    /// PATH so the bundled `cherry` is found, as in a
     /// native tab. It is the running app's path, not a staged copy.
     var executableDirectory: String?
     /// TERM_PROGRAM_VERSION: the embedded Ghostty's version.
     var terminalProgramVersion: String?
     /// GHOSTTY_SHELL_FEATURES, as Ghostty derives it from its configuration.
     var shellFeatures: String
-    /// CHERRY_MCP_HELPER: the app's CherryMCP, when `executableDirectory`
-    /// has one (as a native tab's, `ShellProcessController.appMCPHelperPath`).
-    var mcpHelperPath: String? = nil
+    /// CHERRY_CONTROL_SOCKET: the socket the app's control server answers
+    /// (`CherryControlServer.appSocketPath`), never the one Cherry
+    /// inherited. Nil when it has none (tests, a server that did not listen).
+    var controlSocketPath: String? = nil
+    /// CHERRY_CLI: the `cherry` the app runs itself
+    /// (`ShellProcessController.appCLIPath`).
+    var cliPath: String? = nil
+    /// CHERRY_BIN_DIR, first on PATH: the directory holding only a link to
+    /// it (`TabCLIDirectory.current`).
+    var cliDirectory: String? = nil
 
     /// Ghostty's defaults as Cherry configures it: cursor, path and title on;
     /// sudo, ssh-env and ssh-terminfo off. The cursor feature follows the
@@ -550,15 +583,17 @@ struct HostedLaunchContext: Equatable, Sendable {
         executableDirectory: String? = Bundle.main.executableURL?.deletingLastPathComponent().path,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         parentProcessID: pid_t = getppid(),
+        controlSocketPath: String? = CherryControlServer.appSocketPath,
+        cliPath: String? = ShellProcessController.appCLIPath,
+        cliDirectory: String? = TabCLIDirectory.current,
         stager: GhosttyResourceStager = .shared
     ) async -> HostedLaunchContext {
         let shellPath = configuration.shellPath
         let resources = try? await stager.resolve()
-        let (bootstrap, account, mcpHelperPath) = await stager.perform {
+        let (bootstrap, account) = await stager.perform {
             (
                 try? ShellIntegrationBootstrap.prepare(shellPath: shellPath, homeDirectory: homeDirectory),
-                HostedLaunchAccount.current(),
-                executableDirectory.map { "\($0)/CherryMCP" }.flatMap { FileManager.default.isExecutableFile(atPath: $0) ? $0 : nil }
+                HostedLaunchAccount.current()
             )
         }
         return HostedLaunchContext(
@@ -574,7 +609,9 @@ struct HostedLaunchContext: Equatable, Sendable {
             executableDirectory: executableDirectory,
             terminalProgramVersion: embeddedGhosttyVersion,
             shellFeatures: ghosttyShellFeatures(cursorBlink: cursorBlink),
-            mcpHelperPath: mcpHelperPath
+            controlSocketPath: controlSocketPath,
+            cliPath: cliPath,
+            cliDirectory: cliDirectory
         )
     }
 }
@@ -660,10 +697,7 @@ enum GhosttyResourceStaging {
         applicationSupportName: String = CherryAppIdentity.current.applicationSupportName,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> URL {
-        homeDirectory
-            .appendingPathComponent("Library", isDirectory: true)
-            .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent(applicationSupportName, isDirectory: true)
+        CherryAppIdentity.applicationSupportDirectory(applicationSupportName: applicationSupportName, homeDirectory: homeDirectory)
             .appendingPathComponent("GhosttyResources", isDirectory: true)
     }
 

@@ -18,10 +18,7 @@ private func installed(_ id: String, appPath: String? = nil) -> InstalledEditor 
 
 @MainActor
 private func makeDiscovery(resolving urlsByBundleID: [String: URL]) -> ExternalEditorDiscovery {
-    ExternalEditorDiscovery(
-        appURLResolver: { urlsByBundleID[$0] },
-        iconProvider: { _ in NSImage() }
-    )
+    ExternalEditorDiscovery(appURLResolver: { urlsByBundleID[$0] })
 }
 
 @Test func externalEditorCatalogHasUniqueIDsAndBundleIDs() {
@@ -65,18 +62,6 @@ private func makeDiscovery(resolving urlsByBundleID: [String: URL]) -> ExternalE
 
     #expect(discovery.installedEditors.map(\.id) == ["zed"])
     #expect(discovery.installedEditors.first?.appURL == stableURL)
-}
-
-@MainActor
-@Test func externalEditorDiscoveryCachesIconsAtRefreshTime() throws {
-    let discovery = makeDiscovery(resolving: [
-        "dev.zed.Zed": URL(fileURLWithPath: "/Applications/Zed.app")
-    ])
-    discovery.refresh()
-
-    let zed = try #require(discovery.installedEditors.first)
-    #expect(discovery.icon(for: zed) != nil)
-    #expect(discovery.icon(for: installed("xcode")) == nil)
 }
 
 @Test func externalEditorResolveDefaultPrefersPreferredIDAndFallsBack() {

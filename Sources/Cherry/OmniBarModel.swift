@@ -3,13 +3,12 @@ import Foundation
 
 // The Omni bar (⌘P, ⌘O and the title-bar project button): one floating
 // bar that finds projects on every Mac, the Macs, the tabs of every window
-// and the background sessions, the current project's worktrees, and the
-// commands. Everything here is pure: the live layer (`OmniBarLive.swift`)
-// gathers `OmniSources` from the app's state without connecting to any
-// host, `OmniProviders` turns them into rows, `OmniMatcher` and
-// `OmniRanking` order them, and `OmniBarController` is the bar's state
-// (scopes, query, selection, the ⌘K action list). The view is
-// `OmniBarView.swift`.
+// and the background sessions, and the commands. Everything here is pure:
+// the live layer (`OmniBarLive.swift`) gathers `OmniSources` from the app's
+// state without connecting to any host, `OmniProviders` turns them into
+// rows, `OmniMatcher` and `OmniRanking` order them, and `OmniBarController`
+// is the bar's state (scopes, query, selection, the ⌘K action list). The
+// view is `OmniBarView.swift`.
 
 // MARK: - Items
 
@@ -20,7 +19,6 @@ enum OmniKind: String, Equatable {
     case tab
     /// A background session (`BackgroundSessionsModel`).
     case session
-    case worktree
     case command
     case agent
     /// A folder of folder completion (`OmniFolderRows`).
@@ -44,7 +42,6 @@ enum OmniScope: Hashable {
     /// A Mac drilled into: its tabs and sessions, then its projects.
     case mac(ProjectSwitcherModel.Machine, name: String)
     case tabs
-    case worktrees
     case commands
     /// The launchable agents (New Agent).
     case agents
@@ -59,7 +56,6 @@ enum OmniScope: Hashable {
         case .macs: "Macs"
         case .mac(_, let name): name
         case .tabs: "Tabs & Sessions"
-        case .worktrees: "Worktrees"
         case .commands: "Commands"
         case .agents: "Agents"
         case .agentPresets: "Add Agent"
@@ -81,7 +77,6 @@ enum OmniScope: Hashable {
         case ">": .commands
         case "@": .macs
         case "#": .tabs
-        case "/": .worktrees
         default: nil
         }
     }
@@ -91,6 +86,9 @@ enum OmniScope: Hashable {
 /// (`OmniBarPerformer`).
 enum OmniMenuCommand: String, CaseIterable {
     case newTab
+    case newWindow
+    case newHomeTerminal
+    case goHome
     case splitRight
     case detachTab
     case closeTab
@@ -101,11 +99,10 @@ enum OmniMenuCommand: String, CaseIterable {
     case endBackgroundSessions
     case persistentSessions
     case toggleSidebar
+    case connectAgents
+    case closeFinishedWorkers
     // Ids of the command palette's commands, kept so their usage carries
     // over (`OmniFrecencyStore`).
-    case addProject
-    case newWorktree
-    case manageWorktrees
     case toggleAppearance
 }
 
@@ -119,13 +116,9 @@ enum OmniCommand: Equatable {
     case openProjectInEditor(key: String, editorID: String)
     case revealInFinder(path: String)
     case copyPath(String)
-    /// New Worktree… in the open window of this project.
-    case newWorktreeInProject(key: String)
     case removeProject(key: String)
-    /// One of the picker menu's actions (`ProjectSwitcherActions.perform`).
+    /// Opens a project or acts on a Mac (`ProjectSwitcherActions.perform`).
     case switcher(TitlebarProjectMenuModel.Action)
-    case openFolder(on: ProjectSwitcherModel.Machine)
-    case addProject(on: ProjectSwitcherModel.Machine)
     case newTerminal(on: ProjectSwitcherModel.Machine)
     case endBackgroundSessions(on: ProjectSwitcherModel.Machine)
     case goToTab(UUID)
@@ -134,11 +127,6 @@ enum OmniCommand: Equatable {
     case closeTab(UUID)
     case openBackgroundSession(id: String)
     case endBackgroundSession(id: String)
-    case activateWorktree(root: String)
-    /// New worktree “<name>”: New Worktree with the branch name filled in.
-    case createWorktree(name: String)
-    case renameWorktree(root: String)
-    case removeWorktree(root: String)
     case menu(OmniMenuCommand)
     case launchAgent(id: String)
     case configureAgentPreset(id: String)
@@ -152,6 +140,10 @@ enum OmniCommand: Equatable {
     /// Adds the folder at this path (absolute, or `~/…` on a device) to
     /// the projects of its Mac, and opens it when `open`.
     case addFolder(path: String, on: ProjectSwitcherModel.Machine, open: Bool)
+    /// New folder “…”: makes the folder at this absolute path (not its
+    /// parents) on that Mac, then adds and opens it (`.add`) or opens it
+    /// once (`.openOnce`).
+    case createFolder(path: String, on: ProjectSwitcherModel.Machine, intent: OmniFolderIntent)
     /// A new terminal in this folder of that Mac.
     case newTerminalAt(path: String, on: ProjectSwitcherModel.Machine)
     /// Connects a device that is not connected (Reconnect), keeping the bar
@@ -175,7 +167,8 @@ struct OmniItem: Equatable, Identifiable {
     var id: String
     var kind: OmniKind
     var title: String
-    /// The one muted detail on the right.
+    /// The one muted detail on the right (a project's path when another
+    /// project of its Mac has its name, a tab's place).
     var detail = ""
     var status: OmniStatus?
     /// An SF Symbol, shown when it has no `logo`.
@@ -197,12 +190,15 @@ struct OmniItem: Equatable, Identifiable {
     var keywords: [String] = []
     /// The Mac it is on (projects, Macs, tabs and sessions).
     var machine: ProjectSwitcherModel.Machine?
-    /// The colour its `detail` is tinted with: a project on another Mac
-    /// names that Mac in its colour.
-    var detailColor: RemoteDeviceColor? = nil
+    /// The Mac a row on another Mac (a project, a tab, a background
+    /// session) is on, named after its detail in `machineColor`; empty for
+    /// This Mac's.
+    var machineName = ""
+    /// The colour its `machineName` is tinted with: that Mac's.
+    var machineColor: RemoteDeviceColor? = nil
     /// Added to its frecency in Recent: an open project, a working agent.
     var liveBoost: Double = 0
-    /// Whether ↵ records it as used (not a "New worktree" row).
+    /// Whether ↵ records it as used.
     var recordsUse = true
     /// What ⇥ puts in the field (a folder's path and "/").
     var completion: String? = nil
@@ -227,6 +223,7 @@ struct OmniItem: Equatable, Identifiable {
         case nil: break
         }
         if !detail.isEmpty { parts.append(detail) }
+        if !machineName.isEmpty { parts.append(machineName) }
         return parts.joined(separator: ", ")
     }
 }
@@ -441,8 +438,7 @@ enum OmniRanking {
 struct OmniTab: Equatable {
     var id: UUID
     var title: String
-    /// Its detail: its window's project name, or for a window with no
-    /// project (its home folder) its directory's name, "~" at home
+    /// Its detail: its window's project name, "Home" in its Mac's Home
     /// (`OmniTab.detail`).
     var projectName: String
     var machine: ProjectSwitcherModel.Machine
@@ -452,13 +448,15 @@ struct OmniTab: Equatable {
     /// its logo; nil for other tabs.
     var agentKey: String? = nil
 
-    /// A tab's detail: its window's folder name, unless the window is at
-    /// the home folder (no project), where it is the tab's directory's
-    /// name, or "~" when that is the home folder too (never the bare home
-    /// folder's name, the user's name). `home` is the Mac's home folder
-    /// when known; otherwise a `/Users/<name>` or `/home/<name>` window
-    /// counts as one.
-    static func detail(windowPath: String, workingDirectory: String?, home: String?) -> String {
+    /// A tab's detail: "Home" in its Mac's Home (`isHome`, `HomePlace`),
+    /// else its window's folder name, unless the window is at a home
+    /// folder Cherry does not know as Home (a device whose home it has not
+    /// read yet), where it is the tab's directory's name, or "~" when that
+    /// is the home folder too (never the bare home folder's name, the
+    /// user's name). `home` is the Mac's home folder when known; otherwise
+    /// a `/Users/<name>` or `/home/<name>` window counts as one.
+    static func detail(windowPath: String, workingDirectory: String?, home: String?, isHome: Bool = false) -> String {
+        if isHome { return HomePlace.name }
         if !SessionDisplayTitle.isHome(windowPath, home: home), windowPath != "/" {
             return SessionDisplayTitle.directoryName(windowPath, home: home)
         }
@@ -490,16 +488,6 @@ struct OmniBackgroundSession: Equatable {
     }
 }
 
-/// A worktree of the window's project.
-struct OmniWorktree: Equatable {
-    var root: String
-    var name: String
-    var branch: String?
-    var isActive: Bool
-    var canRename: Bool
-    var canRemove: Bool
-}
-
 struct OmniEditor: Equatable {
     var id: String
     var name: String
@@ -515,16 +503,20 @@ struct OmniAgent: Equatable {
 
 /// What the window the bar is open in can do now (the commands offered).
 struct OmniWindowContext: Equatable {
-    var hasWorkspace = true
     var hasSelectedTab = false
     var canSplit = false
     var canDetach = false
     var canReopenClosedTab = false
+    /// File › New Window opens another window of the window's project
+    /// (`RepositoryWorkspace.allowsAnotherWindow`).
+    var canOpenAnotherWindow = false
     var hasProject = false
-    var supportsWorktrees = false
     var isSidebarHidden = false
     var detachTitle = "Detach Tab"
     var closeTitle = "Close Tab"
+    /// The selected tab's sub-agents whose task settled (Close Finished
+    /// Workers).
+    var finishedWorkerCount = 0
 }
 
 /// Everything the bar lists, gathered from cached state (never by
@@ -532,17 +524,13 @@ struct OmniWindowContext: Equatable {
 struct OmniSources: Equatable {
     /// Projects and Macs (`ProjectSwitcherModel.make`).
     var projects = ProjectSwitcherModel(machines: [], locations: [])
-    /// Each device as the picker menu knows it, for its actions.
+    /// Each device and what is known of it now, for its actions.
     var devices: [TitlebarProjectMenuModel.Device] = []
     var tabs: [OmniTab] = []
     var backgroundSessions: [OmniBackgroundSession] = []
-    var repositoryName = ""
-    var worktrees: [OmniWorktree] = []
     var window = OmniWindowContext()
     /// Local projects in Settings › Projects (Remove from Projects).
     var listedLocalProjects: Set<String> = []
-    /// Keys of open windows whose project has worktrees (New Worktree…).
-    var worktreeProjectKeys: Set<String> = []
     /// The default editor each project opens in (Open in <editor>).
     var editorsByProjectKey: [String: OmniEditor] = [:]
     /// The editors the window's project opens in; the default one first.
@@ -550,7 +538,6 @@ struct OmniSources: Equatable {
     var agents: [OmniAgent] = []
     var agentPresets: [OmniAgent] = []
     var canModifyDevices = true
-    var now = Date(timeIntervalSince1970: 0)
     /// Folder listings by the folder typed (`OmniFolderBrowser`).
     var folderListings: [OmniFolderRequest: OmniFolderListing] = [:]
     /// The git repositories found under the usual places on each Mac
@@ -567,14 +554,18 @@ struct OmniSources: Equatable {
 
 /// Turns the sources into rows, one function per kind.
 enum OmniProviders {
-    static func macName(_ machine: ProjectSwitcherModel.Machine, in sources: OmniSources) -> String {
-        sources.projects.name(of: machine)
-    }
-
     // MARK: Projects
 
     static func projects(_ sources: OmniSources, on machine: ProjectSwitcherModel.Machine? = nil) -> [OmniItem] {
         let model = sources.projects
+        // Projects of one Mac that share a name (two "home" folders) say
+        // which folder each is; of all its projects, so a row says the
+        // same whatever the query. Home is none of them: its house says
+        // which it is.
+        var namesOnMachine: [String: Int] = [:]
+        for location in model.locations where !location.isHome {
+            namesOnMachine[sharedNameKey(location), default: 0] += 1
+        }
         return model.locations
             .filter { machine == nil || $0.machine == machine }
             .map { location in
@@ -590,20 +581,36 @@ enum OmniProviders {
                     id: "project:\(location.key)",
                     kind: .project,
                     title: location.name,
-                    detail: location.machine == .thisMac ? "" : model.name(of: location.machine),
+                    detail: !location.isHome && namesOnMachine[sharedNameKey(location), default: 0] > 1 ? location.displayPath : "",
                     status: status,
-                    symbol: "folder",
+                    symbol: location.isHome ? HomePlace.symbol : "folder",
                     primaryLabel: location.isOpen ? "Switch" : "Open",
                     primary: .openProject(key: location.key),
                     actions: projectActions(location, sources: sources),
-                    keywords: [location.displayPath],
+                    keywords: location.isHome ? [location.displayPath, "home"] : [location.displayPath],
                     machine: location.machine,
-                    detailColor: location.machine.deviceID.flatMap { id in
-                        sources.devices.first { $0.device.id == id }?.device.effectiveColor
-                    },
+                    machineName: machineName(location.machine, sources: sources),
+                    machineColor: machineColor(location.machine, sources: sources),
                     liveBoost: location.isOpen ? (location.isCurrent ? 10 : 40) : 0
                 )
             }
+    }
+
+    private static func sharedNameKey(_ location: ProjectSwitcherModel.Location) -> String {
+        "\(location.machine)\u{0}\(location.name.lowercased())"
+    }
+
+    /// The name a row on `machine` shows after its detail: its Mac's, none
+    /// for This Mac.
+    static func machineName(_ machine: ProjectSwitcherModel.Machine?, sources: OmniSources) -> String {
+        guard let machine, machine != .thisMac else { return "" }
+        return sources.projects.machine(machine)?.name ?? ""
+    }
+
+    /// The colour of that name: its Mac's, when the bar has its record.
+    static func machineColor(_ machine: ProjectSwitcherModel.Machine?, sources: OmniSources) -> RemoteDeviceColor? {
+        guard let id = machine?.deviceID else { return nil }
+        return sources.devices.first { $0.device.id == id }?.device.effectiveColor
     }
 
     static func projectActions(_ location: ProjectSwitcherModel.Location, sources: OmniSources) -> [OmniAction] {
@@ -615,16 +622,14 @@ enum OmniProviders {
             actions.append(.init(title: "Reveal in Finder", command: .revealInFinder(path: location.path)))
         }
         actions.append(.init(title: "Copy Path", command: .copyPath(location.path)))
-        if sources.worktreeProjectKeys.contains(location.key) {
-            actions.append(.init(title: "New Worktree…", command: .newWorktreeInProject(key: location.key)))
-        }
         switch location.machine {
         case .thisMac:
             if sources.listedLocalProjects.contains(location.key) {
                 actions.append(.init(title: "Remove from Projects", command: .removeProject(key: location.key), isDestructive: true))
             }
         case .device(let id):
-            if sources.canModifyDevices {
+            // A device's Home is never hidden.
+            if sources.canModifyDevices, !location.isHome {
                 actions.append(.init(
                     title: "Remove from Projects",
                     command: .switcher(.hideDeviceProject(deviceID: id, path: location.path)),
@@ -652,8 +657,13 @@ enum OmniProviders {
             .prefix(ProjectSwitcherModel.recentLimit))
         let listed = Set((open + recent).map(\.id))
         let all = items.filter { !listed.contains($0.id) }.sorted { lhs, rhs in
+            // Each Mac's Home first.
+            let lhsHome = location(lhs)?.isHome == true, rhsHome = location(rhs)?.isHome == true
+            if lhsHome != rhsHome { return lhsHome }
             let order = lhs.title.localizedStandardCompare(rhs.title)
             if order != .orderedSame { return order == .orderedAscending }
+            let machineOrder = lhs.machineName.localizedStandardCompare(rhs.machineName)
+            if machineOrder != .orderedSame { return machineOrder == .orderedAscending }
             return lhs.detail.localizedStandardCompare(rhs.detail) == .orderedAscending
         }
         return [
@@ -717,70 +727,56 @@ enum OmniProviders {
     }
 
     /// A Mac's ⌘K actions: its folders, a terminal on it, and, for a
-    /// device, what the picker menu offers for it now (Reconnect, Trust New
-    /// Identity…, Update Session Host…, Set Up Cherry MCP…, Rename…,
-    /// Remove…; `TitlebarProjectMenuModel.deviceItem`).
+    /// device, what can be done with it now (Reconnect, Trust New
+    /// Identity…, Update Session Host…, Rename…, Remove…).
     static func macActions(_ machine: ProjectSwitcherModel.Machine, sources: OmniSources) -> [OmniAction] {
         let hasBackground = sources.backgroundSessions.contains { $0.machine == machine }
+        let endBackgroundSessions = OmniAction(
+            title: "End Background Sessions…", command: .endBackgroundSessions(on: machine), isDestructive: true
+        )
         switch machine {
         case .thisMac:
             var actions: [OmniAction] = [
+                .init(title: "Go to Home", command: .menu(.goHome)),
                 .init(title: "Open Folder…", command: .browseFolders(on: .thisMac, intent: .openOnce)),
                 .init(title: "Add Project…", command: .browseFolders(on: .thisMac, intent: .add)),
                 .init(title: "New Terminal on This Mac", command: .newTerminal(on: .thisMac)),
                 .init(title: "Persistent Sessions…", command: .menu(.persistentSessions)),
             ]
-            if hasBackground {
-                actions.append(.init(title: "End Background Sessions…", command: .endBackgroundSessions(on: .thisMac), isDestructive: true))
-            }
+            if hasBackground { actions.append(endBackgroundSessions) }
             return actions
         case .device(let id):
             guard let entry = sources.devices.first(where: { $0.device.id == id }) else { return [] }
-            let item = TitlebarProjectMenuModel.deviceItem(
-                entry, currentProjectKey: nil, canModify: sources.canModifyDevices, now: sources.now
-            )
-            let offered: [TitlebarProjectMenuModel.Item] = (item.children ?? []).compactMap { child in
-                guard case .item(let menuItem) = child, menuItem.isEnabled, !menuItem.isAlternate,
-                      let action = menuItem.action
-                else { return nil }
-                switch action {
-                case .openDeviceHome, .addDeviceProject, .reconnectDevice, .trustDeviceIdentity,
-                     .updateDeviceHost, .setUpDeviceMCP, .renameDevice, .removeDevice:
-                    return menuItem
-                case .openDeviceSessions:
-                    // "Other sessions" and "Persistent Sessions on …" are one.
-                    return menuItem.title.hasPrefix("Persistent Sessions") ? menuItem : nil
-                default:
-                    return nil
-                }
-            }
+            let device = entry.device
+            let state = entry.state
+            // Its projects open only while it answers as itself; only the
+            // copy of the app that keeps the devices changes them.
+            let canOpen = state.allowsOpening
+            let canModify = sources.canModifyDevices
             var actions: [OmniAction] = []
-            for menuItem in offered {
-                guard let action = menuItem.action else { continue }
-                if case .renameDevice = action {
-                    // The machine's own actions go before its management.
-                    if hasBackground {
-                        actions.append(.init(
-                            title: "End Background Sessions…",
-                            command: .endBackgroundSessions(on: machine),
-                            isDestructive: true
-                        ))
-                    }
-                }
-                var isDestructive = false
-                if case .removeDevice = action { isDestructive = true }
-                if case .addDeviceProject = action {
-                    // Its folders, in the bar.
-                    actions.append(.init(title: menuItem.title, command: .browseFolders(on: machine, intent: .add)))
-                } else {
-                    actions.append(.init(title: menuItem.title, command: .switcher(action), isDestructive: isDestructive))
-                }
-                if case .addDeviceProject = action {
-                    actions.append(.init(title: "New Terminal on \(entry.device.name)", command: .newTerminal(on: machine)))
-                }
+            if canOpen, device.homeDirectory != nil {
+                actions.append(.init(title: "Go to Home", command: .switcher(.openDeviceHome(id))))
             }
-            if hasBackground, !actions.contains(where: { $0.title == "End Background Sessions…" }) {
-                actions.append(.init(title: "End Background Sessions…", command: .endBackgroundSessions(on: machine), isDestructive: true))
+            if canOpen, canModify {
+                // Its folders, in the bar.
+                actions.append(.init(title: "Add Project on \(device.name)…", command: .browseFolders(on: machine, intent: .add)))
+                actions.append(.init(title: "New Terminal on \(device.name)", command: .newTerminal(on: machine)))
+            }
+            if state.offersReconnect {
+                actions.append(.init(title: "Reconnect", command: .switcher(.reconnectDevice(id))))
+            }
+            if canModify, state.offersTrustNewIdentity {
+                actions.append(.init(title: "Trust New Identity…", command: .switcher(.trustDeviceIdentity(id))))
+            }
+            if canModify, entry.offersHostUpdate {
+                actions.append(.init(title: entry.hostUpdateTitle, command: .switcher(.updateDeviceHost(id))))
+            }
+            actions.append(.init(title: "Persistent Sessions on \(device.name)…", command: .switcher(.openDeviceSessions(id))))
+            // The machine's own actions go before its management.
+            if hasBackground { actions.append(endBackgroundSessions) }
+            if canModify {
+                actions.append(.init(title: "Rename…", command: .switcher(.renameDevice(id))))
+                actions.append(.init(title: "Remove…", command: .switcher(.removeDevice(id)), isDestructive: true))
             }
             return actions
         }
@@ -808,6 +804,8 @@ enum OmniProviders {
                     actions: actions,
                     keywords: agentKeywords(tab.agentKey),
                     machine: tab.machine,
+                    machineName: machineName(tab.machine, sources: sources),
+                    machineColor: machineColor(tab.machine, sources: sources),
                     liveBoost: tab.isWorking ? 30 : 0
                 )
             }
@@ -832,7 +830,9 @@ enum OmniProviders {
                         .init(title: "End Session", command: .endBackgroundSession(id: session.id), isDestructive: true),
                     ],
                     keywords: agentKeywords(session.agentKey),
-                    machine: session.machine
+                    machine: session.machine,
+                    machineName: machineName(session.machine, sources: sources),
+                    machineColor: machineColor(session.machine, sources: sources)
                 )
             }
     }
@@ -843,53 +843,6 @@ enum OmniProviders {
         guard let agentKey = agentKey?.nilIfEmpty else { return [] }
         let brand = AgentToolBrand(rawValue: agentKey) ?? AgentToolBrand.detect(name: agentKey)
         return [brand?.displayName ?? agentKey]
-    }
-
-    // MARK: Worktrees
-
-    static func worktrees(_ sources: OmniSources) -> [OmniItem] {
-        guard sources.window.supportsWorktrees else { return [] }
-        return sources.worktrees.map { worktree in
-            var actions: [OmniAction] = []
-            if worktree.canRename {
-                actions.append(.init(title: "Rename Branch…", command: .renameWorktree(root: worktree.root)))
-            }
-            if worktree.canRemove {
-                actions.append(.init(title: "Remove…", command: .removeWorktree(root: worktree.root), isDestructive: true))
-            }
-            return OmniItem(
-                id: "worktree:\(worktree.root)",
-                kind: .worktree,
-                title: worktree.name,
-                detail: sources.repositoryName,
-                status: worktree.isActive ? .idle : nil,
-                symbol: "arrow.triangle.branch",
-                primaryLabel: "Switch",
-                primary: .activateWorktree(root: worktree.root),
-                actions: actions,
-                keywords: [worktree.branch].compactMap { $0 }
-            )
-        }
-    }
-
-    /// "New worktree “<query>”", when the query names no worktree.
-    static func newWorktreeItem(query: String, sources: OmniSources) -> OmniItem? {
-        let name = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard sources.window.supportsWorktrees, !name.isEmpty else { return nil }
-        let folded = name.lowercased()
-        let exists = sources.worktrees.contains { worktree in
-            worktree.name.lowercased() == folded || worktree.branch?.lowercased() == folded
-        }
-        guard !exists else { return nil }
-        return OmniItem(
-            id: "worktree-new:\(name)",
-            kind: .worktree,
-            title: "New worktree “\(name)”",
-            symbol: "plus",
-            primaryLabel: "Create",
-            primary: .createWorktree(name: name),
-            recordsUse: false
-        )
     }
 
     // MARK: Commands
@@ -914,13 +867,29 @@ enum OmniProviders {
     }
 
     /// The palette's commands and the main menu's actions this window can
-    /// run now, then an agent row for each launchable agent.
+    /// run now, with their keys as the menus have them (`CherryShortcut`),
+    /// then an agent row for each launchable agent.
     static func commands(_ sources: OmniSources) -> [OmniItem] {
         let window = sources.window
-        var items: [OmniItem] = []
-        if window.hasWorkspace {
-            items.append(command(.newTab, title: "New Tab", shortcut: "⌘T", symbol: "plus.rectangle"))
+        var items: [OmniItem] = [
+            command(.newTab, title: "New Tab", shortcut: CherryShortcut.newTab.display, symbol: "plus.rectangle"),
+        ]
+        if window.canOpenAnotherWindow {
+            items.append(command(
+                .newWindow, title: "New Window",
+                shortcut: CherryShortcut.newWindow.display, symbol: "macwindow.badge.plus"
+            ))
         }
+        // Home (`HomePlace`), from any window.
+        items.append(command(
+            .newHomeTerminal, title: "New Terminal in Home",
+            shortcut: CherryShortcut.newHomeTerminal.display, symbol: "apple.terminal",
+            keywords: ["home", "quick", "scratch"]
+        ))
+        items.append(command(
+            .goHome, title: "Go to Home",
+            shortcut: CherryShortcut.goHome.display, symbol: HomePlace.symbol, keywords: ["~"]
+        ))
         if window.hasProject, !sources.agents.isEmpty {
             items.append(OmniItem(
                 id: "command:agents",
@@ -932,19 +901,34 @@ enum OmniProviders {
             ))
         }
         if window.canSplit {
-            items.append(command(.splitRight, title: "Split Right", shortcut: "⌘⇧D", symbol: "rectangle.split.2x1"))
+            items.append(command(
+                .splitRight, title: "Split Right",
+                shortcut: CherryShortcut.splitRight.display, symbol: "rectangle.split.2x1"
+            ))
         }
         if window.canDetach {
-            items.append(command(.detachTab, title: window.detachTitle, shortcut: "⌘D", symbol: "rectangle.portrait.and.arrow.right"))
+            items.append(command(
+                .detachTab, title: window.detachTitle,
+                shortcut: CherryShortcut.detachTab.display, symbol: "rectangle.portrait.and.arrow.right"
+            ))
         }
         if window.hasSelectedTab {
-            items.append(command(.closeTab, title: window.closeTitle, shortcut: "⌘W", symbol: "xmark.rectangle"))
+            items.append(command(
+                .closeTab, title: window.closeTitle,
+                shortcut: CherryShortcut.closeTab.display, symbol: "xmark.rectangle"
+            ))
         }
         if window.canReopenClosedTab {
-            items.append(command(.reopenClosedTab, title: "Reopen Closed Tab", shortcut: "⌘Z", symbol: "arrow.uturn.backward"))
+            items.append(command(
+                .reopenClosedTab, title: "Reopen Closed Tab",
+                shortcut: CherryShortcut.undoCloseTab.display, symbol: "arrow.uturn.backward"
+            ))
         }
         if window.hasSelectedTab {
-            items.append(command(.clearScrollback, title: "Clear Scrollback", shortcut: "⌘K", symbol: "clear"))
+            items.append(command(
+                .clearScrollback, title: "Clear Scrollback",
+                shortcut: CherryShortcut.clearScrollback.display, symbol: "clear"
+            ))
         }
         if let editor = sources.editors.first {
             items.append(OmniItem(
@@ -973,24 +957,12 @@ enum OmniProviders {
             id: "command:projects",
             kind: .command,
             title: "Projects",
-            detail: "⌘O",
+            detail: CherryShortcut.openProject.display,
             symbol: "folder",
             primaryLabel: "Show",
             primary: .drill(.projects)
         ))
         items += OmniFolderRows.browseItems(sources, on: .thisMac)
-        if window.supportsWorktrees {
-            items.append(OmniItem(
-                id: "command:worktrees",
-                kind: .command,
-                title: "Worktrees",
-                symbol: "arrow.triangle.branch",
-                primaryLabel: "Show",
-                primary: .drill(.worktrees)
-            ))
-            items.append(command(.newWorktree, title: "New Worktree…", symbol: "plus"))
-            items.append(command(.manageWorktrees, title: "Manage Worktrees…", symbol: "list.bullet"))
-        }
         items.append(OmniItem(
             id: "command:addAgent",
             kind: .command,
@@ -999,7 +971,10 @@ enum OmniProviders {
             primaryLabel: "Show",
             primary: .drill(.agentPresets)
         ))
-        items.append(command(.persistentSessions, title: "Persistent Sessions…", shortcut: "⌘⇧R", symbol: "rectangle.stack"))
+        items.append(command(
+            .persistentSessions, title: "Persistent Sessions…",
+            shortcut: CherryShortcut.persistentSessions.display, symbol: "rectangle.stack"
+        ))
         if !sources.backgroundSessions.isEmpty {
             items.append(command(.endBackgroundSessions, title: "End Background Sessions…", symbol: "stop.circle"))
         }
@@ -1007,14 +982,26 @@ enum OmniProviders {
             items.append(command(.addMac, title: "Add Mac…", symbol: "desktopcomputer"))
         }
         items.append(command(
+            .connectAgents, title: "Connect Agents to Cherry…", symbol: "link",
+            keywords: ["skill", "cherry command", "claude", "codex", "pi", "install"]
+        ))
+        if window.finishedWorkerCount > 0 {
+            var item = command(
+                .closeFinishedWorkers, title: "Close Finished Workers", symbol: "xmark.circle",
+                keywords: ["tasks", "workers", "agents", "done"]
+            )
+            item.detail = window.finishedWorkerCount == 1 ? "1 worker" : "\(window.finishedWorkerCount) workers"
+            items.append(item)
+        }
+        items.append(command(
             .toggleSidebar, title: window.isSidebarHidden ? "Show Sidebar" : "Hide Sidebar",
-            shortcut: "⌘S", symbol: "sidebar.left"
+            shortcut: CherryShortcut.hideSidebar.display, symbol: "sidebar.left"
         ))
         items.append(command(
             .toggleAppearance, title: "Toggle Light/Dark Mode",
             symbol: "circle.lefthalf.filled", keywords: ["appearance", "theme"]
         ))
-        items.append(command(.settings, title: "Settings", shortcut: "⌘,", symbol: "gearshape"))
+        items.append(command(.settings, title: "Settings", shortcut: CherryShortcut.settings.display, symbol: "gearshape"))
         return items + agents(sources)
     }
 
@@ -1086,7 +1073,7 @@ enum OmniProviders {
     /// and each Mac's Add Project and Open Folder rows.
     static func everything(_ sources: OmniSources) -> [OmniItem] {
         projects(sources) + tabs(sources) + backgroundSessions(sources) + macs(sources)
-            + worktrees(sources) + commands(sources) + OmniFolderRows.browseItems(sources)
+            + commands(sources) + OmniFolderRows.browseItems(sources)
             + OmniUnaddedRows.items(sources, withQuery: true)
     }
 
@@ -1170,12 +1157,6 @@ enum OmniSections {
             )
         case .tabs?:
             return ranked(OmniProviders.tabs(sources) + OmniProviders.backgroundSessions(sources))
-        case .worktrees?:
-            var sections = ranked(OmniProviders.worktrees(sources))
-            if !isEmpty, let create = OmniProviders.newWorktreeItem(query: query, sources: sources) {
-                sections.append(OmniSection(title: nil, rows: [OmniRow(item: create)]))
-            }
-            return merged(sections)
         case .commands?:
             return ranked(OmniProviders.commands(sources))
         case .agents?:
@@ -1310,7 +1291,7 @@ final class OmniBarController: ObservableObject {
         if let request = folderRequest {
             return "Folders on \(sources.projects.name(of: request.machine)) · ⇥ completes"
         }
-        return scope == nil ? "~/ Folders   @ Macs   # Tabs   / Worktrees   > Commands" : "⌫ to go back"
+        return scope == nil ? "~/ Folders   @ Macs   # Tabs   > Commands" : "⌫ to go back"
     }
 
     /// The listing the query asks for, when it is a path query.
@@ -1424,13 +1405,9 @@ final class OmniBarController: ObservableObject {
     }
 
     /// The field's text changed. At the root, a first character that is a
-    /// scope's prefix (`>`, `@`, `#`, `/`) enters that scope instead.
+    /// scope's prefix (`>`, `@`, `#`) enters that scope instead.
     func setQuery(_ text: String) {
-        // A pasted path ("/Users/…") is a query, not the Worktrees scope.
-        let isPastedPath = text.first == "/" && text.dropFirst().contains("/")
-        // Without worktrees, "/" starts a path.
-        let isPath = text.first == "/" && !sources.window.supportsWorktrees
-        if stack.isEmpty, query.isEmpty, !isPastedPath, !isPath, let first = text.first, let scope = OmniScope.forPrefix(first) {
+        if stack.isEmpty, query.isEmpty, let first = text.first, let scope = OmniScope.forPrefix(first) {
             stack = [scope]
             query = String(text.dropFirst().drop(while: \.isWhitespace))
             recompute(resetSelection: true)
@@ -1492,13 +1469,6 @@ final class OmniBarController: ObservableObject {
     func hover(id: String) {
         guard !isActionListOpen, selectedID != id, rows.contains(where: { $0.id == id }) else { return }
         selectedID = id
-    }
-
-    func select(_ index: Int) {
-        let rows = rows
-        guard rows.indices.contains(index) else { return }
-        selectedID = rows[index].id
-        isActionListOpen = false
     }
 
     func select(id: String) {

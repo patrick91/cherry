@@ -816,6 +816,144 @@ exec sleep 60"#,
 }
 
 #[test]
+fn subscribers_hear_modify_other_keys_turn_on_and_off() {
+    let host = Host::new();
+    let mut control = Control::subscribe(&host);
+    let dir = host.dir();
+    let (on, level1, again, reset) = (
+        dir.join("on"),
+        dir.join("level1"),
+        dir.join("again"),
+        dir.join("reset"),
+    );
+    let session = host.create(shell(&format!(
+        r#"stty -echo
+while [ ! -e '{on}' ]; do sleep 0.02; done
+printf '\033[>4;2m'
+while [ ! -e '{level1}' ]; do sleep 0.02; done
+printf '\033[>4;1m'
+while [ ! -e '{again}' ]; do sleep 0.02; done
+printf '\033[>4;2m'
+while [ ! -e '{reset}' ]; do sleep 0.02; done
+printf '\033[>4m'
+exec sleep 60"#,
+        on = on.display(),
+        level1 = level1.display(),
+        again = again.display(),
+        reset = reset.display(),
+    )));
+    let id = session.id.clone();
+    // Known, and off, from the start.
+    assert_eq!(session.modify_other_keys, Some(false));
+    let hear = |control: &mut Control, what: &str, on: bool| {
+        control.events_until(what, |event| {
+            matches!(event, SessionEvent::Changed { session } if session.id == id
+                && session.modify_other_keys == Some(on))
+        });
+    };
+    touch(&on);
+    hear(&mut control, "level 2", true);
+    assert_eq!(host.session(&id).modify_other_keys, Some(true));
+    // Attached clients are told too.
+    let (_attached, attached, ..) = host.attach(&id, 80, 24);
+    assert_eq!(attached.modify_other_keys, Some(true));
+    // Level 1 is off, as Ghostty encodes keys at level 1 as without it.
+    touch(&level1);
+    hear(&mut control, "level 1", false);
+    touch(&again);
+    hear(&mut control, "level 2 again", true);
+    touch(&reset);
+    hear(&mut control, "its reset", false);
+    host.kill(&id);
+}
+
+#[test]
+fn program_status_reports_become_session_records_until_the_program_ends() {
+    let host = Host::new();
+    let mut control = Control::subscribe(&host);
+    let dir = host.dir();
+    let (reply, blocked, exit) = (dir.join("reply"), dir.join("blocked"), dir.join("exit"));
+    // As Claude Code does: ask whether the terminal reads reports, then
+    // report only if it answered.
+    let session = host.create(shell(&format!(
+        r#"stty raw -echo
+printf '\033]7501;?\033\\'
+: > '{reply}'
+until [ "$(tail -c 2 '{reply}')" = "$(printf '\033\\')" ]; do dd bs=1 count=1 2>/dev/null >> '{reply}'; done
+printf '\033]7501;state=working:app=claude-code:msg=V3JpdGluZyBub3Rlcy50eHQ=\033\\'
+printf '\033]7501;id=lint:state=done:app=claude-code\033\\'
+while [ ! -e '{blocked}' ]; do sleep 0.02; done
+printf '\033]7501;state=blocked:app=claude-code:kind=question:msg=YW5zd2VyOiBUZWEgb3IgY29mZmVlPw==\007'
+while [ ! -e '{exit}' ]; do sleep 0.02; done
+exit 0"#,
+        reply = reply.display(),
+        blocked = blocked.display(),
+        exit = exit.display(),
+    )));
+    let id = session.id.clone();
+    let hear = |control: &mut Control, what: &str, check: &dyn Fn(&[ProgramStatus]) -> bool| {
+        control.events_until(what, |event| {
+            matches!(event, SessionEvent::Changed { session } if session.id == id
+                && check(&session.program_status))
+        });
+    };
+    hear(&mut control, "working", &|records| {
+        records.len() == 2 && records[0].state == ProgramStatusState::Working
+    });
+    // The host answered the support query: `?`, which is all Claude Code
+    // and Pi look for, and since revision 0.4 the states and kinds it takes,
+    // in one string to its terminator.
+    let answer = fs::read(&reply).unwrap();
+    let pairs = answer
+        .strip_prefix(b"\x1b]7501;?")
+        .and_then(|rest| rest.strip_suffix(b"\x1b\\"));
+    assert!(
+        pairs.is_some_and(|pairs| !pairs.iter().any(|&b| b == 0x1b || b == 0x07)),
+        "{:?}",
+        String::from_utf8_lossy(&answer)
+    );
+    assert_eq!(
+        host.session(&id).program_status,
+        [
+            ProgramStatus {
+                id: String::new(),
+                state: ProgramStatusState::Working,
+                kind: None,
+                progress: None,
+                app: "claude-code".into(),
+                title: String::new(),
+                message: "Writing notes.txt".into(),
+            },
+            ProgramStatus {
+                id: "lint".into(),
+                state: ProgramStatusState::Done,
+                kind: None,
+                progress: None,
+                app: "claude-code".into(),
+                title: String::new(),
+                message: String::new(),
+            },
+        ]
+    );
+    touch(&blocked);
+    hear(&mut control, "blocked", &|records| {
+        records.last().is_some_and(|record| {
+            record.state == ProgramStatusState::Blocked
+                && record.kind == Some(ProgramStatusKind::Question)
+                && record.message == "answer: Tea or coffee?"
+        })
+    });
+    // Attached clients are told too.
+    let (_attached, attached, ..) = host.attach(&id, 80, 24);
+    assert_eq!(attached.program_status.len(), 2);
+    // The program exits: its blocked record goes, the done one stays.
+    touch(&exit);
+    hear(&mut control, "the exit", &|records| {
+        records.len() == 1 && records[0].id == "lint"
+    });
+}
+
+#[test]
 fn clearing_history_leaves_the_screen_and_no_history_for_reads_and_reattaches() {
     let host = Host::new();
     let dir = host.dir();

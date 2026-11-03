@@ -21,6 +21,10 @@ struct AgentToolDefinition: Codable, Equatable, Identifiable {
         return "\(trimmedCommand) \(trimmedArguments)"
     }
 
+    var isLaunchable: Bool {
+        enabled && !commandLine.isEmpty
+    }
+
     init(name: String, command: String, arguments: String = "", enabled: Bool = true) {
         self.name = name
         self.command = command
@@ -169,6 +173,60 @@ extension AgentToolDefinition {
         let safeCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.=/:+")
         guard value.rangeOfCharacter(from: safeCharacters.inverted) != nil else { return value }
         return "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+}
+
+extension AgentToolDefinition {
+    /// The flags that let an agent CLI run tools without asking first:
+    /// Claude Code's, and Codex's in its short and long form.
+    static let permissionSkippingFlags: Set<String> = [
+        "--dangerously-skip-permissions",
+        "--yolo",
+        "--dangerously-bypass-approvals-and-sandbox",
+    ]
+
+    /// Whether the agent runs without permission prompts (Settings' "Skips
+    /// permission prompts" tag): a word of its command line, quoted or not,
+    /// is one of `permissionSkippingFlags`.
+    var skipsPermissionPrompts: Bool {
+        commandLine.split(whereSeparator: \.isWhitespace).contains { word in
+            Self.permissionSkippingFlags.contains(word.trimmingCharacters(in: CharacterSet(charactersIn: "\"'")))
+        }
+    }
+}
+
+/// Whether an agent CLI reports its state to Cherry (program status, OSC
+/// 7501, docs/cli.md): from which version, not at all, or not known. One
+/// that does not report is followed by its output going quiet.
+enum ProgramStatusSupport: Equatable, Sendable {
+    case reports(minimumVersion: String)
+    case doesNotReport
+    case unknown
+}
+
+extension AgentToolBrand {
+    /// The CLI's own name, as its agent's page says it: "Claude Code".
+    var productName: String {
+        switch self {
+        case .amp: "Amp"
+        case .claude: "Claude Code"
+        case .codex: "Codex"
+        case .gemini: "Gemini CLI"
+        case .openCode: "OpenCode"
+        case .pi: "Pi"
+        }
+    }
+
+    /// Whether the CLI reports its state (docs/cli.md › program status):
+    /// Claude Code from 2.1.295 and Pi from 1.1.0; Codex and Amp do not;
+    /// Gemini CLI and OpenCode are not known either way.
+    var programStatusSupport: ProgramStatusSupport {
+        switch self {
+        case .claude: .reports(minimumVersion: "2.1.295")
+        case .pi: .reports(minimumVersion: "1.1.0")
+        case .codex, .amp: .doesNotReport
+        case .gemini, .openCode: .unknown
+        }
     }
 }
 
@@ -418,25 +476,34 @@ struct ProjectCommandEnvironmentExtraction: Equatable {
     }
 }
 
-enum ProjectCommandStorage: String, CaseIterable, Identifiable {
+/// Where a project's command, features or appearance are saved: its
+/// cherry.toml, or this Mac's settings.
+enum ProjectSettingStorage {
     case projectFile
     case local
-
-    var id: String { rawValue }
 }
 
-enum ProjectFeatureStorage: String, CaseIterable, Identifiable {
+/// Where a project's value comes from (its row's badge in Settings,
+/// `SettingSource(_:)`): this Mac's value wins over the project's
+/// cherry.toml, which wins over the default.
+enum ProjectValueSource: Equatable, Sendable {
+    /// Neither sets it: the default.
+    case none
+    /// Only the project's cherry.toml sets it.
     case projectFile
-    case local
+    /// This Mac's value replaces the one cherry.toml sets.
+    case overridesProjectFile
+    /// Only this Mac sets it.
+    case thisMacOnly
 
-    var id: String { rawValue }
-}
-
-enum ProjectAppearanceStorage: String, CaseIterable, Identifiable {
-    case projectFile
-    case local
-
-    var id: String { rawValue }
+    init(thisMac: Bool, projectFile: Bool) {
+        switch (thisMac, projectFile) {
+        case (true, true): self = .overridesProjectFile
+        case (true, false): self = .thisMacOnly
+        case (false, true): self = .projectFile
+        case (false, false): self = .none
+        }
+    }
 }
 
 enum ProjectIdentityColor: String, CaseIterable, Codable, Equatable, Identifiable {
@@ -485,10 +552,9 @@ enum ProjectIdentityColor: String, CaseIterable, Codable, Equatable, Identifiabl
 }
 
 struct ProjectFeatureSettings: Codable, Equatable {
-    var notesEnabled: Bool
     var todosEnabled: Bool
 
-    static let disabled = ProjectFeatureSettings(notesEnabled: false, todosEnabled: false)
+    static let disabled = ProjectFeatureSettings(todosEnabled: false)
 }
 
 struct ProjectAppearanceSettings: Codable, Equatable {
@@ -497,12 +563,17 @@ struct ProjectAppearanceSettings: Codable, Equatable {
     static let none = ProjectAppearanceSettings(color: nil)
 }
 
+/// A project's local feature settings (`features.byProject`). The ones
+/// saved before notes were removed may also name `notesEnabled`: decoding
+/// ignores it and the next save drops it, on purpose (the setting went with
+/// notes, and only this Mac's Cherry reads these). cherry.toml keeps its
+/// `notes = …` line instead (`renderFeatureSection`): teammates' older
+/// builds read that file.
 struct ProjectFeatureOverrides: Codable, Equatable {
-    var notesEnabled: Bool?
     var todosEnabled: Bool?
 
     var isEmpty: Bool {
-        notesEnabled == nil && todosEnabled == nil
+        todosEnabled == nil
     }
 }
 
@@ -542,35 +613,20 @@ struct ProjectAppearanceOverrides: Codable, Equatable {
     }
 }
 
-enum AgentToolSource: Equatable {
-    case global
-}
-
-struct ResolvedAgentTool: Equatable, Identifiable {
-    let definition: AgentToolDefinition
-    let source: AgentToolSource
-
-    var id: String { definition.id }
-    var name: String { definition.name }
-    var commandLine: String { definition.commandLine }
-    var enabled: Bool { definition.enabled }
-    var isLaunchable: Bool {
-        definition.enabled && !definition.commandLine.isEmpty
-    }
-}
-
 struct ResolvedAgentProject: Equatable {
     let root: String?
-    let agents: [ResolvedAgentTool]
+    let agents: [AgentToolDefinition]
 
     var validProjectRoot: String? { root }
-    var launchableAgents: [ResolvedAgentTool] { agents.filter(\.isLaunchable) }
+    var launchableAgents: [AgentToolDefinition] { agents.filter(\.isLaunchable) }
 }
 
 enum AgentConfigurationError: LocalizedError, Equatable {
     case missingName
     case missingCommand(name: String)
     case duplicateName(String)
+    /// No agent has the name an edit names (it was removed meanwhile).
+    case unknownAgent(String)
 
     var errorDescription: String? {
         switch self {
@@ -580,6 +636,8 @@ enum AgentConfigurationError: LocalizedError, Equatable {
             "Agent '\(name)' is missing a command."
         case .duplicateName(let name):
             "Duplicate agent name: \(name)."
+        case .unknownAgent(let name):
+            "There is no agent named '\(name)'."
         }
     }
 }
@@ -607,7 +665,8 @@ struct CherryProject: Codable, Equatable, Identifiable {
     var id: String { root }
 
     var name: String {
-        URL(fileURLWithPath: root, isDirectory: true).lastPathComponent
+        // A Mac's Home is named so, never by its folder (the user's name).
+        HomePlace.isHome(root) ? HomePlace.name : URL(fileURLWithPath: root, isDirectory: true).lastPathComponent
     }
 }
 
@@ -691,14 +750,14 @@ final class AgentSettings: ObservableObject {
     @Published private(set) var commandsByProject: [String: [ProjectCommandDefinition]] = [:]
     @Published private(set) var featureOverridesByProject: [String: ProjectFeatureOverrides] = [:]
     @Published private(set) var appearanceOverridesByProject: [String: ProjectAppearanceOverrides] = [:]
-    @Published private(set) var hiddenWorktreesByProject: [String: Set<String>] = [:]
-    @Published private(set) var lastActiveWorktreeByProject: [String: String] = [:]
     /// This Mac's folders the user removed from Projects: the Omni bar
     /// never offers them as "Not added yet" (adding one again forgets it).
     @Published private(set) var removedProjectRoots: Set<String> = []
 
     private let defaults: UserDefaults
-    private var repositoryRootByWorktreeRoot: [String: String] = [:]
+    /// A project's folder as its tabs name it (links resolved, see
+    /// `registerProjectFolder`), by the project it belongs to.
+    private var projectRootByFolder: [String: String] = [:]
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -711,15 +770,19 @@ final class AgentSettings: ObservableObject {
         lastOpenedProjectRoot = Self.loadLastOpenedProjectRoot(from: defaults)
         agents = Self.loadAgents(from: defaults)
         commandsByProject = Self.loadCommandsByProject(from: defaults)
-        featureOverridesByProject = Self.loadFeatureOverridesByProject(from: defaults)
-        appearanceOverridesByProject = Self.loadAppearanceOverridesByProject(from: defaults)
-        hiddenWorktreesByProject = Self.loadHiddenWorktreesByProject(from: defaults)
-        lastActiveWorktreeByProject = Self.loadLastActiveWorktreesByProject(from: defaults)
+        featureOverridesByProject = Self.loadOverridesByProject(
+            ProjectFeatureOverrides.self,
+            forKey: Keys.featureOverridesByProject,
+            from: defaults,
+            isEmpty: \.isEmpty
+        )
+        appearanceOverridesByProject = Self.loadOverridesByProject(
+            ProjectAppearanceOverrides.self,
+            forKey: Keys.appearanceOverridesByProject,
+            from: defaults,
+            isEmpty: \.isEmpty
+        )
         removedProjectRoots = Set(defaults.stringArray(forKey: Keys.removedProjectRoots) ?? [])
-    }
-
-    var resolvedAgents: [ResolvedAgentTool] {
-        agents.map { ResolvedAgentTool(definition: $0, source: .global) }
     }
 
     func selectedProject(for root: String?) -> CherryProject? {
@@ -734,33 +797,20 @@ final class AgentSettings: ObservableObject {
         if let root = Self.validDirectory(lastOpenedProjectRoot ?? "") {
             return root
         }
-        return projects.first?.root
-    }
-
-    func projectRootForWindow(
-        requestedRoot: String?,
-        onboardedRoot: String?
-    ) -> String? {
-        if let root = Self.validDirectory(onboardedRoot ?? "") {
-            return root
-        }
-        if let root = Self.validDirectory(requestedRoot ?? "") {
-            return root
-        }
-        if let root = Self.validDirectory(lastOpenedProjectRoot ?? "") {
-            return root
-        }
-        return projects.first?.root
+        // With no project yet, Home: a first launch opens a terminal.
+        return projects.first?.root ?? HomePlace.thisMacKey
     }
 
     func resolvedProject(for requestedRoot: String?) -> ResolvedAgentProject {
         let root = Self.validDirectory(requestedRoot ?? "")
-        return ResolvedAgentProject(root: root, agents: resolvedAgents)
+        return ResolvedAgentProject(root: root, agents: agents)
     }
 
     func projectCommands(for requestedRoot: String?) -> [ProjectCommandDefinition] {
         guard let checkoutRoot = Self.validDirectory(requestedRoot ?? "") else { return [] }
-        let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
+        // Home has no commands, not even its folder's cherry.toml's.
+        guard !HomePlace.isHome(settingsRoot) else { return [] }
         var commands = CherryProjectFile.loadCommands(projectRoot: checkoutRoot)
         for localCommand in commandsByProject[settingsRoot] ?? [] {
             if let index = commands.firstIndex(where: { $0.normalizedName == localCommand.normalizedName }) {
@@ -779,9 +829,9 @@ final class AgentSettings: ObservableObject {
     /// Where the effective definition of a command currently lives. Local
     /// definitions shadow cherry.toml ones in `projectCommands(for:)`, so a
     /// name present in both is reported as `.local`.
-    func commandStorage(named name: String, for requestedRoot: String?) -> ProjectCommandStorage {
+    func commandStorage(named name: String, for requestedRoot: String?) -> ProjectSettingStorage {
         guard let checkoutRoot = Self.validDirectory(requestedRoot ?? "") else { return .local }
-        let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
         let normalizedName = AgentToolDefinition.normalizedName(name)
         if (commandsByProject[settingsRoot] ?? []).contains(where: { $0.normalizedName == normalizedName }) {
             return .local
@@ -797,17 +847,16 @@ final class AgentSettings: ObservableObject {
         guard let checkoutRoot = Self.validDirectory(requestedRoot ?? "") else {
             return .disabled
         }
-        let root = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        let root = projectRootByFolder[checkoutRoot] ?? checkoutRoot
+        // Home has no to-dos.
+        guard !HomePlace.isHome(root) else { return .disabled }
 
         let shared = CherryProjectFile.loadFeatureSettings(projectRoot: root) ?? .disabled
         guard let local = featureOverridesByProject[root] else {
             return shared
         }
 
-        return ProjectFeatureSettings(
-            notesEnabled: local.notesEnabled ?? shared.notesEnabled,
-            todosEnabled: local.todosEnabled ?? shared.todosEnabled
-        )
+        return ProjectFeatureSettings(todosEnabled: local.todosEnabled ?? shared.todosEnabled)
     }
 
     func projectFeatureOverrides(for requestedRoot: String?) -> ProjectFeatureOverrides {
@@ -849,12 +898,11 @@ final class AgentSettings: ObservableObject {
         return CherryProjectFile.loadAppearanceSettings(projectRoot: root) != nil
     }
 
-    func setProjectFeatures(_ features: ProjectFeatureSettings, for requestedRoot: String, storage: ProjectFeatureStorage) throws {
+    func setProjectFeatures(_ features: ProjectFeatureSettings, for requestedRoot: String, storage: ProjectSettingStorage) throws {
         guard let root = repositoryRoot(for: requestedRoot) else { return }
         switch storage {
         case .local:
             var overrides = featureOverridesByProject[root] ?? ProjectFeatureOverrides()
-            overrides.notesEnabled = features.notesEnabled
             overrides.todosEnabled = features.todosEnabled
             try setFeatureOverrides(overrides, for: root)
         case .projectFile:
@@ -862,7 +910,7 @@ final class AgentSettings: ObservableObject {
         }
     }
 
-    func setProjectAppearance(_ appearance: ProjectAppearanceSettings, for requestedRoot: String, storage: ProjectAppearanceStorage) throws {
+    func setProjectAppearance(_ appearance: ProjectAppearanceSettings, for requestedRoot: String, storage: ProjectSettingStorage) throws {
         guard let root = repositoryRoot(for: requestedRoot) else { return }
         switch storage {
         case .local:
@@ -882,6 +930,33 @@ final class AgentSettings: ObservableObject {
         guard let root = repositoryRoot(for: requestedRoot) else { return }
         appearanceOverridesByProject.removeValue(forKey: root)
         saveAppearanceOverrides()
+    }
+
+    /// Where a project's Todos value comes from: this Mac's override, its
+    /// cherry.toml's `[features]` (which sets it, off without a `todos`
+    /// line), both or neither.
+    func todosSource(for root: String) -> ProjectValueSource {
+        ProjectValueSource(
+            thisMac: projectFeatureOverrides(for: root).todosEnabled != nil,
+            projectFile: projectFileConfiguresFeatures(for: root)
+        )
+    }
+
+    /// Where a project's color comes from: this Mac's override (an explicit
+    /// None is one), its cherry.toml's `[appearance]`, both or neither.
+    func colorSource(for root: String) -> ProjectValueSource {
+        ProjectValueSource(
+            thisMac: !projectAppearanceOverrides(for: root).isEmpty,
+            projectFile: projectFileConfiguresAppearance(for: root)
+        )
+    }
+
+    /// Drops this Mac's Todos and Color overrides of a project, so its
+    /// cherry.toml (else the default) applies again. Its commands keep
+    /// theirs (`removeLocalCommand`), and cherry.toml is left alone.
+    func revertProjectToProjectFile(_ root: String) {
+        clearLocalProjectFeatureOverrides(for: root)
+        clearLocalProjectAppearanceOverrides(for: root)
     }
 
     @discardableResult
@@ -904,8 +979,6 @@ final class AgentSettings: ObservableObject {
         commandsByProject.removeValue(forKey: project.root)
         featureOverridesByProject.removeValue(forKey: project.root)
         appearanceOverridesByProject.removeValue(forKey: project.root)
-        hiddenWorktreesByProject.removeValue(forKey: project.root)
-        lastActiveWorktreeByProject.removeValue(forKey: project.root)
         if lastOpenedProjectRoot == project.root {
             lastOpenedProjectRoot = projects.first?.root
             saveLastOpenedProjectRoot()
@@ -914,8 +987,14 @@ final class AgentSettings: ObservableObject {
         saveCommands()
         saveFeatureOverrides()
         saveAppearanceOverrides()
-        saveHiddenWorktrees()
-        saveLastActiveWorktrees()
+    }
+
+    /// Forgets that the user removed `root` from Projects (Offer Again): the
+    /// Omni bar offers the folder as "Not added yet" again. It does not add
+    /// it.
+    func forgetRemovedProjectRoot(_ root: String) {
+        guard removedProjectRoots.remove(root) != nil else { return }
+        saveRemovedProjectRoots()
     }
 
     func markProjectOpened(_ projectRoot: String?) {
@@ -928,56 +1007,21 @@ final class AgentSettings: ObservableObject {
         saveLastOpenedProjectRoot()
     }
 
-    func registerWorktreeRoots(_ roots: [String], repositoryRoot: String) {
-        guard let canonicalRoot = Self.validDirectory(repositoryRoot) else { return }
-        for requestedRoot in roots {
-            guard let root = Self.validDirectory(requestedRoot) else { continue }
-            repositoryRootByWorktreeRoot[root] = canonicalRoot
+    /// Gives `folder` (a project's folder as its tabs name it: its links
+    /// resolved) the settings of the project at `projectRoot`.
+    func registerProjectFolder(_ folder: String, projectRoot: String) {
+        guard let canonicalRoot = Self.validDirectory(projectRoot) else { return }
+        if let root = Self.validDirectory(folder) {
+            projectRootByFolder[root] = canonicalRoot
         }
-        repositoryRootByWorktreeRoot[canonicalRoot] = canonicalRoot
+        projectRootByFolder[canonicalRoot] = canonicalRoot
     }
 
+    /// The project whose settings `requestedRoot` uses: the project it is
+    /// the folder of (`registerProjectFolder`), else itself.
     func repositoryRoot(for requestedRoot: String?) -> String? {
         guard let root = Self.validDirectory(requestedRoot ?? "") else { return nil }
-        return repositoryRootByWorktreeRoot[root] ?? root
-    }
-
-    func hiddenWorktreeRoots(for repositoryRoot: String) -> Set<String> {
-        guard let root = Self.validDirectory(repositoryRoot) else { return [] }
-        return hiddenWorktreesByProject[root] ?? []
-    }
-
-    func setHiddenWorktreeRoots(_ roots: Set<String>, for repositoryRoot: String) {
-        guard let root = Self.validDirectory(repositoryRoot) else { return }
-        let normalized = Set(roots.compactMap(Self.validDirectory))
-        if normalized.isEmpty {
-            hiddenWorktreesByProject.removeValue(forKey: root)
-        } else {
-            hiddenWorktreesByProject[root] = normalized
-        }
-        saveHiddenWorktrees()
-    }
-
-    func lastActiveWorktreeRoot(for repositoryRoot: String) -> String? {
-        guard let root = Self.validDirectory(repositoryRoot),
-              let worktreeRoot = lastActiveWorktreeByProject[root]
-        else {
-            return nil
-        }
-        return Self.validDirectory(worktreeRoot)
-    }
-
-    func markWorktreeOpened(_ worktreeRoot: String, repositoryRoot: String) {
-        guard let root = Self.validDirectory(repositoryRoot),
-              let worktree = Self.validDirectory(worktreeRoot)
-        else {
-            return
-        }
-        if lastActiveWorktreeByProject[root] != worktree {
-            lastActiveWorktreeByProject[root] = worktree
-            saveLastActiveWorktrees()
-        }
-        markProjectOpened(root)
+        return projectRootByFolder[root] ?? root
     }
 
     func upsertAgent(_ agent: AgentToolDefinition, replacing originalName: String? = nil) throws {
@@ -997,14 +1041,81 @@ final class AgentSettings: ObservableObject {
         try? setAgents(nextAgents)
     }
 
+    /// `name`, trimmed, when no agent has it (names are compared without
+    /// case), else the first of "<name> 2", "<name> 3"… that none has. A
+    /// taken name that ends in a number counts on from it: "Claude 2" gives
+    /// "Claude 3", not "Claude 2 2".
+    func availableAgentName(for name: String) -> String {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let taken = Set(agents.map(\.normalizedName))
+        guard taken.contains(AgentToolDefinition.normalizedName(name)) else { return name }
+        var base = name
+        var number = 2
+        if let space = name.lastIndex(of: " "),
+           case let digits = name[name.index(after: space)...],
+           digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+           let last = Int(digits), last > 0,
+           !name[..<space].trimmingCharacters(in: .whitespaces).isEmpty {
+            base = String(name[..<space])
+            number = last + 1
+        }
+        while taken.contains(AgentToolDefinition.normalizedName("\(base) \(number)")) {
+            number += 1
+        }
+        return "\(base) \(number)"
+    }
+
+    /// Adds `agent` after the others under a name no agent has
+    /// (`availableAgentName`): unlike `upsertAgent`, it never replaces
+    /// one. Returns the agent as stored.
+    @discardableResult
+    func addAgent(_ agent: AgentToolDefinition) throws -> AgentToolDefinition {
+        var added = agent
+        added.name = availableAgentName(for: agent.name)
+        try setAgents(agents + [added])
+        return agents[agents.count - 1]
+    }
+
+    /// Replaces the agent named `name` with `agent` where it is, so the
+    /// Agents menu, the sidebar and MCP's list keep their order
+    /// (`upsertAgent` moves it to the end). `agent` may rename it, but not
+    /// to another agent's name (`duplicateName`).
+    func updateAgent(named name: String, with agent: AgentToolDefinition) throws {
+        let index = try agentIndex(named: name)
+        var nextAgents = agents
+        nextAgents[index] = agent
+        try setAgents(nextAgents)
+    }
+
+    /// Adds a copy of the agent named `name` right after it, under a name
+    /// no agent has ("Claude 2"). Returns the copy as stored.
+    @discardableResult
+    func duplicateAgent(named name: String) throws -> AgentToolDefinition {
+        let index = try agentIndex(named: name)
+        var copy = agents[index]
+        copy.name = availableAgentName(for: copy.name)
+        var nextAgents = agents
+        nextAgents.insert(copy, at: index + 1)
+        try setAgents(nextAgents)
+        return agents[index + 1]
+    }
+
+    private func agentIndex(named name: String) throws -> Int {
+        let normalizedName = AgentToolDefinition.normalizedName(name)
+        guard let index = agents.firstIndex(where: { $0.normalizedName == normalizedName }) else {
+            throw AgentConfigurationError.unknownAgent(name)
+        }
+        return index
+    }
+
     func upsertCommand(
         _ command: ProjectCommandDefinition,
         for requestedRoot: String,
         replacing originalName: String? = nil,
-        storage: ProjectCommandStorage = .local
+        storage: ProjectSettingStorage = .local
     ) throws {
         guard let checkoutRoot = Self.validDirectory(requestedRoot) else { return }
-        let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
         let validatedCommand = try ProjectCommandConfiguration.validated([
             command.withPortableWorkingDirectory(projectRoot: ProjectLocation.launchPath(forKey: checkoutRoot))
         ]).first!
@@ -1037,11 +1148,36 @@ final class AgentSettings: ObservableObject {
 
     func removeCommand(named name: String, for requestedRoot: String) {
         guard let checkoutRoot = Self.validDirectory(requestedRoot) else { return }
-        let settingsRoot = repositoryRootByWorktreeRoot[checkoutRoot] ?? checkoutRoot
+        let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
         let normalizedName = AgentToolDefinition.normalizedName(name)
         let nextCommands = (commandsByProject[settingsRoot] ?? []).filter { $0.normalizedName != normalizedName }
         try? setCommands(nextCommands, for: settingsRoot)
         try? CherryProjectFile.removeCommand(named: name, projectRoot: checkoutRoot)
+    }
+
+    /// Where the command named `name` comes from: this Mac's copy replaces
+    /// cherry.toml's of the same name (`projectCommands(for:)`).
+    func commandSource(named name: String, for root: String) -> ProjectValueSource {
+        guard let checkoutRoot = Self.validDirectory(root) else { return .none }
+        let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
+        let normalizedName = AgentToolDefinition.normalizedName(name)
+        return ProjectValueSource(
+            thisMac: (commandsByProject[settingsRoot] ?? []).contains { $0.normalizedName == normalizedName },
+            projectFile: CherryProjectFile.loadCommands(projectRoot: checkoutRoot)
+                .contains { $0.normalizedName == normalizedName }
+        )
+    }
+
+    /// Removes this Mac's copy of the command named `name`, so cherry.toml's
+    /// applies again, if it has one. Unlike `removeCommand`, it leaves
+    /// cherry.toml alone.
+    func removeLocalCommand(named name: String, for root: String) {
+        guard let checkoutRoot = Self.validDirectory(root) else { return }
+        let settingsRoot = projectRootByFolder[checkoutRoot] ?? checkoutRoot
+        let normalizedName = AgentToolDefinition.normalizedName(name)
+        let localCommands = commandsByProject[settingsRoot] ?? []
+        guard localCommands.contains(where: { $0.normalizedName == normalizedName }) else { return }
+        try? setCommands(localCommands.filter { $0.normalizedName != normalizedName }, for: settingsRoot)
     }
 
     private func setAgents(_ agents: [AgentToolDefinition]) throws {
@@ -1078,7 +1214,7 @@ final class AgentSettings: ObservableObject {
     }
 
     private func saveProjects() {
-        Self.saveProjects(projects, to: defaults)
+        defaults.setJSON(projects, forKey: Keys.projects)
     }
 
     private func saveRemovedProjectRoots() {
@@ -1095,39 +1231,24 @@ final class AgentSettings: ObservableObject {
     }
 
     private func saveAgents() {
-        Self.saveAgents(agents, to: defaults)
+        defaults.setJSON(agents, forKey: Keys.agents)
     }
 
     private func saveCommands() {
-        Self.saveCommandsByProject(commandsByProject, to: defaults)
+        defaults.setJSON(commandsByProject, forKey: Keys.commandsByProject)
     }
 
     private func saveFeatureOverrides() {
-        Self.saveFeatureOverridesByProject(featureOverridesByProject, to: defaults)
+        defaults.setJSON(featureOverridesByProject, forKey: Keys.featureOverridesByProject)
     }
 
     private func saveAppearanceOverrides() {
-        Self.saveAppearanceOverridesByProject(appearanceOverridesByProject, to: defaults)
-    }
-
-    private func saveHiddenWorktrees() {
-        let encoded = hiddenWorktreesByProject.mapValues { Array($0).sorted() }
-        guard let data = try? JSONEncoder().encode(encoded) else { return }
-        defaults.set(data, forKey: Keys.hiddenWorktreesByProject)
-    }
-
-    private func saveLastActiveWorktrees() {
-        guard let data = try? JSONEncoder().encode(lastActiveWorktreeByProject) else { return }
-        defaults.set(data, forKey: Keys.lastActiveWorktreeByProject)
+        defaults.setJSON(appearanceOverridesByProject, forKey: Keys.appearanceOverridesByProject)
     }
 
     private static func loadProjects(from defaults: UserDefaults) -> [CherryProject] {
-        guard let data = defaults.data(forKey: Keys.projects),
-              let decoded = try? JSONDecoder().decode([CherryProject].self, from: data)
-        else {
-            return []
-        }
-        return decoded.filter { validDirectory($0.root) != nil }
+        let projects = defaults.decodedJSON([CherryProject].self, forKey: Keys.projects) ?? []
+        return projects.filter { validDirectory($0.root) != nil }
     }
 
     private static func loadLastOpenedProjectRoot(from defaults: UserDefaults) -> String? {
@@ -1135,19 +1256,16 @@ final class AgentSettings: ObservableObject {
     }
 
     private static func loadAgents(from defaults: UserDefaults) -> [AgentToolDefinition] {
-        if let data = defaults.data(forKey: Keys.agents),
-           let decoded = try? JSONDecoder().decode([AgentToolDefinition].self, from: data),
-           let validated = try? AgentConfiguration.validated(decoded) {
-            return validated
+        guard let decoded = defaults.decodedJSON([AgentToolDefinition].self, forKey: Keys.agents),
+              let validated = try? AgentConfiguration.validated(decoded)
+        else {
+            return []
         }
-
-        return migratedProjectAgents(from: defaults)
+        return validated
     }
 
     private static func loadCommandsByProject(from defaults: UserDefaults) -> [String: [ProjectCommandDefinition]] {
-        guard let data = defaults.data(forKey: Keys.commandsByProject),
-              let decoded = try? JSONDecoder().decode([String: [ProjectCommandDefinition]].self, from: data)
-        else {
+        guard let decoded = defaults.decodedJSON([String: [ProjectCommandDefinition]].self, forKey: Keys.commandsByProject) else {
             return [:]
         }
 
@@ -1164,129 +1282,26 @@ final class AgentSettings: ObservableObject {
         return commandsByProject
     }
 
-    private static func loadFeatureOverridesByProject(from defaults: UserDefaults) -> [String: ProjectFeatureOverrides] {
-        guard let data = defaults.data(forKey: Keys.featureOverridesByProject),
-              let decoded = try? JSONDecoder().decode([String: ProjectFeatureOverrides].self, from: data)
-        else {
+    /// The feature or appearance overrides saved under `key`, by project,
+    /// leaving out empty ones and projects whose folder is gone.
+    private static func loadOverridesByProject<Overrides: Decodable>(
+        _: Overrides.Type,
+        forKey key: String,
+        from defaults: UserDefaults,
+        isEmpty: (Overrides) -> Bool
+    ) -> [String: Overrides] {
+        guard let decoded = defaults.decodedJSON([String: Overrides].self, forKey: key) else {
             return [:]
         }
 
-        var overridesByProject: [String: ProjectFeatureOverrides] = [:]
+        var overridesByProject: [String: Overrides] = [:]
         for (root, overrides) in decoded {
-            guard let validRoot = validDirectory(root), !overrides.isEmpty else {
+            guard let validRoot = validDirectory(root), !isEmpty(overrides) else {
                 continue
             }
             overridesByProject[validRoot] = overrides
         }
         return overridesByProject
-    }
-
-    private static func loadAppearanceOverridesByProject(from defaults: UserDefaults) -> [String: ProjectAppearanceOverrides] {
-        guard let data = defaults.data(forKey: Keys.appearanceOverridesByProject),
-              let decoded = try? JSONDecoder().decode([String: ProjectAppearanceOverrides].self, from: data)
-        else {
-            return [:]
-        }
-
-        var overridesByProject: [String: ProjectAppearanceOverrides] = [:]
-        for (root, overrides) in decoded {
-            guard let validRoot = validDirectory(root), !overrides.isEmpty else {
-                continue
-            }
-            overridesByProject[validRoot] = overrides
-        }
-        return overridesByProject
-    }
-
-    private static func loadHiddenWorktreesByProject(from defaults: UserDefaults) -> [String: Set<String>] {
-        guard let data = defaults.data(forKey: Keys.hiddenWorktreesByProject),
-              let decoded = try? JSONDecoder().decode([String: [String]].self, from: data)
-        else {
-            return [:]
-        }
-
-        var result: [String: Set<String>] = [:]
-        for (repositoryRoot, worktreeRoots) in decoded {
-            guard let root = validDirectory(repositoryRoot) else { continue }
-            let normalized = Set(worktreeRoots.compactMap(validDirectory))
-            if !normalized.isEmpty {
-                result[root] = normalized
-            }
-        }
-        return result
-    }
-
-    private static func loadLastActiveWorktreesByProject(from defaults: UserDefaults) -> [String: String] {
-        guard let data = defaults.data(forKey: Keys.lastActiveWorktreeByProject),
-              let decoded = try? JSONDecoder().decode([String: String].self, from: data)
-        else {
-            return [:]
-        }
-
-        var result: [String: String] = [:]
-        for (repositoryRoot, worktreeRoot) in decoded {
-            guard let root = validDirectory(repositoryRoot),
-                  let worktree = validDirectory(worktreeRoot)
-            else {
-                continue
-            }
-            result[root] = worktree
-        }
-        return result
-    }
-
-    private static func migratedProjectAgents(from defaults: UserDefaults) -> [AgentToolDefinition] {
-        guard let data = defaults.data(forKey: Keys.legacyLocalAgentsByProject),
-              let decoded = try? JSONDecoder().decode([String: [AgentToolDefinition]].self, from: data)
-        else {
-            return []
-        }
-
-        for root in decoded.keys.sorted() {
-            guard let agents = decoded[root],
-                  !agents.isEmpty,
-                  let validated = try? AgentConfiguration.validated(agents)
-            else {
-                continue
-            }
-            return validated
-        }
-
-        return []
-    }
-
-    private static func saveProjects(_ projects: [CherryProject], to defaults: UserDefaults) {
-        guard let data = try? JSONEncoder().encode(projects) else { return }
-        defaults.set(data, forKey: Keys.projects)
-    }
-
-    private static func saveAgents(_ agents: [AgentToolDefinition], to defaults: UserDefaults) {
-        guard let data = try? JSONEncoder().encode(agents) else { return }
-        defaults.set(data, forKey: Keys.agents)
-    }
-
-    private static func saveCommandsByProject(
-        _ commandsByProject: [String: [ProjectCommandDefinition]],
-        to defaults: UserDefaults
-    ) {
-        guard let data = try? JSONEncoder().encode(commandsByProject) else { return }
-        defaults.set(data, forKey: Keys.commandsByProject)
-    }
-
-    private static func saveFeatureOverridesByProject(
-        _ overridesByProject: [String: ProjectFeatureOverrides],
-        to defaults: UserDefaults
-    ) {
-        guard let data = try? JSONEncoder().encode(overridesByProject) else { return }
-        defaults.set(data, forKey: Keys.featureOverridesByProject)
-    }
-
-    private static func saveAppearanceOverridesByProject(
-        _ overridesByProject: [String: ProjectAppearanceOverrides],
-        to defaults: UserDefaults
-    ) {
-        guard let data = try? JSONEncoder().encode(overridesByProject) else { return }
-        defaults.set(data, forKey: Keys.appearanceOverridesByProject)
     }
 
     static func normalizedPath(_ path: String) -> String {
@@ -1350,9 +1365,21 @@ final class AgentSettings: ObservableObject {
         static let commandsByProject = "commands.byProject"
         static let featureOverridesByProject = "features.byProject"
         static let appearanceOverridesByProject = "appearance.byProject"
-        static let hiddenWorktreesByProject = "worktrees.hiddenByProject"
-        static let lastActiveWorktreeByProject = "worktrees.lastActiveByProject"
-        static let legacyLocalAgentsByProject = "agents.localByProject"
+    }
+}
+
+private extension UserDefaults {
+    /// The value saved under `key` as JSON, or nil when there is none or it
+    /// does not decode.
+    func decodedJSON<Value: Decodable>(_: Value.Type, forKey key: String) -> Value? {
+        guard let encoded = data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(Value.self, from: encoded)
+    }
+
+    /// Saves `value` under `key` as JSON (nothing when it does not encode).
+    func setJSON<Value: Encodable>(_ value: Value, forKey key: String) {
+        guard let encoded = try? JSONEncoder().encode(value) else { return }
+        set(encoded, forKey: key)
     }
 }
 
@@ -1409,14 +1436,10 @@ enum CherryProjectFile {
     @MainActor
     private static var parseCache: [String: ParsedFile] = [:]
 
+    /// Forgets the parse of a project's cherry.toml: after a write, or when a
+    /// device project's cherry.toml changed (`RemoteProjectFiles`).
     @MainActor
-    private static func invalidate(projectRoot: String) {
-        parseCache[projectRoot] = nil
-    }
-
-    /// A device project's cherry.toml changed (`RemoteProjectFiles`).
-    @MainActor
-    static func invalidateRemote(projectRoot: String) {
+    static func invalidate(projectRoot: String) {
         parseCache[projectRoot] = nil
     }
 
@@ -1457,10 +1480,7 @@ enum CherryProjectFile {
         parsed.commands = (try? ProjectCommandConfiguration.validated(parseCommands(from: commandSource))) ?? []
         if let featureSource = tableSection(named: "features", in: contents) {
             let fields = parseKeyValues(from: featureSource)
-            parsed.features = ProjectFeatureSettings(
-                notesEnabled: boolValue(fields["notes"]) ?? false,
-                todosEnabled: boolValue(fields["todos"]) ?? false
-            )
+            parsed.features = ProjectFeatureSettings(todosEnabled: boolValue(fields["todos"]) ?? false)
         }
         if let appearanceSource = tableSection(named: "appearance", in: contents) {
             let fields = parseKeyValues(from: appearanceSource)
@@ -1488,43 +1508,41 @@ enum CherryProjectFile {
 
     @MainActor
     static func writeFeatureSettings(_ features: ProjectFeatureSettings, projectRoot: String) throws {
-        try requireLocal(projectRoot)
-        defer { invalidate(projectRoot: projectRoot) }
-        let url = fileURL(projectRoot: projectRoot)
-        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        let nextSection = renderFeatureSection(features)
-        let nextContents: String
-
-        if let range = tableSectionRange(named: "features", in: existing) {
-            let replacement = range.upperBound == existing.endIndex ? nextSection : nextSection + "\n"
-            nextContents = existing.replacingCharacters(in: range, with: replacement)
-        } else if existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            nextContents = nextSection
-        } else {
-            nextContents = existing.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n" + nextSection
+        try writeTableSection(named: "features", projectRoot: projectRoot) { existing in
+            renderFeatureSection(features, replacing: existing)
         }
-
-        try nextContents.trimmingCharacters(in: .whitespacesAndNewlines)
-            .appending("\n")
-            .write(to: url, atomically: true, encoding: .utf8)
     }
 
     @MainActor
     static func writeAppearanceSettings(_ appearance: ProjectAppearanceSettings, projectRoot: String) throws {
+        try writeTableSection(named: "appearance", projectRoot: projectRoot) { _ in
+            renderAppearanceSection(appearance)
+        }
+    }
+
+    /// Replaces the `[table]` section of the project's cherry.toml with the
+    /// section `render` makes of the current one (nil when there is none),
+    /// or appends it.
+    @MainActor
+    private static func writeTableSection(
+        named table: String,
+        projectRoot: String,
+        _ render: (_ existing: String?) -> String
+    ) throws {
         try requireLocal(projectRoot)
         defer { invalidate(projectRoot: projectRoot) }
         let url = fileURL(projectRoot: projectRoot)
         let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        let nextSection = renderAppearanceSection(appearance)
+        let section = render(tableSection(named: table, in: existing))
         let nextContents: String
 
-        if let range = tableSectionRange(named: "appearance", in: existing) {
-            let replacement = range.upperBound == existing.endIndex ? nextSection : nextSection + "\n"
+        if let range = tableSectionRange(named: table, in: existing) {
+            let replacement = range.upperBound == existing.endIndex ? section : section + "\n"
             nextContents = existing.replacingCharacters(in: range, with: replacement)
         } else if existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            nextContents = nextSection
+            nextContents = section
         } else {
-            nextContents = existing.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n" + nextSection
+            nextContents = existing.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n" + section
         }
 
         try nextContents.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1599,12 +1617,28 @@ enum CherryProjectFile {
         return lines.joined(separator: "\n")
     }
 
-    private static func renderFeatureSection(_ features: ProjectFeatureSettings) -> String {
-        [
-            "[features]",
-            "notes = \(features.notesEnabled ? "true" : "false")",
-            "todos = \(features.todosEnabled ? "true" : "false")"
-        ].joined(separator: "\n")
+    /// The `[features]` section with `todos` set. An existing section keeps
+    /// its other lines: a `notes = …` that builds from before notes were
+    /// removed still read stays as it is for teammates on those builds.
+    private static func renderFeatureSection(_ features: ProjectFeatureSettings, replacing existing: String?) -> String {
+        let todosLine = "todos = \(features.todosEnabled ? "true" : "false")"
+        guard let existing else {
+            return ["[features]", todosLine].joined(separator: "\n")
+        }
+        var lines = existing.components(separatedBy: "\n")
+        while let last = lines.last, last.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.removeLast()
+        }
+        var replaced = false
+        lines = lines.compactMap { line -> String? in
+            guard parseKeyValues(from: line).keys.contains("todos") else { return line }
+            defer { replaced = true }
+            return replaced ? nil : todosLine
+        }
+        if !replaced {
+            lines.append(todosLine)
+        }
+        return lines.joined(separator: "\n")
     }
 
     private static func renderAppearanceSection(_ appearance: ProjectAppearanceSettings) -> String {

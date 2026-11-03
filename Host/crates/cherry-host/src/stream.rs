@@ -4,7 +4,7 @@
 //!
 //! The host terminal answers a fixed set of queries whether or not a client
 //! is attached; those are removed from the renderers' stream. Every other
-//! query (`CSI ?6n`, an OSC 52 read, OSC 13–19 colour queries, `CSI 19–21
+//! query (`CSI ?15n`, an OSC 52 read, OSC 13–19 colour queries, `CSI 20/21
 //! t`, ANSI `$p`, an XTGETTCAP name the host does not know, …) is split out
 //! of it too, into `Batch::queries`: the session sends those to one attached
 //! renderer (`ServerMessage::Query`), whose terminal answers. They are not
@@ -279,7 +279,7 @@ impl DisplayStream {
             if self.mode == Mode::Ground {
                 at = self.ground(bytes, at, batch);
             } else {
-                self.step(&bytes[at..at + 1], batch);
+                self.step(bytes[at], batch);
                 at += 1;
             }
         }
@@ -348,129 +348,127 @@ impl DisplayStream {
     }
 
     /// Byte at a time: whatever the ground state's fast paths leave.
-    fn step(&mut self, bytes: &[u8], batch: &mut Batch) {
-        for &b in bytes {
-            if self.mode == Mode::Ground {
-                match b {
-                    0x1b => {
-                        self.pending.push(b);
-                        self.mode = Mode::Escape;
-                    }
-                    0xc2..=0xf4 => {
-                        self.pending.push(b);
-                        self.mode = Mode::Utf8;
-                        self.utf8_left = if b < 0xe0 {
-                            1
-                        } else if b < 0xf0 {
-                            2
-                        } else {
-                            3
-                        };
-                    }
-                    ENQ => batch.control(b),
-                    _ => {
-                        batch.terminal.push(b);
-                        batch.display.push(b);
-                    }
+    fn step(&mut self, b: u8, batch: &mut Batch) {
+        if self.mode == Mode::Ground {
+            match b {
+                0x1b => {
+                    self.pending.push(b);
+                    self.mode = Mode::Escape;
                 }
-                continue;
-            }
-            if self.mode == Mode::Utf8 && !(0x80..=0xbf).contains(&b) {
-                self.finish(batch);
-                self.step(&[b], batch);
-                continue;
-            }
-            // ESC starts a new sequence even inside an unfinished CSI or
-            // escape sequence. The abandoned prefix had no display effect.
-            if b == 0x1b && matches!(self.mode, Mode::Csi | Mode::Escape) {
-                self.pending.clear();
-                self.pending.push(b);
-                self.mode = Mode::Escape;
-                self.discarding = false;
-                continue;
-            }
-            if b == 0x18 || b == 0x1a {
-                // CAN/SUB abort an unfinished control without exposing its
-                // partial prefix to either parser or recovery journal.
-                self.pending.clear();
-                self.reset();
-                batch.terminal.push(b);
-                batch.display.push(b);
-                continue;
-            }
-            if matches!(self.mode, Mode::Csi | Mode::Escape) && b < 0x20 {
-                // Embedded C0 controls execute immediately, without ending
-                // the CSI (a BEL here must not make a query evade filtering).
-                batch.control(b);
-                continue;
-            }
-            if matches!(self.mode, Mode::Osc | Mode::String) && self.escaped && b != b'\\' {
-                // ESC followed by anything except ST abandons the old
-                // string and is the start of a fresh escape sequence.
-                self.pending.clear();
-                self.pending.push(0x1b);
-                self.mode = Mode::Escape;
-                self.escaped = false;
-                self.discarding = false;
-                self.step(&[b], batch);
-                continue;
-            }
-            if matches!(self.mode, Mode::Escape | Mode::Csi | Mode::String) && b >= 0x7f {
-                match b {
-                    0x80..=0x9f => {
-                        self.eight_bit_control(b, batch);
-                        continue;
-                    }
-                    // DEL is a string's data.
-                    0x7f if self.mode == Mode::String => {}
-                    // Ghostty ignores DEL in a sequence, and 0xa0 and up
-                    // anywhere but in an OSC string.
-                    _ => continue,
+                0xc2..=0xf4 => {
+                    self.pending.push(b);
+                    self.mode = Mode::Utf8;
+                    self.utf8_left = if b < 0xe0 {
+                        1
+                    } else if b < 0xf0 {
+                        2
+                    } else {
+                        3
+                    };
+                }
+                ENQ => batch.control(b),
+                _ => {
+                    batch.terminal.push(b);
+                    batch.display.push(b);
                 }
             }
-            if !self.discarding {
-                self.pending.push(b);
+            return;
+        }
+        if self.mode == Mode::Utf8 && !(0x80..=0xbf).contains(&b) {
+            self.finish(batch);
+            self.step(b, batch);
+            return;
+        }
+        // ESC starts a new sequence even inside an unfinished CSI or
+        // escape sequence. The abandoned prefix had no display effect.
+        if b == 0x1b && matches!(self.mode, Mode::Csi | Mode::Escape) {
+            self.pending.clear();
+            self.pending.push(b);
+            self.mode = Mode::Escape;
+            self.discarding = false;
+            return;
+        }
+        if b == 0x18 || b == 0x1a {
+            // CAN/SUB abort an unfinished control without exposing its
+            // partial prefix to either parser or recovery journal.
+            self.pending.clear();
+            self.reset();
+            batch.terminal.push(b);
+            batch.display.push(b);
+            return;
+        }
+        if matches!(self.mode, Mode::Csi | Mode::Escape) && b < 0x20 {
+            // Embedded C0 controls execute immediately, without ending
+            // the CSI (a BEL here must not make a query evade filtering).
+            batch.control(b);
+            return;
+        }
+        if matches!(self.mode, Mode::Osc | Mode::String) && self.escaped && b != b'\\' {
+            // ESC followed by anything except ST abandons the old
+            // string and is the start of a fresh escape sequence.
+            self.pending.clear();
+            self.pending.push(0x1b);
+            self.mode = Mode::Escape;
+            self.escaped = false;
+            self.discarding = false;
+            self.step(b, batch);
+            return;
+        }
+        if matches!(self.mode, Mode::Escape | Mode::Csi | Mode::String) && b >= 0x7f {
+            match b {
+                0x80..=0x9f => {
+                    self.eight_bit_control(b, batch);
+                    return;
+                }
+                // DEL is a string's data.
+                0x7f if self.mode == Mode::String => {}
+                // Ghostty ignores DEL in a sequence, and 0xa0 and up
+                // anywhere but in an OSC string.
+                _ => return,
             }
-            let complete = match self.mode {
-                Mode::Escape => match b {
-                    b'[' => {
-                        self.mode = Mode::Csi;
-                        false
-                    }
-                    b']' => {
-                        self.mode = Mode::Osc;
-                        false
-                    }
-                    b'P' | b'_' | b'^' | b'X' => {
-                        self.mode = Mode::String;
-                        self.string = b;
-                        false
-                    }
-                    0x20..=0x2f => false,
-                    _ => true,
-                },
-                Mode::Csi => (0x40..=0x7e).contains(&b),
-                Mode::Osc | Mode::String => {
-                    let end = (self.escaped && b == b'\\') || (self.mode == Mode::Osc && b == 7);
-                    self.escaped = b == 0x1b;
-                    end
+        }
+        if !self.discarding {
+            self.pending.push(b);
+        }
+        let complete = match self.mode {
+            Mode::Escape => match b {
+                b'[' => {
+                    self.mode = Mode::Csi;
+                    false
                 }
-                Mode::Utf8 => {
-                    self.utf8_left -= 1;
-                    self.utf8_left == 0
+                b']' => {
+                    self.mode = Mode::Osc;
+                    false
                 }
-                Mode::Ground => unreachable!(),
-            };
-            if complete {
-                self.finish(batch);
-            } else if self.pending.len() > self.limit() {
-                // Oversized control strings cannot grow memory without bound.
-                if self.limit() == MAX_CLIPBOARD {
-                    self.dropped_clipboard_writes += 1;
+                b'P' | b'_' | b'^' | b'X' => {
+                    self.mode = Mode::String;
+                    self.string = b;
+                    false
                 }
-                self.pending.clear();
-                self.discarding = true;
+                0x20..=0x2f => false,
+                _ => true,
+            },
+            Mode::Csi => (0x40..=0x7e).contains(&b),
+            Mode::Osc | Mode::String => {
+                let end = (self.escaped && b == b'\\') || (self.mode == Mode::Osc && b == 7);
+                self.escaped = b == 0x1b;
+                end
             }
+            Mode::Utf8 => {
+                self.utf8_left -= 1;
+                self.utf8_left == 0
+            }
+            Mode::Ground => unreachable!(),
+        };
+        if complete {
+            self.finish(batch);
+        } else if self.pending.len() > self.limit() {
+            // Oversized control strings cannot grow memory without bound.
+            if self.limit() == MAX_CLIPBOARD {
+                self.dropped_clipboard_writes += 1;
+            }
+            self.pending.clear();
+            self.discarding = true;
         }
     }
 
@@ -676,17 +674,18 @@ fn route_csi(token: &[u8]) -> Route {
     let host = match (last, prefix, intermediates) {
         // Device attributes (primary, secondary, tertiary).
         (b'c', None | Some(b'>' | b'='), b"") => true,
-        // Status and cursor reports, and the colour-scheme report.
+        // Status and cursor reports, the extended cursor report (DECXCPR)
+        // and the colour-scheme report.
         (b'n', None, b"") => matches!(params, b"5" | b"6"),
-        (b'n', Some(b'?'), b"") => params == b"996",
-        // DEC private mode reports; ANSI mode requests are not answered.
-        (b'p', Some(b'?'), b"$") => true,
+        (b'n', Some(b'?'), b"") => matches!(params, b"6" | b"996"),
+        // Mode reports (DECRQM), DEC private and ANSI.
+        (b'p', Some(b'?') | None, b"$") => true,
         // XTVERSION.
         (b'q', Some(b'>'), b"") => true,
         // Kitty keyboard flags, whatever the parameters.
         (b'u', Some(b'?'), b"") => true,
-        // Text area and cell size reports.
-        (b't', None, b"") => matches!(params, b"14" | b"16" | b"18"),
+        // Text area, cell and screen size reports.
+        (b't', None, b"") => matches!(params, b"14" | b"16" | b"18" | b"19"),
         _ => false,
     };
     if host {
@@ -703,11 +702,9 @@ fn route_csi(token: &[u8]) -> Route {
 fn csi_query(last: u8, prefix: Option<u8>, params: &[u8], intermediates: &[u8]) -> bool {
     let first = params.split(|&b| b == b';').next().unwrap_or_default();
     match (last, prefix, intermediates) {
-        // Status reports (DSR, DECXCPR and the other DEC reports); `CSI > n`
-        // sets key modifier options instead.
+        // Status reports (DSR and the other DEC reports); `CSI > n` sets key
+        // modifier options instead.
         (b'n', None | Some(b'?'), b"") => true,
-        // ANSI mode requests (DECRQM without `?`).
-        (b'p', None, b"$") => true,
         // Window and title reports (XTWINOPS); not the window operations or
         // the title stack.
         (b't', None, b"") => matches!(
@@ -812,6 +809,10 @@ fn route_osc(token: &[u8]) -> Route {
     match fields[0] {
         // Kitty clipboard: the host always replies (with an error).
         b"5522" => Route::Host,
+        // Program status (OSC 7501): the host keeps the records and answers
+        // the support query (`7501;?`); renderers never see either, so no
+        // surface answers too or keeps records of its own.
+        b"7501" => Route::Host,
         // Palette: `4;index;spec;index;spec…`. The host answers queries.
         b"4" => {
             let (answered, sets, _) = indexed_colours(&fields, terminator);
@@ -1165,6 +1166,8 @@ mod tests {
             ("kitty colors", b"\x1b]21;foreground=?\x1b\\"),
             ("kitty clipboard read", b"\x1b]5522;type=read\x1b\\"),
             ("kitty clipboard write", b"\x1b]5522;type=write\x1b\\"),
+            ("program status support", b"\x1b]7501;?\x1b\\"),
+            ("program status support (BEL)", b"\x1b]7501;?\x07"),
             ("SGR state", b"\x1bP$qm\x1b\\"),
             ("invalid DECRQSS", b"\x1bP$qz\x1b\\"),
             ("termcap known", b"\x1bP+q4d73\x1b\\"),
@@ -1191,6 +1194,19 @@ mod tests {
                 host_answered != forwarded,
                 "{label}: host answered={host_answered}, forwarded={forwarded}"
             );
+        }
+    }
+
+    #[test]
+    fn program_status_reports_reach_only_the_host() {
+        for report in [
+            &b"\x1b]7501;state=working:app=claude-code\x1b\\"[..],
+            b"\x1b]7501;state=clear\x07",
+        ] {
+            let batch = split(report);
+            assert_eq!(batch.terminal, report);
+            assert!(batch.display.is_empty());
+            assert!(batch.queries.is_empty());
         }
     }
 
@@ -1269,18 +1285,18 @@ mod tests {
     #[test]
     fn queries_keep_their_place_in_the_stream() {
         let mut stream = DisplayStream::default();
-        let mut batch = stream.feed(b"ab\x1b[?6n\x1b]13;?\x07cd\x1b[?");
+        let mut batch = stream.feed(b"ab\x1b[?15n\x1b]13;?\x07cd\x1b[?");
         assert_eq!(batch.display, b"abcd");
         // Adjacent queries travel together.
-        assert_eq!(batch.queries, [(2, b"\x1b[?6n\x1b]13;?\x07".to_vec())]);
+        assert_eq!(batch.queries, [(2, b"\x1b[?15n\x1b]13;?\x07".to_vec())]);
         // A query completed by a later read, and one interrupting UTF-8.
-        batch.append(stream.feed(b"15nef\xe2\x05\x82\xac"));
+        batch.append(stream.feed(b"53nef\xe2\x05\x82\xac"));
         assert_eq!(batch.display, b"abcdef\xe2\x82\xac");
         assert_eq!(
             batch.queries,
             [
-                (2, b"\x1b[?6n\x1b]13;?\x07".to_vec()),
-                (4, b"\x1b[?15n".to_vec()),
+                (2, b"\x1b[?15n\x1b]13;?\x07".to_vec()),
+                (4, b"\x1b[?53n".to_vec()),
                 (7, b"\x05".to_vec()),
             ]
         );
@@ -1605,9 +1621,10 @@ mod tests {
     }
 
     /// The fast paths against the byte-at-a-time state machine they
-    /// replaced (`reference`, which is HEAD's stream.rs of before them):
-    /// random output of every kind, read in random pieces, then flushed
-    /// with terminators, must split the same, read by read.
+    /// replaced (`reference`: it and the CSI routing as they were before
+    /// them, with the rest of the routing shared): random output of every
+    /// kind, read in random pieces, then flushed with terminators, must
+    /// split the same, read by read.
     #[test]
     fn the_fast_paths_split_output_as_the_reference_does() {
         for seed in [1u64, 31, 97, 4242] {
@@ -1691,7 +1708,7 @@ mod tests {
             (b"\x1b]11;?\x07", true),
             (b"\x1b_Ga=t,q=0;AAAA\x1b\\", true),
             // Only a client answers these.
-            (b"\x1b[?6n\x1b]13;?\x07\x05", false),
+            (b"\x1b[?15n\x1b]13;?\x07\x05", false),
             (b"\x1b]2;title\x07\x1b[?1049h", false),
         ] {
             assert_eq!(

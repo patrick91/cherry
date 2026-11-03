@@ -19,12 +19,11 @@
 //!   that was not newer in the last `RETRY_AFTER` (`handover.json` in the
 //!   state directory): another client's older build won the race to start
 //!   the next daemon, and trying again would only take turns with it.
-use crate::{diagnose, transport::Transport, transport::RPC_TIMEOUT};
-use cherry_protocol::{build_is_newer, ClientMessage, HostStatus, ServerMessage};
+use crate::{diagnose, transport::Transport};
+use cherry_protocol::build_is_newer;
 use std::{
     fs,
-    io::Write,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -78,20 +77,12 @@ pub fn candidate(
     if recently_failed(&state, &attempt, SystemTime::now()) {
         return None;
     }
-    let status = status(transport)?;
+    let status = diagnose::request_status(transport).ok().flatten()?;
     let own_installation = status
         .executable
         .as_deref()
         .is_some_and(|daemon| same_file(Path::new(daemon), &executable));
     (own_installation || status.executable_changed).then_some((executable, attempt))
-}
-
-fn status(transport: &mut Transport) -> Option<HostStatus> {
-    transport.send(&ClientMessage::Status).ok()?;
-    match transport.receive(RPC_TIMEOUT).ok()? {
-        ServerMessage::Status { status } => Some(status),
-        _ => None,
-    }
 }
 
 /// Whether two paths name one file (a hard link, or another spelling).
@@ -166,27 +157,13 @@ fn note_outcome_in(state: &Path, attempt: &Attempt, now_build: Option<&str>, now
         attempt.to,
         now_build.unwrap_or("(unknown)")
     );
-    let path = state.join(RECORD);
     let Ok(bytes) = serde_json::to_vec(&Record {
         attempt: attempt.clone(),
         at: seconds(now),
     }) else {
         return;
     };
-    let dir = state;
-    let temporary = dir.join(format!(".{RECORD}.{}.tmp", std::process::id()));
-    let written = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temporary)
-        .and_then(|mut file| file.write_all(&bytes))
-        .and_then(|()| fs::rename(&temporary, &path));
-    if written.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
+    let _ = cherry_protocol::write_private_atomic(&state.join(RECORD), &bytes, false);
 }
 
 #[cfg(test)]

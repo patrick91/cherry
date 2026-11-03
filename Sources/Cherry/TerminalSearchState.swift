@@ -2,41 +2,17 @@ import AppKit
 import Foundation
 
 @MainActor
-protocol TerminalFindPasteboard: AnyObject {
-    var string: String? { get set }
-}
-
-@MainActor
-final class SystemTerminalFindPasteboard: TerminalFindPasteboard {
-    static let shared = SystemTerminalFindPasteboard()
-
-    private let pasteboard = NSPasteboard(name: .find)
-
-    private init() {}
-
-    var string: String? {
-        get {
-            pasteboard.string(forType: .string)
-        }
-        set {
-            pasteboard.clearContents()
-            if let newValue {
-                pasteboard.setString(newValue, forType: .string)
-            }
-        }
-    }
-}
-
-@MainActor
 final class TerminalSearchState: ObservableObject {
     @Published var query: String = ""
     @Published private(set) var totalMatchCount: Int?
     @Published private(set) var selectedMatchIndex: Int?
     @Published var selectsQueryOnNextFocus = false
 
-    private let pasteboard: TerminalFindPasteboard
+    /// The find pasteboard the query is shared through, as other apps'
+    /// Find; tests pass a private one.
+    private let pasteboard: NSPasteboard
 
-    init(pasteboard: TerminalFindPasteboard = SystemTerminalFindPasteboard.shared) {
+    init(pasteboard: NSPasteboard = NSPasteboard(name: .find)) {
         self.pasteboard = pasteboard
         readQueryFromPasteboard()
     }
@@ -55,7 +31,7 @@ final class TerminalSearchState: ObservableObject {
     }
 
     func readQueryFromPasteboard() {
-        guard let pasteboardQuery = pasteboard.string,
+        guard let pasteboardQuery = pasteboard.string(forType: .string),
               pasteboardQuery != query
         else { return }
 
@@ -64,7 +40,8 @@ final class TerminalSearchState: ObservableObject {
     }
 
     func writeQueryToPasteboard() {
-        pasteboard.string = query
+        pasteboard.clearContents()
+        pasteboard.setString(query, forType: .string)
     }
 
     func update(total: Int?) {

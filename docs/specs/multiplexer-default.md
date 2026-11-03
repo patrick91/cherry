@@ -18,21 +18,22 @@ session in `cherry-host`. Tabs survive Cherry quitting, crashing or updating and
 come back on relaunch. Hosted tabs keep every Cherry feature native tabs have.
 The host survives its own crash and upgrades without killing sessions.
 
-Out of scope: remote project parity (cherry.toml commands, worktrees, port
+Out of scope: remote project parity (cherry.toml commands, port
 forwarding on SSH hosts), a Linux desktop UI, feeding Ghostty without the attach
 adapter.
 
 ## Behaviour
 
-Settings (Settings → Sessions, stored in `TerminalSettings`, never rebuild
-Ghostty config when they change):
+Settings (Settings › Sessions, the background notice on Settings ›
+Notifications; stored in `TerminalSettings`, never rebuild Ghostty config
+when they change):
 
-| Setting (as Settings › Sessions labels it) | Key | Default |
+| Setting (as Settings labels it) | Key | Default |
 |---|---|---|
 | Run local terminals as persistent sessions | `sessions.persistLocal` | on |
 | When quitting or closing a window (*on quit*: Ask, Keep Running, End Sessions) | `sessions.onQuit` (`ask`, `keep`, `end`) | `ask` |
 | Close a tab when its shell exits (*close on exit*) | `sessions.closeTabOnExit` | on |
-| Tell me about background sessions when Cherry opens (*background notice*) | `sessions.backgroundNoticeAtLaunch` | on |
+| Tell me about background sessions when Cherry opens (*background notice*; Settings › Notifications) | `sessions.backgroundNoticeAtLaunch` | on |
 
 The boolean keys are read with `object(forKey:) as? Bool`, so a launch
 argument must be a plist boolean: `-sessions.persistLocal '<false/>'` works,
@@ -51,7 +52,6 @@ Close intents (every path that used to call `TerminalSession.stop()` names one):
 | `appQuit` (Keep Running, *on quit* = keep, nothing asked, or a log out, restart, shut down or update) | detach | detach | stop |
 | `appQuitEndingSessions` (End Sessions, or *on quit* = end) | terminate | detach | stop |
 | `duplicateWindowTeardown` | detach | detach | stop |
-| `worktreeRemoved` | terminate (confirm busy first) | detach | stop |
 | `restart` (menu, MCP `restart_process`) | terminate + create with the same tab id | reconnect | restart |
 | `programExited` (a terminal's shell exited with status 0) | terminate (removes the ended session) | — (attached tabs never close by themselves) | stop |
 
@@ -103,7 +103,7 @@ Pane in a split, act on the selected tab or the focused pane):
   and Close Split Group… asks as before, adding Detach Instead when every
   pane can detach and the close would stop one. MCP `close_process` never
   asks and ends the session.
-- On a window's last tab (no other worktree of the window has tabs), ⌘W
+- On a window's last tab, ⌘W
   and ⌘D close (or detach) the tab, after its question if any, and then
   close the window, which has nothing left to ask about; they do not close
   the window with the tab in it, which would ask whether to keep its
@@ -154,7 +154,7 @@ Undoing a close or detach (`ClosedTabHistory`):
   ends it.
 - Not undoable, and ending at once as before: native tabs (their program
   stops with the tab), MCP `close_process`, a clean-exit close
-  (`programExited`), a worktree removal, a window close or quit, a ⌘W or
+  (`programExited`), a window close or quit, a ⌘W or
   ⌘D that closes the window with its last tab (its toast goes to another
   window, whose Reopen still brings a detached session back), and a
   persistent tab whose Create was still under way. A command tab does not
@@ -162,27 +162,40 @@ Undoing a close or detach (`ClosedTabHistory`):
   runs in one tab per workspace): a closed one's session then ends, and a
   detached one's stays in the background.
 - ⌘Z goes to the closed tabs only while no text view has the keyboard: the
-  terminal, the sidebar or any other view. In a text view (the notes
+  terminal, the sidebar or any other view. In a text view (a to-do's
   editor, a search, name or palette field) ⌘Z and Edit › Undo are its own
   text undo, as before; closed tabs never join it. ⌘Z never reaches the
   terminal program, and with nothing to bring back it beeps.
 
 Quit and window close ask at most one question. When local persistent tabs
 (not native tabs, not tabs attached to a session they do not own) have a
-running program, a Create under way included, and *on quit* is Ask, a sheet
-asks "Keep N sessions running in the background?": **Keep Running** (the
+running program, a Create under way included, at least one of them is busy
+(an agent, a command, or a shell running a job: idle shells alone are kept
+without a question, as its default answer keeps them), and *on quit* is Ask,
+a sheet asks "Keep N sessions running in the background?": **Keep Running** (the
 default, Return) closes with `windowClosed`/`appQuit`, **End Sessions**
 (destructive) with `windowClosedEndingSessions`/`appQuitEndingSessions`, and
 **Cancel** closes nothing. It lists up to five of them (busy ones first,
-marked "(running)", by their sidebar names and their project, or worktree
-when a window has tabs in several), and names the native programs that stop
+marked "(running)", by their sidebar names and their project), and names the native programs that stop
 either way ("N other running processes will be stopped"), so the "Quit
 Cherry?" or "Close window?" confirmation never follows it. A window's
 question also says where the kept sessions are until the project opens again
 ("Until then, open or end them from Background Sessions in the Cherry menu
 bar icon"), and those sessions are ones the user knows about: the launch
 notice below never names them, nor those of a window closed while *on quit*
-is Keep Running, nor a detached tab's.
+is Keep Running, nor a detached tab's. A window closed while another window
+of its project stays open (or is still to open at launch) says instead that
+its kept sessions go to Background Sessions, and its saved tabs are
+forgotten (a primary's file is written empty, another window's removed with
+its frame); its running command tabs go on, with their sessions, in the
+project's most recently active window instead
+(`ProjectWindowRegistry.commandTabsHandedOver`): a project's command runs in
+one tab across its windows. The project's last window keeps its tabs for the
+next time the project opens, another window's becoming the primary's
+(`ProjectWindowRegistry.windowDidClose`). A quit keeps every window's, and so
+does a second copy of the app. While the question of a project's last
+window is up, or that window closes, File › New Window opens no other window
+of its project.
 **Don't ask
 again** stores Keep Running or End Sessions as *on quit*; Cancel stores
 nothing. With *on quit* Keep Running or End Sessions, or with no running
@@ -191,7 +204,7 @@ asks only when the close stops a busy program (with End Sessions, busy
 persistent tabs count). Ended persistent tabs never cause the question; they
 follow *on quit* (Ask keeps them, showing their exit next time). End
 Sessions also ends the sessions of the window's (or every window's) saved
-tabs that no open tab shows, as a worktree removal does (below), so none is
+tabs that no open tab shows (recorded until they are gone, below), so none is
 left running unseen; so does *on quit* = End Sessions, also for a quit with
 no open persistent tab (`SessionTeardownSummary.savedSessionsNotOpen`,
 `SessionQuitPlan`). The quit sheet goes where "Quit Cherry?" goes, and a
@@ -215,9 +228,10 @@ an announcement never makes them count), after which the system ends the
 sessions with the user's processes, so their busy programs are confirmed with
 the native ones in "Quit Cherry?" (`decide(systemEndsSessions:)`; Cancel
 cancels the log out); an update
-(the app bundle on disk has another `CFBundleVersion` than at launch, as
-`Scripts/install-local-app` and `Scripts/package-dmg` stamp every build, or
-`CherryAppDelegate.terminateKeepingSessions()`); and SIGTERM, SIGKILL, Force
+(a relaunch Sparkle armed, `UpdateQuitRequest.relaunchArmed`
+(docs/releasing.md), or the app bundle on disk has another
+`CFBundleVersion` than at launch, as `Scripts/install-local-app` and
+`Scripts/package-dmg` stamp every build); and SIGTERM, SIGKILL, Force
 Quit or a crash, which run no Cherry code. A second copy of the app has no
 persistent tabs to ask about. With `sessions.persistLocal` off new tabs are
 native, but tabs restored as persistent sessions still ask (so *on quit*
@@ -231,8 +245,7 @@ from its restore), closes as `programExited` on
 the next main-loop turn, as most terminals close it. `exit` ends a shell
 with its last command's status, so after a failed command the tab stays. On
 the window's last tab the window closes too, as with ⌘W, without asking
-(nothing runs); with no window, while a sheet is on it, or while it shows a
-note (⌘W would close the note), the tab stays.
+(nothing runs); with no window, or while a sheet is on it, the tab stays.
 Non-zero exits and signals, command and agent tabs, attached tabs, a stop or
 restart (MCP `stop_process` included), and a shell that ended within its
 first second keep the tab, showing how it ended. Native tabs follow the same
@@ -252,9 +265,10 @@ The Cherry menu bar icon's panel lists them under **Background sessions**,
 below the agents and in the same scrolling list: the command's or agent's
 name (or the session's), the project, and `idle`, the foreground program of a
 busy terminal, `running`, `attached` or `exit N`. Clicking a row shows it in a
-tab: its project's window opens (or is focused), and that window's restore
+tab: its project's most recently active window is focused (or its primary
+window, opened again, when none is open), and that window's restore
 brings a closed window's session back with its sibling tabs and layout; a
-session no saved tab names is adopted into its worktree as the tab it was
+session no saved tab names is adopted into that window as the tab it was
 started for (same tab id, kind, agent and command), or attached when another
 client shows it. Hovering a row offers **End**, then **End Session** (a
 second click, inline: an alert would close the panel); an ended session
@@ -263,7 +277,7 @@ double click on **End** is not a yes. A terminal whose shell exited with
 status 0 is removed instead of listed while *close on exit* is on (its tab
 would have closed, and its window's restore removes it too). **Cherry → End
 Background Sessions…** (disabled when there are none), the panel's **End
-All…** and Settings › Sessions' **Background Sessions** card end them all
+All…** and Settings › Sessions' **Background sessions** section end them all
 after "End N background sessions?" (**End Sessions**, destructive, and
 Cancel; "Remove N ended background sessions?" when none runs), shown on the
 Settings window when asked there, else where the quit confirmation goes,
@@ -278,8 +292,9 @@ command, or a terminal whose host reports a foreground job; never an idle
 shell) that it has not told about: "3 sessions are still running in the
 background", "From tabs or windows you closed (<projects>). Open or end them
 from Background Sessions in the Cherry menu bar icon.", with **Reopen**
-(each session back in a tab of its project's window, as Background Sessions
-→ Open does), **End…** (the End Background Sessions confirmation for those
+(each session back in a tab of its project's most recently active window,
+or of its primary one, opened again, as Background Sessions → Open does),
+**End…** (the End Background Sessions confirmation for those
 sessions only) and dismiss. Its time runs only while that window is key in
 the active app, and it takes turns with a closed tab's toast: it waits for
 one on screen to go, and one shown over it sets it aside until that one
@@ -305,7 +320,23 @@ is posted then if none took it. The session's row shows a blue dot, and the
 tab that shows it next (Open, a restore, the Persistent Sessions sheet)
 comes up unread (`Workspaces/unread-sessions.json`, which also brings the
 list's dots back at the next launch); a tab's unread dot is also saved with
-it, so a restored or reopened tab keeps it. The panel's
+it, so a restored or reopened tab keeps it.
+
+What a background session's program reports about itself (OSC 7501 program
+status, which its holder keeps and the host sends with the session) is
+followed the same way, against what Cherry saw when it last looked: a
+program that waits for the user (`blocked`, or blocked on something else
+than before), finishes (`done`) or fails (`error`) marks its session
+unread, as the spec's "the user has not seen it yet" asks. Settings ›
+Notifications › Background sessions decides which are also posted, its own
+message as the text ("Waiting for your permission." and the like when it
+gave none), under the notifications' limits: *Notify me when a background
+program needs me* (on) and *… finishes* (off). What it reported before
+Cherry first looked (at launch, or as its tab went away) is not news. The
+row says "needs permission", "needs you", "working", "done" or "failed"
+with an orange, blue, pink or red dot, and the menu bar icon counts a
+waiting or working program, and a failure not yet seen, as it counts the
+tabs' agents. The panel's
 **Clear Ended** removes every ended session in the list at once (nothing
 asked: nothing runs). An ended session the list has shown for 10 minutes
 of time Cherry was active (in front, the Mac awake: refreshes more than 5 s
@@ -314,10 +345,13 @@ or closed, and set-aside `.bak` copies) is removed by itself; one a closed
 window's saved tab names stays for that window's restore, which shows how
 it ended. One marked unread, or whose host crashed, is never removed by
 itself. Both removals are recorded as
-ends on purpose, like **End**. Settings › Projects › **Remove Project** for
-a project with background sessions asks "End the N background sessions of
-“<project>”?" (**End Sessions**, **Keep Running**, Cancel) first. A session
-belongs to the registered project its worktree's repository is, else to the
+ends on purpose, like **End**. Removing a project in Settings (Settings ›
+Projects' **Remove…**, a project page's **Remove Project…**) always asks
+first: "Remove “<project>” from Cherry?" (**Remove**, Cancel) when it has no
+background session, else "Remove “<project>”? Its N background sessions are
+still running." (**End Sessions and Remove**, **Keep Them Running**,
+Cancel). A session
+belongs to the registered project its folder is (or is the resolved folder of), else to the
 longest registered root that contains it, so a project nested in the one
 removed keeps its sessions.
 
@@ -519,8 +553,10 @@ ignores), `Replace`, `Ok`, `Error{code, message}`.
   command auto-restart runs on real host exits; MCP input to unattached tabs uses
   `SendInput`, output uses `Screen` when no surface is live.
 - **Persistence.** A `WorkspaceStateStore` keeps one JSON file per project
-  (repository root) under `Application Support/<app>/Workspaces/`, with per-
-  worktree session records, display items, splits and selection. It saves on
+  (repository root) under `Application Support/<app>/Workspaces/`, with its
+  session records, display items, splits and selection (one record; a file
+  saved while Cherry had worktree spaces has one per worktree, which the
+  window folds into one, `RepositoryStateRecord.workspaceRecord(root:)`). It saves on
   every structural or identity change (debounced) and never during teardown;
   quit flushes it before closing tabs.
 - **Scoping.** Sessions carry `owner` = the app identity. Restore adopts only the
@@ -549,14 +585,17 @@ differs from the design above.
 
 - The daemon (`cherry-host serve`) and one holder per session
   (`cherry-host hold --socket …`, link on fd 3, never the daemon's child) are
-  implemented as designed. The holder link is at `LINK_VERSION` 8, and a
-  daemon speaks every version from 1. Beyond the frames listed above it has
+  implemented as designed. The holder link is at `LINK_VERSION` 11 (11 adds
+  `program_status`, OSC 7501 program status records, to `Info` and the
+  hello's session), and a
+  daemon speaks every version from 4 (`MIN_LINK_VERSION`: no holder was
+  ever built with an older one). Beyond the frames listed above it has
   `Launch` and `Failed` (Create goes through the holder), `Update` (rename /
   retag kept by the holder), `Info` (title/pwd/foreground, from version 3
   `alternate_screen` and `kitty_keyboard_flags`, from version 4
-  `application_cursor_keys`), `ScreenReply` (from version 3,
-  `SCREEN_LINES_VERSION`, `Screen` carries `max_lines`) and `Refused` (a
-  daemon that will never serve a holder, with `retry`). All of them are
+  `application_cursor_keys`), `ScreenReply` (from version 3 `Screen`
+  carries `max_lines`) and `Refused` (a daemon that will never serve a
+  holder, with `retry`). All of them are
   additive; version 4 adds only `application_cursor_keys` (in `Info` and
   the hello's session), and version 7 adds `bracketed_paste` there (left
   out by older holders, which the daemon then reports as unknown), the
@@ -564,7 +603,9 @@ differs from the design above.
   cell size to `Resize` (`cell_width`, `cell_height`), which the holder
   gives its terminal (size reports, kitty images) and the PTY's pixels, and
   its full and limited snapshots re-send the kitty images on screen (see
-  "Kitty graphics" in `Host/README.md`, with the known gaps). On Linux a daemon starts holders from its own image
+  "Kitty graphics" in `Host/README.md`, with the known gaps); version 9
+  adds `graphics` to `Snapshot`; version 10 adds `modify_other_keys` (in
+  `Info` and the hello's session, left out by older holders). On Linux a daemon starts holders from its own image
   (`/proc/self/exe`); on macOS from its executable's path, which after an
   app update is the new build, so `Launch` fields are additive too.
 - A crashed holder reports its session exited with code 1, and says why:
@@ -618,7 +659,11 @@ differs from the design above.
   selects `ESC O x` for unmodified arrows, Home and End only in legacy key
   encoding, as the kitty encoding sends them as CSI whatever DECCKM says),
   `bracketed_paste` (protocol 7: mode 2004, `None` and left out for a
-  session whose holder predates link version 7), and `request_id` (the
+  session whose holder predates link version 7), `modify_other_keys`
+  (xterm's modifyOtherKeys at level 2, `CSI > 4 ; 2 m`, read from the
+  keyboard state `Terminal::modes` carries; an optional field, so
+  `PROTOCOL_VERSION` did not change; `None` and left out for a session
+  whose holder predates link version 10), and `request_id` (the
   Create's, from the receipt the holder keeps). The
   holder hello carries all of them, so they survive daemon crashes,
   restarts and Replace, and they are kept after exit; a `changed` event
@@ -668,7 +713,7 @@ differs from the design above.
   `MAX_CONNECTIONS` (1024), holders registered and still expected, lost
   sessions and its descriptor limit.
 - The daemon writes `host.pid` in its state directory (JSON: pid, its
-  start identity (`processes::start_identity`), build, start time, socket)
+  start identity (`cherry_protocol::start_identity`), build, start time, socket)
   once it holds the lock, and removes it when it exits normally. Its log lines and its holders' say when, who and which build:
   `2026-09-27T10:15:00.123Z cherry-host[1234] daemon <build>: <message>`
   (`holder` for a holder); other roles (`start`, the gateway) still write
@@ -888,7 +933,9 @@ differs from the design above.
   `GHOSTTY_SURFACE_ID`, `XPC_*` or `NO_COLOR`; stable staged paths; and the
   host adds `CHERRY_SESSION_ID`.
 - Create tags: `cherry.tab`, `cherry.kind`, `cherry.agent`, `cherry.command`,
-  `cherry.project` and `cherry.launch` (the Create request id). The app uses
+  `cherry.project`, `cherry.launch` (the Create request id) and, for a tab
+  of a window other than its project's primary one, `cherry.window` (that
+  window's id, as the Create goes out; never rewritten). The app uses
   the session's `request_id` (or else `cherry.launch`) to end a session whose
   Create answer was lost, and to find the session of a record saved before
   its Create answered. The owner is `CherryAppIdentity.applicationSupportName`.
@@ -902,11 +949,11 @@ differs from the design above.
   closed) sends it once bound. A failed `Update` is logged; the next rename
   sends it again.
 
-- **Session host diagnostics.** Settings › Sessions has a "Session Host"
-  card (`SessionHostDiagnostics`): the local host's status from `cherry
-  status --json` (running, build, uptime, sessions against the limit,
-  connections, sessions whose holder runs another build, pid), read when
-  the pane opens; Reveal Log (the daemon's `host.log` in the Finder); Copy
+- **Session host diagnostics.** Settings › Sessions shows the session host
+  at its top (`SessionHostDiagnostics`): the local host's status from
+  `cherry status --json` (running, build, uptime, sessions against the
+  limit, connections, sessions whose holder runs another build, pid), read
+  when the page opens; Reveal Log (the daemon's `host.log` in the Finder); Copy
   Diagnostics (the app's version, then what `cherry status` and `cherry
   doctor` print); and Restart Host… (`cherry restart`, after an alert that
   says running programs keep running and tabs reconnect). Where local
@@ -1002,12 +1049,12 @@ differs from the design above.
   with `ESC [ 201 ~`. (Holding the paste for the adapter was rejected: it
   would arrive later, after whatever the user typed meanwhile, and the
   surface learns the mode only from the adapter's repaint.)
-- Clear Scrollback (⌘K) and MCP `clear_output` on a persistent tab also send
-  `ClearHistory`, and forget the screen read from the host; `clear_output`
-  answers once the host did, so MCP output and search read after it no
-  longer have the history, and neither does the next attach adapter. The
-  holder answers how it went (`HistoryCleared`): `clear_output` says
-  `cleared: false` with the host's reason (`hostKeptHistory`) when the
+- Clear Scrollback (⌘K) and the control request `clearOutput` on a persistent
+  tab also send `ClearHistory`, and forget the screen read from the host;
+  `clearOutput` answers once the host did, so MCP output and search read
+  after it no longer have the history, and neither does the next attach
+  adapter. The holder answers how it went (`HistoryCleared`): `clearOutput`
+  says `cleared: false` with the host's reason (`hostKeptHistory`) when the
   alternate screen shows, the holder predates link 7, is not connected, or
   failed. A UTF-8 character the output left half written is never broken:
   the holder's erase then waits for the output that completes it.
@@ -1139,11 +1186,13 @@ differs from the design above.
   **Undo** instead (see Undo below); a native tab's close shows nothing.
   While ⌘Z can still undo it, Reopen is that undo; after that, Reopen brings a session back where its tab was: this
   app's own session the way Background Sessions → Open does
-  (`ProjectWindowRegistry.showBackgroundSession`: its project's window,
+  (`ProjectWindowRegistry.showBackgroundSession`: its project's most
+  recently active window (its primary, opened again, when none is open),
   adopted with its tab id, kind, agent and command), and a session the tab
-  did not own attached again in the worktree it was closed from
-  (`ProjectWindowRegistry.workspaceOpeningWindow`); either opens that
-  project's window again when it closed with its last tab. A session of
+  did not own attached again in its project's most recently active window
+  (`ProjectWindowRegistry.workspaceOpeningWindow`), the project's primary
+  window opened again when none is open; either tab is then shown in the
+  window that has it (`revealSession(id:)`). A session of
   This Mac that is gone brings nothing back. On a window's last tab the
   window closes too, and the toast goes on the project window that was
   active last and is on screen (not minimized), when there is one. A window
@@ -1204,7 +1253,7 @@ differs from the design above.
   `TerminalWorkspace.reopenClosedTab`, which builds the tab as a restore
   builds one (`makeRestoredPersistentSession` with its adapter launch
   deferred, or `makeRestoredHostedSession`) and inserts it at its
-  placement; an entry whose workspace went (a removed worktree) ends and is
+  placement; an entry whose workspace went (its window closed) ends and is
   skipped. Edit › Undo: the project window's delegate answers
   `windowWillReturnUndoManager` with `ClosedTabUndoManager`, a stand-in
   whose `canUndo`, `undoMenuItemTitle` and `undo()` read the history,
@@ -1225,11 +1274,11 @@ differs from the design above.
   leaves such a tab to the exit (`keepSessionUntilExit`), which keeps it
   the same way and does not wait for its Create. The tab's saved record names the session by its
   launch request id, and the next restore brings the tab back with it. A
-  stop, a restart, or a close that terminates (a tab close, a
-  worktree removal, a quit or window close answered End Sessions) still ends
+  stop, a restart, or a close that terminates (a tab close, a quit or
+  window close answered End Sessions) still ends
   a late-created session: the answer travels in the close intent, which a
   restore finishing after the close also uses.
-- **Ending a session** (close, worktree removal, restart, a quit answered
+- **Ending a session** (close, restart, a quit answered
   End Sessions): a Kill or Remove that gets no definite answer is resent with
   backoff (250 ms, doubling to 4 s) for up to 60 s. Only the host saying
   `unknown_session`, or another host identity answering, stops it early.
@@ -1283,20 +1332,23 @@ differs from the design above.
   the main thread asks the lock: a Dock click opens no window (the launch
   opens them), ⌘Q quits at once (nothing of this copy's was opened or
   saved), and `markQuitting` does nothing.
-- **MCP and agents.** MCP input to an agent is checked against its current
-  screen first (read from its session host when no surface shows it). While
-  the screen shows a tool-permission prompt, input is refused with
-  `agent_awaiting_permission` and nothing is sent; raw keys sent without
-  submit still go through. `input_not_delivered` is returned when the
-  agent's screen cannot be read from its host. Cherry presses Enter on an
-  agent's startup or trust prompt only for an agent its tab just launched,
-  never for a restored, adopted or attached agent, or on a permission menu.
-  A restored or adopted agent (one its tab did not start) whose screen or
-  title shows it is at work (a working marker, a title spinner) is taken to
-  be in a turn submitted before the tab followed it (`agentTurnState`
-  `.active`), so its end notifies as a finished turn does.
+- **MCP and agents.** An agent's state is what it reports with the program
+  status protocol (OSC 7501), whose records its holder keeps
+  (`SessionInfo.program_status`), so a restored or adopted agent shows its
+  state at once. MCP input to an agent that reports it is blocked on a
+  permission or a question is refused (`agent_awaiting_permission`,
+  `agent_awaiting_input`) and nothing is sent; raw keys sent without submit
+  still go through. An agent that reports nothing has its current screen
+  checked for such a menu instead (read from its session host when no
+  surface shows it); `input_not_delivered` is returned when that screen
+  cannot be read from its host. Cherry presses Enter on an agent's startup
+  or trust prompt only for an agent its tab just launched, never for a
+  restored, adopted or attached agent, or on a permission menu. A restored
+  or adopted agent (one its tab did not start) that reports `working` is
+  taken to be in a turn submitted before the tab followed it
+  (`agentTurnState` `.active`), so its end notifies as a finished turn does.
   `wait_for_process_idle` returns `permission`, and `agent_activity_state` is
-  `permission`, whenever the screen shows a permission prompt. MCP client
+  `permission`, while the agent reports it is blocked on an approval. MCP client
   timeouts: `spawn_process` with kind `command` waits `wait_ms` + 30 s,
   other `spawn_process`, `spawn_agent` and `send_process_input` `wait_ms` +
   20 s; `start_process`, `start_all_commands` and `restart_all_commands`
@@ -1319,18 +1371,32 @@ differs from the design above.
   running session of this app names no copy (it was created before the
   tag), nothing is removed.
 
-- `WorkspaceStateStore` keeps one JSON file per repository (version 1). It
+- `WorkspaceStateStore` keeps one JSON file per project window (version 1):
+  a project's primary window's named by the SHA-256 of its root, as before,
+  another window's by that of its root, a NUL and its id (`windowID` in the
+  record; `open-windows.json` lists `windows` beside `projectRoots`). It
   saves 500 ms after changes, except that a newly opened persistent tab is
   saved at once (its record carries the Create's request id,
-  `launchRequestID`); it never saves during teardown, and quit flushes it
-  first. Records gained optional `owned` and `launchRequestID` fields (older
+  `launchRequestID`), and a window other than a project's primary is saved
+  as it claims its project; it never saves during teardown, and quit
+  flushes it first. A closed window's file is forgotten or moved to the
+  primary's name as the close question above says. The launch's saved
+  windows that cannot open (their folder is missing) or never register stay
+  in `open-windows.json` until a later launch reopens them. Once the
+  launch's windows opened (a few seconds after a launch that reopens none),
+  files of This Mac's windows other than primaries that the saved list did
+  not name and that were written before the launch read it (a crash during a
+  close, an older build's run) are removed in the background, reading only
+  each file's header; one of a project that list does not name, whose
+  primary file has no tabs, becomes the primary's instead. A launch that
+  read no list it could use (none, or one moved aside) removes none. Records gained optional `owned` and `launchRequestID` fields (older
   builds ignore them). A state file (or `open-windows.json`) of another
   version, one that does not decode, or one for another root is moved aside
   as `<file>.<vN|unreadable|other-root>-<UTC yyyyMMddTHHmmssZ>.bak` in the
   same `Workspaces` directory before anything is written, never overwritten;
   if it cannot be moved, that file is not written during the run.
 - The app's restorer is `WorkspaceSessionRestorers.hostedByDefault`
-  (`WorkspaceRestore.swift`). For each worktree it lists every host named by
+  (`WorkspaceRestore.swift`). For each window it lists every host named by
   a saved record through that host's `HostControl`, all hosts at the same
   time, and handles each record as follows:
   - Matched first by its launch request id (the session's `request_id`, or
@@ -1356,13 +1422,11 @@ differs from the design above.
     and the record is kept if holders are still pending then; kept records
     are restored again once the host expects none
     (`HostControl.holdersRegistered()`), or at the next launch. A complete
-    list (`pending_holders` 0) drops the record at once. A host without
-    `pending_holders` (an older one) is listed once more after
-    `disappearanceConfirmationDelay` (2 s); still missing, the record is
-    dropped. A local host that now has another identity (its state was
-    reset) drops it at once. Whenever a record of This Mac would be dropped
-    this way, one whose session the system ended comes back as an ended tab
-    instead (next bullet).
+    list (`pending_holders` 0) drops the record at once. A local host that
+    now has another identity (its state was reset) drops it at once.
+    Whenever a record of This Mac would be dropped this way, one whose
+    session the system ended comes back as an ended tab instead (next
+    bullet).
   - Unreachable, an SSH host that answers with an identity other than the
     trusted one, or this app cannot run local sessions: the record stays
     saved, and so does a record saved while its Create had not answered
@@ -1411,8 +1475,7 @@ differs from the design above.
   the window opened or is now; or its session is in
   `Workspaces/ended-sessions.json`, where `PersistentLocalSessions.end`
   records every session this app ends (a tab's close, End Sessions on a
-  window close or quit, Background Sessions → End, a removed worktree, a
-  clean exit's removal, a restart's previous session) and the Persistent
+  window close or quit, Background Sessions → End, a clean exit's removal, a restart's previous session) and the Persistent
   Sessions sheet records Terminate and Remove of This Mac's sessions: a
   window closed or a quit with End Sessions saved its tabs before ending
   them, and a closed window's record still names the sessions ended from
@@ -1458,7 +1521,7 @@ differs from the design above.
   binding was never saved (the app ended first) comes back as the tab's
   own session. A saved ended tab names no tab id for orphan adoption either,
   so such a session is adopted if the restore did not take it. The window opens no
-  default shell for a worktree that got tabs back, as for any restored tab.
+  default shell for a window that got tabs back, as for any restored tab.
   A command with auto-start is started in its tab by auto-start, and one
   with auto-restart restarts by its policy (`showSystemSessionEnd`), as for
   a restored command whose session ended.
@@ -1479,8 +1542,8 @@ differs from the design above.
   session). Closing one ends nothing; it cannot be undone with ⌘Z, since
   there is no session to bring back (as for native tabs).
 - **Orphan adoption.** Sessions this app created (owner) for a tab
-  (`cherry.tab`) in one of the window's worktrees (`cherry.project`) that no
-  saved record names are adopted as persistent tabs of that worktree, after
+  (`cherry.tab`) in the window's folder (`cherry.project`) that no
+  saved record names are adopted as persistent tabs of that window, after
   the tabs already open: a tab never saved because the app crashed right
   after opening it, or a record that was lost. The session must have been
   created after the last save (to the second) and before this app run began.
@@ -1490,9 +1553,17 @@ differs from the design above.
   modification time) is the lower bound, and the tabs it named come back
   whenever they were created, until this version saves a file for the
   project. With no file of any version ever saved, any of the project's
-  sessions from before this run are adopted. Each worktree is scanned once
-  per run: at window open and after discovery, again once the host is
-  reachable, and after a restarted daemon's holders have registered.
+  sessions from before this run are adopted. Of a project's several
+  windows, each adopts only the sessions tagged with its own id
+  (`cherry.window`), the primary only untagged ones, and none that a saved
+  tab of another window names while that window may still restore it (one
+  of the launch's windows still to open, or restoring:
+  `sessionRecordsAwaitingRestore`), since an untagged session can be in
+  another window's file (a command handed over at a close, or one opened
+  there from Background Sessions); a window other than the primary with no
+  saved state (opened this run) looks for none.
+  Each window is scanned once per run: at window open, again once the host
+  is reachable, and after a restarted daemon's holders have registered.
   Sessions recorded to be ended (below) are never adopted. With *close on
   exit* on, a terminal (its `cherry.kind` tag) whose shell exited with status
   0 is removed instead of adopted.
@@ -1507,7 +1578,7 @@ differs from the design above.
   nothing more is coming and no terminal or agent came back (auto-started
   commands do not count). A split whose panes are on hosts that answered at
   different times comes back as separate tabs. A restore still under way
-  when its window closes (or its worktree is forgotten) builds no more tabs:
+  when its window closes builds no more tabs:
   it keeps those records saved and ends the tabs it built but had not handed
   back yet with the window's close intent, so a reopened window's restore
   owns the sessions again.
@@ -1521,7 +1592,7 @@ differs from the design above.
 - **Scoping.** "Adopt" means "own". Restore only owns sessions whose `owner`
   is this app. A viewer record comes back attached whatever the owner (sheet
   sessions have no owner). A session is owned by at most one tab. A record
-  that would own a session another open tab owns (any window or worktree) is
+  that would own a session another open tab owns (any window) is
   dropped, not attached. Records naming the same session in one restore give
   one tab. A record whose tab id is already open is dropped.
 - **Staggered attach.** Restored tabs follow their host at once. Persistent
@@ -1532,22 +1603,25 @@ differs from the design above.
   while their adapter reports it reconnects (a failure is
   `input_not_delivered`). `RestoredTabLaunchQueue` launches adapters one per
   main run-loop turn, the selected tab and the other panes of its split
-  first, then the other tabs of the worktree shown. The pause between
+  first, then the window's other tabs. The pause between
   launches is 50 ms or as long as the last launch took, whichever is longer
-  (each builds a surface on the main thread). Tabs of worktrees not shown
-  launch their adapters when their worktree is activated, and showing any
-  tab launches its adapter at once.
+  (each builds a surface on the main thread), and showing any tab launches
+  its adapter at once.
 - Agent trees come back with parents before children. A child whose parent
   did not come back is shown as a root and keeps its parent id. Collapsed
   groups, split groups (with their weights), display order and selection are
   restored. Kept tabs that come back later (the retry) are added after the
   tabs opened meanwhile, as saves order them.
-- **Commands.** A command has one tab per workspace.
-  - Auto-start runs after the restore of its worktree. It never adds a
-    second tab for a command a restored tab runs (running or ended). An
-    auto-start command whose tab is still being restored (a host that
-    answers late) or was kept because the local host was unreachable (or its
-    holders were pending) waits for that tab to come back during this run.
+- **Commands.** A command has one tab per project, across the project's
+  windows.
+  - Auto-start runs in the window that opened the project, after its
+    restore (at launch, once the project's other launch windows
+    registered). It never adds a second tab for a command a restored tab of
+    any of the project's windows runs (running or ended). An auto-start
+    command whose tab is still being restored in any of them (a host that
+    answers late, a tab shown before the host answered included) or was kept
+    because the local host was unreachable (or its holders were pending)
+    waits for that tab to come back during this run.
     Until then it does not start at all, which avoids two copies of a
     server.
   - Auto-start also restarts a restored auto-start command whose session
@@ -1557,8 +1631,9 @@ differs from the design above.
     restart policy (new session, the ended one removed).
   - Sidebar starts and MCP `spawn_process`, `start_process`,
     `start_all_commands` and `restart_all_commands` wait (at most 10 s) for
-    a restore under way that may bring back the command's tab, then use that
-    tab instead of starting a second copy.
+    a restore under way in any of the project's windows that may bring back
+    the command's tab, then use that tab, in whichever window it is, instead
+    of starting a second copy.
   - If a command tab was opened anyway (the wait ran out, or while the local
     host was unreachable), the tab whose program runs keeps the command: a
     restored tab whose program runs replaces an open tab whose program ended
@@ -1566,20 +1641,24 @@ differs from the design above.
     and if its program runs, its record is set aside and stays saved (its
     session keeps running, in Background Sessions and the Persistent
     Sessions sheet), so
-    nothing is orphaned without a record.
+    nothing is orphaned without a record. This is decided within the
+    restoring window: a restored command tab whose command a tab of another
+    of the project's windows runs is restored beside it.
 - **Deviation (ended tabs).** Ended persistent terminal and agent tabs show
   "Session ended (exit N)" with **Restart** and **Close**; Close removes the
   ended session, so there is no separate Remove. A terminal whose shell
   exited with status 0 closes instead, and its session is removed, unless
   *close on exit* is off or the shell ended within its first second.
   Attached tabs whose session ended show Remove from Host and Close Tab.
-- **Worktrees.** Removing a worktree, or its disappearing from discovery,
-  ends the local sessions owned by its saved tabs that are not open tabs:
-  not restored yet, still being restored, kept while the host was
+- **Saved tabs that are not tabs.** A window close or quit that ends
+  sessions also ends the local sessions owned by its saved tabs that are not
+  open tabs: not restored yet, still being restored, kept while the host was
   unreachable, or set aside. Records that were only attached are never
-  ended. A removal's confirmation counts all of these as running processes.
-  Those tabs (an owned local binding, or a Create under way) are recorded in
-  `Workspaces/sessions-to-end.json` before the next save drops them. They are
+  ended. Its question counts all of these
+  (`SessionTeardownSummary.savedSessionsNotOpen`). Those tabs (an owned
+  local binding, or a Create under way) are recorded in
+  `Workspaces/sessions-to-end.json`; the saved tabs themselves stay, and the
+  next restore drops them once their sessions are gone. They are
   ended as soon as the host can be listed (asked again for up to 5 minutes
   while it cannot); an entry is removed once a complete list shows none of
   its sessions left. Whatever this run could not end (the host stayed
@@ -1627,8 +1706,8 @@ differs from the design above.
   too (`isEnding`, `isScheduledToEnd`), and `canAdopt` refuses it, so a
   window reopened meanwhile builds no tab that outlives it. Quit already
   waits for ends under way. Open (`ProjectWindowRegistry.showBackgroundSession`)
-  finds the window by `cherry.project` (the open window of that worktree's
-  repository, else `AgentSettings.repositoryRoot(for:)` or the worktree
+  finds the window by `cherry.project` (the open window of that folder's
+  project, else `AgentSettings.repositoryRoot(for:)` or the folder
   itself, opened with SwiftUI's `openWindow` through `projectWindowOpener`,
   else the active window), waits (10 s at most) for that window's restores
   and orphan scan, then reveals the tab that shows the session, or else,
@@ -1713,21 +1792,18 @@ differs from the design above.
   first showed them, not from their exit (the host does not report when a
   session exited). Notifications of background sessions are not tested
   with the system's notification center (their content, the click's Open
-  and the unread marks are). After a
-  relaunch, a linked worktree's repository is known only once its window
-  opened (no `cherry.repository` tag): Open for such a session opens a
-  window for the worktree itself. Saved tabs of a worktree an open window
-  never restores (worktree spaces off) count as awaiting restore for the
-  whole run, so their sessions are not listed. The menu bar panel, the
-  Settings card, the Cherry menu command and the sheets are not covered by
+  and the unread marks are). Open for a session started in a
+  folder no project names (a Git worktree's, say) opens a window for that
+  folder. The menu bar panel, the
+  Settings section, the Cherry menu command and the sheets are not covered by
   tests (the model, classifier, copy, Open, End and the notice are); the
   Persistent Sessions sheet's Create still makes ownerless sessions, which
   are never in the background.
 - End Sessions on quit ends the sessions of saved tabs no open tab shows
   only if the host lists them before the quit's wait ends; otherwise they
   are recorded in `sessions-to-end.json` and ended when the next launch
-  opens the project's window, after its restore (which may bring such a tab
-  back first).
+  opens a window of the project, after its restore (which may bring such a
+  tab back first).
 - Test gaps: bringing the quit sheet's window on screen is not unit-tested
   (it would take focus from the user's apps), nor is the quit's reply to
   AppKit after the sessions question (what it does is: `SessionQuitPlan`,
@@ -1803,7 +1879,7 @@ differs from the design above.
   file and manifests without locking; it cannot tell a PID file of a
   daemon that just started from a stale one in the moment before the daemon
   binds its socket. A handover the old build won is not tried again for an
-  hour, even when the old build's client is gone by then. The Settings card, its alert, and the waiting bar are
+  hour, even when the old build's client is gone by then. Settings › Sessions' host header, its alert, and the waiting bar are
   tested through their models (`SessionHostDiagnostics`,
   `SessionHostStatus`, `HostedReconnects`, `HostedConnectionBarState`), not
   as SwiftUI views; the wake notification and NWPathMonitor are tested

@@ -321,6 +321,22 @@ pub struct SessionInfo {
     /// or for a session whose holder predates link version 7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bracketed_paste: Option<bool>,
+    /// Whether the program set xterm's modifyOtherKeys to level 2
+    /// (`CSI > 4 ; 2 m`), as the host's terminal has it: in legacy key
+    /// encoding, keys with modifiers are then sent as `ESC [ 27 ; m ; code ~`
+    /// (Control+P as `ESC [ 27 ; 5 ; 112 ~`, not ^P). Level 1 and reset
+    /// (`CSI > 4 m`) are off, as for Ghostty, which encodes keys at level 1
+    /// as without it. It does not apply while [`Self::kitty_keyboard_flags`]
+    /// is not 0. None when it is not known: from an older host, or for a
+    /// session whose holder predates link version 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modify_other_keys: Option<bool>,
+    /// What the programs in the session say they are doing (OSC 7501
+    /// program status), the record updated longest ago first; at most
+    /// 64. Empty when none reported anything, and from a host or holder
+    /// older than the field (holder link version 11).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub program_status: Vec<ProgramStatus>,
     /// The `request_id` of the `Create` that made the session. It survives
     /// host restarts; None for a session whose host did not record it.
     #[serde(default)]
@@ -392,12 +408,6 @@ pub struct ForegroundProcess {
 pub enum SessionState {
     Running,
     Exited,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionList {
-    pub host_id: String,
-    pub sessions: Vec<SessionInfo>,
 }
 
 /// A frame from a client: a message and the optional request ID that the
@@ -804,9 +814,7 @@ pub enum ServerMessage {
     /// line when blank rows after the text hold it. When the cursor is above
     /// the lines returned (fewer asked for than lie below it), and for
     /// `max_lines` 0 (an empty text), it is 0. `cursor_col` is the cursor's
-    /// column on the screen either way. (For a session whose process
-    /// predates `max_lines`, the host limits the whole text itself and
-    /// estimates the cursor's line from its row.)
+    /// column on the screen either way.
     ScreenText {
         id: String,
         text: String,
@@ -840,7 +848,9 @@ pub struct HostStatus {
     /// The log it writes to, when that is a file (`host.log`).
     #[serde(default)]
     pub log_path: Option<String>,
-    /// Where its executable is now, when it can tell.
+    /// Where its executable is now, when it can tell; on macOS, where it
+    /// started from once another build was installed there (an app bundle
+    /// swapped by an update), since new holders run that build.
     #[serde(default)]
     pub executable: Option<String>,
     /// Its executable was removed or replaced (by an update) since it
@@ -930,6 +940,67 @@ pub enum SessionEvent {
     Resync,
 }
 
+/// A program status record (OSC 7501): the latest report a program sent
+/// about one id. The host keeps them by the specification's rules
+/// (https://www.superlogical.com/rex/docs/build/program-status): a report
+/// replaces its record whole, `working`, `blocked` and `idle` records go
+/// when the program exits or a shell starts a new prompt, a reset clears
+/// them all. The text is the program's, decoded and without control or
+/// invisible formatting characters, but untrusted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgramStatus {
+    /// Empty for the root record, the program itself; `/` separates a
+    /// child from its parent (`build/test`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub state: ProgramStatusState,
+    /// What a blocked program needs, when it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ProgramStatusKind>,
+    /// 0–100, for `working` and `blocked` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+    /// A stable name for the program (`claude-code`, `cargo`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// One line saying what the record is doing, waiting for or finished.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramStatusState {
+    /// At rest, waiting for the user's next instruction.
+    Idle,
+    Working,
+    /// Finished; the result waits for the user.
+    Done,
+    /// Can't go on until the user does something.
+    Blocked,
+    /// Failed and stopped.
+    Error,
+    /// A state a newer host knows.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramStatusKind {
+    /// Approval to do something.
+    Permission,
+    /// An answer the user has to give.
+    Question,
+    /// A login, password, token or other credential.
+    Auth,
+    /// A kind a newer host knows.
+    #[serde(other)]
+    Unknown,
+}
+
 /// A progress report's state (OSC 9;4).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -984,21 +1055,19 @@ pub fn valid_cell_size(width: Option<u32>, height: Option<u32>) -> Option<(u32, 
 }
 
 pub fn default_socket_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("CHERRY_HOST_SOCKET") {
-        return path.into();
-    }
-    // A short path also fits sockaddr_un on macOS. This directory must be 0700;
-    // clients verify ownership before trusting it (see `verify_socket_path`).
-    PathBuf::from(format!("/tmp/cherry-host-{}/host.sock", unsafe {
-        libc::geteuid()
-    }))
+    std::env::var_os("CHERRY_HOST_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(builtin_socket_path)
 }
 
-fn euid() -> u32 {
+/// This process's effective user ID.
+pub fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
 /// The socket path used when neither --socket nor CHERRY_HOST_SOCKET is set.
+/// A short path also fits sockaddr_un on macOS. This directory must be 0700;
+/// clients verify ownership before trusting it (see `verify_socket_path`).
 pub fn builtin_socket_path() -> PathBuf {
     PathBuf::from(format!("/tmp/cherry-host-{}/host.sock", euid()))
 }
@@ -1196,6 +1265,98 @@ pub fn connect_verified(path: &Path) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// When the process `pid` started, as a token that another process with the
+/// same PID (after the PID was reused, or after a reboot) never has: on
+/// macOS `seconds.microseconds` (`proc_bsdinfo`, the same value `sysctl`'s
+/// `kinfo_proc.kp_proc.p_starttime` gives); on Linux the boot id and the
+/// start time in clock ticks since it. None when it cannot be read.
+/// Holders' manifests, the daemon's PID file and `attach --status-file`
+/// record it, and `cherry doctor` and the app compare it, so its format
+/// never changes.
+pub fn start_identity(pid: libc::pid_t) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        (libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        ) == size)
+            .then(|| format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        // After the parenthesised command name: the state (field 3) comes
+        // first, and the start time is field 22.
+        let end = stat.iter().rposition(|&b| b == b')')?;
+        let fields = std::str::from_utf8(&stat[end + 1..]).ok()?;
+        let started = fields.split_ascii_whitespace().nth(22 - 3)?;
+        Some(format!("{}/{started}", boot.trim()))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether the process a PID file or manifest names (`pid`, which started
+/// at `started`, a `start_identity`) still exists, a zombie included, and
+/// was not given to another process since (unless that cannot be told).
+pub fn process_runs(pid: u32, started: Option<&str>) -> bool {
+    // 0 and values beyond pid_t would address process groups.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 || unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    match (started, start_identity(pid)) {
+        (Some(recorded), Some(current)) => recorded == current,
+        _ => true,
+    }
+}
+
+/// Replace the file at `path` with `bytes`, private to this user (mode
+/// 0600): readers see the old file or the new one, never a partial one. The
+/// new one is written beside it (`.<name>.<pid>.tmp`, never through a
+/// symlink) and renamed over it. A `durable` file is on disk before it gets
+/// its name; its directory is not synced.
+pub fn write_private_atomic(path: &Path, bytes: &[u8], durable: bool) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let mut temporary_name = std::ffi::OsString::from(".");
+    temporary_name.push(name);
+    temporary_name.push(format!(".{}.tmp", std::process::id()));
+    let temporary = path.with_file_name(temporary_name);
+    let _ = std::fs::remove_file(&temporary);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            if durable {
+                file.sync_all()?;
+            }
+            Ok(())
+        })
+        .and_then(|()| std::fs::rename(&temporary, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
+}
+
 /// Name of the stable agent-socket link in the directory that holds the
 /// host's socket (the `state_dir` of `update_agent_link`). Sessions receive
 /// `SSH_AUTH_SOCK=<that directory>/agent.sock`. Like tmux's
@@ -1303,7 +1464,7 @@ pub fn release_agent_link(state_dir: &Path, lends: impl Fn(u32) -> bool) -> io::
 }
 
 /// An existing socket (after following links) owned by this user.
-fn is_own_socket(path: &Path) -> bool {
+pub fn is_own_socket(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_socket() && meta.uid() == euid())
 }
 
@@ -2616,6 +2777,8 @@ mod tests {
             kitty_keyboard_flags: 31,
             application_cursor_keys: true,
             bracketed_paste: Some(true),
+            modify_other_keys: Some(true),
+            program_status: Vec::new(),
             request_id: Some("d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3b".into()),
             ended_by: None,
             holder_log: None,
@@ -3074,7 +3237,7 @@ mod tests {
             added.starts_with(r#"{"type":"event","event":{"kind":"added","session":{"id":"3f6c","#)
         );
         assert!(added.contains(
-            r#""title":"vim — main.rs","pwd":"file://studio/Users/me/My%20Code","foreground":{"pid":4300,"name":"nvim"},"clients":2,"owner":"com.example.cherry","tags":{"kind":"agent","tab":"6d1f"},"created_at":1790000000123,"alternate_screen":true,"kitty_keyboard_flags":31,"application_cursor_keys":true,"bracketed_paste":true,"request_id":"d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3b""#
+            r#""title":"vim — main.rs","pwd":"file://studio/Users/me/My%20Code","foreground":{"pid":4300,"name":"nvim"},"clients":2,"owner":"com.example.cherry","tags":{"kind":"agent","tab":"6d1f"},"created_at":1790000000123,"alternate_screen":true,"kitty_keyboard_flags":31,"application_cursor_keys":true,"bracketed_paste":true,"modify_other_keys":true,"request_id":"d7c0f7d8-8f5e-4a51-9f47-5d0c1f1f2a3b""#
         ), "{added}");
         assert_eq!(
             json(&ServerMessage::Sessions {
@@ -3210,6 +3373,17 @@ mod tests {
             ..session_info()
         };
         assert!(json(&off).contains(r#""bracketed_paste":false"#));
+        // modifyOtherKeys likewise.
+        let unknown = SessionInfo {
+            modify_other_keys: None,
+            ..session_info()
+        };
+        assert!(!json(&unknown).contains("modify_other_keys"));
+        let off = SessionInfo {
+            modify_other_keys: Some(false),
+            ..session_info()
+        };
+        assert!(json(&off).contains(r#""modify_other_keys":false"#));
         // Why it ended: left out unless a holder was lost.
         let normal = json(&session_info());
         assert!(!normal.contains("ended_by") && !normal.contains("holder_log"));
@@ -3284,9 +3458,10 @@ mod tests {
                 info.kitty_keyboard_flags,
                 info.application_cursor_keys,
                 info.bracketed_paste,
+                info.modify_other_keys,
                 info.request_id
             ),
-            (false, 0, false, None, None)
+            (false, 0, false, None, None, None)
         );
         // What a host of an earlier stage sends.
         assert_eq!(
@@ -3529,5 +3704,36 @@ mod tests {
         update_agent_link(&state, None).unwrap();
         assert!(std::fs::symlink_metadata(state.join(AGENT_LINK_NAME)).is_err());
         assert!(std::fs::symlink_metadata(state.join(AGENT_CLIENTS_DIR)).is_err());
+    }
+
+    #[test]
+    fn the_start_identity_is_the_kernels_and_tells_processes_apart() {
+        let own = start_identity(std::process::id() as libc::pid_t).unwrap();
+        assert_eq!(
+            start_identity(std::process::id() as libc::pid_t).unwrap(),
+            own
+        );
+        // Started later than this process: another identity.
+        std::thread::sleep(Duration::from_millis(20));
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let other = start_identity(child.id() as libc::pid_t).unwrap();
+        assert!(process_runs(child.id(), Some(other.as_str())));
+        assert!(process_runs(child.id(), None));
+        assert!(!process_runs(child.id(), Some(own.as_str())));
+        let _ = child.kill();
+        let _ = child.wait();
+        // Compared as numbers: Linux's clock ticks after the boot id gain
+        // digits (9897, then 10544), macOS's seconds and microseconds don't.
+        let started =
+            |identity: &str| -> f64 { identity.rsplit('/').next().unwrap().parse().unwrap() };
+        assert!(started(&other) >= started(&own), "{other} < {own}");
+        assert_ne!(other, own);
+        assert_eq!(start_identity(i32::MAX), None);
+        // 0 and values beyond pid_t name no process.
+        assert!(!process_runs(0, None));
+        assert!(!process_runs(u32::MAX, None));
     }
 }

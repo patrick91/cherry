@@ -103,3 +103,47 @@ import Testing
     syntaxCheck.waitUntilExit()
     #expect(syntaxCheck.terminationStatus == 0)
 }
+
+@Test func zshShellIntegrationReportsNamesWithoutLettingThemWriteSequences() async throws {
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer {
+        try? FileManager.default.removeItem(at: temporaryDirectory)
+    }
+
+    let bootstrap = try #require(try ShellIntegrationBootstrap.prepare(
+        shellPath: "/bin/zsh",
+        homeDirectory: temporaryDirectory
+    ))
+    let integrationURL = URL(fileURLWithPath: bootstrap.zdotdir)
+        .appendingPathComponent("cherry-integration.zsh")
+
+    // A name whose backslash escapes `print` would expand into a BEL that
+    // ends the OSC 7 and an OSC 52 clipboard write, plus raw control bytes.
+    let hostile = temporaryDirectory
+        .appendingPathComponent("x\\a\\e]52;c;SGVsbG8=\\a\u{07}\u{1B}]52;c;SGk=\u{07}", isDirectory: true)
+    try FileManager.default.createDirectory(at: hostile, withIntermediateDirectories: true)
+
+    let shell = Process()
+    shell.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    shell.arguments = [
+        "-f", "-i", "-c",
+        "source \"$1\"; _cherry_set_title \"$PWD\"; _cherry_emit_command_metadata \"$PWD\"",
+        "zsh", integrationURL.path,
+    ]
+    shell.currentDirectoryURL = hostile
+    let output = Pipe()
+    shell.standardOutput = output
+    shell.standardError = FileHandle.nullDevice
+    shell.standardInput = FileHandle.nullDevice
+    try shell.run()
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    shell.waitUntilExit()
+
+    let text = String(decoding: data, as: UTF8.self)
+    #expect(!text.contains("\u{1B}]52;"), "a name started its own sequence: \(text.debugDescription)")
+    #expect(text.contains("x\\a\\e"))
+    // Each report is one sequence: one ESC to open it, one BEL to end it.
+    #expect(data.filter { $0 == 0x1B }.count == 3)
+    #expect(data.filter { $0 == 0x07 }.count == 3)
+}

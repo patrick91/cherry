@@ -472,19 +472,12 @@ fn leaving_the_alternate_screen_restores_the_primary_cursor_frames_painted() {
     assert_eq!(shown.active[..5], source.active[..]);
 }
 
+/// The host forwards `TN` to the renderer (`route_xtgettcap` in
+/// cherry-host), which answers it alone.
 #[test]
-fn terminfo_name_answers_xtgettcap_tn() {
+fn xtgettcap_tn_goes_unanswered() {
     let mut t = term(20, 4);
-    let query = b"\x1bP+q544e\x1b\\";
-    assert!(t.feed(query).is_empty(), "no name is reported by default");
-    t.set_terminfo_name("xterm-256color").unwrap();
-    assert_eq!(
-        t.feed(query),
-        b"\x1bP1+r544E=787465726D2D323536636F6C6F72\x1b\\"
-    );
-    assert!(t.set_terminfo_name(&"x".repeat(129)).is_err());
-    t.set_terminfo_name("").unwrap();
-    assert!(t.feed(query).is_empty());
+    assert!(t.feed(b"\x1bP+q544e\x1b\\").is_empty());
 }
 
 #[test]
@@ -1373,16 +1366,17 @@ fn some_saved_cursor_state_is_not_restored() {
 }
 
 #[test]
-fn a_pending_wrap_away_from_the_edge_keeps_only_its_position() {
-    // Ghostty keeps a pending wrap when the terminal widens under it; no
-    // edge holds it on the replay, so only the position comes back.
+fn a_pending_wrap_is_resolved_when_the_terminal_widens() {
+    // Ghostty moves the cursor past a pending wrap when the terminal
+    // widens under it, so no pending wrap away from the edge is left to
+    // replay, and the copy has the same position.
     let mut original = term(12, 3);
     original.feed(b"abcdefghijkl");
     original.resize(15, 3).unwrap();
     let copy = restored(&original).inspect().unwrap();
     let source = original.inspect().unwrap();
-    assert_eq!((source.cursor, source.pending_wrap), ((11, 0), true));
-    assert_eq!((copy.cursor, copy.pending_wrap), ((11, 0), false));
+    assert_eq!((source.cursor, source.pending_wrap), ((12, 0), false));
+    assert_eq!((copy.cursor, copy.pending_wrap), (source.cursor, false));
     assert_eq!(copy.active, source.active);
 }
 
@@ -1480,7 +1474,6 @@ fn events_split_across_reads_are_reported_once_complete() {
     assert!(terminal.take_events().is_empty());
     terminal.feed(b" done");
     assert!(terminal.take_events().is_empty());
-    assert_eq!(terminal.title(), None);
     terminal.feed(b"\x1b\\");
     assert_eq!(terminal.take_events(), [VtEvent::Title("half done".into())]);
 }
@@ -1488,30 +1481,24 @@ fn events_split_across_reads_are_reported_once_complete() {
 #[test]
 fn title_and_working_directory_follow_the_program() {
     let mut terminal = term(40, 5);
-    assert_eq!((terminal.title(), terminal.pwd()), (None, None));
     terminal.feed(b"\x1b]0;vim \xe2\x80\x94 main.rs\x07");
-    assert_eq!(terminal.title().as_deref(), Some("vim \u{2014} main.rs"));
     terminal.feed(b"\x1b]7;file://studio/tmp\x07");
-    assert_eq!(terminal.pwd().as_deref(), Some("file://studio/tmp"));
     terminal.feed(b"\x1b]1337;CurrentDir=/Users/me\x07");
-    assert_eq!(terminal.pwd().as_deref(), Some("/Users/me"));
-    terminal.feed(b"\x1b]9;9;/opt/work\x07");
-    assert_eq!(terminal.pwd().as_deref(), Some("/opt/work"));
     assert_eq!(
         terminal.take_events(),
         [
             VtEvent::Title("vim \u{2014} main.rs".into()),
-            VtEvent::Pwd("/opt/work".into()),
+            VtEvent::Pwd("/Users/me".into()),
         ]
     );
+    terminal.feed(b"\x1b]9;9;/opt/work\x07");
+    assert_eq!(terminal.take_events(), [VtEvent::Pwd("/opt/work".into())]);
     // The icon name is not the title, and a title that is not UTF-8 is
     // ignored.
     terminal.feed(b"\x1b]1;icon\x07\x1b]2;bad \xff\x07");
-    assert_eq!(terminal.title().as_deref(), Some("vim \u{2014} main.rs"));
     assert!(terminal.take_events().is_empty());
     // Clearing them.
     terminal.feed(b"\x1b]2;\x07\x1b]7;\x07");
-    assert_eq!((terminal.title(), terminal.pwd()), (None, None));
     assert_eq!(
         terminal.take_events(),
         [VtEvent::Title(String::new()), VtEvent::Pwd(String::new())]
@@ -1523,14 +1510,12 @@ fn title_and_working_directory_follow_the_program() {
     assert!(terminal.take_events().is_empty());
     // Titles are cut to 1024 bytes.
     terminal.feed(format!("\x1b]2;{}\x07", "t".repeat(1500)).as_bytes());
-    assert_eq!(terminal.title().unwrap().len(), 1024);
     assert!(matches!(&terminal.take_events()[..], [VtEvent::Title(title)] if title.len() == 1024));
     // A reset clears both without a callback; that is reported too, after
     // the progress report a reset makes.
     terminal.feed(b"\x1b]7;file://studio/tmp\x07");
     terminal.take_events();
     terminal.feed(b"\x1bc");
-    assert_eq!((terminal.title(), terminal.pwd()), (None, None));
     assert_eq!(
         terminal.take_events(),
         [
@@ -1682,7 +1667,9 @@ fn snapshots_resizes_and_inspection_report_no_events() {
     let mut terminal = term(40, 5);
     terminal.feed(EVENTFUL);
     terminal.feed(b"\x1b[?1049h\x1b]2;vim\x07\x07");
-    terminal.take_events();
+    assert!(terminal
+        .take_events()
+        .contains(&VtEvent::Title("vim".into())));
     let snapshot = terminal.snapshot().unwrap();
     terminal.refresh().unwrap();
     terminal.snapshot_limited(1024 * 1024).unwrap();
@@ -1692,7 +1679,6 @@ fn snapshots_resizes_and_inspection_report_no_events() {
     terminal.screen_text().unwrap();
     assert!(terminal.resize(30, 4).unwrap().is_empty());
     assert!(terminal.take_events().is_empty());
-    assert_eq!(terminal.title().as_deref(), Some("vim"));
     // A snapshot carries neither title nor working directory: its replay
     // reports only what its reset does.
     let mut copy = replay(&terminal, &snapshot);
@@ -1703,7 +1689,6 @@ fn snapshots_resizes_and_inspection_report_no_events() {
             value: None
         }]
     );
-    assert_eq!((copy.title(), copy.pwd()), (None, None));
 }
 
 #[test]
@@ -1713,13 +1698,15 @@ fn kitty_notifications_are_left_to_osc99() {
     let mut terminal = term(40, 5);
     assert!(terminal.feed(sequence).is_empty());
     assert!(terminal.take_events().is_empty());
-    assert_eq!(parse_osc99(sequence), Some(notification("Hello world", "")));
+    // A fresh `Osc99` reads a single sequence.
+    let single = |sequence: &[u8]| Osc99::default().feed(sequence);
+    assert_eq!(single(sequence), Some(notification("Hello world", "")));
     assert_eq!(
-        parse_osc99(b"\x1b]99;i=1:p=body;done; really\x07"),
+        single(b"\x1b]99;i=1:p=body;done; really\x07"),
         Some(notification("", "done; really"))
     );
     assert_eq!(
-        parse_osc99(b"\x1b]99;e=1;SGVsbG8g4pyT\x07"),
+        single(b"\x1b]99;e=1;SGVsbG8g4pyT\x07"),
         Some(notification("Hello \u{2713}", ""))
     );
     for sequence in [
@@ -1734,7 +1721,7 @@ fn kitty_notifications_are_left_to_osc99() {
         b"\x1b]9;not kitty\x07",
         b"99;;bare\x07",
     ] {
-        assert_eq!(parse_osc99(sequence), None, "{sequence:?}");
+        assert_eq!(single(sequence), None, "{sequence:?}");
     }
 }
 
@@ -1986,7 +1973,8 @@ fn clearing_history_keeps_the_screen_and_an_unfinished_sequence() {
     terminal.feed(&numbered(10));
     terminal.feed(b"$ a\xe2\x94");
     assert!(!terminal.clear_history().unwrap());
-    terminal.feed(b"\x80b");
+    // That feed's own replies still come.
+    assert_eq!(terminal.feed(b"\x80b\x1b[6n"), b"\x1b[3;6R");
     let cleared = terminal.inspect().unwrap();
     assert!(cleared.history.is_empty(), "{:?}", cleared.history);
     let mut plain = term(20, 3);
@@ -2688,6 +2676,37 @@ fn resize_leaves_prompts_it_cannot_clear_whole_to_ghostty() {
 }
 
 #[test]
+fn the_last_prompt_mark_or_reset_in_a_feed_says_what_the_shell_redraws() {
+    use PromptRedraw::{All, LastLine, Nothing};
+    for (bytes, from, expected) in [
+        (&b"\x1bc\x1b]133;A;redraw=0\x07"[..], All, Nothing),
+        (b"\x1b]133;A;redraw=0\x07\x1bc", LastLine, All),
+        (
+            b"\x1b]133;A;redraw=0\x1b\\\x1b]133;N;redraw=last\x07",
+            All,
+            LastLine,
+        ),
+        // A reset ends the OSC and comes after it.
+        (b"\x1b]133;A;redraw=0\x1bc", Nothing, All),
+        // A mark that changes nothing, or is unfinished, leaves it.
+        (b"\x1b]133;A;redraw=0\x07\x1b]133;A\x07", All, Nothing),
+        (b"\x1b]133;B;redraw=last\x07", Nothing, Nothing),
+        (b"\x1b]133;A;redraw=0", LastLine, LastLine),
+        // The first occurrence of the option counts.
+        (
+            b"\x1b\x1b]133;A;cl=line;redraw=last;redraw=1\x07",
+            All,
+            LastLine,
+        ),
+        (b"\x1b[0m\x1b]0;c\x07", Nothing, Nothing),
+    ] {
+        let mut redraw = from;
+        redraw.observe(bytes);
+        assert_eq!(redraw, expected, "{:?}", String::from_utf8_lossy(bytes));
+    }
+}
+
+#[test]
 fn clearing_a_prompt_before_the_reflow_keeps_an_unfinished_sequence() {
     let mut terminal = term(60, 6);
     at_two_line_prompt(&mut terminal, TOP);
@@ -2695,6 +2714,79 @@ fn clearing_a_prompt_before_the_reflow_keeps_an_unfinished_sequence() {
     terminal.resize(30, 6).unwrap();
     assert_eq!(active(&terminal), ["$ echo hi", "hi"]);
     terminal.feed(b"tle\x07ok");
-    assert_eq!(terminal.title().as_deref(), Some("half a title"));
+    assert!(terminal
+        .take_events()
+        .contains(&VtEvent::Title("half a title".into())));
     assert_eq!(active(&terminal), ["$ echo hi", "hi", "", "··ok"]);
+}
+
+#[test]
+fn program_status_reports_become_records() {
+    let mut terminal = term(40, 5);
+    // The support query is answered with `?`, which is all Claude Code and
+    // Pi look for, and since revision 0.4 the states and kinds it takes, in
+    // one string to its terminator.
+    let reply = terminal.feed(b"\x1b]7501;?\x1b\\");
+    let pairs = reply
+        .strip_prefix(b"\x1b]7501;?")
+        .and_then(|rest| rest.strip_suffix(b"\x1b\\"));
+    assert!(
+        pairs.is_some_and(|pairs| !pairs.iter().any(|&b| b == 0x1b || b == 0x07)),
+        "{:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    // Claude Code 2.1.295's reports.
+    assert!(terminal
+        .feed(b"\x1b]7501;state=idle:app=claude-code\x1b\\")
+        .is_empty());
+    assert_eq!(terminal.take_events(), [VtEvent::ProgramStatus]);
+    terminal.feed(
+        b"\x1b]7501;state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiB0b3VjaCB6ei1wcm9iZS50eHQ=\x07",
+    );
+    assert_eq!(terminal.take_events(), [VtEvent::ProgramStatus]);
+    assert_eq!(
+        terminal.program_status(),
+        [ProgramStatusRecord {
+            id: String::new(),
+            state: ProgramState::Blocked,
+            kind: Some(ProgramStatusKind::Permission),
+            progress: None,
+            app: "claude-code".into(),
+            title: String::new(),
+            message: "approve Bash: touch zz-probe.txt".into(),
+        }]
+    );
+    // The same report again is no change.
+    terminal.feed(
+        b"\x1b]7501;state=blocked:app=claude-code:kind=permission:msg=YXBwcm92ZSBCYXNoOiB0b3VjaCB6ei1wcm9iZS50eHQ=\x07",
+    );
+    assert!(terminal.take_events().is_empty());
+    // A report without a valid state is ignored whole.
+    terminal.feed(b"\x1b]7501;state=sparkle\x1b\\\x1b]7501;app=x\x1b\\");
+    assert!(terminal.take_events().is_empty());
+    // A child record, with progress, and a done one.
+    terminal.feed(b"\x1b]7501;id=build/test:state=working:progress=40\x1b\\");
+    terminal.feed(b"\x1b]7501;id=deploy:state=done\x1b\\");
+    assert_eq!(terminal.program_status().len(), 3);
+    assert_eq!(terminal.program_status()[1].progress, Some(40));
+    // A new shell prompt ends the program: only done and error stay.
+    terminal.take_events();
+    terminal.feed(b"\x1b]133;A\x07");
+    assert_eq!(terminal.take_events(), [VtEvent::ProgramStatus]);
+    assert_eq!(terminal.program_status().len(), 1);
+    assert_eq!(terminal.program_status()[0].id, "deploy");
+    // A reset clears every record.
+    terminal.feed(b"\x1bc");
+    assert!(terminal.take_events().contains(&VtEvent::ProgramStatus));
+    assert!(terminal.program_status().is_empty());
+}
+
+#[test]
+fn an_exited_program_leaves_only_its_unseen_records() {
+    let mut terminal = term(40, 5);
+    terminal.feed(b"\x1b]7501;state=working\x1b\\\x1b]7501;id=a:state=error\x1b\\");
+    assert!(terminal.end_program());
+    assert_eq!(terminal.program_status().len(), 1);
+    assert_eq!(terminal.program_status()[0].state, ProgramState::Error);
+    assert!(!terminal.end_program());
 }

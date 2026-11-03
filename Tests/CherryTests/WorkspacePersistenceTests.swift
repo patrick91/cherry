@@ -8,17 +8,6 @@ import Testing
 
 // MARK: - Helpers
 
-private func makeCanonicalTemporaryDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    guard let resolved = url.path.withCString({ realpath($0, nil) }) else {
-        throw CocoaError(.fileNoSuchFile)
-    }
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
-}
-
 private func hostedRecord(
     id: UUID = UUID(),
     title: String,
@@ -89,23 +78,6 @@ private final class Box<Value> {
     }
 }
 
-/// Suspends a restore until the test opens it.
-@MainActor
-private final class RestoreGate {
-    private var continuation: CheckedContinuation<Void, Never>?
-    private(set) var isWaiting = false
-
-    func wait() async {
-        isWaiting = true
-        await withCheckedContinuation { continuation = $0 }
-    }
-
-    func open() {
-        continuation?.resume()
-        continuation = nil
-    }
-}
-
 /// Restores hosted records as tabs that launch nothing.
 @MainActor
 private final class FakeHostedRestorer {
@@ -152,28 +124,9 @@ private final class RecordingBackendPolicy {
     var policy: SessionBackendPolicy {
         SessionBackendPolicy(
             settings: { [self] in settings },
-            hostedLocalTabsFollowSettings: true,
             terminateHostedSession: { [self] session, intent in
                 terminated.append((session.hostedAttachment?.sessionID ?? "native", intent))
             }
-        )
-    }
-}
-
-private func runGit(_ arguments: [String]) throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    process.arguments = ["git"] + arguments
-    process.standardOutput = FileHandle.nullDevice
-    let errorPipe = Pipe()
-    process.standardError = errorPipe
-    try process.run()
-    process.waitUntilExit()
-    guard process.terminationStatus == 0 else {
-        throw GitWorktreeCommandError(
-            arguments: arguments,
-            exitCode: process.terminationStatus,
-            standardError: String(decoding: errorPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         )
     }
 }
@@ -190,7 +143,7 @@ private func makeTestWindow() -> NSWindow {
     return window
 }
 
-/// Saves one worktree of hosted tabs for `root` and returns a repository
+/// Saves hosted tabs for `root` and returns a repository
 /// that restores them with `restorer`.
 @MainActor
 private func makeRestoringRepository(
@@ -212,13 +165,6 @@ private func makeRestoringRepository(
         sessionRestorer: restorer.restorer,
         autoStartCommands: { _ in [] }
     )
-}
-
-/// `RepositoryWorkspace.repositoryRoot` for a directory: standardized, so a
-/// temporary directory loses its /private prefix. Worktree roots stay real
-/// paths.
-private func repositoryKey(_ url: URL) -> String {
-    URL(fileURLWithPath: url.path, isDirectory: true).standardizedFileURL.path
 }
 
 @MainActor
@@ -246,7 +192,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 // MARK: - Store
 
 @Test func workspaceStateStoreRoundTripsRepositoryState() throws {
-    let directory = try makeCanonicalTemporaryDirectory("cherry-workspace-store")
+    let directory = try canonicalTemporaryDirectory("cherry-workspace-store")
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = WorkspaceStateStore(directory: directory)
     let splitID = UUID()
@@ -306,7 +252,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test func workspaceStateStoreReplacesFilesAtomicallyAndPrivately() throws {
-    let directory = try makeCanonicalTemporaryDirectory("cherry-workspace-atomic")
+    let directory = try canonicalTemporaryDirectory("cherry-workspace-atomic")
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
     let old = RepositoryStateRecord(
@@ -342,7 +288,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test func theStoreRecordsSystemQuitsAndSessionsEndedOnPurposeAndTabsTheSystemEnded() throws {
-    let directory = try makeCanonicalTemporaryDirectory("cherry-system-ends")
+    let directory = try canonicalTemporaryDirectory("cherry-system-ends")
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
 
@@ -451,7 +397,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test func openProjectWindowListRoundTripsAndReopensOnlyWindowsWithTabs() throws {
-    let directory = try makeCanonicalTemporaryDirectory("cherry-open-windows")
+    let directory = try canonicalTemporaryDirectory("cherry-open-windows")
     defer { try? FileManager.default.removeItem(at: directory) }
     let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
     let withTabs = directory.appendingPathComponent("with-tabs", isDirectory: true)
@@ -474,7 +420,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     #expect(store.projectWindowRootsToReopen() == [withTabs.path])
 }
 
-@Test func keptTabsMergeIntoTheLiveWorktreeWithoutDuplicates() {
+@Test func keptTabsMergeIntoTheLiveWorkspaceWithoutDuplicates() {
     let editor = hostedRecord(title: "Editor", sessionID: "s-editor")
     let logs = hostedRecord(title: "Logs", sessionID: "s-logs")
     let native = nativeRecord(title: "Shell 2")
@@ -558,7 +504,6 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     let invalidHost = hostedRecord(title: "Bad", host: "ssh:-oProxyCommand=x", sessionID: "s-3")
     let request = WorkspaceRestoreRequest(
         repositoryRoot: "/repo",
-        worktreeRoot: "/repo",
         records: [local, remote, invalidHost],
         workspace: workspace
     )
@@ -669,27 +614,19 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 
 @Test func sessionClosePolicyMatchesTodayAndTheSpecTable() {
     // Native tabs stop and remote (attached) tabs detach, whatever the
-    // intent; local persistent tabs follow their intent, unless a policy
-    // turns that off, when they detach too.
-    #expect(SessionClosePolicy.hostedLocalTabsFollowSettings)
+    // intent; local persistent tabs follow their intent.
     for intent in SessionCloseIntent.allCases {
         #expect(SessionClosePolicy.closeAction(for: .native, intent: intent) == .stop)
         #expect(SessionClosePolicy.closeAction(for: .hostedRemote, intent: intent) == .detach)
         #expect(SessionClosePolicy.closeAction(for: .hostedLocal, intent: intent)
             == SessionClosePolicy.hostedLocalAction(for: intent))
-        #expect(SessionClosePolicy.closeAction(
-            for: .hostedLocal, intent: intent, hostedLocalTabsFollowSettings: false
-        ) == .detach)
-        #expect(SessionClosePolicy.closeAction(
-            for: .native, intent: intent, hostedLocalTabsFollowSettings: false
-        ) == .stop)
     }
 
     // The spec's local hosted column. A tab close ends its session and a
     // detach keeps it; a window close or quit carries its answer (or the
     // quit preference) in its intent.
     func local(_ intent: SessionCloseIntent) -> SessionCloseAction {
-        SessionClosePolicy.closeAction(for: .hostedLocal, intent: intent, hostedLocalTabsFollowSettings: true)
+        SessionClosePolicy.closeAction(for: .hostedLocal, intent: intent)
     }
     #expect(local(.userClosedTab) == .terminate)
     #expect(local(.userDetachedTab) == .detach)
@@ -699,7 +636,6 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     #expect(local(.windowClosedEndingSessions) == .terminate)
     #expect(local(.appQuitEndingSessions) == .terminate)
     #expect(local(.duplicateWindowTeardown) == .detach)
-    #expect(local(.worktreeRemoved) == .terminate)
     #expect(local(.restart) == .terminate)
     #expect(local(.programExited) == .terminate)
 
@@ -717,7 +653,6 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     let settingsBox = Box(SessionPersistenceSettings.defaults)
     let policy = SessionBackendPolicy(
         settings: { settingsBox.value },
-        hostedLocalTabsFollowSettings: true,
         terminateHostedSession: { session, intent in
             terminatedBox.value.append((session.hostedAttachment?.sessionID ?? "native", intent))
         }
@@ -763,7 +698,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     // A workspace with the default policy never terminates anything.
     let native = TerminalWorkspace(createInitialSession: false)
     _ = native.attachHostedSession(localAttachment(sessionID: "local-5"), launchShell: false)
-    native.closeAllSessions(intent: .worktreeRemoved)
+    native.closeAllSessions(intent: .mcpClose)
     #expect(!native.isTornDown)
     #expect(terminated.count == 2)
 
@@ -811,8 +746,11 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     #expect(defaults.object(forKey: "sessions.onQuit") as? String == "end")
     #expect(defaults.object(forKey: "sessions.closeTabOnExit") as? Bool == false)
 
-    // Not part of the terminal appearance.
-    settings.resetTerminalAppearance()
+    // Not on a page that resets.
+    settings.reset(
+        TerminalSettings.Setting.interfacePage + TerminalSettings.Setting.themesPage
+            + TerminalSettings.Setting.terminalPage
+    )
     #expect(!settings.persistLocalSessions)
     #expect(settings.localSessionsOnQuit == .end)
     #expect(!settings.closeTabsOnCleanExit)
@@ -832,10 +770,16 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     #expect(LocalSessionsOnQuit.allCases.map(\.label) == ["Ask", "Keep Running", "End Sessions"])
     #expect(!SessionBackendPolicy(settings: { reloaded.sessionPersistenceSettings }).prefersPersistentLocalSessions)
     #expect(!SessionBackendPolicy.native.prefersPersistentLocalSessions)
-    #expect(SettingsPage.filtered(by: "quitting") == [.sessions])
-    // Close a tab when its shell exits.
-    for query in ["exit", "shell", "close"] {
-        #expect(SettingsPage.filtered(by: query) == [.sessions], Comment(rawValue: query))
+    // Search finds Sessions' rows: When quitting or closing a window, Close
+    // a tab when its shell exits.
+    let rows = SettingsSearchIndex.rows(in: SettingsSearchContext(
+        terminal: reloaded,
+        agents: AgentSettings(defaults: defaults),
+        defaults: defaults
+    ))
+    for query in ["quitting", "exit", "shell"] {
+        let sessions = SettingsSearchIndex.groups(for: query, in: rows).first { $0.kind == .page(.sessions) }
+        #expect(sessions?.results.contains { !$0.row.opensPage } == true, Comment(rawValue: query))
     }
     #expect(SettingsPage.sessions.title == "Sessions")
 }
@@ -843,8 +787,8 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 // MARK: - Restore
 
 @Test @MainActor func repositoryRestoresHostedRecordsWithTheirIDsAndLayout() async throws {
-    let root = try makeCanonicalTemporaryDirectory("cherry-restore")
-    let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-restore-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-store")
     defer {
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
@@ -886,7 +830,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
         autoStartCommands: { _ in [] }
     )
     defer { repository.closeAllSessions(intent: .windowClosed) }
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
     // A saved hosted tab replaces the default shell.
     #expect(workspace.sessions.isEmpty)
     #expect(fake.requestedRecordIDs.isEmpty)
@@ -947,8 +891,8 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test @MainActor func repositoryOpensTheDefaultShellWhenNothingIsRestored() async throws {
-    let root = try makeCanonicalTemporaryDirectory("cherry-restore-empty")
-    let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-restore-empty-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-empty")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-empty-store")
     defer {
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
@@ -971,19 +915,19 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
         autoStartCommands: { _ in [] }
     )
     defer { repository.closeAllSessions(intent: .windowClosed) }
-    #expect(repository.activeWorkspace.sessions.isEmpty)
+    #expect(repository.workspace.sessions.isEmpty)
 
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
 
     #expect(fake.requestedRecordIDs.count == 1)
-    #expect(repository.activeWorkspace.sessions.map(\.title) == ["Shell 1"])
-    #expect(repository.activeWorkspace.sessions.first?.hostedAttachment == nil)
-    #expect(repository.activeWorkspace.selectedSessionID == repository.activeWorkspace.sessions.first?.id)
+    #expect(repository.workspace.sessions.map(\.title) == ["Shell 1"])
+    #expect(repository.workspace.sessions.first?.hostedAttachment == nil)
+    #expect(repository.workspace.selectedSessionID == repository.workspace.sessions.first?.id)
 
     // Only native tabs saved: nothing can come back, so the window opens its
     // default shell at once and the restorer is never asked.
-    let nativeOnlyRoot = try makeCanonicalTemporaryDirectory("cherry-restore-native")
+    let nativeOnlyRoot = try canonicalTemporaryDirectory("cherry-restore-native")
     defer { try? FileManager.default.removeItem(at: nativeOnlyRoot) }
     store.saveSynchronously(RepositoryStateRecord(
         repositoryRoot: repositoryKey(nativeOnlyRoot),
@@ -998,16 +942,16 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
         autoStartCommands: { _ in [] }
     )
     defer { nativeRepository.closeAllSessions(intent: .windowClosed) }
-    #expect(nativeRepository.activeWorkspace.sessions.count == 1)
+    #expect(nativeRepository.workspace.sessions.count == 1)
     nativeRepository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await nativeRepository.waitForPendingRestores()
     #expect(nativeFake.requestedRecordIDs.isEmpty)
-    #expect(nativeRepository.activeWorkspace.sessions.count == 1)
+    #expect(nativeRepository.workspace.sessions.count == 1)
 }
 
 @Test @MainActor func autoStartWaitsForTheRestoreAndSkipsRestoredCommands() async throws {
-    let root = try makeCanonicalTemporaryDirectory("cherry-restore-autostart")
-    let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-restore-autostart-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-autostart")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-autostart-store")
     defer {
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
@@ -1038,17 +982,17 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
         gate.open()
         repository.closeAllSessions(intent: .windowClosed)
     }
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
 
     // The window appears before it claimed its project: nothing starts.
     repository.autoStartInitialCommandsIfNeeded()
     #expect(autoStartRequests.isEmpty)
 
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
-    for _ in 0..<100 where !gate.isWaiting {
+    for _ in 0..<100 where gate.waiting == 0 {
         await Task.yield()
     }
-    #expect(gate.isWaiting)
+    #expect(gate.waiting > 0)
     repository.autoStartInitialCommandsIfNeeded()
     #expect(autoStartRequests.isEmpty)
     #expect(workspace.sessions.isEmpty)
@@ -1066,8 +1010,8 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 }
 
 @Test @MainActor func repositoryKeepsSavedTabsItCannotRestoreYet() async throws {
-    let root = try makeCanonicalTemporaryDirectory("cherry-restore-kept")
-    let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-restore-kept-store")
+    let root = try canonicalTemporaryDirectory("cherry-restore-kept")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-kept-store")
     defer {
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
@@ -1076,7 +1020,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     let editor = hostedRecord(title: "Editor", sessionID: "s-editor")
     let logs = hostedRecord(title: "Logs", sessionID: "s-logs")
     let splitID = UUID()
-    let savedWorktree = WorktreeStateRecord(
+    let savedRecord = WorktreeStateRecord(
         root: root.path,
         sessions: [editor, nativeRecord(title: "Shell 2"), logs],
         displayItems: [WorkspaceDisplayItemRecord(kind: .split, id: splitID)],
@@ -1091,7 +1035,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     store.saveSynchronously(RepositoryStateRecord(
         repositoryRoot: repositoryKey(root),
         activeWorktreeRoot: root.path,
-        worktrees: [savedWorktree]
+        worktrees: [savedRecord]
     ))
 
     // The helper is unavailable: nothing comes back, the window opens its
@@ -1107,13 +1051,13 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     first.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await first.waitForPendingRestores()
     #expect(unavailable.requestedRecordIDs == [[editor.id, logs.id]])
-    let shell = try #require(first.activeWorkspace.sessions.first)
-    #expect(first.activeWorkspace.sessions.map(\.title) == ["Shell 1"])
+    let shell = try #require(first.workspace.sessions.first)
+    #expect(first.workspace.sessions.map(\.title) == ["Shell 1"])
     first.flushPersistentState()
     let kept = try #require(store.load(repositoryRoot: repositoryKey(root))?.worktree(root: root.path))
     #expect(kept.sessions.map(\.id) == [shell.id, editor.id, logs.id])
     #expect(Array(kept.sessions.dropFirst()) == [editor, logs])
-    #expect(kept.splitGroups == savedWorktree.splitGroups)
+    #expect(kept.splitGroups == savedRecord.splitGroups)
     #expect(kept.selectedSessionID == logs.id)
     first.closeAllSessions(intent: .windowClosed)
 
@@ -1129,9 +1073,9 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     second.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await second.waitForPendingRestores()
     #expect(available.requestedRecordIDs == [[editor.id, logs.id]])
-    #expect(second.activeWorkspace.sessions.map(\.id) == [editor.id, logs.id])
-    #expect(second.activeWorkspace.terminalSplitGroups.map(\.id) == [splitID])
-    #expect(second.activeWorkspace.selectedSessionID == logs.id)
+    #expect(second.workspace.sessions.map(\.id) == [editor.id, logs.id])
+    #expect(second.workspace.terminalSplitGroups.map(\.id) == [splitID])
+    #expect(second.workspace.selectedSessionID == logs.id)
 }
 
 @Test @MainActor func restoreFinishingAfterTheWindowClosedEndsTabsWithThatIntent() async throws {
@@ -1140,8 +1084,8 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     // Sessions), and is kept, as its saved record, when it keeps them.
     for (intent, ends) in [(SessionCloseIntent.appQuitEndingSessions, true), (.appQuit, false)] {
         let label = Comment(rawValue: "\(intent)")
-        let root = try makeCanonicalTemporaryDirectory("cherry-restore-abandoned")
-        let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-restore-abandoned-store")
+        let root = try canonicalTemporaryDirectory("cherry-restore-abandoned")
+        let storeDirectory = try canonicalTemporaryDirectory("cherry-restore-abandoned-store")
         defer {
             try? FileManager.default.removeItem(at: root)
             try? FileManager.default.removeItem(at: storeDirectory)
@@ -1161,16 +1105,16 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
         )
         defer { gate.open() }
         repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
-        for _ in 0..<100 where !gate.isWaiting {
+        for _ in 0..<100 where gate.waiting == 0 {
             await Task.yield()
         }
-        #expect(gate.isWaiting, label)
+        #expect(gate.waiting > 0, label)
 
         repository.closeAllSessions(intent: intent)
         gate.open()
         await repository.waitForPendingRestores()
-        #expect(repository.activeWorkspace.sessions.isEmpty, label)
-        #expect(repository.activeWorkspace.closeAllIntent == intent, label)
+        #expect(repository.workspace.sessions.isEmpty, label)
+        #expect(repository.workspace.closeAllIntent == intent, label)
         #expect(recorder.terminated.map(\.sessionID) == (ends ? ["s-editor"] : []), label)
         #expect(recorder.terminated.map(\.intent) == (ends ? [intent] : []), label)
         store.flush()
@@ -1178,22 +1122,19 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     }
 }
 
-@Test @MainActor func worktreesRestoreOnDiscoveryAndRemovalEndsTheirTabs() async throws {
-    let container = try makeCanonicalTemporaryDirectory("cherry-restore-worktrees")
+/// A file saved while Cherry had worktree spaces: the tabs of every
+/// worktree it names (one whose folder is gone too) come back in the
+/// window in one restore, the project's own first, nothing is ended, and
+/// they are saved again as the window's one record.
+@Test @MainActor func aFileSavedWithWorktreeSpacesRestoresEveryWorktreesTabsInTheWindow() async throws {
+    let container = try canonicalTemporaryDirectory("cherry-restore-worktrees")
     defer { try? FileManager.default.removeItem(at: container) }
     let root = container.appendingPathComponent("repo", isDirectory: true)
     let feature = container.appendingPathComponent("feature", isDirectory: true)
     let gone = container.appendingPathComponent("gone", isDirectory: true)
     let storeDirectory = container.appendingPathComponent("store", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-    try runGit(["-C", root.path, "init", "-b", "main"])
-    try runGit(["-C", root.path, "-c", "user.name=Cherry Tests", "-c", "user.email=cherry@example.invalid",
-                "commit", "--allow-empty", "-m", "Initial"])
-    try runGit(["-C", root.path, "worktree", "add", "-b", "feature", feature.path])
-    let settings = TerminalSettings.shared
-    let previousWorktreeSpacesEnabled = settings.worktreeSpacesEnabled
-    settings.worktreeSpacesEnabled = true
-    defer { settings.worktreeSpacesEnabled = previousWorktreeSpacesEnabled }
+    try FileManager.default.createDirectory(at: feature, withIntermediateDirectories: true)
 
     let store = WorkspaceStateStore(directory: storeDirectory)
     let main = hostedRecord(title: "Main", sessionID: "s-main")
@@ -1201,11 +1142,11 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     let goneTab = hostedRecord(title: "Gone", sessionID: "s-gone")
     store.saveSynchronously(RepositoryStateRecord(
         repositoryRoot: repositoryKey(root),
-        activeWorktreeRoot: root.path,
+        activeWorktreeRoot: feature.path,
         worktrees: [
-            WorktreeStateRecord(root: root.path, sessions: [main]),
-            WorktreeStateRecord(root: feature.path, sessions: [featureTab]),
-            WorktreeStateRecord(root: gone.path, sessions: [goneTab])
+            WorktreeStateRecord(root: feature.path, sessions: [featureTab], selectedSessionID: featureTab.id),
+            WorktreeStateRecord(root: gone.path, sessions: [goneTab]),
+            WorktreeStateRecord(root: root.path, sessions: [main], selectedSessionID: main.id)
         ]
     ))
     let recorder = RecordingBackendPolicy()
@@ -1219,36 +1160,23 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
     )
     defer { repository.closeAllSessions(intent: .windowClosed) }
 
-    // At first the window knows only its own worktree.
     repository.beginRestoringSavedStateIfNeeded(chromeState: nil)
     await repository.waitForPendingRestores()
-    #expect(fake.requestedRecordIDs == [[main.id]])
+    #expect(fake.requestedRecordIDs == [[main.id, featureTab.id, goneTab.id]])
+    #expect(repository.workspace.sessions.map(\.id) == [main.id, featureTab.id, goneTab.id])
+    #expect(repository.workspace.selectedSessionID == main.id)
+    #expect(recorder.terminated.isEmpty)
     repository.flushPersistentState()
-    #expect(store.load(repositoryRoot: repositoryKey(root))?.worktrees.map(\.root) == [feature.path, gone.path, root.path])
-
-    // Discovery restores the linked worktree and forgets the missing one.
-    await repository.refresh()
-    await repository.waitForPendingRestores()
-    #expect(fake.requestedRecordIDs == [[main.id], [featureTab.id]])
-    let featureWorkspace = try #require(repository.workspaceIfLoaded(for: feature.path))
-    #expect(featureWorkspace.sessions.map(\.id) == [featureTab.id])
-    repository.flushPersistentState()
-    #expect(store.load(repositoryRoot: repositoryKey(root))?.worktrees.map(\.root) == [feature.path, root.path])
-
-    // Removing the worktree ends its tabs as a worktree removal.
-    let featureWorktree = try #require(repository.worktrees.first { $0.root == feature.path })
-    try await repository.remove(featureWorktree, force: true, chromeState: nil)
-    #expect(recorder.terminated.map(\.sessionID) == ["s-feature"])
-    #expect(recorder.terminated.map(\.intent) == [.worktreeRemoved])
-    repository.flushPersistentState()
-    #expect(store.load(repositoryRoot: repositoryKey(root))?.worktrees.map(\.root) == [root.path])
+    let saved = try #require(store.load(repositoryRoot: repositoryKey(root)))
+    #expect(saved.worktrees.map(\.root) == [root.path])
+    #expect(saved.worktrees.first?.sessions.map(\.id) == [main.id, featureTab.id, goneTab.id])
 }
 
 // MARK: - Saving
 
 @Test @MainActor func repositoryNeverSavesBeforeClaimingItsWindowOrDuringTeardown() async throws {
-    let root = try makeCanonicalTemporaryDirectory("cherry-save-teardown")
-    let storeDirectory = try makeCanonicalTemporaryDirectory("cherry-save-teardown-store")
+    let root = try canonicalTemporaryDirectory("cherry-save-teardown")
+    let storeDirectory = try canonicalTemporaryDirectory("cherry-save-teardown-store")
     defer {
         try? FileManager.default.removeItem(at: root)
         try? FileManager.default.removeItem(at: storeDirectory)
@@ -1266,7 +1194,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
         sessionRestorer: FakeHostedRestorer().restorer,
         autoStartCommands: { _ in [] }
     )
-    let workspace = repository.activeWorkspace
+    let workspace = repository.workspace
 
     // Until the window claims the project (a duplicate never does), nothing
     // is written, not even a flush.
@@ -1310,7 +1238,7 @@ private func savedSessionIDs(_ state: RepositoryStateRecord?, root: String) -> [
 @MainActor
 struct WorkspaceRegistryPersistenceTests {
     @Test func confirmedQuitSavesWhatChangedWhileTheAlertWasUp() async throws {
-        let container = try makeCanonicalTemporaryDirectory("cherry-quit-flush")
+        let container = try canonicalTemporaryDirectory("cherry-quit-flush")
         defer { try? FileManager.default.removeItem(at: container) }
         let rootA = container.appendingPathComponent("a", isDirectory: true)
         let rootB = container.appendingPathComponent("b", isDirectory: true)
@@ -1338,9 +1266,8 @@ struct WorkspaceRegistryPersistenceTests {
             #expect(registry.register(
                 window: window,
                 projectRoot: root.path,
-                workspace: repository.activeWorkspace,
+                workspace: repository.workspace,
                 repository: repository,
-                noteStore: nil,
                 todoStore: nil,
                 chromeState: nil
             ))
@@ -1350,10 +1277,12 @@ struct WorkspaceRegistryPersistenceTests {
         let bothWindows = [repositoryKey(rootA), repositoryKey(rootB)].sorted()
 
         // Quit asks first; the save before the alert freezes nothing.
-        let early = repositoryA.activeWorkspace.attachHostedSession(localAttachment(sessionID: "s-early"), launchShell: false)
+        let early = repositoryA.workspace.attachHostedSession(localAttachment(sessionID: "s-early"), launchShell: false)
         registry.flushWorkspacePersistence()
         #expect(savedSessionIDs(store.load(repositoryRoot: repositoryKey(rootA)), root: rootA.path) == [savedA.id, early.id])
         #expect(store.loadOpenProjectWindowRoots() == bothWindows)
+        // Each project's primary window, the one active last first.
+        #expect(store.loadOpenProjectWindows() == [.primary(repositoryKey(rootA)), .primary(repositoryKey(rootB))])
 
         // While the alert is up, window B closes (as its close delegate
         // does) and window A opens a tab.
@@ -1362,14 +1291,14 @@ struct WorkspaceRegistryPersistenceTests {
         registry.unregister(window: windowB, projectRoot: rootB.path)
         store.flush()
         #expect(store.loadOpenProjectWindowRoots() == [repositoryKey(rootA)])
-        let late = repositoryA.activeWorkspace.attachHostedSession(localAttachment(sessionID: "s-late"), launchShell: false)
+        let late = repositoryA.workspace.attachHostedSession(localAttachment(sessionID: "s-late"), launchShell: false)
 
         // Quit confirmed: the change still inside the save debounce is saved
         // before every tab closes, and nothing is saved after.
         registry.tearDownForQuit()
         #expect(repositoryA.isTearingDown)
-        #expect(repositoryA.activeWorkspace.sessions.isEmpty)
-        #expect(repositoryA.activeWorkspace.closeAllIntent == .appQuit)
+        #expect(repositoryA.workspace.sessions.isEmpty)
+        #expect(repositoryA.workspace.closeAllIntent == .appQuit)
         try await Task.sleep(for: .milliseconds(800))
         store.flush()
         #expect(savedSessionIDs(store.load(repositoryRoot: repositoryKey(rootA)), root: rootA.path)
@@ -1386,9 +1315,8 @@ struct WorkspaceRegistryPersistenceTests {
         #expect(registry.register(
             window: windowA,
             projectRoot: rootA.path,
-            workspace: repositoryA.activeWorkspace,
+            workspace: repositoryA.workspace,
             repository: repositoryA,
-            noteStore: nil,
             todoStore: nil,
             chromeState: nil
         ))
@@ -1398,7 +1326,7 @@ struct WorkspaceRegistryPersistenceTests {
     }
 
     @Test func savedWindowsReopenOnceAndSkipOpenOnes() throws {
-        let directory = try makeCanonicalTemporaryDirectory("cherry-reopen")
+        let directory = try canonicalTemporaryDirectory("cherry-reopen")
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
         let projects = ["open", "closed", "empty"].map { directory.appendingPathComponent($0, isDirectory: true) }
@@ -1428,16 +1356,15 @@ struct WorkspaceRegistryPersistenceTests {
             window: window,
             projectRoot: projects[0].path,
             workspace: workspace,
-            noteStore: nil,
             todoStore: nil,
             chromeState: nil
         ))
 
         // The project without saved tabs does not come back.
-        #expect(registry.launchWindowPlan(hasVisibleWindow: true) == .reopen([projects[1].path]))
+        #expect(registry.launchWindowPlan(hasVisibleWindow: true) == .reopen([.primary(projects[1].path)]))
         // Once: the open window is all there is to show now.
         #expect(registry.launchWindowPlan(hasVisibleWindow: true) == .nothing)
-        #expect(registry.takeProjectWindowRootsToReopen().isEmpty)
+        #expect(registry.takeProjectWindowsToReopen().isEmpty)
     }
 
     /// Project windows are not restorable by AppKit, so relaunching the app
@@ -1445,7 +1372,7 @@ struct WorkspaceRegistryPersistenceTests {
     /// back from the app's own list alone: a new run reads what the last one
     /// saved as its windows closed at quit.
     @Test func windowsOpenAtQuitReopenAtTheNextLaunchWithoutAppKit() throws {
-        let directory = try makeCanonicalTemporaryDirectory("cherry-relaunch-windows")
+        let directory = try canonicalTemporaryDirectory("cherry-relaunch-windows")
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
         let projects = ["a", "b"].map { directory.appendingPathComponent($0, isDirectory: true) }
@@ -1474,7 +1401,6 @@ struct WorkspaceRegistryPersistenceTests {
                 window: window,
                 projectRoot: project.path,
                 workspace: workspace,
-                noteStore: nil,
                 todoStore: nil,
                 chromeState: nil
             ))
@@ -1490,15 +1416,17 @@ struct WorkspaceRegistryPersistenceTests {
         workspaces.removeAll()
 
         // The next run, however the app was launched: no window was restored.
+        // Each one's primary window, the one active last first.
         let nextRun = ProjectWindowRegistry()
         nextRun.configureWorkspacePersistence(store: store)
-        #expect(nextRun.launchWindowPlan(hasVisibleWindow: false) == .reopen(projects.map(\.path)))
+        #expect(store.loadOpenProjectWindows() == projects.map { .primary($0.path) })
+        #expect(nextRun.launchWindowPlan(hasVisibleWindow: false) == .reopen(projects.map { .primary($0.path) }))
     }
 
     /// Saved windows open at once at launch (`savedWindowsLaunchPlan`);
     /// only the default project's window waits a moment for a deep link's.
     @Test func savedWindowsOpenWithoutWaitingForTheDefaultWindowDecision() throws {
-        let directory = try makeCanonicalTemporaryDirectory("cherry-saved-windows-now")
+        let directory = try canonicalTemporaryDirectory("cherry-saved-windows-now")
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
 
@@ -1521,14 +1449,14 @@ struct WorkspaceRegistryPersistenceTests {
         store.saveOpenProjectWindowRoots(projects.map(\.path), synchronously: true)
         let registry = ProjectWindowRegistry()
         registry.configureWorkspacePersistence(store: store)
-        #expect(registry.savedWindowsLaunchPlan() == .reopen(projects.map(\.path)))
+        #expect(registry.savedWindowsLaunchPlan() == .reopen(projects.map { .primary($0.path) }))
         // Taken once.
         #expect(registry.savedWindowsLaunchPlan() == nil)
-        #expect(registry.takeProjectWindowRootsToReopen().isEmpty)
+        #expect(registry.takeProjectWindowsToReopen().isEmpty)
     }
 
     @Test func launchOpensTheDefaultWindowOnlyWhenNothingElseOpens() throws {
-        let directory = try makeCanonicalTemporaryDirectory("cherry-default-window")
+        let directory = try canonicalTemporaryDirectory("cherry-default-window")
         defer { try? FileManager.default.removeItem(at: directory) }
         let store = WorkspaceStateStore(directory: directory.appendingPathComponent("Workspaces", isDirectory: true))
 
@@ -1550,7 +1478,6 @@ struct WorkspaceRegistryPersistenceTests {
             window: window,
             projectRoot: project.path,
             workspace: workspace,
-            noteStore: nil,
             todoStore: nil,
             chromeState: nil
         ))
@@ -1560,7 +1487,7 @@ struct WorkspaceRegistryPersistenceTests {
     /// A second copy of the app (another holds the instance lock) reopens
     /// none of the first copy's windows: it opens the default one.
     @Test func aSecondCopyOpensOnlyTheDefaultWindow() throws {
-        let directory = try makeCanonicalTemporaryDirectory("cherry-second-copy-windows")
+        let directory = try canonicalTemporaryDirectory("cherry-second-copy-windows")
         defer { try? FileManager.default.removeItem(at: directory) }
         let lockURL = directory.appendingPathComponent("instance.lock")
         let owner = AppInstanceLock(fileURL: lockURL, applicationSupportName: "CherryTests")
@@ -1607,7 +1534,7 @@ struct WorkspaceRegistryPersistenceTests {
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let frames = ProjectWindowFrameStore(defaults: defaults)
-        let directory = try makeCanonicalTemporaryDirectory("cherry-window-frames")
+        let directory = try canonicalTemporaryDirectory("cherry-window-frames")
         defer { try? FileManager.default.removeItem(at: directory) }
         let roots = try ["a", "b", "c"].map { name in
             let project = directory.appendingPathComponent(name, isDirectory: true)
@@ -1630,7 +1557,6 @@ struct WorkspaceRegistryPersistenceTests {
                 window: window,
                 projectRoot: root,
                 workspace: workspace,
-                noteStore: nil,
                 todoStore: nil,
                 chromeState: nil
             )
@@ -1687,7 +1613,7 @@ struct WorkspaceRegistryPersistenceTests {
         let defaultsName = "CherryTests.OwningWindow.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: defaultsName))
         let settings = AgentSettings(defaults: defaults)
-        let container = try makeCanonicalTemporaryDirectory("cherry-mcp-owning-window")
+        let container = try canonicalTemporaryDirectory("cherry-mcp-owning-window")
         let rootA = container.appendingPathComponent("a", isDirectory: true)
         let rootB = container.appendingPathComponent("b", isDirectory: true)
         try FileManager.default.createDirectory(at: rootA, withIntermediateDirectories: true)
@@ -1736,7 +1662,6 @@ struct WorkspaceRegistryPersistenceTests {
             window: windowB,
             projectRoot: rootB.path,
             workspace: workspaceB,
-            noteStore: nil,
             todoStore: nil,
             chromeState: nil
         ))

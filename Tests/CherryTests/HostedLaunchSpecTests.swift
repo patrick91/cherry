@@ -12,8 +12,12 @@ private let stableRoot = "/Users/tester/Library/Application Support/Cherry/Ghost
 private let bootstrapDirectory = "/Users/tester/Library/Application Support/Cherry/ShellIntegration/zsh"
 private let binDirectory = "/Applications/Cherry.app/Contents/MacOS"
 private let tabID = "6F1C1F7E-5B7A-4C1B-9A55-3D2F8E0C4A11"
+/// The socket the app's control server answers, and the `cherry` it runs:
+/// every tab's CHERRY_CONTROL_SOCKET and CHERRY_CLI.
+private let appSocket = "/tmp/cherry-501/Cherry-0123456789ab/control.sock"
+private let appCLI = "\(binDirectory)/cherry"
 /// The embedded Ghostty whose launch code HostedLaunchSpec reproduces.
-private let auditedGhosttyVersion = "1.3.2-HEAD-+3c47ca159"
+private let auditedGhosttyVersion = "1.4.0"
 
 /// Cherry's environment as launchd gives it to a Dock launch, after
 /// libghostty's init set LANG, LANGUAGE and GHOSTTY_RESOURCES_DIR, plus
@@ -55,8 +59,7 @@ private let loginEnvironment: [String: String] = [
 private let account = HostedLaunchAccount(
     userName: "tester",
     homeDirectory: "/Users/tester",
-    shell: "/bin/zsh",
-    hushLogin: false
+    shell: "/bin/zsh"
 )
 
 private func context(
@@ -76,7 +79,9 @@ private func context(
         zshBootstrap: bootstrap,
         executableDirectory: binDirectory,
         terminalProgramVersion: auditedGhosttyVersion,
-        shellFeatures: HostedLaunchContext.ghosttyShellFeatures(cursorBlink: true)
+        shellFeatures: HostedLaunchContext.ghosttyShellFeatures(cursorBlink: true),
+        controlSocketPath: appSocket,
+        cliPath: appCLI
     )
 }
 
@@ -120,19 +125,10 @@ private func nativeLaunch(
         for: configuration,
         shellIntegration: isZsh ? bootstrap : nil,
         inheritedEnvironment: processEnvironment,
-        terminfoDirectories: bundleTerminfo
+        terminfoDirectories: bundleTerminfo,
+        controlSocketPath: appSocket,
+        cliPath: appCLI
     )
-}
-
-private func makeTemporaryDirectory(_ prefix: String) throws -> URL {
-    let url = FileManager.default.temporaryDirectory
-        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    guard let resolved = url.path.withCString({ realpath($0, nil) }) else {
-        throw CocoaError(.fileNoSuchFile)
-    }
-    defer { free(resolved) }
-    return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
 }
 
 private struct ProcessResult {
@@ -270,7 +266,6 @@ func hostedLaunchMatchesNativeLaunchForEveryTabKind(shell: String) throws {
         "LANG": "en_GB.UTF-8",
         "__CFBundleIdentifier": "dev.patrick.cherry",
         "__CF_USER_TEXT_ENCODING": "0x1F5:0:2",
-        "CHERRY_CONTROL_SOCKET": "/tmp/cherry-dev/control.sock",
         // The login shell's agent, not launchd's.
         "SSH_AUTH_SOCK": "/Users/tester/.1password/agent.sock",
         // Ghostty's additions.
@@ -293,6 +288,9 @@ func hostedLaunchMatchesNativeLaunchForEveryTabKind(shell: String) throws {
         "CHERRY_EMIT_OSC133": "1",
         "CHERRY_PROJECT_ROOT": "/Users/tester/code/app",
         "CHERRY_PROCESS_ID": tabID,
+        // The app's own socket, never the one Cherry inherited.
+        "CHERRY_CONTROL_SOCKET": appSocket,
+        "CHERRY_CLI": appCLI,
         "CHERRY_BOOTSTRAP_ZDOTDIR": bootstrapDirectory,
         "ZDOTDIR": bootstrapDirectory
     ]
@@ -360,35 +358,183 @@ func hostedLaunchMatchesNativeLaunchForEveryTabKind(shell: String) throws {
     }
     #expect(hosted.environment["TERM_PROGRAM"] == "Ghostty")
     #expect(hosted.environment["CHERRY_PROCESS_ID"] == tabID)
-    #expect(hosted.environment["CHERRY_CONTROL_SOCKET"] == "/tmp/cherry-dev/control.sock")
+    // The app's control socket, not the one of the tab (or private run)
+    // Cherry was started from.
+    #expect(hosted.environment["CHERRY_CONTROL_SOCKET"] == appSocket)
     #expect(hosted.environment["PWD"] == "/tmp")
+
+    // An app whose server has no socket: none, never the inherited one.
+    var withoutSocket = context(processEnvironment: environment)
+    withoutSocket.controlSocketPath = nil
+    let unanswered = HostedLaunchSpec.make(for: configuration, context: withoutSocket)
+    #expect(environment["CHERRY_CONTROL_SOCKET"] == "/tmp/cherry-dev/control.sock")
+    #expect(unanswered.environment["CHERRY_CONTROL_SOCKET"] == nil)
 }
 
-/// Every tab of This Mac names the app's CherryMCP in CHERRY_MCP_HELPER,
-/// native and hosted alike, so `"$CHERRY_MCP_HELPER" --call …` works
-/// whatever the tab's PATH; one the app inherited is never passed on.
-@Test func hostedAndNativeLaunchesNameTheAppsCherryMCP() {
-    let helper = "\(binDirectory)/CherryMCP"
+/// No tab names a CherryMCP (CHERRY_MCP_HELPER) or an MCP server's name
+/// (CHERRY_MCP_SERVER_NAME) any more: `cherry` sends its commands to the
+/// app itself. Ones the app inherited are never passed on, nor sent to
+/// another Mac.
+@Test func hostedAndNativeLaunchesNameNoCherryMCP() {
     var inherited = processEnvironment
     inherited[CherryControl.mcpHelperEnvironmentKey] = "/elsewhere/CherryMCP"
-    var hostedContext = context(processEnvironment: inherited)
-    hostedContext.mcpHelperPath = helper
+    inherited[CherryControl.mcpServerNameEnvironmentKey] = "elsewhere"
     for kind in TabKind.allCases {
-        let hosted = HostedLaunchSpec.make(for: configuration(kind, shell: "/bin/zsh"), context: hostedContext)
-        #expect(hosted.environment[CherryControl.mcpHelperEnvironmentKey] == helper, Comment(rawValue: kind.rawValue))
+        let hosted = HostedLaunchSpec.make(for: configuration(kind, shell: "/bin/zsh"), context: context(processEnvironment: inherited))
+        #expect(hosted.environment[CherryControl.mcpHelperEnvironmentKey] == nil, Comment(rawValue: kind.rawValue))
+        #expect(hosted.environment[CherryControl.mcpServerNameEnvironmentKey] == nil, Comment(rawValue: kind.rawValue))
+        let native = ShellProcessController.nativeExecLaunch(
+            for: configuration(kind, shell: "/bin/bash"),
+            shellIntegration: nil,
+            inheritedEnvironment: inherited,
+            terminfoDirectories: nil
+        )
+        #expect(native.environment[CherryControl.mcpHelperEnvironmentKey] == nil, Comment(rawValue: kind.rawValue))
+        #expect(native.environment[CherryControl.mcpServerNameEnvironmentKey] == nil, Comment(rawValue: kind.rawValue))
+    }
+    #expect(CherryTabEnvironment.keys.contains(CherryControl.mcpHelperEnvironmentKey))
+    #expect(CherryTabEnvironment.keys.contains(CherryControl.mcpServerNameEnvironmentKey))
+    #expect(RemoteLaunchSpec.localOnlyKeys.contains(CherryControl.mcpHelperEnvironmentKey))
+    #expect(RemoteLaunchSpec.localOnlyKeys.contains(CherryControl.mcpServerNameEnvironmentKey))
+}
+
+/// Every tab of This Mac names the socket the app's control server
+/// answers in CHERRY_CONTROL_SOCKET and the `cherry` it runs in
+/// CHERRY_CLI, native and hosted alike; ones the app inherited (from the
+/// Cherry tab it was started from) are never passed on.
+@Test func hostedAndNativeLaunchesNameTheAppsControlSocketAndCherry() {
+    var inherited = processEnvironment
+    inherited[CherryControl.cliEnvironmentKey] = "/elsewhere/cherry"
+    #expect(inherited[CherryControl.socketEnvironmentKey] == "/tmp/cherry-dev/control.sock")
+    for kind in TabKind.allCases {
+        let label = Comment(rawValue: kind.rawValue)
+        let hosted = HostedLaunchSpec.make(for: configuration(kind, shell: "/bin/zsh"), context: context(processEnvironment: inherited))
+        #expect(hosted.environment[CherryControl.socketEnvironmentKey] == appSocket, label)
+        #expect(hosted.environment[CherryControl.cliEnvironmentKey] == appCLI, label)
         let native = ShellProcessController.nativeExecLaunch(
             for: configuration(kind, shell: "/bin/bash"),
             shellIntegration: nil,
             inheritedEnvironment: inherited,
             terminfoDirectories: nil,
-            mcpHelperPath: helper
+            controlSocketPath: appSocket,
+            cliPath: appCLI
         )
-        #expect(native.environment[CherryControl.mcpHelperEnvironmentKey] == helper, Comment(rawValue: kind.rawValue))
+        #expect(native.environment[CherryControl.socketEnvironmentKey] == appSocket, label)
+        #expect(native.environment[CherryControl.cliEnvironmentKey] == appCLI, label)
     }
-    // Without a CherryMCP next to the app: none, not the inherited one.
-    let without = HostedLaunchSpec.make(for: configuration(.agent, shell: "/bin/zsh"), context: context(processEnvironment: inherited))
-    #expect(without.environment[CherryControl.mcpHelperEnvironmentKey] == nil)
-    #expect(CherryTabEnvironment.keys.contains(CherryControl.mcpHelperEnvironmentKey))
+    // Without them (no socket answered, no helper): none of the inherited.
+    var bare = context(processEnvironment: inherited)
+    bare.controlSocketPath = nil
+    bare.cliPath = nil
+    let hosted = HostedLaunchSpec.make(for: configuration(.agent, shell: "/bin/zsh"), context: bare)
+    #expect(hosted.environment[CherryControl.socketEnvironmentKey] == nil)
+    #expect(hosted.environment[CherryControl.cliEnvironmentKey] == nil)
+
+    // A Cherry tab's identity, cleared from the app at launch; the socket is
+    // not (a private run names the app's that way), but no launch passes on
+    // the inherited one.
+    for key in [CherryControl.cliEnvironmentKey, CherryControl.mcpTokenEnvironmentKey, CherryControl.controlMachineEnvironmentKey] {
+        #expect(CherryTabEnvironment.keys.contains(key), Comment(rawValue: key))
+    }
+    #expect(!CherryTabEnvironment.keys.contains(CherryControl.socketEnvironmentKey))
+    #expect(HostedLaunchSpec.isInheritedTerminalState(CherryControl.socketEnvironmentKey))
+}
+
+/// A Ghostty surface builds its child's environment over Cherry's own and
+/// cannot remove a key from it: with no socket of the app's to name, a
+/// native launch empties an inherited CHERRY_CONTROL_SOCKET (which
+/// CherryControl.socketURL treats as unset) and otherwise sets nothing.
+@Test func nativeLaunchWithoutTheAppsSocketEmptiesAnInheritedOne() {
+    let configuration = configuration(.agent, shell: "/bin/bash")
+    func launch(inherited: [String: String], socket: String?) -> [String: String] {
+        ShellProcessController.nativeExecLaunch(
+            for: configuration,
+            shellIntegration: nil,
+            inheritedEnvironment: inherited,
+            terminfoDirectories: nil,
+            controlSocketPath: socket,
+            cliPath: nil
+        ).environment
+    }
+    var bare = processEnvironment
+    bare[CherryControl.socketEnvironmentKey] = nil
+    #expect(launch(inherited: processEnvironment, socket: nil)[CherryControl.socketEnvironmentKey] == "")
+    #expect(!launch(inherited: bare, socket: nil).keys.contains(CherryControl.socketEnvironmentKey))
+    #expect(launch(inherited: processEnvironment, socket: appSocket)[CherryControl.socketEnvironmentKey] == appSocket)
+    #expect(launch(inherited: bare, socket: "")[CherryControl.socketEnvironmentKey] == nil)
+    // The empty value reads as no socket: the helper derives its own.
+    let empty = launch(inherited: processEnvironment, socket: nil)
+    #expect(CherryControl.socketURL(environment: empty, executableURL: nil) == CherryControl.socketURL(environment: [:], executableURL: nil))
+}
+
+/// CHERRY_CLI is the helper `HostedSessionClient` resolves, never the
+/// `cherry` beside the executable unchecked: on a case-insensitive volume
+/// that is a SwiftPM-built `Cherry` GUI itself.
+@Test func theAppsCLIIsItsOwnHelperNeverItsGUI() throws {
+    let directory = try canonicalTemporaryDirectory("cherry-cli-path")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = "#!/bin/sh\nexit 0\n"
+    let gui = directory.appendingPathComponent(".build/debug/Cherry")
+    try writeFile(script, to: gui, executable: true)
+    let sourceRoot = directory.appendingPathComponent("source", isDirectory: true)
+    func resolve(_ environment: [String: String] = [:], executable: URL = gui, bundle: URL? = nil, debug: Bool = true) -> String? {
+        ShellProcessController.resolvedCLIPath(
+            environment: environment,
+            runningExecutable: executable,
+            bundleURL: bundle ?? executable.deletingLastPathComponent(),
+            sourceRoot: sourceRoot,
+            isDebugBuild: debug
+        )
+    }
+    // `.build/debug/cherry` names the GUI on a case-insensitive volume (and
+    // nothing on a case-sensitive one): no CLI at all.
+    #expect(resolve() == nil)
+    // A development build's helper is found instead.
+    let helper = sourceRoot.appendingPathComponent("Host/target/debug/cherry")
+    try writeFile(script, to: helper, executable: true)
+    // (Standardized, as `developmentTargetDirectories` gives them.)
+    #expect(resolve() == helper.standardizedFileURL.path)
+    // CHERRY_CLI_PATH wins, as for the app's own helpers.
+    let override = directory.appendingPathComponent("override-cherry")
+    try writeFile(script, to: override, executable: true)
+    #expect(resolve(["CHERRY_CLI_PATH": override.path]) == override.path)
+
+    // A packaged app: the `cherry` beside its `CherryApp`, and only that.
+    let app = directory.appendingPathComponent("Cherry.app", isDirectory: true)
+    let macOS = app.appendingPathComponent("Contents/MacOS", isDirectory: true)
+    let packagedGUI = macOS.appendingPathComponent("CherryApp")
+    try writeFile(script, to: packagedGUI, executable: true)
+    #expect(resolve(executable: packagedGUI, bundle: app, debug: false) == nil)
+    let bundled = macOS.appendingPathComponent("cherry")
+    try writeFile(script, to: bundled, executable: true)
+    #expect(resolve(executable: packagedGUI, bundle: app, debug: false) == bundled.path)
+}
+
+/// Helpers and adapters run with Cherry's own environment less what
+/// describes another tab: never the control socket of the Cherry (or
+/// private run) this one was started from, nor one the login capture read.
+@Test func helperEnvironmentNeverCarriesAControlSocket() throws {
+    let helper = HostedSessionLoginEnvironment.helperEnvironment(
+        base: [
+            "PATH": "/usr/bin", "HOME": "/Users/me", CherryControl.socketEnvironmentKey: "/tmp/cherry-501/x/control.sock",
+            CherryControl.cliEnvironmentKey: "/elsewhere/cherry", "CHERRY_HOST_SOCKET": "/tmp/private/host.sock"
+        ],
+        login: ["PATH": "/login/bin"]
+    )
+    #expect(helper == ["PATH": "/login/bin", "HOME": "/Users/me", "CHERRY_HOST_SOCKET": "/tmp/private/host.sock"])
+
+    let marker = "__MARK__"
+    var data = Data(marker.utf8)
+    for entry in [
+        "PATH=/login/bin", "\(CherryControl.socketEnvironmentKey)=/tmp/cherry-501/x/control.sock",
+        "\(CherryControl.cliEnvironmentKey)=/elsewhere/cherry"
+    ] {
+        data.append(Data(entry.utf8))
+        data.append(0)
+    }
+    data.append(Data(marker.utf8))
+    let captured = try #require(HostedSessionLoginEnvironment.parse(data, marker: marker))
+    #expect(captured == ["PATH": "/login/bin"])
 }
 
 @Test func hostedLaunchNeverPassesOnACherryTabsVariables() {
@@ -524,14 +670,10 @@ func hostedLaunchMatchesNativeLaunchForEveryTabKind(shell: String) throws {
 @Test func hostedLaunchRunsNoLoginWrapperAndFallsBackWithoutAnAccount() {
     // login(1) exits 0 whatever the shell's status, so hosted sessions run
     // without it; there is no banner for ~/.hushlogin to silence.
-    var quiet = account
-    quiet.hushLogin = true
     let terminal = configuration(.terminal, shell: "/bin/zsh")
-    for account in [account, quiet] {
-        let argv = HostedLaunchSpec.make(for: terminal, context: context(account: account)).argv
-        #expect(argv == ["/bin/bash", "--noprofile", "--norc", "-c", "exec -l /bin/zsh -l"])
-        #expect(!argv.contains(HostedLaunchSpec.loginProgram))
-    }
+    let argv = HostedLaunchSpec.make(for: terminal, context: context(account: account)).argv
+    #expect(argv == ["/bin/bash", "--noprofile", "--norc", "-c", "exec -l /bin/zsh -l"])
+    #expect(!argv.contains("/usr/bin/login"))
 
     let unwrapped = HostedLaunchSpec.make(for: terminal, context: context(account: nil))
     #expect(unwrapped.argv == ["/bin/sh", "-c", "/bin/zsh -l"])
@@ -544,7 +686,6 @@ func hostedLaunchMatchesNativeLaunchForEveryTabKind(shell: String) throws {
     #expect(current.userName == String(cString: record.pointee.pw_name))
     #expect(current.homeDirectory == String(cString: record.pointee.pw_dir))
     #expect(current.shell == String(cString: record.pointee.pw_shell))
-    #expect(current.hushLogin == FileManager.default.fileExists(atPath: "\(current.homeDirectory)/.hushlogin"))
 }
 
 // MARK: - Ghostty shell integration
@@ -723,7 +864,7 @@ private struct Integration: Equatable {
     "  printf   '%s|' 'tab\there' '\\\\back' '*' \"`echo tick`\" > \"$CHERRY_TEST_OUTPUT\""
 ])
 func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: String) throws {
-    let directory = try makeTemporaryDirectory("cherry-hosted-quoting")
+    let directory = try canonicalTemporaryDirectory("cherry-hosted-quoting")
     defer { try? FileManager.default.removeItem(at: directory) }
     let argumentsFile = directory.appendingPathComponent("arguments")
     let outputFile = directory.appendingPathComponent("output")
@@ -772,7 +913,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func hostedZshLaunchRunsTheStartupCommandThroughCherrysBootstrap() throws {
-    let home = try makeTemporaryDirectory("cherry-hosted-zsh")
+    let home = try canonicalTemporaryDirectory("cherry-hosted-zsh")
     defer { try? FileManager.default.removeItem(at: home) }
     let bootstrap = try #require(try ShellIntegrationBootstrap.prepare(shellPath: "/bin/zsh", homeDirectory: home))
     let outputFile = home.appendingPathComponent("output")
@@ -829,7 +970,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 // MARK: - Resource staging
 
 @Test func stagingCopiesResourcesOnceIntoAContentAddressedDirectory() throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-stage")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-stage")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try makeResourceSource(in: directory.appendingPathComponent("bundle", isDirectory: true))
     let base = directory.appendingPathComponent("GhosttyResources", isDirectory: true)
@@ -884,7 +1025,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func stagingRepairsADamagedCopyInPlaceAndKeepsWhatItDoesNotOwn() throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-repair")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-repair")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try makeResourceSource(in: directory.appendingPathComponent("bundle", isDirectory: true))
     let base = directory.appendingPathComponent("GhosttyResources", isDirectory: true)
@@ -936,7 +1077,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func concurrentStagingConvergesOnOneCompleteCopy() throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-race")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-race")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try makeResourceSource(in: directory.appendingPathComponent("bundle", isDirectory: true))
     let base = directory.appendingPathComponent("GhosttyResources", isDirectory: true)
@@ -953,7 +1094,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func stagingRemovesOldLeftoversOfInterruptedStages() throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-leftovers")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-leftovers")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try makeResourceSource(in: directory.appendingPathComponent("bundle", isDirectory: true))
     let base = directory.appendingPathComponent("GhosttyResources", isDirectory: true)
@@ -982,7 +1123,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func stagingFailsWhenTheBundleHasNoResources() throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-missing")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-missing")
     defer { try? FileManager.default.removeItem(at: directory) }
     let missing = GhosttyResourceStaging.Source(
         resourcesDirectory: directory.appendingPathComponent("Ghostty"),
@@ -994,7 +1135,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func stagerStagesOnceOffTheCallersThreadAndRetriesFailures() async throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-stager")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-stager")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try makeResourceSource(in: directory.appendingPathComponent("bundle", isDirectory: true))
     let base = directory.appendingPathComponent("GhosttyResources", isDirectory: true)
@@ -1026,7 +1167,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func bundledGhosttyResourcesStageWithAUsableTerminfo() async throws {
-    let directory = try makeTemporaryDirectory("cherry-ghostty-bundled")
+    let directory = try canonicalTemporaryDirectory("cherry-ghostty-bundled")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try #require(GhosttyResourceStaging.bundledSource())
     let staged = try GhosttyResourceStaging.stage(source, into: directory)
@@ -1067,7 +1208,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
 }
 
 @Test func preparingAZshTabWritesTheBootstrapItsLaunchUses() async throws {
-    let directory = try makeTemporaryDirectory("cherry-hosted-prepare")
+    let directory = try canonicalTemporaryDirectory("cherry-hosted-prepare")
     defer { try? FileManager.default.removeItem(at: directory) }
     let source = try makeResourceSource(in: directory.appendingPathComponent("bundle", isDirectory: true))
     let stager = GhosttyResourceStager(
@@ -1162,6 +1303,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
     // `open` from a Cherry tab passes that tab's environment to the app.
     let keys = [
         "CHERRY_SESSION_ID", CherryControl.processIDEnvironmentKey, CherryControl.agentIDEnvironmentKey,
+        CherryControl.cliEnvironmentKey, CherryControl.mcpTokenEnvironmentKey, CherryControl.controlMachineEnvironmentKey,
         "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION",
     ]
     // Never this process's own environment: libghostty, initialised by
@@ -1172,4 +1314,7 @@ func hostedNonZshStartupCommandSurvivesTheLoginWrapperQuoting(startupCommand: St
     for key in keys { #expect(removed.contains(key)) }
     #expect(!removed.contains("CHERRY_HOST_SOCKET_PROBE_KEEP"))
     #expect(!removed.contains("PATH"))
+    // A private run's socket: `CherryControlServer.appSocketURL` decides
+    // whether this app takes it.
+    #expect(!removed.contains(CherryControl.socketEnvironmentKey))
 }

@@ -10,6 +10,8 @@ anyhow.workspace = true
 # images a snapshot re-sends are zlib-compressed.
 png = "0.18"
 miniz_oxide = "0.8"
+# The output is scanned for the prompt redraw options (`PromptRedraw`).
+memchr = "2"
 
 [build-dependencies]
 cc = "1.2"

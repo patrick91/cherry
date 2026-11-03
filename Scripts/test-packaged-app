@@ -3,9 +3,17 @@
 
 Run in a logged-in macOS GUI session:
     Scripts/test-packaged-app '/path/to/Cherry Sessions.app'
+    Scripts/test-packaged-app DIR/Cherry.app --sign-identity ID [--keychain KC] \
+        --entitlements Packaging/Cherry.entitlements
 
 The source app is verified, copied, given disposable preferences, and launched
 under a per-process sandbox. No shared build directories are moved or changed.
+The copy gets another bundle identifier, data folder and URL scheme, and no
+Sparkle (SU*) keys, so it never shares the original's preferences or updates
+itself. It is signed again: ad hoc with --deep by default (no hardened runtime,
+so the ad hoc Sparkle.framework loads), or with --sign-identity inside out
+through Scripts/sign-app, with the hardened runtime and the entitlements when
+its certificate has a Team ID, as a release is (Scripts/package-release sign).
 Opening a real project and reading a command's rendered terminal output catches
 resource lookup failures that a launch-only check (or the developer's checkout)
 can conceal. The temporary test window is closed when the check finishes.
@@ -44,6 +52,8 @@ import cherry_private_host  # noqa: E402
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 HELPERS = ("cherry", "cherry-host")
+LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+              "LaunchServices.framework/Support/lsregister")
 
 
 def run(*command, **kwargs):
@@ -99,10 +109,19 @@ def architectures(path):
 
 
 def check_bundle_contents(app, skip_helpers):
-    """Reject test resources and missing or wrong-architecture helpers."""
+    """Reject test resources, a Sparkle.framework that is missing or keeps its
+    XPC services, and missing or wrong-architecture helpers."""
     test_bundles = sorted(path.name for path in (app / "Contents/Resources").glob("*Tests*.bundle"))
     if test_bundles:
         raise RuntimeError(f"App bundle contains test resource bundles: {', '.join(test_bundles)}")
+    framework = app / "Contents/Frameworks/Sparkle.framework"
+    for part in ("Versions/B/Autoupdate", "Versions/B/Updater.app"):
+        if not (framework / part).exists():
+            raise RuntimeError(f"Missing {framework / part}: the app must embed Sparkle.framework")
+    for directory, subdirectories, files in os.walk(framework):
+        if "XPCServices" in subdirectories or "XPCServices" in files:
+            raise RuntimeError(f"{Path(directory) / 'XPCServices'} exists: the app embeds Sparkle "
+                               "without its XPC services")
     if skip_helpers:
         return
     with (app / "Contents/Info.plist").open("rb") as file:
@@ -155,18 +174,18 @@ def exercise_helpers(app, sandbox, environment, fixture):
     socket_path = state / "host.sock"
 
     def cherry(*arguments):
-        result = subprocess.run(sandbox + [str(cli), "--socket", str(socket_path), *arguments],
+        result = subprocess.run(sandbox + [str(cli), "--socket", str(socket_path), "host", *arguments],
                                 env=environment, cwd=fixture, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
-            raise RuntimeError(f"Bundled `cherry {' '.join(arguments)}` failed with status "
+            raise RuntimeError(f"Bundled `cherry host {' '.join(arguments)}` failed with status "
                                f"{result.returncode}: {result.stderr.strip()}")
         return result.stdout
 
     def session(session_id):
-        listing = json_object(cherry("list", "--json"), "`cherry list --json` output")
+        listing = json_object(cherry("list", "--json"), "`cherry host list --json` output")
         sessions = listing.get("sessions")
         if not isinstance(sessions, list) or not all(isinstance(item, dict) for item in sessions):
-            raise RuntimeError(f"`cherry list --json` has no list of session objects: {listing}")
+            raise RuntimeError(f"`cherry host list --json` has no list of session objects: {listing}")
         return next((item for item in sessions if item.get("id") == session_id), None)
 
     session_id = None
@@ -176,10 +195,10 @@ def exercise_helpers(app, sandbox, environment, fixture):
         lines = [line for line in cherry("new", "--name=packaged-helper-smoke", f"--cwd={fixture}",
                                          "--", "/bin/sh", "-c", "sleep 30").splitlines() if line.strip()]
         if not lines:
-            raise RuntimeError("Bundled `cherry new` printed no session")
-        created = json_object(lines[-1], "`cherry new` output")
+            raise RuntimeError("Bundled `cherry host new` printed no session")
+        created = json_object(lines[-1], "`cherry host new` output")
         if not isinstance(created.get("id"), str) or not created["id"]:
-            raise RuntimeError(f"Bundled `cherry new` printed no session id: {created}")
+            raise RuntimeError(f"Bundled `cherry host new` printed no session id: {created}")
         session_id = created["id"]
         if created.get("state") != "running":
             raise RuntimeError(f"Bundled helpers did not start the session: {created}")
@@ -200,7 +219,7 @@ def exercise_helpers(app, sandbox, environment, fixture):
     finally:
         if not stopped and host_reachable(socket_path):
             for arguments in ([["kill", session_id]] if session_id else []) + [["shutdown"]]:
-                subprocess.run(sandbox + [str(cli), "--socket", str(socket_path), *arguments],
+                subprocess.run(sandbox + [str(cli), "--socket", str(socket_path), "host", *arguments],
                                env=environment, capture_output=True, timeout=30)
             time.sleep(0.5)
             if host_reachable(socket_path):
@@ -219,6 +238,12 @@ def main():
                         help="Retain the isolated app, home, sandbox profile, and log for diagnosis")
     parser.add_argument("--skip-helpers", action="store_true",
                         help="The app was built with CHERRY_SKIP_HOST=1; skip the session helper checks")
+    parser.add_argument("--sign-identity",
+                        help="Sign the copy inside out with this identity and the hardened runtime "
+                             "(Scripts/sign-app) instead of ad hoc with --deep")
+    parser.add_argument("--keychain", help="The keychain that holds --sign-identity")
+    parser.add_argument("--entitlements", type=Path, default=REPOSITORY / "Packaging/Cherry.entitlements",
+                        help="The app's entitlements with --sign-identity (default: Packaging/Cherry.entitlements)")
     args = parser.parse_args()
     original = args.app.expanduser().resolve()
     if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").exists():
@@ -227,6 +252,10 @@ def main():
         parser.error(f"Not an application bundle: {original}")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.keychain and not args.sign_identity:
+        parser.error("--keychain needs --sign-identity")
+    if args.sign_identity and not args.entitlements.is_file():
+        parser.error(f"Missing entitlements file {args.entitlements}")
 
     run("/usr/bin/codesign", "--verify", "--deep", "--strict", str(original))
     check_bundle_contents(original, args.skip_helpers)
@@ -245,6 +274,7 @@ def main():
     sandbox = None
     environment = None
     bundle_id = None
+    app = None
     success = False
     try:
         sockets.mkdir(mode=0o700)
@@ -263,10 +293,20 @@ def main():
         # the default fallback Dock icon is loaded through CherryResources.
         info.pop("CFBundleIconFile", None)
         info.pop("CFBundleIconName", None)
+        # The rewritten identity already keeps the updater off; without a
+        # feed or key it could not start either.
+        for key in [key for key in info if key.startswith("SU")]:
+            info.pop(key)
         with info_path.open("wb") as file:
             plistlib.dump(info, file)
         bundle_id = info["CFBundleIdentifier"]
-        run("/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app))
+        if args.sign_identity:
+            run(str(REPOSITORY / "Scripts/sign-app"), "--identity", args.sign_identity,
+                *(["--keychain", args.keychain] if args.keychain else []),
+                "--timestamp=none", "--entitlements", str(args.entitlements.resolve()), str(app))
+            print(f"Signed the copy inside out with {args.sign_identity} (Scripts/sign-app).", flush=True)
+        else:
+            run("/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app))
         executable = app / "Contents/MacOS" / info["CFBundleExecutable"]
 
         # Always hide this checkout. Also detect compiled SwiftPM .build paths
@@ -351,13 +391,14 @@ def main():
         control(socket_path, request("openProject", {"projectRoot": str(project)}))
         terminals = scoped("listTerminals")["terminals"]
         terminal_ids.extend(terminal["id"] for terminal in terminals)
-        created = scoped("createTerminal", {"title": "Packaged app smoke", "workingDirectory": str(project)})
-        terminal_id = created["terminalID"]
+        created = scoped("spawnProcess", {"kind": "terminal", "title": "Packaged app smoke",
+                                          "workingDirectory": str(project)})
+        terminal_id = created["process"]["id"]
         terminal_ids.append(terminal_id)
-        scoped("selectTerminal", {"terminalID": terminal_id})
+        scoped("selectProcess", {"processID": terminal_id})
         while True:
             check_running(process)
-            initial = scoped("getTerminalOutput", {"terminalID": terminal_id, "lineLimit": 100})
+            initial = scoped("getProcessOutput", {"processID": terminal_id, "lineLimit": 100})
             if any("Ghostty failed to launch" in line for line in initial["lines"]):
                 raise RuntimeError(f"Native shell did not launch: {initial['lines']}")
             if any(line.strip() for line in initial["lines"]):
@@ -368,11 +409,11 @@ def main():
         # The complete marker never occurs in the input, so echoed input cannot
         # pass this check without the shell actually executing the command.
         marker = "CHERRY_PACKAGED_" + unique
-        scoped("sendInput", {"terminalID": terminal_id,
-                             "text": "printf '\\n%s%s\\n' 'CHERRY_PACKAGED_' '" + unique + "'\n"})
+        scoped("sendProcessInput", {"processID": terminal_id,
+                                    "text": "printf '\\n%s%s\\n' 'CHERRY_PACKAGED_' '" + unique + "'\n"})
         while True:
             check_running(process)
-            output = scoped("getTerminalOutput", {"terminalID": terminal_id, "lineLimit": 100})
+            output = scoped("getProcessOutput", {"processID": terminal_id, "lineLimit": 100})
             if any(line.strip() == marker for line in output["lines"]):
                 break
             if time.monotonic() >= deadline:
@@ -407,7 +448,7 @@ def main():
                 try:
                     control(socket_path, request("scoped", {
                         "projectRoot": str(project),
-                        "request": request("closeTerminal", {"terminalID": terminal_id}),
+                        "request": request("closeProcess", {"processID": terminal_id}),
                     }), timeout=1)
                 except (OSError, ValueError, RuntimeError):
                     pass
@@ -438,6 +479,10 @@ def main():
         if args.keep_fixture:
             print(f"Fixture retained at {fixture}", flush=True)
         else:
+            # Launching the copy registered it with LaunchServices; its record
+            # would outlive the fixture (one per run, each a unique id).
+            if app is not None:
+                subprocess.run([LSREGISTER, "-u", str(app)], capture_output=True)
             shutil.rmtree(fixture)
         if leftover:
             print("Packaged GUI session host cleanup: " + "; ".join(leftover), file=sys.stderr)

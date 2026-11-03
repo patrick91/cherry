@@ -20,7 +20,7 @@ import AppKit
 /// (`ProjectWindowToasts`): Reopen, End…, and dismiss. Nobody asked for it,
 /// so it is an unprompted toast: its time runs only while its window is key
 /// in the active app, and it takes turns with a closed tab's toast rather
-/// than replacing one or being replaced. Off in Settings › Sessions
+/// than replacing one or being replaced. Off in Settings › Notifications
 /// (`sessions.backgroundNoticeAtLaunch`).
 @MainActor
 final class BackgroundSessionsNotice {
@@ -65,7 +65,7 @@ final class BackgroundSessionsNotice {
     private let peeks: RemoteDevicePeeks
 
     /// - Parameters:
-    ///   - isEnabled: Settings › Sessions' "Tell me about background
+    ///   - isEnabled: Settings › Notifications' "Tell me about background
     ///     sessions when Cherry opens".
     ///   - defaults: where the sessions told about are kept.
     ///   - canPresent: whether a window can show it now (on screen).
@@ -103,15 +103,15 @@ final class BackgroundSessionsNotice {
         BackgroundSessionsNotice(model: .shared, registry: registry)
     }
 
-    /// The launch asked for its windows (`projectRoots`: the ones it
-    /// reopens): once they have opened and restored their tabs, it checks,
-    /// once per run.
-    func launchWindowsOpened(expecting projectRoots: [String] = []) {
+    /// The launch asked for its windows (`windows`: the ones it reopens):
+    /// once each of them has opened (another window of its project is not
+    /// it) and restored its tabs, it checks, once per run.
+    func launchWindowsOpened(expecting windows: [ProjectWindowValue] = []) {
         guard phase == .idle else { return }
         phase = .checking
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let content = await self.check(expecting: projectRoots)
+            let content = await self.check(expecting: windows)
             self.checked(content)
         }
     }
@@ -131,10 +131,10 @@ final class BackgroundSessionsNotice {
 
     /// What to say, if anything: the background sessions at work of a
     /// complete list that it has not told about.
-    private func check(expecting projectRoots: [String]) async -> Content? {
+    private func check(expecting windows: [ProjectWindowValue]) async -> Content? {
         try? await Task.sleep(for: settleDelay)
         let deadline = ContinuousClock.now + restoreWait
-        while projectRoots.contains(where: { !registry.hasWindow(for: $0) }), ContinuousClock.now < deadline {
+        while windows.contains(where: { !registry.hasWindow($0) }), ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(50))
         }
         for repository in registry.allRepositories {
@@ -194,21 +194,9 @@ final class BackgroundSessionsNotice {
             return HostedSessionList(hostID: hostID, sessions: control.sessions, pendingHolders: control.expectsHolders ? 1 : 0)
         }
         let peeks = peeks
-        let peek = await Self.within(deviceListTimeout) { await peeks.refresh(control) }
+        let peek = await withinTimeout(deviceListTimeout) { await peeks.refresh(control) }
         if case .listed(let list)?? = peek { return list }
         return nil
-    }
-
-    /// `work`'s answer, or nil when it takes longer than `timeout`.
-    private static func within<T: Sendable>(_ timeout: Duration, _ work: @escaping @MainActor () async -> T) async -> T? {
-        let once = ResumeOnceBox<T>()
-        return await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
-            Task { @MainActor in once.resume(continuation, with: await work()) }
-            Task { @MainActor in
-                try? await Task.sleep(for: timeout)
-                once.resume(continuation, with: nil)
-            }
-        }
     }
 
     private func checked(_ content: Content?) {
@@ -336,17 +324,5 @@ final class BackgroundSessionsNotice {
             message: from + (named.map { " (\($0))" } ?? "") + ". " + whereTo,
             sessionIDs: sessions.map(\.id)
         )
-    }
-}
-
-/// Resumes a continuation once, whichever answer comes first.
-@MainActor
-private final class ResumeOnceBox<T: Sendable> {
-    private var resumed = false
-
-    func resume(_ continuation: CheckedContinuation<T?, Never>, with value: T?) {
-        guard !resumed else { return }
-        resumed = true
-        continuation.resume(returning: value)
     }
 }

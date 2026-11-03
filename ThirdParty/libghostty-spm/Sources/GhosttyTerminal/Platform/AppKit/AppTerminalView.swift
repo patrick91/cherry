@@ -58,6 +58,13 @@
             surface?.sendText(text)
         }
 
+        /// Pastes text as the clipboard's would be pasted: bracketed while the
+        /// program asks for it, and under paste protection (unsafe text goes
+        /// through the clipboard confirmation first), unlike `sendText`.
+        public func pasteText(_ text: String) {
+            surface?.pasteText(text)
+        }
+
         /// Synthesizes a key press (+release). `keycode` is the AppKit virtual
         /// keycode. Used for native-PTY control/escape input (Enter, arrows, Tab,
         /// Ctrl-combos) which the text path can't express.

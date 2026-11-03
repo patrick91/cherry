@@ -1,50 +1,11 @@
 import AppKit
-import CherryControl
+@testable import CherryControl
 import Darwin
 import Foundation
 import GhosttyTerminal
-import MCP
 import SwiftUI
 import Testing
 @testable import Cherry
-@testable import CherryMCP
-
-private func runProcessOutput(executable: String, arguments: [String]) throws -> String {
-    let outputPipe = Pipe()
-    let errorPipe = Pipe()
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: executable)
-    process.arguments = arguments
-    process.standardOutput = outputPipe
-    process.standardError = errorPipe
-
-    try process.run()
-    process.waitUntilExit()
-
-    let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-    let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
-    return String(decoding: output + errorOutput, as: UTF8.self)
-}
-
-private func runGitForTest(_ arguments: [String]) throws {
-    let outputPipe = Pipe()
-    let errorPipe = Pipe()
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    process.arguments = ["git"] + arguments
-    process.standardOutput = outputPipe
-    process.standardError = errorPipe
-    try process.run()
-    process.waitUntilExit()
-    guard process.terminationStatus == 0 else {
-        let error = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        throw GitWorktreeCommandError(
-            arguments: arguments,
-            exitCode: process.terminationStatus,
-            standardError: String(decoding: error, as: UTF8.self)
-        )
-    }
-}
 
 private func canonicalPathForTest(_ url: URL) throws -> String {
     guard let resolved = url.path.withCString({ realpath($0, nil) }) else {
@@ -52,22 +13,6 @@ private func canonicalPathForTest(_ url: URL) throws -> String {
     }
     defer { free(resolved) }
     return String(cString: resolved)
-}
-
-@MainActor
-private func waitForCondition(
-    timeout: TimeInterval = 1,
-    interval: UInt64 = 10_000_000,
-    _ condition: @MainActor () -> Bool
-) async -> Bool {
-    let deadline = Date(timeIntervalSinceNow: timeout)
-    while Date() < deadline {
-        if condition() {
-            return true
-        }
-        try? await Task.sleep(nanoseconds: interval)
-    }
-    return condition()
 }
 
 private final class DataWriteRecorder: @unchecked Sendable {
@@ -125,10 +70,6 @@ private final class LockedBool: @unchecked Sendable {
     }
 }
 
-private final class MockTerminalFindPasteboard: TerminalFindPasteboard {
-    var string: String?
-}
-
 private func environmentValue(_ key: String) -> String? {
     getenv(key).map { String(cString: $0) }
 }
@@ -162,14 +103,12 @@ private struct ContentViewTestHost: View {
     @StateObject private var repository: RepositoryWorkspace
     @ObservedObject var workspace: TerminalWorkspace
     @ObservedObject var chromeState: ProjectWindowChromeState
-    @ObservedObject var noteStore: ProjectNoteStore
     @ObservedObject var todoStore: ProjectTodoStore
     @State private var storedSidebarWidth = 320.0
 
     init(
         workspace: TerminalWorkspace,
         chromeState: ProjectWindowChromeState,
-        noteStore: ProjectNoteStore,
         todoStore: ProjectTodoStore
     ) {
         _repository = StateObject(wrappedValue: RepositoryWorkspace(
@@ -177,7 +116,6 @@ private struct ContentViewTestHost: View {
         ))
         self.workspace = workspace
         self.chromeState = chromeState
-        self.noteStore = noteStore
         self.todoStore = todoStore
     }
 
@@ -186,7 +124,6 @@ private struct ContentViewTestHost: View {
             repository: repository,
             workspace: workspace,
             chromeState: chromeState,
-            noteStore: noteStore,
             todoStore: todoStore,
             projectRoot: workspace.projectRoot,
             openProject: { _ in },
@@ -194,28 +131,6 @@ private struct ContentViewTestHost: View {
             isSidebarRevealed: $chromeState.isSidebarRevealed,
             isCursorOverSidebar: $chromeState.isCursorOverSidebar,
             storedSidebarWidth: $storedSidebarWidth
-        )
-    }
-}
-
-@MainActor
-private final class TerminalWorkspaceSelectionForTesting: ObservableObject {
-    @Published var workspace: TerminalWorkspace
-
-    init(workspace: TerminalWorkspace) {
-        self.workspace = workspace
-    }
-}
-
-private struct TerminalWorkspaceSwitchTestHost: View {
-    @ObservedObject var selection: TerminalWorkspaceSelectionForTesting
-    @ObservedObject var chromeState: ProjectWindowChromeState
-
-    var body: some View {
-        TerminalSplitSceneView(
-            workspace: selection.workspace,
-            chromeState: chromeState,
-            usesWorktreeSurfaceTransition: true
         )
     }
 }
@@ -237,10 +152,6 @@ private func makeHostedContentViewWindow(
     // Cmd+S into the floating swap or keeps a revealed sidebar up. Tests
     // that need the cursor over the sidebar set their own probe.
     chromeState.cursorOverSidebarProbeForTesting = { _ in false }
-    let noteStore = ProjectNoteStore(
-        projectRoot: projectDirectory.path,
-        storageDirectory: storageDirectory.appendingPathComponent("notes", isDirectory: true)
-    )
     let todoStore = ProjectTodoStore(
         projectRoot: projectDirectory.path,
         storageDirectory: storageDirectory.appendingPathComponent("todos", isDirectory: true)
@@ -262,7 +173,6 @@ private func makeHostedContentViewWindow(
     let rootView = ContentViewTestHost(
         workspace: workspace,
         chromeState: chromeState,
-        noteStore: noteStore,
         todoStore: todoStore
     )
     let hostingView = NSHostingView(rootView: rootView)
@@ -489,15 +399,8 @@ private func installStartupConfirmationAgentScript(
     return scriptURL
 }
 
-private func decodeMCPToolResult<T: Decodable>(_ type: T.Type, from result: CallTool.Result) throws -> T {
-    guard let text = result.content.compactMap({ content -> String? in
-        if case .text(let text, _, _) = content {
-            return text
-        }
-        return nil
-    }).first else {
-        throw CherryControlError(code: "missing_tool_text", message: "MCP tool result did not include text content.")
-    }
+private func decodeMCPToolResult<T: Decodable>(_ type: T.Type, from result: CallToolResult) throws -> T {
+    let text = result.text
     if result.isError == true {
         throw CherryControlError(code: "mcp_tool_error", message: text)
     }
@@ -534,13 +437,11 @@ private struct MCPProcessStatusPayload: Decodable {
 }
 
 private struct MCPBindSessionProcessPayload: Decodable {
-    let mcpSessionID: String?
     let boundProcessID: String
     let previousBoundProcessID: String?
     let process: MCPProcessReference
 
     private enum CodingKeys: String, CodingKey {
-        case mcpSessionID = "mcp_session_id"
         case boundProcessID = "bound_process_id"
         case previousBoundProcessID = "previous_bound_process_id"
         case process
@@ -620,14 +521,12 @@ private struct MCPAgentWait: Decodable {
 }
 
 private struct MCPWhoamiPayload: Decodable {
-    let mcpSessionID: String?
     let effectiveProjectRoot: String?
     let callerProcessID: String?
     let boundProcessID: String?
     let selectedProcessID: String?
 
     private enum CodingKeys: String, CodingKey {
-        case mcpSessionID = "mcp_session_id"
         case effectiveProjectRoot = "effective_project_root"
         case callerProcessID = "caller_process_id"
         case boundProcessID = "bound_process_id"
@@ -637,8 +536,9 @@ private struct MCPWhoamiPayload: Decodable {
 
 @MainActor
 @Test func terminalSearchStateSyncsWithFindPasteboard() {
-    let pasteboard = MockTerminalFindPasteboard()
-    pasteboard.string = "initial needle"
+    let pasteboard = NSPasteboard(name: .init("CherryTests.Find.\(UUID().uuidString)"))
+    pasteboard.clearContents()
+    pasteboard.setString("initial needle", forType: .string)
 
     let state = TerminalSearchState(pasteboard: pasteboard)
 
@@ -648,9 +548,10 @@ private struct MCPWhoamiPayload: Decodable {
     state.query = "new query"
     state.writeQueryToPasteboard()
 
-    #expect(pasteboard.string == "new query")
+    #expect(pasteboard.string(forType: .string) == "new query")
 
-    pasteboard.string = "external query"
+    pasteboard.clearContents()
+    pasteboard.setString("external query", forType: .string)
     state.readQueryFromPasteboard()
 
     #expect(state.query == "external query")
@@ -659,7 +560,7 @@ private struct MCPWhoamiPayload: Decodable {
 
 @MainActor
 @Test func terminalSearchStateFormatsSearchResultCounts() {
-    let state = TerminalSearchState(pasteboard: MockTerminalFindPasteboard())
+    let state = TerminalSearchState(pasteboard: NSPasteboard(name: .init("CherryTests.Find.\(UUID().uuidString)")))
 
     #expect(state.resultCountDescription == nil)
 
@@ -1246,8 +1147,8 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func cherryControlRequestRoundTrips() async throws {
-    let request = CherryControlRequest.sendInput(.init(
-        terminalID: UUID().uuidString,
+    let request = CherryControlRequest.sendProcessInput(.init(
+        processID: UUID().uuidString,
         text: "pwd\n",
         rawBase64: nil,
         waitMilliseconds: 100,
@@ -1263,7 +1164,7 @@ private struct MCPWhoamiPayload: Decodable {
 @Test func scopedCherryControlRequestRoundTrips() async throws {
     let request = CherryControlRequest.scoped(.init(
         projectRoot: "/tmp/project-b",
-        request: .createNote(.init(title: "Scoped", markdown: "Project B"))
+        request: .createTodo(.init(title: "Scoped", markdown: "Project B"))
     ))
 
     let data = try JSONEncoder().encode(request)
@@ -1272,391 +1173,64 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(decoded == request)
 }
 
-@Test func gitWorktreePorcelainParserPreservesLifecycleState() throws {
-    let porcelain = """
-    worktree /tmp/cherry-main\0HEAD 0123456789abcdef\0branch refs/heads/main\0\0worktree /tmp/cherry-feature\0HEAD fedcba9876543210\0branch refs/heads/feature/worktrees\0locked IDE lease\0\0worktree /tmp/cherry-detached\0HEAD aabbccddeeff0011\0detached\0prunable gitdir file points to non-existent location\0\0
-    """
-
-    let worktrees = GitWorktreeService.parseWorktreeList(Data(porcelain.utf8))
-
-    #expect(worktrees.count == 3)
-    #expect(worktrees[0].root == "/tmp/cherry-main")
-    #expect(worktrees[0].branch == "main")
-    #expect(worktrees[0].isMain)
-    #expect(worktrees[1].branch == "feature/worktrees")
-    #expect(worktrees[1].lockReason == "IDE lease")
-    #expect(worktrees[2].isDetached)
-    #expect(worktrees[2].displayName == "@aabbccd")
-    #expect(worktrees[2].pruneReason == "gitdir file points to non-existent location")
-}
-
-@Test func worktreeRemovalCanCloseRunningProcessesForCurrentCheckout() {
-    let busy = WorktreeRemovalBlockers(
-        runningProcessCount: 2,
-        isDirty: false,
-        lockReason: nil,
-        pruneReason: nil
-    )
-    #expect(!busy.canRemove)
-    #expect(busy.canRemove(closingRunningProcesses: true))
-
-    let dirty = WorktreeRemovalBlockers(
-        runningProcessCount: 2,
-        isDirty: true,
-        lockReason: nil,
-        pruneReason: nil
-    )
-    #expect(!dirty.canRemove(closingRunningProcesses: true))
-    #expect(dirty.canRemove(closingRunningProcesses: true, force: true))
-
-    let locked = WorktreeRemovalBlockers(
-        runningProcessCount: 0,
-        isDirty: false,
-        lockReason: "in use",
-        pruneReason: nil
-    )
-    #expect(!locked.canRemove)
-    #expect(locked.canRemove(closingRunningProcesses: true, force: true))
-
-    let missing = WorktreeRemovalBlockers(
-        runningProcessCount: 0,
-        isDirty: true,
-        lockReason: nil,
-        pruneReason: "checkout is missing"
-    )
-    #expect(!missing.canRemove(closingRunningProcesses: true, force: true))
-}
-
-@Test func gitBranchReferenceParserOrdersLocalBeforeRemoteAndHidesRemoteHead() {
-    let references = """
-    refs/remotes/origin/feature\0bbbb\0
-    refs/heads/main\0aaaa\0origin/main
-    refs/remotes/origin/HEAD\0aaaa\0
-    refs/heads/feature\0bbbb\0origin/feature
-    """
-
-    let parsed = GitWorktreeService.parseBranchReferences(Data(references.utf8))
-
-    #expect(parsed.map(\.displayName) == ["feature", "main", "origin/feature"])
-    #expect(parsed.map(\.kind) == [.local, .local, .remote])
-    #expect(parsed[0].upstream == "origin/feature")
-}
-
-@MainActor
-@Test func worktreeSwipeStateAnimatesProgrammaticSwitchAndResets() async throws {
-    let state = WorktreeSidebarSwipeState()
-    let activations = BoolRecorder()
-
-    let started = state.animateSwitch(
-        sourceRoot: "/tmp/cherry-main",
-        targetRoot: "/tmp/cherry-feature",
-        direction: 1,
-        sidebarWidth: 320,
-        duration: 0.01
-    ) {
-        activations.append(true)
-    }
-
-    #expect(started)
-    #expect(activations.values == [true])
-    #expect(state.sourceRoot == "/tmp/cherry-main")
-    #expect(state.targetRoot == "/tmp/cherry-feature")
-    #expect(state.direction == 1)
-    #expect(state.offset == -320)
-    #expect(state.isAnimatingProgrammatically)
-
-    let duplicateStarted = state.animateSwitch(
-        sourceRoot: "/tmp/cherry-main",
-        targetRoot: "/tmp/cherry-third",
-        direction: 1,
-        sidebarWidth: 320,
-        duration: 0.01
-    ) {}
-    #expect(!duplicateStarted)
-
-    try await Task.sleep(for: .milliseconds(50))
-
-    #expect(activations.values == [true])
-    #expect(state.targetRoot == nil)
-    #expect(state.sourceRoot == nil)
-    #expect(state.direction == 0)
-    #expect(state.offset == 0)
-    #expect(!state.isAnimatingProgrammatically)
-}
-
-@Test func worktreeSwipeCommitDecisionProjectsFastFlicks() {
-    #expect(WorktreeSwipeCommitDecision.shouldCommit(
-        distance: 24,
-        velocity: 520,
-        threshold: 64
-    ))
-    #expect(!WorktreeSwipeCommitDecision.shouldCommit(
-        distance: 24,
-        velocity: 120,
-        threshold: 64
-    ))
-    #expect(!WorktreeSwipeCommitDecision.shouldCommit(
-        distance: 24,
-        velocity: -900,
-        threshold: 64
-    ))
-    #expect(WorktreeSwipeCommitDecision.shouldCommit(
-        distance: 64,
-        velocity: 0,
-        threshold: 64
-    ))
-}
-
-@Test func worktreeSwipeSettleDurationTracksRemainingDistance() {
-    let fullDistance = WorktreeSwipeTuning.resolvedSettleDuration(
-        configuredDuration: 0.14,
-        currentOffset: 0,
-        finalOffset: -320,
-        sidebarWidth: 320
-    )
-    let partialDistance = WorktreeSwipeTuning.resolvedSettleDuration(
-        configuredDuration: 0.14,
-        currentOffset: -64,
-        finalOffset: -320,
-        sidebarWidth: 320
-    )
-    let nearlyComplete = WorktreeSwipeTuning.resolvedSettleDuration(
-        configuredDuration: 0.14,
-        currentOffset: -304,
-        finalOffset: -320,
-        sidebarWidth: 320
-    )
-
-    #expect(abs(fullDistance - 0.14) < 0.0001)
-    #expect(abs(partialDistance - 0.112) < 0.0001)
-    #expect(abs(nearlyComplete - 0.05) < 0.0001)
-}
-
-@Test func worktreeSwipeReleaseDecisionUsesTheLastDirectionAfterReversing() {
-    let fastReversal = WorktreeSwipeReleaseDecision.make(
-        distance: -80,
-        velocity: 900,
-        lastIntentDirection: -1,
-        threshold: 64
-    )
-    #expect(fastReversal == WorktreeSwipeReleaseDecision(
-        direction: -1,
-        shouldCommit: true
-    ))
-
-    let slowReversal = WorktreeSwipeReleaseDecision.make(
-        distance: -80,
-        velocity: 100,
-        lastIntentDirection: -1,
-        threshold: 64
-    )
-    #expect(slowReversal == WorktreeSwipeReleaseDecision(
-        direction: -1,
-        shouldCommit: false
-    ))
-
-    let uninterruptedSwipe = WorktreeSwipeReleaseDecision.make(
-        distance: -70,
-        velocity: -200,
-        lastIntentDirection: 1,
-        threshold: 64
-    )
-    #expect(uninterruptedSwipe == WorktreeSwipeReleaseDecision(
-        direction: 1,
-        shouldCommit: true
-    ))
-}
-
-@Test func worktreeSwipeIdleFallbackIgnoresActiveGesturePhases() {
-    #expect(!WorktreeSwipeGesturePhase.shouldScheduleIdleFallback(for: .began))
-    #expect(!WorktreeSwipeGesturePhase.shouldScheduleIdleFallback(for: .changed))
-    #expect(!WorktreeSwipeGesturePhase.shouldScheduleIdleFallback(for: .ended))
-    #expect(WorktreeSwipeGesturePhase.shouldScheduleIdleFallback(for: []))
-}
-
-@Test func gitWorktreeServiceDiscoversCreatesAndRemovesACleanWorktree() async throws {
-    let container = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryWorktreeTests-\(UUID().uuidString)", isDirectory: true)
-    let repositoryRoot = container.appendingPathComponent("repository", isDirectory: true)
-    let worktreeRoot = container
-        .appendingPathComponent("managed", isDirectory: true)
-        .appendingPathComponent("feature", isDirectory: true)
-    defer { try? FileManager.default.removeItem(at: container) }
-
-    try FileManager.default.createDirectory(at: repositoryRoot, withIntermediateDirectories: true)
-    let canonicalRepositoryRoot = try canonicalPathForTest(repositoryRoot)
-    try runGitForTest(["-C", repositoryRoot.path, "init", "-b", "main"])
-    try runGitForTest(["-C", repositoryRoot.path, "config", "user.name", "Cherry Tests"])
-    try runGitForTest(["-C", repositoryRoot.path, "config", "user.email", "cherry@example.invalid"])
-    try Data("Cherry\n".utf8).write(to: repositoryRoot.appendingPathComponent("README.md"))
-    try runGitForTest(["-C", repositoryRoot.path, "add", "README.md"])
-    try runGitForTest(["-C", repositoryRoot.path, "commit", "-m", "Initial commit"])
-
-    let service = GitWorktreeService()
-    let initial = try await service.discover(projectRoot: repositoryRoot.path)
-    #expect(initial.primaryRoot == canonicalRepositoryRoot)
-    #expect(initial.worktrees.map(\.branch) == ["main"])
-
-    try await service.create(
-        .newBranch(name: "feature/worktrees", startPoint: "HEAD", destination: worktreeRoot.path),
-        repositoryRoot: repositoryRoot.path
-    )
-    let canonicalWorktreeRoot = try canonicalPathForTest(worktreeRoot)
-    let created = try await service.discover(projectRoot: repositoryRoot.path)
-    #expect(created.worktrees.count == 2)
-    #expect(created.worktrees.first { $0.root == canonicalWorktreeRoot }?.branch == "feature/worktrees")
-
-    try await service.renameBranch(
-        worktreeRoot: worktreeRoot.path,
-        newName: "feature/renamed-worktree"
-    )
-    let renamed = try await service.discover(projectRoot: repositoryRoot.path)
-    #expect(renamed.worktrees.first { $0.root == canonicalWorktreeRoot }?.branch == "feature/renamed-worktree")
-
-    let isDirty = try await service.isDirty(worktreeRoot: worktreeRoot.path)
-    #expect(isDirty == false)
-
-    try Data("untracked\n".utf8).write(to: worktreeRoot.appendingPathComponent("untracked.txt"))
-    let missingRoot = container.appendingPathComponent("missing", isDirectory: true).path
-    let statuses = await service.dirtyStatuses(worktreeRoots: [
-        canonicalRepositoryRoot,
-        canonicalWorktreeRoot,
-        missingRoot,
-    ])
-    #expect(statuses == [
-        canonicalRepositoryRoot: false,
-        canonicalWorktreeRoot: true,
-    ])
-    try runGitForTest([
-        "-C", repositoryRoot.path,
-        "worktree", "lock", canonicalWorktreeRoot,
-    ])
-    await #expect(throws: GitWorktreeCommandError.self) {
-        try await service.remove(
-            worktreeRoot: worktreeRoot.path,
-            repositoryRoot: repositoryRoot.path
-        )
-    }
-    try await service.remove(
-        worktreeRoot: worktreeRoot.path,
-        repositoryRoot: repositoryRoot.path,
-        force: true
-    )
-    let removed = try await service.discover(projectRoot: repositoryRoot.path)
-    #expect(removed.worktrees.map(\.root) == [canonicalRepositoryRoot])
-    #expect(!FileManager.default.fileExists(atPath: worktreeRoot.path))
-}
-
-@Test func projectInfoDecodesPayloadsFromBeforeWorktreeSupport() throws {
-    let payload = Data("""
+@Test func projectInfoDecodesPayloadsWithOrWithoutWorktrees() throws {
+    // The app's own payload, and one from a build with worktree spaces,
+    // whose worktrees are ignored.
+    let current = Data("""
     {
       "root": "/tmp/cherry",
       "name": "cherry",
       "active": true,
       "open": true,
-      "features": {"notesEnabled": true, "todosEnabled": false}
+      "features": {"notesEnabled": false, "todosEnabled": false}
     }
     """.utf8)
-
-    let project = try JSONDecoder().decode(ProjectInfo.self, from: payload)
-
-    #expect(project.worktrees.isEmpty)
-    #expect(project.activeWorktreeRoot == nil)
-    #expect(project.features.notesEnabled)
-}
-
-@Test func projectInfoRoundTripsWorktreeMetadata() throws {
-    let project = ProjectInfo(
+    let withWorktrees = Data("""
+    {
+      "root": "/tmp/cherry",
+      "name": "cherry",
+      "active": true,
+      "open": true,
+      "features": {"notesEnabled": true, "todosEnabled": false},
+      "worktrees": [{
+        "root": "/tmp/cherry-feature", "branch": "feature", "head": "0123456789abcdef",
+        "main": false, "detached": false, "locked": false, "hidden": false, "loaded": true, "active": true
+      }],
+      "activeWorktreeRoot": "/tmp/cherry-feature"
+    }
+    """.utf8)
+    let expected = ProjectInfo(
         root: "/tmp/cherry",
         name: "cherry",
         active: true,
         open: true,
-        worktrees: [
-            WorktreeInfo(
-                root: "/tmp/cherry-feature",
-                branch: "feature/worktrees",
-                head: "0123456789abcdef",
-                main: false,
-                detached: false,
-                locked: false,
-                hidden: true,
-                loaded: false,
-                active: true
-            )
-        ],
-        activeWorktreeRoot: "/tmp/cherry-feature"
+        features: .init(todosEnabled: false)
     )
 
-    let decoded = try JSONDecoder().decode(ProjectInfo.self, from: JSONEncoder().encode(project))
-
-    #expect(decoded == project)
+    for payload in [current, withWorktrees] {
+        #expect(try JSONDecoder().decode(ProjectInfo.self, from: payload) == expected)
+    }
+    #expect(try JSONDecoder().decode(ProjectInfo.self, from: JSONEncoder().encode(expected)) == expected)
 }
 
 @Test func cherryDeepLinksRoundTrip() throws {
     let projectRoot = "/tmp/Cherry Project"
-    let noteID = UUID()
-    let link = CherryDeepLink(projectRoot: projectRoot, kind: .note, targetID: noteID.uuidString)
+    let todoID = UUID()
+    let link = CherryDeepLink(projectRoot: projectRoot, kind: .todo, targetID: todoID.uuidString)
     let parsed = try CherryDeepLink.parse(link.absoluteString)
 
     #expect(parsed == link)
-    #expect(parsed.absoluteString == "cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/note/\(noteID.uuidString)")
+    #expect(parsed.absoluteString == "cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/todo/\(todoID.uuidString)")
 
     #expect(throws: CherryControlError(code: "invalid_deep_link", message: "Cherry link must start with cherry://project/.")) {
         try CherryDeepLink.parse("https://example.com")
     }
-    #expect(throws: CherryControlError(code: "invalid_deep_link_kind", message: "Cherry link kind must be note, todo, or terminal.")) {
-        try CherryDeepLink.parse("cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/project/\(noteID.uuidString)")
+    #expect(throws: CherryControlError(code: "invalid_deep_link_kind", message: "Cherry link kind must be todo or terminal.")) {
+        try CherryDeepLink.parse("cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/project/\(todoID.uuidString)")
     }
-}
-
-@Test func cherryControlRunAgentRequestRoundTrips() async throws {
-    let parentAgentID = UUID().uuidString
-    let request = CherryControlRequest.runAgent(.init(
-        agentName: "Codex",
-        model: "gpt-5.4-mini",
-        title: "Review workflow",
-        text: "status\n",
-        rawBase64: nil,
-        waitMilliseconds: 100,
-        lineLimit: 20,
-        submit: true,
-        parentAgentID: parentAgentID,
-        select: true
-    ))
-
-    let data = try JSONEncoder().encode(request)
-    let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
-
-    #expect(decoded == request)
-}
-
-@Test func cherryControlRenameTerminalRequestRoundTrips() async throws {
-    let request = CherryControlRequest.renameTerminal(.init(
-        terminalID: UUID().uuidString,
-        title: "API migration"
-    ))
-
-    let data = try JSONEncoder().encode(request)
-    let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
-
-    #expect(decoded == request)
-}
-
-@Test func cherryControlNoteRequestsRoundTrip() async throws {
-    let noteID = UUID().uuidString
-    let create = CherryControlRequest.createNote(.init(title: "Review", markdown: "# Review", open: true))
-    let update = CherryControlRequest.updateNote(.init(noteID: noteID, title: "Updated", markdown: "- item", open: false))
-    let append = CherryControlRequest.appendNote(.init(noteID: noteID, markdown: "- more"))
-    let rename = CherryControlRequest.renameNote(.init(noteID: noteID, title: "Renamed"))
-    let search = CherryControlRequest.searchNotes(.init(query: "Review", caseSensitive: false, maxMatches: 10))
-    let get = CherryControlRequest.getNote(.init(noteID: noteID))
-    let delete = CherryControlRequest.deleteNote(.init(noteID: noteID))
-    let select = CherryControlRequest.selectNote(.init(noteID: noteID))
-
-    for request in [create, update, append, rename, search, get, delete, select] {
-        let data = try JSONEncoder().encode(request)
-        let decoded = try JSONDecoder().decode(CherryControlRequest.self, from: data)
-        #expect(decoded == request)
+    // A note's link, from before notes were removed.
+    #expect(throws: CherryControlError(code: "notes_removed", message: "Cherry no longer has notes; this is a link to a note.")) {
+        try CherryDeepLink.parse("cherry://project/\(CherryDeepLink.projectKey(forProjectRoot: projectRoot))/note/\(UUID().uuidString)")
     }
 }
 
@@ -1665,9 +1239,9 @@ private struct MCPWhoamiPayload: Decodable {
     let afterTodoID = UUID().uuidString
     let terminalID = UUID().uuidString
     let commentID = UUID().uuidString
-    let create = CherryControlRequest.createTodo(.init(title: "Review", markdown: "# Review", status: .ready, tags: ["UI", "Bug"], open: true))
-    let update = CherryControlRequest.updateTodo(.init(todoID: todoID, title: "Updated", markdown: "- item", status: .doing, tags: ["Docs"], open: false))
-    let move = CherryControlRequest.moveTodo(.init(todoID: todoID, status: .blocked, afterTodoID: afterTodoID, open: true))
+    let create = CherryControlRequest.createTodo(.init(title: "Review", markdown: "# Review", status: .ready, tags: ["UI", "Bug"]))
+    let update = CherryControlRequest.updateTodo(.init(todoID: todoID, title: "Updated", markdown: "- item", status: .doing, tags: ["Docs"]))
+    let move = CherryControlRequest.moveTodo(.init(todoID: todoID, status: .blocked, afterTodoID: afterTodoID))
     let get = CherryControlRequest.getTodo(.init(todoID: todoID))
     let delete = CherryControlRequest.deleteTodo(.init(todoID: todoID))
     let select = CherryControlRequest.selectTodo(.init(todoID: todoID))
@@ -1675,8 +1249,7 @@ private struct MCPWhoamiPayload: Decodable {
         todoID: todoID,
         markdown: "Handing this off",
         author: "Codex",
-        terminalID: terminalID,
-        open: true
+        terminalID: terminalID
     ))
     let comments = CherryControlRequest.listTodoComments(.init(todoID: todoID))
     let updateComment = CherryControlRequest.updateTodoComment(.init(
@@ -1717,7 +1290,7 @@ private struct MCPWhoamiPayload: Decodable {
         .renameProcess(.init(processID: processID, title: "Build")),
         .selectProcess(.init(processID: processID)),
         .sendProcessInput(.init(processID: processID, text: "status", rawBase64: nil, submit: true, waitMilliseconds: 100, lineLimit: 20)),
-        .startAllCommands(.init(waitMilliseconds: 100, lineLimit: 20)),
+        .startAllCommands(.init(waitMilliseconds: 100)),
         .stopAllCommands(.init()),
         .restartAllCommands(.init())
     ]
@@ -1734,7 +1307,8 @@ private struct MCPWhoamiPayload: Decodable {
         fileURLWithPath: "/tmp/ct-\(UUID().uuidString.prefix(8))",
         isDirectory: true
     )
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    // Private, as the client requires of a socket's directory.
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     let socketURL = directory.appendingPathComponent("control.sock")
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     try #require(fd >= 0)
@@ -2045,96 +1619,6 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func projectNoteStorePersistsProjectNotes() async throws {
-    let projectRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-    let storageRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryNotes-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(at: projectRoot)
-        try? FileManager.default.removeItem(at: storageRoot)
-    }
-
-    let store = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
-    let note = try store.create(title: " Review ", markdown: "# Review")
-    _ = try store.update(id: note.id, title: "Updated", markdown: "- done")
-
-    let reloaded = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
-    #expect(reloaded.notes.count == 1)
-    #expect(reloaded.notes[0].id == note.id)
-    #expect(reloaded.notes[0].title == "Updated")
-    #expect(reloaded.notes[0].markdown == "- done")
-
-    try reloaded.delete(id: note.id)
-    #expect(ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot).notes.isEmpty)
-}
-
-@MainActor
-@Test func projectNoteEditorAutosavePersistsAfterBackgroundFlush() async throws {
-    let projectRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-    let storageRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryNotes-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(at: projectRoot)
-        try? FileManager.default.removeItem(at: storageRoot)
-    }
-
-    let store = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
-    let note = try store.create(title: "Draft", markdown: "Before")
-    _ = try store.updateFromEditor(id: note.id, title: "Draft", markdown: "After")
-    store.flushPendingWrites()
-
-    let reloaded = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: storageRoot)
-    #expect(reloaded.notes.first?.markdown == "After")
-}
-
-@MainActor
-@Test func projectNoteStoreCanLoadLargeCollectionsOffTheMainActor() async throws {
-    let projectRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-    let storageRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryNotes-\(UUID().uuidString)", isDirectory: true)
-    try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
-    try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(at: projectRoot)
-        try? FileManager.default.removeItem(at: storageRoot)
-    }
-
-    let now = Date()
-    let notes = (0..<1_000).map { index in
-        ProjectNote(
-            id: UUID(),
-            projectRoot: projectRoot.path,
-            title: "Note \(index)",
-            markdown: String(repeating: "Body \(index)\n", count: 32),
-            createdAt: now.addingTimeInterval(-Double(index)),
-            updatedAt: now.addingTimeInterval(-Double(index))
-        )
-    }
-    let encoder = JSONEncoder()
-    encoder.dateEncodingStrategy = .iso8601
-    let fileURL = storageRoot.appendingPathComponent(
-        ProjectNoteStore.projectStorageName(projectRoot: projectRoot.path)
-    )
-    try encoder.encode(notes).write(to: fileURL)
-
-    let store = ProjectNoteStore(
-        projectRoot: projectRoot.path,
-        storageDirectory: storageRoot,
-        loadsInBackground: true
-    )
-    #expect(store.isLoading)
-    #expect(store.notes.isEmpty)
-    #expect(await waitForCondition(timeout: 5) { !store.isLoading })
-    #expect(store.notes.count == notes.count)
-    #expect(store.notes.first?.id == notes.first?.id)
-}
-
-@MainActor
 @Test func projectTodoStorePersistsProjectTodosAndComments() async throws {
     let projectRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -2243,6 +1727,41 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(store.todos.filter { $0.status == .ready }.map(\.position) == [0, 1, 2])
 }
 
+/// A project's windows (#22) and MCP share one to-do store: each save
+/// writes the whole file, so two stores would write over each other's
+/// changes. One per root and storage directory, freed once nothing holds
+/// it.
+@MainActor
+@Test func aProjectsWindowsShareOneTodoStore() async throws {
+    let storageRoot = try canonicalTemporaryDirectory("CherryTodos-shared")
+    let otherStorageRoot = try canonicalTemporaryDirectory("CherryTodos-shared-other")
+    defer {
+        try? FileManager.default.removeItem(at: storageRoot)
+        try? FileManager.default.removeItem(at: otherStorageRoot)
+    }
+    let project = "/projects/\(UUID().uuidString)"
+    var first: ProjectTodoStore? = ProjectTodoStore.shared(projectRoot: project, storageDirectory: storageRoot)
+    var second: ProjectTodoStore? = ProjectTodoStore.shared(projectRoot: project, storageDirectory: storageRoot)
+    #expect(first === second)
+    // Another project's, or another directory's, is another store.
+    #expect(ProjectTodoStore.shared(projectRoot: project + "-other", storageDirectory: storageRoot) !== first)
+    #expect(ProjectTodoStore.shared(projectRoot: project, storageDirectory: otherStorageRoot) !== first)
+
+    // A change made in one window is the other's: neither writes over it.
+    let todo = try #require(first).create(title: "Ship it", markdown: "")
+    #expect(second?.todos.map(\.id) == [todo.id])
+    _ = try #require(second).create(title: "Then rest", markdown: "")
+    #expect(ProjectTodoStore(projectRoot: project, storageDirectory: storageRoot).todos.count == 2)
+
+    // Once no window holds it, it goes; the next reads the file again.
+    weak var freed = first
+    first = nil
+    second = nil
+    #expect(freed == nil)
+    let reopened = ProjectTodoStore.shared(projectRoot: project, storageDirectory: storageRoot)
+    #expect(reopened.todos.map(\.title) == ["Ship it", "Then rest"])
+}
+
 @MainActor
 @Test func controlServerListsConfiguredAgents() async throws {
     let harness = try ControlServerHarness()
@@ -2280,28 +1799,28 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let response = try await harness.send(.runAgent(.init(
-        agentName: " echo ",
+    let response = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: " echo ",
         text: "agent-input\n",
         waitMilliseconds: 250,
-        lineLimit: 20,
-        select: false
+        lineLimit: 20
     )))
 
-    guard case .runAgent(let result)? = response.result else {
-        Issue.record("Expected runAgent result, got \(String(describing: response))")
+    guard case .spawnProcess(let result)? = response.result else {
+        Issue.record("Expected spawnProcess result, got \(String(describing: response))")
         return
     }
 
     #expect(response.error == nil)
-    #expect(result.projectRoot == harness.projectRoot.path)
-    #expect(result.kind == "agent")
-    #expect(result.agentName == "Echo")
-    #expect(result.title == "Echo")
+    #expect(harness.workspace.session(id: result.process.id)?.projectRoot == harness.projectRoot.path)
+    #expect(result.process.kind == "agent")
+    #expect(result.process.agentName == "Echo")
+    #expect(harness.workspace.session(id: result.process.id)?.title == "Echo")
     #expect(result.sentBytes == Data("agent-input\n".utf8).count)
     #expect(result.output?.lines.joined(separator: "\n").contains("agent-input") == true)
     #expect(harness.workspace.agentSessions.count == 1)
-    #expect(harness.workspace.selectedSessionID != UUID(uuidString: result.terminalID))
+    #expect(harness.workspace.selectedSessionID != UUID(uuidString: result.process.id))
 }
 
 @MainActor
@@ -2396,15 +1915,16 @@ private struct MCPWhoamiPayload: Decodable {
     )))
     #expect(terminalResponse.error?.code == "invalid_process_request")
 
-    let emptyResponse = try await harness.send(.runAgent(.init(
-        agentName: "Custom",
+    let emptyResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Custom",
         model: "  "
     )))
     #expect(emptyResponse.error?.code == "invalid_model")
 }
 
 @MainActor
-@Test func controlServerRunAgentSubmitsPlainTextPromptByDefault() async throws {
+@Test func controlServerSpawnedAgentSubmitsPlainTextPromptByDefault() async throws {
     let harness = try ControlServerHarness()
     defer {
         harness.stop()
@@ -2413,15 +1933,16 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let response = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
+    let response = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
         text: "agent-input",
         waitMilliseconds: 250,
         lineLimit: 20
     )))
 
-    guard case .runAgent(let result)? = response.result else {
-        Issue.record("Expected runAgent result, got \(String(describing: response))")
+    guard case .spawnProcess(let result)? = response.result else {
+        Issue.record("Expected spawnProcess result, got \(String(describing: response))")
         return
     }
 
@@ -2456,15 +1977,16 @@ private struct MCPWhoamiPayload: Decodable {
     ))
     harness.server.start()
 
-    let response = try await harness.send(.runAgent(.init(
-        agentName: "Codex",
+    let response = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Codex",
         text: "delayed prompt",
         waitMilliseconds: 2_500,
         lineLimit: 20
     )))
 
-    guard case .runAgent(let result)? = response.result else {
-        Issue.record("Expected runAgent result, got \(String(describing: response))")
+    guard case .spawnProcess(let result)? = response.result else {
+        Issue.record("Expected spawnProcess result, got \(String(describing: response))")
         return
     }
 
@@ -2485,62 +2007,65 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let parentResponse = try await harness.send(.runAgent(.init(agentName: "Echo")))
-    guard case .runAgent(let parent)? = parentResponse.result,
-          let parentID = UUID(uuidString: parent.terminalID)
+    let parentResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
+    guard case .spawnProcess(let parent)? = parentResponse.result,
+          let parentID = UUID(uuidString: parent.process.id)
     else {
-        Issue.record("Expected parent runAgent result, got \(String(describing: parentResponse))")
+        Issue.record("Expected parent spawnProcess result, got \(String(describing: parentResponse))")
         return
     }
 
-    let childResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        parentAgentID: parent.terminalID
+    let childResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
+        parentAgentID: parent.process.id
     )))
-    guard case .runAgent(let child)? = childResponse.result,
-          let childID = UUID(uuidString: child.terminalID)
+    guard case .spawnProcess(let child)? = childResponse.result,
+          let childID = UUID(uuidString: child.process.id)
     else {
-        Issue.record("Expected child runAgent result, got \(String(describing: childResponse))")
+        Issue.record("Expected child spawnProcess result, got \(String(describing: childResponse))")
         return
     }
 
-    #expect(child.parentAgentID == parent.terminalID)
-    #expect(child.childAgentCount == 0)
-    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == parentID)
+    #expect(child.process.parentAgentID == parent.process.id)
+    #expect(child.process.childAgentCount == 0)
+    #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == parentID)
 
-    let nestedChildResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        parentAgentID: child.terminalID
+    let nestedChildResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
+        parentAgentID: child.process.id
     )))
-    guard case .runAgent(let nestedChild)? = nestedChildResponse.result,
-          let nestedChildID = UUID(uuidString: nestedChild.terminalID)
+    guard case .spawnProcess(let nestedChild)? = nestedChildResponse.result,
+          let nestedChildID = UUID(uuidString: nestedChild.process.id)
     else {
-        Issue.record("Expected nested child runAgent result, got \(String(describing: nestedChildResponse))")
+        Issue.record("Expected nested child spawnProcess result, got \(String(describing: nestedChildResponse))")
         return
     }
 
-    #expect(nestedChild.parentAgentID == parent.terminalID)
-    #expect(harness.workspace.session(id: nestedChild.terminalID)?.parentAgentID == parentID)
+    #expect(nestedChild.process.parentAgentID == parent.process.id)
+    #expect(harness.workspace.session(id: nestedChild.process.id)?.parentAgentID == parentID)
 
-    let parentStatusResponse = try await harness.send(.getProcessStatus(.init(processID: parent.terminalID)))
+    let parentStatusResponse = try await harness.send(.getProcessStatus(.init(processID: parent.process.id)))
     guard case .getProcessStatus(let parentStatus)? = parentStatusResponse.result else {
         Issue.record("Expected parent process status, got \(String(describing: parentStatusResponse))")
         return
     }
     #expect(parentStatus.process.childAgentCount == 2)
 
-    let rejectCloseResponse = try await harness.send(.closeProcess(.init(processID: parent.terminalID)))
+    let rejectCloseResponse = try await harness.send(.closeProcess(.init(processID: parent.process.id)))
     #expect(rejectCloseResponse.error?.code == "agent_has_sub_agents")
 
     let terminalID = try #require(harness.workspace.terminalSessions.first?.id.uuidString)
-    let invalidParentResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
+    let invalidParentResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
         parentAgentID: terminalID
     )))
     #expect(invalidParentResponse.error?.code == "parent_agent_not_agent")
 
     let promoteResponse = try await harness.send(.closeProcess(.init(
-        processID: parent.terminalID,
+        processID: parent.process.id,
         agentClosePolicy: .promoteSubAgents
     )))
     guard case .closeProcess(_)? = promoteResponse.result else {
@@ -2548,9 +2073,9 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
     #expect(!harness.workspace.sessions.contains { $0.id == parentID })
-    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == nil)
+    #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == nil)
     #expect(harness.workspace.sessions.contains { $0.id == childID })
-    #expect(harness.workspace.session(id: nestedChild.terminalID)?.parentAgentID == nil)
+    #expect(harness.workspace.session(id: nestedChild.process.id)?.parentAgentID == nil)
     #expect(harness.workspace.sessions.contains { $0.id == nestedChildID })
 }
 
@@ -2564,58 +2089,59 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let parentResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        select: true
-    )))
-    guard case .runAgent(let parent)? = parentResponse.result,
-          let parentID = UUID(uuidString: parent.terminalID)
+    let parentResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
+    guard case .spawnProcess(let parent)? = parentResponse.result,
+          let parentID = UUID(uuidString: parent.process.id)
     else {
-        Issue.record("Expected parent runAgent result, got \(String(describing: parentResponse))")
+        Issue.record("Expected parent spawnProcess result, got \(String(describing: parentResponse))")
         return
     }
+    #expect(try await harness.send(.selectProcess(.init(processID: parent.process.id))).error == nil)
     #expect(harness.workspace.selectedSessionID == parentID)
 
-    let childResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
+    let childResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
         parentAgentID: CherryControl.selectedAgentParentID
     )))
-    guard case .runAgent(let child)? = childResponse.result else {
-        Issue.record("Expected child runAgent result, got \(String(describing: childResponse))")
+    guard case .spawnProcess(let child)? = childResponse.result else {
+        Issue.record("Expected child spawnProcess result, got \(String(describing: childResponse))")
         return
     }
 
-    #expect(child.parentAgentID == parent.terminalID)
-    #expect(harness.workspace.session(id: child.terminalID)?.parentAgentID == parentID)
+    #expect(child.process.parentAgentID == parent.process.id)
+    #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == parentID)
     #expect(harness.workspace.selectedSessionID == parentID)
 
     let terminal = harness.workspace.addSession(select: false)
     harness.workspace.select(terminal)
     harness.chromeState.selectTerminal()
 
-    let fallbackChildResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
+    let fallbackChildResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
         parentAgentID: CherryControl.selectedAgentParentID
     )))
-    guard case .runAgent(let fallbackChild)? = fallbackChildResponse.result else {
-        Issue.record("Expected fallback child runAgent result, got \(String(describing: fallbackChildResponse))")
+    guard case .spawnProcess(let fallbackChild)? = fallbackChildResponse.result else {
+        Issue.record("Expected fallback child spawnProcess result, got \(String(describing: fallbackChildResponse))")
         return
     }
 
-    #expect(fallbackChild.parentAgentID == parent.terminalID)
-    #expect(harness.workspace.session(id: fallbackChild.terminalID)?.parentAgentID == parentID)
+    #expect(fallbackChild.process.parentAgentID == parent.process.id)
+    #expect(harness.workspace.session(id: fallbackChild.process.id)?.parentAgentID == parentID)
 
-    let topLevelResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
+    let topLevelResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
         parentAgentID: CherryControl.topLevelAgentParentID
     )))
-    guard case .runAgent(let topLevel)? = topLevelResponse.result else {
-        Issue.record("Expected top-level runAgent result, got \(String(describing: topLevelResponse))")
+    guard case .spawnProcess(let topLevel)? = topLevelResponse.result else {
+        Issue.record("Expected top-level spawnProcess result, got \(String(describing: topLevelResponse))")
         return
     }
 
-    #expect(topLevel.parentAgentID == nil)
-    #expect(harness.workspace.session(id: topLevel.terminalID)?.parentAgentID == nil)
+    #expect(topLevel.process.parentAgentID == nil)
+    #expect(harness.workspace.session(id: topLevel.process.id)?.parentAgentID == nil)
 }
 
 @MainActor
@@ -2640,16 +2166,14 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let selectedParentResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        select: true
-    )))
-    guard case .runAgent(let selectedParent)? = selectedParentResponse.result else {
-        Issue.record("Expected selected parent runAgent result, got \(String(describing: selectedParentResponse))")
+    let selectedParentResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
+    guard case .spawnProcess(let selectedParent)? = selectedParentResponse.result else {
+        Issue.record("Expected selected parent spawnProcess result, got \(String(describing: selectedParentResponse))")
         return
     }
+    #expect(try await harness.send(.selectProcess(.init(processID: selectedParent.process.id))).error == nil)
 
-    let childResult = await CherryMCPTools.call(
+    let childResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2659,11 +2183,11 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(selectedParent.parentAgentID == nil)
+    #expect(selectedParent.process.parentAgentID == nil)
     #expect(child.process.parentAgentID == nil)
     #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == nil)
 
-    let emptyParentResult = await CherryMCPTools.call(
+    let emptyParentResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2677,7 +2201,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(emptyParentChild.process.parentAgentID == nil)
     #expect(harness.workspace.session(id: emptyParentChild.process.id)?.parentAgentID == nil)
 
-    let topLevelResult = await CherryMCPTools.call(
+    let topLevelResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2714,42 +2238,44 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let firstResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        title: "First",
-        select: true
+    let firstResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
+        title: "First"
     )))
-    guard case .runAgent(let first)? = firstResponse.result,
-          let firstID = UUID(uuidString: first.terminalID)
+    guard case .spawnProcess(let first)? = firstResponse.result,
+          let firstID = UUID(uuidString: first.process.id)
     else {
-        Issue.record("Expected first runAgent result, got \(String(describing: firstResponse))")
+        Issue.record("Expected first spawnProcess result, got \(String(describing: firstResponse))")
         return
     }
+    #expect(try await harness.send(.selectProcess(.init(processID: first.process.id))).error == nil)
 
-    let secondResponse = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        title: "Second",
-        select: true
+    let secondResponse = try await harness.send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
+        title: "Second"
     )))
-    guard case .runAgent(let second)? = secondResponse.result,
-          let secondID = UUID(uuidString: second.terminalID)
+    guard case .spawnProcess(let second)? = secondResponse.result,
+          let secondID = UUID(uuidString: second.process.id)
     else {
-        Issue.record("Expected second runAgent result, got \(String(describing: secondResponse))")
+        Issue.record("Expected second spawnProcess result, got \(String(describing: secondResponse))")
         return
     }
+    #expect(try await harness.send(.selectProcess(.init(processID: second.process.id))).error == nil)
     #expect(harness.workspace.selectedSessionID == secondID)
 
-    let sessionContext = CherryMCPToolContext.bound(callerProcessID: second.terminalID)
-    #expect(sessionContext.callerProcessID == second.terminalID)
-    #expect(sessionContext.boundProcessID == second.terminalID)
+    let sessionContext = ToolCallBinding.bound(callerProcessID: second.process.id)
+    #expect(sessionContext.callerProcessID == second.process.id)
+    #expect(sessionContext.boundProcessID == second.process.id)
 
-    if let firstSession = harness.workspace.session(id: first.terminalID) {
+    if let firstSession = harness.workspace.session(id: first.process.id) {
         harness.workspace.select(firstSession)
     }
     harness.chromeState.selectTerminal()
     #expect(harness.workspace.selectedSessionID == firstID)
 
-    let childResult = await CherryMCPTools.call(
+    let childResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2760,10 +2286,10 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(child.process.parentAgentID == second.terminalID)
+    #expect(child.process.parentAgentID == second.process.id)
     #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == secondID)
 
-    let secondChildResult = await CherryMCPTools.call(
+    let secondChildResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2774,7 +2300,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let secondChild = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: secondChildResult)
 
-    #expect(secondChild.process.parentAgentID == second.terminalID)
+    #expect(secondChild.process.parentAgentID == second.process.id)
     #expect(harness.workspace.session(id: secondChild.process.id)?.parentAgentID == secondID)
 }
 
@@ -2853,31 +2379,36 @@ private struct MCPWhoamiPayload: Decodable {
         }
     }
 
-    let parentAResponse = try await send(.runAgent(.init(
-        agentName: "Echo",
-        title: "Project A parent",
-        select: true
+    let parentAResponse = try await send(.spawnProcess(.init(
+        kind: "agent",
+        name: "Echo",
+        title: "Project A parent"
     )))
-    guard case .runAgent(let parentA)? = parentAResponse.result else {
+    guard case .spawnProcess(let parentA)? = parentAResponse.result else {
         Issue.record("Expected project A parent, got \(String(describing: parentAResponse))")
         return
     }
+    #expect(try await send(.selectProcess(.init(processID: parentA.process.id))).error == nil)
 
     let parentBResponse = try await send(.scoped(.init(
         projectRoot: projectRootB.path,
-        request: .runAgent(.init(
-            agentName: "Echo",
-            title: "Project B parent",
-            select: true
+        request: .spawnProcess(.init(
+            kind: "agent",
+            name: "Echo",
+            title: "Project B parent"
         ))
     )))
-    guard case .runAgent(let parentB)? = parentBResponse.result else {
+    guard case .spawnProcess(let parentB)? = parentBResponse.result else {
         Issue.record("Expected project B parent, got \(String(describing: parentBResponse))")
         return
     }
+    #expect(try await send(.scoped(.init(
+        projectRoot: projectRootB.path,
+        request: .selectProcess(.init(processID: parentB.process.id))
+    ))).error == nil)
 
-    let sessionContext = CherryMCPToolContext.bound(callerProcessID: parentA.terminalID)
-    let childResult = await CherryMCPTools.call(
+    let sessionContext = ToolCallBinding.bound(callerProcessID: parentA.process.id)
+    let childResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -2888,13 +2419,13 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(parentB.parentAgentID == nil)
+    #expect(parentB.process.parentAgentID == nil)
     #expect(child.process.parentAgentID == nil)
     #expect(workspaceB.session(id: child.process.id)?.parentAgentID == nil)
 }
 
 @Test func mcpAgentCreationToolsDoNotAdvertiseTopLevelOverride() throws {
-    let tool = try #require(CherryMCPTools.all.first { $0.name == "spawn_process" })
+    let tool = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "spawn_process" })
     let schema = try #require(tool.inputSchema.objectValue)
     let properties = try #require(schema["properties"]?.objectValue)
 
@@ -2905,15 +2436,15 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func mcpSendProcessInputAdvertisesSubmitOverride() throws {
-    let tool = try #require(CherryMCPTools.all.first { $0.name == "send_process_input" })
+    let tool = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "send_process_input" })
     let schema = try #require(tool.inputSchema.objectValue)
     let properties = try #require(schema["properties"]?.objectValue)
 
     #expect(properties["submit"] != nil)
 }
 
-@Test func mcpWorktreeActivationAdvertisesOnlyAnExistingRoot() throws {
-    let tool = try #require(CherryMCPTools.all.first { $0.name == "activate_worktree" })
+@Test func mcpOpenProjectAdvertisesOnlyAProjectRoot() throws {
+    let tool = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "open_project" })
     let schema = try #require(tool.inputSchema.objectValue)
     let properties = try #require(schema["properties"]?.objectValue)
     let required = try #require(schema["required"]?.arrayValue)
@@ -2925,7 +2456,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func mcpWaitForProcessIdleAdvertisesOnlyProcessSelectors() throws {
-    let tool = try #require(CherryMCPTools.all.first { $0.name == "wait_for_process_idle" })
+    let tool = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "wait_for_process_idle" })
     let schema = try #require(tool.inputSchema.objectValue)
     let properties = try #require(schema["properties"]?.objectValue)
 
@@ -2937,7 +2468,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @Test func mcpAgentSpecificToolsAdvertiseMessageSchemas() throws {
-    let spawnTool = try #require(CherryMCPTools.all.first { $0.name == "spawn_agent" })
+    let spawnTool = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "spawn_agent" })
     let spawnSchema = try #require(spawnTool.inputSchema.objectValue)
     let spawnProperties = try #require(spawnSchema["properties"]?.objectValue)
     let spawnRequired = try #require(spawnSchema["required"]?.arrayValue)
@@ -2950,7 +2481,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(spawnProperties["kind"] == nil)
     #expect(spawnRequired.contains(.string("name")))
 
-    let sendTool = try #require(CherryMCPTools.all.first { $0.name == "send_agent_message" })
+    let sendTool = try #require(CherryToolCatalog.tools(for: .unknown).first { $0.name == "send_agent_message" })
     let sendSchema = try #require(sendTool.inputSchema.objectValue)
     let sendProperties = try #require(sendSchema["properties"]?.objectValue)
     let sendRequired = try #require(sendSchema["required"]?.arrayValue)
@@ -2980,27 +2511,60 @@ private struct MCPWhoamiPayload: Decodable {
         "close_terminal",
         "wait_for_idle"
     ]
-    let advertisedNames = Set(CherryMCPTools.all.map(\.name))
+    let advertisedNames = Set(CherryToolCatalog.tools(for: .unknown).map(\.name))
 
     #expect(advertisedNames.isDisjoint(with: removedToolNames))
 }
 
+/// A transport no request reaches: the layer refuses a name it does not
+/// know before it sends anything.
+private struct UnreachedToolTransport: CherryToolTransport {
+    var socketPath: String? { nil }
+
+    func send(_ request: CherryControlRequest, timeout: TimeInterval?) async throws -> CherryControlResponse {
+        Issue.record("The layer sent \(request) for a tool it does not know")
+        throw CherryControlError(code: "cherry_unavailable", message: "No app here.")
+    }
+}
+
 @Test func mcpLegacyTerminalToolsReturnUnknownTool() async throws {
-    let result = await CherryMCPTools.call(
+    let result = await CherryToolLayer.call(
         name: "send_input",
         arguments: [
             "terminal_id": .string(UUID().uuidString),
             "text": .string("ignored")
-        ]
+        ],
+        caller: CherryToolCaller(),
+        transport: UnreachedToolTransport()
     )
 
     #expect(result.isError == true)
-    #expect(result.content.contains { content in
-        if case .text(let text, _, _) = content {
-            return text.contains("unknown_tool")
-        }
-        return false
-    })
+    #expect(result.text.contains("unknown_tool"))
+}
+
+@Test func mcpNoteToolsAreGone() async throws {
+    let noteToolNames: Set<String> = [
+        "list_notes",
+        "create_note",
+        "get_note",
+        "update_note",
+        "append_note",
+        "rename_note",
+        "search_notes",
+        "delete_note",
+        "select_note"
+    ]
+    #expect(Set(CherryToolCatalog.tools(for: .unknown).map(\.name)).isDisjoint(with: noteToolNames))
+
+    // An agent whose tool list predates their removal gets a clean error.
+    let result = await CherryToolLayer.call(
+        name: "create_note",
+        arguments: ["title": .string("Review"), "markdown": .string("# Review")],
+        caller: CherryToolCaller(),
+        transport: UnreachedToolTransport()
+    )
+    #expect(result.isError == true)
+    #expect(result.text.contains("unknown_tool"))
 }
 
 @MainActor
@@ -3025,25 +2589,25 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let firstResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "First root")))
-    guard case .runAgent(let first)? = firstResponse.result else {
-        Issue.record("Expected first runAgent result, got \(String(describing: firstResponse))")
+    let firstResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo", title: "First root")))
+    guard case .spawnProcess(let first)? = firstResponse.result else {
+        Issue.record("Expected first spawnProcess result, got \(String(describing: firstResponse))")
         return
     }
 
-    let secondResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "Second root")))
-    guard case .runAgent(let second)? = secondResponse.result,
-          UUID(uuidString: second.terminalID) != nil
+    let secondResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo", title: "Second root")))
+    guard case .spawnProcess(let second)? = secondResponse.result,
+          UUID(uuidString: second.process.id) != nil
     else {
-        Issue.record("Expected second runAgent result, got \(String(describing: secondResponse))")
+        Issue.record("Expected second spawnProcess result, got \(String(describing: secondResponse))")
         return
     }
 
-    #expect(first.parentAgentID == nil)
-    #expect(second.parentAgentID == nil)
+    #expect(first.process.parentAgentID == nil)
+    #expect(second.process.parentAgentID == nil)
 
-    let sessionContext = CherryMCPToolContext.bound()
-    let childResult = await CherryMCPTools.call(
+    let sessionContext = ToolCallBinding.bound()
+    let childResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -3057,7 +2621,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(child.process.parentAgentID == nil)
     #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == nil)
 
-    let spawnResult = await CherryMCPTools.call(
+    let spawnResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -3105,21 +2669,20 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
 
-    let context = CherryMCPToolContext.bound(sessionID: "test-session")
-    let bindResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let bindResult = await ToolCalls.call(
         name: "bind_session_process",
         arguments: ["process_id": .string(started.process.id)],
         context: context
     )
     let bound = try decodeMCPToolResult(MCPBindSessionProcessPayload.self, from: bindResult)
 
-    #expect(bound.mcpSessionID == "test-session")
     #expect(bound.boundProcessID == started.process.id)
     #expect(bound.previousBoundProcessID == nil)
     #expect(bound.process.id == started.process.id)
     #expect(context.boundProcessID == started.process.id)
 
-    let statusResult = await CherryMCPTools.call(
+    let statusResult = await ToolCalls.call(
         name: "get_process_status",
         arguments: [:],
         context: context
@@ -3127,19 +2690,18 @@ private struct MCPWhoamiPayload: Decodable {
     let status = try decodeMCPToolResult(MCPProcessStatusPayload.self, from: statusResult)
     #expect(status.process.id == started.process.id)
 
-    let whoamiResult = await CherryMCPTools.call(
+    let whoamiResult = await ToolCalls.call(
         name: "whoami",
         arguments: [:],
         context: context
     )
     let whoami = try decodeMCPToolResult(MCPWhoamiPayload.self, from: whoamiResult)
-    #expect(whoami.mcpSessionID == "test-session")
     #expect(whoami.effectiveProjectRoot == harness.projectRoot.path)
     #expect(whoami.callerProcessID == nil)
     #expect(whoami.boundProcessID == started.process.id)
     #expect(whoami.selectedProcessID == harness.workspace.selectedSessionID?.uuidString)
 
-    let selectResult = await CherryMCPTools.call(
+    let selectResult = await ToolCalls.call(
         name: "select_process",
         arguments: [:],
         context: context
@@ -3169,8 +2731,8 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound(sessionID: "agent-session")
-    let spawnResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Echo"),
@@ -3184,19 +2746,14 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(spawned.boundProcessID == nil)
     #expect(context.boundProcessID == nil)
 
-    let sendResult = await CherryMCPTools.call(
+    let sendResult = await ToolCalls.call(
         name: "send_agent_message",
         arguments: ["message": .string("should require a target")],
         context: context
     )
 
     #expect(sendResult.isError == true)
-    #expect(sendResult.content.contains { content in
-        if case .text(let text, _, _) = content {
-            return text.contains("missing_process_selector")
-        }
-        return false
-    })
+    #expect(sendResult.text.contains("missing_process_selector"))
 }
 
 @MainActor
@@ -3218,7 +2775,7 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Codex", command: "/bin/echo", arguments: "--yolo"))
     harness.server.start()
 
-    let result = await CherryMCPTools.call(
+    let result = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Codex"),
@@ -3250,8 +2807,8 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound(sessionID: "agent-session")
-    let spawnResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Echo"),
@@ -3267,7 +2824,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(spawned.previousBoundProcessID == nil)
     #expect(context.boundProcessID == spawned.process.id)
 
-    let sendResult = await CherryMCPTools.call(
+    let sendResult = await ToolCalls.call(
         name: "send_agent_message",
         arguments: [
             "message": .string("hello from agent message"),
@@ -3310,7 +2867,7 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Codex", command: scriptURL.path))
     harness.server.start()
 
-    let spawnResult = await CherryMCPTools.call(
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Codex"),
@@ -3353,8 +2910,8 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Codex", command: scriptURL.path))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound(sessionID: "codex-agent-session")
-    let spawnResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Codex"),
@@ -3369,7 +2926,7 @@ private struct MCPWhoamiPayload: Decodable {
     let spawnOutput = spawned.output?.lines.joined(separator: "\n") ?? ""
     #expect(spawnOutput.contains("ready"), Comment(rawValue: spawnOutput))
 
-    let sendResult = await CherryMCPTools.call(
+    let sendResult = await ToolCalls.call(
         name: "send_agent_message",
         arguments: [
             "message": .string("bound prompt"),
@@ -3413,8 +2970,8 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: scriptURL.path))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound(sessionID: "claude-agent-session")
-    let spawnResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Claude"),
@@ -3428,7 +2985,7 @@ private struct MCPWhoamiPayload: Decodable {
     let spawned = try decodeMCPToolResult(MCPSpawnAgentPayload.self, from: spawnResult)
     #expect(spawned.process.kind == "agent")
 
-    let sendResult = await CherryMCPTools.call(
+    let sendResult = await ToolCalls.call(
         name: "send_agent_message",
         arguments: [
             "message": .string("after startup"),
@@ -3470,8 +3027,8 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Pi", command: scriptURL.path))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound(sessionID: "pi-agent-session")
-    let spawnResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Pi"),
@@ -3486,7 +3043,7 @@ private struct MCPWhoamiPayload: Decodable {
     let spawnOutput = spawned.output?.lines.joined(separator: "\n") ?? ""
     #expect(spawnOutput.contains("ready"), Comment(rawValue: spawnOutput))
 
-    let sendResult = await CherryMCPTools.call(
+    let sendResult = await ToolCalls.call(
         name: "send_process_input",
         arguments: [
             "text": .string("pi prompt"),
@@ -3537,8 +3094,8 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Pi", command: scriptURL.path))
     harness.server.start()
 
-    let context = CherryMCPToolContext.bound(sessionID: "pi-newline-session")
-    let spawnResult = await CherryMCPTools.call(
+    let context = ToolCallBinding.bound()
+    let spawnResult = await ToolCalls.call(
         name: "spawn_agent",
         arguments: [
             "name": .string("Pi"),
@@ -3556,7 +3113,7 @@ private struct MCPWhoamiPayload: Decodable {
         let deadline = Date(timeIntervalSinceNow: 30)
         var lines: [String] = []
         repeat {
-            let result = await CherryMCPTools.call(
+            let result = await ToolCalls.call(
                 name: "get_process_output",
                 arguments: ["process_id": .string(spawned.process.id), "line_limit": .int(20)],
                 context: context
@@ -3572,7 +3129,7 @@ private struct MCPWhoamiPayload: Decodable {
     let started = try await output { $0.trimmingCharacters(in: .whitespaces) == "ready" }
     try #require(started.contains("ready"), Comment(rawValue: started))
 
-    let sendResult = await CherryMCPTools.call(
+    let sendResult = await ToolCalls.call(
         name: "send_process_input",
         arguments: [
             "text": .string("newline prompt\n"),
@@ -3619,7 +3176,7 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
 
-    let result = await CherryMCPTools.call(
+    let result = await ToolCalls.call(
         name: "send_agent_message",
         arguments: [
             "process_id": .string(started.process.id),
@@ -3628,12 +3185,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
 
     #expect(result.isError == true)
-    #expect(result.content.contains { content in
-        if case .text(let text, _, _) = content {
-            return text.contains("not_agent_process")
-        }
-        return false
-    })
+    #expect(result.text.contains("not_agent_process"))
 }
 
 @MainActor
@@ -3659,24 +3211,24 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let firstResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "First root")))
-    guard case .runAgent(let first)? = firstResponse.result,
-          let firstID = UUID(uuidString: first.terminalID)
+    let firstResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo", title: "First root")))
+    guard case .spawnProcess(let first)? = firstResponse.result,
+          let firstID = UUID(uuidString: first.process.id)
     else {
-        Issue.record("Expected first runAgent result, got \(String(describing: firstResponse))")
+        Issue.record("Expected first spawnProcess result, got \(String(describing: firstResponse))")
         return
     }
 
-    let secondResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "Second root")))
-    guard case .runAgent(let second)? = secondResponse.result else {
-        Issue.record("Expected second runAgent result, got \(String(describing: secondResponse))")
+    let secondResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo", title: "Second root")))
+    guard case .spawnProcess(let second)? = secondResponse.result else {
+        Issue.record("Expected second spawnProcess result, got \(String(describing: secondResponse))")
         return
     }
 
-    setEnvironmentValue(second.terminalID, for: CherryControl.agentIDEnvironmentKey)
-    setEnvironmentValue(first.terminalID, for: CherryControl.processIDEnvironmentKey)
+    setEnvironmentValue(second.process.id, for: CherryControl.agentIDEnvironmentKey)
+    setEnvironmentValue(first.process.id, for: CherryControl.processIDEnvironmentKey)
 
-    let childResult = await CherryMCPTools.call(
+    let childResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -3686,8 +3238,8 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(second.parentAgentID == nil)
-    #expect(child.process.parentAgentID == first.terminalID)
+    #expect(second.process.parentAgentID == nil)
+    #expect(child.process.parentAgentID == first.process.id)
     #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == firstID)
 }
 
@@ -3716,23 +3268,23 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let parentResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "Parent")))
-    guard case .runAgent(let parent)? = parentResponse.result,
-          let parentID = UUID(uuidString: parent.terminalID)
+    let parentResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo", title: "Parent")))
+    guard case .spawnProcess(let parent)? = parentResponse.result,
+          let parentID = UUID(uuidString: parent.process.id)
     else {
-        Issue.record("Expected parent runAgent result, got \(String(describing: parentResponse))")
+        Issue.record("Expected parent spawnProcess result, got \(String(describing: parentResponse))")
         return
     }
 
-    let parentSession = try #require(harness.workspace.session(id: parent.terminalID))
-    #expect(await waitForCondition { parentSession.childProcessID != nil })
+    let parentSession = try #require(harness.workspace.session(id: parent.process.id))
+    #expect(await eventually(timeout: 1) { parentSession.childProcessID != nil })
     let parentPID = try #require(parentSession.childProcessID)
-    let inferredCallerID = await CherryMCPTools.inferredCallerProcessID(parentPID: parentPID)
+    let inferredCallerID = await ToolCalls.inferredCallerProcessID(parentPIDs: [parentPID])
 
-    #expect(inferredCallerID == parent.terminalID)
+    #expect(inferredCallerID == parent.process.id)
 
-    let sessionContext = CherryMCPToolContext.bound(callerProcessID: inferredCallerID)
-    let childResult = await CherryMCPTools.call(
+    let sessionContext = ToolCallBinding.bound(callerProcessID: inferredCallerID)
+    let childResult = await ToolCalls.call(
         name: "spawn_process",
         arguments: [
             "kind": .string("agent"),
@@ -3743,7 +3295,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
     let child = try decodeMCPToolResult(MCPSpawnProcessPayload.self, from: childResult)
 
-    #expect(child.process.parentAgentID == parent.terminalID)
+    #expect(child.process.parentAgentID == parent.process.id)
     #expect(harness.workspace.session(id: child.process.id)?.parentAgentID == parentID)
 }
 
@@ -3772,21 +3324,21 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let parentResponse = try await harness.send(.runAgent(.init(agentName: "Echo", title: "Parent")))
-    guard case .runAgent(let parent)? = parentResponse.result else {
-        Issue.record("Expected parent runAgent result, got \(String(describing: parentResponse))")
+    let parentResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo", title: "Parent")))
+    guard case .spawnProcess(let parent)? = parentResponse.result else {
+        Issue.record("Expected parent spawnProcess result, got \(String(describing: parentResponse))")
         return
     }
 
-    let parentSession = try #require(harness.workspace.session(id: parent.terminalID))
-    #expect(await waitForCondition { parentSession.childProcessID != nil })
+    let parentSession = try #require(harness.workspace.session(id: parent.process.id))
+    #expect(await eventually(timeout: 1) { parentSession.childProcessID != nil })
     let parentPID = try #require(parentSession.childProcessID)
     let unrelatedIntermediatePID = Int32.max
-    let inferredCallerID = await CherryMCPTools.inferredCallerProcessID(
+    let inferredCallerID = await ToolCalls.inferredCallerProcessID(
         parentPIDs: [unrelatedIntermediatePID, parentPID]
     )
 
-    #expect(inferredCallerID == parent.terminalID)
+    #expect(inferredCallerID == parent.process.id)
 }
 
 @MainActor
@@ -3844,7 +3396,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func controlServerRunAgentSelectionFocusesTerminalPane() async throws {
+@Test func controlServerSelectingSpawnedAgentFocusesTerminalPane() async throws {
     let harness = try ControlServerHarness()
     defer {
         harness.stop()
@@ -3855,31 +3407,29 @@ private struct MCPWhoamiPayload: Decodable {
 
     let todoResponse = try await harness.send(.createTodo(.init(
         title: "Focused launch",
-        markdown: "",
-        open: true
+        markdown: ""
     )))
     guard case .createTodo(let createdTodo)? = todoResponse.result else {
         Issue.record("Expected createTodo result, got \(String(describing: todoResponse))")
         return
     }
+    let selectTodoResponse = try await harness.send(.selectTodo(.init(todoID: createdTodo.todo.id.uuidString)))
+    #expect(selectTodoResponse.error == nil)
     #expect(harness.chromeState.selectedTodoID == createdTodo.todo.id)
     #expect(harness.chromeState.isTodoPanePresented == true)
 
-    let response = try await harness.send(.runAgent(.init(
-        agentName: "Echo",
-        select: true
-    )))
-    guard case .runAgent(let result)? = response.result,
-          let terminalID = UUID(uuidString: result.terminalID)
+    let response = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
+    guard case .spawnProcess(let result)? = response.result,
+          let terminalID = UUID(uuidString: result.process.id)
     else {
-        Issue.record("Expected runAgent result, got \(String(describing: response))")
+        Issue.record("Expected spawnProcess result, got \(String(describing: response))")
         return
     }
+    #expect(try await harness.send(.selectProcess(.init(processID: result.process.id))).error == nil)
 
     #expect(harness.workspace.selectedSessionID == terminalID)
     #expect(harness.chromeState.isShowingTerminalContent == true)
     #expect(harness.chromeState.selectedTodoID == nil)
-    #expect(harness.chromeState.selectedNoteID == nil)
 }
 
 @MainActor
@@ -3892,127 +3442,29 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Echo", command: "/bin/cat"))
     harness.server.start()
 
-    let firstResponse = try await harness.send(.runAgent(.init(agentName: "Echo")))
-    let secondResponse = try await harness.send(.runAgent(.init(agentName: "Echo")))
+    let firstResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
+    let secondResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Echo")))
 
-    guard case .runAgent(let firstResult)? = firstResponse.result,
-          case .runAgent(let secondResult)? = secondResponse.result
+    guard case .spawnProcess(let firstResult)? = firstResponse.result,
+          case .spawnProcess(let secondResult)? = secondResponse.result
     else {
-        Issue.record("Expected runAgent results")
+        Issue.record("Expected spawnProcess results")
         return
     }
 
-    #expect(firstResult.title == "Echo")
-    #expect(secondResult.title == "Echo")
+    #expect(firstResult.process.id != secondResult.process.id)
+    #expect(harness.workspace.session(id: firstResult.process.id)?.title == "Echo")
+    #expect(harness.workspace.session(id: secondResult.process.id)?.title == "Echo")
     #expect(harness.workspace.agentSessions.map(\.title) == ["Echo", "Echo"])
 }
 
 @MainActor
-@Test func controlServerManagesProjectNotes() async throws {
-    let harness = try ControlServerHarness()
-    defer {
-        harness.stop()
-    }
-    harness.server.start()
-
-    let createResponse = try await harness.send(.createNote(.init(
-        title: "Review Notes",
-        markdown: "# Findings",
-        open: true
-    )))
-    guard case .createNote(let created)? = createResponse.result else {
-        Issue.record("Expected createNote result, got \(String(describing: createResponse))")
-        return
-    }
-
-    #expect(createResponse.error == nil)
-    #expect(created.note.title == "Review Notes")
-    #expect(created.note.markdown == "# Findings")
-    #expect(created.selected == true)
-    #expect(harness.chromeState.selectedNoteID == created.note.id)
-
-    let listResponse = try await harness.send(.listNotes)
-    guard case .listNotes(let list)? = listResponse.result else {
-        Issue.record("Expected listNotes result, got \(String(describing: listResponse))")
-        return
-    }
-    #expect(list.activeProjectRoot == harness.projectRoot.path)
-    #expect(list.notes.map(\.id) == [created.note.id.uuidString])
-    #expect(list.selectedNoteID == created.note.id.uuidString)
-
-    let updateResponse = try await harness.send(.updateNote(.init(
-        noteID: created.note.id.uuidString,
-        title: "Updated",
-        markdown: "- done",
-        open: false
-    )))
-    guard case .updateNote(let updated)? = updateResponse.result else {
-        Issue.record("Expected updateNote result, got \(String(describing: updateResponse))")
-        return
-    }
-    #expect(updated.note.title == "Updated")
-    #expect(updated.note.markdown == "- done")
-    #expect(updated.selected == true)
-
-    let appendResponse = try await harness.send(.appendNote(.init(
-        noteID: created.note.id.uuidString,
-        markdown: "- appended"
-    )))
-    guard case .appendNote(let appended)? = appendResponse.result else {
-        Issue.record("Expected appendNote result, got \(String(describing: appendResponse))")
-        return
-    }
-    #expect(appended.note.markdown == "- done\n- appended")
-
-    let renameResponse = try await harness.send(.renameNote(.init(
-        noteID: created.note.id.uuidString,
-        title: "Renamed"
-    )))
-    guard case .renameNote(let renamed)? = renameResponse.result else {
-        Issue.record("Expected renameNote result, got \(String(describing: renameResponse))")
-        return
-    }
-    #expect(renamed.note.title == "Renamed")
-
-    let searchResponse = try await harness.send(.searchNotes(.init(query: "appended")))
-    guard case .searchNotes(let search)? = searchResponse.result else {
-        Issue.record("Expected searchNotes result, got \(String(describing: searchResponse))")
-        return
-    }
-    #expect(search.matches.map(\.noteID) == [created.note.id.uuidString])
-    #expect(search.matches.first?.lineNumber == 1)
-
-    let getResponse = try await harness.send(.getNote(.init(noteID: created.note.id.uuidString)))
-    guard case .getNote(let fetched)? = getResponse.result else {
-        Issue.record("Expected getNote result, got \(String(describing: getResponse))")
-        return
-    }
-    #expect(fetched.note == renamed.note)
-
-    let deleteResponse = try await harness.send(.deleteNote(.init(noteID: created.note.id.uuidString)))
-    guard case .deleteNote(let deleted)? = deleteResponse.result else {
-        Issue.record("Expected deleteNote result, got \(String(describing: deleteResponse))")
-        return
-    }
-    #expect(deleted.deleted == true)
-    #expect(harness.noteStore.notes.isEmpty)
-    #expect(harness.chromeState.selectedNoteID == nil)
-}
-
-@MainActor
-@Test func controlServerRejectsDisabledProjectNoteAndTodoTools() async throws {
+@Test func controlServerRejectsDisabledProjectTodoTools() async throws {
     let harness = try ControlServerHarness(enableProjectFeatures: false)
     defer {
         harness.stop()
     }
     harness.server.start()
-
-    let noteResponse = try await harness.send(.createNote(.init(
-        title: "Disabled Note",
-        markdown: "No write"
-    )))
-    #expect(noteResponse.error?.code == "feature_disabled")
-    #expect(harness.noteStore.notes.isEmpty)
 
     let todoResponse = try await harness.send(.createTodo(.init(
         title: "Disabled Todo",
@@ -4026,9 +3478,124 @@ private struct MCPWhoamiPayload: Decodable {
         Issue.record("Expected getProjectStatus result, got \(String(describing: statusResponse))")
         return
     }
-    #expect(status.features == ProjectFeatureAvailability(notesEnabled: false, todosEnabled: false))
-    #expect(status.noteCount == nil)
+    #expect(status.features == ProjectFeatureAvailability(todosEnabled: false))
     #expect(status.todoCount == nil)
+}
+
+/// A CherryMCP from before notes were removed (an agent's helper an update
+/// kept running, a build on another Mac) still sends their requests: each
+/// gets a clean error and changes nothing.
+@MainActor
+@Test func controlServerAnswersAnOlderHelpersNoteRequestsWithAnError() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    // As such a helper encodes them: today's requests of the same shape,
+    // renamed.
+    func renamed(_ data: Data, _ names: [(String, String)]) -> String {
+        names.reduce(String(decoding: data, as: UTF8.self)) { text, name in
+            text.replacingOccurrences(of: "\"\(name.0)\"", with: "\"\(name.1)\"")
+        }
+    }
+    let encoder = JSONEncoder()
+    let requests = [
+        renamed(try encoder.encode(CherryControlRequest.createTodo(.init(title: "T", markdown: "M"))), [("createTodo", "createNote")]),
+        renamed(try encoder.encode(CherryControlRequest.listTodos), [("listTodos", "listNotes")]),
+        renamed(try encoder.encode(CherryControlRequest.scoped(.init(
+            projectRoot: harness.projectRoot.path,
+            request: .listTodos
+        ))), [("listTodos", "listNotes")]),
+        renamed(try encoder.encode(CherryControlEnvelope(
+            cherryAuth: .init(token: "t", processID: UUID().uuidString),
+            request: .deleteTodo(.init(todoID: UUID().uuidString))
+        )), [("deleteTodo", "deleteNote"), ("todoID", "noteID")]),
+    ]
+    let sessionsBefore = harness.workspace.sessions.count
+    for request in requests {
+        #expect(request.contains("Note"), Comment(rawValue: request))
+        let response = await harness.server.handleRequestData(Data(request.utf8), peerPID: nil)
+        #expect(response.result == nil, Comment(rawValue: request))
+        #expect(response.error?.code == "notes_removed", Comment(rawValue: request))
+    }
+    #expect(harness.todoStore.todos.isEmpty)
+    #expect(harness.workspace.sessions.count == sessionsBefore)
+
+    // Anything else that does not decode stays an invalid request.
+    let unknown = await harness.server.handleRequestData(Data(#"{"createWidget":{}}"#.utf8), peerPID: nil)
+    #expect(unknown.error?.code == "invalid_request")
+}
+
+/// What an older CherryMCP decodes `ProjectFeatureAvailability` as: it
+/// requires `notesEnabled`.
+private struct ProjectFeatureAvailabilityBeforeNotesWereRemoved: Decodable {
+    let notesEnabled: Bool
+    let todosEnabled: Bool
+}
+
+@Test func projectFeatureAvailabilityStillCarriesNotesEnabledForOlderHelpers() throws {
+    let features = ProjectFeatureAvailability(todosEnabled: true)
+    let old = try JSONDecoder().decode(
+        ProjectFeatureAvailabilityBeforeNotesWereRemoved.self,
+        from: JSONEncoder().encode(features)
+    )
+    #expect(old.notesEnabled == false)
+    #expect(old.todosEnabled == true)
+
+    // Inside the answers of list_projects and get_project_status too.
+    struct OldPayload: Decodable { let features: ProjectFeatureAvailabilityBeforeNotesWereRemoved }
+    let project = ProjectInfo(root: "/tmp/cherry", name: "cherry", active: true, open: true, features: features)
+    #expect(try JSONDecoder().decode(OldPayload.self, from: JSONEncoder().encode(project)).features.todosEnabled)
+    let status = ProjectStatusResult(
+        projectRoot: "/tmp/cherry",
+        processCounts: ProcessCounts(total: 0, terminals: 0, agents: 0, commands: 0),
+        todoCount: 0,
+        features: features,
+        selectedProcessID: nil,
+        selectedProcessName: nil,
+        health: "ok"
+    )
+    #expect(try JSONDecoder().decode(OldPayload.self, from: JSONEncoder().encode(status)).features.todosEnabled)
+
+    // Decoding takes payloads with or without the key.
+    #expect(try JSONDecoder().decode(ProjectFeatureAvailability.self, from: Data(#"{"todosEnabled":true}"#.utf8)) == features)
+    #expect(try JSONDecoder().decode(
+        ProjectFeatureAvailability.self,
+        from: Data(#"{"notesEnabled":true,"todosEnabled":true}"#.utf8)
+    ) == features)
+}
+
+/// Agents never see `notesEnabled`: CherryMCP's answers leave it out, in
+/// their text and in their structured content.
+@MainActor
+@Test func mcpProjectAnswersLeaveOutNotesEnabled() async throws {
+    let harness = try ControlServerHarness()
+    defer {
+        harness.stop()
+    }
+
+    let previousSocket = environmentValue(CherryControl.socketEnvironmentKey)
+    let previousProjectRoot = environmentValue(CherryControl.projectRootEnvironmentKey)
+    setEnvironmentValue(harness.socketURL.path, for: CherryControl.socketEnvironmentKey)
+    setEnvironmentValue(harness.projectRoot.path, for: CherryControl.projectRootEnvironmentKey)
+    defer {
+        setEnvironmentValue(previousSocket, for: CherryControl.socketEnvironmentKey)
+        setEnvironmentValue(previousProjectRoot, for: CherryControl.projectRootEnvironmentKey)
+    }
+    harness.server.start()
+
+    for name in ["list_projects", "get_project_status"] {
+        let result = await ToolCalls.call(name: name, arguments: [:])
+        let text = result.text
+        #expect(result.isError != true, Comment(rawValue: text))
+        #expect(text.contains("todos_enabled"), Comment(rawValue: text))
+        #expect(!text.contains("notes_enabled"), Comment(rawValue: text))
+
+        let structured = String(decoding: try JSONEncoder().encode(try #require(result.structured)), as: UTF8.self)
+        #expect(structured.contains("todosEnabled"), Comment(rawValue: structured))
+        #expect(!structured.contains("notesEnabled"), Comment(rawValue: structured))
+    }
 }
 
 @MainActor
@@ -4108,7 +3675,7 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func controlServerScopesNotesToRequestedProject() async throws {
+@Test func controlServerScopesTodosToRequestedProject() async throws {
     let defaultsName = "CherryTests.ScopedControlServer.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: defaultsName))
     let settings = AgentSettings(defaults: defaults)
@@ -4117,8 +3684,6 @@ private struct MCPWhoamiPayload: Decodable {
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
     let projectRootB = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString, isDirectory: true)
-    let notesRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryScopedNotes-\(UUID().uuidString)", isDirectory: true)
     let todosRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("CherryScopedTodos-\(UUID().uuidString)", isDirectory: true)
     let socketDirectory = URL(
@@ -4131,35 +3696,29 @@ private struct MCPWhoamiPayload: Decodable {
     try FileManager.default.createDirectory(at: projectRootB, withIntermediateDirectories: true)
     _ = settings.addProject(path: projectRootA.path)
     _ = settings.addProject(path: projectRootB.path)
-    try settings.setProjectFeatures(.init(notesEnabled: true, todosEnabled: true), for: projectRootA.path, storage: .local)
-    try settings.setProjectFeatures(.init(notesEnabled: true, todosEnabled: true), for: projectRootB.path, storage: .local)
+    try settings.setProjectFeatures(.init(todosEnabled: true), for: projectRootA.path, storage: .local)
+    try settings.setProjectFeatures(.init(todosEnabled: true), for: projectRootB.path, storage: .local)
 
     let workspaceA = TerminalWorkspace(projectRoot: projectRootA.path, launchBackend: .hostManaged)
     let workspaceB = TerminalWorkspace(projectRoot: projectRootB.path, launchBackend: .hostManaged)
-    let noteStoreA = ProjectNoteStore(projectRoot: projectRootA.path, storageDirectory: notesRoot)
-    let noteStoreB = ProjectNoteStore(projectRoot: projectRootB.path, storageDirectory: notesRoot)
     let todoStoreA = ProjectTodoStore(projectRoot: projectRootA.path, storageDirectory: todosRoot)
     let todoStoreB = ProjectTodoStore(projectRoot: projectRootB.path, storageDirectory: todosRoot)
     let chromeStateA = ProjectWindowChromeState()
     let chromeStateB = ProjectWindowChromeState()
 
     let activeWorkspace = workspaceA
-    let activeNoteStore = noteStoreA
     let activeTodoStore = todoStoreA
     let activeChromeState = chromeStateA
     let workspaces = [projectRootA.path: workspaceA, projectRootB.path: workspaceB]
-    let noteStores = [projectRootA.path: noteStoreA, projectRootB.path: noteStoreB]
     let todoStores = [projectRootA.path: todoStoreA, projectRootB.path: todoStoreB]
     let chromeStates = [projectRootA.path: chromeStateA, projectRootB.path: chromeStateB]
     let openProjectRoots = [projectRootA.path, projectRootB.path]
 
     let server = CherryControlServer(
         workspaceProvider: { activeWorkspace },
-        noteStoreProvider: { activeNoteStore },
         todoStoreProvider: { activeTodoStore },
         chromeStateProvider: { activeChromeState },
         workspaceForProjectRootProvider: { workspaces[$0] },
-        noteStoreForProjectRootProvider: { noteStores[$0] },
         todoStoreForProjectRootProvider: { todoStores[$0] },
         chromeStateForProjectRootProvider: { chromeStates[$0] },
         openProjectRootsProvider: { openProjectRoots },
@@ -4173,7 +3732,6 @@ private struct MCPWhoamiPayload: Decodable {
         defaults.removePersistentDomain(forName: defaultsName)
         try? FileManager.default.removeItem(at: projectRootA)
         try? FileManager.default.removeItem(at: projectRootB)
-        try? FileManager.default.removeItem(at: notesRoot)
         try? FileManager.default.removeItem(at: todosRoot)
         try? FileManager.default.removeItem(at: socketDirectory)
     }
@@ -4192,39 +3750,38 @@ private struct MCPWhoamiPayload: Decodable {
         }
     }
 
-    let unscopedResponse = try await send(.createNote(.init(title: "Active A", markdown: "A")))
+    let unscopedResponse = try await send(.createTodo(.init(title: "Active A", markdown: "A")))
     #expect(unscopedResponse.error?.code == "project_scope_required")
-    #expect(noteStoreA.notes.isEmpty)
-    #expect(noteStoreB.notes.isEmpty)
+    #expect(todoStoreA.todos.isEmpty)
+    #expect(todoStoreB.todos.isEmpty)
 
     let scopedResponse = try await send(.scoped(.init(
         projectRoot: projectRootB.path,
-        request: .createNote(.init(title: "Scoped B", markdown: "B"))
+        request: .createTodo(.init(title: "Scoped B", markdown: "B"))
     )))
     #expect(scopedResponse.error == nil)
 
-    #expect(noteStoreA.notes.isEmpty)
-    #expect(noteStoreB.notes.map(\.title) == ["Scoped B"])
+    #expect(todoStoreA.todos.isEmpty)
+    #expect(todoStoreB.todos.map(\.title) == ["Scoped B"])
     #expect(activeWorkspace === workspaceA)
-    #expect(activeNoteStore === noteStoreA)
     #expect(activeTodoStore === todoStoreA)
     #expect(activeChromeState === chromeStateA)
 
-    let listResponse = try await send(.scoped(.init(projectRoot: projectRootB.path, request: .listNotes)))
-    guard case .listNotes(let list)? = listResponse.result else {
-        Issue.record("Expected scoped listNotes result, got \(String(describing: listResponse))")
+    let listResponse = try await send(.scoped(.init(projectRoot: projectRootB.path, request: .listTodos)))
+    guard case .listTodos(let list)? = listResponse.result else {
+        Issue.record("Expected scoped listTodos result, got \(String(describing: listResponse))")
         return
     }
     #expect(list.activeProjectRoot == projectRootB.path)
-    #expect(list.notes.map(\.title) == ["Scoped B"])
+    #expect(list.todos.map(\.title) == ["Scoped B"])
 
     let scopedSubdirectoryResponse = try await send(.scoped(.init(
         projectRoot: projectRootB.appendingPathComponent("Sources").path,
-        request: .createNote(.init(title: "Scoped B Subdir", markdown: "B subdir"))
+        request: .createTodo(.init(title: "Scoped B Subdir", markdown: "B subdir"))
     )))
     #expect(scopedSubdirectoryResponse.error == nil)
-    #expect(noteStoreA.notes.isEmpty)
-    #expect(Set(noteStoreB.notes.map(\.title)) == ["Scoped B", "Scoped B Subdir"])
+    #expect(todoStoreA.todos.isEmpty)
+    #expect(Set(todoStoreB.todos.map(\.title)) == ["Scoped B", "Scoped B Subdir"])
 }
 
 @MainActor
@@ -4240,8 +3797,7 @@ private struct MCPWhoamiPayload: Decodable {
         title: "Review Todo",
         markdown: "# Findings",
         status: .ready,
-        tags: ["Bug", "UI"],
-        open: true
+        tags: ["Bug", "UI"]
     )))
     guard case .createTodo(let created)? = createResponse.result else {
         Issue.record("Expected createTodo result, got \(String(describing: createResponse))")
@@ -4253,15 +3809,17 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(created.todo.markdown == "# Findings")
     #expect(created.todo.status == .ready)
     #expect(created.todo.tags.map(\.name) == ["Bug", "UI"])
-    #expect(created.selected == true)
+    #expect(created.selected == false)
+
+    let selectResponse = try await harness.send(.selectTodo(.init(todoID: created.todo.id.uuidString)))
+    #expect(selectResponse.error == nil)
     #expect(harness.chromeState.selectedTodoID == created.todo.id)
     #expect(harness.chromeState.isTodoPanePresented == true)
 
     let secondResponse = try await harness.send(.createTodo(.init(
         title: "Second",
         markdown: "",
-        status: .ready,
-        open: false
+        status: .ready
     )))
     guard case .createTodo(let second)? = secondResponse.result else {
         Issue.record("Expected second createTodo result, got \(String(describing: secondResponse))")
@@ -4271,8 +3829,7 @@ private struct MCPWhoamiPayload: Decodable {
     let moveResponse = try await harness.send(.moveTodo(.init(
         todoID: second.todo.id.uuidString,
         status: .doing,
-        afterTodoID: nil,
-        open: false
+        afterTodoID: nil
     )))
     guard case .moveTodo(let moved)? = moveResponse.result else {
         Issue.record("Expected moveTodo result, got \(String(describing: moveResponse))")
@@ -4289,8 +3846,7 @@ private struct MCPWhoamiPayload: Decodable {
     let commentResponse = try await harness.send(.addTodoComment(.init(
         todoID: created.todo.id.uuidString,
         markdown: "Taking a look",
-        terminalID: agentSession.id.uuidString,
-        open: true
+        terminalID: agentSession.id.uuidString
     )))
     guard case .addTodoComment(let commented)? = commentResponse.result else {
         Issue.record("Expected addTodoComment result, got \(String(describing: commentResponse))")
@@ -4346,8 +3902,7 @@ private struct MCPWhoamiPayload: Decodable {
         title: "Updated",
         markdown: "- done",
         status: .blocked,
-        tags: ["Docs"],
-        open: false
+        tags: ["Docs"]
     )))
     guard case .updateTodo(let updated)? = updateResponse.result else {
         Issue.record("Expected updateTodo result, got \(String(describing: updateResponse))")
@@ -4407,26 +3962,12 @@ private struct MCPWhoamiPayload: Decodable {
 }
 
 @MainActor
-@Test func controlServerDoesNotSelectNotesOrTodosByDefault() async throws {
+@Test func controlServerDoesNotSelectTodosByDefault() async throws {
     let harness = try ControlServerHarness()
     defer {
         harness.stop()
     }
     harness.server.start()
-
-    let noteResponse = try await harness.send(.createNote(.init(
-        title: "Quiet Note",
-        markdown: "No focus change"
-    )))
-    guard case .createNote(let createdNote)? = noteResponse.result else {
-        Issue.record("Expected createNote result, got \(String(describing: noteResponse))")
-        return
-    }
-
-    #expect(noteResponse.error == nil)
-    #expect(createdNote.selected == false)
-    #expect(harness.chromeState.selectedNoteID == nil)
-    #expect(harness.chromeState.isShowingTerminalContent == true)
 
     let todoResponse = try await harness.send(.createTodo(.init(
         title: "Quiet Todo",
@@ -4455,14 +3996,6 @@ private struct MCPWhoamiPayload: Decodable {
 
     let initialSessionID = try #require(harness.workspace.selectedSessionID)
 
-    let noteResponse = try await harness.send(.createNote(.init(title: "Link Note", markdown: "note body")))
-    guard case .createNote(let createdNote)? = noteResponse.result,
-          let noteLink = createdNote.link
-    else {
-        Issue.record("Expected createNote result with link, got \(String(describing: noteResponse))")
-        return
-    }
-
     let todoResponse = try await harness.send(.createTodo(.init(title: "Link Todo", markdown: "todo body")))
     guard case .createTodo(let createdTodo)? = todoResponse.result,
           let todoLink = createdTodo.link
@@ -4473,23 +4006,13 @@ private struct MCPWhoamiPayload: Decodable {
 
     let terminalLink = CherryDeepLink.terminalURL(projectRoot: harness.projectRoot.path, terminalID: initialSessionID)
 
-    let noteResolveResponse = try await harness.send(.resolveLink(.init(link: noteLink)))
-    guard case .resolveLink(let noteResult)? = noteResolveResponse.result else {
-        Issue.record("Expected resolveLink note result, got \(String(describing: noteResolveResponse))")
-        return
-    }
-    #expect(noteResult.found == true)
-    #expect(noteResult.projectRoot == harness.projectRoot.path)
-    #expect(noteResult.kind == .note)
-    #expect(noteResult.note?.id == createdNote.note.id)
-    #expect(noteResult.noteLink == noteLink)
-
     let todoResolveResponse = try await harness.send(.resolveLink(.init(link: todoLink)))
     guard case .resolveLink(let todoResult)? = todoResolveResponse.result else {
         Issue.record("Expected resolveLink todo result, got \(String(describing: todoResolveResponse))")
         return
     }
     #expect(todoResult.found == true)
+    #expect(todoResult.projectRoot == harness.projectRoot.path)
     #expect(todoResult.kind == .todo)
     #expect(todoResult.todo?.id == createdTodo.todo.id)
     #expect(todoResult.todoLink == todoLink)
@@ -4519,8 +4042,13 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(staleResult.found == false)
     #expect(staleResult.projectRoot == harness.projectRoot.path)
 
+    // A note's link, from before notes were removed.
+    let noteLink = "\(CherryDeepLink.scheme)://project/\(CherryDeepLink.projectKey(forProjectRoot: harness.projectRoot.path))/note/\(UUID().uuidString)"
+    let noteResponse = try await harness.send(.resolveLink(.init(link: noteLink)))
+    #expect(noteResponse.result == nil)
+    #expect(noteResponse.error?.code == "notes_removed")
+
     #expect(harness.workspace.selectedSessionID == initialSessionID)
-    #expect(harness.chromeState.selectedNoteID == nil)
     #expect(harness.chromeState.selectedTodoID == nil)
     #expect(harness.chromeState.isShowingTerminalContent == true)
 }
@@ -4553,7 +4081,6 @@ private struct MCPWhoamiPayload: Decodable {
     }
     #expect(status.projectRoot == harness.projectRoot.path)
     #expect(status.processCounts.terminals == 1)
-    #expect(status.noteCount == 0)
     #expect(status.todoCount == 0)
 
     let rawData = Data("perf-diagnostics\r\n".utf8)
@@ -4731,10 +4258,7 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
 
-    let expectedPayload = TerminalInputEncoder.terminalTextData(
-        prompt,
-        keyboardProtocolFlags: 7
-    )
+    let expectedPayload = TerminalInputEncoder.terminalTextData(prompt)
     #expect(sent.sentBytes == expectedPayload.count)
     // The response's own 500 ms wait can end before a busy machine runs the
     // script's reply, so wait for the reply itself.
@@ -4812,10 +4336,7 @@ private struct MCPWhoamiPayload: Decodable {
         return
     }
 
-    let expectedPayload = TerminalInputEncoder.terminalTextData(
-        prompt,
-        keyboardProtocolFlags: 8
-    )
+    let expectedPayload = TerminalInputEncoder.terminalTextData(prompt)
     #expect(sent.sentBytes == expectedPayload.count)
     // The response's own 500 ms wait can end before a busy machine runs the
     // script's reply, so wait for the reply itself.
@@ -4985,22 +4506,22 @@ private struct MCPWhoamiPayload: Decodable {
     harness.server.start()
     let terminalID = try #require(harness.workspace.selectedSession?.id.uuidString)
 
-    let response = try await harness.send(.renameTerminal(.init(
-        terminalID: terminalID,
+    let response = try await harness.send(.renameProcess(.init(
+        processID: terminalID,
         title: "Build log"
     )))
 
-    guard case .renameTerminal(let result)? = response.result else {
-        Issue.record("Expected renameTerminal result, got \(String(describing: response))")
+    guard case .renameProcess(let result)? = response.result else {
+        Issue.record("Expected renameProcess result, got \(String(describing: response))")
         return
     }
 
-    #expect(result.title == "Build log")
+    #expect(result.process.name == "Build log")
     #expect(harness.workspace.selectedSession?.title == "Build log")
 }
 
 @MainActor
-@Test func controlServerSelectTerminalActivatesGroupedPane() async throws {
+@Test func controlServerSelectProcessActivatesGroupedPane() async throws {
     let harness = try ControlServerHarness()
     defer {
         harness.stop()
@@ -5021,13 +4542,13 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(initialList.selectedTerminalID == secondSession.id.uuidString)
     #expect(initialList.terminals.filter(\.selected).map(\.id) == [secondSession.id.uuidString])
 
-    let selectResponse = try await harness.send(.selectTerminal(.init(terminalID: firstSession.id.uuidString)))
-    guard case .selectTerminal(let selected)? = selectResponse.result else {
-        Issue.record("Expected selectTerminal result, got \(String(describing: selectResponse))")
+    let selectResponse = try await harness.send(.selectProcess(.init(processID: firstSession.id.uuidString)))
+    guard case .selectProcess(let selected)? = selectResponse.result else {
+        Issue.record("Expected selectProcess result, got \(String(describing: selectResponse))")
         return
     }
-    #expect(selected.selected)
-    #expect(selected.terminalID == firstSession.id.uuidString)
+    #expect(selected.process.selected)
+    #expect(selected.process.id == firstSession.id.uuidString)
     #expect(harness.workspace.selectedSessionID == firstSession.id)
     #expect(harness.workspace.splitGroup(id: groupID)?.activeSessionID == firstSession.id)
 
@@ -5041,12 +4562,12 @@ private struct MCPWhoamiPayload: Decodable {
     harness.workspace.closeActivePane()
     #expect(harness.workspace.splitGroup(id: groupID) == nil)
     #expect(harness.workspace.selectedSessionID == secondSession.id)
-    let dissolvedSelectResponse = try await harness.send(.selectTerminal(.init(terminalID: secondSession.id.uuidString)))
-    guard case .selectTerminal(let dissolvedSelected)? = dissolvedSelectResponse.result else {
-        Issue.record("Expected selectTerminal result, got \(String(describing: dissolvedSelectResponse))")
+    let dissolvedSelectResponse = try await harness.send(.selectProcess(.init(processID: secondSession.id.uuidString)))
+    guard case .selectProcess(let dissolvedSelected)? = dissolvedSelectResponse.result else {
+        Issue.record("Expected selectProcess result, got \(String(describing: dissolvedSelectResponse))")
         return
     }
-    #expect(dissolvedSelected.selected)
+    #expect(dissolvedSelected.process.selected)
     #expect(harness.workspace.selectedSessionID == secondSession.id)
 }
 
@@ -5060,10 +4581,10 @@ private struct MCPWhoamiPayload: Decodable {
     try harness.settings.upsertAgent(AgentToolDefinition(name: "Claude", command: "claude", enabled: false))
     harness.server.start()
 
-    let missingResponse = try await harness.send(.runAgent(.init(agentName: "Codex")))
+    let missingResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Codex")))
     #expect(missingResponse.error?.code == "agent_not_found")
 
-    let disabledResponse = try await harness.send(.runAgent(.init(agentName: "Claude")))
+    let disabledResponse = try await harness.send(.spawnProcess(.init(kind: "agent", name: "Claude")))
     #expect(disabledResponse.error?.code == "agent_not_launchable")
 }
 
@@ -5156,7 +4677,7 @@ private struct MCPWhoamiPayload: Decodable {
     )
 
     processor.enqueueOutput(Data("visible\r\n".utf8), launchID: nil, responseWriter: { _ in })
-    #expect(await waitForCondition { processor.snapshot(range: 0..<processor.lineCount).contains("visible") })
+    #expect(await eventually(timeout: 1) { processor.snapshot(range: 0..<processor.lineCount).contains("visible") })
 
     processor.setOutputProcessingSuspended(true)
     processor.enqueueOutput(Data("hidden\r\n".utf8), launchID: nil, responseWriter: { _ in })
@@ -5166,7 +4687,35 @@ private struct MCPWhoamiPayload: Decodable {
     processor.setOutputProcessingSuspended(false)
     processor.clear()
     processor.enqueueOutput(Data("replayed\r\n".utf8), launchID: nil, responseWriter: { _ in })
-    #expect(await waitForCondition { processor.snapshot(range: 0..<processor.lineCount).contains("replayed") })
+    #expect(await eventually(timeout: 1) { processor.snapshot(range: 0..<processor.lineCount).contains("replayed") })
+}
+
+/// A program's last output comes just before its exit: what was read while
+/// its launch ran is kept even when the launch ends before the output is
+/// processed, and only output of a launch that ended before it came, or of
+/// an earlier launch once a new one began, is dropped.
+@MainActor
+@Test func terminalProcessorKeepsALaunchsLastOutputAfterItEnds() async throws {
+    let processor = TerminalProcessor(maxScrollback: 1_000, buffer: LiveTerminalOutputBuffer(maxScrollback: 1_000))
+    let first = UUID()
+    processor.beginLaunch(first)
+    // Enough queued that the last chunks are still waiting when the launch
+    // ends at once.
+    for n in 0..<200 {
+        processor.enqueueOutput(Data("line \(n)\r\n".utf8), launchID: first, responseWriter: { _ in })
+    }
+    processor.enqueueOutput(Data("last words\r\n".utf8), launchID: first, responseWriter: { _ in })
+    processor.endLaunch(first)
+    #expect(await eventually(timeout: 1) { processor.snapshot(range: 0..<processor.lineCount).contains("last words") })
+
+    // After the launch ended, its output is dropped.
+    processor.enqueueOutput(Data("too late\r\n".utf8), launchID: first, responseWriter: { _ in })
+    // Queued for the first launch, processed once a second began: dropped.
+    let second = UUID()
+    processor.beginLaunch(second)
+    processor.enqueueOutput(Data("second\r\n".utf8), launchID: second, responseWriter: { _ in })
+    #expect(await eventually(timeout: 1) { processor.snapshot(range: 0..<processor.lineCount).contains("second") })
+    #expect(!processor.snapshot(range: 0..<processor.lineCount).contains("too late"))
 }
 
 @MainActor
@@ -5459,28 +5008,17 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(!text.contains("\u{1B}[K"))
 }
 
-@Test func ghosttyReplayOutputDropsTerminalQueriesThatCanWriteHostInput() async throws {
-    let replay = Data([
-        "before",
-        "\u{1B}]11;?\u{07}",
-        "\u{1B}]10;?\u{1B}\\",
-        "\u{1B}[6n",
-        "\u{1B}[c",
-        "\u{1B}[>c",
-        "\u{1B}[?2027$p",
-        "\u{1B}[?u",
-        "\u{1B}P+q4D73\u{1B}\\",
-        "\u{1B}]2;kept title\u{07}",
-        "\u{1B}[31m",
-        "after"
-    ].joined().utf8)
-
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
-
-    #expect(String(decoding: sanitized, as: UTF8.self) == "before\u{1B}]2;kept title\u{07}\u{1B}[31mafter")
+/// What the live feed (`GhosttyOutputSink`) hands Ghostty for `data`
+/// received in one chunk.
+private func ghosttyFeedOutput(_ data: Data) -> Data {
+    let observedData = DataWriteRecorder()
+    let sink = GhosttyOutputSink(receiveForTesting: { observedData.append($0) })
+    sink.receive(data)
+    sink.flushForTesting()
+    return observedData.values.reduce(into: Data()) { $0.append($1) }
 }
 
-@Test func ghosttyReplayOutputCollapsesOverwrittenProgressFrames() async throws {
+@Test func ghosttyFeedCollapsesOverwrittenProgressFrames() async throws {
     let replay = Data([
         "Building for debugging...\r\n",
         "\u{1B}[2K\r[0/3] Write swift-version--58304C5D6DBC2206.txt",
@@ -5490,7 +5028,7 @@ private struct MCPWhoamiPayload: Decodable {
         "\r\nBuild complete\r\n"
     ].joined().utf8)
 
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let sanitized = ghosttyFeedOutput(replay)
     let output = String(decoding: sanitized, as: UTF8.self)
 
     #expect(output == (
@@ -5500,7 +5038,7 @@ private struct MCPWhoamiPayload: Decodable {
     ))
 }
 
-@Test func ghosttyReplayOutputDropsZshPromptEndOfLineMarks() async throws {
+@Test func ghosttyFeedDropsZshPromptEndOfLineMarks() async throws {
     let promptEndMark = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
         String(repeating: " ", count: 120) +
         "\r \r"
@@ -5515,7 +5053,7 @@ private struct MCPWhoamiPayload: Decodable {
         "\u{1B}[1;32m❯\u{1B}[0m "
     ].joined().utf8)
 
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let sanitized = ghosttyFeedOutput(replay)
     let output = String(decoding: sanitized, as: UTF8.self)
 
     #expect(!output.contains("\u{1B}[7m%\u{1B}[27m"))
@@ -5524,29 +5062,29 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(output.contains("\u{1B}[1;32m❯\u{1B}[0m "))
 }
 
-@Test func ghosttyReplayOutputDropsCompactZshPromptEndOfLineMarks() async throws {
+@Test func ghosttyFeedDropsCompactZshPromptEndOfLineMarks() async throws {
     let replay = Data((
         "before\r\n" +
         "\u{1B}[7m%\u{1B}[27m\r" +
         "\u{1B}[1;36m~/github/patrick91/cherry\u{1B}[0m\r\n"
     ).utf8)
 
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let sanitized = ghosttyFeedOutput(replay)
     let output = String(decoding: sanitized, as: UTF8.self)
 
     #expect(!output.contains("\u{1B}[7m%\u{1B}[27m"))
     #expect(output == "before\r\n\r\u{1B}[K\u{1B}[1;36m~/github/patrick91/cherry\u{1B}[0m\r\n")
 }
 
-@Test func ghosttyReplayOutputKeepsPaletteColoredPercentLines() async throws {
+@Test func ghosttyFeedKeepsPaletteColoredPercentLines() async throws {
     let replay = Data("progress \u{1B}[38;5;7m%\u{1B}[0m\r\n".utf8)
 
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let sanitized = ghosttyFeedOutput(replay)
 
     #expect(sanitized == replay)
 }
 
-@Test func ghosttyReplayOutputKeepsPromptRepaintReturnAfterDroppingZshMark() async throws {
+@Test func ghosttyFeedKeepsPromptRepaintReturnAfterDroppingZshMark() async throws {
     let promptEndMark = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m" +
         String(repeating: " ", count: 20) +
         "\r \r"
@@ -5558,7 +5096,7 @@ private struct MCPWhoamiPayload: Decodable {
         "a\u{08}as"
     ].joined().utf8)
 
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let sanitized = ghosttyFeedOutput(replay)
 
     #expect(!String(decoding: sanitized, as: UTF8.self).contains("\u{1B}[7m%\u{1B}[27m"))
     var replayedBuffer = LiveTerminalOutputBuffer(maxScrollback: nil)
@@ -5569,7 +5107,7 @@ private struct MCPWhoamiPayload: Decodable {
     #expect(!promptLine.contains("ls"))
 }
 
-@Test func ghosttyReplayOutputPreservesContentSharingRowWithZshMark() async throws {
+@Test func ghosttyFeedPreservesContentSharingRowWithZshMark() async throws {
     // Regression: a zsh PROMPT_EOL_MARK that follows real content on the SAME row must NOT
     // be collapsed into `\r\x1b[K`. That carriage-return + erase-to-end-of-line rewinds to
     // column 0 and wipes the content sharing the row — the reported ghost/missing-character
@@ -5586,7 +5124,7 @@ private struct MCPWhoamiPayload: Decodable {
         "\u{1B}[0m❯ "
     ).utf8)
 
-    let sanitized = GhosttySessionBridge.sanitizeReplayOutputForHostManagedTerminal(replay)
+    let sanitized = ghosttyFeedOutput(replay)
 
     var replayedBuffer = LiveTerminalOutputBuffer(maxScrollback: nil)
     replayedBuffer.ingest(sanitized)
@@ -5868,20 +5406,20 @@ private struct MCPWhoamiPayload: Decodable {
     }
 
     let command = "sleep 0.5"
-    let didLaunch = await waitForCondition(timeout: 2) {
+    let didLaunch = await eventually(timeout: 2) {
         session.acceptsInput
     }
     #expect(didLaunch)
 
     session.send(text: command + "\n")
-    let didShowCommandTitle = await waitForCondition(timeout: 2) {
+    let didShowCommandTitle = await eventually(timeout: 2) {
         session.title == command
     }
     #expect(didShowCommandTitle)
 
     session.setAuxiliaryProcessingActive(false)
 
-    let didRestorePromptTitle = await waitForCondition(timeout: 2) {
+    let didRestorePromptTitle = await eventually(timeout: 2) {
         session.title != command
     }
     #expect(didRestorePromptTitle)
@@ -6079,7 +5617,7 @@ private struct MCPWhoamiPayload: Decodable {
 
     closingWindow.endSheet(sheet)
 
-    #expect(await waitForCondition {
+    #expect(await eventually(timeout: 1) {
         !closingWindow.isVisible
     })
     #expect(otherWindow.isVisible)
@@ -6125,13 +5663,13 @@ private struct MCPWhoamiPayload: Decodable {
         }
     }
 
-    #expect(await waitForCondition {
+    #expect(await eventually(timeout: 1) {
         closingWindow.attachedSheet != nil
     })
 
     alert.buttons[0].performClick(nil)
 
-    #expect(await waitForCondition(timeout: 2) {
+    #expect(await eventually(timeout: 2) {
         !closingWindow.isVisible
     })
     #expect(otherWindow.isVisible)
@@ -6167,9 +5705,8 @@ private struct QuitCountWindowTestHost: View {
         Text("Sessions: \(workspace.sessions.count)")
             .background(ProjectWindowBinder(
                 projectRoot: repository.repositoryRoot,
-                workspace: repository.activeWorkspace,
+                workspace: repository.workspace,
                 repository: repository,
-                noteStore: nil,
                 todoStore: nil,
                 chromeState: nil
             ))
@@ -6192,14 +5729,14 @@ private struct QuitCountWindowTestHost: View {
         view.freeSurface()
         window.close()
     }
-    #expect(await waitForCondition { view.needsConfirmQuit })
+    #expect(await eventually(timeout: 1) { view.needsConfirmQuit })
     let prompt = "\u{1b}]133;A\u{7}$ \u{1b}]133;B\u{7}"
     input.receive(prompt)
-    #expect(await waitForCondition { !view.needsConfirmQuit })
+    #expect(await eventually(timeout: 1) { !view.needsConfirmQuit })
     input.receive("cat\r\n\u{1b}]133;C\u{7}running\r\n")
-    #expect(await waitForCondition { view.needsConfirmQuit })
+    #expect(await eventually(timeout: 1) { view.needsConfirmQuit })
     input.receive("\u{1b}]133;D;0\u{7}" + prompt)
-    #expect(await waitForCondition { !view.needsConfirmQuit })
+    #expect(await eventually(timeout: 1) { !view.needsConfirmQuit })
 }
 
 @MainActor
@@ -6223,44 +5760,35 @@ private struct QuitCountWindowTestHost: View {
         session.releaseGhosttyBridge()
         try? FileManager.default.removeItem(at: directory)
     }
-    #expect(await waitForCondition(timeout: 5) { session.childProcessID != nil })
-    #expect(await waitForCondition { !session.hasRunningProcess() })
+    #expect(await eventually(timeout: 5) { session.childProcessID != nil })
+    #expect(await eventually(timeout: 1) { !session.hasRunningProcess() })
     // A background helper (like a prompt's git-status daemon) is a child of
     // an otherwise idle shell. It must not count as a foreground program.
     session.send(text: "/bin/sleep 30 & printf '%s\\n' $! > helper.pid\n")
-    #expect(await waitForCondition(timeout: 5) { FileManager.default.fileExists(atPath: helperPIDFile.path) })
+    #expect(await eventually(timeout: 5) { FileManager.default.fileExists(atPath: helperPIDFile.path) })
     let shellPID = try #require(session.childProcessID)
     let helperPID = try #require(Int32(String(contentsOf: helperPIDFile, encoding: .utf8)
         .trimmingCharacters(in: .whitespacesAndNewlines)))
     #expect(kill(helperPID, 0) == 0)
     #expect(getpgid(helperPID) != getpgid(shellPID))
-    #expect(await waitForCondition { !session.hasRunningProcess() })
+    #expect(await eventually(timeout: 1) { !session.hasRunningProcess() })
 
     session.send(text: "/bin/cat\n")
-    #expect(await waitForCondition { session.hasRunningProcess() })
-    session.sendInterrupt()
-    #expect(await waitForCondition { !session.hasRunningProcess() })
+    #expect(await eventually(timeout: 1) { session.hasRunningProcess() })
+    session.sendRaw(data: Data([0x03]))
+    #expect(await eventually(timeout: 1) { !session.hasRunningProcess() })
     #expect(kill(helperPID, 0) == 0)
 }
 
 @MainActor
-@Test func quitCountDropsClosedWindowsAndTheirInactiveWorktrees() async throws {
+@Test func quitCountDropsClosedWindows() async throws {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("CherryQuitCount-\(UUID().uuidString)", isDirectory: true)
     let closingRoot = directory.appendingPathComponent("closing", isDirectory: true)
     let remainingRoot = directory.appendingPathComponent("remaining", isDirectory: true)
-    let worktreeRoot = directory.appendingPathComponent("feature", isDirectory: true)
     try FileManager.default.createDirectory(at: closingRoot, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: remainingRoot, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
-
-    try runGitForTest(["-C", closingRoot.path, "init", "-b", "main"])
-    try runGitForTest(["-C", closingRoot.path, "-c", "user.name=Cherry Tests",
-                       "-c", "user.email=cherry@example.invalid", "commit", "--allow-empty", "-m", "Initial"])
-    try runGitForTest(["-C", closingRoot.path, "worktree", "add", "-b", "feature", worktreeRoot.path])
-    let previousWorktreeSpacesEnabled = TerminalSettings.shared.worktreeSpacesEnabled
-    TerminalSettings.shared.worktreeSpacesEnabled = true
-    defer { TerminalSettings.shared.worktreeSpacesEnabled = previousWorktreeSpacesEnabled }
 
     let closingRepository = RepositoryWorkspace(projectRoot: try canonicalPathForTest(closingRoot))
     let remainingRepository = RepositoryWorkspace(projectRoot: try canonicalPathForTest(remainingRoot))
@@ -6268,21 +5796,17 @@ private struct QuitCountWindowTestHost: View {
         closingRepository.closeAllSessions()
         remainingRepository.closeAllSessions()
     }
-    await closingRepository.refresh()
-    let closingWorkspace = closingRepository.activeWorkspace
-    let remainingWorkspace = remainingRepository.activeWorkspace
-    let inactiveWorkspace = try #require(closingRepository.prepareWorkspace(
-        worktreeRoot: try canonicalPathForTest(worktreeRoot)
-    ))
+    let closingWorkspace = closingRepository.workspace
+    let remainingWorkspace = remainingRepository.workspace
     closingWorkspace.closeAllSessions()
     remainingWorkspace.closeAllSessions()
     let definition = AgentToolDefinition(name: "Quit count", command: "/bin/cat")
-    for (workspace, count) in [(closingWorkspace, 3), (inactiveWorkspace, 3), (remainingWorkspace, 4)] {
+    for (workspace, count) in [(closingWorkspace, 3), (remainingWorkspace, 4)] {
         for _ in 0..<count {
             workspace.addAgentSession(agent: definition, projectRoot: try #require(workspace.projectRoot))
         }
     }
-    let closingSessions = closingWorkspace.sessions + inactiveWorkspace.sessions
+    let closingSessions = closingWorkspace.sessions
     let remainingSessions = remainingWorkspace.sessions
     let registry = ProjectWindowRegistry.shared
     let initialCount = registry.runningProcessCount()
@@ -6310,25 +5834,19 @@ private struct QuitCountWindowTestHost: View {
     }
     closingWindow.orderFrontRegardless()
     remainingWindow.orderFrontRegardless()
-    #expect(await waitForCondition(timeout: 5) {
-        registry.runningProcessCount() == initialCount + 10
+    #expect(await eventually(timeout: 5) {
+        registry.runningProcessCount() == initialCount + 7
     })
-
-    // Count inactive worktrees once, even after switching the registered workspace.
-    _ = closingRepository.activate(worktreeRoot: try canonicalPathForTest(worktreeRoot), chromeState: nil)
-    try await Task.sleep(for: .milliseconds(100))
-    #expect(registry.runningProcessCount() == initialCount + 10)
     closingWindow.performClose(nil)
-    #expect(await waitForCondition { closingWindow.attachedSheet != nil })
+    #expect(await eventually(timeout: 1) { closingWindow.attachedSheet != nil })
     let alert = try #require(closingWindow.attachedSheet)
     let stopButton = try #require(findSubview(in: alert.contentView!) {
         ($0 as? NSButton)?.title == "Stop and close"
     } as? NSButton)
     stopButton.performClick(nil)
-    #expect(await waitForCondition { !closingWindow.isVisible })
+    #expect(await eventually(timeout: 1) { !closingWindow.isVisible })
     #expect(closingSessions.allSatisfy { !$0.isRunning })
     #expect(closingWorkspace.sessions.isEmpty)
-    #expect(inactiveWorkspace.sessions.isEmpty)
     #expect(remainingSessions.allSatisfy { $0.isRunning })
     #expect(registry.runningProcessCount() == initialCount + 4)
 
@@ -6336,7 +5854,7 @@ private struct QuitCountWindowTestHost: View {
     // Those updates must not bring its workspace back into the quit count.
     closingWindow.contentView?.layoutSubtreeIfNeeded()
     try await Task.sleep(for: .milliseconds(200))
-    #expect(!registry.allWorkspaces().contains { $0 === closingWorkspace || $0 === inactiveWorkspace })
+    #expect(!registry.allWorkspaces().contains { $0 === closingWorkspace })
     #expect(registry.runningProcessCount() == initialCount + 4)
 
     // Closing individual panes must also immediately remove them from the total.
@@ -6684,7 +6202,7 @@ private struct QuitCountWindowTestHost: View {
 }
 
 @MainActor
-@Test func ghosttySessionSwitchIsImmediateWithinAWorktree() {
+@Test func ghosttySessionSwitchIsImmediate() {
     let first = TerminalSession(
         title: "First",
         subtitle: "No shell",
@@ -6714,72 +6232,7 @@ private struct QuitCountWindowTestHost: View {
     container.configure(with: first, colorScheme: .dark, allowsAutoFocus: false)
     container.configure(with: second, colorScheme: .dark, allowsAutoFocus: false)
 
-    #expect(!container.hasSurfaceTransitionSnapshotForTesting)
     #expect(container.activeSessionIDForTesting == second.id)
-}
-
-@MainActor
-@Test func worktreeWorkspaceSwitchReusesTerminalContainerWithoutSurfaceFade() async throws {
-    let firstWorkspace = TerminalWorkspace(projectRoot: "/tmp/cherry-first-worktree", launchBackend: .hostManaged)
-    let secondWorkspace = TerminalWorkspace(projectRoot: "/tmp/cherry-second-worktree", launchBackend: .hostManaged)
-    let selection = TerminalWorkspaceSelectionForTesting(workspace: firstWorkspace)
-    let swipeState = WorktreeSidebarSwipeState()
-    let chromeState = ProjectWindowChromeState()
-    let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
-        styleMask: [.borderless],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    let hostingView = NSHostingView(rootView: TerminalWorkspaceSwitchTestHost(
-        selection: selection,
-        chromeState: chromeState
-    ))
-    hostingView.frame = window.contentView?.bounds ?? .zero
-    window.contentView = hostingView
-    window.orderFrontRegardless()
-
-    defer {
-        swipeState.reset()
-        firstWorkspace.closeAllSessions()
-        secondWorkspace.closeAllSessions()
-        window.close()
-    }
-
-    #expect(await waitForCondition {
-        findSubview(in: hostingView) { $0 is GhosttyTerminalContainerView } != nil
-    })
-    let originalContainer = try #require(
-        findSubview(in: hostingView) { $0 is GhosttyTerminalContainerView }
-            as? GhosttyTerminalContainerView
-    )
-
-    #expect(swipeState.animateSwitch(
-        sourceRoot: "/tmp/cherry-first-worktree",
-        targetRoot: "/tmp/cherry-second-worktree",
-        direction: 1,
-        sidebarWidth: 320,
-        duration: 0.5
-    ) {
-        selection.workspace = secondWorkspace
-    })
-
-    let secondSessionID = try #require(secondWorkspace.selectedSession?.id)
-    #expect(await waitForCondition {
-        originalContainer.activeSessionIDForTesting == secondSessionID
-    })
-    let currentContainer = try #require(
-        findSubview(in: hostingView) { $0 is GhosttyTerminalContainerView }
-            as? GhosttyTerminalContainerView
-    )
-
-    #expect(currentContainer === originalContainer)
-    #expect(currentContainer.hasSurfaceTransitionSnapshotForTesting)
-    // The target terminal is already transitioning while the sidebar is still
-    // in its settle phase; neither waits for the other to finish first.
-    #expect(swipeState.targetRoot == "/tmp/cherry-second-worktree")
-    #expect(swipeState.sourceRoot == "/tmp/cherry-first-worktree")
 }
 
 @MainActor
@@ -7149,7 +6602,7 @@ private struct QuitCountWindowTestHost: View {
     ))
     session.ghosttyBridge.activateOutputFeedWhenSurfaceIsReady()
 
-    let observerInstalled = await waitForCondition {
+    let observerInstalled = await eventually(timeout: 1) {
         session.rawOutputObserverCount == 1
     }
     #expect(observerInstalled)
@@ -7211,7 +6664,7 @@ private struct QuitCountWindowTestHost: View {
         cellHeightPixels: cellHeightPixels
     ))
 
-    let observerInstalled = await waitForCondition {
+    let observerInstalled = await eventually(timeout: 1) {
         session.rawOutputObserverCount == 1
     }
     let mountedMetrics = session.ghosttyBridge.gridMetrics
@@ -7261,12 +6714,12 @@ private struct QuitCountWindowTestHost: View {
 
     container.frame = NSRect(x: 0, y: 0, width: 900, height: 520)
     NotificationCenter.default.post(name: NSWindow.didResizeNotification, object: window)
-    let frameUpdated = await waitForCondition {
+    let frameUpdated = await eventually(timeout: 1) {
         session.ghosttyBridge.terminalView.frame.size.width == 900 &&
             session.ghosttyBridge.terminalView.frame.size.height == 520
     }
     let refitCompleted = if hasHeadlessGridMetrics {
-        await waitForCondition {
+        await eventually(timeout: 1) {
             session.revision > revisionAfterInitialFit
         }
     } else {
@@ -7310,7 +6763,7 @@ private struct QuitCountWindowTestHost: View {
     }
 
     container.configure(with: session, colorScheme: .dark, allowsAutoFocus: false)
-    _ = await waitForCondition {
+    _ = await eventually(timeout: 1) {
         session.ghosttyBridge.terminalView.window != nil
     }
     #expect(session.rawOutput(maxBytes: 1_024).data.isEmpty == false)
@@ -7514,7 +6967,8 @@ private struct QuitCountWindowTestHost: View {
     #expect(session.title == "Review PR #4676")
     #expect(session.titleSource == .automatic)
     #expect(session.sidebarDetail == "codex --yolo")
-    #expect(session.agentActivityState == .working)
+    // A spinner in the title names a task, never a state.
+    #expect(session.agentActivityState == .unknown)
 
     session.rename(to: "Deploy review")
     session.ingestTestingData(Data("\u{1B}]0;⠋ Check CI secrets | cherry\u{7}".utf8))
@@ -7524,76 +6978,6 @@ private struct QuitCountWindowTestHost: View {
     session.rename(to: "")
     #expect(session.title == "Check CI secrets")
     #expect(session.titleSource == .automatic)
-}
-
-@Test func agentTerminalTitleParserHandlesCodexAndClaudeChrome() {
-    let projects: Set<String> = ["cherry"]
-
-    #expect(AgentTerminalTitleParser.taskTitle(
-        from: "⠋ Review PR #4676 ⠹ | cherry",
-        brand: .codex,
-        projectNames: projects,
-        agentName: "Codex"
-    ) == "Review PR #4676")
-    #expect(AgentTerminalTitleParser.taskTitle(
-        from: "[ ! ] Action Required | Review PR #4676 | cherry",
-        brand: .codex,
-        projectNames: projects,
-        agentName: "Codex"
-    ) == "Review PR #4676")
-    #expect(AgentTerminalTitleParser.taskTitle(
-        from: "⠹ cherry",
-        brand: .codex,
-        projectNames: projects,
-        agentName: "Codex"
-    ) == nil)
-    #expect(AgentTerminalTitleParser.taskTitle(
-        from: "⠹ cherry | gpt-5.6-sol",
-        brand: .codex,
-        projectNames: projects,
-        agentName: "Codex"
-    ) == nil)
-    #expect(AgentTerminalTitleParser.taskTitle(
-        from: "✳ Probe session initialization",
-        brand: .claude,
-        projectNames: projects,
-        agentName: "Claude"
-    ) == "Probe session initialization")
-    #expect(AgentTerminalTitleParser.taskTitle(
-        from: "✳ Claude Code",
-        brand: .claude,
-        projectNames: projects,
-        agentName: "Claude"
-    ) == nil)
-}
-
-@MainActor
-@Test func agentSessionTracksActivityStateFromTitleAndCompletionNotification() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer {
-        TerminalNotificationCenter.shared.isDeliveryEnabled = true
-    }
-
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Codex"
-    )
-
-    #expect(session.agentActivityState == .unknown)
-
-    session.ingestTestingData(Data("\u{1B}]0;⠹ Review deployment | cherry\u{7}".utf8))
-    #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
-
-    session.ingestTestingData(Data("\u{1B}]9;Agent turn complete\u{7}".utf8))
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-    #expect(session.hasUnreadNotification == false)
-    #expect(session.lastNotification == nil)
 }
 
 @MainActor
@@ -7623,355 +7007,6 @@ private struct QuitCountWindowTestHost: View {
     #expect(session.title == "Manual review")
     session.rename(to: "")
     #expect(session.title == "Codex")
-}
-
-@MainActor
-@Test func permissionNotificationFlipsAgentToPermissionState() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer {
-        TerminalNotificationCenter.shared.isDeliveryEnabled = true
-    }
-
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Codex"
-    )
-
-    session.ingestTestingData(Data("\u{1B}]0;⠹ Edit routing tests | cherry\u{7}".utf8))
-    #expect(session.agentActivityState == .working)
-
-    session.ingestTestingData(Data("\u{1B}]9;Permission required\u{7}".utf8))
-    #expect(session.agentActivityState == .permission)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-    #expect(session.hasUnreadNotification == true)
-}
-
-@MainActor
-@Test func unrelatedCompletionNotificationDoesNotClearAgentWorkingIndicator() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer {
-        TerminalNotificationCenter.shared.isDeliveryEnabled = true
-    }
-
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Codex"
-    )
-
-    session.ingestTestingData(Data("\u{1B}]0;⠹ Investigate build failure | cherry\u{7}".utf8))
-    #expect(session.agentActivityState == .working)
-
-    session.ingestTestingData(Data("\u{1B}]9;Compilation completed for module Foo\u{7}".utf8))
-    #expect(session.agentActivityState == .working)
-
-    session.ingestTestingData(Data("\u{1B}]9;Confirmation email sent to user\u{7}".utf8))
-    #expect(session.agentActivityState == .working)
-}
-
-@MainActor
-@Test func agentOutputDoesNotClearWorkingStateJustBecauseOutputIsQuiet() async throws {
-    let session = TerminalSession(
-        title: "Custom",
-        subtitle: "custom-agent",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Custom"
-    )
-
-    #expect(session.agentActivityState == .unknown)
-
-    session.ingestTestingData(Data("streaming chunk one\n".utf8))
-    try await Task.sleep(for: .milliseconds(60))
-
-    #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
-
-    try await Task.sleep(for: .milliseconds(1_700))
-
-    #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func submittedAgentInputMarksAgentWorkingBeforeOutput() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: true,
-        kind: .agent,
-        agentName: "Codex",
-        launchCommand: "stty -echo; cat >/dev/null",
-        launchBackend: .hostManaged
-    )
-    defer { session.stop() }
-
-    let deadline = Date(timeIntervalSinceNow: 2)
-    while !session.acceptsInput, Date() < deadline {
-        try await Task.sleep(for: .milliseconds(25))
-    }
-    try #require(session.acceptsInput)
-
-    session.ingestTestingData(Data("finished previous turn\n".utf8))
-    session.ingestTestingData(Data("\u{1B}]9;Agent turn complete\u{7}".utf8))
-    #expect(session.agentActivityState == .idle)
-
-    session.send(text: "Run /review on my current changes\n")
-
-    #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func submittedAgentInputStaysWorkingWhenOldPromptRemainsInTail() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: true,
-        kind: .agent,
-        agentName: "Codex",
-        launchCommand: "stty -echo; cat >/dev/null",
-        launchBackend: .hostManaged
-    )
-    defer { session.stop() }
-
-    let deadline = Date(timeIntervalSinceNow: 2)
-    while !session.acceptsInput, Date() < deadline {
-        try await Task.sleep(for: .milliseconds(25))
-    }
-    try #require(session.acceptsInput)
-
-    session.ingestTestingData(Data("""
-    Finished previous turn
-    \u{203A} Run tests
-    gpt-5.5 xhigh fast · ~/github/patrick91/cherry
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-    #expect(session.agentActivityState == .idle)
-
-    session.send(text: "Run /review on my current changes\n")
-    #expect(session.agentActivityState == .working)
-
-    // The fixture injects output directly rather than receiving the submitted
-    // line back from a host-managed PTY, so advance to the next terminal row.
-    session.ingestTestingData(Data("\nStarting review\n".utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func renderedCodexInputPromptClearsAgentWorkingIndicator() async throws {
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Codex"
-    )
-
-    session.noteTestingInput(Data("\r".utf8))
-    #expect(session.agentActivityState == .working)
-
-    session.ingestTestingData(Data("""
-    Before I write code: should this be a demo auth setup?
-    Worked for 1m 35s
-    \u{203A} Summarize recent commits
-    gpt-5.5 xhigh fast · ~/github/patrick91/demo
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func renderedCodexInputPromptAfterScreenClearClearsAgentWorkingIndicator() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: true,
-        kind: .agent,
-        agentName: "Codex",
-        launchCommand: "stty -echo; cat >/dev/null",
-        launchBackend: .hostManaged
-    )
-    defer { session.stop() }
-
-    let deadline = Date(timeIntervalSinceNow: 2)
-    while !session.acceptsInput, Date() < deadline {
-        try await Task.sleep(for: .milliseconds(25))
-    }
-    try #require(session.acceptsInput)
-
-    let previousTurn = (0..<40)
-        .map { "previous output line \($0)" }
-        .joined(separator: "\n")
-    session.ingestTestingData(Data("\(previousTurn)\n".utf8))
-
-    session.send(text: "Refactor auth flow\n")
-    #expect(session.agentActivityState == .working)
-
-    session.ingestTestingData(Data("""
-    \u{1B}[3J\u{1B}[H
-    Renamed the shared module.
-
-    Worked for 2m 05s
-    \u{203A} Improve documentation in @filename
-    gpt-5.5 xhigh fast · ~/github/fastapilabs/fastapi-cloud-cli
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func unsubmittedAgentInputDoesNotHideRepaintedCodexPromptFromIdleDetection() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: true,
-        kind: .agent,
-        agentName: "Codex",
-        launchCommand: "stty -echo; cat >/dev/null",
-        launchBackend: .hostManaged
-    )
-    defer { session.stop() }
-
-    let deadline = Date(timeIntervalSinceNow: 2)
-    while !session.acceptsInput, Date() < deadline {
-        try await Task.sleep(for: .milliseconds(25))
-    }
-    try #require(session.acceptsInput)
-
-    session.ingestTestingData(Data("MCP startup incomplete\n".utf8))
-    try await Task.sleep(for: .milliseconds(80))
-    #expect(session.agentActivityState == .working)
-
-    session.send(text: "draft")
-    session.ingestTestingData(Data("\r\u{1B}[2K\u{203A} draft".utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func unsubmittedAgentInputKeepsUnknownComposerRepaintsIdle() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: true,
-        kind: .agent,
-        agentName: "Codex",
-        launchCommand: "stty -echo; cat >/dev/null",
-        launchBackend: .hostManaged
-    )
-    defer { session.stop() }
-
-    let deadline = Date(timeIntervalSinceNow: 2)
-    while !session.acceptsInput, Date() < deadline {
-        try await Task.sleep(for: .milliseconds(25))
-    }
-    try #require(session.acceptsInput)
-
-    session.ingestTestingData(Data("MCP startup interrupted\n".utf8))
-    try await Task.sleep(for: .milliseconds(80))
-    #expect(session.agentActivityState == .working)
-
-    session.noteTestingInput(Data("draft".utf8))
-    session.ingestTestingData(Data("\r\u{1B}[2K? draft".utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func renderedCodexWorkingStatusKeepsAgentWorkingIndicator() async throws {
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Codex"
-    )
-
-    session.ingestTestingData(Data("\u{1B}]0;⠹ Editing implementation plan | cherry\u{7}".utf8))
-
-    session.ingestTestingData(Data("""
-    Edited plans/cli-ai.md (+2 -0)
-
-    Working (5m02s • esc to interrupt)
-
-    \u{203A} Summarize recent commits
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func renderedPiInputPromptDoesNotTurnAnIdleRepaintIntoWorkingOutput() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Pi",
-        subtitle: "pi",
-        tint: .systemPink,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Pi"
-    )
-
-    // Pi's composer uses a plain `>` prompt. Reflowing this settled screen must
-    // not be classified as new output and then settled again by the quiet timer.
-    session.ingestTestingData(Data("""
-    Validation passed.
-
-     GPT-5.6 Sol  think:xhigh  cloud
-    ────────────────────────────────────────
-    >
-    ────────────────────────────────────────
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(session.agentActivityEvidenceIsStrong)
 }
 
 @Test func sidebarWorkingIndicatorAvoidsSwiftUITimelineInvalidation() throws {
@@ -8015,464 +7050,12 @@ private struct QuitCountWindowTestHost: View {
     #expect(indicatorSource.contains("SidebarAgentWorkingIndicatorView.viewSize"))
 }
 
-@Test func attentionToolsMenuDoesNotObserveLiveTerminalSession() throws {
-    let testFile = URL(fileURLWithPath: #filePath)
-    let repoRoot = testFile
-        .deletingLastPathComponent()
-        .deletingLastPathComponent()
-        .deletingLastPathComponent()
-    let sourceURL = repoRoot.appending(path: "Sources/Cherry/ContentView.swift")
-    let source = String(decoding: try Data(contentsOf: sourceURL), as: UTF8.self)
-
-    let start = try #require(source.range(of: "private struct AttentionToolsMenu"))
-    let end = try #require(source.range(
-        of: "@MainActor\nprivate enum AttentionDebugPresenter",
-        range: start.upperBound..<source.endIndex
-    ))
-    let menuSource = String(source[start.lowerBound..<end.lowerBound])
-
-    #expect(!menuSource.contains("@ObservedObject"))
-    #expect(menuSource.contains("let prediction: TerminalAttentionPrediction?"))
-    #expect(menuSource.contains("let currentTag: TerminalAttentionCorrection?"))
-}
-
-@MainActor
-@Test func renderedClaudeInputPromptClearsAgentWorkingIndicator() async throws {
-    let session = TerminalSession(
-        title: "Claude",
-        subtitle: "claude",
-        tint: .systemPurple,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Claude"
-    )
-
-    session.noteTestingInput(Data("\r".utf8))
-    #expect(session.agentActivityState == .working)
-
-    session.ingestTestingData(Data("""
-    Claude Code v2.1.150
-    Opus 4.7 (1M context) with high effort · Claude Max
-    > Try "fix lint errors"
-    >> bypass permissions on (shift+tab to cycle)
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func renderedClaudeWorkingStatusKeepsAgentWorkingIndicator() async throws {
-    let session = TerminalSession(
-        title: "Claude",
-        subtitle: "claude",
-        tint: .systemPurple,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Claude"
-    )
-
-    session.ingestTestingData(Data("\u{1B}]0;⠹ User requested lint error fix\u{7}".utf8))
-
-    session.ingestTestingData(Data("""
-    Read 1 file (ctrl+o to expand)
-    I'll review this plan against the actual codebase.
-    Reading 5 files... (ctrl+o to expand)
-    * Whisking... (20s . down 734 tokens . still thinking with high effort)
-    >
-    >> bypass permissions on (shift+tab to cycle)
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func outputAfterCompletionNotificationStaysIdleUntilUserInput() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Codex"
-    )
-
-    session.ingestTestingData(Data("streaming output\n".utf8))
-    try await Task.sleep(for: .milliseconds(60))
-    #expect(session.agentActivityState == .working)
-
-    session.ingestTestingData(Data("\u{1B}]9;Agent turn complete\u{7}".utf8))
-    #expect(session.agentActivityState == .idle)
-
-    session.ingestTestingData(Data("post-completion housekeeping line\n".utf8))
-    try await Task.sleep(for: .milliseconds(60))
-    #expect(session.agentActivityState == .idle)
-}
-
 private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     var payload = ""
     for (index, row) in rows.enumerated() {
         payload += "\u{1B}[\(index + 1);1H\(row)\u{1B}[K"
     }
     return Data(payload.utf8)
-}
-
-@MainActor
-@Test func claudeAlternateScreenIdlePromptClearsWorkingAfterSubmit() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Claude",
-        subtitle: "claude --dangerously-skip-permissions",
-        tint: .systemPurple,
-        launchShell: true,
-        kind: .agent,
-        agentName: "Claude",
-        launchCommand: "stty -echo; cat >/dev/null",
-        launchBackend: .hostManaged
-    )
-    defer { session.stop() }
-
-    let deadline = Date(timeIntervalSinceNow: 2)
-    while !session.acceptsInput, Date() < deadline {
-        try await Task.sleep(for: .milliseconds(25))
-    }
-    try #require(session.acceptsInput)
-
-    session.ingestTestingData(Data("\u{1B}[?1049h\u{1B}[2J\u{1B}[H".utf8))
-    session.ingestTestingData(claudeAlternateScreenFrame(rows: [
-        "Claude Code v2.1.170",
-        "",
-        "────────────────────────────",
-        "❯ Try \"fix lint errors\"",
-        "────────────────────────────",
-        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
-    ]))
-    try await Task.sleep(for: .milliseconds(80))
-    #expect(session.agentActivityState == .idle)
-
-    session.send(text: "run the probe\n")
-    #expect(session.agentActivityState == .working)
-
-    session.ingestTestingData(claudeAlternateScreenFrame(rows: [
-        "❯ run the probe",
-        "",
-        "✻ Stewing…",
-        "❯ ",
-        "────────────────────────────",
-        "  ⏵⏵ bypass permissions on · esc to interrupt"
-    ]))
-    try await Task.sleep(for: .milliseconds(80))
-    #expect(session.agentActivityState == .working)
-
-    session.ingestTestingData(claudeAlternateScreenFrame(rows: [
-        "❯ run the probe",
-        "⏺ Done!",
-        "✻ Cooked for 4s",
-        "❯ ",
-        "────────────────────────────",
-        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
-    ]))
-    try await Task.sleep(for: .milliseconds(80))
-    #expect(session.agentActivityState == .working)
-
-    try await Task.sleep(for: .milliseconds(700))
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func claudeBackgroundShellAloneDoesNotKeepAgentWorking() async throws {
-    // Users corrected "✻ Worked for … · 1 shell still running" to "result
-    // ready" every time: a dev server or watcher outlives the turn. Only a
-    // live title spinner (or a background agent) keeps the session working.
-    let session = TerminalSession(
-        title: "Claude",
-        subtitle: "claude --dangerously-skip-permissions",
-        tint: .systemPurple,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Claude"
-    )
-
-    session.ingestTestingData(Data("""
-    ⏺ The command is running in the background.
-    ✻ Sautéed for 23s · 1 shell still running
-    ❯
-      ⏵⏵ bypass permissions on · 1 shell · ← for agents · ↓ to manage
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-
-    session.ingestTestingData(Data("\u{1B}]0;⠹ Running probe command\u{7}".utf8))
-    #expect(session.agentActivityState == .working)
-}
-
-@MainActor
-@Test func claudeLiveTaskFooterKeepsParentWorkingWithoutTrustingStaleTranscript() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Claude",
-        subtitle: "claude --dangerously-skip-permissions",
-        tint: .systemPurple,
-        launchShell: true,
-        kind: .agent,
-        agentName: "Claude",
-        launchCommand: "stty -echo; cat >/dev/null",
-        launchBackend: .hostManaged
-    )
-    defer { session.stop() }
-
-    let deadline = Date(timeIntervalSinceNow: 2)
-    while !session.acceptsInput, Date() < deadline {
-        try await Task.sleep(for: .milliseconds(25))
-    }
-    try #require(session.acceptsInput)
-    session.resize(columns: 171, rows: 66)
-    session.ingestTestingData(Data("\u{1B}[?1049h\u{1B}[2J\u{1B}[H".utf8))
-    session.send(text: "review the pull request\n")
-
-    let transcript = [
-        "❯ review the pull request",
-        "⏺ The review is running and I'll report when it completes.",
-        "✻ Waiting for 1 background agent to finish"
-    ] + Array(repeating: "", count: 38)
-    let composer = [
-        "────────────────────────────",
-        "❯ ",
-        "────────────────────────────",
-        "  ⏵⏵ bypass permissions on · ← for agents · ↓ to manage",
-        "",
-        "  ⏺ main",
-        "  ◯ code-review (+2)  /code-review 4402  16m 22s · ↑ 169.2k tokens"
-    ]
-    session.ingestTestingData(claudeAlternateScreenFrame(rows: transcript + composer))
-    // Let the debounced content observation replace the immediate input-submit
-    // prediction so this verifies the classifier sees the corrected native state.
-    try await Task.sleep(for: .milliseconds(1_200))
-
-    #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
-    #expect(session.attentionClassifierPrediction?.needsAttention == false)
-    #expect(session.attentionClassifierPrediction?.nativeActivityState == "working")
-    #expect(session.attentionClassifierPrediction?.activityEvidence == "working_marker")
-    #expect(session.attentionClassifierPrediction?.turnState == .active)
-    #expect(session.hasUnacknowledgedAttention == false)
-
-    // The waiting line is the newest status only while the review runs: a
-    // later status line makes it transcript.
-    let settledTranscript = Array(transcript.prefix(3)) + [
-        "⏺ The review found nothing blocking.",
-        "✻ Cooked for 2s"
-    ] + Array(repeating: "", count: 36)
-    let settledComposer = [
-        "────────────────────────────",
-        "❯ ",
-        "────────────────────────────",
-        "  ⏵⏵ bypass permissions on · ← for agents · ↓ to manage",
-        "",
-        "  ⏺ main",
-        "  ◯ code-review  /code-review 4402"
-    ]
-    session.ingestTestingData(claudeAlternateScreenFrame(rows: settledTranscript + settledComposer))
-    try await Task.sleep(for: .milliseconds(700))
-
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func brailleSpinnerTitleMarksAgentWorkingAndClearedTitleRestoresIdle() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Codex"
-    )
-
-    session.ingestTestingData(Data("""
-    Finished previous turn
-    \u{203A} Summarize recent commits
-    gpt-5.5 xhigh fast · ~/github/patrick91/cherry
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-    #expect(session.agentActivityState == .idle)
-
-    session.ingestTestingData(Data("\u{1B}]0;⠹ cherry\u{7}".utf8))
-    #expect(session.agentActivityState == .working)
-    #expect(session.agentActivityState.showsWorkingIndicator)
-
-    session.ingestTestingData(Data("\u{1B}]0;cherry\u{7}".utf8))
-    try await Task.sleep(for: .milliseconds(700))
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func staleBrailleSpinnerTitleDoesNotPinWorkingAfterStartupSettles() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Codex"
-    )
-
-    session.ingestTestingData(Data("\u{1B}]0;⠹ cherry\u{7}".utf8))
-    session.ingestTestingData(Data("MCP startup incomplete (failed: cloudflare-api, paper)\n".utf8))
-    session.ingestTestingData(Data("\u{1B}]0;⠴ cherry\u{7}".utf8))
-    session.ingestTestingData(Data("""
-    \u{203A} Use /skills to list available skills
-    gpt-5.5 xhigh fast · ~/github/fastapilabs/fastapi-cloud-cli
-    """.utf8))
-    try await Task.sleep(for: .milliseconds(80))
-    #expect(session.agentActivityState == .working)
-
-    // No clean title ever arrives: the stale spinner frame must decay and the
-    // quiet recheck must restore idle from the visible composer.
-    try await Task.sleep(for: .milliseconds(4_800))
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-
-@MainActor
-@Test func claudeStartupGhostSuggestionScreenSettlesIdle() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    // Real captured Claude Code 2.1.170 startup byte stream where the composer
-    // ghost text is rendered as "❯\u{00A0}Try ..." (no-break space): the sidebar
-    // spinner used to stay pinned at working on this screen.
-    let url = try #require(Bundle.module.url(
-        forResource: "claude-code-2.1.170-startup-ghost",
-        withExtension: "raw",
-        subdirectory: "Fixtures"
-    ))
-    let data = try Data(contentsOf: url)
-
-    let session = TerminalSession(
-        title: "Claude",
-        subtitle: "claude --dangerously-skip-permissions",
-        tint: .systemPurple,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Claude"
-    )
-    session.resize(columns: 261, rows: 83)
-
-    var offset = 0
-    while offset < data.count {
-        let end = min(offset + 1_024, data.count)
-        session.ingestTestingData(data[offset..<end])
-        offset = end
-        try await Task.sleep(for: .milliseconds(4))
-    }
-    try await Task.sleep(for: .milliseconds(700))
-
-    #expect(session.usesAlternateScreen)
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func escInterruptedTurnSettlesIdleDespiteStaleTitleAndGhostComposer() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Claude",
-        subtitle: "claude --dangerously-skip-permissions",
-        tint: .systemPurple,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Claude"
-    )
-
-    session.ingestTestingData(Data("\u{1B}[?1049h\u{1B}[2J\u{1B}[H".utf8))
-    session.ingestTestingData(Data("\u{1B}]0;\u{2810} Running probe\u{7}".utf8))
-    session.ingestTestingData(claudeAlternateScreenFrame(rows: [
-        "\u{276F}\u{A0}run the thing",
-        "\u{2733} Stewing\u{2026}",
-        "\u{276F}\u{A0}",
-        "  \u{23F5}\u{23F5} bypass permissions on \u{B7} esc to interrupt"
-    ]))
-    try await Task.sleep(for: .milliseconds(80))
-    #expect(session.agentActivityState == .working)
-
-    // ESC interrupts the turn: marker disappears, ghost suggestion returns to
-    // the composer (with a no-break space), but the braille title is never
-    // re-emitted clean.
-    session.ingestTestingData(claudeAlternateScreenFrame(rows: [
-        "\u{276F}\u{A0}run the thing",
-        "\u{23FA} Interrupted \u{B7} What should Claude do instead?",
-        "\u{276F}\u{A0}Try \"fix lint errors\"",
-        "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)"
-    ]))
-
-    try await Task.sleep(for: .milliseconds(5_000))
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
-}
-
-@MainActor
-@Test func codexStartupWithParkedCursorBelowContentSettlesIdle() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    // Real captured Codex v0.139.0 startup byte stream: content occupies the top
-    // ~29 rows while the cursor is parked on the bottom screen row, leaving ~54
-    // trailing blank rows that pushed the composer out of the prompt window.
-    let url = try #require(Bundle.module.url(
-        forResource: "codex-0.139.0-startup-parked-cursor",
-        withExtension: "raw",
-        subdirectory: "Fixtures"
-    ))
-    let data = try Data(contentsOf: url)
-
-    let session = TerminalSession(
-        title: "Codex",
-        subtitle: "codex --yolo",
-        tint: .systemGreen,
-        launchShell: false,
-        kind: .agent,
-        agentName: "Codex"
-    )
-    session.resize(columns: 220, rows: 83)
-
-    var offset = 0
-    while offset < data.count {
-        let end = min(offset + 1_024, data.count)
-        session.ingestTestingData(data[offset..<end])
-        offset = end
-        try await Task.sleep(for: .milliseconds(4))
-    }
-
-    // The braille title spinner from MCP-client startup must decay and the
-    // composer far above the parked cursor must be found by the recheck.
-    try await Task.sleep(for: .milliseconds(5_000))
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
 }
 
 @MainActor
@@ -8494,7 +7077,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     session.ingestTestingData(Data("\u{1B}[?1049h\u{1B}[2J\u{1B}[H".utf8))
     session.ingestTestingData(frame)
     try await Task.sleep(for: .milliseconds(80))
-    #expect(session.agentActivityState == .idle)
 
     let contentVersionBefore = session.contentVersion
     let outputVersionBefore = session.outputVersion
@@ -8503,46 +7085,8 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 
     #expect(session.contentVersion == contentVersionBefore)
     #expect(session.outputVersion > outputVersionBefore)
-    #expect(session.agentActivityState == .idle)
-}
-
-@MainActor
-@Test func emptySubmitOnIdlePromptRecoversToIdleAfterQuietRecheck() async throws {
-    TerminalNotificationCenter.shared.isDeliveryEnabled = false
-    defer { TerminalNotificationCenter.shared.isDeliveryEnabled = true }
-
-    let session = TerminalSession(
-        title: "Claude",
-        subtitle: "claude --dangerously-skip-permissions",
-        tint: .systemPurple,
-        launchShell: true,
-        kind: .agent,
-        agentName: "Claude",
-        launchCommand: "stty -echo; cat >/dev/null",
-        launchBackend: .hostManaged
-    )
-    defer { session.stop() }
-
-    let deadline = Date(timeIntervalSinceNow: 2)
-    while !session.acceptsInput, Date() < deadline {
-        try await Task.sleep(for: .milliseconds(25))
-    }
-    try #require(session.acceptsInput)
-
-    session.ingestTestingData(Data("\u{1B}[?1049h\u{1B}[2J\u{1B}[H".utf8))
-    session.ingestTestingData(claudeAlternateScreenFrame(rows: [
-        "❯ Try \"fix lint errors\"",
-        "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
-    ]))
-    try await Task.sleep(for: .milliseconds(80))
-    #expect(session.agentActivityState == .idle)
-
-    session.send(text: "\n")
-    #expect(session.agentActivityState == .working)
-
-    try await Task.sleep(for: .milliseconds(4_700))
-    #expect(session.agentActivityState == .idle)
-    #expect(!session.agentActivityState.showsWorkingIndicator)
+    // The screen says nothing about the agent's state: only its reports do.
+    #expect(session.agentActivityState == .unknown)
 }
 
 @MainActor
@@ -8798,8 +7342,9 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     settings.sidebarTerminalPathDisplayMode = .fullPath
     #expect(TerminalSettings(defaults: defaults).sidebarTerminalPathDisplayMode == .fullPath)
 
-    settings.resetTerminalAppearance()
+    settings.reset(TerminalSettings.Setting.interfacePage)
     #expect(settings.sidebarTerminalPathDisplayMode == .repoFocused)
+    #expect(defaults.object(forKey: "sidebar.terminalPathDisplayMode") == nil)
 }
 
 @MainActor
@@ -8816,23 +7361,9 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     settings.projectColorDisplayMode = .tinted
     #expect(TerminalSettings(defaults: defaults).projectColorDisplayMode == .tinted)
 
-    settings.resetTerminalAppearance()
+    settings.reset(TerminalSettings.Setting.interfacePage)
     #expect(settings.projectColorDisplayMode == .accent)
-}
-
-@MainActor
-@Test func terminalSettingsPersistWorktreeSpacesPreference() async throws {
-    let defaultsName = "CherryTests.WorktreeSpacesSettings.\(UUID().uuidString)"
-    let defaults = try #require(UserDefaults(suiteName: defaultsName))
-    defer {
-        defaults.removePersistentDomain(forName: defaultsName)
-    }
-
-    let settings = TerminalSettings(defaults: defaults)
-    #expect(!settings.worktreeSpacesEnabled)
-
-    settings.worktreeSpacesEnabled = true
-    #expect(TerminalSettings(defaults: defaults).worktreeSpacesEnabled)
+    #expect(defaults.object(forKey: "sidebar.projectColorDisplayMode") == nil)
 }
 
 @MainActor
@@ -8843,7 +7374,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         minimumContrast: 1.15
     )
 
-    #expect(configuration.rendered.contains("scrollback-limit = 4000000"))
+    #expect(configuration.rendered.contains("scrollback-limit-bytes = 4000000"))
     #expect(configuration.rendered.contains("cursor-style = bar"))
 }
 
@@ -9475,26 +8006,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     }
 }
 
-@Test func mcpInstallCommandsUseProcessBoundStdioHelper() async throws {
-    let commands = MCPInstallCommandBuilder.commands()
-    let helperCommand = MCPInstallCommandBuilder.helperCommand
-
-    #expect(commands == [
-        MCPInstallCommand(
-            harness: .codex,
-            command: "codex mcp add cherry -- \(helperCommand)"
-        ),
-        MCPInstallCommand(
-            harness: .claude,
-            command: "claude mcp add --transport stdio --scope user cherry -- \(helperCommand)"
-        ),
-        MCPInstallCommand(
-            harness: .pi,
-            command: "pi mcp add cherry --exposure direct -- \(helperCommand)"
-        )
-    ])
-}
-
 @Test func cherryControlSocketSeparatesInstalledAppFromSwiftPMBuild() {
     let appExecutable = URL(fileURLWithPath: "/Users/patrick/Applications/Cherry.app/Contents/MacOS/Cherry")
     let swiftPMExecutable = URL(fileURLWithPath: "/Users/patrick/github/patrick91/cherry/.build/arm64-apple-macosx/debug/Cherry")
@@ -9538,6 +8049,15 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         charactersIgnoringModifiers: "w",
         modifiers: [.command]
     ) == .closeSelectedSessionOrWindow)
+    // ⌘N is New Window, never the terminal's; ⌘⇧N is not Cherry's.
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "n",
+        modifiers: [.command]
+    ) == .openAnotherWindow)
+    #expect(AppShortcutMonitor.shortcutAction(
+        charactersIgnoringModifiers: "N",
+        modifiers: [.command, .shift]
+    ) == nil)
     #expect(AppShortcutMonitor.shortcutAction(
         charactersIgnoringModifiers: "D",
         modifiers: [.command, .shift, .option]
@@ -9583,80 +8103,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
 }
 
 @MainActor
-@Test func appShortcutMonitorCommandWClosesSelectedNoteBeforeSession() async throws {
-    let projectDirectory = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryShortcutNoteClose-\(UUID().uuidString)", isDirectory: true)
-    let storageDirectory = projectDirectory.appendingPathComponent("stores", isDirectory: true)
-    try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
-
-    let workspace = TerminalWorkspace(projectRoot: projectDirectory.path, launchBackend: .hostManaged)
-    let chromeState = ProjectWindowChromeState()
-    let noteStore = ProjectNoteStore(
-        projectRoot: projectDirectory.path,
-        storageDirectory: storageDirectory.appendingPathComponent("notes", isDirectory: true)
-    )
-    let todoStore = ProjectTodoStore(
-        projectRoot: projectDirectory.path,
-        storageDirectory: storageDirectory.appendingPathComponent("todos", isDirectory: true)
-    )
-    let secondSession = workspace.addSession(title: "Keep Me")
-    let note = try noteStore.create(title: "Active Note", markdown: "draft")
-    chromeState.selectNote(id: note.id)
-
-    let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.orderFrontRegardless()
-
-    let coordinator = AppShortcutMonitor.Coordinator(
-        workspace: workspace,
-        chromeState: chromeState,
-        noteStore: noteStore,
-        todoStore: todoStore,
-        projectRoot: projectDirectory.path,
-        visibleCommandNames: [],
-        visibleCommands: [],
-        projectFeatures: ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
-        openSettings: {}
-    )
-    coordinator.window = window
-
-    defer {
-        _ = coordinator
-        for session in workspace.sessions {
-            session.releaseGhosttyBridge()
-            session.stop()
-        }
-        window.close()
-        try? FileManager.default.removeItem(at: projectDirectory)
-    }
-
-    let event = try #require(NSEvent.keyEvent(
-        with: .keyDown,
-        location: .zero,
-        modifierFlags: [.command],
-        timestamp: 1,
-        windowNumber: window.windowNumber,
-        context: nil,
-        characters: "w",
-        charactersIgnoringModifiers: "w",
-        isARepeat: false,
-        keyCode: 13
-    ))
-
-    NSApp.sendEvent(event)
-    try await Task.sleep(for: .milliseconds(20))
-
-    #expect(chromeState.selectedNoteID == nil)
-    #expect(workspace.sessions.contains { $0.id == secondSession.id })
-    #expect(workspace.sessions.count == 2)
-}
-
-@MainActor
 @Test func appShortcutMonitorCommandWClosesActiveSplitPane() async throws {
     let projectDirectory = FileManager.default.temporaryDirectory
         .appendingPathComponent("CherryShortcutSplitClose-\(UUID().uuidString)", isDirectory: true)
@@ -9666,10 +8112,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     let workspace = TerminalWorkspace(projectRoot: projectDirectory.path, launchBackend: .hostManaged)
     workspace.updateTerminalDetailWidth(1_200)
     let chromeState = ProjectWindowChromeState()
-    let noteStore = ProjectNoteStore(
-        projectRoot: projectDirectory.path,
-        storageDirectory: storageDirectory.appendingPathComponent("notes", isDirectory: true)
-    )
     let todoStore = ProjectTodoStore(
         projectRoot: projectDirectory.path,
         storageDirectory: storageDirectory.appendingPathComponent("todos", isDirectory: true)
@@ -9691,12 +8133,10 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     let coordinator = AppShortcutMonitor.Coordinator(
         workspace: workspace,
         chromeState: chromeState,
-        noteStore: noteStore,
         todoStore: todoStore,
         projectRoot: projectDirectory.path,
-        visibleCommandNames: [],
         visibleCommands: [],
-        projectFeatures: ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
+        projectFeatures: ProjectFeatureSettings(todosEnabled: true),
         openSettings: {}
     )
     coordinator.window = window
@@ -9731,100 +8171,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     #expect(workspace.selectedSessionID == firstSession.id)
     #expect(workspace.splitGroup(id: groupID) == nil)
     #expect(workspace.terminalDisplayItems == [.single(firstSession.id)])
-}
-
-@MainActor
-@Test func appShortcutMonitorCommandWKeepsWindowOpenForSessionsInOtherWorktrees() async throws {
-    let container = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryShortcutWorktreeClose-\(UUID().uuidString)", isDirectory: true)
-    let repositoryRoot = container.appendingPathComponent("repository", isDirectory: true)
-    let worktreeRoot = container.appendingPathComponent("feature", isDirectory: true)
-    let storageDirectory = container.appendingPathComponent("stores", isDirectory: true)
-    try FileManager.default.createDirectory(at: repositoryRoot, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: container) }
-
-    try runGitForTest(["-C", repositoryRoot.path, "init", "-b", "main"])
-    try runGitForTest(["-C", repositoryRoot.path, "config", "user.name", "Cherry Tests"])
-    try runGitForTest(["-C", repositoryRoot.path, "config", "user.email", "cherry@example.invalid"])
-    try Data("Cherry\n".utf8).write(to: repositoryRoot.appendingPathComponent("README.md"))
-    try runGitForTest(["-C", repositoryRoot.path, "add", "README.md"])
-    try runGitForTest(["-C", repositoryRoot.path, "commit", "-m", "Initial commit"])
-
-    let service = GitWorktreeService()
-    try await service.create(
-        .newBranch(name: "feature", startPoint: "HEAD", destination: worktreeRoot.path),
-        repositoryRoot: repositoryRoot.path
-    )
-
-    let settings = TerminalSettings.shared
-    let previousWorktreeSpacesEnabled = settings.worktreeSpacesEnabled
-    settings.worktreeSpacesEnabled = true
-    defer { settings.worktreeSpacesEnabled = previousWorktreeSpacesEnabled }
-
-    let canonicalRepositoryRoot = try canonicalPathForTest(repositoryRoot)
-    let canonicalWorktreeRoot = try canonicalPathForTest(worktreeRoot)
-    let repository = RepositoryWorkspace(projectRoot: canonicalRepositoryRoot)
-    await repository.refresh()
-    _ = repository.activate(worktreeRoot: canonicalRepositoryRoot, chromeState: nil)
-
-    let workspace = repository.activeWorkspace
-    let otherWorkspace = try #require(
-        repository.prepareWorkspace(worktreeRoot: canonicalWorktreeRoot)
-    )
-    let otherSession = otherWorkspace.addSession(title: "Keep Me")
-    let chromeState = ProjectWindowChromeState()
-    let noteStore = ProjectNoteStore(
-        projectRoot: canonicalRepositoryRoot,
-        storageDirectory: storageDirectory.appendingPathComponent("notes", isDirectory: true)
-    )
-    let todoStore = ProjectTodoStore(
-        projectRoot: canonicalRepositoryRoot,
-        storageDirectory: storageDirectory.appendingPathComponent("todos", isDirectory: true)
-    )
-    let window = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.orderFrontRegardless()
-
-    let coordinator = AppShortcutMonitor.Coordinator(
-        repository: repository,
-        workspace: workspace,
-        chromeState: chromeState,
-        noteStore: noteStore,
-        todoStore: todoStore,
-        projectRoot: canonicalRepositoryRoot,
-        visibleCommandNames: [],
-        visibleCommands: [],
-        projectFeatures: ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
-        openSettings: {}
-    )
-    coordinator.window = window
-
-    defer {
-        _ = coordinator
-        repository.closeAllSessions()
-        window.close()
-    }
-
-    #expect(!SessionCloseCoordinator.shouldCloseWindow(
-        for: workspace,
-        repository: repository
-    ))
-    coordinator.closeSelectedSessionOrWindow()
-    // A native shell that has not shown its prompt yet counts as busy, so
-    // its close may ask first: answered Close, the window stays.
-    if let request = chromeState.pendingTabClose {
-        #expect(request.closingWindow == nil)
-        SessionCloseCoordinator.answerTabClose(.close, to: request, chromeState: chromeState)
-    }
-
-    #expect(workspace.sessions.isEmpty)
-    #expect(otherWorkspace.sessions.map(\.id) == [otherSession.id])
-    #expect(window.isVisible)
 }
 
 @Test func commandAutoRestartPolicyEscalatesDelaysAndResetsOnHealthyRuns() {
@@ -10109,58 +8455,90 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     let settings = AgentSettings(defaults: defaults)
     settings.addProject(path: directory.path)
 
-    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: false))
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(todosEnabled: false))
 
-    try CherryProjectFile.writeFeatureSettings(.init(notesEnabled: true, todosEnabled: false), projectRoot: directory.path)
-    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: true, todosEnabled: false))
+    try CherryProjectFile.writeFeatureSettings(.init(todosEnabled: true), projectRoot: directory.path)
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(todosEnabled: true))
 
-    try settings.setProjectFeatures(.init(notesEnabled: false, todosEnabled: true), for: directory.path, storage: .local)
-    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: true))
-    #expect(AgentSettings(defaults: defaults).projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: true))
+    try settings.setProjectFeatures(.init(todosEnabled: false), for: directory.path, storage: .local)
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(todosEnabled: false))
+    #expect(AgentSettings(defaults: defaults).projectFeatures(for: directory.path) == ProjectFeatureSettings(todosEnabled: false))
 
     settings.clearLocalProjectFeatureOverrides(for: directory.path)
-    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(notesEnabled: true, todosEnabled: false))
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(todosEnabled: true))
+}
+
+/// Local feature settings saved before notes were removed name
+/// `notesEnabled` too: they still load, and one that named only notes is
+/// no override.
+@MainActor
+@Test func projectFeatureOverridesSavedBeforeNotesWereRemovedStillLoad() async throws {
+    let defaultsName = "CherryTests.ProjectFeaturesBeforeNotes.\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: defaultsName))
+    defer {
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let notesOnly = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: notesOnly, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+        try? FileManager.default.removeItem(at: notesOnly)
+    }
+
+    let saved: [String: [String: Bool]] = [
+        directory.path: ["notesEnabled": true, "todosEnabled": true],
+        notesOnly.path: ["notesEnabled": true],
+    ]
+    defaults.set(try JSONEncoder().encode(saved), forKey: "features.byProject")
+
+    let settings = AgentSettings(defaults: defaults)
+    #expect(settings.projectFeatures(for: directory.path) == ProjectFeatureSettings(todosEnabled: true))
+    #expect(!settings.projectFeatureOverrides(for: directory.path).isEmpty)
+    #expect(settings.projectFeatures(for: notesOnly.path) == ProjectFeatureSettings(todosEnabled: false))
+    #expect(settings.projectFeatureOverrides(for: notesOnly.path).isEmpty)
 }
 
 @MainActor
-@Test func worktreesShareLocalSettingsButLoadCommandsFromTheirActiveCheckout() async throws {
-    let defaultsName = "CherryTests.WorktreeSettings.\(UUID().uuidString)"
+@Test func aProjectsResolvedFolderUsesTheProjectsSettings() async throws {
+    // A project added through a link: its tabs name the folder with the link
+    // resolved (`RepositoryWorkspace.workspaceRoot`), which uses the
+    // project's local commands as well as its cherry.toml.
+    let defaultsName = "CherryTests.ProjectFolderSettings.\(UUID().uuidString)"
     let defaults = try #require(UserDefaults(suiteName: defaultsName))
     defer { defaults.removePersistentDomain(forName: defaultsName) }
 
     let container = FileManager.default.temporaryDirectory
-        .appendingPathComponent("CherryWorktreeSettings-\(UUID().uuidString)", isDirectory: true)
-    let repositoryRoot = container.appendingPathComponent("main", isDirectory: true)
-    let worktreeRoot = container.appendingPathComponent("feature", isDirectory: true)
-    try FileManager.default.createDirectory(at: repositoryRoot, withIntermediateDirectories: true)
-    try FileManager.default.createDirectory(at: worktreeRoot, withIntermediateDirectories: true)
+        .appendingPathComponent("CherryProjectFolderSettings-\(UUID().uuidString)", isDirectory: true)
+    let target = container.appendingPathComponent("target", isDirectory: true)
+    let link = container.appendingPathComponent("link", isDirectory: true)
+    try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+    try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
     defer { try? FileManager.default.removeItem(at: container) }
+    let folder = try canonicalPathForTest(link)
 
     let settings = AgentSettings(defaults: defaults)
-    _ = settings.addProject(path: repositoryRoot.path)
-    settings.registerWorktreeRoots(
-        [repositoryRoot.path, worktreeRoot.path],
-        repositoryRoot: repositoryRoot.path
-    )
+    let project = try #require(settings.addProject(path: link.path))
+    settings.registerProjectFolder(folder, projectRoot: link.path)
 
     try CherryProjectFile.upsertCommand(
-        ProjectCommandDefinition(name: "Main Config", command: "main-server"),
-        projectRoot: repositoryRoot.path
-    )
-    try CherryProjectFile.upsertCommand(
-        ProjectCommandDefinition(name: "Feature Config", command: "feature-server"),
-        projectRoot: worktreeRoot.path
+        ProjectCommandDefinition(name: "Config", command: "server"),
+        projectRoot: target.path
     )
     try settings.upsertCommand(
         ProjectCommandDefinition(name: "Local Tool", command: "local-tool"),
-        for: worktreeRoot.path,
+        for: folder,
         storage: .local
     )
 
-    #expect(settings.projectCommands(for: repositoryRoot.path).map(\.name).sorted() == ["Local Tool", "Main Config"])
-    #expect(settings.projectCommands(for: worktreeRoot.path).map(\.name).sorted() == ["Feature Config", "Local Tool"])
-    #expect(settings.commandStorage(named: "Local Tool", for: repositoryRoot.path) == .local)
-    #expect(settings.selectedProject(for: worktreeRoot.path)?.root == repositoryRoot.path)
+    #expect(settings.projectCommands(for: link.path).map(\.name).sorted() == ["Config", "Local Tool"])
+    #expect(settings.projectCommands(for: folder).map(\.name).sorted() == ["Config", "Local Tool"])
+    #expect(settings.commandStorage(named: "Local Tool", for: link.path) == .local)
+    #expect(settings.selectedProject(for: folder)?.root == project.root)
 }
 
 @MainActor
@@ -10172,21 +8550,52 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    try CherryProjectFile.writeFeatureSettings(.init(notesEnabled: true, todosEnabled: false), projectRoot: directory.path)
+    try CherryProjectFile.writeFeatureSettings(.init(todosEnabled: false), projectRoot: directory.path)
     try CherryProjectFile.upsertCommand(
         ProjectCommandDefinition(name: "Web", command: "npm", arguments: "run dev"),
         projectRoot: directory.path
     )
-    try CherryProjectFile.writeFeatureSettings(.init(notesEnabled: false, todosEnabled: true), projectRoot: directory.path)
+    try CherryProjectFile.writeFeatureSettings(.init(todosEnabled: true), projectRoot: directory.path)
 
     let contents = try String(contentsOf: CherryProjectFile.fileURL(projectRoot: directory.path), encoding: .utf8)
     #expect(contents.contains("[features]"))
-    #expect(contents.contains("notes = false"))
     #expect(contents.contains("todos = true"))
+    #expect(!contents.contains("todos = false"))
+    #expect(!contents.contains("notes"))
     #expect(contents.contains("# BEGIN CHERRY COMMANDS"))
     #expect(contents.contains("[[commands]]"))
-    #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(notesEnabled: false, todosEnabled: true))
+    #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(todosEnabled: true))
     #expect(CherryProjectFile.loadCommands(projectRoot: directory.path).map(\.name) == ["Web"])
+}
+
+/// A cherry.toml's `[features]` keeps what Cherry no longer reads (a
+/// `notes = true` that builds from before notes were removed read, a
+/// comment) when Cherry saves its to-dos setting there.
+@MainActor
+@Test func cherryTomlFeatureSettingsKeepTheSectionsOtherLines() async throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: directory)
+    }
+    let url = CherryProjectFile.fileURL(projectRoot: directory.path)
+    try "[features]\n# shared with the team\nnotes = true\ntodos = false\n\n[appearance]\ncolor = \"blue\"\n"
+        .write(to: url, atomically: true, encoding: .utf8)
+
+    try CherryProjectFile.writeFeatureSettings(.init(todosEnabled: true), projectRoot: directory.path)
+
+    let contents = try String(contentsOf: url, encoding: .utf8)
+    #expect(contents.hasPrefix("[features]\n# shared with the team\nnotes = true\ntodos = true\n"), Comment(rawValue: contents))
+    #expect(!contents.contains("todos = false"), Comment(rawValue: contents))
+    #expect(contents.contains("[appearance]\ncolor = \"blue\""), Comment(rawValue: contents))
+    #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(todosEnabled: true))
+    #expect(CherryProjectFile.loadAppearanceSettings(projectRoot: directory.path) == ProjectAppearanceSettings(color: .blue))
+
+    // A section without the line gets it.
+    try "[features]\nnotes = true\n".write(to: url, atomically: true, encoding: .utf8)
+    try CherryProjectFile.writeFeatureSettings(.init(todosEnabled: false), projectRoot: directory.path)
+    #expect(try String(contentsOf: url, encoding: .utf8) == "[features]\nnotes = true\ntodos = false\n")
 }
 
 @MainActor
@@ -10233,7 +8642,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    try CherryProjectFile.writeFeatureSettings(.init(notesEnabled: true, todosEnabled: false), projectRoot: directory.path)
+    try CherryProjectFile.writeFeatureSettings(.init(todosEnabled: true), projectRoot: directory.path)
     try CherryProjectFile.upsertCommand(
         ProjectCommandDefinition(name: "Web", command: "npm", arguments: "run dev"),
         projectRoot: directory.path
@@ -10245,7 +8654,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     #expect(contents.contains("[appearance]"))
     #expect(contents.contains("color = \"teal\""))
     #expect(contents.contains("# BEGIN CHERRY COMMANDS"))
-    #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(notesEnabled: true, todosEnabled: false))
+    #expect(CherryProjectFile.loadFeatureSettings(projectRoot: directory.path) == ProjectFeatureSettings(todosEnabled: true))
     #expect(CherryProjectFile.loadAppearanceSettings(projectRoot: directory.path) == ProjectAppearanceSettings(color: .teal))
     #expect(CherryProjectFile.loadCommands(projectRoot: directory.path).map(\.name) == ["Web"])
 
@@ -10350,14 +8759,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     #expect(reloadedSettings.lastOpenedProjectRoot == secondDirectory.path)
     #expect(reloadedSettings.projectRoot(for: nil) == secondDirectory.path)
     #expect(defaults.string(forKey: "projects.lastOpenedRoot") == secondDirectory.path)
-    #expect(reloadedSettings.projectRootForWindow(
-        requestedRoot: firstDirectory.path,
-        onboardedRoot: nil
-    ) == firstDirectory.path)
-    #expect(reloadedSettings.projectRootForWindow(
-        requestedRoot: nil,
-        onboardedRoot: nil
-    ) == secondDirectory.path)
+    #expect(reloadedSettings.projectRoot(for: firstDirectory.path) == firstDirectory.path)
 
     reloadedSettings.removeProject(firstProject)
     #expect(reloadedSettings.projectRoot(for: nil) == secondDirectory.path)
@@ -10437,7 +8839,7 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
         "\(parent.id.uuidString):0"
     ])
 
-    workspace.closeAgentPromotingChildren(parent)
+    workspace.close(parent)
 
     #expect(!workspace.sessions.contains { $0.id == parent.id })
     #expect(child.parentAgentID == nil)
@@ -10527,39 +8929,6 @@ private func claudeAlternateScreenFrame(rows: [String]) -> Data {
     #expect(workspace.sessions.isEmpty)
     #expect(workspace.selectedSessionID == nil)
     #expect(!agent.isRunning)
-}
-
-@MainActor
-@Test func workspaceInstallsPreviewAgentTreeWithoutLaunchingAgents() async throws {
-    let directory = FileManager.default.temporaryDirectory
-        .appendingPathComponent(UUID().uuidString, isDirectory: true)
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    defer {
-        try? FileManager.default.removeItem(at: directory)
-    }
-
-    let workspace = TerminalWorkspace(projectRoot: directory.path, launchBackend: .hostManaged)
-    defer {
-        workspace.sessions.forEach { $0.stop() }
-    }
-
-    let previewSessions = workspace.installPreviewAgentTree()
-    let parent = try #require(previewSessions.first)
-
-    #expect(previewSessions.count == 20)
-    #expect(workspace.agentSessions.map(\.id) == previewSessions.map(\.id))
-    #expect(workspace.rootAgentSessions.map(\.id) == [parent.id, previewSessions[13].id, previewSessions[19].id])
-    #expect(workspace.childAgentSessions(of: parent).map(\.id) == previewSessions[1...12].map(\.id))
-    #expect(workspace.childAgentSessions(of: previewSessions[13]).map(\.id) == previewSessions[14...18].map(\.id))
-    #expect(workspace.descendantAgentSessions(of: parent).map(\.id) == previewSessions[1...12].map(\.id))
-    #expect(workspace.visibleAgentTreeItems().allSatisfy { $0.depth <= 1 })
-    #expect(previewSessions.contains { $0.sidebarDetail.isEmpty })
-    #expect(previewSessions.allSatisfy { session in
-        session.kind == .agent &&
-        session.childProcessID == nil &&
-        session.state == .exited(0)
-    })
-    #expect(workspace.installPreviewAgentTree().isEmpty)
 }
 
 @MainActor
@@ -10870,10 +9239,8 @@ final class ControlServerHarness {
     let defaults: UserDefaults
     let settings: AgentSettings
     let projectRoot: URL
-    let notesRoot: URL
     let todosRoot: URL
     let workspace: TerminalWorkspace
-    let noteStore: ProjectNoteStore
     let todoStore: ProjectTodoStore
     let chromeState: ProjectWindowChromeState
     let socketURL: URL
@@ -10886,8 +9253,6 @@ final class ControlServerHarness {
         projectRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: projectRoot, withIntermediateDirectories: true)
-        notesRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("CherryControlNotes-\(UUID().uuidString)", isDirectory: true)
         todosRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("CherryControlTodos-\(UUID().uuidString)", isDirectory: true)
 
@@ -10901,18 +9266,16 @@ final class ControlServerHarness {
         _ = settings.addProject(path: projectRoot.path)
         if enableProjectFeatures {
             try settings.setProjectFeatures(
-                ProjectFeatureSettings(notesEnabled: true, todosEnabled: true),
+                ProjectFeatureSettings(todosEnabled: true),
                 for: projectRoot.path,
                 storage: .local
             )
         }
         workspace = TerminalWorkspace(projectRoot: projectRoot.path, launchBackend: .hostManaged)
-        noteStore = ProjectNoteStore(projectRoot: projectRoot.path, storageDirectory: notesRoot)
         todoStore = ProjectTodoStore(projectRoot: projectRoot.path, storageDirectory: todosRoot)
         chromeState = ProjectWindowChromeState()
         server = CherryControlServer(
             workspace: workspace,
-            noteStore: noteStore,
             todoStore: todoStore,
             chromeState: chromeState,
             socketURL: socketURL,
@@ -10930,7 +9293,6 @@ final class ControlServerHarness {
         workspace.sessions.forEach { $0.stop() }
         defaults.removePersistentDomain(forName: defaultsName)
         try? FileManager.default.removeItem(at: projectRoot)
-        try? FileManager.default.removeItem(at: notesRoot)
         try? FileManager.default.removeItem(at: todosRoot)
         try? FileManager.default.removeItem(at: socketURL.deletingLastPathComponent())
     }
@@ -11272,151 +9634,22 @@ private func serviceRecord(
     #expect(visibleLines.dropFirst(promptIndex + 2).allSatisfy { $0.isEmpty })
 }
 
-@Test func nerdFontFamiliesPreferMonoFonts() async throws {
-    let families = [
-        "Example Nerd Font",
-        "JetBrainsMono Nerd Font Mono",
-        "Apple Symbols",
-        "CaskaydiaCove Nerd Font Mono"
-    ]
-
-    #expect(TerminalFontPalette.preferredNerdFontFamilies(from: families) == [
-        "JetBrainsMono Nerd Font Mono",
-        "CaskaydiaCove Nerd Font Mono",
-        "Example Nerd Font"
-    ])
-}
-
-@Test func alternateScreenScrollWheelProducesCursorKeys() async throws {
-    var remainder: CGFloat = 0
-
-    let sequence = TerminalInputEncoder.alternateScreenScrollSequence(
-        deltaY: 20,
-        hasPreciseScrollingDeltas: true,
-        lineHeight: 20,
-        remainder: &remainder
-    )
-
-    #expect(sequence == Data("\u{1B}[A\u{1B}[A\u{1B}[A".utf8))
-}
-
-@Test func preciseScrollAccumulatesByPartialTerminalCells() async throws {
-    var remainder: CGFloat = 0
-
-    let firstSequence = TerminalInputEncoder.alternateScreenScrollSequence(
-        deltaY: 10,
-        hasPreciseScrollingDeltas: true,
-        lineHeight: 20,
-        remainder: &remainder
-    )
-    let secondSequence = TerminalInputEncoder.alternateScreenScrollSequence(
-        deltaY: 10,
-        hasPreciseScrollingDeltas: true,
-        lineHeight: 20,
-        remainder: &remainder
-    )
-
-    #expect(firstSequence == Data("\u{1B}[A".utf8))
-    #expect(secondSequence == Data("\u{1B}[A\u{1B}[A".utf8))
-}
-
-@Test func sgrMouseWheelProducesTerminalMouseEvents() async throws {
-    var remainder: CGFloat = 0
-
-    let sequence = TerminalInputEncoder.mouseWheelSequence(
-        deltaY: -20,
-        hasPreciseScrollingDeltas: true,
-        lineHeight: 20,
-        column: 5,
-        row: 3,
-        mouseState: TerminalMouseState(trackingMode: .normal, usesSGREncoding: true),
-        remainder: &remainder
-    )
-
-    #expect(sequence == Data("\u{1B}[<65;5;3M\u{1B}[<65;5;3M\u{1B}[<65;5;3M".utf8))
-}
-
-@Test func terminalMousePositionUsesVisibleViewportCoordinates() async throws {
-    let position = TerminalInputEncoder.mousePosition(
-        documentLocation: NSPoint(x: 22 + 4.5 * 8, y: 900 + 24 + 2.5 * 20),
-        visibleOrigin: NSPoint(x: 0, y: 900),
-        viewportSize: TerminalViewportSize(columns: 80, rows: 24),
-        sideInset: 22,
-        topInset: 24,
-        cellWidth: 8,
-        lineHeight: 20
-    )
-
-    #expect(position.column == 5)
-    #expect(position.row == 3)
-}
-
-@Test func viewportScrollOffsetClampsAtDocumentEdges() async throws {
-    let contentHeight: CGFloat = 1_000
-    let viewportHeight: CGFloat = 400
-
-    #expect(TerminalInputEncoder.clampedViewportOffset(
-        currentOffset: 4,
-        deltaY: 20,
-        hasPreciseScrollingDeltas: true,
-        lineHeight: 20,
-        documentHeight: contentHeight,
-        viewportHeight: viewportHeight
-    ) == 0)
-    #expect(TerminalInputEncoder.clampedViewportOffset(
-        currentOffset: 590,
-        deltaY: -20,
-        hasPreciseScrollingDeltas: true,
-        lineHeight: 20,
-        documentHeight: contentHeight,
-        viewportHeight: viewportHeight
-    ) == 600)
-}
-
 @Test func terminalEnterSendsCarriageReturn() async throws {
-    let enter = TerminalInputEncoder.commandSequence(for: #selector(NSResponder.insertNewline(_:)))
-
-    #expect(enter == Data("\r".utf8))
-    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 0) == Data("\r".utf8))
-    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 7) == Data("\r".utf8))
-    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 8) == Data("\r".utf8))
-    #expect(TerminalInputEncoder.enterSequence(keyboardProtocolFlags: 9) == Data("\r".utf8))
+    #expect(TerminalInputEncoder.enterData == Data("\r".utf8))
 }
 
 @Test func terminalTextDataEncodesLineEndingsAsEnter() async throws {
-    #expect(TerminalInputEncoder.terminalTextData(
-        "one\ntwo\r\nthree\rfour",
-        keyboardProtocolFlags: 0
-    ) == Data("one\rtwo\rthree\rfour".utf8))
-
-    #expect(TerminalInputEncoder.terminalTextData(
-        "disambiguate\n",
-        keyboardProtocolFlags: 7
-    ) == Data("disambiguate\r".utf8))
-
-    #expect(TerminalInputEncoder.terminalTextData(
-        "all-keys\n",
-        keyboardProtocolFlags: 8
-    ) == Data("all-keys\r".utf8))
+    #expect(TerminalInputEncoder.terminalTextData("one\ntwo\r\nthree\rfour") == Data("one\rtwo\rthree\rfour".utf8))
+    #expect(TerminalInputEncoder.terminalTextData("line\n") == Data("line\r".utf8))
+    #expect(TerminalInputEncoder.terminalTextData("no line ending") == Data("no line ending".utf8))
 }
 
 @Test func terminalArrowKeysFollowApplicationCursorMode() async throws {
-    let normalUp = TerminalInputEncoder.commandSequence(for: #selector(NSResponder.moveUp(_:)))
-    let applicationUp = TerminalInputEncoder.commandSequence(
-        for: #selector(NSResponder.moveUp(_:)),
-        usesApplicationCursorKeys: true
-    )
-
-    #expect(normalUp == Data("\u{1B}[A".utf8))
-    #expect(applicationUp == Data("\u{1B}OA".utf8))
+    #expect(TerminalInputEncoder.cursorKeySequence(.up, usesApplicationCursorKeys: false) == "\u{1B}[A")
+    #expect(TerminalInputEncoder.cursorKeySequence(.up, usesApplicationCursorKeys: true) == "\u{1B}OA")
     #expect(TerminalInputEncoder.cursorKeySequence(.down, usesApplicationCursorKeys: true) == "\u{1B}OB")
     #expect(TerminalInputEncoder.cursorKeySequence(.right, usesApplicationCursorKeys: true) == "\u{1B}OC")
     #expect(TerminalInputEncoder.cursorKeySequence(.left, usesApplicationCursorKeys: true) == "\u{1B}OD")
-}
-
-@Test func terminalInsertedTextIgnoresAppKitFunctionKeyCharacters() async throws {
-    #expect(TerminalInputEncoder.insertedTextData(String(UnicodeScalar(NSUpArrowFunctionKey)!)) == nil)
-    #expect(TerminalInputEncoder.insertedTextData("a") == Data("a".utf8))
 }
 
 @Test func appKitArrowFastPathUsesApplicationCursorMode() async throws {
@@ -11502,9 +9735,6 @@ private func serviceRecord(
         keyCode: 51,
         modifiers: [.option, .shift]
     ) == nil)
-    #expect(TerminalInputEncoder.commandSequence(
-        for: #selector(NSResponder.deleteWordBackward(_:))
-    ) == Data([0x1B, 0x7F]))
 }
 
 @Test func appKitOptionDigitTextUsesAppKitCharacters() async throws {
@@ -11512,24 +9742,21 @@ private func serviceRecord(
         keyCode: 20,
         characters: "#",
         charactersIgnoringModifiers: "3",
-        modifiers: .option,
-        keyboardProtocolFlags: 0
+        modifiers: .option
     ) == Data("#".utf8))
 
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
         keyCode: 19,
         characters: "€",
         charactersIgnoringModifiers: "2",
-        modifiers: [.option, .shift],
-        keyboardProtocolFlags: 0
+        modifiers: [.option, .shift]
     ) == Data("€".utf8))
 
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
         keyCode: 20,
         characters: "#",
         charactersIgnoringModifiers: "£",
-        modifiers: .option,
-        keyboardProtocolFlags: 0
+        modifiers: .option
     ) == Data("#".utf8))
 }
 
@@ -11538,15 +9765,13 @@ private func serviceRecord(
         keyCode: 18,
         characters: nil,
         charactersIgnoringModifiers: nil,
-        modifiers: .option,
-        keyboardProtocolFlags: 0
+        modifiers: .option
     ))
     let optionTwo = try #require(TerminalInputEncoder.appKitOptionDigitTextData(
         keyCode: 19,
         characters: "",
         charactersIgnoringModifiers: nil,
-        modifiers: .option,
-        keyboardProtocolFlags: 0
+        modifiers: .option
     ))
 
     #expect(!optionOne.isEmpty)
@@ -11558,24 +9783,21 @@ private func serviceRecord(
         keyCode: 0,
         characters: "å",
         charactersIgnoringModifiers: "a",
-        modifiers: .option,
-        keyboardProtocolFlags: 0
+        modifiers: .option
     ) == nil)
 
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
         keyCode: 20,
         characters: "#",
         charactersIgnoringModifiers: "3",
-        modifiers: [.option, .command],
-        keyboardProtocolFlags: 0
+        modifiers: [.option, .command]
     ) == nil)
 
     #expect(TerminalInputEncoder.appKitOptionDigitTextData(
         keyCode: 20,
         characters: String(UnicodeScalar(NSUpArrowFunctionKey)!),
         charactersIgnoringModifiers: "3",
-        modifiers: .option,
-        keyboardProtocolFlags: 0
+        modifiers: .option
     ) == nil)
 }
 
@@ -11684,10 +9906,7 @@ private func serviceRecord(
     pasteboard.clearContents()
     pasteboard.setString("alpha\nbeta", forType: .string)
 
-    let data = try #require(TerminalPasteboardContent.pasteData(
-        from: pasteboard,
-        bracketedPasteMode: true
-    ))
+    let data = try #require(TerminalPasteboardContent.pasteData(from: pasteboard, bracketing: { _ in true }))
 
     #expect(String(decoding: data, as: UTF8.self) == "\u{1B}[200~alpha\nbeta\u{1B}[201~")
 }
@@ -11701,7 +9920,7 @@ private func serviceRecord(
     #expect(TerminalPasteboardContent.urlPasteText(from: pasteboard) == "/tmp/cherry\\ paste/image\\'s\\ test.png")
 }
 
-@Test func pasteboardImageContentsAreSavedAndPastedAsPath() async throws {
+@Test func pasteboardImageContentsAreSavedNamedAfterTheirTimeAndID() async throws {
     let pasteboard = NSPasteboard(name: .init("CherryTests.ImagePaste.\(UUID().uuidString)"))
     pasteboard.clearContents()
     let pngData = try #require(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="))
@@ -11714,7 +9933,7 @@ private func serviceRecord(
     }
     let imageID = try #require(UUID(uuidString: "ABCDEF12-0000-0000-0000-000000000123"))
     let now = Date()
-    let data = try #require(TerminalPasteboardContent.nonTextPasteData(
+    let url = try #require(TerminalPasteboardContent.pastedImageFileURL(
         from: pasteboard,
         imageDirectory: directory,
         imageID: imageID,
@@ -11724,30 +9943,8 @@ private func serviceRecord(
     let path = directory.appendingPathComponent(PastedImageStore.fileName(at: now, id: imageID)).path
     #expect(path.hasSuffix("-abcdef12.png"))
 
-    #expect(String(decoding: data, as: UTF8.self) == PastedImage.quoted(path))
+    #expect(url.path == path)
     #expect(FileManager.default.fileExists(atPath: path))
-}
-
-@Test func selectedTextSpansRows() async throws {
-    var buffer = LiveTerminalOutputBuffer(maxScrollback: nil)
-    buffer.ingest(Data("alpha\r\nbravo\r\ncharlie".utf8))
-    let selection = TerminalSelectionRange(
-        anchor: TerminalGridPoint(row: 0, column: 2),
-        extent: TerminalGridPoint(row: 2, column: 4)
-    )
-
-    #expect(buffer.selectedText(in: selection) == "pha\nbravo\nchar")
-}
-
-@Test func selectedTextHandlesReverseSelection() async throws {
-    var buffer = LiveTerminalOutputBuffer(maxScrollback: nil)
-    buffer.ingest(Data("alpha\r\nbravo".utf8))
-    let selection = TerminalSelectionRange(
-        anchor: TerminalGridPoint(row: 1, column: 3),
-        extent: TerminalGridPoint(row: 0, column: 1)
-    )
-
-    #expect(buffer.selectedText(in: selection) == "lpha\nbra")
 }
 
 @Test func ghosttyBridgeSkipsUnchangedMountedGridResize() async throws {
@@ -11771,90 +9968,6 @@ private func serviceRecord(
 }
 
 @MainActor
-@Test func markdownInlineCodeChipUsesFontMetricsInsteadOfLineFragmentHeight() {
-    let text = "- `frontend/src/hooks/useAppLogs.ts`"
-    let textStorage = NSTextStorage(string: text)
-    let layoutManager = MarkdownLayoutManager()
-    let textContainer = NSTextContainer(containerSize: NSSize(width: 716, height: 1_000))
-    layoutManager.addTextContainer(textContainer)
-    textStorage.addLayoutManager(layoutManager)
-
-    let paragraph = NSMutableParagraphStyle()
-    paragraph.lineHeightMultiple = 1.4
-    paragraph.paragraphSpacing = 7
-    paragraph.firstLineHeadIndent = NoteEditorStyle.document.textGutter
-    paragraph.headIndent = NoteEditorStyle.document.textGutter
-
-    let bodyFont = NSFont.systemFont(ofSize: 15)
-    let codeFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-    textStorage.setAttributes(
-        [.font: bodyFont, .paragraphStyle: paragraph],
-        range: NSRange(location: 0, length: textStorage.length)
-    )
-    let codeRange = (text as NSString).range(of: "`frontend/src/hooks/useAppLogs.ts`")
-    textStorage.addAttribute(.font, value: codeFont, range: codeRange)
-
-    layoutManager.ensureLayout(for: textContainer)
-    let glyphRange = layoutManager.glyphRange(forCharacterRange: codeRange, actualCharacterRange: nil)
-    let glyphBounds = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-    guard let chipRect = layoutManager.inlineCodeChipRect(
-        forGlyphBounds: glyphBounds,
-        glyphIndex: glyphRange.location
-    ) else {
-        Issue.record("Expected inline-code chip geometry")
-        return
-    }
-
-    let lineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphRange.location, effectiveRange: nil)
-    let baselineY = lineRect.minY + layoutManager.location(forGlyphAt: glyphRange.location).y
-
-    #expect(chipRect.minY > glyphBounds.minY)
-    #expect(chipRect.height < glyphBounds.height)
-    #expect(abs((baselineY - chipRect.minY) - (codeFont.ascender + 1)) < 0.001)
-    #expect(abs((chipRect.maxY - baselineY) - (-codeFont.descender + 1)) < 0.001)
-    #expect(abs(chipRect.minX - (glyphBounds.minX - 2)) < 0.001)
-    #expect(abs(chipRect.maxX - (glyphBounds.maxX + 2)) < 0.001)
-}
-
-@MainActor
-@Test func markdownCodeBlockUsesAvailableDocumentWidth() {
-    let code = "bootstrap: userId ? { data }"
-    let markdown = "```ts\n\(code)\n```"
-    let textStorage = NSTextStorage()
-    let layoutManager = NSLayoutManager()
-    let textContainer = NSTextContainer(containerSize: NSSize(width: 716, height: 1_000))
-    layoutManager.addTextContainer(textContainer)
-    textStorage.addLayoutManager(layoutManager)
-    let textView = NSTextView(
-        frame: NSRect(x: 0, y: 0, width: 716, height: 1_000),
-        textContainer: textContainer
-    )
-
-    let coordinator = MarkdownSourceEditor.Coordinator(
-        text: .constant(""),
-        themeColors: nil,
-        bodyFontSize: 15,
-        useMonospacedFont: false,
-        style: .document
-    )
-    textView.string = markdown
-    coordinator.applyHighlighting(to: textView)
-
-    layoutManager.ensureLayout(for: textContainer)
-    let codeRange = (markdown as NSString).range(of: code)
-    let glyphRange = layoutManager.glyphRange(forCharacterRange: codeRange, actualCharacterRange: nil)
-    var lineFragmentCount = 0
-    var lineFragmentWidth: CGFloat = 0
-    layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { rect, _, _, _, _ in
-        lineFragmentCount += 1
-        lineFragmentWidth = rect.width
-    }
-
-    #expect(lineFragmentCount == 1)
-    #expect(lineFragmentWidth > 600)
-}
-
-@MainActor
 @Test func markdownFencedCodeKeepsMarkdownLikeLinesInsideOneBlock() {
     let markdown = """
     ```sh
@@ -11869,7 +9982,7 @@ private func serviceRecord(
     # Actual heading
     """
     let textStorage = NSTextStorage()
-    let layoutManager = MarkdownLayoutManager()
+    let layoutManager = NSLayoutManager()
     let textContainer = NSTextContainer(containerSize: NSSize(width: 716, height: 1_000))
     layoutManager.addTextContainer(textContainer)
     textStorage.addLayoutManager(layoutManager)
@@ -11877,45 +9990,31 @@ private func serviceRecord(
         frame: NSRect(x: 0, y: 0, width: 716, height: 1_000),
         textContainer: textContainer
     )
-    let coordinator = MarkdownSourceEditor.Coordinator(
-        text: .constant(""),
-        themeColors: nil,
-        bodyFontSize: 15,
-        useMonospacedFont: false,
-        style: .document
-    )
+    let coordinator = MarkdownSourceEditor.Coordinator(text: .constant(""), themeColors: nil)
     textView.string = markdown
     coordinator.applyHighlighting(to: textView)
 
     let nsMarkdown = markdown as NSString
+    let codeFontName = NSFont.monospacedSystemFont(ofSize: 15, weight: .regular).fontName
+    func font(at text: String) -> NSFont? {
+        textStorage.attribute(.font, at: nsMarkdown.range(of: text).location, effectiveRange: nil) as? NSFont
+    }
     for line in [
         "# This is a shell comment, not a heading.",
         "> this is code, not a quote",
         "1. this is code, not a list",
+        "`literal backticks`",
     ] {
-        let range = nsMarkdown.range(of: line)
-        let paragraph = textStorage.attribute(
-            .paragraphStyle,
-            at: range.location,
-            effectiveRange: nil
-        ) as? NSParagraphStyle
-        #expect(paragraph?.textBlocks.isEmpty == false)
+        #expect(font(at: line)?.fontName == codeFontName, Comment(rawValue: line))
+        #expect(font(at: line)?.pointSize == 15, Comment(rawValue: line))
     }
-
-    let inlineCodeRange = nsMarkdown.range(of: "`literal backticks`")
     #expect(textStorage.attribute(
-        MarkdownLayoutManager.chipAttribute,
-        at: inlineCodeRange.location,
+        .obliqueness,
+        at: nsMarkdown.range(of: "> this is code, not a quote").location,
         effectiveRange: nil
     ) == nil)
 
-    let headingRange = nsMarkdown.range(of: "# Actual heading")
-    let headingParagraph = textStorage.attribute(
-        .paragraphStyle,
-        at: headingRange.location,
-        effectiveRange: nil
-    ) as? NSParagraphStyle
-    #expect(headingParagraph?.textBlocks.isEmpty == true)
+    #expect((font(at: "# Actual heading")?.pointSize ?? 0) > 15)
 }
 
 @MainActor
@@ -11928,7 +10027,7 @@ private func serviceRecord(
     ```
     """
     let textStorage = NSTextStorage()
-    let layoutManager = MarkdownLayoutManager()
+    let layoutManager = NSLayoutManager()
     let textContainer = NSTextContainer(containerSize: NSSize(width: 716, height: 1_000))
     layoutManager.addTextContainer(textContainer)
     textStorage.addLayoutManager(layoutManager)
@@ -11936,13 +10035,7 @@ private func serviceRecord(
         frame: NSRect(x: 0, y: 0, width: 716, height: 1_000),
         textContainer: textContainer
     )
-    let coordinator = MarkdownSourceEditor.Coordinator(
-        text: .constant(""),
-        themeColors: nil,
-        bodyFontSize: 15,
-        useMonospacedFont: false,
-        style: .document
-    )
+    let coordinator = MarkdownSourceEditor.Coordinator(text: .constant(""), themeColors: nil)
     textView.string = markdown
     coordinator.applyHighlighting(to: textView)
 

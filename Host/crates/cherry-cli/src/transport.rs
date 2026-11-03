@@ -2,7 +2,7 @@
 //! `cherry-host gateway` through the system ssh.
 use crate::{
     stderr_relay::StderrRelay,
-    sys::{interrupted, poll, pollfd, read_some, set_nonblocking},
+    sys::{interrupted, poll, pollfd, read_some, set_nonblocking, write_some},
     timing::timing,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -467,20 +467,12 @@ impl Transport {
 
     fn write_available(&mut self) -> io::Result<()> {
         while self.pending() > 0 {
-            let bytes = &self.outgoing[self.written..];
-            let n = unsafe { libc::write(self.write_fd(), bytes.as_ptr().cast(), bytes.len()) };
-            if n > 0 {
-                self.written += n as usize;
-                self.sent_total += n as u64;
-                self.progress = Instant::now();
-                continue;
-            }
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => break,
-                _ => return Err(error),
-            }
+            let Some(n) = write_some(self.write_fd(), &self.outgoing[self.written..])? else {
+                break;
+            };
+            self.written += n;
+            self.sent_total += n as u64;
+            self.progress = Instant::now();
         }
         if self.pending() == 0 {
             self.outgoing.clear();
@@ -975,7 +967,7 @@ pub fn start_local_host_from(
         .arg(socket)
         .current_dir("/")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(if quiet {
             Stdio::piped()
         } else {
@@ -989,6 +981,7 @@ pub fn start_local_host_from(
             )
         })?;
     let mut errors = HeldOutput::new(child.stderr.take())?;
+    let mut exit = ExitPipe::new(child.stdout.take())?;
     loop {
         // Before the exit status, so nothing it printed before exiting is
         // missed; it never fills the pipe.
@@ -1011,7 +1004,62 @@ pub fn start_local_host_from(
             interrupted()?;
             bail!("timed out starting cherry-host");
         }
-        std::thread::sleep(Duration::from_millis(20));
+        exit.wait(START_LOOK.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+/// How often `start_local_host_from` looks for a signal, or the end of its
+/// time, while `cherry-host start` runs.
+const START_LOOK: Duration = Duration::from_millis(20);
+
+/// The standard output of `cherry-host start`, which prints nothing there:
+/// it ends as the child exits, so a wait for that ends at once.
+struct ExitPipe {
+    source: Option<std::process::ChildStdout>,
+    ended: Option<Instant>,
+}
+
+impl ExitPipe {
+    fn new(source: Option<std::process::ChildStdout>) -> Result<Self> {
+        if let Some(source) = &source {
+            set_nonblocking(source.as_raw_fd())?;
+        }
+        Ok(Self {
+            source,
+            ended: None,
+        })
+    }
+
+    /// Wait at most `timeout`, less when the output ends meanwhile. What
+    /// the child prints is dropped, as it was before there was a pipe.
+    fn wait(&mut self, timeout: Duration) {
+        if let Some(source) = &self.source {
+            let mut fds = [pollfd(source.as_raw_fd(), libc::POLLIN)];
+            if poll(&mut fds, timeout).is_ok() {
+                if fds[0].revents == 0 {
+                    return;
+                }
+                let mut buffer = [0u8; 4096];
+                loop {
+                    match read_some(source.as_raw_fd(), &mut buffer) {
+                        Ok(Some(n)) if n > 0 => {}
+                        Ok(None) => return,
+                        Ok(Some(_)) | Err(_) => break,
+                    }
+                }
+            }
+            // It ended (or cannot be waited on): the child exits now, and
+            // is reaped a moment later.
+            self.source = None;
+            self.ended = Some(Instant::now());
+            return;
+        }
+        let exiting = self.ended.is_some_and(|ended| ended.elapsed() < START_LOOK);
+        std::thread::sleep(if exiting {
+            Duration::from_millis(1)
+        } else {
+            timeout
+        });
     }
 }
 

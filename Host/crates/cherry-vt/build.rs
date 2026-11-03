@@ -20,15 +20,15 @@ fn main() {
     };
     assert_eq!(
         stamp("SOURCE_REVISION"),
-        "7aab0a0392369613472bd5dcfd66bef58e78c3ec",
+        "83fb95624b0439ee660c2679b43b38c8b63769cd",
         "VT archive must match Cherry's pinned C ABI; run Scripts/build-host-vt"
     );
     // The daemon parses untrusted output from every session with this
     // library, so Zig's runtime safety checks must be compiled in.
     let optimize = stamp("OPTIMIZE");
     assert!(
-        optimize == "ReleaseSafe",
-        "libghostty-vt at {} is not a ReleaseSafe build (OPTIMIZE stamp: {optimize:?}); run Scripts/build-host-vt",
+        optimize == "safe",
+        "libghostty-vt at {} is not a safe (ReleaseSafe) build (OPTIMIZE stamp: {optimize:?}); run Scripts/build-host-vt",
         prefix.display()
     );
     println!("cargo:rerun-if-env-changed=CHERRY_GHOSTTY_VT_DIR");

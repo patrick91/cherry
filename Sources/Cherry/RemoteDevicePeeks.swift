@@ -32,8 +32,6 @@ final class RemoteDevicePeeks: ObservableObject {
     private let now: @MainActor () -> Date
     let retryInterval: TimeInterval
     let answeredInterval: TimeInterval
-    /// How many looks ran, by host id (tests).
-    private(set) var peekCounts: [String: Int] = [:]
 
     /// Follows wakes and network changes (which unblock devices) once one
     /// is blocked.
@@ -69,7 +67,6 @@ final class RemoteDevicePeeks: ObservableObject {
         let host = control.host
         if let running = inFlight[host.id] { return await running.value }
         guard mayPeek(host) else { return entries[host.id]?.result }
-        peekCounts[host.id, default: 0] += 1
         let peek = peek
         let task = Task { @MainActor in await peek(control) }
         inFlight[host.id] = task
@@ -120,5 +117,20 @@ final class RemoteDevicePeeks: ObservableObject {
     func retry(_ host: HostedSessionHost) {
         blocked.remove(host.id)
         entries[host.id] = nil
+    }
+}
+
+extension HostControl {
+    /// A device's Reconnect or Retry (Settings, its bars, the picker, after
+    /// Update Session Host…): its host may be looked at again now
+    /// (`RemoteDevicePeeks.retry`), and it connects again (at once, when it
+    /// waits to).
+    func reconnectAsked() {
+        RemoteDevicePeeks.shared.retry(host)
+        if case .waitingToReconnect = state {
+            reconnectNow()
+        } else {
+            Task { _ = try? await self.connect(retryingLoginEnvironment: true) }
+        }
     }
 }

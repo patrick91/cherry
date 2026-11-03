@@ -5,42 +5,19 @@ from pathlib import Path
 import sys
 
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import perf_common  # noqa: E402
+
+
 def load_report(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def sample_summary(report):
-    summary = report.get("sample_summary") or {}
-    if summary:
-        return summary
-
-    samples = report.get("samples", [])
-    if not samples:
-        return {}
-
-    ordered = sorted(samples, key=lambda sample: sample.get("elapsed_seconds", 0.0))
-    first = ordered[0]
-    last = ordered[-1]
-    elapsed = max(0.0, float(last.get("elapsed_seconds", 0.0)) - float(first.get("elapsed_seconds", 0.0)))
-    first_rss = int(first.get("total_rss_bytes", 0))
-    last_rss = int(last.get("total_rss_bytes", 0))
-    rss_delta = last_rss - first_rss
-    rss_growth = (rss_delta / elapsed) if elapsed > 0 else 0.0
-    max_process_rss = 0
-    for sample in ordered:
-        for process in sample.get("processes", []):
-            max_process_rss = max(max_process_rss, process.get("rss_bytes", 0))
-
-    return {
-        "sample_count": len(ordered),
-        "first_total_rss_bytes": first_rss,
-        "last_total_rss_bytes": last_rss,
-        "max_total_rss_bytes": max(sample.get("total_rss_bytes", 0) for sample in ordered),
-        "rss_delta_bytes": rss_delta,
-        "rss_growth_mib_per_hour": (rss_growth * 3600) / 1_048_576,
-        "max_total_cpu_percent": max(sample.get("total_cpu_percent", 0.0) for sample in ordered),
-        "max_process_rss_bytes": max_process_rss,
-    }
+    # A report from before the soak and the Ghostty workload stored their
+    # summary has only its samples.
+    return report.get("sample_summary") or perf_common.summarize_samples(report.get("samples", []))
 
 
 def cherry_workload_count(report):
@@ -177,8 +154,7 @@ def main():
             "[compare] cherry_diagnostics "
             f"last_bridges={cherry_summary.get('last_ghostty_live_bridge_count', 0)} "
             f"last_observers={cherry_summary.get('last_ghostty_output_observer_count', 0)} "
-            f"last_raw_observers={cherry_summary.get('last_raw_output_observer_count', 0)} "
-            f"last_raw_mib={cherry_summary.get('last_raw_output_retained_bytes', 0) / 1_048_576:.2f}"
+            f"last_raw_observers={cherry_summary.get('last_raw_output_observer_count', 0)}"
         )
 
     result = {

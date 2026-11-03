@@ -36,6 +36,48 @@ final class TerminalNotificationCenter {
         }
     }
 
+    /// Whether macOS lets Cherry post notifications now (System Settings ›
+    /// Notifications), for Settings › Notifications' banner. Unavailable
+    /// without a notification-capable bundle (`swift run`, tests), where
+    /// `UNUserNotificationCenter` must not be touched.
+    func permission() async -> NotificationPermission {
+        guard canUseNativeNotifications else { return .unavailable }
+        return NotificationPermission(await Self.authorizationStatus())
+    }
+
+    /// Asks macOS now (Allow Notifications…) instead of before the first
+    /// post, and says what it allows then.
+    func requestAuthorizationNow() async -> NotificationPermission {
+        guard canUseNativeNotifications else { return .unavailable }
+        didRequestAuthorization = true
+        do {
+            _ = try await Self.requestAuthorization()
+        } catch {
+            fputs("[notification authorization] \(error.localizedDescription)\n", stderr)
+        }
+        return await permission()
+    }
+
+    // Off the main actor: the settings object never crosses to it.
+    nonisolated private static func authorizationStatus() async -> UNAuthorizationStatus {
+        await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+
+    nonisolated private static func requestAuthorization() async throws -> Bool {
+        try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+    }
+
+    /// Posts `content` now, asking for permission first if this run has not.
+    private func add(_ content: UNMutableNotificationContent, identifier: String) {
+        requestAuthorizationIfNeeded()
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                fputs("[notification post] \(error.localizedDescription)\n", stderr)
+            }
+        }
+    }
+
     func post(_ notification: TerminalNotificationRequest, for session: TerminalSession) {
         deliver(
             title: notification.title?.nilIfEmpty ?? session.title,
@@ -45,21 +87,34 @@ final class TerminalNotificationCenter {
         )
     }
 
-    /// What an attention notification says: a menu on screen says what
-    /// the agent waits for.
-    static func attentionBody(for state: AgentActivityState) -> String {
-        switch state {
-        case .needsInput: "This agent is asking you a question."
-        case .permission: "This agent is waiting for your permission."
-        default: "This agent may need your attention."
+    /// What a program status notification says: the program's own line
+    /// when it gave one (`message`, untrusted text, shown as plain text),
+    /// else what its state means.
+    nonisolated static func programStatusBody(for status: ProgramStatus) -> String {
+        if !status.message.isEmpty {
+            return String(status.message.prefix(256))
+        }
+        switch status.state {
+        case .blocked:
+            switch status.kind {
+            case .permission?: return "Waiting for your permission."
+            case .question?: return "Asking you a question."
+            case .auth?: return "Waiting for you to sign in."
+            case .unknown?, nil: return "Waiting for you."
+            }
+        case .done: return "Finished."
+        case .error: return "Failed."
+        case .idle, .working, .unknown: return "Needs your attention."
         }
     }
 
-    func postAttention(for session: TerminalSession) {
+    /// A tab's program blocked on the user, finished or failed (OSC 7501)
+    /// while the tab is not on screen.
+    func postProgramStatus(_ status: ProgramStatus, for session: TerminalSession) {
         deliver(
             title: session.title,
-            body: Self.attentionBody(for: session.agentActivityState),
-            identifierPrefix: "cherry-attention",
+            body: Self.programStatusBody(for: status),
+            identifierPrefix: "cherry-program-status",
             for: session
         )
     }
@@ -74,23 +129,13 @@ final class TerminalNotificationCenter {
             reportUnavailableDeliveryIfNeeded()
             return
         }
-        requestAuthorizationIfNeeded()
         let notification = UNMutableNotificationContent()
         notification.title = content.title
         notification.subtitle = content.subtitle
         notification.body = content.body
         notification.sound = .default
         notification.userInfo = content.userInfo
-        let request = UNNotificationRequest(
-            identifier: "cherry-background-\(content.sessionID)-\(UUID().uuidString)",
-            content: notification,
-            trigger: nil
-        )
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error {
-                fputs("[notification post] \(error.localizedDescription)\n", stderr)
-            }
-        }
+        add(notification, identifier: "cherry-background-\(content.sessionID)-\(UUID().uuidString)")
     }
 
     private func deliver(
@@ -106,8 +151,6 @@ final class TerminalNotificationCenter {
             return
         }
 
-        requestAuthorizationIfNeeded()
-
         let projectRoot = ProjectWindowRegistry.shared.projectRoot(containing: session.id)
         let content = UNMutableNotificationContent()
         content.title = title
@@ -117,18 +160,7 @@ final class TerminalNotificationCenter {
             "sessionID": session.id.uuidString,
             "projectRoot": projectRoot ?? ""
         ]
-
-        let request = UNNotificationRequest(
-            identifier: "\(identifierPrefix)-\(session.id.uuidString)-\(UUID().uuidString)",
-            content: content,
-            trigger: nil
-        )
-
-        UNUserNotificationCenter.current().add(request) { error in
-            if let error {
-                fputs("[notification post] \(error.localizedDescription)\n", stderr)
-            }
-        }
+        add(content, identifier: "\(identifierPrefix)-\(session.id.uuidString)-\(UUID().uuidString)")
     }
 
     func handleResponse(userInfo: [AnyHashable: Any]) {
@@ -156,16 +188,6 @@ final class TerminalNotificationCenter {
         handleResponse(userInfo: userInfo)
     }
 
-    func handleResponse(sessionIDString: String?, projectRoot: String?) {
-        guard let sessionIDString,
-              let sessionID = UUID(uuidString: sessionIDString)
-        else {
-            return
-        }
-
-        focusSession(sessionID: sessionID, projectRoot: projectRoot?.nilIfEmpty)
-    }
-
     private func focusSession(sessionID: UUID, projectRoot: String?) {
         ProjectWindowRegistry.shared.focusSession(sessionID: sessionID, projectRoot: projectRoot)
     }
@@ -183,8 +205,35 @@ final class TerminalNotificationCenter {
     }
 }
 
-/// What the notification for a background session's bell or notification
-/// says (`TerminalNotificationCenter.postBackgroundSession`); pure, for tests.
+/// Whether macOS lets Cherry post notifications
+/// (`TerminalNotificationCenter.permission()`); Settings › Notifications
+/// shows a banner when it does not, or has not been asked.
+enum NotificationPermission: Equatable, Sendable {
+    /// No notification-capable bundle (`swift run`, tests): Cherry posts
+    /// nothing, and there is nothing to ask.
+    case unavailable
+    /// Cherry has not asked: it asks the first time it has one to post.
+    case notDetermined
+    /// Off for Cherry in System Settings.
+    case denied
+    case allowed
+
+    /// Authorized and provisional (quiet) delivery are allowed, and so is a
+    /// status macOS does not have today (an App Clip's ephemeral): no
+    /// banner for it.
+    init(_ status: UNAuthorizationStatus) {
+        switch status {
+        case .notDetermined: self = .notDetermined
+        case .denied: self = .denied
+        case .authorized, .provisional: self = .allowed
+        @unknown default: self = .allowed
+        }
+    }
+}
+
+/// What the notification for a background session's bell, notification or
+/// program status says (`TerminalNotificationCenter.postBackgroundSession`);
+/// pure, for tests.
 struct BackgroundSessionNotificationContent: Equatable {
     /// The host session id, in `userInfo` under `sessionIDKey`.
     static let sessionIDKey = "backgroundSessionID"
@@ -201,23 +250,35 @@ struct BackgroundSessionNotificationContent: Equatable {
 
     /// `machine`: the device the session is on, nil for This Mac.
     init(session: BackgroundSession, signal: PersistentHostSignal, machine: String? = nil) {
+        let body: String
+        switch signal {
+        case .notification(let title, let text):
+            let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty {
+                body = title.isEmpty ? "Notification" : title
+            } else {
+                body = title.isEmpty ? text : "\(title): \(text)"
+            }
+        case .bell, .progress:
+            body = session.kind == .agent ? "This agent may need your attention." : "Terminal bell"
+        }
+        self.init(session: session, body: body, machine: machine)
+    }
+
+    /// Its program's status (OSC 7501): its own message, else what its
+    /// state means (`TerminalNotificationCenter.programStatusBody`).
+    init(session: BackgroundSession, programStatus: ProgramStatus, machine: String? = nil) {
+        self.init(session: session, body: TerminalNotificationCenter.programStatusBody(for: programStatus), machine: machine)
+    }
+
+    private init(session: BackgroundSession, body: String, machine: String?) {
         sessionID = session.id
         hostID = session.hostID
         title = session.title
         subtitle = machine.map { "\(session.projectName) on \($0) · in the background" }
             ?? "\(session.projectName) · in the background"
-        switch signal {
-        case .notification(let title, let body):
-            let body = body.trimmingCharacters(in: .whitespacesAndNewlines)
-            let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
-            if body.isEmpty {
-                self.body = title.isEmpty ? "Notification" : title
-            } else {
-                self.body = title.isEmpty ? body : "\(title): \(body)"
-            }
-        case .bell, .progress:
-            body = session.kind == .agent ? "This agent may need your attention." : "Terminal bell"
-        }
+        self.body = body
     }
 
     var userInfo: [String: String] {

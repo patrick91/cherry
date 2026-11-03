@@ -159,11 +159,9 @@ final class ParityControlServer {
             .appendingPathComponent("control.sock")
         server = CherryControlServer(
             workspaceProvider: { active },
-            noteStoreProvider: { nil },
             todoStoreProvider: { nil },
             chromeStateProvider: { nil },
             workspaceForProjectRootProvider: { root in workspaces.first { $0.projectRoot == root } },
-            noteStoreForProjectRootProvider: { _ in nil },
             todoStoreForProjectRootProvider: { _ in nil },
             chromeStateForProjectRootProvider: { _ in nil },
             openProjectRootsProvider: { workspaces.compactMap(\.projectRoot) },
@@ -398,7 +396,7 @@ final class ParityControlServer {
         title: "htop", pwd: subdirectory.path, owner: "CherryTests"
     )]
     let result = await harness.restorer(WorkspaceRestoreRequest(
-        repositoryRoot: harness.project.path, worktreeRoot: harness.project.path,
+        repositoryRoot: harness.project.path,
         records: [record], workspace: workspace
     ))
     workspace.restoreSessions(result.sessions, from: WorktreeStateRecord(root: harness.project.path, sessions: [record]))
@@ -456,15 +454,22 @@ final class ParityControlServer {
     harness.push(.progress(id: sessionID, state: .remove, value: nil))
     #expect(await harness.fake.wait { tab.progressReport == nil })
 
-    // An agent's notification drives its attention state, as a native one's.
+    // An agent's notification marks it unread; its state comes only from
+    // its program status, which the host keeps.
     let agent = workspace.addAgentSession(
         agent: AgentToolDefinition(name: "Claude", command: "claude"), projectRoot: harness.project.path
     )
     #expect(await harness.waitUntilAttached(agent))
     let agentSession = try #require(agent.persistentSession?.sessionID)
     harness.push(.notification(id: agentSession, title: "Claude", body: "Claude needs permission to run a tool"))
+    #expect(await harness.fake.wait { agent.hasUnreadNotification })
+    #expect(agent.agentActivityState == .unknown)
+    let listed = try #require(harness.hosting.sessionInfo(agentSession))
+    harness.push(.changed(HostedSessionInfo(
+        id: listed.id, name: listed.name, cwd: listed.cwd, pid: listed.pid, owner: listed.owner, tags: listed.tags,
+        programStatus: [ProgramStatus(state: .blocked, kind: .permission, app: "claude-code", message: "approve Bash: ls")]
+    )))
     #expect(await harness.fake.wait { agent.agentActivityState == .permission })
-    #expect(agent.hasUnreadNotification)
 }
 
 @Test @MainActor func anAttachedAdapterShowsBellsAndNotificationsAndTheHostTakesOverWhenItIsGone() async throws {
@@ -695,7 +700,7 @@ final class ParityControlServer {
         return nil
     }
 
-    // MCP clear_output asks the host before it answers.
+    // The control request clearOutput asks the host before it answers.
     let cleared = try await control.send(.clearOutput(.init(terminalID: tab.id.uuidString)))
     #expect(cleared.error == nil)
     guard case .clearOutput(let clearedResult)? = cleared.result else {
@@ -879,6 +884,7 @@ final class ParityControlServer {
         return
     }
     #expect(result.sentBytes == 0)
+    #expect(result.inputError?.code == "input_not_delivered", "\(String(describing: result.inputError))")
     let sent = try await sending
     #expect(sent.error?.code == "input_not_delivered")
     #expect(harness.fake.requests("send_input").count == 2)

@@ -4,7 +4,7 @@ import Foundation
 
 // MARK: - Tasks
 //
-// An orchestrating agent hands work to worker agents as tasks (docs/mcp.md,
+// An orchestrating agent hands work to worker agents as tasks (docs/cli.md,
 // Tasks and results): MCP `spawn_agent` with `task` opens an ordinary,
 // visible agent tab nested under the orchestrator, records the task in a
 // run, and types a one-line kickoff into the worker once it is ready. The
@@ -22,7 +22,10 @@ import Foundation
 // result."); idle again without a report, its task is `no_report`, with its
 // screen's last lines as the result. Neither happens while the worker waits
 // on a monitor of its own (a wake subscription whose processes still run or
-// whose events it has not read). The monitor sampler watches open tasks
+// whose events it has not read), nor while its task awaits approval: a
+// worker that asks its orchestrator (`report_progress` with
+// `awaiting_approval`) waits, open, until a message is submitted to it.
+// The monitor sampler watches open tasks
 // (`sampleTasks`), so tasks reuse its refresh throttle, status and idle
 // rules. Everything Cherry types into a tab (wake lines, the nudge, a
 // kickoff) goes through one lock per tab (`typeCherryLine`), so two lines
@@ -62,21 +65,18 @@ struct AgentTaskSessionBinding: Codable, Equatable, Hashable, Sendable {
     var hostID: String?
     var sessionID: String
 
-    init(host: String, hostID: String?, sessionID: String) {
-        self.host = host
-        self.hostID = hostID
-        self.sessionID = sessionID
-    }
-
-    init(_ attachment: HostedSessionAttachment) {
-        self.init(host: attachment.host.id, hostID: attachment.hostID, sessionID: attachment.sessionID)
-    }
-
     /// Whether `attachment` names this session.
     func names(_ attachment: HostedSessionAttachment?) -> Bool {
         guard let attachment else { return false }
         return attachment.sessionID == sessionID && attachment.host.id == host
             && (hostID == nil || attachment.hostID == hostID)
+    }
+}
+
+// In an extension, so the memberwise initializer stays.
+extension AgentTaskSessionBinding {
+    init(_ attachment: HostedSessionAttachment) {
+        self.init(host: attachment.host.id, hostID: attachment.hostID, sessionID: attachment.sessionID)
     }
 }
 
@@ -122,11 +122,17 @@ final class AgentTask {
     let phase: String?
     let brief: String
     let resultSchema: JSONValue?
+    /// The worker may use its own CLI's subagents in its tab
+    /// (`spawn_agent`'s `allow_subagents`): its rules say so.
+    let allowSubagents: Bool
     let createdAt: Date
     var state: AgentTaskState = .queued
     var startedAt: Date?
     var settledAt: Date?
     var reason: String?
+    /// The tab whose `cancel_tasks` cancelled it, when Cherry confirmed the
+    /// caller: its own monitors are not told (in memory only, as they are).
+    var cancelledBy: UUID?
     var result: AgentTaskResult?
     var progress: String?
     var progressAt: Date?
@@ -134,6 +140,13 @@ final class AgentTask {
     /// the user: `wait_for_tasks` reads them even when the events went.
     var settledSeq: Int?
     var needsInputSeq: Int?
+    /// The event at which its worker last asked its orchestrator for
+    /// approval (`report_progress` with `awaiting_approval`), and the
+    /// worker's submitted turns then: a later submit (its orchestrator's
+    /// answer, or the user's, never a line of Cherry's) puts it back to
+    /// work (`resumeIfAnswered`).
+    var awaitingApprovalSeq: Int?
+    var approvalSubmittedTurn = 0
     /// When its last report was recorded, and whether one is being checked.
     var lastReportAt: Date?
     var isCheckingReport = false
@@ -192,6 +205,7 @@ final class AgentTask {
         phase: String?,
         brief: String,
         resultSchema: JSONValue?,
+        allowSubagents: Bool = false,
         createdAt: Date = Date()
     ) {
         self.id = id
@@ -204,27 +218,13 @@ final class AgentTask {
         self.phase = phase
         self.brief = brief
         self.resultSchema = resultSchema
+        self.allowSubagents = allowSubagents
         self.createdAt = createdAt
     }
 
-    convenience init(
-        id: String,
-        runID: String,
-        device: UUID?,
-        worker: TerminalSession,
-        workspace: TerminalWorkspace,
-        label: String,
-        phase: String?,
-        brief: String,
-        resultSchema: JSONValue?
-    ) {
-        self.init(
-            id: id, runID: runID, device: device, workerID: worker.id, worker: worker, workspace: workspace,
-            label: label, phase: phase, brief: brief, resultSchema: resultSchema
-        )
+    var kickoffLine: String {
+        AgentTaskRegistry.kickoffLine(taskID: id, reportsInOneWord: AgentTaskRegistry.reportsInOneWord(worker))
     }
-
-    var kickoffLine: String { AgentTaskRegistry.kickoffLine(taskID: id) }
 }
 
 /// The tasks one orchestrator handed out together (main actor only).
@@ -262,8 +262,15 @@ final class AgentRun {
     /// The settle its owner read with `wait_for_tasks` (or caused, with
     /// `cancel_tasks`): no wake line then.
     var ownerReadSeq = 0
+    /// The newest approval request (`AgentTask.awaitingApprovalSeq`) its
+    /// approval wake line was typed for (or given up on), and the newest
+    /// its owner read with `wait_for_tasks`.
+    var approvalWokenSeq = 0
+    var approvalReadSeq = 0
     var lastWakeAt: Date?
     var isWaking = false
+    /// Why its wake line was last logged as held (`noteWakeHeld`).
+    var wakeHoldReason: String?
     /// `wait_for_tasks` calls on it now: no wake line while one runs.
     var activeWaits = 0
     /// Read back from the last run's file, its owner not found again yet.
@@ -272,6 +279,10 @@ final class AgentRun {
     var relinkedAt: Date?
     /// Since when none of its tabs is open or running (`pruneSettledRuns`).
     var tabsGoneSince: Date?
+    /// Its owner's tab is in no open window and its session runs no more
+    /// (`pruneSettledRuns`): its settled tasks no longer mark their workers'
+    /// rows, since nobody is left to act on them.
+    var ownerIsGone = false
 
     init(
         id: String,
@@ -341,6 +352,7 @@ final class AgentTaskRegistry {
     /// can be many bytes).
     static let summaryBytes = 4 * CherryControl.maximumTaskSummaryCharacters
     static let progressBytes = 4 * CherryControl.maximumTaskProgressCharacters
+    static let approvalRequestBytes = 4 * CherryControl.maximumTaskApprovalRequestCharacters
     static let labelLimit = (characters: 80, bytes: 320)
     static let phaseLimit = (characters: 60, bytes: 240)
     /// A report's or progress message's excerpt in an event.
@@ -349,7 +361,7 @@ final class AgentTaskRegistry {
     static let screenTailLines = 40
     static let screenTailCharacters = 4_000
     /// Typed once into a worker that went idle without reporting.
-    static let nudgeLine = "Please call report_result with your result."
+    static let nudgeLine = "Please run cherry task report with your result."
 
     let board: AgentTaskBoard
     let typingLocks = TabTypingLocks()
@@ -363,7 +375,8 @@ final class AgentTaskRegistry {
     /// cursor in between names events the file lost (`cursor_reset`).
     private(set) var restoredThroughSeq: Int?
     private(set) var restoredSeqGapEnd: Int?
-    /// Settings › MCP › Wake idle agents (the server's monitors' setting).
+    /// Settings › Agents › Monitors › Wake idle agents (the server's
+    /// monitors' setting).
     var wakeLinesEnabled: @MainActor () -> Bool = { true }
 
     // Persistence (`AgentTaskPersistence.swift`): nil saves nothing (tests
@@ -457,23 +470,51 @@ final class AgentTaskRegistry {
         return (kept + ellipsis, true)
     }
 
-    /// One line, typed into the worker as its first message.
-    nonisolated static func kickoffLine(taskID: String) -> String {
-        "You are Cherry task \(taskID): call get_my_task (Cherry MCP) for your brief, do it, then call report_result. "
-            + "Without Cherry MCP tools, run \"$CHERRY_MCP_HELPER\" --call get_my_task, then "
-            + "\"$CHERRY_MCP_HELPER\" --call report_result '{\"value\":{},\"status\":\"ok\",\"summary\":\"done\"}' "
-            + "(one JSON object, your result as value)."
+    /// One line, typed into the worker as its first message: the `cherry`
+    /// commands it runs.
+    /// `reportsInOneWord`: the JSON goes as one single-quoted argument
+    /// (`reportsInOneWord(_:)`), not on standard input.
+    nonisolated static func kickoffLine(taskID: String, reportsInOneWord: Bool = false) -> String {
+        let how = reportsInOneWord
+            ? "as one single-quoted argument, no heredoc or pipe, with any ' in it written \\u0027"
+            : "on standard input, in a heredoc"
+        return "You are Cherry task \(taskID): run cherry task mine for your brief, do it, then report with cherry task report "
+            + "(a JSON object {\"value\":…,\"status\":\"ok\",\"summary\":\"…\"} \(how))."
     }
 
-    /// What `get_my_task` tells every worker.
-    static let workerRules = [
-        "Do the brief in this tab. Don't hand parts of it to other agents: Cherry tasks are one level deep.",
-        "Finish with report_result: value (matching result_schema when there is one), status ok or failed, and a summary of at most \(CherryControl.maximumTaskSummaryCharacters) characters.",
-        "If you cannot finish, report status failed with the reason in summary rather than waiting for an answer.",
-        "For long work you may call report_progress with a short message (at most one every few seconds is kept).",
-        "If you get more instructions in this tab later, report again: the newest report replaces the earlier one.",
-        "Without Cherry MCP tools, run \"$CHERRY_MCP_HELPER\" --call get_my_task and \"$CHERRY_MCP_HELPER\" --call report_result '{\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}' in a shell: the second argument is one valid JSON object in single quotes (no placeholders such as …).",
-    ]
+    /// Whether `worker` reports with the JSON as one argument: Codex runs a
+    /// `cherry` command outside its sandbox (which blocks Cherry's socket)
+    /// only when Cherry's rules file matches it, and its rules match plain
+    /// commands only, never a heredoc or a pipe.
+    static func reportsInOneWord(_ worker: TerminalSession?) -> Bool {
+        guard let worker else { return false }
+        return AgentToolBrand.detect(name: worker.agentName, commandLine: worker.launchCommand) == .codex
+    }
+
+    /// What `cherry task mine` tells a worker: with `allowSubagents`, that
+    /// it may use its own CLI's subagents (never Cherry tasks of its own).
+    static func workerRules(allowSubagents: Bool, reportsInOneWord: Bool = false) -> [String] {
+        [
+            allowSubagents
+                ? "Do the brief in this tab. You may use your own CLI's subagents for parts of it, but not cherry spawn agent with --task: Cherry tasks are one level deep."
+                : "Do the brief in this tab. Don't hand parts of it to other agents: Cherry tasks are one level deep.",
+            "Finish with cherry task report: value (matching result_schema when there is one), status ok or failed, and a summary of at most \(CherryControl.maximumTaskSummaryCharacters) characters.",
+            "If you need your orchestrator's approval or an answer before you go on (a plan to approve, a question), run cherry task progress --awaiting-approval with the whole plan or question (at most \(CherryControl.maximumTaskApprovalRequestCharacters) characters, lines kept; - or a heredoc reads it from standard input), then end your turn: the task waits, and the answer comes as a message in this tab.",
+            "If you cannot finish otherwise, report status failed with the reason in summary.",
+            "For long work you may run cherry task progress with a short message (at most one every few seconds is kept).",
+            "If you get more instructions in this tab later, report again: the newest report replaces the earlier one.",
+            reportsInOneWord
+                ? "Report with the JSON as one single-quoted argument, never a heredoc or a pipe (only a plain cherry command runs outside your sandbox): cherry task report '{\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}' (one valid JSON object, no placeholders such as …; write any ' inside it as \\u0027)."
+                : "Report with a heredoc, so the JSON needs no shell quoting: cherry task report <<'EOF', then {\"value\":{\"key\":\"result\"},\"status\":\"ok\",\"summary\":\"one sentence\"}, then EOF (one valid JSON object, no placeholders such as …).",
+        ]
+    }
+
+    /// The approval wake line: the run's id and how many of its tasks
+    /// await approval, never a worker's text.
+    static func approvalWakeLine(runID: String, counts: AgentRunCounts) -> String {
+        let noun = counts.awaitingApproval == 1 ? "task awaits" : "tasks await"
+        return "[cherry] Run \(runID): \(counts.awaitingApproval) \(noun) your approval. Run cherry task wait \(runID) to read the questions, and answer each worker with cherry send."
+    }
 
     /// The run's wake line: its id and counts, never a worker's text.
     static func wakeLine(runID: String, counts: AgentRunCounts) -> String {
@@ -482,7 +523,8 @@ final class AgentTaskRegistry {
             (counts.noReport, "no report"), (counts.cancelled, "cancelled"),
         ].filter { $0.0 > 0 }.map { "\($0.0) \($0.1)" }
         let noun = counts.total == 1 ? "task" : "tasks"
-        return "[cherry] Run \(runID): \(counts.total) \(noun) settled (\(parts.joined(separator: ", "))). Call the cherry wait_for_tasks tool with run_id \"\(runID)\" to read them, and get_task for each result."
+        return "[cherry] Run \(runID): \(counts.total) \(noun) settled (\(parts.joined(separator: ", ")))."
+            + " Run cherry task wait \(runID) to read them, and cherry task get for each result."
     }
 
     // MARK: Lookup
@@ -539,6 +581,20 @@ final class AgentTaskRegistry {
     func awaitsWake(_ run: AgentRun) -> Bool {
         guard run.wakes, let settledSeq = run.settledSeq else { return false }
         return settledSeq > run.wokenSeq && settledSeq > run.ownerReadSeq
+    }
+
+    /// The newest approval request of `run`'s tasks that still await
+    /// approval (0 for none).
+    func approvalSeq(of run: AgentRun) -> Int {
+        tasks(of: run).filter { $0.state == .awaitingApproval }.compactMap(\.awaitingApprovalSeq).max() ?? 0
+    }
+
+    /// An approval request of `run` its owner was neither woken for nor
+    /// read.
+    func awaitsApprovalWake(_ run: AgentRun) -> Bool {
+        guard run.wakes else { return false }
+        let seq = approvalSeq(of: run)
+        return seq > run.approvalWokenSeq && seq > run.approvalReadSeq
     }
 
     /// The sampler is needed: a task is open, or a settled run's wake line
@@ -653,13 +709,14 @@ final class AgentTaskRegistry {
         } else if result?.source == "report_result" {
             task.reason = nil
         }
-        if [.working, .needsInput, .reported, .failed].contains(state), task.startedAt == nil { task.startedAt = now }
+        if [.working, .needsInput, .awaitingApproval, .reported, .failed].contains(state), task.startedAt == nil { task.startedAt = now }
         task.state = state
         task.settledAt = state.isSettled ? (task.settledAt ?? now) : nil
         if state.isSettled, kind.settles { task.settledAt = now }
         let event = record(kind, for: task, text: text, version: result?.version)
         if state.isSettled, kind.settles { task.settledSeq = event.seq }
         if state == .needsInput { task.needsInputSeq = event.seq }
+        if state == .awaitingApproval { task.awaitingApprovalSeq = event.seq }
         if let run = runs[task.runID] { settleCheck(run, seq: event.seq) }
         publish()
     }
@@ -749,6 +806,10 @@ final class AgentTaskRegistry {
         var badges: [UUID: AgentTaskBadge] = [:]
         for id in taskOrder {
             guard let task = tasks[id] else { continue }
+            if task.state.isSettled, runs[task.runID]?.ownerIsGone == true {
+                badges[task.workerID] = nil
+                continue
+            }
             badges[task.workerID] = AgentTaskBadge(
                 state: task.state,
                 label: task.label,
@@ -763,8 +824,26 @@ final class AgentTaskRegistry {
             let current = progress[ownerID] ?? AgentRunProgress(settled: 0, total: 0)
             progress[ownerID] = AgentRunProgress(settled: current.settled + counts.settled, total: current.total + counts.total)
         }
-        board.update(badges: badges, runProgress: progress)
+        board.update(badges: badges, runProgress: progress, workerSummaries: workerSummaries())
         scheduleSave()
+    }
+
+    /// Each orchestrator's workers, by their latest task, over all its runs
+    /// still kept (a settled run is pruned after a while).
+    func workerSummaries() -> [UUID: AgentWorkerSummary] {
+        var latest: [UUID: AgentTask] = [:]
+        for id in taskOrder {
+            guard let task = tasks[id] else { continue }
+            latest[task.workerID] = task
+        }
+        var summaries: [UUID: AgentWorkerSummary] = [:]
+        for id in taskOrder {
+            guard let task = tasks[id], latest[task.workerID] === task,
+                  let ownerID = runs[task.runID]?.ownerID
+            else { continue }
+            summaries[ownerID, default: AgentWorkerSummary()].add(task.state, worker: task.workerID)
+        }
+        return summaries
     }
 }
 
@@ -785,6 +864,41 @@ struct AgentRunProgress: Equatable {
     var text: String { "\(settled)/\(total)" }
 }
 
+/// An orchestrator's workers, each by its latest task: what the sidebar
+/// shows on a collapsed orchestrator and what Close Finished Workers
+/// closes.
+struct AgentWorkerSummary: Equatable {
+    var reported = 0
+    /// Failed or settled without a report.
+    var failed = 0
+    var cancelled = 0
+    var open = 0
+    /// Workers whose latest task settled, in task order.
+    var finishedWorkerIDs: [UUID] = []
+
+    var total: Int { reported + failed + cancelled + open }
+    /// Every worker's task settled.
+    var allSettled: Bool { total > 0 && open == 0 }
+
+    mutating func add(_ state: AgentTaskState, worker: UUID) {
+        switch state {
+        case .reported: reported += 1
+        case .failed, .noReport: failed += 1
+        case .cancelled: cancelled += 1
+        case .queued, .working, .needsInput, .awaitingApproval: open += 1
+        }
+        if state.isSettled { finishedWorkerIDs.append(worker) }
+    }
+
+    /// "10 done", "8 done · 2 failed", "3 cancelled".
+    var text: String {
+        let parts = [(reported, "done"), (failed, "failed"), (cancelled, "cancelled")]
+            .filter { $0.0 > 0 }
+            .map { "\($0.0) \($0.1)" }
+        return parts.joined(separator: " · ")
+    }
+}
+
 /// What the sidebar shows of tasks: the app's control server writes it
 /// (tests give their servers their own).
 @MainActor
@@ -796,9 +910,17 @@ final class AgentTaskBoard: ObservableObject {
     /// By orchestrator tab, while one of its runs is open.
     @Published private(set) var runProgress: [UUID: AgentRunProgress] = [:]
 
-    func update(badges: [UUID: AgentTaskBadge], runProgress: [UUID: AgentRunProgress]) {
+    /// By orchestrator tab, for its workers' latest tasks, open or not.
+    @Published private(set) var workerSummaries: [UUID: AgentWorkerSummary] = [:]
+
+    func update(
+        badges: [UUID: AgentTaskBadge],
+        runProgress: [UUID: AgentRunProgress],
+        workerSummaries: [UUID: AgentWorkerSummary] = [:]
+    ) {
         if self.badges != badges { self.badges = badges }
         if self.runProgress != runProgress { self.runProgress = runProgress }
+        if self.workerSummaries != workerSummaries { self.workerSummaries = workerSummaries }
     }
 }
 
@@ -809,6 +931,7 @@ extension AgentTaskState {
         case .queued: "Queued"
         case .working: "Working"
         case .needsInput: "Needs you"
+        case .awaitingApproval: "Awaits approval"
         case .reported: "Reported"
         case .noReport: "No report"
         case .failed: "Failed"
@@ -822,6 +945,7 @@ extension AgentTaskState {
         case .queued: "clock"
         case .working: "ellipsis.circle"
         case .needsInput: "exclamationmark.circle.fill"
+        case .awaitingApproval: "hand.raised.circle"
         case .reported: "checkmark.circle.fill"
         case .noReport: "questionmark.circle"
         case .failed: "xmark.circle.fill"
@@ -839,6 +963,7 @@ extension CherryControlServer {
         var label: String
         var phase: String?
         var resultSchema: JSONValue?
+        var allowSubagents = false
         /// The run named by `run_id`; nil for the owner's current run.
         var run: AgentRun?
         var device: UUID?
@@ -886,7 +1011,10 @@ extension CherryControlServer {
     @MainActor
     func typeCherryLine(_ text: String, into session: TerminalSession) async throws -> Int {
         await tasks.typingLocks.acquire(session.id)
-        defer { tasks.typingLocks.release(session.id) }
+        defer {
+            noteCherryLineTyped(into: session)
+            tasks.typingLocks.release(session.id)
+        }
         return try await sendControlInput(text: text, rawBase64: nil, submit: true, to: session)
     }
 
@@ -896,10 +1024,11 @@ extension CherryControlServer {
     @MainActor
     func prepareTaskSpawn(_ request: SpawnProcessRequest, parentAgentID: UUID?, workspace: TerminalWorkspace) throws -> TaskSpawnPlan? {
         guard let rawTask = request.task else {
-            if request.label != nil || request.phase != nil || request.runID != nil || request.resultSchema != nil {
+            if request.label != nil || request.phase != nil || request.runID != nil || request.resultSchema != nil
+                || request.allowSubagents == true {
                 throw CherryControlError(
                     code: "invalid_process_request",
-                    message: "label, phase, run_id and result_schema go with task."
+                    message: "label, phase, run_id, result_schema and allow_subagents go with task."
                 )
             }
             return nil
@@ -956,6 +1085,7 @@ extension CherryControlServer {
             label: AgentTaskRegistry.clip(label, characters: AgentTaskRegistry.labelLimit.characters, bytes: AgentTaskRegistry.labelLimit.bytes).text,
             phase: phase.map { AgentTaskRegistry.clip($0, characters: AgentTaskRegistry.phaseLimit.characters, bytes: AgentTaskRegistry.phaseLimit.bytes).text },
             resultSchema: request.resultSchema,
+            allowSubagents: request.allowSubagents ?? false,
             run: run,
             device: device,
             ownerID: ownerID,
@@ -980,12 +1110,14 @@ extension CherryControlServer {
             id: AgentTaskRegistry.newID("task"),
             runID: run.id,
             device: plan.device,
+            workerID: worker.id,
             worker: worker,
             workspace: workspace,
             label: plan.label,
             phase: plan.phase,
             brief: plan.brief,
-            resultSchema: plan.resultSchema
+            resultSchema: plan.resultSchema,
+            allowSubagents: plan.allowSubagents
         )
         if let binding = worker.hostedSessionBinding {
             task.workerSession = AgentTaskSessionBinding(binding)
@@ -1066,7 +1198,7 @@ extension CherryControlServer {
         guard let caller = verifiedCallerSession() else {
             if let away = awayWorkerTaskOfCaller() { return away }
             throw Self.noAssignment(
-                "Cherry could not tell which of its tabs this MCP session runs in, so it has no task for it. Run CherryMCP inside the agent's own Cherry tab (as its MCP server, or \"$CHERRY_MCP_HELPER\" --call from its shell)."
+                "Cherry could not tell which of its tabs this MCP session runs in, so it has no task for it. Run cherry inside the agent's own Cherry tab."
             )
         }
         guard let task = tasks.latestTask(forWorker: caller.id) else {
@@ -1077,15 +1209,15 @@ extension CherryControlServer {
 
     /// A task whose worker's tab is in no open window while its session
     /// runs on its host, when the caller (This Mac's) descends from that
-    /// session's program.
+    /// session's program (among its processes pinned when it connected,
+    /// `callerProcessChain`).
     @MainActor
     private func awayWorkerTaskOfCaller() -> AgentTask? {
-        guard Self.remoteDevice == nil, callerSessionResolverForTesting == nil, let peerPID = Self.callerPeerPID else { return nil }
-        let ancestry = Set(Self.processAncestry(of: peerPID))
+        guard Self.remoteDevice == nil, callerSessionResolverForTesting == nil, let chain = Self.callerProcessChain else { return nil }
         for id in tasks.taskOrder.reversed() {
             guard let task = tasks.tasks[id], task.state != .cancelled, locateWorker(task) == nil,
                   let hosting = hosting(of: task), let sessionID = task.hostSessionID ?? task.workerSession?.sessionID,
-                  let pid = hosting.sessionInfo(sessionID)?.pid, ancestry.contains(Int32(bitPattern: pid))
+                  let pid = hosting.sessionInfo(sessionID)?.pid, chain.contains(Int32(bitPattern: pid))
             else { continue }
             return task
         }
@@ -1107,7 +1239,10 @@ extension CherryControlServer {
             phase: task.phase,
             brief: task.brief,
             resultSchema: task.resultSchema,
-            rules: AgentTaskRegistry.workerRules,
+            rules: AgentTaskRegistry.workerRules(
+                allowSubagents: task.allowSubagents,
+                reportsInOneWord: AgentTaskRegistry.reportsInOneWord(task.worker)
+            ),
             state: task.state,
             resultVersion: task.result?.version ?? 0
         )
@@ -1216,30 +1351,97 @@ extension CherryControlServer {
     func reportProgress(_ request: ReportProgressRequest) throws -> ReportProgressResult {
         let task = try callerTask()
         if task.state == .cancelled { throw Self.taskCancelled(task) }
-        let oneLine = request.message
-            .components(separatedBy: .newlines)
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespaces)
-        guard !oneLine.isEmpty else {
+        let now = Date()
+        // A settled task's worker (it reported) is not asked to report
+        // again: its question is a progress message.
+        let asksApproval = request.awaitingApproval == true && !task.state.isSettled
+        // An approval request carries the whole plan or question, its lines
+        // kept, for the orchestrator to read with get_task; progress is one
+        // short line.
+        let text = asksApproval
+            ? request.message.trimmingCharacters(in: .whitespacesAndNewlines)
+            : request.message
+                .components(separatedBy: .newlines)
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else {
             throw CherryControlError(code: "invalid_argument", message: "message is empty.")
         }
-        let now = Date()
-        if let last = task.progressAt, now.timeIntervalSince(last) < tasks.progressInterval {
+        // An approval request is never dropped: the worker ends its turn
+        // after it, and a dropped one would leave it to the nudge.
+        if !asksApproval, let last = task.progressAt, now.timeIntervalSince(last) < tasks.progressInterval {
             let wait = tasks.progressInterval - now.timeIntervalSince(last)
-            return ReportProgressResult(taskID: task.id, recorded: false, retryAfterMilliseconds: Int((wait * 1_000).rounded(.up)))
+            return ReportProgressResult(
+                taskID: task.id, recorded: false, retryAfterMilliseconds: Int((wait * 1_000).rounded(.up)), state: task.state
+            )
         }
-        let message = AgentTaskRegistry.clip(
-            oneLine, characters: CherryControl.maximumTaskProgressCharacters, bytes: AgentTaskRegistry.progressBytes
-        ).text
+        let message = asksApproval
+            ? AgentTaskRegistry.clip(
+                text, characters: CherryControl.maximumTaskApprovalRequestCharacters, bytes: AgentTaskRegistry.approvalRequestBytes
+            ).text
+            : AgentTaskRegistry.clip(
+                text, characters: CherryControl.maximumTaskProgressCharacters, bytes: AgentTaskRegistry.progressBytes
+            ).text
         noteFetched(task)
         task.progress = message
         task.progressAt = now
+        if asksApproval {
+            if let found = locateWorker(task) {
+                task.approvalSubmittedTurn = found.session.agentSubmittedTurnCount
+            } else {
+                // Its tab is away: counted from when it is found again.
+                task.worker = nil
+                task.approvalSubmittedTurn = .max
+            }
+            tasks.update(task, to: .awaitingApproval, event: .awaitingApproval, text: message)
+            startMonitorSamplerIfNeeded()
+            return ReportProgressResult(taskID: task.id, recorded: true, state: task.state)
+        }
         if task.state == .queued {
             tasks.update(task, to: .working, event: .started)
+        } else if task.state == .awaitingApproval {
+            resume(task, text: "It went on without an answer.")
         }
         tasks.record(.progress, for: task, text: message)
         tasks.publish()
-        return ReportProgressResult(taskID: task.id, recorded: true)
+        return ReportProgressResult(taskID: task.id, recorded: true, state: task.state)
+    }
+
+    /// A task that awaited approval is at work again: its turn (and the
+    /// nudge's single ask) count from now.
+    @MainActor
+    private func resume(_ task: AgentTask, text: String) {
+        task.turnBaselineAt = Date()
+        task.turnBaseline = task.worker?.agentSubmittedTurnCount ?? task.turnBaseline
+        task.nudgedAt = nil
+        task.lastNudgeAttemptAt = nil
+        tasks.update(task, to: .working, event: .resumed, text: text)
+    }
+
+    /// A task that awaits approval goes back to work once something other
+    /// than Cherry's own lines submitted a message to its worker since it
+    /// asked: its orchestrator's `send_agent_message` (or
+    /// `send_process_input`), or the user typing in its tab.
+    @MainActor
+    func resumeIfAnswered(_ task: AgentTask, worker: TerminalSession) {
+        guard task.state == .awaitingApproval, worker.agentSubmittedTurnCount > task.approvalSubmittedTurn else { return }
+        resume(task, text: "It got an answer.")
+    }
+
+    /// Input was sent to `session` by a request: the answer its task's
+    /// approval request waited for, if it submitted a message.
+    @MainActor
+    func noteRequestInput(to session: TerminalSession) {
+        guard let task = tasks.latestTask(forWorker: session.id) else { return }
+        resumeIfAnswered(task, worker: session)
+    }
+
+    /// Cherry typed a line of its own into `session`: a submit that is no
+    /// answer to its task's approval request.
+    @MainActor
+    func noteCherryLineTyped(into session: TerminalSession) {
+        guard let task = tasks.latestTask(forWorker: session.id), task.state == .awaitingApproval else { return }
+        task.approvalSubmittedTurn = max(task.approvalSubmittedTurn, session.agentSubmittedTurnCount)
     }
 
     // MARK: Orchestrator side
@@ -1305,10 +1507,9 @@ extension CherryControlServer {
         }
         let selection = try taskSelection(runID: request.runID, taskIDs: request.taskIDs, defaultingToCallers: true)
         let callerID = verifiedCallerSession()?.id
-        let timeout = min(
-            max(request.timeoutMilliseconds ?? CherryControl.maximumTaskWaitMilliseconds, 0),
-            CherryControl.maximumTaskWaitMilliseconds
-        )
+        // A tool call's client may allow a longer wait than a typed
+        // request's (`callerWaitCapMilliseconds`); the default stays 50 s.
+        let timeout = Self.callerWaitMilliseconds(request.timeoutMilliseconds, typedMaximum: CherryControl.maximumTaskWaitMilliseconds)
         let maxEvents = min(max(request.maxEvents ?? 100, 1), 500)
         var after = max(request.cursor ?? 0, 0)
         // A cursor Cherry cannot go on from (it names events a relaunch
@@ -1332,11 +1533,12 @@ extension CherryControlServer {
             let changed = selected.contains { task in
                 (task.state.isSettled && (task.settledSeq ?? 0) > after)
                     || (task.state == .needsInput && (task.needsInputSeq ?? 0) > after)
+                    || (task.state == .awaitingApproval && (task.awaitingApprovalSeq ?? 0) > after)
             }
             let ready = cursorReset || (until == "all" ? pending.isEmpty : pending.isEmpty || changed)
             if ready || Date() >= deadline {
                 let events = Array(available.prefix(maxEvents))
-                let latestChange = selected.compactMap { max($0.settledSeq ?? 0, $0.needsInputSeq ?? 0) }.max() ?? 0
+                let latestChange = selected.compactMap { max($0.settledSeq ?? 0, $0.needsInputSeq ?? 0, $0.awaitingApprovalSeq ?? 0) }.max() ?? 0
                 let cursor = events.count == available.count
                     ? max(events.last?.seq ?? after, min(latestChange, tasks.nextSeq - 1), after)
                     : events.last?.seq ?? after
@@ -1344,6 +1546,12 @@ extension CherryControlServer {
                 for run in runs where run.ownerID != nil && run.ownerID == callerID {
                     if let settledSeq = run.settledSeq, events.count == available.count, settledSeq > run.ownerReadSeq {
                         run.ownerReadSeq = settledSeq
+                        tasks.scheduleSave()
+                    }
+                    // Its approval requests too: they came with the events.
+                    let approvalSeq = tasks.approvalSeq(of: run)
+                    if events.count == available.count, approvalSeq > run.approvalReadSeq, approvalSeq <= cursor {
+                        run.approvalReadSeq = approvalSeq
                         tasks.scheduleSave()
                     }
                 }
@@ -1404,10 +1612,12 @@ extension CherryControlServer {
         var cancelled: [String] = []
         var closed: [String] = []
         var alreadySettled: [String] = []
+        let callerID = verifiedCallerSession()?.id
         for task in selectedTasks(selection) {
             if task.state.isSettled {
                 alreadySettled.append(task.id)
             } else {
+                task.cancelledBy = callerID
                 tasks.update(task, to: .cancelled, event: .cancelled, text: "Cancelled by the orchestrator.", reason: "cancelled by the orchestrator")
                 cancelled.append(task.id)
             }
@@ -1420,7 +1630,7 @@ extension CherryControlServer {
             }
         }
         // Its owner ended it: it knows the run settled (no wake line).
-        if let callerID = verifiedCallerSession()?.id {
+        if let callerID {
             for run in involvedRuns(selection) where run.ownerID == callerID {
                 if let settledSeq = run.settledSeq { run.ownerReadSeq = max(run.ownerReadSeq, settledSeq) }
             }
@@ -1452,6 +1662,8 @@ extension CherryControlServer {
             task.workerID = worker.id
             tasks.publish()
         }
+        // Another tab counts its own submits.
+        if task.worker !== worker { task.approvalSubmittedTurn = worker.agentSubmittedTurnCount }
         task.worker = worker
         task.workspace = workspace
         task.awaySince = nil
@@ -1478,6 +1690,9 @@ extension CherryControlServer {
         let now = Date()
         task.restoredAt = nil
         task.relinkedAt = now
+        // Its submits are counted again from 0 in this run: an answer is
+        // one submitted from now.
+        task.approvalSubmittedTurn = worker.agentSubmittedTurnCount
         if task.kickoffDeliveredAt != nil {
             task.turnBaselineAt = now
             task.turnBaseline = worker.agentSubmittedTurnCount
@@ -1632,22 +1847,23 @@ extension CherryControlServer {
             // Shown before its host answered (a relaunch): nothing is
             // decided or typed until the restore confirms the tab.
             if worker.isProvisionalRestore { continue }
-            let key = ObjectIdentifier(worker)
-            let now = Date()
-            if monitors.lastRefreshAt[key].map({ now.timeIntervalSince($0) >= monitors.refreshInterval }) ?? true {
-                monitors.lastRefreshAt[key] = now
-                await refreshForMonitor(worker)
-            }
+            await refreshForMonitorIfDue(worker, now: Date())
             // A report may have come in meanwhile.
             guard !task.state.isSettled else { continue }
             if let end = worker.systemSessionEnd {
                 // It came back ended: the system ended its session while
                 // Cherry was closed.
-                let reason = "its session " + AgentTaskRegistry.lowercasedFirst(end.message)
+                let reason = "its session " + end.endedClause()
                 tasks.update(task, to: .failed, event: .failed, text: "The worker's session is gone: \(reason).", reason: reason)
                 continue
             }
             let status = monitorStatus(session: worker, workspace: workspace, now: Date())
+            // Waiting for its orchestrator: back at work once a message was
+            // submitted to it (never one of Cherry's own lines, which are
+            // typed under its typing lock).
+            if task.state == .awaitingApproval, !isTypingWakeLine(into: worker) {
+                resumeIfAnswered(task, worker: worker)
+            }
             switch status {
             case "closed":
                 settleIfWorkerGone(task, now: Date())
@@ -1669,7 +1885,9 @@ extension CherryControlServer {
                 }
             case "working":
                 checkKickoff(task, worker: worker, now: Date())
-                if task.kickoffDeliveredAt != nil, task.state != .working {
+                // A worker that asked for approval finishes its turn at
+                // work: it still waits.
+                if task.kickoffDeliveredAt != nil, task.state != .working, task.state != .awaitingApproval {
                     tasks.update(task, to: .working, event: task.state == .needsInput ? .resumed : .started)
                 }
             case "idle":
@@ -1677,7 +1895,11 @@ extension CherryControlServer {
                     tasks.update(task, to: .working, event: .resumed)
                 }
                 checkKickoff(task, worker: worker, now: Date())
-                checkTurnEnded(task, worker: worker, now: Date())
+                // Waiting for approval is not the end of its turn's work:
+                // no nudge, no `no_report`.
+                if task.state != .awaitingApproval {
+                    checkTurnEnded(task, worker: worker, now: Date())
+                }
             default:
                 // Cherry cannot tell (an agent it cannot read): only
                 // report_result settles the task; its kickoff is still
@@ -1687,6 +1909,9 @@ extension CherryControlServer {
         }
         for run in tasks.runsAwaitingWake {
             deliverRunWakeIfReady(run)
+        }
+        for run in tasks.orderedRuns where tasks.awaitsApprovalWake(run) {
+            deliverApprovalWakeIfReady(run)
         }
     }
 
@@ -1725,11 +1950,6 @@ extension CherryControlServer {
         task.typing = .kickoff
         task.lastKickoffAttemptAt = Date()
         task.kickoffCopiesBefore = AgentTaskRegistry.kickoffCopies(taskID: task.id, in: kickoffScreen(of: worker))
-    }
-
-    @MainActor
-    private func screenKey(of worker: TerminalSession) -> String {
-        AgentScreenActivity.agentKey(name: worker.agentName ?? worker.title, commandLine: worker.subtitle)
     }
 
     /// The worker's screen has not changed for `interval`.
@@ -1773,7 +1993,7 @@ extension CherryControlServer {
             return
         }
         let lines = kickoffScreen(of: worker)
-        let agent = screenKey(of: worker)
+        let agent = worker.agentToolKey
         let placement = AgentTaskRegistry.kickoffPlacement(taskID: task.id, in: lines, agent: agent, copiesBefore: task.kickoffCopiesBefore)
         if placement == .submitted || kickoffTurnStarted(worker, since: typedAt) {
             noteKickoffDelivered(task, at: typedAt)
@@ -1800,9 +2020,10 @@ extension CherryControlServer {
             }
         case .absent:
             guard verdict == .prompt else {
-                // A screen Cherry cannot read (no composer, no marker): the
-                // kickoff counts as typed, as it always did.
-                if verdict == .none, !worker.agentActivityEvidenceIsStrong {
+                // A screen Cherry cannot read (no composer) of a worker that
+                // reports no status: the kickoff counts as typed, as it
+                // always did.
+                if verdict == .none, !worker.reportsProgramStatus {
                     noteKickoffDelivered(task, at: typedAt)
                 }
                 return
@@ -1823,26 +2044,31 @@ extension CherryControlServer {
         }
     }
 
-    /// The worker's turn started after `typedAt`: working evidence since,
-    /// or it was at work when the kickoff was submitted (its CLI queued it).
+    /// The worker's turn started after `typedAt`: it reported `working`
+    /// since, or it was at work when the kickoff was submitted (its CLI
+    /// queued it).
     @MainActor
     private func kickoffTurnStarted(_ worker: TerminalSession, since typedAt: Date) -> Bool {
-        if let evidence = worker.lastStrongWorkingEvidenceAt, evidence >= typedAt { return true }
+        if let working = worker.lastWorkingReportAt, working >= typedAt { return true }
         if worker.agentWasWorkingAtLastSubmit, let submittedAt = worker.lastAgentSubmitAt, submittedAt >= typedAt { return true }
         return false
     }
 
     /// The worker sits at a still composer: it takes input, nobody types
     /// into it, no line of Cherry's goes in, its screen has not changed
-    /// for `kickoffQuietInterval` and shows its composer (when Cherry can
-    /// read it at all).
+    /// for `kickoffQuietInterval`, and it reports it is idle (a worker that
+    /// reports its status) or shows its composer (when Cherry can read it
+    /// at all).
     @MainActor
     private func workerTakesKickoff(_ worker: TerminalSession, now: Date) -> Bool {
         guard worker.acceptsControlInput, !worker.humanIsComposing(within: tasks.kickoffQuietInterval),
               !isTypingWakeLine(into: worker), screenIsStill(worker, for: tasks.kickoffQuietInterval, now: now)
         else { return false }
-        let verdict = AgentScreenActivity.verdict(for: kickoffScreen(of: worker, lineLimit: 80), agent: screenKey(of: worker))
-        return verdict == .prompt || (verdict == .none && !worker.agentActivityEvidenceIsStrong)
+        if worker.reportsProgramStatus {
+            return worker.agentActivityState == .idle
+        }
+        let verdict = AgentScreenActivity.verdict(for: kickoffScreen(of: worker, lineLimit: 80), agent: worker.agentToolKey)
+        return verdict == .prompt || verdict == .none
     }
 
     /// Types the kickoff (again) once the worker takes it, at most so
@@ -1912,7 +2138,7 @@ extension CherryControlServer {
         guard let baselineAt = task.turnBaselineAt, task.kickoffDeliveredAt != nil, !task.isTypingIntoWorker,
               worker.agentSubmittedTurnCount >= task.turnBaseline, !inRestoredGrace(task.relinkedAt, now: now)
         else { return }
-        let sawWork = worker.lastStrongWorkingEvidenceAt.map { $0 >= baselineAt } ?? false
+        let sawWork = worker.lastWorkingReportAt.map { $0 >= baselineAt } ?? false
         let completedThatTurn = worker.agentTurnState == .completed
             && (worker.lastAgentSubmitAt.map { $0 >= baselineAt } ?? false)
         guard sawWork || completedThatTurn || now.timeIntervalSince(baselineAt) >= tasks.idleFallbackInterval else { return }
@@ -1956,7 +2182,7 @@ extension CherryControlServer {
         task.turnBaselineAt = nil
         task.kickoffEnterPresses = 0
         let lines = kickoffScreen(of: worker)
-        if AgentTaskRegistry.kickoffPlacement(taskID: task.id, in: lines, agent: screenKey(of: worker)) == .composer {
+        if AgentTaskRegistry.kickoffPlacement(taskID: task.id, in: lines, agent: worker.agentToolKey) == .composer {
             // Its last one still sits in the composer (taken as sent by
             // mistake): its Enter, not a second copy.
             task.kickoffTypedAt = now
@@ -2011,26 +2237,38 @@ extension CherryControlServer {
     /// (`relinkGrace`); one found again waits `restoredLineGrace` first.
     @MainActor
     func deliverRunWakeIfReady(_ run: AgentRun) {
-        guard monitors.wakeLinesEnabled, !run.isWaking, run.activeWaits == 0,
-              tasks.awaitsWake(run), let settledSeq = run.settledSeq
+        guard monitors.wakeLinesEnabled, !run.isWaking, tasks.awaitsWake(run), let settledSeq = run.settledSeq
         else { return }
         let now = Date()
+        guard run.activeWaits == 0 else { return noteWakeHeld(run, "its owner waits in wait_for_tasks", now: now) }
         if run.settledAt.map({ now.timeIntervalSince($0) > tasks.wakeLifetime }) ?? false {
+            noteWakeHeld(run, "given up after \(Int(tasks.wakeLifetime)) s", now: now)
             run.wokenSeq = settledSeq
             tasks.scheduleSave()
             return
         }
         guard let owner = locateOwner(run) else {
-            if let restoredAt = run.restoredAt, now.timeIntervalSince(restoredAt) < tasks.relinkGrace { return }
+            if let restoredAt = run.restoredAt, now.timeIntervalSince(restoredAt) < tasks.relinkGrace {
+                return noteWakeHeld(run, "its owner's tab is not found again yet", now: now)
+            }
             // Nobody to wake any more.
+            noteWakeHeld(run, "given up: its owner's tab is gone", now: now)
             run.wokenSeq = settledSeq
             tasks.scheduleSave()
             return
         }
-        if inRestoredGrace(run.relinkedAt, now: now) { return }
-        if let last = run.lastWakeAt, now.timeIntervalSince(last) < monitors.wakeMinimumInterval { return }
+        if inRestoredGrace(run.relinkedAt, now: now) { return noteWakeHeld(run, "its owner was just found again", now: now) }
+        if let last = run.lastWakeAt, now.timeIntervalSince(last) < monitors.wakeMinimumInterval {
+            return noteWakeHeld(run, "a line was typed into its owner recently", now: now)
+        }
         // One line at a time into a tab.
-        guard !isTypingWakeLine(into: owner), subscriberTakesWakeLine(owner, now: now) else { return }
+        guard !isTypingWakeLine(into: owner) else {
+            return noteWakeHeld(run, "another line is being typed into its owner", now: now)
+        }
+        if let reason = wakeLineHoldReason(owner, now: now) {
+            return noteWakeHeld(run, "its owner \(owner.id.uuidString.prefix(8)) is \(reason)", now: now)
+        }
+        if run.wakeHoldReason != nil { noteWakeHeld(run, nil, now: now) }
         let line = AgentTaskRegistry.wakeLine(runID: run.id, counts: tasks.counts(of: run))
         run.isWaking = true
         Task { @MainActor [weak self] in
@@ -2048,13 +2286,64 @@ extension CherryControlServer {
             self.tasks.scheduleSave()
         }
     }
+
+    /// Logs (once per change, and only once the run settled
+    /// `wakeHoldLogDelay` ago) why its wake line is held, or that it goes
+    /// out after all (`reason` nil): a late line can be explained afterwards.
+    @MainActor
+    func noteWakeHeld(_ run: AgentRun, _ reason: String?, now: Date) {
+        guard reason != run.wakeHoldReason,
+              let settledAt = run.settledAt, now.timeIntervalSince(settledAt) >= Self.wakeHoldLogDelay
+        else { return }
+        run.wakeHoldReason = reason
+        let waited = Int(now.timeIntervalSince(settledAt))
+        SessionLog.notice("[task] wake line for \(run.id) \(reason.map { "held: \($0)" } ?? "goes out") (settled \(waited) s ago)")
+    }
+
+    static let wakeHoldLogDelay: TimeInterval = 30
+
+    /// Types the approval wake line into the run's owner once a task of it
+    /// awaits approval that the owner neither was woken for nor read, by
+    /// the settle wake line's rules (an idle owner, at most one line so
+    /// often, none while it waits in `wait_for_tasks`).
+    @MainActor
+    func deliverApprovalWakeIfReady(_ run: AgentRun) {
+        guard monitors.wakeLinesEnabled, !run.isWaking, run.activeWaits == 0, tasks.awaitsApprovalWake(run) else { return }
+        let seq = tasks.approvalSeq(of: run)
+        let now = Date()
+        guard let owner = locateOwner(run) else {
+            if let restoredAt = run.restoredAt, now.timeIntervalSince(restoredAt) < tasks.relinkGrace { return }
+            run.approvalWokenSeq = seq
+            tasks.scheduleSave()
+            return
+        }
+        if inRestoredGrace(run.relinkedAt, now: now) { return }
+        if let last = run.lastWakeAt, now.timeIntervalSince(last) < monitors.wakeMinimumInterval { return }
+        guard !isTypingWakeLine(into: owner), subscriberTakesWakeLine(owner, now: now) else { return }
+        let line = AgentTaskRegistry.approvalWakeLine(runID: run.id, counts: tasks.counts(of: run))
+        run.isWaking = true
+        Task { @MainActor [weak self] in
+            defer { run.isWaking = false }
+            guard let self else { return }
+            do {
+                _ = try await self.typeCherryLine(line, into: owner)
+                run.approvalWokenSeq = max(run.approvalWokenSeq, seq)
+            } catch {
+                if Self.inputMayHaveBeenTyped(error) { run.approvalWokenSeq = max(run.approvalWokenSeq, seq) }
+                SessionLog.debug("[task] approval wake line for \(run.id) not sent: \(error)")
+            }
+            run.lastWakeAt = Date()
+            self.tasks.scheduleSave()
+        }
+    }
 }
 
 // MARK: - Where a kickoff stands
 
 /// Where the kickoff is on the worker's screen.
 enum KickoffPlacement: Equatable, Sendable {
-    /// On the composer's prompt line: typed, not sent.
+    /// On the composer's prompt line, or inside Amp's composer box: typed,
+    /// not sent.
     case composer
     /// Above the composer (among the sent messages), or on a screen with
     /// no composer.
@@ -2073,15 +2362,22 @@ extension AgentTaskRegistry {
     /// oldest first), when `copiesBefore` copies of it were there before it
     /// was typed: a copy on the composer's prompt line (the last prompt
     /// line on screen, `AgentScreenActivity.isInputPromptLine`, also inside
-    /// a framed composer `│ > …`) is unsent; one more copy than before
-    /// anywhere else (among the sent messages, or on a screen without a
-    /// composer) was sent; otherwise it is not there.
+    /// a framed composer `│ > …`), or for Amp between the borders of its
+    /// composer box (`AgentScreenActivity.ampComposerBox`, rows without a
+    /// prompt glyph, however many a kickoff wraps over), is unsent; one
+    /// more copy than before anywhere else
+    /// (among the sent messages, or on a screen without a composer) was
+    /// sent; otherwise it is not there.
     nonisolated static func kickoffPlacement(taskID: String, in lines: [String], agent: String, copiesBefore: Int = 0) -> KickoffPlacement {
         let marker = kickoffMarker(taskID: taskID)
         let copies = lines.indices.filter { lines[$0].contains(marker) }
         guard let markerLine = copies.last else { return .absent }
         if isComposerPromptLine(lines[markerLine], agent: agent),
            !lines[(markerLine + 1)...].contains(where: { isComposerPromptLine($0, agent: agent) }) {
+            return .composer
+        }
+        if agent == "amp", let box = AgentScreenActivity.ampComposerBox(in: lines),
+           box.lowerBound < markerLine, markerLine < box.upperBound {
             return .composer
         }
         return copies.count > copiesBefore ? .submitted : .absent

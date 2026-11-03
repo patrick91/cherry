@@ -17,7 +17,8 @@ enum HostProtocol {
     /// in binary frames instead of base64 in JSON. The app's control
     /// connection speaks the same JSON messages as in v5.
     /// v7: `ClearHistory`, `Create`'s `colors`, and `SessionInfo`'s
-    /// `bracketed_paste`.
+    /// `bracketed_paste`. `SessionInfo`'s `modify_other_keys` came later
+    /// without a new version: a v7 host may leave it out.
     static let version: UInt32 = 7
     static let maxFrameBytes = 16 * 1_024 * 1_024
     /// The most bytes one `SendInput` carries.
@@ -28,20 +29,12 @@ enum HostProtocol {
     static let maxTagBytes = 16 * 1_024
     static let defaultCols = 120
     static let defaultRows = 32
-    /// A connection that is neither attached nor subscribed must send a frame
-    /// at least this often.
-    static let idleTimeout: Duration = .seconds(10)
     /// Subscribed connections send `Ping` at least this often.
     static let heartbeatInterval: Duration = .seconds(15)
-    /// The host drops a subscribed connection that sent nothing for this long.
-    static let heartbeatTimeout: Duration = .seconds(45)
 
     enum ErrorCode {
         static let versionMismatch = "version_mismatch"
-        static let requestFailed = "request_failed"
-        static let unsupportedOperation = "unsupported_operation"
         static let unknownSession = "unknown_session"
-        static let notRunning = "not_running"
     }
 
     static func isValidSize(cols: Int, rows: Int) -> Bool {

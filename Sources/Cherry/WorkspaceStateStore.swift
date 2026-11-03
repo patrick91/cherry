@@ -1,36 +1,28 @@
 import CherryControl
 import Combine
-import CryptoKit
 import Darwin
 import Foundation
 
 // MARK: - Saved records
 
-/// One project window's tabs: every worktree workspace of one repository.
+/// One project window's tabs. A window saves one `WorktreeStateRecord`, for
+/// its folder; a file saved while Cherry had worktree spaces can have one
+/// for each worktree the window showed (`workspaceRecord(root:)` folds
+/// them). The keys stay as they were, so older builds read the file.
 struct RepositoryStateRecord: Codable, Equatable, Sendable {
     static let currentVersion = 1
 
     /// Files with another version are not migrated: they are moved aside
     /// (`WorkspaceStateStore`), never written over.
-    var version: Int
+    var version: Int = RepositoryStateRecord.currentVersion
     var repositoryRoot: String
+    /// The window's folder (`RepositoryWorkspace.workspaceRoot`).
     var activeWorktreeRoot: String?
     var worktrees: [WorktreeStateRecord]
     var savedAt: Date?
-
-    init(
-        version: Int = RepositoryStateRecord.currentVersion,
-        repositoryRoot: String,
-        activeWorktreeRoot: String?,
-        worktrees: [WorktreeStateRecord],
-        savedAt: Date? = nil
-    ) {
-        self.version = version
-        self.repositoryRoot = repositoryRoot
-        self.activeWorktreeRoot = activeWorktreeRoot
-        self.worktrees = worktrees
-        self.savedAt = savedAt
-    }
+    /// Another window's id (`ProjectWindowValue.windowID`); nil, and left
+    /// out, in a primary's file. `load` checks it with `repositoryRoot`.
+    var windowID: UUID? = nil
 
     var hasSessions: Bool {
         worktrees.contains { !$0.sessions.isEmpty }
@@ -39,33 +31,34 @@ struct RepositoryStateRecord: Codable, Equatable, Sendable {
     func worktree(root: String) -> WorktreeStateRecord? {
         worktrees.first { $0.root == root }
     }
+
+    /// The window's tabs as one record for `root`: the record saved for
+    /// that folder (or for `repositoryRoot`) first, then the other records'
+    /// tabs with their saved layout, as `WorktreeStateRecord.merging(kept:)`
+    /// adds them. Nil when it saved none.
+    func workspaceRecord(root: String) -> WorktreeStateRecord? {
+        guard !worktrees.isEmpty else { return nil }
+        let first = worktrees.firstIndex { $0.root == root }
+            ?? worktrees.firstIndex { $0.root == repositoryRoot }
+            ?? worktrees.startIndex
+        var record = worktrees[first]
+        record.root = root
+        for (index, other) in worktrees.enumerated() where index != first {
+            record = record.merging(kept: other)
+        }
+        return record
+    }
 }
 
-/// One worktree's `TerminalWorkspace`.
+/// The tabs of one folder's `TerminalWorkspace`.
 struct WorktreeStateRecord: Codable, Equatable, Sendable {
     var root: String
     /// In `TerminalWorkspace.sessions` order.
     var sessions: [WorkspaceSessionRecord]
-    var displayItems: [WorkspaceDisplayItemRecord]
-    var splitGroups: [WorkspaceSplitGroupRecord]
+    var displayItems: [WorkspaceDisplayItemRecord] = []
+    var splitGroups: [WorkspaceSplitGroupRecord] = []
     var selectedSessionID: UUID?
-    var collapsedAgentGroupIDs: [UUID]
-
-    init(
-        root: String,
-        sessions: [WorkspaceSessionRecord],
-        displayItems: [WorkspaceDisplayItemRecord] = [],
-        splitGroups: [WorkspaceSplitGroupRecord] = [],
-        selectedSessionID: UUID? = nil,
-        collapsedAgentGroupIDs: [UUID] = []
-    ) {
-        self.root = root
-        self.sessions = sessions
-        self.displayItems = displayItems
-        self.splitGroups = splitGroups
-        self.selectedSessionID = selectedSessionID
-        self.collapsedAgentGroupIDs = collapsedAgentGroupIDs
-    }
+    var collapsedAgentGroupIDs: [UUID] = []
 
     /// Whether a restore may bring back any tab: one bound to a hosted
     /// session, or one whose session's Create had not answered when it was
@@ -151,15 +144,15 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
     var id: UUID
     var kind: TerminalSession.SessionKind
     var title: String
-    var titleSource: TerminalSession.TitleSource
+    var titleSource: TerminalSession.TitleSource = .system
     var agentName: String?
     var parentAgentID: UUID?
     var commandName: String?
     var launchCommand: String?
-    var launchEnvironment: [String: String]
+    var launchEnvironment: [String: String] = [:]
     var launchWorkingDirectory: String?
     var workingDirectory: String
-    var restartOnExit: Bool
+    var restartOnExit = false
     var projectRoot: String?
     var hosted: HostedSessionBindingRecord?
     /// The `request_id` (lowercased) of the Create that started, or was
@@ -196,50 +189,6 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
     /// the tab comes back unread. Saved only when true.
     var hasUnreadNotification: Bool?
 
-    init(
-        id: UUID,
-        kind: TerminalSession.SessionKind,
-        title: String,
-        titleSource: TerminalSession.TitleSource = .system,
-        agentName: String? = nil,
-        parentAgentID: UUID? = nil,
-        commandName: String? = nil,
-        launchCommand: String? = nil,
-        launchEnvironment: [String: String] = [:],
-        launchWorkingDirectory: String? = nil,
-        workingDirectory: String,
-        restartOnExit: Bool = false,
-        projectRoot: String? = nil,
-        hosted: HostedSessionBindingRecord? = nil,
-        launchRequestID: String? = nil,
-        hostKey: String? = nil,
-        systemEnd: SystemSessionEnd? = nil,
-        exitStatus: Int32? = nil,
-        savedAt: Date? = nil,
-        hasUnreadNotification: Bool? = nil
-    ) {
-        self.id = id
-        self.kind = kind
-        self.title = title
-        self.titleSource = titleSource
-        self.agentName = agentName
-        self.parentAgentID = parentAgentID
-        self.commandName = commandName
-        self.launchCommand = launchCommand
-        self.launchEnvironment = launchEnvironment
-        self.launchWorkingDirectory = launchWorkingDirectory
-        self.workingDirectory = workingDirectory
-        self.restartOnExit = restartOnExit
-        self.projectRoot = projectRoot
-        self.hosted = hosted
-        self.launchRequestID = launchRequestID
-        self.hostKey = hostKey
-        self.systemEnd = systemEnd
-        self.exitStatus = exitStatus
-        self.savedAt = savedAt
-        self.hasUnreadNotification = hasUnreadNotification
-    }
-
     /// A tab whose program can still be running after Cherry quit.
     var isRestorable: Bool {
         hosted != nil
@@ -253,7 +202,7 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
     }
 
     /// A saved tab that may own a session of This Mac (a persistent tab,
-    /// which closing or a worktree removal ends): bound to a local session
+    /// which closing ends): bound to a local session
     /// it did not only attach to, or saved while its Create was under way.
     var mayOwnLocalSession: Bool {
         mayOwnSession(on: .local)
@@ -301,7 +250,9 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
             hostKey: hostKey
         )
     }
+}
 
+extension WorkspaceSessionRecord {
     /// Every tab carries its own metadata: a restored tab attached to a
     /// hosted session (`hostedAttachment`) got its kind, agent, command and
     /// launch settings from its record. `restoredRecord` (what a restored
@@ -357,24 +308,6 @@ struct HostedSessionBindingRecord: Codable, Hashable, Sendable {
     /// back only attached. Nil in records saved before this was recorded.
     var owned: Bool?
 
-    init(host: String, hostID: String, sessionID: String, remoteWorkingDirectory: String? = nil, owned: Bool? = nil) {
-        self.host = host
-        self.hostID = hostID
-        self.sessionID = sessionID
-        self.remoteWorkingDirectory = remoteWorkingDirectory
-        self.owned = owned
-    }
-
-    init(_ attachment: HostedSessionAttachment, owned: Bool? = nil) {
-        self.init(
-            host: attachment.host.id,
-            hostID: attachment.hostID,
-            sessionID: attachment.sessionID,
-            remoteWorkingDirectory: attachment.remoteWorkingDirectory,
-            owned: owned
-        )
-    }
-
     /// Identifies the hosted session whatever the tab: the host's identity
     /// and its session id.
     var sessionKey: String {
@@ -391,6 +324,18 @@ struct HostedSessionBindingRecord: Codable, Hashable, Sendable {
     }
 }
 
+extension HostedSessionBindingRecord {
+    init(_ attachment: HostedSessionAttachment, owned: Bool? = nil) {
+        self.init(
+            host: attachment.host.id,
+            hostID: attachment.hostID,
+            sessionID: attachment.sessionID,
+            remoteWorkingDirectory: attachment.remoteWorkingDirectory,
+            owned: owned
+        )
+    }
+}
+
 struct WorkspaceDisplayItemRecord: Codable, Equatable, Sendable {
     enum Kind: String, Codable, Sendable {
         case single
@@ -400,12 +345,9 @@ struct WorkspaceDisplayItemRecord: Codable, Equatable, Sendable {
     var kind: Kind
     /// The tab id of a single item, the split group id of a split.
     var id: UUID
+}
 
-    init(kind: Kind, id: UUID) {
-        self.kind = kind
-        self.id = id
-    }
-
+extension WorkspaceDisplayItemRecord {
     init(_ item: TerminalDisplayItem) {
         switch item {
         case .single(let sessionID):
@@ -421,14 +363,9 @@ struct WorkspaceSplitGroupRecord: Codable, Equatable, Sendable {
     var paneSessionIDs: [UUID]
     var activeSessionID: UUID
     var widthWeights: [Double]
+}
 
-    init(id: UUID, paneSessionIDs: [UUID], activeSessionID: UUID, widthWeights: [Double]) {
-        self.id = id
-        self.paneSessionIDs = paneSessionIDs
-        self.activeSessionID = activeSessionID
-        self.widthWeights = widthWeights
-    }
-
+extension WorkspaceSplitGroupRecord {
     init(_ group: TerminalSplitGroup) {
         self.init(
             id: group.id,
@@ -439,22 +376,39 @@ struct WorkspaceSplitGroupRecord: Codable, Equatable, Sendable {
     }
 }
 
+/// A project window as `open-windows.json` lists it: its project as
+/// `RepositoryWorkspace.repositoryRoot` names it (the standardized folder,
+/// or a `device:<uuid>:/path` key) and, for every window but the project's
+/// primary one, its own id. The primary window keeps the file and keys a
+/// project's one window had before windows had ids (#22).
+struct ProjectWindowValue: Codable, Hashable, Sendable {
+    var projectRoot: String
+    var windowID: UUID?
+
+    static func primary(_ projectRoot: String) -> ProjectWindowValue {
+        ProjectWindowValue(projectRoot: projectRoot, windowID: nil)
+    }
+
+    var isPrimary: Bool { windowID == nil }
+}
+
 /// Project windows open when Cherry last saved them (at quit, or when a
-/// window opened or closed), by repository root.
+/// window opened or closed).
 struct OpenProjectWindowsRecord: Codable, Equatable, Sendable {
     static let currentVersion = 1
 
-    var version: Int
+    var version: Int = OpenProjectWindowsRecord.currentVersion
+    /// The windows' projects: what builds before #22 read (they reopen each
+    /// one's primary window when its file has tabs).
     var projectRoots: [String]
-
-    init(version: Int = OpenProjectWindowsRecord.currentVersion, projectRoots: [String]) {
-        self.version = version
-        self.projectRoots = projectRoots
-    }
+    /// Every window, in the order they were saved in (a primary has no
+    /// `windowID`). Nil in a file of a build before #22: its
+    /// `projectRoots` are primaries.
+    var windows: [ProjectWindowValue]? = nil
 }
 
-/// Saved tabs forgotten with their worktree (it was removed, or no longer
-/// exists) whose sessions of This Mac are still to be ended. An entry stays
+/// Saved tabs no open tab showed whose sessions of This Mac are still to be
+/// ended (a window closed, or a quit, that ended sessions). An entry stays
 /// until the host's list shows none of its sessions running, so a session
 /// this run could not end before it quit (the host could not be reached)
 /// is ended at the next launch
@@ -471,13 +425,8 @@ struct SessionsToEndRecord: Codable, Equatable, Sendable {
         var forgottenAt: Date
     }
 
-    var version: Int
+    var version: Int = SessionsToEndRecord.currentVersion
     var entries: [Entry]
-
-    init(version: Int = SessionsToEndRecord.currentVersion, entries: [Entry]) {
-        self.version = version
-        self.entries = entries
-    }
 }
 
 /// When Cherry quit for a log out, restart or shut down
@@ -490,18 +439,12 @@ struct SystemQuitsRecord: Codable, Equatable, Sendable {
     /// The newest ones kept.
     static let limit = 32
 
-    var version: Int
+    var version: Int = SystemQuitsRecord.currentVersion
     var quits: [Date]
-
-    init(version: Int = SystemQuitsRecord.currentVersion, quits: [Date]) {
-        self.version = version
-        self.quits = quits
-    }
 }
 
 /// Sessions of This Mac this app ended on purpose, oldest first: a tab's
-/// close, End Sessions, Background Sessions → End, a removed worktree's
-/// tabs, a clean exit's removal, a restart's previous session, or
+/// close, End Sessions, Background Sessions → End, a clean exit's removal, a restart's previous session, or
 /// Persistent Sessions → Terminate or Remove. A saved tab that names one
 /// never comes back as ended by the system (`SystemEndedSessions`), even
 /// after a restart: a closed window's record still names the sessions
@@ -518,18 +461,12 @@ struct EndedSessionsRecord: Codable, Equatable, Sendable {
         var endedAt: Date
     }
 
-    var version: Int
+    var version: Int = EndedSessionsRecord.currentVersion
     var entries: [Entry]
     /// The list was lost (its file could not be read) at this time: the
     /// sessions a record saved before it names may have been ended on
     /// purpose, so such a record never comes back as ended by the system.
     var lostBefore: Date?
-
-    init(version: Int = EndedSessionsRecord.currentVersion, entries: [Entry], lostBefore: Date? = nil) {
-        self.version = version
-        self.entries = entries
-        self.lostBefore = lostBefore
-    }
 }
 
 /// Sessions of This Mac whose holders the local host found killed
@@ -545,13 +482,8 @@ struct LostSessionsRecord: Codable, Equatable, Sendable {
         var seenAt: Date
     }
 
-    var version: Int
+    var version: Int = LostSessionsRecord.currentVersion
     var entries: [Entry]
-
-    init(version: Int = LostSessionsRecord.currentVersion, entries: [Entry]) {
-        self.version = version
-        self.entries = entries
-    }
 }
 
 /// Sessions of This Mac that had a bell or notification while in the
@@ -568,13 +500,8 @@ struct UnreadSessionsRecord: Codable, Equatable, Sendable {
         var since: Date
     }
 
-    var version: Int
+    var version: Int = UnreadSessionsRecord.currentVersion
     var entries: [Entry]
-
-    init(version: Int = UnreadSessionsRecord.currentVersion, entries: [Entry]) {
-        self.version = version
-        self.entries = entries
-    }
 }
 
 /// What a project's state file that this version could not use (and moved
@@ -593,17 +520,19 @@ struct SetAsideStateSummary: Equatable, Sendable {
 
 // MARK: - Store
 
-/// Saves each project's tabs as JSON under
-/// `Application Support/<app>/Workspaces/<sha256(repository root)>.json`,
-/// replacing the file atomically, owner-only, with the open windows
-/// (`open-windows.json`) and the sessions of forgotten tabs still to end
-/// (`sessions-to-end.json`, `SessionsToEndRecord`) beside them. Writes run on
-/// one serial queue, so a synchronous save or load sees every earlier write.
+/// Saves each project window's tabs as JSON under
+/// `Application Support/<app>/Workspaces/<sha256(repository root)>.json`
+/// (a project's primary window) or `<sha256(root, NUL, window id)>.json`
+/// (another window of it), replacing the file atomically, owner-only, with
+/// the open windows (`open-windows.json`) and the sessions of forgotten tabs
+/// still to end (`sessions-to-end.json`, `SessionsToEndRecord`) beside them.
+/// Writes run on one serial queue, so a synchronous save or load sees every
+/// earlier write.
 ///
 /// A file that is there but cannot be used (another version, one that does
-/// not decode, or another root's) is never written over: it is moved aside
-/// first, to `<name>.<v2|unreadable|other-root>-<UTC time>.bak` beside it,
-/// so a build of another version can still be pointed at it.
+/// not decode, or another root's or window's) is never written over: it is
+/// moved aside first, to `<name>.<v2|unreadable|other-root>-<UTC time>.bak`
+/// beside it, so a build of another version can still be pointed at it.
 ///
 /// With an `instanceLock` (the app's store), the store is used only while
 /// this copy of the app holds that lock: another copy with the same identity
@@ -630,21 +559,30 @@ final class WorkspaceStateStore: @unchecked Sendable {
     static func defaultDirectory(
         applicationSupportName: String = CherryAppIdentity.current.applicationSupportName
     ) -> URL {
-        FileManager.default
-            .homeDirectoryForCurrentUser
-            .appendingPathComponent("Library", isDirectory: true)
-            .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent(applicationSupportName, isDirectory: true)
+        CherryAppIdentity.applicationSupportDirectory(applicationSupportName: applicationSupportName)
             .appendingPathComponent("Workspaces", isDirectory: true)
     }
 
-    static func stateFileName(repositoryRoot: String) -> String {
-        let digest = SHA256.hash(data: Data(repositoryRoot.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined() + ".json"
+    /// A project window's state file: the primary's (`windowID` nil) is
+    /// named by its root, as a project's one window was before windows had
+    /// ids; another window's by its root, a NUL and its id, so builds before
+    /// #22 never load it but still read it as a state file.
+    static func stateFileName(repositoryRoot: String, windowID: UUID? = nil) -> String {
+        let key = windowID.map { "\(repositoryRoot)\u{0}\($0.uuidString)" } ?? repositoryRoot
+        return CherryAppIdentity.projectFileName(for: key)
     }
 
-    func stateFileURL(repositoryRoot: String) -> URL {
-        directory.appendingPathComponent(Self.stateFileName(repositoryRoot: repositoryRoot), isDirectory: false)
+    /// A project window's state file (`stateFileName`), not a set-aside
+    /// copy or another record.
+    private static func isStateFileName(_ name: String) -> Bool {
+        name.count == 69 && name.hasSuffix(".json") && name.dropLast(5).allSatisfy({ $0.isHexDigit })
+    }
+
+    func stateFileURL(repositoryRoot: String, windowID: UUID? = nil) -> URL {
+        directory.appendingPathComponent(
+            Self.stateFileName(repositoryRoot: repositoryRoot, windowID: windowID),
+            isDirectory: false
+        )
     }
 
     var openProjectWindowsFileURL: URL {
@@ -674,37 +612,29 @@ final class WorkspaceStateStore: @unchecked Sendable {
         instanceLock?.markQuitting()
     }
 
-    /// Nil when nothing was saved, when the store is disabled (another copy
-    /// of the app holds the instance lock), or when the file cannot be used:
-    /// unreadable, another version, or for another root (a hash collision).
-    /// Such a file is moved aside, never written over.
-    func load(repositoryRoot: String) -> RepositoryStateRecord? {
+    /// The tabs a project window saved (`windowID` nil: the project's
+    /// primary window). Nil when nothing was saved, when the store is
+    /// disabled (another copy of the app holds the instance lock), or when
+    /// the file cannot be used: unreadable, another version, or for another
+    /// root or window (a hash collision). Such a file is moved aside, never
+    /// written over.
+    func load(repositoryRoot: String, windowID: UUID? = nil) -> RepositoryStateRecord? {
         guard isEnabled else { return nil }
-        let fileURL = stateFileURL(repositoryRoot: repositoryRoot)
+        let fileURL = stateFileURL(repositoryRoot: repositoryRoot, windowID: windowID)
         return queue.sync { () -> RepositoryStateRecord? in
-            switch Self.readFile(RepositoryStateRecord.self, from: fileURL) {
-            case .missing:
+            guard let state = readVersionedLocked(RepositoryStateRecord.self, from: fileURL) else { return nil }
+            guard state.repositoryRoot == repositoryRoot, state.windowID == windowID else {
+                setAsideLocked(fileURL, label: "other-root")
                 return nil
-            case .unusable(let version):
-                setAsideLocked(fileURL, label: version.map { "v\($0)" } ?? "unreadable")
-                return nil
-            case .usable(let state):
-                guard state.version == RepositoryStateRecord.currentVersion else {
-                    setAsideLocked(fileURL, label: "v\(state.version)")
-                    return nil
-                }
-                guard state.repositoryRoot == repositoryRoot else {
-                    setAsideLocked(fileURL, label: "other-root")
-                    return nil
-                }
-                return state
             }
+            return state
         }
     }
 
+    /// Writes the file of the window `state` names (`repositoryRoot`, `windowID`).
     func save(_ state: RepositoryStateRecord) {
         guard isEnabled else { return }
-        let fileURL = stateFileURL(repositoryRoot: state.repositoryRoot)
+        let fileURL = stateFileURL(repositoryRoot: state.repositoryRoot, windowID: state.windowID)
         queue.async {
             self.writeLocked(state, to: fileURL)
         }
@@ -712,9 +642,9 @@ final class WorkspaceStateStore: @unchecked Sendable {
 
     func saveSynchronously(_ state: RepositoryStateRecord) {
         guard isEnabled else { return }
-        let fileURL = stateFileURL(repositoryRoot: state.repositoryRoot)
+        let fileURL = stateFileURL(repositoryRoot: state.repositoryRoot, windowID: state.windowID)
         queue.sync {
-            writeLocked(state, to: fileURL)
+            _ = writeLocked(state, to: fileURL)
         }
     }
 
@@ -723,78 +653,282 @@ final class WorkspaceStateStore: @unchecked Sendable {
         queue.sync {}
     }
 
-    func hasSavedTabs(repositoryRoot: String) -> Bool {
-        load(repositoryRoot: repositoryRoot)?.hasSessions == true
+    func hasSavedTabs(repositoryRoot: String, windowID: UUID? = nil) -> Bool {
+        load(repositoryRoot: repositoryRoot, windowID: windowID)?.hasSessions == true
     }
 
+    /// The saved windows in their saved order; a file of a build before
+    /// #22 lists primaries only (its `projectRoots`).
+    func loadOpenProjectWindows() -> [ProjectWindowValue] {
+        loadSavedOpenProjectWindows() ?? []
+    }
+
+    /// The saved windows as `loadOpenProjectWindows` reads them, or nil when
+    /// there is no list this version can use: none was saved, or the file
+    /// was moved aside (unreadable, or of another version).
+    func loadSavedOpenProjectWindows() -> [ProjectWindowValue]? {
+        loadOpenProjectWindowsRecord().map { $0.windows ?? $0.projectRoots.map(ProjectWindowValue.primary) }
+    }
+
+    /// Saves `windows` in their order, with their projects, once each and
+    /// sorted, as `projectRoots` for builds before #22.
+    func saveOpenProjectWindows(_ windows: [ProjectWindowValue], synchronously: Bool = false) {
+        saveOpenProjectWindowsRecord(
+            OpenProjectWindowsRecord(projectRoots: Array(Set(windows.map(\.projectRoot))).sorted(), windows: windows),
+            synchronously: synchronously
+        )
+    }
+
+    /// The saved windows' projects as builds before #22 read them (`projectRoots`).
     func loadOpenProjectWindowRoots() -> [String] {
-        guard isEnabled else { return [] }
+        loadOpenProjectWindowsRecord()?.projectRoots ?? []
+    }
+
+    /// Saves each of `projectRoots`' primary window, and `projectRoots` as given.
+    func saveOpenProjectWindowRoots(_ projectRoots: [String], synchronously: Bool = false) {
+        saveOpenProjectWindowsRecord(
+            OpenProjectWindowsRecord(projectRoots: projectRoots, windows: projectRoots.map(ProjectWindowValue.primary)),
+            synchronously: synchronously
+        )
+    }
+
+    private func loadOpenProjectWindowsRecord() -> OpenProjectWindowsRecord? {
+        guard isEnabled else { return nil }
         let fileURL = openProjectWindowsFileURL
-        return queue.sync { () -> [String] in
-            switch Self.readFile(OpenProjectWindowsRecord.self, from: fileURL) {
-            case .missing:
-                return []
-            case .unusable(let version):
-                setAsideLocked(fileURL, label: version.map { "v\($0)" } ?? "unreadable")
-                return []
-            case .usable(let record):
-                guard record.version == OpenProjectWindowsRecord.currentVersion else {
-                    setAsideLocked(fileURL, label: "v\(record.version)")
-                    return []
-                }
-                return record.projectRoots
-            }
+        return queue.sync {
+            readVersionedLocked(OpenProjectWindowsRecord.self, from: fileURL)
         }
     }
 
-    func saveOpenProjectWindowRoots(_ projectRoots: [String], synchronously: Bool = false) {
+    private func saveOpenProjectWindowsRecord(_ record: OpenProjectWindowsRecord, synchronously: Bool) {
         guard isEnabled else { return }
-        let record = OpenProjectWindowsRecord(projectRoots: projectRoots)
         let fileURL = openProjectWindowsFileURL
         if synchronously {
-            queue.sync { writeLocked(record, to: fileURL) }
+            queue.sync { _ = writeLocked(record, to: fileURL) }
         } else {
             queue.async { self.writeLocked(record, to: fileURL) }
         }
     }
 
-    /// Windows to reopen at launch: saved ones whose directory still exists
-    /// and whose workspace had tabs. A project on another Mac (a
-    /// `ProjectLocation` key) is never looked for on this Mac's disk: it is
-    /// reopened while its device is still known (`remoteProjectIsKnown`).
-    func projectWindowRootsToReopen(remoteProjectIsKnown: (String) -> Bool = { _ in false }) -> [String] {
-        var seen = Set<String>()
-        return loadOpenProjectWindowRoots().filter { root in
-            guard seen.insert(root).inserted else { return false }
+    /// Windows to reopen at launch, with the tabs each saved: each saved
+    /// window (`saved`, else `loadOpenProjectWindows()`) once, in saved
+    /// order, whose directory still exists and whose own file has tabs. A
+    /// project on another Mac (a `ProjectLocation` key) is never looked for
+    /// on this Mac's disk: it is reopened while its device is still known
+    /// (`remoteProjectIsKnown`).
+    func projectWindowsToReopen(
+        _ saved: [ProjectWindowValue]? = nil,
+        remoteProjectIsKnown: (String) -> Bool = { _ in false }
+    ) -> [(window: ProjectWindowValue, state: RepositoryStateRecord)] {
+        var seen = Set<ProjectWindowValue>()
+        return (saved ?? loadOpenProjectWindows()).compactMap { window in
+            guard seen.insert(window).inserted else { return nil }
+            let root = window.projectRoot
             if ProjectLocation.isRemoteKey(root) {
-                return remoteProjectIsKnown(root) && hasSavedTabs(repositoryRoot: root)
+                guard remoteProjectIsKnown(root) else { return nil }
+            } else {
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: root, isDirectory: &isDirectory),
+                      isDirectory.boolValue
+                else { return nil }
             }
-            var isDirectory: ObjCBool = false
-            return FileManager.default.fileExists(atPath: root, isDirectory: &isDirectory)
-                && isDirectory.boolValue
-                && hasSavedTabs(repositoryRoot: root)
+            guard let state = load(repositoryRoot: root, windowID: window.windowID), state.hasSessions else { return nil }
+            return (window, state)
         }
     }
 
-    /// What the state file of `repositoryRoot` that this version could not
-    /// use said: the one still there (it could not be moved aside), else
-    /// the newest one moved aside, while no usable file replaced it. Nil
-    /// when a usable file is there, when none was ever set aside, or when
-    /// the store is disabled.
-    func setAsideState(repositoryRoot: String) -> SetAsideStateSummary? {
+    /// The saved windows of This Mac (`saved`) with saved tabs whose folder
+    /// is missing (an unmounted volume), once each, in saved order:
+    /// `projectWindowsToReopen` skips them, and they stay saved as open
+    /// until it can reopen them (`ProjectWindowRegistry`).
+    func projectWindowsAwaitingTheirFolder(_ saved: [ProjectWindowValue]) -> [ProjectWindowValue] {
+        var seen = Set<ProjectWindowValue>()
+        return saved.filter { window in
+            guard seen.insert(window).inserted, !ProjectLocation.isRemoteKey(window.projectRoot) else { return false }
+            var isDirectory: ObjCBool = false
+            guard !FileManager.default.fileExists(atPath: window.projectRoot, isDirectory: &isDirectory)
+                    || !isDirectory.boolValue
+            else { return false }
+            return load(repositoryRoot: window.projectRoot, windowID: window.windowID)?.hasSessions == true
+        }
+    }
+
+    /// The projects of the windows to reopen at launch (`projectWindowsToReopen`).
+    func projectWindowRootsToReopen(remoteProjectIsKnown: (String) -> Bool = { _ in false }) -> [String] {
+        projectWindowsToReopen(remoteProjectIsKnown: remoteProjectIsKnown).map(\.window.projectRoot)
+    }
+
+    // MARK: Closed windows (#22)
+
+    /// A window the user closed while another window of its project stays
+    /// open (or is still to open at launch): its saved tabs are forgotten.
+    /// The primary's file (`windowID` nil) is written as an empty record
+    /// (no tabs, `savedAt` now), never removed: with no file the next
+    /// primary window's orphan scan would take every session kept on
+    /// purpose for its own (`OrphanedSessionCriteria`). Another window's
+    /// file is removed. Queued behind the window's last save and the ends
+    /// its close recorded; a protected file is left alone.
+    func forgetWindowState(repositoryRoot: String, windowID: UUID?) {
+        guard isEnabled else { return }
+        let fileURL = stateFileURL(repositoryRoot: repositoryRoot, windowID: windowID)
+        let now = Date()
+        queue.async {
+            guard windowID == nil else {
+                guard !self.protectedFiles.contains(fileURL.path) else { return }
+                unlink(fileURL.path)
+                return
+            }
+            self.writeLocked(RepositoryStateRecord(repositoryRoot: repositoryRoot, worktrees: [], savedAt: now), to: fileURL)
+        }
+    }
+
+    /// The project's last window closed, and it is not the primary: its
+    /// saved tabs become the primary's, for the next time the project
+    /// opens. Its record (checked to be its root's and window's) is written
+    /// under the primary's name without `windowID`, a primary file this
+    /// version cannot use (or of another root or window) moved aside first,
+    /// as `load` does; its own file is removed only once that write
+    /// succeeded, so nothing is lost when it fails. Queued as
+    /// `forgetWindowState` is.
+    func moveWindowStateToPrimary(repositoryRoot: String, windowID: UUID) {
+        guard isEnabled else { return }
+        queue.async {
+            self.moveWindowStateToPrimaryLocked(repositoryRoot: repositoryRoot, windowID: windowID)
+        }
+    }
+
+    /// `moveWindowStateToPrimary`'s work, on `queue`: true once the record
+    /// is the primary's and its own file is gone.
+    @discardableResult
+    private func moveWindowStateToPrimaryLocked(repositoryRoot: String, windowID: UUID) -> Bool {
+        let fileURL = stateFileURL(repositoryRoot: repositoryRoot, windowID: windowID)
+        let primaryURL = stateFileURL(repositoryRoot: repositoryRoot)
+        guard var state = readVersionedLocked(RepositoryStateRecord.self, from: fileURL),
+              state.repositoryRoot == repositoryRoot, state.windowID == windowID
+        else { return false }
+        if let primary = readVersionedLocked(RepositoryStateRecord.self, from: primaryURL),
+           primary.repositoryRoot != repositoryRoot || primary.windowID != nil {
+            setAsideLocked(primaryURL, label: "other-root")
+        }
+        state.windowID = nil
+        guard writeLocked(state, to: primaryURL) else { return false }
+        return unlink(fileURL.path) == 0
+    }
+
+    /// What the launch's sweep did with the state files of windows no list
+    /// named (`removeAbandonedWindowStates`).
+    struct AbandonedWindowStates: Sendable {
+        /// Removed: their frames go too.
+        var removed: [ProjectWindowValue] = []
+        /// Moved to their project's primary file: their frames go to the
+        /// primary's keys.
+        var movedToPrimary: [ProjectWindowValue] = []
+    }
+
+    /// What `removeAbandonedWindowStates` reads of a state file: never its
+    /// tabs.
+    private struct StateFileHeader: Decodable {
+        var version: Int
+        var repositoryRoot: String
+        var windowID: UUID?
+    }
+
+    /// In the background: removes the state files of This Mac's windows
+    /// other than primaries (a `windowID`, a root that is no device's key)
+    /// that `listed` (the windows the launch read as open, from a list it
+    /// could use) does not name and that were last written before `cutoff`
+    /// (when it read them), then gives `completion` what it did, on the
+    /// main queue. They are no window's: every window open this run was
+    /// listed or has saved since, a window the launch could not reopen
+    /// stays listed, and a window closed while its project stayed open
+    /// removed its own file. A crash between such a close's save and its
+    /// removal leaves one, and so does an older build, which reopens
+    /// primaries only and drops the others from the list. One of a project
+    /// no window of which is listed, whose primary file has no tabs, is
+    /// moved to the primary's file instead, the newest first, as the
+    /// project's last window's close would have (`moveWindowStateToPrimary`,
+    /// which may have failed); with a primary file this version cannot use,
+    /// it is left. Never a primary's file, a device project's (its device
+    /// may be unknown now, and its stand-in window keeps its tabs as
+    /// saved), a protected or unusable one, one under another window's
+    /// name, or any while the store is disabled. Reads only each file's
+    /// header (`StateFileHeader`), not its tabs.
+    func removeAbandonedWindowStates(
+        listed: Set<ProjectWindowValue>,
+        modifiedBefore cutoff: Date,
+        completion: @escaping @MainActor @Sendable (AbandonedWindowStates) -> Void
+    ) {
+        guard isEnabled else { return }
+        let directory = directory
+        let listedRoots = Set(listed.map(\.projectRoot))
+        queue.async {
+            let manager = FileManager.default
+            var abandoned: [(url: URL, modified: Date, window: ProjectWindowValue)] = []
+            for name in (try? manager.contentsOfDirectory(atPath: directory.path)) ?? [] where Self.isStateFileName(name) {
+                let url = directory.appendingPathComponent(name, isDirectory: false)
+                guard !self.protectedFiles.contains(url.path),
+                      let modified = (try? manager.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+                      modified < cutoff,
+                      case .usable(let header) = Self.readFile(StateFileHeader.self, from: url),
+                      header.version == RepositoryStateRecord.currentVersion,
+                      let windowID = header.windowID,
+                      !ProjectLocation.isRemoteKey(header.repositoryRoot),
+                      name == Self.stateFileName(repositoryRoot: header.repositoryRoot, windowID: windowID)
+                else { continue }
+                let window = ProjectWindowValue(projectRoot: header.repositoryRoot, windowID: windowID)
+                if !listed.contains(window) {
+                    abandoned.append((url, modified, window))
+                }
+            }
+            var result = AbandonedWindowStates()
+            for file in abandoned.sorted(by: { $0.modified > $1.modified }) {
+                let root = file.window.projectRoot
+                if !listedRoots.contains(root) {
+                    switch Self.readFile(RepositoryStateRecord.self, from: self.stateFileURL(repositoryRoot: root)) {
+                    case .usable(let primary)
+                        where primary.version == RepositoryStateRecord.currentVersion
+                            && primary.repositoryRoot == root && primary.windowID == nil && primary.hasSessions:
+                        break
+                    case .missing, .usable:
+                        if let windowID = file.window.windowID,
+                           self.moveWindowStateToPrimaryLocked(repositoryRoot: root, windowID: windowID) {
+                            result.movedToPrimary.append(file.window)
+                        }
+                        continue
+                    case .unusable:
+                        continue
+                    }
+                }
+                if unlink(file.url.path) == 0 {
+                    result.removed.append(file.window)
+                }
+            }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { completion(result) }
+            }
+        }
+    }
+
+    /// What the state file of a project window (`windowID` nil: its
+    /// primary) that this version could not use said: the one still there
+    /// (it could not be moved aside), else the newest one moved aside, while
+    /// no usable file replaced it. Nil when a usable file is there, when
+    /// none was ever set aside, or when the store is disabled.
+    func setAsideState(repositoryRoot: String, windowID: UUID? = nil) -> SetAsideStateSummary? {
         guard isEnabled else { return nil }
-        let fileURL = stateFileURL(repositoryRoot: repositoryRoot)
+        let fileURL = stateFileURL(repositoryRoot: repositoryRoot, windowID: windowID)
         let directory = directory
         return queue.sync { () -> SetAsideStateSummary? in
             let manager = FileManager.default
             if manager.fileExists(atPath: fileURL.path) {
                 if case .usable(let state) = Self.readFile(RepositoryStateRecord.self, from: fileURL),
                    state.version == RepositoryStateRecord.currentVersion,
-                   state.repositoryRoot == repositoryRoot {
+                   state.repositoryRoot == repositoryRoot,
+                   state.windowID == windowID {
                     return nil
                 }
                 let modified = (try? manager.attributesOfItem(atPath: fileURL.path))?[.modificationDate] as? Date
-                return Self.summary(of: fileURL, modified: modified, repositoryRoot: repositoryRoot)
+                return Self.summary(of: fileURL, modified: modified, repositoryRoot: repositoryRoot, windowID: windowID)
             }
             let prefix = fileURL.lastPathComponent + "."
             guard let names = try? manager.contentsOfDirectory(atPath: directory.path) else { return nil }
@@ -807,17 +941,25 @@ final class WorkspaceStateStore: @unchecked Sendable {
                     newest = (url, modified)
                 }
             }
-            return newest.flatMap { Self.summary(of: $0.url, modified: $0.modified, repositoryRoot: repositoryRoot) }
+            return newest.flatMap {
+                Self.summary(of: $0.url, modified: $0.modified, repositoryRoot: repositoryRoot, windowID: windowID)
+            }
         }
     }
 
     /// Reads what it can of a state file of any version: nil when it names
-    /// another repository.
-    private static func summary(of url: URL, modified: Date?, repositoryRoot: String) -> SetAsideStateSummary? {
+    /// another repository or another window.
+    private static func summary(
+        of url: URL,
+        modified: Date?,
+        repositoryRoot: String,
+        windowID: UUID?
+    ) -> SetAsideStateSummary? {
         guard let data = try? Data(contentsOf: url),
               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         else { return SetAsideStateSummary(savedAt: modified) }
         if let root = object["repositoryRoot"] as? String, root != repositoryRoot { return nil }
+        if (object["windowID"] as? String).flatMap(UUID.init(uuidString:)) != windowID { return nil }
         let savedAt = (object["savedAt"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
         var summary = SetAsideStateSummary(savedAt: savedAt ?? modified)
         let worktrees = (object["worktrees"] as? [Any] ?? []).compactMap { $0 as? [String: Any] }
@@ -890,9 +1032,7 @@ final class WorkspaceStateStore: @unchecked Sendable {
         guard isEnabled else { return }
         let fileURL = systemQuitsFileURL
         queue.sync {
-            var quits = readVersionedLocked(
-                SystemQuitsRecord.self, from: fileURL, version: \.version, currentVersion: SystemQuitsRecord.currentVersion
-            )?.quits ?? []
+            var quits = readVersionedLocked(SystemQuitsRecord.self, from: fileURL)?.quits ?? []
             quits.append(date)
             if quits.count > SystemQuitsRecord.limit {
                 quits.removeFirst(quits.count - SystemQuitsRecord.limit)
@@ -907,9 +1047,7 @@ final class WorkspaceStateStore: @unchecked Sendable {
         guard isEnabled else { return [] }
         let fileURL = systemQuitsFileURL
         return queue.sync {
-            readVersionedLocked(
-                SystemQuitsRecord.self, from: fileURL, version: \.version, currentVersion: SystemQuitsRecord.currentVersion
-            )?.quits ?? []
+            readVersionedLocked(SystemQuitsRecord.self, from: fileURL)?.quits ?? []
         }
     }
 
@@ -970,9 +1108,7 @@ final class WorkspaceStateStore: @unchecked Sendable {
         let fileURL = lostSessionsFileURL
         let now = Date()
         queue.async {
-            var entries = self.readVersionedLocked(
-                LostSessionsRecord.self, from: fileURL, version: \.version, currentVersion: LostSessionsRecord.currentVersion
-            )?.entries ?? []
+            var entries = self.readVersionedLocked(LostSessionsRecord.self, from: fileURL)?.entries ?? []
             let known = Set(entries.map { Self.key(hostID: $0.hostID, sessionID: $0.sessionID) })
             let fresh = sessionIDs.sorted().filter { !known.contains(Self.key(hostID: hostID, sessionID: $0)) }
             guard !fresh.isEmpty else { return }
@@ -1029,9 +1165,7 @@ final class WorkspaceStateStore: @unchecked Sendable {
     /// Only on `queue`.
     private func readUnreadSessionsLocked(_ fileURL: URL) -> [UnreadSessionsRecord.Entry] {
         let oldest = Date().addingTimeInterval(-UnreadSessionsRecord.maximumAge)
-        return (readVersionedLocked(
-            UnreadSessionsRecord.self, from: fileURL, version: \.version, currentVersion: UnreadSessionsRecord.currentVersion
-        )?.entries ?? []).filter { $0.since >= oldest }
+        return (readVersionedLocked(UnreadSessionsRecord.self, from: fileURL)?.entries ?? []).filter { $0.since >= oldest }
     }
 
     /// Whether a saved tab of any project (open or closed window, or a
@@ -1055,8 +1189,7 @@ final class WorkspaceStateStore: @unchecked Sendable {
                 let text = String(decoding: data, as: UTF8.self)
                 if mentions.contains(where: { text.range(of: $0, options: .caseInsensitive) != nil }) { return true }
             }
-            for name in names where name.count == 69 && name.hasSuffix(".json")
-                && name.dropLast(5).allSatisfy({ $0.isHexDigit }) {
+            for name in names where Self.isStateFileName(name) {
                 let url = directory.appendingPathComponent(name, isDirectory: false)
                 switch Self.readFile(RepositoryStateRecord.self, from: url) {
                 case .missing:
@@ -1082,9 +1215,7 @@ final class WorkspaceStateStore: @unchecked Sendable {
         guard isEnabled else { return [] }
         let fileURL = lostSessionsFileURL
         return queue.sync {
-            let entries = readVersionedLocked(
-                LostSessionsRecord.self, from: fileURL, version: \.version, currentVersion: LostSessionsRecord.currentVersion
-            )?.entries ?? []
+            let entries = readVersionedLocked(LostSessionsRecord.self, from: fileURL)?.entries ?? []
             return Set(entries.filter { $0.hostID == hostID }.map(\.sessionID))
         }
     }
@@ -1098,8 +1229,7 @@ final class WorkspaceStateStore: @unchecked Sendable {
     private func namedLocalSessionsLocked() -> Set<String> {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return [] }
         var named = Set<String>()
-        for name in names where name.count == 69 && name.hasSuffix(".json")
-            && name.dropLast(5).allSatisfy({ $0.isHexDigit }) {
+        for name in names where Self.isStateFileName(name) {
             let url = directory.appendingPathComponent(name, isDirectory: false)
             guard case .usable(let state) = Self.readFile(RepositoryStateRecord.self, from: url) else { continue }
             for worktree in state.worktrees {
@@ -1119,9 +1249,7 @@ final class WorkspaceStateStore: @unchecked Sendable {
         if case .missing = Self.readFile(EndedSessionsRecord.self, from: fileURL) {
             return EndedSessionsRecord(entries: [])
         }
-        if let record = readVersionedLocked(
-            EndedSessionsRecord.self, from: fileURL, version: \.version, currentVersion: EndedSessionsRecord.currentVersion
-        ) {
+        if let record = readVersionedLocked(EndedSessionsRecord.self, from: fileURL) {
             return record
         }
         let restarted = EndedSessionsRecord(entries: [], lostBefore: Date())
@@ -1129,14 +1257,10 @@ final class WorkspaceStateStore: @unchecked Sendable {
         return restarted
     }
 
-    /// A small record file of this version; one this version cannot use is
-    /// moved aside first. Only on `queue`.
-    private func readVersionedLocked<Record: Decodable>(
-        _ type: Record.Type,
-        from fileURL: URL,
-        version: KeyPath<Record, Int>,
-        currentVersion: Int
-    ) -> Record? {
+    /// A record file of this version; one this version cannot use (another
+    /// version, or one that does not decode) is moved aside first. Only on
+    /// `queue`.
+    private func readVersionedLocked<Record: VersionedRecord>(_ type: Record.Type, from fileURL: URL) -> Record? {
         switch Self.readFile(type, from: fileURL) {
         case .missing:
             return nil
@@ -1144,8 +1268,8 @@ final class WorkspaceStateStore: @unchecked Sendable {
             setAsideLocked(fileURL, label: found.map { "v\($0)" } ?? "unreadable")
             return nil
         case .usable(let record):
-            guard record[keyPath: version] == currentVersion else {
-                setAsideLocked(fileURL, label: "v\(record[keyPath: version])")
+            guard record.version == Record.currentVersion else {
+                setAsideLocked(fileURL, label: "v\(record.version)")
                 return nil
             }
             return record
@@ -1155,20 +1279,9 @@ final class WorkspaceStateStore: @unchecked Sendable {
     /// The entries that have not expired; a file this version cannot use is
     /// moved aside first. Only on `queue`.
     private func readSessionsToEndLocked(_ fileURL: URL) -> [SessionsToEndRecord.Entry]? {
-        switch Self.readFile(SessionsToEndRecord.self, from: fileURL) {
-        case .missing:
-            return nil
-        case .unusable(let version):
-            setAsideLocked(fileURL, label: version.map { "v\($0)" } ?? "unreadable")
-            return nil
-        case .usable(let record):
-            guard record.version == SessionsToEndRecord.currentVersion else {
-                setAsideLocked(fileURL, label: "v\(record.version)")
-                return nil
-            }
-            let oldest = Date().addingTimeInterval(-SessionsToEndRecord.maximumAge)
-            return record.entries.filter { $0.forgottenAt >= oldest }
-        }
+        guard let record = readVersionedLocked(SessionsToEndRecord.self, from: fileURL) else { return nil }
+        let oldest = Date().addingTimeInterval(-SessionsToEndRecord.maximumAge)
+        return record.entries.filter { $0.forgottenAt >= oldest }
     }
 
     private enum FileRead<Value> {
@@ -1243,92 +1356,64 @@ final class WorkspaceStateStore: @unchecked Sendable {
     /// Moves a file this version cannot use out of the way of the next save,
     /// keeping it beside the original. Only on `queue`.
     private func setAsideLocked(_ fileURL: URL, label: String) {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        let stamp = formatter.string(from: Date())
-        let directory = fileURL.deletingLastPathComponent()
-        var destination = directory.appendingPathComponent("\(fileURL.lastPathComponent).\(label)-\(stamp).bak")
-        var status = stat()
-        if lstat(destination.path, &status) == 0 {
-            destination = directory.appendingPathComponent(
-                "\(fileURL.lastPathComponent).\(label)-\(stamp)-\(UUID().uuidString.prefix(8)).bak"
-            )
-        }
-        if rename(fileURL.path, destination.path) == 0 {
-            fputs("Cherry: \(fileURL.lastPathComponent) cannot be used by this version (\(label)); moved it to \(destination.lastPathComponent)\n", stderr)
+        do {
+            try PrivateFile.setAside(fileURL, label: label)
             protectedFiles.remove(fileURL.path)
-        } else {
-            let reason = String(cString: strerror(errno))
+        } catch {
+            let reason = (error as? POSIXError).map { String(cString: strerror($0.code.rawValue)) } ?? "\(error)"
             fputs("Cherry: \(fileURL.lastPathComponent) cannot be used by this version (\(label)) and could not be moved aside (\(reason)); it will not be written over\n", stderr)
             protectedFiles.insert(fileURL.path)
         }
     }
 
-    /// Only on `queue`.
-    private func writeLocked<Value: Encodable>(_ value: Value, to fileURL: URL) {
+    /// Only on `queue`. True once `value` is written.
+    @discardableResult
+    private func writeLocked<Value: Encodable>(_ value: Value, to fileURL: URL) -> Bool {
         guard !protectedFiles.contains(fileURL.path) else {
             fputs("Cherry: not saving \(fileURL.lastPathComponent): a file this version cannot use is still there\n", stderr)
-            return
+            return false
         }
         do {
             try Self.write(value, to: fileURL)
+            return true
         } catch {
             fputs("Cherry: could not save \(fileURL.lastPathComponent): \(error)\n", stderr)
+            return false
         }
     }
 
-    /// Writes a private temporary file beside the destination, then renames
-    /// it over the destination: readers see the old file or the new one,
+    /// Writes `value` as JSON, owner-only, replacing the file atomically
+    /// (`PrivateFile.write`): readers see the old file or the new one,
     /// never a partial write.
     static func write<Value: Encodable>(_ value: Value, to fileURL: URL) throws {
-        let directory = fileURL.deletingLastPathComponent()
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(value)
-
-        let temporaryURL = directory.appendingPathComponent(
-            ".\(fileURL.lastPathComponent).\(UUID().uuidString).tmp",
-            isDirectory: false
-        )
-        guard FileManager.default.createFile(
-            atPath: temporaryURL.path,
-            contents: nil,
-            attributes: [.posixPermissions: 0o600]
-        ) else {
-            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: temporaryURL.path])
-        }
-        do {
-            let handle = try FileHandle(forWritingTo: temporaryURL)
-            defer { try? handle.close() }
-            try handle.write(contentsOf: data)
-            try handle.synchronize()
-        } catch {
-            try? FileManager.default.removeItem(at: temporaryURL)
-            throw error
-        }
-        guard rename(temporaryURL.path, fileURL.path) == 0 else {
-            let code = POSIXErrorCode(rawValue: errno) ?? .EIO
-            try? FileManager.default.removeItem(at: temporaryURL)
-            throw POSIXError(code)
-        }
+        try PrivateFile.write(encoder.encode(value), to: fileURL)
     }
 }
 
+/// A saved record file with a version (`WorkspaceStateStore.readVersionedLocked`):
+/// a file of another version is moved aside, never migrated.
+private protocol VersionedRecord: Decodable {
+    var version: Int { get }
+    static var currentVersion: Int { get }
+}
+
+extension RepositoryStateRecord: VersionedRecord {}
+extension OpenProjectWindowsRecord: VersionedRecord {}
+extension SessionsToEndRecord: VersionedRecord {}
+extension SystemQuitsRecord: VersionedRecord {}
+extension EndedSessionsRecord: VersionedRecord {}
+extension LostSessionsRecord: VersionedRecord {}
+extension UnreadSessionsRecord: VersionedRecord {}
+
 // MARK: - Restore
 
-/// What a restorer brings back for one worktree.
+/// What a restorer brings back for one project window.
 @MainActor
 struct WorkspaceRestoreRequest {
     let repositoryRoot: String
-    let worktreeRoot: String
     /// The records a tab can come back for (bound to a hosted session), in
     /// saved order.
     let records: [WorkspaceSessionRecord]
@@ -1336,7 +1421,7 @@ struct WorkspaceRestoreRequest {
     /// `makeRestoredPersistentSession`), but do not add them: the restore
     /// adds them with the saved layout.
     let workspace: TerminalWorkspace
-    /// The worktree's other records (no hosted binding saved: a native tab,
+    /// The window's other records (no hosted binding saved: a native tab,
     /// or a local tab whose session's Create had not answered when it was
     /// saved). A restorer may bring one back when the local host has a
     /// session of this app that its saved Create started
@@ -1344,7 +1429,7 @@ struct WorkspaceRestoreRequest {
     /// others are dropped, as native tabs are.
     var unboundRecords: [WorkspaceSessionRecord] = []
     /// Cancelled when the workspace is torn down (its window closed, the app
-    /// quit) or its worktree forgotten while this restore runs: the restore
+    /// quit) while this restore runs: the restore
     /// then builds no more tabs, and ends those it built that it has not
     /// handed back yet (with the workspace's close intent), so no stale tab
     /// goes on owning a session a new window's restore should bring back.
@@ -1389,17 +1474,19 @@ enum SystemSessionEnd: String, Codable, Equatable, Sendable {
 
     var message: String { message() }
 
+    /// The message as a clause: "ended when the Mac restarted" (a task's
+    /// reason, after "its session").
+    func endedClause(machine: String? = nil) -> String {
+        let text = message(machine: machine)
+        guard let first = text.first else { return text }
+        return first.lowercased() + text.dropFirst()
+    }
+
     /// The window's toast after its tab count: "3 tabs ended when the Mac
     /// restarted".
     func predicate(machine: String? = nil) -> String {
-        switch self {
-        case .restart: " ended when the Mac restarted"
-        case .logout: " ended when you logged out"
-        case .hostRestart: " ended when \(machine ?? "the other Mac") restarted"
-        }
+        " " + endedClause(machine: machine)
     }
-
-    var predicate: String { predicate() }
 }
 
 /// Decides whether the system ended a saved tab's session while Cherry was
@@ -1532,7 +1619,7 @@ final class WorkspaceRestoreCancellation {
 }
 
 /// This app's sessions on This Mac that no saved tab names, which the
-/// window adopts as tabs of the worktree they were started in (their
+/// window of the project they were started in adopts as tabs (their
 /// `cherry.project` tag), instead of leaving them running unseen: sessions
 /// whose tab was never saved (the app crashed within the save delay after
 /// opening it) or whose saved record was lost. A session qualifies when
@@ -1543,7 +1630,9 @@ final class WorkspaceRestoreCancellation {
 /// this run belongs to this run's tabs) and after the saved state it would
 /// be missing from (`createdSince`, the last save, to the second): a
 /// session created before that save and missing from it was left running on
-/// purpose (a detached tab).
+/// purpose (a detached tab). Of a project's windows (#22), each adopts only
+/// the sessions created for it (`windowID`, the `cherry.window` tag), the
+/// project's primary window only those with no window tag.
 ///
 /// Without a usable state file:
 /// - When this version moved one aside (another version's, or one that
@@ -1564,6 +1653,9 @@ struct OrphanedSessionCriteria: Sendable {
     let recoveredTabIDs: Set<UUID>
     let recoveredSessionIDs: Set<String>
     let recoveredLaunchIDs: Set<String>
+    /// The window whose orphans these are (`ProjectWindowValue.windowID`);
+    /// nil for a project's primary window.
+    let windowID: UUID?
 
     init(
         owner: String,
@@ -1571,10 +1663,12 @@ struct OrphanedSessionCriteria: Sendable {
         setAside: SetAsideStateSummary? = nil,
         sessionsToEnd: [WorkspaceSessionRecord] = [],
         createdBefore: Date,
-        host: HostedSessionHost = .local
+        host: HostedSessionHost = .local,
+        windowID: UUID? = nil
     ) {
         self.owner = owner
         self.createdBefore = createdBefore
+        self.windowID = windowID
         let records = savedState?.worktrees.flatMap(\.sessions) ?? []
         let recovered = savedState == nil ? setAside : nil
         if let savedState {
@@ -1601,6 +1695,7 @@ struct OrphanedSessionCriteria: Sendable {
         guard info.owner == owner,
               let tabID = PersistentLocalSessions.tabID(of: info, owner: owner),
               info.tags[PersistentSessionTag.project]?.isEmpty == false,
+              isCreatedForThisWindow(info),
               !namedTabIDs.contains(tabID),
               !namedSessionIDs.contains(info.id),
               !(launchID.map(namedLaunchIDs.contains) ?? false),
@@ -1619,7 +1714,15 @@ struct OrphanedSessionCriteria: Sendable {
         return created < createdBefore ? tabID : nil
     }
 
-    /// The directory of the worktree `info` was started in, as its tab saw it.
+    /// Whether `info` was created for this window: tagged with its id, or,
+    /// for a project's primary window, with no window tag (a tag no id
+    /// reads is no window's).
+    private func isCreatedForThisWindow(_ info: HostedSessionInfo) -> Bool {
+        guard info.tags[PersistentSessionTag.window] != nil else { return windowID == nil }
+        return windowID != nil && PersistentLocalSessions.windowID(of: info) == windowID
+    }
+
+    /// The project folder `info` was started in, as its tab saw it.
     static func projectRoot(of info: HostedSessionInfo) -> String? {
         info.tags[PersistentSessionTag.project]?.nilIfEmpty
     }
@@ -1654,16 +1757,16 @@ struct OrphanedSessionCriteria: Sendable {
     }
 }
 
-/// What a restorer brought back for one worktree.
+/// What a restorer brought back for one project window.
 @MainActor
 struct WorkspaceRestoreResult {
     /// Tabs built for saved records (not added to the workspace).
-    var sessions: [TerminalSession]
+    var sessions: [TerminalSession] = []
     /// Records that cannot come back now but may later, because the helper or
     /// the host is unavailable, not because their session is gone. They stay
     /// saved, unchanged, for the next launch. Every other record the result
     /// has no tab for is dropped.
-    var keptRecordIDs: Set<UUID>
+    var keptRecordIDs: Set<UUID> = []
     /// Fires (once) when the kept records may come back during this run:
     /// the local host, unreachable during the restore, became reachable, or
     /// a host that still expected holders to register expects none now.
@@ -1674,7 +1777,7 @@ struct WorkspaceRestoreResult {
     /// (or whose session is being looked for again): `remainder` finishes
     /// them. They stay saved meanwhile, and a command they name is not
     /// started a second time.
-    var pendingRecordIDs: Set<UUID>
+    var pendingRecordIDs: Set<UUID> = []
     /// The rest of this restore, for `pendingRecordIDs`: a result like this
     /// one (tabs, kept records, and maybe records still pending with a
     /// remainder of their own).
@@ -1684,28 +1787,14 @@ struct WorkspaceRestoreResult {
     /// are: the host lists their session. Not in `sessions`.
     var confirmedOptimisticRecordIDs: Set<UUID> = []
 
-    init(
-        sessions: [TerminalSession] = [],
-        keptRecordIDs: Set<UUID> = [],
-        retryWhenAvailable: AnyPublisher<Void, Never>? = nil,
-        pendingRecordIDs: Set<UUID> = [],
-        remainder: Task<WorkspaceRestoreResult, Never>? = nil
-    ) {
-        self.sessions = sessions
-        self.keptRecordIDs = keptRecordIDs
-        self.retryWhenAvailable = retryWhenAvailable
-        self.pendingRecordIDs = pendingRecordIDs
-        self.remainder = remainder
-    }
-
     /// Restores nothing now and keeps `records` saved.
     static func keeping(_ records: [WorkspaceSessionRecord]) -> WorkspaceRestoreResult {
         WorkspaceRestoreResult(keptRecordIDs: Set(records.map(\.id)))
     }
 
     /// Ends the tabs of `result`, and of its remainder when that finishes,
-    /// as `workspace` ended its other tabs (the window closed, the app quit
-    /// or the worktree was removed while the restore ran).
+    /// as `workspace` ended its other tabs (the window closed or the app
+    /// quit while the restore ran).
     static func discard(_ result: WorkspaceRestoreResult, in workspace: TerminalWorkspace) {
         workspace.discardRestoredSessions(result.sessions)
         guard let remainder = result.remainder else { return }

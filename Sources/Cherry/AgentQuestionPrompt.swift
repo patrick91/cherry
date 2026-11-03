@@ -2,10 +2,9 @@ import Foundation
 
 /// Recognizes an agent CLI asking the user a question with a choice menu
 /// (Claude Code's AskUserQuestion, Codex's request_user_input picker) at
-/// the bottom of its screen. The agent's turn is paused on the answer: MCP
-/// waits end with `needs_input` instead of waiting for a turn that cannot
-/// end by itself, and MCP input is refused there, since Enter picks the
-/// highlighted option.
+/// the bottom of its screen, for an agent that reports no status (one that
+/// does says it is blocked on a question, OSC 7501). MCP input is refused
+/// there, since Enter picks the highlighted option.
 ///
 /// Only a menu counts, not prose: the last lines must hold at least two
 /// numbered options, one of them marked by a selection cursor, and, below
@@ -17,9 +16,8 @@ import Foundation
 /// permission menu (`AgentPermissionPrompt`) is checked first by every
 /// caller and is not a question.
 ///
-/// One recognizer for MCP (`needs_input`, refused input) and the app's own
-/// activity state (`AgentScreenActivity.answerMenu`: the sidebar, the menu
-/// bar and attention alerts).
+/// Also one of the menus `AgentScreenActivity` tells from a composer when a
+/// task's kickoff is typed.
 enum AgentQuestionPrompt {
     private static let pickerPhrases = [
         "enter to select",
@@ -51,10 +49,10 @@ enum AgentQuestionPrompt {
         for (index, trimmed) in tail.enumerated() {
             var isOption = false
             if let first = trimmed.first, cursors.contains(first),
-               isNumberedOption(trimmed.dropFirst().drop { $0.isWhitespace }) {
+               AgentPermissionPrompt.optionText(trimmed.dropFirst().drop { $0.isWhitespace }) != nil {
                 isOption = true
                 hasSelectedOption = true
-            } else if isNumberedOption(Substring(trimmed)) {
+            } else if AgentPermissionPrompt.optionText(Substring(trimmed)) != nil {
                 isOption = true
             }
             if isOption {
@@ -72,18 +70,5 @@ enum AgentQuestionPrompt {
             }
         }
         return optionCount >= 2 && hasSelectedOption && hasPickerPhrase
-    }
-
-    /// "1. Text" or "2) Text".
-    private static func isNumberedOption(_ text: Substring) -> Bool {
-        var index = text.startIndex
-        var digits = 0
-        while index < text.endIndex, text[index].isASCII, text[index].isNumber, digits < 2 {
-            index = text.index(after: index)
-            digits += 1
-        }
-        guard digits > 0, index < text.endIndex, text[index] == "." || text[index] == ")" else { return false }
-        let next = text.index(after: index)
-        return next < text.endIndex && text[next] == " "
     }
 }

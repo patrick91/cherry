@@ -7,6 +7,12 @@ import Testing
 // A keystroke that changes nothing a view shows publishes nothing: every
 // view observing the tab (the pane, its context bar, the sidebar row) would
 // otherwise re-render once per key (about 1.75 ms of main thread a key).
+// Nor does a native tab's output: no view shows its lines or the output
+// counters, which MCP waits, monitors and tasks read when they poll.
+//
+// These tests type with `noteTestingInput`, which is DEBUG only: release
+// builds, such as Scripts/perf-terminal-stress's, compile without them.
+#if DEBUG
 
 @MainActor
 private final class PublishCounter {
@@ -29,8 +35,7 @@ private func makeTab(kind: TerminalSession.SessionKind = .terminal) -> TerminalS
         workingDirectory: NSHomeDirectory(),
         launchShell: false,
         kind: kind,
-        agentName: kind == .agent ? "Claude" : nil,
-        attentionObservationDirectoryProvider: { nil }
+        agentName: kind == .agent ? "Claude" : nil
     )
 }
 
@@ -75,7 +80,6 @@ private func settle() async throws {
     // The first key sets where the output was when input last came.
     type("a", into: session)
     #expect(session.lastInputOutputVersion == session.outputVersion)
-    #expect(session.currentAttentionScreenTag == nil)
 
     try await settle()
     let counter = PublishCounter(session)
@@ -99,56 +103,34 @@ private func ingestOutput(_ text: String, into session: TerminalSession) async t
     #expect(session.outputVersion != before)
 }
 
-@Test @MainActor func aKeystrokeStillPublishesWhatItChanges() async throws {
-    let directory = FileManager.default.temporaryDirectory
-        .appendingPathComponent("cherry-keystroke-publish-\(UUID().uuidString)", isDirectory: true)
-    defer { try? FileManager.default.removeItem(at: directory) }
+/// A key after output moves the input baseline MCP measures new output
+/// from (`lastInputOutputVersion`), which no view shows.
+@Test @MainActor func aKeystrokeAfterOutputMovesTheBaselineAndPublishesNothing() async throws {
     let session = TerminalSession(
         title: "Keys",
         subtitle: "",
         tint: .systemBlue,
-        launchShell: false,
-        attentionObservationDirectoryProvider: { nil },
-        attentionCorrectionDirectoryProvider: { directory }
+        launchShell: false
     )
     defer { session.stop() }
     type("a", into: session)
 
-    // Output since the last key: the next key moves the baseline, once.
     try await ingestOutput("output\r\n", into: session)
+    #expect(session.lastInputOutputVersion != session.outputVersion)
     let counter = PublishCounter(session)
     type("b", into: session)
     #expect(session.lastInputOutputVersion == session.outputVersion)
-    let afterBaseline = counter.count
-    #expect(afterBaseline > 0)
     type("c", into: session)
-    #expect(counter.count == afterBaseline)
-
-    // A tagged screen: the next key clears the tag, once.
-    _ = try session.captureAttentionCorrection(.blockedOrError)
-    #expect(session.currentAttentionScreenTag == .blockedOrError)
-    let afterTag = counter.count
-    type("d", into: session)
-    #expect(session.currentAttentionScreenTag == nil)
-    #expect(counter.count > afterTag)
-    let afterClear = counter.count
-    type("e", into: session)
-    #expect(counter.count == afterClear)
+    #expect(counter.count == 0)
 }
 
 /// An agent tab's keys also update its draft (from the AppKit event, or
-/// the bytes) and schedule an attention observation, debounced: neither
-/// publishes per key.
+/// the bytes): that publishes nothing per key.
 @Test @MainActor func anAgentsKeystrokeThatChangesNothingPublishesNothing() async throws {
     let session = makeTab(kind: .agent)
     defer { session.stop() }
     type("a", into: session)
-    // The observation that follows the first key (its first prediction).
-    let deadline = Date().addingTimeInterval(5)
-    while session.attentionClassifierPrediction == nil, Date() < deadline {
-        try await Task.sleep(for: .milliseconds(25))
-    }
-    try #require(session.attentionClassifierPrediction != nil)
+    try await settle()
 
     let counter = PublishCounter(session)
     for key in ["b", "c", "d", "e", "b", "c", "d", "e"] {
@@ -159,11 +141,6 @@ private func ingestOutput(_ text: String, into session: TerminalSession) async t
     #expect(counter.count == 0)
     try await settle()
     #expect(counter.count == 0)
-
-    // The debounced observation after the keys: at most its new
-    // prediction (its timings moved on), however many keys came.
-    try await Task.sleep(for: .milliseconds(1_300))
-    #expect(counter.count <= 1)
 }
 
 @Test @MainActor func theContextBarsContentStaysEqualAcrossKeystrokes() async throws {
@@ -183,3 +160,34 @@ private func ingestOutput(_ text: String, into session: TerminalSession) async t
     #expect(moved != before)
     #expect(moved.displayPath == "~/project")
 }
+
+/// A native tab's surface text, read as its program writes (the render
+/// signal of a pane on screen, MCP idle waits), advances the output and
+/// content counters and publishes nothing.
+@Test @MainActor func aNativeTabsOutputPublishesNothing() async throws {
+    let project = try canonicalTemporaryDirectory("CherryPublishNative")
+    let workspace = TerminalWorkspace(projectRoot: project.path, createInitialSession: false, launchBackend: .nativePTY)
+    defer {
+        workspace.closeAllSessions(intent: .windowClosed)
+        try? FileManager.default.removeItem(at: project)
+    }
+    let tab = workspace.addSession(title: "Counter", command: "i=0; while :; do i=$((i+1)); echo \"line $i\"; sleep 0.05; done")
+    #expect(tab.ghosttyBridge.isNativePTYBacked)
+    #expect(tab.persistentSession == nil)
+    // Its launch publishes (its state, its process): let that settle.
+    _ = await eventually(timeout: 10, interval: .milliseconds(50)) { tab.lineCount >= 3 }
+    #expect(tab.state == .live)
+    try await Task.sleep(for: .milliseconds(500))
+
+    let counter = PublishCounter(tab)
+    let outputVersion = tab.outputVersion
+    let contentVersion = tab.contentVersion
+    for _ in 0..<8 {
+        try await Task.sleep(for: .milliseconds(120))
+        tab.watchContentForChanges()
+    }
+    #expect(tab.outputVersion > outputVersion + 2)
+    #expect(tab.contentVersion > contentVersion + 2)
+    #expect(counter.count == 0)
+}
+#endif

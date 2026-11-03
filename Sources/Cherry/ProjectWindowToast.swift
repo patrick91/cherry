@@ -464,6 +464,22 @@ extension View {
     func projectWindowToastObstacle() -> some View {
         anchorPreference(key: ProjectWindowToastObstacles.self, value: .bounds) { [$0] }
     }
+
+    /// A bar floating at the bottom of a terminal pane (a command's exit,
+    /// reconnecting, a device offline, …): material with an outline and a
+    /// shadow, at most `maxWidth` wide, kept clear of the window's toast.
+    func floatingBarChrome(maxWidth: CGFloat = 460) -> some View {
+        padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+            }
+            .shadow(color: Color.black.opacity(0.18), radius: 12, y: 5)
+            .frame(maxWidth: maxWidth)
+            .projectWindowToastObstacle()
+    }
 }
 
 /// Where a project window shows its toast: centered at the bottom of its

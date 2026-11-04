@@ -150,12 +150,46 @@ public protocol TerminalSurfaceLinkHoverDelegate: TerminalSurfaceViewDelegate {
     }
 #endif
 
+/// Where a URL of Ghostty's `open_url` action came from
+/// (`ghostty_action_open_url_kind_e`).
+public enum TerminalOpenURLKind: Sendable, Equatable {
+    /// Text a `link` pattern matched in terminal output (a Cmd-click): a
+    /// URL, or a plain path that Ghostty made absolute against the
+    /// terminal's directory when that file exists.
+    case unknown
+    /// A file Ghostty itself names, known to be text (its configuration).
+    case text
+    /// A file Ghostty itself names, known to be HTML.
+    case html
+    /// An OSC 8 hyperlink's target, exactly as the program sent it; the
+    /// text shown for it may say something else.
+    case osc8
+
+    /// Whether terminal output, which any program controls, chose the URL.
+    /// Since Ghostty 1.4, Ghostty on macOS never opens these itself: a
+    /// delegate that leaves one to it opens nothing.
+    public var isUntrusted: Bool {
+        self == .unknown || self == .osc8
+    }
+
+    /// The kind Ghostty sent; one this wrapper does not know is untrusted.
+    public init(_ kind: ghostty_action_open_url_kind_e) {
+        switch kind {
+        case GHOSTTY_ACTION_OPEN_URL_KIND_TEXT: self = .text
+        case GHOSTTY_ACTION_OPEN_URL_KIND_HTML: self = .html
+        case GHOSTTY_ACTION_OPEN_URL_KIND_OSC8: self = .osc8
+        default: self = .unknown
+        }
+    }
+}
+
 /// Opening a URL the user clicked (Ghostty's `open_url` action).
 @MainActor
 public protocol TerminalSurfaceOpenURLDelegate: TerminalSurfaceViewDelegate {
     /// True when the delegate opens (or otherwise handles) `url`; false
-    /// leaves it to Ghostty, which opens it with the system's handler.
-    func terminalShouldHandleOpenURL(_ url: String) -> Bool
+    /// leaves it to Ghostty, which opens a `text` or `html` one with the
+    /// system's handler and refuses an untrusted one (`isUntrusted`).
+    func terminalShouldHandleOpenURL(_ url: String, kind: TerminalOpenURLKind) -> Bool
 }
 
 public struct TerminalSearchStartRequest: Sendable, Equatable {

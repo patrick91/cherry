@@ -120,8 +120,9 @@ enum TerminalCallbacks {
             .takeUnretainedValue()
         if action.tag == GHOSTTY_ACTION_OPEN_URL {
             // Answered now: true keeps Ghostty from opening it itself. A
-            // click is handled on the main thread; anywhere else Ghostty
-            // opens it as before.
+            // click is handled on the main thread; anywhere else the URL is
+            // Ghostty's (a `text` or `html` one opens, an untrusted one
+            // does not).
             guard Thread.isMainThread else { return false }
             return MainActor.assumeIsolated { openURL(action, bridge: bridge) }
         }
@@ -134,7 +135,8 @@ enum TerminalCallbacks {
 
     /// Ghostty's `open_url` action: whether the surface's delegate opens
     /// the URL itself (`TerminalSurfaceOpenURLDelegate`); false leaves it
-    /// to Ghostty, which opens it with the system's handler.
+    /// to Ghostty, which opens a `text` or `html` one with the system's
+    /// handler and refuses an untrusted one.
     @MainActor
     static func openURL(_ action: ghostty_action_s, bridge: TerminalCallbackBridge) -> Bool {
         guard action.tag == GHOSTTY_ACTION_OPEN_URL else { return false }
@@ -142,7 +144,7 @@ enum TerminalCallbacks {
         guard link.len > 0, let buffer = link.url,
               let url = String(data: Data(bytes: buffer, count: Int(link.len)), encoding: .utf8)
         else { return false }
-        return bridge.handleOpenURL(url)
+        return bridge.handleOpenURL(url, kind: TerminalOpenURLKind(link.kind))
     }
 
     static func closeSurface(

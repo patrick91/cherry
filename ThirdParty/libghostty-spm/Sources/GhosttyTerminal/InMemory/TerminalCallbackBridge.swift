@@ -199,9 +199,13 @@ final class TerminalCallbackBridge {
     #endif
 
     /// Whether the delegate handles a click on `url` itself.
-    func handleOpenURL(_ url: String) -> Bool {
-        TerminalDebugLog.log(.actions, "callback action=open_url url=\(TerminalDebugLog.describe(url))")
-        return (delegate as? any TerminalSurfaceOpenURLDelegate)?.terminalShouldHandleOpenURL(url) ?? false
+    func handleOpenURL(_ url: String, kind: TerminalOpenURLKind) -> Bool {
+        TerminalDebugLog.log(
+            .actions,
+            "callback action=open_url kind=\(kind) url=\(TerminalDebugLog.describe(url))"
+        )
+        return (delegate as? any TerminalSurfaceOpenURLDelegate)?
+            .terminalShouldHandleOpenURL(url, kind: kind) ?? false
     }
 
     func handleClose(processAlive: Bool) {

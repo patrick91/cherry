@@ -772,8 +772,11 @@ vendored `libghostty-spm`):
   forwards that port and opens the URL at `127.0.0.1:<local>` (where the
   forward listens; path, query and fragment kept) in the browser, with a
   toast "Forwarded from Studio" ("localhost:3000 on Studio opens here as
-  127.0.0.1:52011."); a failure says so and opens nothing. Other URLs, and
-  every URL in a tab of This Mac, open as before.
+  127.0.0.1:52011."); a failure says so and opens nothing. Other links, and
+  every link in a tab of This Mac, go through `TerminalLinkOpening` (since
+  Ghostty 1.4 refuses a link from terminal output its embedder leaves to
+  it); a file link in a device tab names that Mac's file and is refused
+  ("The file is on Studio, not on this Mac.").
 - **MCP** (`DeviceServiceDetector`): `get_process_ports`, `services_list`
   and `wait_for_bound_port` give a device tab's services from its Mac
   (`CherryControlServer` sends only This Mac's tabs to the lsof detector),

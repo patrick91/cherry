@@ -126,13 +126,15 @@ Screens:
   one group of one-line rows, a verb and what it acted on with paths
   relative to the session's folder (`ToolPresentation`, `DisplayPath`),
   the latest three shown, each opening on the start of its result; a row
-  says when the agent works. The toolbar switches to the screen, which
-  every other session shows: the host's screen text at the session's
-  width, kept to the bottom. Under either is the composer: a menu on screen
-  (`ScreenMenu`) as compact buttons that type the option's digit, as an
-  agent takes it (else the program's status, unless the conversation shows
-  it working), a reply field (text, then Enter) and, behind the keyboard
-  button, keys: Esc, arrows, Enter, Tab, ⌃C. A Mac whose `cherry` predates
+  says when the agent works. A menu on the agent's screen (`ScreenMenu`: a
+  permission prompt, a question, each option with the lines describing it)
+  is a card under the last entry whose options type their digit, as an
+  agent takes it. The toolbar switches to the screen, which every other
+  session shows: the host's screen text at the session's width, kept to
+  the bottom. Under either is the composer: on the screen, its menu as
+  compact buttons (else the program's status, unless the conversation
+  shows it working), a reply field (text, then Enter) and, behind the
+  keyboard button, keys: Esc, arrows, Enter, Tab, ⌃C. A Mac whose `cherry` predates
   `host transcript` says to update Cherry there.
 - **Terminal:** Ghostty's `UITerminalView` on an `InMemoryTerminalSession`,
   bridged to a `TerminalAttachment`.

@@ -1,8 +1,9 @@
 import CherryMobileKit
 import SwiftUI
 
-/// A session: an agent's conversation or the screen as its host keeps it,
-/// and the composer: a menu's options as buttons, a reply field, keys.
+/// A session: an agent's conversation (a menu on its screen answered in it)
+/// or the screen as its host keeps it, and the composer: there a menu's
+/// options as buttons, a reply field, keys.
 struct SessionView: View {
     @Environment(AppModel.self) private var model
     let key: SessionKey
@@ -14,19 +15,22 @@ struct SessionView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if isAgent && !showsScreen {
+            if showsConversation {
                 ConversationView(
                     key: key,
                     project: session?.directory,
                     working: session?.attention == .working ? (session?.detail ?? "") : nil,
-                    reconnecting: reconnecting
-                ) {
+                    reconnecting: reconnecting,
+                    question: menu
+                ) { keys in
+                    await send(keys)
+                } showScreen: {
                     showsScreen = true
                 }
             } else {
                 ScreenTextView(screen: screen, problem: reconnecting ?? problem)
             }
-            Composer(menu: menu, status: status, isRunning: session?.isRunning ?? true) { keys in
+            Composer(menu: showsConversation ? nil : menu, status: status, isRunning: session?.isRunning ?? true) { keys in
                 await send(keys)
             }
         }
@@ -80,6 +84,10 @@ struct SessionView: View {
         return false
     }
 
+    private var showsConversation: Bool {
+        isAgent && !showsScreen
+    }
+
     /// While the Mac reconnects, the last screen stays, with a note.
     private var reconnecting: String? {
         guard let mac = model.mac(key.macID), mac.status.isReconnecting || mac.status == .connecting else { return nil }
@@ -95,7 +103,7 @@ struct SessionView: View {
     /// screen asks it already, or the conversation shows it working.
     private var status: (attention: AgentAttention, message: String)? {
         guard menu == nil, let session, session.isRunning, let detail = session.detail else { return nil }
-        if isAgent, !showsScreen, session.attention == .working { return nil }
+        if showsConversation, session.attention == .working { return nil }
         return (session.attention, detail)
     }
 

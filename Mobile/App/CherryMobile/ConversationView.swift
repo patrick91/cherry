@@ -3,7 +3,8 @@ import SwiftUI
 
 /// An agent's conversation, read from its own session on the Mac (`cherry
 /// host transcript`): the latest messages and tool calls, then what comes
-/// after them every few seconds, kept to the bottom.
+/// after them every few seconds, kept to the bottom, and a menu its screen
+/// asks with under them.
 struct ConversationView: View {
     @Environment(AppModel.self) private var model
     let key: SessionKey
@@ -14,6 +15,10 @@ struct ConversationView: View {
     let working: String?
     /// Why the Mac's connection is away, shown over the last conversation.
     let reconnecting: String?
+    /// The menu the agent's screen shows (a permission prompt, a question),
+    /// answered in place.
+    let question: ScreenMenu?
+    let answer: @MainActor ([MobileKey]) async -> Void
     let showScreen: () -> Void
 
     @State private var conversation = Conversation()
@@ -40,7 +45,11 @@ struct ConversationView: View {
                         ToolGroupView(tools: tools, project: project)
                     }
                 }
-                if let working, loaded {
+                if let question {
+                    QuestionCard(menu: question, answer: answer)
+                        // A new question starts unanswered.
+                        .id([question.question ?? ""] + question.options.map(\.label))
+                } else if let working, loaded {
                     HStack(spacing: 8) {
                         ProgressView()
                             .controlSize(.small)
@@ -59,7 +68,7 @@ struct ConversationView: View {
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
         .overlay { emptyState }
         .overlay(alignment: .bottom) {
-            if let note = reconnecting ?? (loaded && !conversation.entries.isEmpty ? problem?.localizedDescription : nil) {
+            if let note = reconnecting ?? (loaded && (!conversation.entries.isEmpty || question != nil) ? problem?.localizedDescription : nil) {
                 Label(note, systemImage: reconnecting == nil ? "exclamationmark.triangle.fill" : "arrow.triangle.2.circlepath")
                     .font(.footnote)
                     .padding(10)
@@ -73,9 +82,12 @@ struct ConversationView: View {
         }
     }
 
+    /// None under a question, which shows still.
     @ViewBuilder
     private var emptyState: some View {
-        if let problem, conversation.entries.isEmpty {
+        if question != nil {
+            EmptyView()
+        } else if let problem, conversation.entries.isEmpty {
             ContentUnavailableView {
                 Label("No conversation", systemImage: "text.bubble")
             } description: {
@@ -114,6 +126,84 @@ struct ConversationView: View {
             problem = .failed(error.localizedDescription)
         }
         loaded = true
+    }
+}
+
+/// A menu the agent asks with, in the conversation: its question, then each
+/// option with what describes it. An option types its digit, which an agent
+/// takes by itself; the others wait until the screen changes.
+struct QuestionCard: View {
+    let menu: ScreenMenu
+    let answer: @MainActor ([MobileKey]) async -> Void
+    @State private var chosen: Int?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label {
+                Text(menu.question ?? "Choose an option")
+                    .font(.subheadline.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: "questionmark.bubble.fill")
+                    .foregroundStyle(Color.accentColor)
+            }
+            VStack(spacing: 6) {
+                ForEach(menu.options, id: \.number) { option in
+                    optionButton(option)
+                }
+            }
+        }
+        .padding(12)
+        .background(Color.accentColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.accentColor.opacity(0.3)))
+    }
+
+    private func optionButton(_ option: ScreenMenu.Option) -> some View {
+        Button {
+            choose(option)
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text("\(option.number)")
+                    .font(.caption.monospacedDigit().weight(.bold))
+                    .frame(width: 22, height: 22)
+                    .background(option.isSelected ? Color.accentColor : Color.secondary.opacity(0.22), in: Circle())
+                    .foregroundStyle(option.isSelected ? Color.white : Color.primary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(option.label)
+                        .font(.subheadline)
+                    if let detail = option.detail {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if chosen == option.number {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 10))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(chosen != nil)
+        .opacity(chosen == nil || chosen == option.number ? 1 : 0.45)
+        .accessibilityLabel("Option \(option.number): \(option.label)")
+    }
+
+    /// Types its digit; if the menu is still there a while later (the agent
+    /// didn't take it), its options can be tapped again.
+    private func choose(_ option: ScreenMenu.Option) {
+        chosen = option.number
+        Task {
+            await answer(option.keys)
+            try? await Task.sleep(for: .seconds(3))
+            chosen = nil
+        }
     }
 }
 

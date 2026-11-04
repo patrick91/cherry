@@ -23,6 +23,8 @@ import Testing
     ])
     #expect(menu.options.map(\.isSelected) == [true, false, false])
     #expect(menu.options[1].keys == [.text("2")])
+    // Nothing describes them; the frame under the last is no description.
+    #expect(menu.options.map(\.detail) == [nil, nil, nil])
 }
 
 @Test func codexsApprovalIsAMenu() throws {
@@ -39,6 +41,7 @@ import Testing
     ]))
     #expect(menu.options.count == 3)
     #expect(menu.options[0].isSelected)
+    #expect(menu.options[2].detail == nil)
 }
 
 @Test func optionsWithDescriptionsUnderThemAreOneMenu() throws {
@@ -52,9 +55,25 @@ import Testing
         "  2. Scratch directory",
         "     Cleared on reboot",
         "  3. Type something.",
+        "",
+        "Enter to select · ↑/↓ to navigate · Esc to cancel",
     ]))
     #expect(menu.question == "Where should the samples go?")
     #expect(menu.options.map(\.number) == [1, 2, 3])
+    #expect(menu.options.map(\.detail) == ["Private, out of backups", "Cleared on reboot", nil])
+}
+
+@Test func aFramedOptionsDescriptionLinesAreJoined() throws {
+    let menu = try #require(ScreenMenu.find(in: [
+        "│ Which parser?                       │",
+        "│ ❯ 1. The old one                    │",
+        "│      Slower, but every test passes  │",
+        "│      today                          │",
+        "│   2. The new one                    │",
+        "│  Esc to cancel                      │",
+        "╰─────────────────────────────────────╯",
+    ]))
+    #expect(menu.options.map(\.detail) == ["Slower, but every test passes today", nil])
 }
 
 @Test func aNumberedListInProseIsNotAMenu() {

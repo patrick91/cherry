@@ -10,11 +10,14 @@ public struct ScreenMenu: Hashable, Sendable {
         public var label: String
         /// The option the menu's cursor is on (`❯ 1. Yes`).
         public var isSelected: Bool
+        /// The lines under it that describe it (AskUserQuestion's), joined.
+        public var detail: String?
 
-        public init(number: Int, label: String, isSelected: Bool) {
+        public init(number: Int, label: String, isSelected: Bool, detail: String? = nil) {
             self.number = number
             self.label = label
             self.isSelected = isSelected
+            self.detail = detail
         }
 
         /// What choosing it types.
@@ -70,7 +73,41 @@ public struct ScreenMenu: Hashable, Sendable {
         let question = questionLine(above: run[0].index, in: window)
         let hasCursor = run.contains { $0.option.isSelected }
         guard hasCursor || question?.hasSuffix("?") == true else { return nil }
-        return ScreenMenu(options: run.map(\.option), question: question)
+        let options = run.map { index, option in
+            var option = option
+            option.detail = detail(below: index, in: window)
+            return option
+        }
+        return ScreenMenu(options: options, question: question)
+    }
+
+    /// The lines right under the option at `index` that start at least as
+    /// far in as its label: its description. A hint or a frame under the
+    /// last option starts further out.
+    private static func detail(below index: Int, in lines: [String]) -> String? {
+        guard let column = labelColumn(lines[index]) else { return nil }
+        var detail: [String] = []
+        var line = index + 1
+        while line < lines.count, detail.count < maximumGap, parse(lines[line]) == nil {
+            let text = unframed(lines[line])
+            guard text.contains(where: { $0.isLetter }), let start = textColumn(lines[line]), start >= column else { break }
+            detail.append(text)
+            line += 1
+        }
+        return detail.isEmpty ? nil : detail.joined(separator: " ")
+    }
+
+    /// Where an option line's label starts, after its number and mark.
+    private static func labelColumn(_ line: String) -> Int? {
+        guard let marker = line.firstRange(of: /\d{1,2}[.)] +/) else { return nil }
+        return line.distance(from: line.startIndex, to: marker.upperBound)
+    }
+
+    /// Where a line's text starts, after a frame and spaces.
+    private static func textColumn(_ line: String) -> Int? {
+        let skipped = frame.union(.whitespaces)
+        guard let start = line.firstIndex(where: { !$0.unicodeScalars.allSatisfy(skipped.contains) }) else { return nil }
+        return line.distance(from: line.startIndex, to: start)
     }
 
     /// Box drawing a menu's frame puts at the start and end of its lines.

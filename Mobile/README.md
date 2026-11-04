@@ -130,8 +130,10 @@ Screens:
   permission prompt, a question, each option with the lines describing it)
   is a card under the last entry whose options type their digit, as an
   agent takes it. The toolbar switches to the screen, which every other
-  session shows: the host's screen text at the session's width, kept to
-  the bottom. Under either is the composer: on the screen, its menu as
+  session shows: the host's screen text, kept to the bottom, an agent's at
+  the session's width (scrolling sideways, for its boxes), a terminal's or
+  command's wrapped at the phone's (the host joins wrapped rows, so it
+  reflows; the toolbar switches back to the session's width). Under either is the composer: on the screen, its menu as
   compact buttons, a reply field (text, then Enter) and, behind the
   keyboard button, keys: Esc, arrows, Enter, Tab, ⌃C. The program's status
   shows in the inbox, not here. A Mac whose `cherry` predates

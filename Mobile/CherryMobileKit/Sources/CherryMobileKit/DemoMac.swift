@@ -122,6 +122,8 @@ public actor DemoMacConnection: MacConnection {
                 "  ➜  Local:   http://localhost:5173/",
                 "  ➜  Network: use --host to expose",
                 "  ➜  press h + enter to show help",
+                "",
+                "11:04:51 PM [vite] hmr update /src/components/SessionList.tsx, /src/styles/session-list.css (x2)",
             ],
             "demo-zsh": [
                 "~ ❯ ",

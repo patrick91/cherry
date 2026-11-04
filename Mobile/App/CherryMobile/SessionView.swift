@@ -12,6 +12,7 @@ struct SessionView: View {
     @State private var screen: ScreenSnapshot?
     @State private var problem: String?
     @State private var showsScreen = false
+    @State private var wrapsLines = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -28,7 +29,7 @@ struct SessionView: View {
                     showsScreen = true
                 }
             } else {
-                ScreenTextView(screen: screen, problem: reconnecting ?? problem)
+                ScreenTextView(screen: screen, problem: reconnecting ?? problem, wraps: !isAgent && wrapsLines)
             }
             Composer(menu: showsConversation ? nil : menu, isRunning: session?.isRunning ?? true) { keys in
                 await send(keys)
@@ -46,6 +47,16 @@ struct SessionView: View {
                 }
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
+                if !isAgent {
+                    Button {
+                        wrapsLines.toggle()
+                    } label: {
+                        Label(
+                            wrapsLines ? "Don't Wrap Lines" : "Wrap Lines",
+                            systemImage: wrapsLines ? "arrow.left.and.right" : "text.alignleft"
+                        )
+                    }
+                }
                 if isAgent {
                     Button {
                         showsScreen.toggle()
@@ -122,21 +133,24 @@ struct SessionView: View {
     }
 }
 
-/// The screen's text at the session's own width, kept to its bottom.
+/// The screen's text, kept to its bottom: at the session's own width,
+/// scrolling sideways, or wrapped at the phone's (the host joins the rows
+/// a line wrapped onto, so it reflows as a terminal of that width would).
 struct ScreenTextView: View {
     let screen: ScreenSnapshot?
     let problem: String?
+    var wraps = false
 
     var body: some View {
         ZStack {
             Color(red: 0.07, green: 0.07, blue: 0.09)
             if let screen {
-                ScrollView([.vertical, .horizontal]) {
+                ScrollView(wraps ? .vertical : [.vertical, .horizontal]) {
                     Text(text(of: screen))
                         .font(.system(size: 12, design: .monospaced))
                         .foregroundStyle(Color(white: 0.9))
                         .textSelection(.enabled)
-                        .fixedSize(horizontal: true, vertical: true)
+                        .fixedSize(horizontal: !wraps, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(12)
                 }

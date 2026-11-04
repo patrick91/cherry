@@ -224,6 +224,55 @@ holders still run without one. Each line is `ok` or `PROBLEM` followed by a
 With `--host` it refuses: run it on that machine (`ssh my-server cherry
 doctor`).
 
+`cherry host transcript ID` prints, as JSON, the conversation of the agent a
+session runs (Claude Code, Codex, Pi or Amp), and the agent's own id for that
+session. Cherry for iPhone runs it over SSH to show an agent's conversation;
+the id resumes the session (`claude --resume ID`, `codex resume ID`,
+`pi --session PATH`, `amp threads continue ID`). It never starts a host, and
+with `--host` it refuses (the agent's files are on the machine it runs on).
+
+```sh
+cherry host transcript 7F0C1E52-… --limit 150
+cherry host transcript 7F0C1E52-… --after 'v1:file:16777232:9112:40960'
+cherry host transcript 7F0C1E52-… --locate
+```
+
+The agent is found from the session's processes (the session's program and
+its descendants, from `ps`):
+
+- Claude Code writes `~/.claude/sessions/<pid>.json` (`CLAUDE_CONFIG_DIR`)
+  for each of its processes, which names its session
+  (`projects/<folder>/<session>.jsonl`). A record whose `startedAt` is more
+  than two minutes from when the process started is a gone process's.
+- Codex (a process named `codex`): the rollout in
+  `~/.codex/sessions/YYYY/MM/DD/` (`CODEX_HOME`) whose `session_meta` names
+  the session's folder (its `cwd` or its shell's `pwd`) and that was created
+  first since the process started, else (a resumed session) written last.
+- Pi (`pi`): the same rule over `~/.pi/agent/sessions/--<folder>--/`
+  (`PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`).
+- Amp (`amp`): the thread whose log in `~/.cache/amp/logs/threads/` names the
+  process (`"pid":PID`), written last; the conversation comes from
+  `amp threads export`, as Amp keeps it on its server.
+
+A session's `cherry.agent` tag stands in for a program that runs the agent
+under another name. The output is `{"agent", "session_id", "path", "title",
+"cursor", "reset", "more_before", "entries"}`; each entry has a `kind`
+(`user`, `assistant`, `tool`, `tool_result`, `note`), an `id` and, but for
+`tool_result`, a `time`; text is cut at 20,000 characters, a tool's `summary`
+(its command, path, pattern, URL or query) at 200 and its `result` at 2,000.
+A tool's `status` is `running`, `ok` or `error`; a `tool_result` finishes a
+tool an earlier read returned (same `id`), and an entry with an `id` a client
+has replaces it. Hidden: thinking, Claude Code's own context and reminders,
+subagents, the summary a compaction writes (a `note` says it compacted).
+Without `--after` it reads the latest `--limit` entries (200, at most 2000),
+from the end of the file, and `reset` is true; with an earlier read's
+`cursor` (the file's identity and the offset after its last whole line, or
+how many of an Amp thread's messages were complete) it returns only what
+came after, unless the session's file changed or more than `--limit` came,
+which reads the latest again with `reset` true. A line still being written
+is read next time. `--locate` prints only `{"agent", "session_id", "path"}`.
+A session that runs none of these agents is an error (exit 1).
+
 `cherry host control` connects as `list` does (starting a host, or replacing one
 that speaks an older protocol, when needed) and then relays protocol frames
 between its standard input and output until either side closes: standard

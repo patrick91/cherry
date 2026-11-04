@@ -114,6 +114,38 @@ struct LoopbackTests {
         await #expect(throws: MacConnectionError.self) { try await connection.sessions() }
     }
 
+    /// A network gone quiet: the Mac's `cherry host control` is stopped
+    /// (SIGSTOP), so the connection stays open and nothing answers.
+    @Test func aMacThatStopsAnsweringIsDisconnected() async throws {
+        let identity = try Loopback.authorizedIdentity()
+        let connection = try await SSHMacConnector(identity: identity).connect(to: try Loopback.endpoint())
+        let events = connection.events()
+        let terminal = try await connection.attach(try Loopback.value("SESSION"), size: TerminalSize(columns: 80, rows: 24))
+        try await connection.ping(timeout: .seconds(5))
+
+        // This connection's control process: it names the private host's
+        // id, and is the newest (an earlier test's may still be exiting).
+        let pgrep = Process()
+        pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        pgrep.arguments = ["-n", "-f", "host control --no-start --expected-host-id \(try Loopback.value("HOST_ID"))"]
+        let pipe = Pipe()
+        pgrep.standardOutput = pipe
+        try pgrep.run()
+        pgrep.waitUntilExit()
+        let pid = try #require(pid_t(String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        kill(pid, SIGSTOP)
+        defer { kill(pid, SIGCONT) }
+
+        await #expect(throws: MacConnectionError.self) { try await connection.ping(timeout: .seconds(1)) }
+        var heard: [MacEvent] = []
+        for await event in events { heard.append(event) }
+        #expect(heard.last == .disconnected(reason: "The Mac stopped answering."))
+        // The whole SSH connection closed, so the terminal detached too.
+        for await _ in terminal.output {}
+        await #expect(throws: MacConnectionError.self) { try await connection.sessions() }
+    }
+
     @Test func aChangedHostKeyIsRefused() async throws {
         let identity = try Loopback.authorizedIdentity()
         let pinned = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"

@@ -36,13 +36,16 @@ struct TerminalScreen: View {
 
             ZStack {
                 if let connection = model.connection(for: key.macID), let session = model.session(key) {
+                    // A new connection (the Mac reconnected) attaches anew.
                     TerminalHost(
                         connection: connection,
                         sessionID: key.sessionID,
                         mode: fitsPhone ? .fitToPhone : .keepMacSize(session.size),
                         status: status
                     )
-                    .id(fitsPhone)
+                    .id(TerminalHostID(fitsPhone: fitsPhone, connection: ObjectIdentifier(connection)))
+                } else if let mac = model.mac(key.macID), mac.status.isReconnecting || mac.status == .connecting {
+                    ProgressView("\(mac.status == .connecting ? "Connecting" : "Reconnecting") to \(mac.endpoint.name)…")
                 } else {
                     ContentUnavailableView("Not connected", systemImage: "bolt.horizontal.circle", description: Text("This session's Mac isn't connected."))
                 }
@@ -59,10 +62,16 @@ struct TerminalScreen: View {
                     .allowsHitTesting(false)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .navigationTitle(model.session(key)?.title ?? "Terminal")
         .navigationBarTitleDisplayMode(.inline)
     }
+}
+
+private struct TerminalHostID: Hashable {
+    var fitsPhone: Bool
+    var connection: ObjectIdentifier
 }
 
 /// What the terminal tells the screen about itself.

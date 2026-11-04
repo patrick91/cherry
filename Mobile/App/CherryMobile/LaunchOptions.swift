@@ -4,7 +4,8 @@ import Foundation
 /// `-screen inbox`, `-screen session:<id>`, `-screen terminal:<id>`,
 /// `-screen terminal-fit:<id>` or `-screen macs` opens that screen against
 /// the Demo Mac. A run with `-screen` uses only the Demo Mac and connects
-/// nowhere else.
+/// nowhere else. `-demoDropAfter <seconds>` makes the Demo Mac drop each
+/// connection that long after it opened, to show reconnecting.
 struct LaunchOptions: Equatable, Sendable {
     enum Screen: Equatable, Sendable {
         case inbox
@@ -14,6 +15,7 @@ struct LaunchOptions: Equatable, Sendable {
     }
 
     var screen: Screen?
+    var demoDropsAfter: Duration?
 
     /// Only the Demo Mac: saved Macs are neither shown nor connected.
     var demoOnly: Bool {
@@ -21,7 +23,10 @@ struct LaunchOptions: Equatable, Sendable {
     }
 
     static var current: LaunchOptions {
-        LaunchOptions(argument: UserDefaults.standard.string(forKey: "screen"))
+        var options = LaunchOptions(argument: UserDefaults.standard.string(forKey: "screen"))
+        let drop = UserDefaults.standard.double(forKey: "demoDropAfter")
+        if drop > 0 { options.demoDropsAfter = .milliseconds(Int(drop * 1000)) }
+        return options
     }
 
     init(screen: Screen? = nil) {

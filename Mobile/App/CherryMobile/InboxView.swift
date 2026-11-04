@@ -9,7 +9,7 @@ struct InboxView: View {
 
     var body: some View {
         List {
-            let problems = model.macs.filter(\.status.isFailure)
+            let problems = model.macs.filter { $0.status.isFailure || $0.status.isReconnecting }
             if !problems.isEmpty {
                 Section {
                     ForEach(problems) { mac in
@@ -66,7 +66,7 @@ struct InboxView: View {
             } actions: {
                 Button("Add a Mac") { path.append(.macs) }
             }
-        } else if model.macs.contains(where: { $0.status == .connecting || $0.status == .idle }) {
+        } else if model.macs.contains(where: { $0.status == .connecting || $0.status == .idle || $0.status.isReconnecting }) {
             ProgressView("Connecting…")
         } else if !model.macs.contains(where: \.status.isFailure) {
             ContentUnavailableView("No sessions", systemImage: "terminal", description: Text("Your Macs have no Cherry sessions running."))
@@ -77,20 +77,34 @@ struct InboxView: View {
 struct MacProblemRow: View {
     let mac: AppModel.Mac
 
+    private var reason: String? {
+        switch mac.status {
+        case .failed(let reason), .reconnecting(let reason): reason
+        default: nil
+        }
+    }
+
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+            if mac.status.isReconnecting {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            }
             VStack(alignment: .leading, spacing: 2) {
-                Text(mac.endpoint.name)
+                Text(mac.status.isReconnecting ? "Reconnecting to \(mac.endpoint.name)…" : mac.endpoint.name)
                     .font(.subheadline.weight(.semibold))
-                if case .failed(let reason) = mac.status {
+                if let reason {
                     Text(reason)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
             }
+            // Reconnecting is no error: not in the button's tint.
+            .foregroundStyle(mac.status.isReconnecting ? AnyShapeStyle(Color.primary) : AnyShapeStyle(.tint))
         }
     }
 }

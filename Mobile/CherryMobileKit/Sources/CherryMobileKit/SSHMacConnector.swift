@@ -146,11 +146,14 @@ actor SSHMacConnection: MacConnection {
         guard case .ok = try await request(.subscribe) else {
             throw MacConnectionError.failed("The Mac's session host refused to send its events.")
         }
+        // A ping the host does not answer ends the connection: a network
+        // that went away (another Wi-Fi, a suspended app's NAT entry gone)
+        // only shows as silence.
         heartbeat = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: HostWire.heartbeatInterval)
                 guard let self, !Task.isCancelled else { return }
-                _ = try? await self.request(.ping)
+                try? await self.ping(timeout: .seconds(15))
             }
         }
     }
@@ -235,6 +238,20 @@ actor SSHMacConnection: MacConnection {
         } catch let failure as SSHConnection.Failure {
             throw Self.error(for: failure)
         }
+    }
+
+    func ping(timeout: Duration) async throws {
+        let reply: HostWireReply
+        do {
+            reply = try await request(.ping, timeout: timeout)
+        } catch {
+            if closedReason == nil {
+                await end(reason: "The Mac stopped answering.")
+                await ssh.close()
+            }
+            throw error
+        }
+        guard case .pong = reply else { throw unexpected(reply) }
     }
 
     func disconnect() async {
@@ -384,7 +401,11 @@ actor SSHMacConnection: MacConnection {
             continuation.finish()
         }
         subscribers.removeAll()
-        await control.close()
+        // Not awaited: a channel's close waits for the Mac's own, which a
+        // dead network or a wedged process never sends. Closing the SSH
+        // connection (`disconnect`, a failed ping) ends it anyway.
+        let control = control
+        Task { await control.close() }
     }
 
     /// Why `cherry host control --no-start` ended before its `Welcome`.

@@ -13,7 +13,7 @@ struct SessionView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ScreenTextView(screen: screen, problem: problem)
+            ScreenTextView(screen: screen, problem: reconnecting ?? problem)
             if let session, session.isRunning, let detail = session.detail {
                 StatusLine(attention: session.attention, message: detail)
             }
@@ -54,6 +54,12 @@ struct SessionView: View {
 
     private var session: MobileSession? {
         model.session(key)
+    }
+
+    /// While the Mac reconnects, the last screen stays, with a note.
+    private var reconnecting: String? {
+        guard let mac = model.mac(key.macID), mac.status.isReconnecting || mac.status == .connecting else { return nil }
+        return "\(mac.status == .connecting ? "Connecting" : "Reconnecting") to \(mac.endpoint.name)…"
     }
 
     private var menu: ScreenMenu? {

@@ -110,6 +110,11 @@ struct MacRow: View {
         case .awaitingTrust:
             Label("Waiting for you to trust its host key", systemImage: "circle.fill")
                 .labelStyle(StatusLabelStyle(color: .orange))
+        case .reconnecting(let reason):
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("Reconnecting… \(reason)").foregroundStyle(.secondary).lineLimit(3)
+            }
         case .failed(let reason):
             Label(reason, systemImage: "circle.fill")
                 .labelStyle(StatusLabelStyle(color: .red))

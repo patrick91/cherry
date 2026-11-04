@@ -13,13 +13,24 @@ public struct DemoMac: MacConnector {
 
     /// How long a demo agent works on a turn.
     public let turnDuration: Duration
+    /// When set, each connection drops this long after it opened, as a lost
+    /// network would (to show reconnecting).
+    public let dropsAfter: Duration?
 
-    public init(turnDuration: Duration = .seconds(4)) {
+    public init(turnDuration: Duration = .seconds(4), dropsAfter: Duration? = nil) {
         self.turnDuration = turnDuration
+        self.dropsAfter = dropsAfter
     }
 
     public func connect(to endpoint: MacEndpoint) async throws -> any MacConnection {
-        DemoMacConnection(endpoint: endpoint, turnDuration: turnDuration)
+        let connection = DemoMacConnection(endpoint: endpoint, turnDuration: turnDuration)
+        if let dropsAfter {
+            Task { [weak connection] in
+                try? await Task.sleep(for: dropsAfter)
+                await connection?.drop(reason: "The Demo Mac dropped the connection.")
+            }
+        }
+        return connection
     }
 }
 
@@ -171,10 +182,20 @@ public actor DemoMacConnection: MacConnection {
         return attachment
     }
 
+    public func ping(timeout: Duration) async throws {
+        try checkConnected()
+    }
+
     public func disconnect() async {
+        drop(reason: "Disconnected")
+    }
+
+    /// Ends the connection as a lost network would, with `reason`.
+    public func drop(reason: String) {
+        guard isConnected else { return }
         isConnected = false
         for continuation in subscribers.values {
-            continuation.yield(.disconnected(reason: "Disconnected"))
+            continuation.yield(.disconnected(reason: reason))
             continuation.finish()
         }
         subscribers.removeAll()

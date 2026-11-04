@@ -171,11 +171,36 @@ Recommendation: start with option 1 once there is a paid team, and keep
 option 3 as the zero-setup fallback. A push carries no screen text, only
 "Claude in cherry needs you", with the session as a deep link.
 
+### Reconnects
+
+A connection is checked as well as used: `cherry host control` must answer a
+`Ping` every 15 s within 15 s, or the app ends the connection ("The Mac
+stopped answering."), its terminals with it. A network that went away (other
+Wi-Fi, a NAT entry dropped while the phone slept) only shows as silence.
+
+A dropped connection, or a connect that failed for a reason that can clear
+up (an unreachable Mac, no session host yet, a broken channel), is tried
+again by itself after 1, 2, 4, … s, at most 30 s (`ReconnectPolicy`), while
+the app is in front and the network is up. A refused key, a changed host
+key, a missing `cherry` or another protocol version wait for the user. The
+Mac shows *Reconnecting…* with the last reason, its sessions stay listed (the
+session screen keeps its last text, with a note), and an open terminal
+attaches again once the new connection is up.
+
+In the background every connection closes after 20 s, inside a background
+task, so a Mac never keeps an attachment, and a Fit to phone grid, for a
+phone iOS suspended. Back in front, or when the network comes back or
+changes interface (`NWPathMonitor`), every open connection must answer a
+ping within 3 s and every Mac waiting to reconnect tries at once. The app
+logs this under subsystem `dev.patrick.cherry.mobile`, category
+"Connections".
+
 ### Background refresh
 
-While the app is open it keeps its connections and listens to events.
-Backgrounded, it refreshes through `BGAppRefreshTask` (best effort, minutes
-apart). That makes notifications (P3), not polling, the real signal.
+While the app is open it keeps its connections and listens to events; 20 s
+after it goes to the background it closes them (Reconnects). Backgrounded,
+it refreshes through `BGAppRefreshTask` (best effort, minutes apart). That
+makes notifications (P3), not polling, the real signal.
 
 ### Code sharing (with issue #7)
 

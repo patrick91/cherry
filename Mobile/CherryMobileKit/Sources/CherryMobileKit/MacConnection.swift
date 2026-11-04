@@ -27,6 +27,11 @@ public protocol MacConnection: AnyObject, Sendable {
     /// What the connection reports by itself, until it ends.
     func events() -> AsyncStream<MacEvent>
 
+    /// Checks that the Mac still answers within `timeout`. A connection
+    /// that does not is ended: its subscribers hear `disconnected`, and its
+    /// terminals detach.
+    func ping(timeout: Duration) async throws
+
     /// Attaches a terminal to the session at `size` (its PTY size; the
     /// host's shared grid is the smallest among its clients).
     func attach(_ sessionID: String, size: TerminalSize) async throws -> any TerminalAttachment

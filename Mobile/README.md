@@ -141,6 +141,9 @@ nowhere else:
 - `-screen terminal-fit:demo-claude`
 - `-screen macs`
 
+`-demoDropAfter <seconds>` makes the Demo Mac drop each connection that long
+after it opened, to show reconnecting.
+
 ## Rules for tests
 
 Tests never reach the user's real Macs, daemon or Cherry:

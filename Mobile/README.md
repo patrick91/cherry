@@ -97,6 +97,16 @@ privacy manifest (`App/CherryMobile/PrivacyInfo.xcprivacy`) declares the
 required-reason APIs the linked binary uses: check it again when a new one
 appears (`nm -u` on the app's binary).
 
+Xcode Cloud does the same with no keychain at all (Apple signs it). Its
+workflow, made in Xcode (Integrate › Create Workflow) by someone signed in to
+the team, archives for iOS and hands the build to TestFlight's internal
+testers. `App/ci_scripts/ci_post_clone.sh` runs after its clone: it
+generates the project and gives it the kit's `Package.resolved` (Xcode Cloud
+resolves no packages itself). Xcode Cloud numbers its builds itself (1, 2,
+…), below `testflight`'s UTC numbers, so once a version has an upload from
+one, keep using that one for it (or set Xcode Cloud's next build number in
+App Store Connect).
+
 `screenshots` runs headless: it creates a private simulator named
 `CherryMobile-Proto`, boots it without Simulator.app, then shuts it down and
 deletes it. It touches no other simulator. To run the app yourself, open the

@@ -18,7 +18,11 @@ SOURCE_DIR="${1:?Usage: $0 <ghostty-source-dir>}"
 #
 # Fix:
 # - Allow ±1px tolerance on iOS when comparing surface vs layer dimensions
-# - Dynamically adjust contentsScale when dimensions don't match exactly
+# - Reject stale frames whose dimensions differ by more than 1px, as upstream
+#   does, keeping the last correctly sized contents until the matching frame
+#   renders. (An older variant rescaled them through contentsScale, which fed
+#   back into surfaceSize() and left the layer at a stale size after a
+#   resize: libghostty-spm ad4ef61 and 1666330.)
 # - Use CAIOSurfaceLayer as base class on iOS for native IOSurface compositing
 # - Mark layer as opaque since terminal content fills the entire bounds
 # =============================================================================
@@ -49,8 +53,7 @@ src = src.replace(
 
 # Replace the strict size equality check with a platform-aware version.
 # On iOS, UIKit's point→pixel rounding can produce a 1px discrepancy.
-# Rather than dropping the frame entirely (→ blank screen), we accept it
-# and recalculate contentsScale so CoreAnimation stretches correctly.
+# Larger mismatches are stale frames from an earlier resize: discard them.
 old_block = """    if (width != surface.getWidth() or height != surface.getHeight()) {
         log.debug(
             "setSurfaceCallback(): surface is wrong size for layer, discarding. surface = {d}x{d}, layer = {d}x{d}",
@@ -65,23 +68,7 @@ new_block = """    const sw = surface.getWidth();
     const dh: usize = if (height > sh) height - sh else sh - height;
     // iOS UIKit rounding can produce ±1px discrepancy; macOS must match exactly
     const max_drift: usize = if (comptime builtin.os.tag == .ios) 1 else 0;
-    if (dw > max_drift or dh > max_drift) {
-        if (comptime builtin.os.tag == .ios) {
-            // Recalculate contentsScale so CA maps surface pixels to layer points
-            const pw = bounds.size.width;
-            const ph = bounds.size.height;
-            if (pw > 0 and ph > 0) {
-                const cs_x: f64 = @as(f64, @floatFromInt(sw)) / pw;
-                const cs_y: f64 = @as(f64, @floatFromInt(sh)) / ph;
-                const cs: f64 = @max(cs_x, cs_y);
-                if (@abs(cs - scale) > 0.01) {
-                    layer.setProperty("contentsScale", cs);
-                }
-            }
-        } else {
-            return;
-        }
-    }"""
+    if (dw > max_drift or dh > max_drift) return;"""
 
 if old_block not in src:
     print("[!] IOSurfaceLayer size check block not found — source may have changed")

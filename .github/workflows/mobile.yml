@@ -30,7 +30,7 @@ defaults:
 
 jobs:
   mobile:
-    name: iOS kit, SSH loopback and simulator build
+    name: iOS kit, SSH loopback and app builds
     runs-on: macos-26
     timeout-minutes: 45
     steps:
@@ -50,3 +50,7 @@ jobs:
         run: brew list --versions xcodegen || brew install xcodegen
       - name: Build the app for the simulator
         run: Mobile/Scripts/build-app
+      # What TestFlight gets, unsigned: Release, for devices, linking
+      # GhosttyKit's ios-arm64 slice, which the simulator build never uses.
+      - name: Archive the app for devices, unsigned
+        run: Mobile/Scripts/testflight --unsigned

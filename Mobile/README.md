@@ -80,6 +80,23 @@ It signs with that team (one Xcode is signed in to), registering the bundle
 id and the device on the first run, then installs and launches the app. A
 free Personal team's build stops launching after 7 days; run it again.
 
+To TestFlight, for internal testers, once the app's record (bundle id
+`dev.patrick.cherry.mobile`) exists in App Store Connect:
+
+```bash
+CHERRY_MOBILE_TEAM=<team id> Mobile/Scripts/testflight
+```
+
+It archives a Release build for devices, signs it with the team (Xcode's
+automatic signing, or an App Store Connect API key named by `ASC_KEY_PATH`,
+`ASC_KEY_ID` and `ASC_ISSUER_ID`) and uploads it, marked for internal testing
+only. The build number is the UTC time. Signing needs the login keychain, so
+run it in your own terminal. `--export DIR` writes the `.ipa` instead of
+uploading it; `--unsigned` only checks the device build, as CI does. The
+privacy manifest (`App/CherryMobile/PrivacyInfo.xcprivacy`) declares the
+required-reason APIs the linked binary uses: check it again when a new one
+appears (`nm -u` on the app's binary).
+
 `screenshots` runs headless: it creates a private simulator named
 `CherryMobile-Proto`, boots it without Simulator.app, then shuts it down and
 deletes it. It touches no other simulator. To run the app yourself, open the

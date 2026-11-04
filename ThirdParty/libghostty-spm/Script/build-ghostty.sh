@@ -36,10 +36,12 @@ if ! command -v zig >/dev/null 2>&1; then
     exit 1
 fi
 
-./Script/apply-patches.sh "$SOURCE_DIR"
-
 CACHE_ROOT="${BUILD_CACHE_ROOT:-$ROOT_DIR/build/cache}"
 GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$CACHE_ROOT/zig-global}"
+
+# A patch that fetches Zig packages (0012) reuses the build's cache.
+ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" ./Script/apply-patches.sh "$SOURCE_DIR"
+
 LOCAL_CACHE_DIR="$CACHE_ROOT/$ZIG_TARGET/zig-local"
 MODULE_CACHE_DIR="${CLANG_MODULE_CACHE_ROOT:-$CACHE_ROOT/clang-module-cache}/$ZIG_TARGET"
 
@@ -57,6 +59,13 @@ mkdir -p \
     "$MODULE_CACHE_DIR"
 
 rm -rf "$SOURCE_DIR/zig-out"
+
+# iOS builds against a patched copy of Zig's std when Patches/zig has one for
+# this Zig; every other target uses the toolchain as it is.
+STAGED_ZIG_LIB=
+if [[ "$ZIG_TARGET" == *-ios* ]]; then
+    STAGED_ZIG_LIB=$(./Script/prepare-zig-lib.sh "$CACHE_ROOT")
+fi
 
 ZIG_BUILD_COMMAND=(
     zig build
@@ -84,6 +93,9 @@ fi
 
 (
     cd "$SOURCE_DIR"
+    if [ -n "$STAGED_ZIG_LIB" ]; then
+        export ZIG_LIB_DIR="$STAGED_ZIG_LIB"
+    fi
     env \
         CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR" \
         ZIG_GLOBAL_CACHE_DIR="$GLOBAL_CACHE_DIR" \

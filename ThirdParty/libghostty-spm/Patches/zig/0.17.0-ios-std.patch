@@ -1,0 +1,13 @@
+--- a/std/process.zig
++++ b/std/process.zig
+@@ -254,7 +254,9 @@
+ /// process image. If this is `false` then calling `replace` or `replaceFile`
+ /// functions will return `error.OperationUnsupported`.
+ pub const can_replace = switch (native_os) {
+-    .windows, .haiku, .wasi => false,
++    // libghostty-spm: Io.Threaded's Darwin replace path opens /dev/null
++    // through `null_file.fd`, which its NullFile has no field for on iOS.
++    .windows, .haiku, .wasi, .ios, .tvos, .visionos, .watchos => false,
+     else => true,
+ };
+ 

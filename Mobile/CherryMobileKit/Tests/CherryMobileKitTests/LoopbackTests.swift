@@ -146,6 +146,69 @@ struct LoopbackTests {
         await #expect(throws: MacConnectionError.self) { try await connection.sessions() }
     }
 
+    /// `cherry host transcript` over SSH: the session's program stands in
+    /// for Claude Code, with its record (`~/.claude/sessions/<pid>.json`)
+    /// and transcript under the private HOME.
+    @Test func anAgentsConversationIsReadFromItsSessionOnTheMac() async throws {
+        let identity = try Loopback.authorizedIdentity()
+        let session = try Loopback.value("SESSION")
+        let pid = try #require(Int32(try Loopback.value("PROGRAM_PID")))
+        let claude = URL(fileURLWithPath: try Loopback.value("HOME")).appendingPathComponent(".claude")
+        defer { try? FileManager.default.removeItem(at: claude) }
+
+        // When the program started, as Claude Code records it.
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-o", "etime=", "-p", String(pid)]
+        let pipe = Pipe()
+        ps.standardOutput = pipe
+        try ps.run()
+        ps.waitUntilExit()
+        let elapsed = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: { $0 == ":" || $0 == "-" })
+            .compactMap { Double($0) }
+            .reduce(0) { $0 * 60 + $1 }
+        let startedAt = Int((Date().timeIntervalSince1970 - elapsed) * 1000)
+        let sessions = claude.appendingPathComponent("sessions")
+        let project = claude.appendingPathComponent("projects/-")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"pid":\#(pid),"sessionId":"loopback","cwd":"/","startedAt":\#(startedAt)}"#
+            .write(to: sessions.appendingPathComponent("\(pid).json"), atomically: true, encoding: .utf8)
+        try """
+        {"type":"user","uuid":"u1","message":{"content":"Run the tests"}}
+        {"type":"assistant","uuid":"a1","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"npm test"}}]}}
+
+        """.write(to: project.appendingPathComponent("loopback.jsonl"), atomically: true, encoding: .utf8)
+
+        let connection = try await SSHMacConnector(identity: identity).connect(to: try Loopback.endpoint())
+        var conversation = Conversation()
+        conversation.apply(try await connection.transcript(of: session, after: nil, limit: 50))
+        #expect(conversation.agent == "claude")
+        #expect(conversation.sessionID == "loopback")
+        #expect(conversation.entries.map(\.kind) == [.user, .tool])
+        #expect(conversation.entries.last?.status == .running)
+
+        // What comes after: the tool's result.
+        let handle = try FileHandle(forWritingTo: project.appendingPathComponent("loopback.jsonl"))
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(#"{"type":"user","uuid":"u2","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#.utf8 + [0x0A]))
+        try handle.close()
+        let next = try await connection.transcript(of: session, after: conversation.cursor, limit: 50)
+        #expect(!next.reset)
+        conversation.apply(next)
+        #expect(conversation.entries.last?.status == .ok)
+        #expect(conversation.entries.last?.result == "ok")
+
+        // Without the record, the session runs no agent Cherry can read.
+        try FileManager.default.removeItem(at: sessions)
+        await #expect(throws: MacConnectionError.noConversation) {
+            _ = try await connection.transcript(of: session, after: nil, limit: 50)
+        }
+        await connection.disconnect()
+    }
+
     @Test func aChangedHostKeyIsRefused() async throws {
         let identity = try Loopback.authorizedIdentity()
         let pinned = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"

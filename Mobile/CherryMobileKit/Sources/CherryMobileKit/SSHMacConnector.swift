@@ -228,6 +228,43 @@ actor SSHMacConnection: MacConnection {
         return stream
     }
 
+    func transcript(of sessionID: String, after cursor: String?, limit: Int) async throws -> AgentTranscript {
+        if let closedReason { throw MacConnectionError.unreachable(closedReason) }
+        var words = [cherryPath, "host", "transcript", sessionID, "--limit", String(limit)]
+        if let cursor { words += ["--after", cursor] }
+        if let hostID { words += ["--expected-host-id", hostID] }
+        let result: SSHCommandResult
+        do {
+            // Amp's conversation comes from its server (`amp threads export`).
+            result = try await ssh.run(ShellQuote.command(words), timeout: .seconds(30))
+        } catch let failure as SSHConnection.Failure {
+            throw Self.error(for: failure)
+        }
+        guard result.status == 0 else {
+            throw Self.transcriptError(result.stderrText, sessionID: sessionID)
+        }
+        do {
+            return try JSONDecoder().decode(AgentTranscript.self, from: result.stdout)
+        } catch {
+            throw MacConnectionError.failed("The Mac's cherry answered something this app can't read.")
+        }
+    }
+
+    /// Why `cherry host transcript` failed, from its standard error.
+    static func transcriptError(_ stderr: String, sessionID: String) -> MacConnectionError {
+        if stderr.contains("unrecognized subcommand") {
+            return .transcriptUnsupported
+        }
+        if stderr.contains("conversation found") || stderr.contains("runs no program") {
+            return .noConversation
+        }
+        if stderr.contains("no session") || stderr.contains("is not running") {
+            return .sessionGone(sessionID)
+        }
+        let message = stderr.hasPrefix("cherry: ") ? String(stderr.dropFirst("cherry: ".count)) : stderr
+        return .failed(message.isEmpty ? "The Mac's cherry couldn't read the conversation." : message)
+    }
+
     func attach(_ sessionID: String, size: TerminalSize) async throws -> any TerminalAttachment {
         if let closedReason { throw MacConnectionError.unreachable(closedReason) }
         var words = [cherryPath, "host", "attach", sessionID, "--detach-key", "none", "--client-id", "mobile-\(deviceID)"]

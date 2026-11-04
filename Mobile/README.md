@@ -118,10 +118,16 @@ Screens:
 - **Inbox:** every Mac's sessions. *Needs you* comes first (approvals,
   questions, errors, results), then *Working*, then the rest. Pull to
   refresh.
-- **Session:** the host's screen text at the session's width, kept to the
-  bottom. A menu on screen (`ScreenMenu`) becomes buttons that type the
-  option's digit, as an agent takes it. Below them are a reply field (text,
-  then Enter) and keys: Esc, arrows, Enter, Tab, ⌃C.
+- **Session:** for an agent, its *Conversation* by default: the messages,
+  tool calls (a row with a one-line summary that opens on the start of its
+  result) and notes the Mac's `cherry host transcript` reads from the
+  agent's own session (Claude Code, Codex, Pi, Amp; Host/README.md),
+  followed every 2 s (5 s for Amp) from its cursor. *Screen*, and every
+  other session, shows the host's screen text at the session's width, kept
+  to the bottom. A menu on screen (`ScreenMenu`) becomes buttons that type
+  the option's digit, as an agent takes it. Below them are a reply field
+  (text, then Enter) and keys: Esc, arrows, Enter, Tab, ⌃C. A Mac whose
+  `cherry` predates `host transcript` says to update Cherry there.
 - **Terminal:** Ghostty's `UITerminalView` on an `InMemoryTerminalSession`,
   bridged to a `TerminalAttachment`.
   - *Keep Mac size* (the default) attaches at the session's grid in a

@@ -32,6 +32,11 @@ public protocol MacConnection: AnyObject, Sendable {
     /// terminals detach.
     func ping(timeout: Duration) async throws
 
+    /// The conversation of the agent the session runs, as the Mac's `cherry
+    /// host transcript` reads it from the agent's own session: the latest
+    /// `limit` entries, or what came after `cursor` (an earlier read's).
+    func transcript(of sessionID: String, after cursor: String?, limit: Int) async throws -> AgentTranscript
+
     /// Attaches a terminal to the session at `size` (its PTY size; the
     /// host's shared grid is the smallest among its clients).
     func attach(_ sessionID: String, size: TerminalSize) async throws -> any TerminalAttachment

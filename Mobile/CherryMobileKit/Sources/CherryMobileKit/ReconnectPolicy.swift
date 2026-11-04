@@ -31,7 +31,8 @@ public struct ReconnectPolicy: Equatable, Sendable {
         switch error {
         case .unreachable, .noSessionHost, .failed:
             return true
-        case .authenticationFailed, .hostKeyMismatch, .cherryNotFound, .protocolMismatch, .sessionGone:
+        case .authenticationFailed, .hostKeyMismatch, .cherryNotFound, .protocolMismatch, .sessionGone,
+             .transcriptUnsupported, .noConversation:
             return false
         }
     }

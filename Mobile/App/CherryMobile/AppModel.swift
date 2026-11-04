@@ -257,6 +257,13 @@ final class AppModel {
         return try await connection.screen(of: key.sessionID)
     }
 
+    func transcript(of key: SessionKey, after cursor: String?, limit: Int) async throws -> AgentTranscript {
+        guard let connection = connections[key.macID] else {
+            throw MacConnectionError.unreachable("not connected")
+        }
+        return try await connection.transcript(of: key.sessionID, after: cursor, limit: limit)
+    }
+
     func send(_ keys: [MobileKey], to key: SessionKey) async throws {
         guard let connection = connections[key.macID] else {
             throw MacConnectionError.unreachable("not connected")

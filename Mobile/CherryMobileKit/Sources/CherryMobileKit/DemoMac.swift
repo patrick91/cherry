@@ -45,6 +45,12 @@ public actor DemoMacConnection: MacConnection {
     /// Each attachment's size, which its paints keep to.
     private var attachmentSizes: [ObjectIdentifier: TerminalSize] = [:]
     private var isConnected = true
+    /// Each agent's conversation as its session file would hold it: entries
+    /// and the results of tools that finished later, in order.
+    private var conversations: [String: [TranscriptEntry]] = DemoMacConnection.seededConversations
+    /// The tool each agent waits to run until it is approved.
+    private var toolsAwaitingApproval = ["demo-claude": "c5"]
+    private var nextEntry = 0
 
     init(endpoint: MacEndpoint, turnDuration: Duration) {
         self.endpoint = endpoint
@@ -172,6 +178,29 @@ public actor DemoMacConnection: MacConnection {
         return stream
     }
 
+    public func transcript(of sessionID: String, after cursor: String?, limit: Int) async throws -> AgentTranscript {
+        try checkConnected()
+        guard let session = sessions.first(where: { $0.id == sessionID }) else {
+            throw MacConnectionError.sessionGone(sessionID)
+        }
+        guard case .agent(let agent) = session.kind, let log = conversations[sessionID] else {
+            throw MacConnectionError.noConversation
+        }
+        if let cursor, cursor.hasPrefix("demo:"), let seen = Int(cursor.dropFirst("demo:".count)), seen <= log.count {
+            return AgentTranscript(agent: agent, cursor: "demo:\(log.count)", reset: false, entries: Array(log[seen...]))
+        }
+        var conversation = Conversation(capacity: limit)
+        conversation.apply(AgentTranscript(agent: agent, cursor: "", reset: true, entries: log))
+        return AgentTranscript(
+            agent: agent,
+            sessionID: "\(sessionID)-session",
+            cursor: "demo:\(log.count)",
+            reset: true,
+            moreBefore: conversation.moreBefore,
+            entries: conversation.entries
+        )
+    }
+
     public func attach(_ sessionID: String, size: TerminalSize) async throws -> any TerminalAttachment {
         try checkConnected()
         guard let lines = screens[sessionID] else { throw MacConnectionError.sessionGone(sessionID) }
@@ -276,6 +305,7 @@ public actor DemoMacConnection: MacConnection {
             return
         case .resultReady, .idle, .unknown, .error:
             guard !draft.isEmpty else { return }
+            record(TranscriptEntry(id: entryID(), kind: .user, text: draft), in: id)
             screens[id, default: []] += ["", "› \(draft)", "", "✻ Thinking… (esc to interrupt)"]
             startTurn(at: index, answer: "⏺ (\(name) in the demo) Done: \(draft)")
         case .working:
@@ -303,6 +333,10 @@ public actor DemoMacConnection: MacConnection {
         let id = sessions[index].id
         drafts[id] = nil
         if choice == "3" {
+            if let tool = toolsAwaitingApproval.removeValue(forKey: id) {
+                record(TranscriptEntry(id: tool, kind: .toolResult, result: "Not approved", status: .error), in: id)
+            }
+            record(TranscriptEntry(id: entryID(), kind: .assistant, text: "Stopped. What should I do instead?"), in: id)
             screens[id] = ["⏺ Stopped. What should I do instead?", ""]
             sessions[index].attention = .resultReady
             sessions[index].detail = "Stopped"
@@ -327,6 +361,10 @@ public actor DemoMacConnection: MacConnection {
 
     private func finishTurn(_ id: String, answer: String) {
         guard isConnected, let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        if let tool = toolsAwaitingApproval.removeValue(forKey: id) {
+            record(TranscriptEntry(id: tool, kind: .toolResult, result: "Executed 16 tests, with 0 failures", status: .ok), in: id)
+        }
+        record(TranscriptEntry(id: entryID(), kind: .assistant, text: answer.replacingOccurrences(of: "⏺ ", with: "")), in: id)
         screens[id] = (screens[id] ?? []).filter { !$0.contains("esc to interrupt") } + [answer, ""]
         sessions[index].attention = .resultReady
         sessions[index].detail = answer.replacingOccurrences(of: "⏺ ", with: "")
@@ -349,6 +387,39 @@ public actor DemoMacConnection: MacConnection {
     private func unsubscribe(_ id: UUID) {
         subscribers[id] = nil
     }
+
+    private func record(_ entry: TranscriptEntry, in sessionID: String) {
+        conversations[sessionID, default: []].append(entry)
+    }
+
+    private func entryID() -> String {
+        nextEntry += 1
+        return "demo-\(nextEntry)"
+    }
+
+    /// What the demo's agents said before the app connected.
+    private static let seededConversations: [String: [TranscriptEntry]] = [
+        "demo-claude": [
+            TranscriptEntry(id: "c1", kind: .user, text: "The key encoder tests fail on CI. Fix them, and commit once they pass."),
+            TranscriptEntry(id: "c2", kind: .tool, name: "Read", summary: "Sources/Cherry/HostRoutedKeyEncoder.swift", result: "412 lines", status: .ok),
+            TranscriptEntry(id: "c3", kind: .assistant, text: "Shift+Return is encoded as `CSI 13;2u` only while the kitty flags are on, so the legacy path sends a bare CR. I'll fix that, then run the **key encoder tests** before committing."),
+            TranscriptEntry(id: "c4", kind: .tool, name: "Edit", summary: "Sources/Cherry/HostRoutedKeyEncoder.swift", result: "Updated 1 hunk (+6 −2)", status: .ok),
+            TranscriptEntry(id: "c5", kind: .tool, name: "Bash", summary: "swift test --filter AdapterAwayKeyInput", status: .running),
+        ],
+        "demo-codex": [
+            TranscriptEntry(id: "x1", kind: .user, text: "Port the schema printer to the new AST."),
+            TranscriptEntry(id: "x2", kind: .tool, name: "Shell", summary: "rg -l SchemaPrinter", result: "Sources/Printer/SchemaPrinter.swift\nTests/PrinterTests.swift", status: .ok),
+            TranscriptEntry(id: "x3", kind: .tool, name: "Edit", summary: "SchemaPrinter.swift", result: "+48 −12", status: .ok),
+            TranscriptEntry(id: "x4", kind: .assistant, text: "The printer walks the new AST now. Updating its tests next."),
+            TranscriptEntry(id: "x5", kind: .tool, name: "Shell", summary: "swift test --filter Printer", status: .running),
+        ],
+        "demo-pi": [
+            TranscriptEntry(id: "p1", kind: .user, text: "Tidy my notes: merge duplicates and fix broken links."),
+            TranscriptEntry(id: "p2", kind: .tool, name: "bash", summary: "ls notes | wc -l", result: "214", status: .ok),
+            TranscriptEntry(id: "p3", kind: .note, text: "Conversation compacted"),
+            TranscriptEntry(id: "p4", kind: .assistant, text: "Tidied 12 notes: merged 3 duplicates and fixed 9 broken links."),
+        ],
+    ]
 
     private func broadcast(_ event: MacEvent) {
         for continuation in subscribers.values {

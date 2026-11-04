@@ -85,6 +85,23 @@ The inbox shows the screen text the host keeps (`Screen`), which costs
 nothing on the Mac and never resizes anything. It is shown at the Mac's
 width in a horizontally scrollable monospaced view.
 
+### Conversations
+
+An agent's session opens on its conversation, read from the agent's own
+session on the Mac: `cherry host transcript <session>` (Host/README.md) runs
+over the SSH connection, finds the agent from the session's processes
+(Claude Code's `sessions/<pid>.json`, the Codex rollout or Pi session file
+its process started in the session's folder, the Amp thread whose log names
+it) and prints trimmed entries: messages, tool calls with a one-line summary
+and the start of their result, notes. The phone keeps them in a
+`Conversation` (an entry with an id it has replaces it, a `tool_result`
+finishes its tool) and reads what came after its cursor every 2 s, 5 s for
+Amp, whose conversation comes from its server. Claude Code's transcripts run
+to tens of megabytes, which is why the Mac reads and trims them, not the
+phone. Only agents running in a session count, and the same lookup gives the
+agent's own session id, with which the Mac app can later resume an agent
+after a reboot.
+
 ### Agent state (attention)
 
 The phone reads each session's program status from the host, as the Mac

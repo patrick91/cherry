@@ -19,7 +19,8 @@
 #   /tmp/cherry-host-$UID) can answer it;
 # - the session's program is a stand-in agent that reports its status
 #   (OSC 7501) as Claude Code does: blocked on a permission, then done once
-#   a line `approve` comes;
+#   a line `approve` comes; a test writes a stand-in Claude Code record and
+#   transcript for it under the private HOME;
 # - everything is stopped by the pids it started, and the directory removed.
 #
 # Exits 2 when sshd cannot run here.
@@ -165,6 +166,8 @@ CHERRY_TEST_MOBILE_CHERRY="$dir/bin/cherry" \
 CHERRY_TEST_MOBILE_HOST_ID="$host_id" \
 CHERRY_TEST_MOBILE_SESSION="$session" \
 CHERRY_TEST_MOBILE_TAB="$tab" \
+CHERRY_TEST_MOBILE_PROGRAM_PID="$program_pid" \
+CHERRY_TEST_MOBILE_HOME="$dir/home" \
   swift test --package-path "$root/Mobile/CherryMobileKit" --filter Loopback || status=$?
 
 if [ "$status" != 0 ]; then

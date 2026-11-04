@@ -1,8 +1,8 @@
 import CherryMobileKit
 import SwiftUI
 
-/// A session's screen as its host keeps it, and quick replies: a menu's
-/// options as buttons, a reply field, and keys.
+/// A session: an agent's conversation or the screen as its host keeps it,
+/// and quick replies: a menu's options as buttons, a reply field, and keys.
 struct SessionView: View {
     @Environment(AppModel.self) private var model
     let key: SessionKey
@@ -10,10 +10,26 @@ struct SessionView: View {
 
     @State private var screen: ScreenSnapshot?
     @State private var problem: String?
+    @State private var showsScreen = false
 
     var body: some View {
         VStack(spacing: 0) {
-            ScreenTextView(screen: screen, problem: reconnecting ?? problem)
+            if isAgent {
+                Picker("Show", selection: $showsScreen) {
+                    Text("Conversation").tag(false)
+                    Text("Screen").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+            }
+            if isAgent && !showsScreen {
+                ConversationView(key: key, reconnecting: reconnecting) {
+                    showsScreen = true
+                }
+            } else {
+                ScreenTextView(screen: screen, problem: reconnecting ?? problem)
+            }
             if let session, session.isRunning, let detail = session.detail {
                 StatusLine(attention: session.attention, message: detail)
             }
@@ -54,6 +70,11 @@ struct SessionView: View {
 
     private var session: MobileSession? {
         model.session(key)
+    }
+
+    private var isAgent: Bool {
+        if case .agent = session?.kind { return true }
+        return false
     }
 
     /// While the Mac reconnects, the last screen stays, with a note.

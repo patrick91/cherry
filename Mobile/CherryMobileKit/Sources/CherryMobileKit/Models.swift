@@ -234,6 +234,10 @@ public enum MacConnectionError: Error, Hashable, Sendable, LocalizedError {
     case cherryNotFound
     case protocolMismatch(String)
     case sessionGone(String)
+    /// The Mac's `cherry` predates `cherry host transcript`.
+    case transcriptUnsupported
+    /// The session runs no agent whose conversation the Mac can read.
+    case noConversation
     case failed(String)
 
     public var errorDescription: String? {
@@ -246,6 +250,8 @@ public enum MacConnectionError: Error, Hashable, Sendable, LocalizedError {
         case .cherryNotFound: "Cherry isn't installed on the Mac, or not where the app looked."
         case .protocolMismatch(let why): "This app and the Mac's Cherry don't speak the same version: \(why)"
         case .sessionGone(let id): "The session \(id) has ended."
+        case .transcriptUnsupported: "The Mac's Cherry can't read agent conversations yet. Update Cherry there."
+        case .noConversation: "No Claude Code, Codex, Pi or Amp conversation found in this session."
         case .failed(let why): why
         }
     }

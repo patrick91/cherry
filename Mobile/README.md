@@ -118,16 +118,22 @@ Screens:
 - **Inbox:** every Mac's sessions. *Needs you* comes first (approvals,
   questions, errors, results), then *Working*, then the rest. Pull to
   refresh.
-- **Session:** for an agent, its *Conversation* by default: the messages,
-  tool calls (a row with a one-line summary that opens on the start of its
-  result) and notes the Mac's `cherry host transcript` reads from the
-  agent's own session (Claude Code, Codex, Pi, Amp; Host/README.md),
-  followed every 2 s (5 s for Amp) from its cursor. *Screen*, and every
-  other session, shows the host's screen text at the session's width, kept
-  to the bottom. A menu on screen (`ScreenMenu`) becomes buttons that type
-  the option's digit, as an agent takes it. Below them are a reply field
-  (text, then Enter) and keys: Esc, arrows, Enter, Tab, ⌃C. A Mac whose
-  `cherry` predates `host transcript` says to update Cherry there.
+- **Session:** for an agent, its conversation by default: what the Mac's
+  `cherry host transcript` reads from the agent's own session (Claude Code,
+  Codex, Pi, Amp; Host/README.md), followed every 2 s (5 s for Amp) from
+  its cursor. Messages are Markdown (`Markdown.blocks`: paragraphs,
+  headings, lists, code, tables as code, quotes); each run of tool calls is
+  one group of one-line rows, a verb and what it acted on with paths
+  relative to the session's folder (`ToolPresentation`, `DisplayPath`),
+  the latest three shown, each opening on the start of its result; a row
+  says when the agent works. The toolbar switches to the screen, which
+  every other session shows: the host's screen text at the session's
+  width, kept to the bottom. Under either is the composer: a menu on screen
+  (`ScreenMenu`) as compact buttons that type the option's digit, as an
+  agent takes it (else the program's status, unless the conversation shows
+  it working), a reply field (text, then Enter) and, behind the keyboard
+  button, keys: Esc, arrows, Enter, Tab, ⌃C. A Mac whose `cherry` predates
+  `host transcript` says to update Cherry there.
 - **Terminal:** Ghostty's `UITerminalView` on an `InMemoryTerminalSession`,
   bridged to a `TerminalAttachment`.
   - *Keep Mac size* (the default) attaches at the session's grid in a

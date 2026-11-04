@@ -401,9 +401,23 @@ public actor DemoMacConnection: MacConnection {
     private static let seededConversations: [String: [TranscriptEntry]] = [
         "demo-claude": [
             TranscriptEntry(id: "c1", kind: .user, text: "The key encoder tests fail on CI. Fix them, and commit once they pass."),
-            TranscriptEntry(id: "c2", kind: .tool, name: "Read", summary: "Sources/Cherry/HostRoutedKeyEncoder.swift", result: "412 lines", status: .ok),
-            TranscriptEntry(id: "c3", kind: .assistant, text: "Shift+Return is encoded as `CSI 13;2u` only while the kitty flags are on, so the legacy path sends a bare CR. I'll fix that, then run the **key encoder tests** before committing."),
-            TranscriptEntry(id: "c4", kind: .tool, name: "Edit", summary: "Sources/Cherry/HostRoutedKeyEncoder.swift", result: "Updated 1 hunk (+6 −2)", status: .ok),
+            TranscriptEntry(id: "c2", kind: .tool, name: "Read", summary: "/Users/you/github/patrick91/cherry/Sources/Cherry/HostRoutedKeyEncoder.swift", result: "412 lines", status: .ok),
+            TranscriptEntry(id: "c2b", kind: .tool, name: "Grep", summary: "shiftReturn", result: "Sources/Cherry/HostRoutedKeyEncoder.swift:88\nTests/CherryTests/KeyEncoderTests.swift:41", status: .ok),
+            TranscriptEntry(id: "c2c", kind: .tool, name: "Read", summary: "/Users/you/github/patrick91/cherry/Tests/CherryTests/KeyEncoderTests.swift", result: "120 lines", status: .ok),
+            TranscriptEntry(id: "c2d", kind: .tool, name: "Bash", summary: "cd /Users/you/github/patrick91/cherry && swift test --filter KeyEncoder", result: "✘ shiftReturnIsCSI13u: expected \"\\e[13;2u\", got \"\\r\"\n1 of 16 tests failed", status: .error),
+            TranscriptEntry(id: "c3", kind: .assistant, text: """
+            The failure is in **Shift+Return**:
+
+            1. Under the kitty flags it sends `CSI 13;2u`.
+            2. On the legacy path it sends a bare `CR`, which Claude Code takes as Return.
+
+            ```swift
+            case .shiftReturn: kittyFlags == 0 ? "\\e[27;2;13~" : "\\e[13;2u"
+            ```
+
+            I'll fix the legacy path, then run the key encoder tests before committing.
+            """),
+            TranscriptEntry(id: "c4", kind: .tool, name: "Edit", summary: "/Users/you/github/patrick91/cherry/Sources/Cherry/HostRoutedKeyEncoder.swift", result: "Updated 1 hunk (+6 −2)", status: .ok),
             TranscriptEntry(id: "c5", kind: .tool, name: "Bash", summary: "swift test --filter AdapterAwayKeyInput", status: .running),
         ],
         "demo-codex": [

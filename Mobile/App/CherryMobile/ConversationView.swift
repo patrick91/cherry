@@ -7,6 +7,11 @@ import SwiftUI
 struct ConversationView: View {
     @Environment(AppModel.self) private var model
     let key: SessionKey
+    /// The session's folder, which tool calls' paths are shown relative to.
+    let project: String?
+    /// What the agent says it is working on, while it works: a row under
+    /// the last entry says so.
+    let working: String?
     /// Why the Mac's connection is away, shown over the last conversation.
     let reconnecting: String?
     let showScreen: () -> Void
@@ -20,18 +25,35 @@ struct ConversationView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 10) {
+            LazyVStack(alignment: .leading, spacing: 14) {
                 if conversation.moreBefore {
                     Text("Earlier messages aren't shown.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity)
                 }
-                ForEach(conversation.entries) { entry in
-                    TranscriptEntryView(entry: entry)
+                ForEach(ConversationRow.rows(of: conversation.entries)) { row in
+                    switch row {
+                    case .entry(let entry):
+                        MessageView(entry: entry)
+                    case .tools(let tools):
+                        ToolGroupView(tools: tools, project: project)
+                    }
+                }
+                if let working, loaded {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(working.isEmpty ? "Working…" : "Working · \(working)")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                    .padding(.leading, 4)
                 }
             }
-            .padding(12)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
         }
         .defaultScrollAnchor(.bottom, for: .initialOffset)
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
@@ -95,87 +117,177 @@ struct ConversationView: View {
     }
 }
 
-/// One entry: the user's messages as bubbles, the agent's as text, tool
-/// calls as rows that open on their result, notes in small print.
-struct TranscriptEntryView: View {
+/// The user's messages as bubbles, the agent's as Markdown, notes in small
+/// print.
+struct MessageView: View {
     let entry: TranscriptEntry
 
     var body: some View {
         switch entry.kind {
         case .user:
             HStack {
-                Spacer(minLength: 48)
+                Spacer(minLength: 44)
                 Text(entry.text ?? "")
+                    .font(.subheadline)
                     .textSelection(.enabled)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
-                    .background(Color.accentColor.opacity(0.15), in: RoundedRectangle(cornerRadius: 16))
+                    .background(Color.accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 16))
             }
         case .assistant:
-            Text(Self.markdown(entry.text ?? ""))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        case .tool:
-            ToolCallRow(entry: entry)
+            MarkdownView(entry.text ?? "")
         case .note:
             Text(entry.text ?? "")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
-        case .toolResult, .unknown:
+        case .tool, .toolResult, .unknown:
             EmptyView()
         }
     }
+}
 
-    /// Inline Markdown (emphasis, code, links), its line breaks kept.
-    static func markdown(_ text: String) -> AttributedString {
+/// An agent's Markdown: paragraphs, headings, lists, code (and tables),
+/// quotes and rules, each with its inline emphasis, code and links.
+struct MarkdownView: View {
+    let blocks: [MarkdownBlock]
+
+    init(_ text: String) {
+        blocks = Markdown.blocks(text)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                switch block {
+                case .paragraph(let text):
+                    Text(Self.inline(text))
+                case .heading(let level, let text):
+                    Text(Self.inline(text))
+                        .font(level <= 2 ? .headline : .subheadline.weight(.semibold))
+                        .padding(.top, 2)
+                case .list(let ordered, let items):
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                Text(ordered ? "\(index + 1)." : "•")
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                                Text(Self.inline(item))
+                            }
+                        }
+                    }
+                case .code(_, let text):
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        Text(text)
+                            .font(.caption.monospaced())
+                            .padding(10)
+                    }
+                    .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+                case .quote(let text):
+                    HStack(spacing: 8) {
+                        RoundedRectangle(cornerRadius: 1.5)
+                            .fill(.tertiary)
+                            .frame(width: 3)
+                        Text(Self.inline(text))
+                            .foregroundStyle(.secondary)
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                case .rule:
+                    Divider()
+                }
+            }
+        }
+        .font(.subheadline)
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    static func inline(_ text: String) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
     }
 }
 
-struct ToolCallRow: View {
+/// A run of tool calls between messages: one line each, the latest few
+/// shown and the rest a tap away.
+struct ToolGroupView: View {
+    let tools: [TranscriptEntry]
+    let project: String?
+    @State private var showsAll = false
+
+    private static let shown = 3
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if tools.count > Self.shown, !showsAll {
+                let hidden = tools.count - Self.shown
+                Button {
+                    withAnimation(.snappy) { showsAll = true }
+                } label: {
+                    Label("\(hidden) more tool call\(hidden == 1 ? "" : "s")", systemImage: "chevron.up")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            ForEach(showsAll ? tools : Array(tools.suffix(Self.shown))) { tool in
+                ToolLine(entry: tool, project: project)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 2)
+        .background(Color(.secondarySystemFill).opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+/// A tool call in one line, its verb and what it acted on; it opens on the
+/// start of its result.
+struct ToolLine: View {
     let entry: TranscriptEntry
+    let project: String?
     @State private var expanded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Opens on the result, or the whole summary while there is none.
+        let shown = ToolPresentation(entry, project: project)
+        VStack(alignment: .leading, spacing: 4) {
             Button {
                 withAnimation(.snappy) { expanded.toggle() }
             } label: {
                 HStack(spacing: 8) {
-                    status
-                    Text(entry.name ?? "Tool")
-                        .font(.footnote.weight(.semibold))
-                    Text(entry.summary ?? "")
-                        .font(.footnote.monospaced())
+                    Image(systemName: shown.symbol)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
+                        .frame(width: 18)
+                    Text("\(Text(shown.title).fontWeight(.medium)) \(Text(shown.detail).font(shown.isCode ? .footnote.monospaced() : .footnote).foregroundStyle(.secondary))")
+                        .font(.footnote)
                         .lineLimit(expanded ? nil : 1)
+                        .truncationMode(shown.isCode ? .tail : .middle)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    if entry.result != nil {
-                        Image(systemName: "chevron.right")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.tertiary)
-                            .rotationEffect(expanded ? .degrees(90) : .zero)
-                    }
+                    status
                 }
+                .padding(.vertical, 7)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            if expanded, let result = entry.result {
-                ScrollView(.horizontal) {
+            if expanded, let result = entry.result, !result.isEmpty {
+                ScrollView([.horizontal, .vertical]) {
                     Text(result)
-                        .font(.caption.monospaced())
+                        .font(.caption2.monospaced())
                         .textSelection(.enabled)
                         .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .frame(maxHeight: 220)
+                .fixedSize(horizontal: false, vertical: true)
                 .background(Color(.tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+                .padding(.bottom, 7)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .background(Color(.secondarySystemFill).opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
     }
 
     @ViewBuilder
@@ -185,9 +297,9 @@ struct ToolCallRow: View {
             ProgressView()
                 .controlSize(.mini)
         case .ok:
-            Image(systemName: "checkmark.circle.fill")
-                .font(.caption)
-                .foregroundStyle(.green)
+            Image(systemName: "checkmark")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.tertiary)
         case .error:
             Image(systemName: "xmark.circle.fill")
                 .font(.caption)

@@ -2,7 +2,7 @@ import CherryMobileKit
 import SwiftUI
 
 /// A session: an agent's conversation or the screen as its host keeps it,
-/// and quick replies: a menu's options as buttons, a reply field, and keys.
+/// and the composer: a menu's options as buttons, a reply field, keys.
 struct SessionView: View {
     @Environment(AppModel.self) private var model
     let key: SessionKey
@@ -14,26 +14,19 @@ struct SessionView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if isAgent {
-                Picker("Show", selection: $showsScreen) {
-                    Text("Conversation").tag(false)
-                    Text("Screen").tag(true)
-                }
-                .pickerStyle(.segmented)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-            }
             if isAgent && !showsScreen {
-                ConversationView(key: key, reconnecting: reconnecting) {
+                ConversationView(
+                    key: key,
+                    project: session?.directory,
+                    working: session?.attention == .working ? (session?.detail ?? "") : nil,
+                    reconnecting: reconnecting
+                ) {
                     showsScreen = true
                 }
             } else {
                 ScreenTextView(screen: screen, problem: reconnecting ?? problem)
             }
-            if let session, session.isRunning, let detail = session.detail {
-                StatusLine(attention: session.attention, message: detail)
-            }
-            QuickReplyBar(menu: menu, isRunning: session?.isRunning ?? true) { keys in
+            Composer(menu: menu, status: status, isRunning: session?.isRunning ?? true) { keys in
                 await send(keys)
             }
         }
@@ -48,7 +41,17 @@ struct SessionView: View {
                     }
                 }
             }
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if isAgent {
+                    Button {
+                        showsScreen.toggle()
+                    } label: {
+                        Label(
+                            showsScreen ? "Show Conversation" : "Show Screen",
+                            systemImage: showsScreen ? "text.bubble" : "doc.plaintext"
+                        )
+                    }
+                }
                 Button {
                     path.append(.terminal(key, fitsPhone: false))
                 } label: {
@@ -88,6 +91,14 @@ struct SessionView: View {
         return ScreenMenu.find(in: screen.lines)
     }
 
+    /// What the program says it does or waits for, unless a menu on its
+    /// screen asks it already, or the conversation shows it working.
+    private var status: (attention: AgentAttention, message: String)? {
+        guard menu == nil, let session, session.isRunning, let detail = session.detail else { return nil }
+        if isAgent, !showsScreen, session.attention == .working { return nil }
+        return (session.attention, detail)
+    }
+
     private func subtitle(mac: AppModel.Mac) -> String {
         [mac.endpoint.name, session?.directory].compactMap { $0 }.joined(separator: " — ")
     }
@@ -112,7 +123,7 @@ struct SessionView: View {
 }
 
 /// What the session's program says it is doing or waits for (its status
-/// message), above the replies.
+/// message), above the reply field.
 struct StatusLine: View {
     let attention: AgentAttention
     let message: String
@@ -122,11 +133,9 @@ struct StatusLine: View {
             AttentionBadge(attention: attention, isRunning: true)
             Text(message)
                 .font(.footnote)
-                .lineLimit(3)
+                .lineLimit(2)
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 10)
     }
 }
 
@@ -188,33 +197,54 @@ struct ScreenTextView: View {
     ]
 }
 
-/// Answers without opening a terminal.
-struct QuickReplyBar: View {
+/// Answers without opening a terminal: the menu the screen shows as
+/// buttons (else the program's status), the keys a terminal has (behind a
+/// button), and a reply field.
+struct Composer: View {
     let menu: ScreenMenu?
+    let status: (attention: AgentAttention, message: String)?
     let isRunning: Bool
     let send: @MainActor ([MobileKey]) async -> Void
 
     @State private var reply = ""
+    @State private var showsKeys = false
     @FocusState private var replyFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             if let menu {
-                MenuButtons(menu: menu, send: send)
+                MenuCard(menu: menu, send: send)
+            } else if let status {
+                StatusLine(attention: status.attention, message: status.message)
             }
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    KeyChip("esc", keys: [.escape], send: send)
-                    KeyChip("↑", keys: [.up], send: send)
-                    KeyChip("↓", keys: [.down], send: send)
-                    KeyChip("⏎", keys: [.enter], send: send)
-                    KeyChip("⇥", keys: [.tab], send: send)
-                    KeyChip("⌃C", keys: [.controlC], send: send)
+            if showsKeys {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        KeyChip("esc", keys: [.escape], send: send)
+                        KeyChip("↑", keys: [.up], send: send)
+                        KeyChip("↓", keys: [.down], send: send)
+                        KeyChip("←", keys: [.left], send: send)
+                        KeyChip("→", keys: [.right], send: send)
+                        KeyChip("⏎", keys: [.enter], send: send)
+                        KeyChip("⇥", keys: [.tab], send: send)
+                        KeyChip("⌃C", keys: [.controlC], send: send)
+                    }
                 }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            HStack(spacing: 8) {
+            HStack(alignment: .bottom, spacing: 8) {
+                Button {
+                    withAnimation(.snappy) { showsKeys.toggle() }
+                } label: {
+                    Image(systemName: showsKeys ? "keyboard.chevron.compact.down" : "keyboard")
+                        .font(.system(size: 18))
+                        .frame(width: 36, height: 36)
+                        .background(Color(.secondarySystemBackground), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(showsKeys ? "Hide Keys" : "Show Keys")
                 TextField("Reply", text: $reply, axis: .vertical)
-                    .lineLimit(1...4)
+                    .lineLimit(1...5)
                     .textInputAutocapitalization(.sentences)
                     .focused($replyFocused)
                     .padding(.horizontal, 12)
@@ -223,7 +253,7 @@ struct QuickReplyBar: View {
                     .onSubmit(sendReply)
                 Button(action: sendReply) {
                     Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 30))
+                        .font(.system(size: 32))
                 }
                 .disabled(reply.isEmpty)
                 .accessibilityLabel("Send")
@@ -231,7 +261,8 @@ struct QuickReplyBar: View {
         }
         .disabled(!isRunning)
         .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.top, 8)
+        .padding(.bottom, 6)
         .background(.bar)
     }
 
@@ -243,9 +274,9 @@ struct QuickReplyBar: View {
     }
 }
 
-/// A menu's options: a button types the option's digit, which an agent
-/// takes by itself.
-struct MenuButtons: View {
+/// A menu's options, compact: a button types the option's digit, which an
+/// agent takes by itself. Many options scroll.
+struct MenuCard: View {
     let menu: ScreenMenu
     let send: @MainActor ([MobileKey]) async -> Void
 
@@ -253,25 +284,42 @@ struct MenuButtons: View {
         VStack(alignment: .leading, spacing: 6) {
             if let question = menu.question {
                 Text(question)
-                    .font(.subheadline.weight(.semibold))
+                    .font(.footnote.weight(.semibold))
+                    .lineLimit(3)
             }
+            if menu.options.count > 4 {
+                ScrollView {
+                    options
+                }
+                .frame(maxHeight: 190)
+            } else {
+                options
+            }
+        }
+    }
+
+    private var options: some View {
+        VStack(spacing: 5) {
             ForEach(menu.options, id: \.number) { option in
                 Button {
                     Task { await send(option.keys) }
                 } label: {
-                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    HStack(alignment: .firstTextBaseline, spacing: 9) {
                         Text("\(option.number)")
-                            .font(.subheadline.monospacedDigit().weight(.bold))
-                            .frame(width: 22, height: 22)
+                            .font(.caption.monospacedDigit().weight(.bold))
+                            .frame(width: 20, height: 20)
                             .background(option.isSelected ? Color.accentColor : Color.secondary.opacity(0.25), in: Circle())
                             .foregroundStyle(option.isSelected ? Color.white : Color.primary)
                         Text(option.label)
+                            .font(.subheadline)
+                            .lineLimit(2)
                             .multilineTextAlignment(.leading)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }

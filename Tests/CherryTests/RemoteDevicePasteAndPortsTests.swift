@@ -350,9 +350,11 @@ private final class PrivatePasteboard {
 private final class OpenURLDelegate: TerminalSurfaceOpenURLDelegate {
     var handles: Bool
     var asked: [String] = []
+    var kinds: [TerminalOpenURLKind] = []
     init(handles: Bool) { self.handles = handles }
-    func terminalShouldHandleOpenURL(_ url: String) -> Bool {
+    func terminalShouldHandleOpenURL(_ url: String, kind: TerminalOpenURLKind) -> Bool {
         asked.append(url)
+        kinds.append(kind)
         return handles
     }
 }
@@ -362,12 +364,16 @@ private final class PlainDelegate: TerminalSurfaceViewDelegate {}
 
 @Test @MainActor func RemoteDeviceGhosttyOpenURLAsksTheDelegateBeforeOpeningItself() throws {
     let url = "http://localhost:3000/x"
-    func action(_ text: String, tag: ghostty_action_tag_e = GHOSTTY_ACTION_OPEN_URL) -> (ghostty_action_s, UnsafeMutablePointer<CChar>) {
+    func action(
+        _ text: String,
+        kind: ghostty_action_open_url_kind_e = GHOSTTY_ACTION_OPEN_URL_KIND_UNKNOWN,
+        tag: ghostty_action_tag_e = GHOSTTY_ACTION_OPEN_URL
+    ) -> (ghostty_action_s, UnsafeMutablePointer<CChar>) {
         let buffer = strdup(text)!
         var action = ghostty_action_s()
         action.tag = tag
         action.action.open_url = ghostty_action_open_url_s(
-            kind: GHOSTTY_ACTION_OPEN_URL_KIND_UNKNOWN, url: UnsafePointer(buffer), len: UInt(strlen(buffer))
+            kind: kind, url: UnsafePointer(buffer), len: UInt(strlen(buffer))
         )
         return (action, buffer)
     }
@@ -377,6 +383,7 @@ private final class PlainDelegate: TerminalSurfaceViewDelegate {}
     let taking = OpenURLDelegate(handles: true)
     #expect(TerminalCallbacks.openURL(open, bridge: TerminalCallbackBridge(delegate: taking)))
     #expect(taking.asked == [url])
+    #expect(taking.kinds == [.unknown])
     // It leaves it to Ghostty, or does not open URLs at all: false.
     let leaving = OpenURLDelegate(handles: false)
     #expect(!TerminalCallbacks.openURL(open, bridge: TerminalCallbackBridge(delegate: leaving)))
@@ -387,10 +394,19 @@ private final class PlainDelegate: TerminalSurfaceViewDelegate {}
     let (other, otherBuffer) = action(url, tag: GHOSTTY_ACTION_RING_BELL)
     defer { free(otherBuffer) }
     #expect(!TerminalCallbacks.openURL(other, bridge: TerminalCallbackBridge(delegate: taking)))
-
-    // Cherry's delegate: a tab of This Mac leaves every URL to Ghostty.
-    let workspace = TerminalWorkspace(projectRoot: NSTemporaryDirectory(), createInitialSession: false)
-    let tab = workspace.addSession(title: "Local")
-    #expect(!tab.ghosttyBridge.terminalShouldHandleOpenURL(url))
-    workspace.closeAllSessions(intent: .windowClosed)
+    // The delegate learns where the URL came from.
+    let kinds: [(ghostty_action_open_url_kind_e, TerminalOpenURLKind)] = [
+        (GHOSTTY_ACTION_OPEN_URL_KIND_TEXT, .text), (GHOSTTY_ACTION_OPEN_URL_KIND_HTML, .html),
+        (GHOSTTY_ACTION_OPEN_URL_KIND_OSC8, .osc8), (ghostty_action_open_url_kind_e(rawValue: 99), .unknown),
+    ]
+    for (kind, expected) in kinds {
+        let (sent, sentBuffer) = action(url, kind: kind)
+        defer { free(sentBuffer) }
+        let delegate = OpenURLDelegate(handles: true)
+        _ = TerminalCallbacks.openURL(sent, bridge: TerminalCallbackBridge(delegate: delegate))
+        #expect(delegate.kinds == [expected])
+    }
+    #expect(TerminalOpenURLKind.unknown.isUntrusted && TerminalOpenURLKind.osc8.isUntrusted)
+    #expect(!TerminalOpenURLKind.text.isUntrusted && !TerminalOpenURLKind.html.isUntrusted)
+    // What Cherry's own delegate does with a click is in TerminalLinkOpeningTests.
 }

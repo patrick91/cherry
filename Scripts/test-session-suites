@@ -10,7 +10,8 @@
 # models, ControlTool: the MCP tools and the control socket's tool requests,
 # AgentTitle: an agent's terminal title as its tab's task name, and
 # ControlAgentMonitor: MCP monitors' events, a task worker's settle and a
-# silent agent's quiet done among them, and HomePlace: each Mac's Home). Swift
+# silent agent's quiet done among them, HomePlace: each Mac's Home, and
+# TerminalLink: a click on a link in terminal output). Swift
 # Testing matches --filter against a test's ID, which includes
 # its source file name, so a group selects every test in the files named after
 # it (WorkspaceRestore selects all of WorkspaceRestoreTests.swift) as well as
@@ -146,6 +147,7 @@ groups=(
   AgentTitle            # AgentTitleTests: an agent's terminal title as its tab's task name
   ControlAgentMonitor   # ControlAgentMonitorTests: MCP monitors' events, task workers' settles, silent agents' quiet dones
   HomePlace             # HomePlaceTests: each Mac's Home, its rows in the Omni bar, New Terminal in Home
+  TerminalLink          # TerminalLinkOpeningTests: a click on a link in terminal output opens, asks or is refused
 )
 
 # What marks a test file as a session suite: the hosted and persistent session

@@ -59,18 +59,18 @@ public actor DemoMacConnection: MacConnection {
         let now = Date()
         sessions = [
             MobileSession(
-                id: "demo-claude", macID: mac, title: "claude", directory: "~/github/patrick91/cherry",
+                id: "demo-claude", macID: mac, title: "Fix the key encoder tests", directory: "~/github/patrick91/cherry",
                 kind: .agent("claude"), attention: .approval,
                 detail: "Approve Bash: swift test --filter AdapterAwayKeyInput",
                 size: TerminalSize(columns: 100, rows: 30), changedAt: now.addingTimeInterval(-40)
             ),
             MobileSession(
-                id: "demo-codex", macID: mac, title: "codex", directory: "~/github/patrick91/strawberry",
-                kind: .agent("codex"), attention: .working, detail: "Port the schema printer",
+                id: "demo-codex", macID: mac, title: "Port the schema printer", directory: "~/github/patrick91/strawberry",
+                kind: .agent("codex"), attention: .working, detail: "Editing SchemaPrinter.swift",
                 size: TerminalSize(columns: 100, rows: 30), changedAt: now.addingTimeInterval(-2)
             ),
             MobileSession(
-                id: "demo-pi", macID: mac, title: "pi", directory: "~/notes",
+                id: "demo-pi", macID: mac, title: "Tidy my notes", directory: "~/notes",
                 kind: .agent("pi"), attention: .resultReady, detail: "Tidied 12 notes",
                 size: TerminalSize(columns: 100, rows: 30), changedAt: now.addingTimeInterval(-600)
             ),

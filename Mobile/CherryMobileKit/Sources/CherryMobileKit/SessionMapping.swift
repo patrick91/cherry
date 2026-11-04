@@ -2,13 +2,14 @@ import Foundation
 
 /// A host session as the phone lists it, read the way the Mac app reads its
 /// tags (`PersistentSessionTag`: `cherry.tab`, `cherry.kind`,
-/// `cherry.agent`, `cherry.command`).
+/// `cherry.agent`, `cherry.command`, `cherry.project`).
 enum SessionMapping {
     enum Tag {
         static let tab = "cherry.tab"
         static let kind = "cherry.kind"
         static let agent = "cherry.agent"
         static let command = "cherry.command"
+        static let project = "cherry.project"
     }
 
     static func session(_ info: HostWireSession, macID: UUID, attentionSince: Date? = nil) -> MobileSession {
@@ -19,6 +20,7 @@ enum SessionMapping {
             macID: macID,
             title: title(of: info, kind: kind),
             directory: directory(of: info),
+            project: project(of: info),
             kind: kind,
             isRunning: info.isRunning,
             attention: attention(of: status),
@@ -74,6 +76,16 @@ enum SessionMapping {
         String(text.unicodeScalars.drop { scalar in
             !CharacterSet.alphanumerics.contains(scalar) && !"~/.([\"'".unicodeScalars.contains(scalar)
         }).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// The project's folder its tab's window has: a device window's key
+    /// (`device:<uuid>:/path`) as its path.
+    static func project(of info: HostWireSession) -> String? {
+        guard var root = info.tags[Tag.project]?.nilIfBlank else { return nil }
+        if root.hasPrefix("device:"), let path = root.firstIndex(of: "/") {
+            root = String(root[path...])
+        }
+        return root
     }
 
     /// Where the program says it is (OSC 7, decoded), else where it started.

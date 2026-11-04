@@ -115,9 +115,17 @@ uses your team.
 
 Screens:
 
-- **Inbox:** every Mac's sessions. *Needs you* comes first (approvals,
-  questions, errors, results), then *Working*, then the rest. Pull to
-  refresh.
+- **Inbox:** every Mac's sessions by project (`Inbox.projects`: the
+  project the Mac's Cherry tagged the session with, `cherry.project`, else
+  its folder; the home folder is Home). A project is a heading (with its
+  Mac when there are several, and its folder's place when another of that
+  Mac's projects has its name), its agents a line each: a mark for what
+  they need (a dot for an approval or a question, a check for a result, a
+  spinner while working), the task, and the agent with what it says; its
+  commands and terminals in small type under them. Projects whose agents
+  wait on you come first, then those an agent works in, each by name;
+  quiet ones fold at the end and open in place. Filters keep the agents
+  that need you, or those working. Pull to refresh.
 - **Session:** for an agent, its conversation by default: what the Mac's
   `cherry host transcript` reads from the agent's own session (Claude Code,
   Codex, Pi, Amp; Host/README.md), followed every 2 s (5 s for Amp) from

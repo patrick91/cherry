@@ -71,8 +71,8 @@ public struct ToolPresentation: Equatable, Sendable {
 public enum DisplayPath {
     public static func shorten(_ path: String, project: String?) -> String {
         guard path.hasPrefix("/") || path.hasPrefix("~") else { return path }
-        var short = home(path)
-        if let project = project.map(home)?.trimmingSuffix("/"), !project.isEmpty {
+        var short = abbreviatingHome(path)
+        if let project = project.map(abbreviatingHome)?.trimmingSuffix("/"), !project.isEmpty {
             if short == project {
                 short = "."
             } else if short.hasPrefix(project + "/") {
@@ -89,8 +89,8 @@ public enum DisplayPath {
     /// Every path in a command line shortened the same way: the session's
     /// folder dropped, a home folder written `~`.
     public static func shortenPaths(in text: String, project: String?) -> String {
-        var text = home(text)
-        if let project = project.map(home)?.trimmingSuffix("/"), project.count > 2 {
+        var text = abbreviatingHome(text)
+        if let project = project.map(abbreviatingHome)?.trimmingSuffix("/"), project.count > 2 {
             // Agents start many commands in the session's folder.
             for prefix in ["cd \(project) && ", "cd \(project); "] where text.hasPrefix(prefix) {
                 text = String(text.dropFirst(prefix.count))
@@ -111,12 +111,12 @@ public enum DisplayPath {
     }
 
     /// `/Users/<name>/…` (and `/home/<name>/…`) as `~/…`.
-    private static func home(_ text: String) -> String {
+    static func abbreviatingHome(_ text: String) -> String {
         text.replacingOccurrences(of: #"/(Users|home)/[^/\s'"]+(?=/|\s|$)"#, with: "~", options: .regularExpression)
     }
 }
 
-private extension String {
+extension String {
     func trimmingSuffix(_ suffix: String) -> String {
         hasSuffix(suffix) && count > suffix.count ? String(dropLast(suffix.count)) : self
     }

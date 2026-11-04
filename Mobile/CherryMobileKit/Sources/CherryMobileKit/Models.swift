@@ -81,6 +81,8 @@ public struct MobileSession: Identifiable, Hashable, Sendable {
     public var title: String
     /// Its working directory on the Mac, when known.
     public var directory: String?
+    /// The folder of the project the Mac's Cherry opened it in, when it did.
+    public var project: String?
     public var kind: SessionKind
     public var isRunning: Bool
     public var attention: AgentAttention
@@ -98,6 +100,7 @@ public struct MobileSession: Identifiable, Hashable, Sendable {
         macID: UUID,
         title: String,
         directory: String? = nil,
+        project: String? = nil,
         kind: SessionKind,
         isRunning: Bool = true,
         attention: AgentAttention = .unknown,
@@ -109,6 +112,7 @@ public struct MobileSession: Identifiable, Hashable, Sendable {
         self.macID = macID
         self.title = title
         self.directory = directory
+        self.project = project
         self.kind = kind
         self.isRunning = isRunning
         self.attention = attention

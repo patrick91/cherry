@@ -132,9 +132,9 @@ Screens:
   agent takes it. The toolbar switches to the screen, which every other
   session shows: the host's screen text at the session's width, kept to
   the bottom. Under either is the composer: on the screen, its menu as
-  compact buttons (else the program's status, unless the conversation
-  shows it working), a reply field (text, then Enter) and, behind the
-  keyboard button, keys: Esc, arrows, Enter, Tab, ⌃C. A Mac whose `cherry` predates
+  compact buttons, a reply field (text, then Enter) and, behind the
+  keyboard button, keys: Esc, arrows, Enter, Tab, ⌃C. The program's status
+  shows in the inbox, not here. A Mac whose `cherry` predates
   `host transcript` says to update Cherry there.
 - **Terminal:** Ghostty's `UITerminalView` on an `InMemoryTerminalSession`,
   bridged to a `TerminalAttachment`.

@@ -30,7 +30,7 @@ struct SessionView: View {
             } else {
                 ScreenTextView(screen: screen, problem: reconnecting ?? problem)
             }
-            Composer(menu: showsConversation ? nil : menu, status: status, isRunning: session?.isRunning ?? true) { keys in
+            Composer(menu: showsConversation ? nil : menu, isRunning: session?.isRunning ?? true) { keys in
                 await send(keys)
             }
         }
@@ -99,14 +99,6 @@ struct SessionView: View {
         return ScreenMenu.find(in: screen.lines)
     }
 
-    /// What the program says it does or waits for, unless a menu on its
-    /// screen asks it already, or the conversation shows it working.
-    private var status: (attention: AgentAttention, message: String)? {
-        guard menu == nil, let session, session.isRunning, let detail = session.detail else { return nil }
-        if showsConversation, session.attention == .working { return nil }
-        return (session.attention, detail)
-    }
-
     private func subtitle(mac: AppModel.Mac) -> String {
         [mac.endpoint.name, session?.directory].compactMap { $0 }.joined(separator: " — ")
     }
@@ -126,23 +118,6 @@ struct SessionView: View {
             await reload()
         } catch {
             problem = error.localizedDescription
-        }
-    }
-}
-
-/// What the session's program says it is doing or waits for (its status
-/// message), above the reply field.
-struct StatusLine: View {
-    let attention: AgentAttention
-    let message: String
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            AttentionBadge(attention: attention, isRunning: true)
-            Text(message)
-                .font(.footnote)
-                .lineLimit(2)
-            Spacer(minLength: 0)
         }
     }
 }
@@ -206,11 +181,11 @@ struct ScreenTextView: View {
 }
 
 /// Answers without opening a terminal: the menu the screen shows as
-/// buttons (else the program's status), the keys a terminal has (behind a
-/// button), and a reply field.
+/// buttons, the keys a terminal has (behind a button), and a reply field.
+/// What the program says it does is the inbox's: the conversation and the
+/// screen show it.
 struct Composer: View {
     let menu: ScreenMenu?
-    let status: (attention: AgentAttention, message: String)?
     let isRunning: Bool
     let send: @MainActor ([MobileKey]) async -> Void
 
@@ -222,8 +197,6 @@ struct Composer: View {
         VStack(alignment: .leading, spacing: 8) {
             if let menu {
                 MenuCard(menu: menu, send: send)
-            } else if let status {
-                StatusLine(attention: status.attention, message: status.message)
             }
             if showsKeys {
                 ScrollView(.horizontal, showsIndicators: false) {

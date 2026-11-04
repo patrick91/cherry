@@ -271,6 +271,98 @@ fn list_json_has_host_identity_and_plain_session_descriptors() {
     server.join().unwrap();
 }
 
+/// `host transcript` finds the listed session's agent from its process (a
+/// stand-in Claude Code: a real process with a `sessions/<pid>.json` in a
+/// private CLAUDE_CONFIG_DIR) and prints its conversation.
+#[test]
+fn transcript_reads_the_conversation_of_the_listed_sessions_agent() {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let mut agent = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let pid = agent.id();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    std::fs::create_dir_all(agent_dir.path().join("sessions")).unwrap();
+    std::fs::write(
+        agent_dir.path().join(format!("sessions/{pid}.json")),
+        serde_json::json!({"pid": pid, "sessionId": "abc", "cwd": "/work", "startedAt": now})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(agent_dir.path().join("projects/-work")).unwrap();
+    let lines = [
+        serde_json::json!({"type": "user", "uuid": "u1", "message": {"content": "Fix the tests"}}),
+        serde_json::json!({"type": "assistant", "uuid": "a1", "message": {"content": [
+            {"type": "text", "text": "Done."}]}}),
+    ];
+    std::fs::write(
+        agent_dir.path().join("projects/-work/abc.jsonl"),
+        lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+
+    let mut listed = session();
+    listed.pid = Some(pid);
+    let run = |arguments: &[&str]| {
+        let (_directory, listener, mut command) = listener();
+        let listed = listed.clone();
+        let server = thread::spawn(move || {
+            let mut stream = accept(listener);
+            assert!(matches!(
+                read_client(&mut stream),
+                Some(ClientMessage::List)
+            ));
+            write_frame(&mut stream, &sessions_reply("host-1", vec![listed])).unwrap();
+        });
+        let result = command
+            .env("CLAUDE_CONFIG_DIR", agent_dir.path())
+            .args(["host", "transcript", "test-session"])
+            .args(arguments)
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap()
+    };
+
+    let read = run(&[]);
+    assert_eq!(read["agent"], "claude");
+    assert_eq!(read["session_id"], "abc");
+    assert_eq!(read["reset"], true);
+    assert_eq!(
+        read["entries"][0],
+        serde_json::json!({"kind": "user", "id": "u1", "text": "Fix the tests"})
+    );
+    assert_eq!(read["entries"][1]["text"], "Done.");
+    let after = run(&["--after", read["cursor"].as_str().unwrap()]);
+    assert_eq!(after["reset"], false);
+    assert_eq!(after["entries"], serde_json::json!([]));
+    let located = run(&["--locate"]);
+    assert_eq!(located["session_id"], "abc");
+    assert!(located.get("entries").is_none());
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn transcript_is_local_only() {
+    let result = Command::new(env!("CARGO_BIN_EXE_cherry"))
+        .args(["--host", "elsewhere", "host", "transcript", "s1"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("transcript is local only"));
+}
+
 #[test]
 fn create_preserves_request_id_and_command_without_shell_interpolation() {
     let (_directory, listener, mut command) = listener();

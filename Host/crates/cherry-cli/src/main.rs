@@ -13,6 +13,7 @@ mod stderr_relay;
 mod sys;
 mod timing;
 mod tracker;
+mod transcript;
 mod transport;
 mod writer;
 
@@ -192,6 +193,25 @@ enum Action {
     /// left without a daemon. Says how to fix each; exits with status 1 when
     /// it found any. Never starts a host.
     Doctor,
+    /// Print, as JSON, the conversation of the agent a session runs (Claude
+    /// Code, Codex, Pi or Amp), read from the agent's own session on this
+    /// machine: messages, tool calls with a one-line summary and the start
+    /// of their result, and notes such as a compaction; and the agent's id
+    /// for the session, which resumes it. Local only; never starts a host.
+    Transcript {
+        id: String,
+        /// Only what came after this cursor, from an earlier read's `cursor`.
+        #[arg(long, value_name = "CURSOR")]
+        after: Option<String>,
+        /// At most this many entries, the latest.
+        #[arg(long, default_value_t = transcript::DEFAULT_LIMIT as u16,
+              value_parser = clap::value_parser!(u16).range(1..=transcript::MAX_LIMIT as i64))]
+        limit: u16,
+        /// Only say which agent session it is: `{"agent", "session_id",
+        /// "path"}`, without reading the conversation.
+        #[arg(long)]
+        locate: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -207,7 +227,10 @@ impl Action {
     fn kind(&self) -> Kind {
         match self {
             Action::Start => Kind::Start,
-            Action::List { .. } | Action::Status { .. } | Action::Doctor => Kind::Query,
+            Action::List { .. }
+            | Action::Status { .. }
+            | Action::Doctor
+            | Action::Transcript { .. } => Kind::Query,
             Action::Attach { .. } => Kind::Attach,
             Action::Control { .. } => Kind::Control,
             Action::Shutdown
@@ -369,6 +392,12 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
         return diagnose::doctor(&transport::local_socket_path(cli.socket.as_deref())?);
     }
 
+    if let Action::Transcript { .. } = cli.command {
+        if cli.host.is_some() {
+            bail!("transcript is local only; run it on the machine the agent runs on (ssh HOST cherry host transcript ID)");
+        }
+    }
+
     // Where to start the next host once this one made way.
     let restart_socket = match cli.command {
         Action::Restart { .. } if cli.host.is_some() => {
@@ -507,6 +536,37 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
                 }
                 message => Err(unexpected("session list", message)),
             }
+        }
+        Action::Transcript {
+            id,
+            after,
+            limit,
+            locate,
+        } => {
+            transport.send(&ClientMessage::List)?;
+            let sessions = match transport.receive(RPC_TIMEOUT)? {
+                ServerMessage::Sessions { sessions, .. } => sessions,
+                message => return Err(unexpected("session list", message)),
+            };
+            let Some(session) = sessions.iter().find(|session| session.id == id) else {
+                bail!("no session {id}");
+            };
+            let located = transcript::locate(
+                session,
+                &transcript::processes()?,
+                &transcript::Dirs::from_environment()?,
+            )?;
+            let text = if locate {
+                serde_json::to_string(&located)?
+            } else {
+                serde_json::to_string(&transcript::read(
+                    located,
+                    after.as_deref(),
+                    usize::from(limit),
+                )?)?
+            };
+            print(&format!("{text}\n"))?;
+            Ok(0)
         }
         Action::New {
             cwd,

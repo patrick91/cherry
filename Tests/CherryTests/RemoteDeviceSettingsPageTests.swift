@@ -389,14 +389,17 @@ private final class MacsFixture {
     }
     let withHosts = context(sshHosts: [try .ssh("mini.local"), try .ssh("deploy@build.example.com")])
     let rows = MacsSettingsPage.searchRows(in: withHosts)
-    #expect(rows.map(\.id) == [.macsList, .mac(mini.id), .mac(studio.id), .macsSSHHosts])
+    #expect(rows.map(\.id) == [.macsList, .mac(mini.id), .mac(studio.id), .macsPhones, .macsSSHHosts])
     #expect(rows.allSatisfy { $0.route == .page(.macs) })
     #expect(rows[0].value == "2 Macs")
     let miniRow = rows[1]
     #expect(miniRow.title == "Mac mini" && miniRow.section == "Your Macs" && miniRow.value == "mini.local")
     #expect(miniRow.keywords.contains("~/code/api-server") && miniRow.keywords.contains("~/code/old-site"))
+    // Your iPhones is found by its words; its phones are read only when the
+    // page shows.
+    #expect(rows[3].title == "Your iPhones" && rows[3].keywords.contains("iphone") && rows[3].value == nil)
     // A Mac's own destination is its card's, not an SSH host's.
-    let hosts = rows[3]
+    let hosts = rows[4]
     #expect(hosts.keywords.contains("deploy@build.example.com"))
     #expect(!hosts.keywords.contains("mini.local"))
     #expect(hosts.value == "1 host")

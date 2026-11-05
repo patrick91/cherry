@@ -38,7 +38,7 @@ private func keyDown(_ characters: String, modifiers: NSEvent.ModifierFlags = [.
         .sessions, .interface, .themes, .terminal, .shortcuts, .notifications, .macs, .agents, .projects, .updates,
     ])
     #expect(SettingsPage.allCases.map(\.title) == [
-        "Sessions", "Interface", "Themes", "Terminal", "Shortcuts", "Notifications", "Macs", "Agents",
+        "Sessions", "Interface", "Themes", "Terminal", "Shortcuts", "Notifications", "Devices", "Agents",
         "Projects", "Updates",
     ])
     #expect(SettingsPage.allCases.map(\.sidebarGroup) == [0, 1, 1, 2, 2, 2, 3, 3, 3, 4])
@@ -59,7 +59,7 @@ private func keyDown(_ characters: String, modifiers: NSEvent.ModifierFlags = [.
     ))
     #expect(SettingsPage.shortcuts.tile == SettingsTileStyle(.symbol("command"), background: "#8E8E93"))
     #expect(SettingsPage.notifications.tile == SettingsTileStyle(.symbol("bell.fill"), background: "#F97316"))
-    #expect(SettingsPage.macs.tile == SettingsTileStyle(.symbol("desktopcomputer"), background: "#0A84FF"))
+    #expect(SettingsPage.macs.tile == SettingsTileStyle(.symbol("laptopcomputer.and.iphone"), background: "#0A84FF"))
     #expect(SettingsPage.agents.tile == SettingsTileStyle(.symbol("sparkles"), background: "#A855F7"))
     #expect(SettingsPage.projects.tile == SettingsTileStyle(.symbol("folder.fill"), background: "#D98E04"))
     #expect(SettingsPage.updates.tile == SettingsTileStyle(.symbol("arrow.down.circle"), background: "#22A55B"))

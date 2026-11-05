@@ -148,6 +148,7 @@ groups=(
   ControlAgentMonitor   # ControlAgentMonitorTests: MCP monitors' events, task workers' settles, silent agents' quiet dones
   HomePlace             # HomePlaceTests: each Mac's Home, its rows in the Omni bar, New Terminal in Home
   TerminalLink          # TerminalLinkOpeningTests: a click on a link in terminal output opens, asks or is refused
+  MobilePairing         # MobilePairingTests: Pair iPhone…'s offer, its listener and the phones in authorized_keys
 )
 
 # What marks a test file as a session suite: the hosted and persistent session

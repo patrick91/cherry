@@ -6,7 +6,7 @@ import SwiftUI
 
 /// The Settings window's pages, in the sidebar's order: Sessions (its
 /// status item), then four groups ([Interface, Themes], [Terminal,
-/// Shortcuts, Notifications], [Macs, Agents, Projects], [Updates]).
+/// Shortcuts, Notifications], [Devices, Agents, Projects], [Updates]).
 /// Each agent and each project has a page of its own besides
 /// (`SettingsRoute`).
 enum SettingsPage: String, CaseIterable, Identifiable, Sendable {
@@ -31,7 +31,7 @@ enum SettingsPage: String, CaseIterable, Identifiable, Sendable {
         case .terminal: "Terminal"
         case .shortcuts: "Shortcuts"
         case .notifications: "Notifications"
-        case .macs: "Macs"
+        case .macs: "Devices"
         case .agents: "Agents"
         case .projects: "Projects"
         case .updates: "Updates"
@@ -49,7 +49,7 @@ enum SettingsPage: String, CaseIterable, Identifiable, Sendable {
             SettingsTileStyle(.symbol("apple.terminal"), background: Colors.terminal, foreground: Colors.terminalGlyph)
         case .shortcuts: SettingsTileStyle(.symbol("command"), background: Colors.shortcuts)
         case .notifications: SettingsTileStyle(.symbol("bell.fill"), background: Colors.notifications)
-        case .macs: SettingsTileStyle(.symbol("desktopcomputer"), background: Colors.macs)
+        case .macs: SettingsTileStyle(.symbol("laptopcomputer.and.iphone"), background: Colors.macs)
         case .agents: SettingsTileStyle(.symbol("sparkles"), background: Colors.agents)
         case .projects: SettingsTileStyle(.symbol("folder.fill"), background: Colors.projects)
         case .updates: SettingsTileStyle(.symbol("arrow.down.circle"), background: Colors.updates)
@@ -77,7 +77,7 @@ enum SettingsPage: String, CaseIterable, Identifiable, Sendable {
         case .terminal: ["keyboard", "ghostty", "scrollback", "font"]
         case .shortcuts: ["shortcut", "key binding", "keybind", "hotkey", "keys"]
         case .notifications: ["notify", "notification", "alert", "sound", "badge", "bell"]
-        case .macs: ["mac", "device", "ssh", "remote", "host", "tailscale"]
+        case .macs: ["mac", "macs", "ssh", "remote", "host", "tailscale", "iphone", "phone", "mobile", "pair", "qr"]
         case .agents: ["agent", "mcp", "claude", "codex", "pi", "gemini", "opencode", "amp"]
         case .projects: ["project", "folder", "cherry.toml"]
         case .updates: ["version", "build", "release", "upgrade", "restart", "prerelease", "pre-release", "beta", "sparkle"]

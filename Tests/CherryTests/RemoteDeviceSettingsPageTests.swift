@@ -371,7 +371,7 @@ private final class MacsFixture {
 
 // MARK: - Search
 
-@Test @MainActor func RemoteDeviceSettingsSearchFindsEachMacItsProjectsAndTheSSHHosts() throws {
+@Test @MainActor func RemoteDeviceSettingsSearchFindsEachMacAndTheSSHHostsButNotTheirProjects() throws {
     let defaults = privateDefaults("RemoteDeviceSettingsSearch")
     let mini = RemoteDevice(
         name: "Mac mini", sshDestination: "mini.local", homeDirectory: "/Users/me",
@@ -394,7 +394,8 @@ private final class MacsFixture {
     #expect(rows[0].value == "2 Macs")
     let miniRow = rows[1]
     #expect(miniRow.title == "Mac mini" && miniRow.section == "Your Macs" && miniRow.value == "mini.local")
-    #expect(miniRow.keywords.contains("~/code/api-server") && miniRow.keywords.contains("~/code/old-site"))
+    // Its card lists no projects, so they find nothing.
+    #expect(!miniRow.keywords.contains { $0.contains("api-server") || $0.contains("old-site") })
     // Your iPhones is found by its words; its phones are read only when the
     // page shows.
     #expect(rows[3].title == "Your iPhones" && rows[3].keywords.contains("iphone") && rows[3].value == nil)
@@ -412,7 +413,7 @@ private final class MacsFixture {
             .results.map(\.id) ?? []
     }
     #expect(macsResults("mac mini").first == .mac(mini.id))
-    #expect(macsResults("api-server") == [.mac(mini.id)])
+    #expect(macsResults("api-server").isEmpty)
     #expect(macsResults("studio").first == .mac(studio.id))
     #expect(macsResults("deploy") == [.macsSSHHosts])
     #expect(macsResults("identity").contains(.macsSSHHosts))

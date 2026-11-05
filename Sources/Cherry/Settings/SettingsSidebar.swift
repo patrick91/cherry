@@ -178,7 +178,15 @@ struct SettingsSidebar: View {
     }
 
     var body: some View {
-        Group {
+        // The field stands above the list, not over it: in an inset, the
+        // rows scrolled under it and showed through it and the title bar.
+        VStack(spacing: 0) {
+            SettingsSidebarSearchField(text: $search.text, focusRequest: search.focusRequest) { command in
+                search.handle(command)
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 4)
+            .padding(.bottom, 8)
             if search.isSearching {
                 let tiles = resultTiles()
                 SettingsSearchResultsList(search: search) { route in
@@ -187,14 +195,6 @@ struct SettingsSidebar: View {
             } else {
                 pageList
             }
-        }
-        .safeAreaInset(edge: .top, spacing: 0) {
-            SettingsSidebarSearchField(text: $search.text, focusRequest: search.focusRequest) { command in
-                search.handle(command)
-            }
-            .padding(.horizontal, 10)
-            .padding(.top, 4)
-            .padding(.bottom, 8)
         }
         // What the results read changed: they follow, once per turn.
         .onReceive(rowsChanged) { _ in search.scheduleRowsRefresh() }

@@ -2,8 +2,8 @@ import AppKit
 import SwiftUI
 
 /// Settings › Devices (the `macs` page): the user's other Macs, where tabs
-/// run over SSH, one card each (how it stands, its name, SSH destination,
-/// color and projects, and what can be done with it), Add Mac…, the
+/// run over SSH, one card each (how it stands, its name, SSH destination
+/// and color, and what can be done with it), Add Mac…, the
 /// iPhones paired with this Mac (Pair iPhone…, `PairPhoneSheet`; Remove…),
 /// and the SSH hosts saved for persistent sessions that no Mac uses. It
 /// never connects a Mac: it shows what their connections know
@@ -101,8 +101,7 @@ struct MacsSettingsPage: View, SettingsPageContent {
                             }
                         },
                         openProject: { key in actions.openProjectWindow(key) },
-                        addProject: { addingProject = RemoteDeviceReference(id: row.id) },
-                        confirm: { confirmation = $0 }
+                        addProject: { addingProject = RemoteDeviceReference(id: row.id) }
                     )
                 }
                 SettingsCaption(Self.listCaption)
@@ -263,7 +262,6 @@ struct MacsSettingsPage: View, SettingsPageContent {
     static let emptyMessage = "Add a Mac you reach over SSH. Its projects open in their own windows and their tabs run there."
     static let automaticColorTitle = "Automatic"
     static let colorHelp = "Marks this Mac's windows and tabs. Automatic picks a color from the Mac's identity."
-    static let projectsHelp = "Folders you added on this Mac, and ones you hid from the project picker."
     static let phonesEmptyTitle = "No iPhones yet"
     static let phonesEmptyMessage = "Pair Cherry for iOS to see your agents and sessions on your iPhone, and to answer them."
     static let phonesCaption = "Each can log in to this Mac over SSH with its own key, which Cherry added to ~/.ssh/authorized_keys."
@@ -290,10 +288,7 @@ struct MacsSettingsPage: View, SettingsPageContent {
                 route: .page(.macs),
                 section: "Your Macs",
                 title: device.name,
-                // Its projects, as its card shows them.
-                keywords: ["ssh", "destination"] + (device.addedProjects + device.hiddenProjects).map {
-                    ProjectSwitcherModel.displayPath($0, home: device.homeDirectory)
-                },
+                keywords: ["ssh", "destination"],
                 value: device.sshDestination
             )
         }
@@ -332,8 +327,9 @@ extension SettingsRowID {
 
 /// A Mac's card: its header (tile, name, Update
 /// available, status and what is wrong, Trust New Identity… or Reconnect,
-/// and `···`), its name, SSH destination, color and projects, and its
-/// actions. Changes are off while another copy of Cherry keeps the Macs.
+/// and `···`), its name, SSH destination and color, and its actions. Its
+/// projects are the project picker's (Add Project on <Mac>… is in `···`).
+/// Changes are off while another copy of Cherry keeps the Macs.
 private struct MacCard: View {
     let row: RemoteDeviceSettingsRow
     let model: RemoteDeviceSettingsModel
@@ -343,7 +339,6 @@ private struct MacCard: View {
     let openProject: @MainActor (String) -> Void
     /// Add Project on <Mac>…'s sheet.
     let addProject: @MainActor () -> Void
-    let confirm: @MainActor (SettingsConfirmation) -> Void
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -375,16 +370,6 @@ private struct MacCard: View {
                     leading: .init(MacsSettingsPage.automaticColorTitle, value: nil)
                 )
                 .disabled(!model.canModify)
-            }
-
-            let projects = row.projects
-            if !projects.isEmpty {
-                projectsLabel
-                ForEach(Array(projects.enumerated()), id: \.element.id) { index, project in
-                    projectItem(project)
-                        // No separator between the label and the list.
-                        .settingsSeparatorAbove(index > 0)
-                }
             }
 
             actionsRow
@@ -451,55 +436,10 @@ private struct MacCard: View {
             : SettingsDesign.Colors.hex(SettingsDesign.TileColors.projectWithoutColor)
     }
 
-    // MARK: Projects
-
-    /// "Projects" and what the list holds: no separator
-    /// above it, nor between it and the first folder.
-    private var projectsLabel: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            SettingsGroupLabel("Projects")
-            Text(MacsSettingsPage.projectsHelp)
-                .font(SettingsDesign.Fonts.groupLabel)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, SettingsDesign.Metrics.rowHorizontalPadding)
-        }
-        .settingsSeparatorAbove(false)
-    }
-
-    private func projectItem(_ project: RemoteDeviceSettingsRow.Project) -> some View {
-        SettingsListItem {
-            Text(project.displayPath)
-                .font(SettingsDesign.Fonts.mono)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-                .help(project.path)
-        } trailing: {
-            SettingsStatusText(project.isHidden ? "Hidden" : "Added")
-            if project.isHidden {
-                Button("Show Again") {
-                    model.showProjectAgain(path: project.path, on: row.id)
-                }
-                .settingsButton(size: .small)
-                .disabled(!model.canModify)
-            } else {
-                Button("Remove…") {
-                    confirm(RemoteDeviceAlerts.removeProjectConfirmation(path: project.displayPath, deviceName: row.name) {
-                        model.hideProject(path: project.path, on: row.id)
-                    })
-                }
-                .settingsButton(size: .small)
-                .disabled(!model.canModify)
-            }
-        }
-    }
-
     // MARK: Actions
 
-    /// Update Session Host… (or Reinstall) when one applies, Set Up Cherry
-    /// MCP…, and Remove…, at the trailing end.
+    /// Update Session Host… (or Reinstall) when one applies, and Remove…,
+    /// at the trailing end.
     private var actionsRow: some View {
         HStack(spacing: 8) {
             Spacer(minLength: 0)

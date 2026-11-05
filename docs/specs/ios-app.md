@@ -161,14 +161,18 @@ trick.
 - **P0:** the app makes its key and shows its OpenSSH public key with a Copy
   button. You add it to `~/.ssh/authorized_keys` on the Mac yourself. The
   host key is pinned on first connect, after the app shows its fingerprint.
-- **P1:** pairing from the Mac app. Settings › Mobile shows a QR code with
-  the Mac's addresses, user, host key fingerprint and a one-time code. The
-  phone scans it and sends its public key over a pairing endpoint. The Mac
-  app asks before adding it, with
-  `restrict,pty,command="…/cherry mobile-gateway"`, so the phone's key can
-  only reach Cherry: no port forwarding, no arbitrary commands. The gateway
-  allows `host control` and `host attach`. A session is
-  a shell, so this narrows the surface, not what an attached user can do.
+- **P1 (built):** pairing from the Mac app (docs/specs/mobile-pairing.md).
+  Settings › Devices › Pair iPhone… shows a QR code with the Mac's
+  addresses, user, host key fingerprints and a one-time code. The phone
+  scans it (or the camera opens it) and sends its public key to the Mac's
+  short-lived pairing listener with an HMAC proof of the code. The Mac app
+  asks before adding it to `~/.ssh/authorized_keys`, and the phone's first
+  connect accepts only a host key the code listed.
+- **Later:** the key is added unrestricted. A
+  `restrict,pty,command="…/cherry mobile-gateway"` line would let it reach
+  only Cherry: no port forwarding, no arbitrary commands, the gateway
+  allowing `host control` and `host attach`. A session is a shell, so this
+  narrows the surface, not what an attached user can do.
 
 ### Notifications (P3)
 

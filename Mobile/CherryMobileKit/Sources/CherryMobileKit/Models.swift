@@ -15,6 +15,10 @@ public struct MacEndpoint: Codable, Hashable, Identifiable, Sendable {
     /// The Mac's host key as OpenSSH prints its fingerprint
     /// (`SHA256:…`), pinned on the first connect; nil until then.
     public var hostKeyFingerprint: String?
+    /// The host keys the Mac's pairing code listed (`SHA256:…`): until one
+    /// is pinned, a connect accepts only these, and pins the one presented
+    /// without asking. Nil for a Mac added by hand.
+    public var pairedHostKeyFingerprints: [String]?
     /// The identity of the Mac's session host (its `Welcome`'s `host_id`),
     /// pinned on the first connect like the host key: the phone then only
     /// talks to that host (`cherry … --expected-host-id`). Nil until then.
@@ -28,6 +32,7 @@ public struct MacEndpoint: Codable, Hashable, Identifiable, Sendable {
         user: String,
         cherryPath: String? = nil,
         hostKeyFingerprint: String? = nil,
+        pairedHostKeyFingerprints: [String]? = nil,
         expectedHostID: String? = nil
     ) {
         self.id = id
@@ -37,6 +42,7 @@ public struct MacEndpoint: Codable, Hashable, Identifiable, Sendable {
         self.user = user
         self.cherryPath = cherryPath
         self.hostKeyFingerprint = hostKeyFingerprint
+        self.pairedHostKeyFingerprints = pairedHostKeyFingerprints
         self.expectedHostID = expectedHostID
     }
 }

@@ -76,7 +76,8 @@ actor SSHMacConnection: MacConnection {
                 port: endpoint.port,
                 user: endpoint.user,
                 key: key,
-                pinnedFingerprint: endpoint.hostKeyFingerprint
+                pinnedFingerprint: endpoint.hostKeyFingerprint,
+                acceptableFingerprints: endpoint.pairedHostKeyFingerprints
             )
         } catch let failure as SSHConnection.Failure {
             throw Self.error(for: failure)

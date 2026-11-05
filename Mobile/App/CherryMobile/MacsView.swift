@@ -2,63 +2,47 @@ import CherryMobileKit
 import SwiftUI
 import UIKit
 
-/// The Macs the app reaches, this device's key, and the Demo Mac.
+/// The Macs the app reaches, in the inbox's style: Pair a Mac (the code a
+/// Mac's Cherry shows) first, then each Mac as a heading with how it stands
+/// and where it is, then setting one up by hand (this iPhone's key) and
+/// the Demo Mac.
 struct MacsView: View {
     @Environment(AppModel.self) private var model
     @State private var editing: MacEndpoint?
 
     var body: some View {
-        List {
-            Section {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                pairButton
+                    .padding(.top, 8)
                 ForEach(model.macs) { mac in
-                    Button {
+                    MacSection(mac: mac, sessionCount: model.sessions.filter { $0.macID == mac.id }.count) {
                         if !mac.isDemo { editing = mac.endpoint }
-                    } label: {
-                        MacRow(mac: mac, sessionCount: model.sessions.filter { $0.macID == mac.id }.count)
-                    }
-                    .buttonStyle(.plain)
-                    .swipeActions {
-                        if !mac.isDemo {
-                            Button("Remove", role: .destructive) {
-                                Task { await model.remove(mac.id) }
-                            }
-                        }
+                    } remove: {
+                        Task { await model.remove(mac.id) }
                     }
                 }
-                Button {
-                    editing = MacEndpoint(name: "", host: "", user: "")
-                } label: {
-                    Label("Add a Mac", systemImage: "plus")
-                }
-            } header: {
-                Text("Macs")
-            } footer: {
-                Text("Cherry reaches each Mac over SSH: turn on Remote Login there (System Settings › General › Sharing). With Tailscale, use the Mac's tailnet name.")
-            }
-
-            Section {
-                DeviceKeyView(key: model.deviceKey)
-            } header: {
-                Text("This device's key")
-            } footer: {
-                Text("Add it to ~/.ssh/authorized_keys on each Mac.")
-            }
-
-            if !model.launch.demoOnly {
-                Section {
-                    Toggle("Demo Mac", isOn: Binding(
-                        get: { model.showsDemoMac },
-                        set: { shows in Task { await model.setShowsDemoMac(shows) } }
-                    ))
-                } footer: {
-                    Text("A Mac inside the app, with agents in every state, to try Cherry without one.")
+                byHand
+                    .padding(.top, 36)
+                if !model.launch.demoOnly {
+                    demoToggle
+                        .padding(.top, 28)
                 }
             }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 24)
         }
         .navigationTitle("Macs")
         .sheet(item: $editing) { endpoint in
             NavigationStack {
-                MacEditor(endpoint: endpoint, isNew: model.mac(endpoint.id) == nil) { saved in
+                MacEditor(
+                    endpoint: endpoint,
+                    isNew: model.mac(endpoint.id) == nil,
+                    remove: model.mac(endpoint.id) == nil ? nil : {
+                        editing = nil
+                        Task { await model.remove(endpoint.id) }
+                    }
+                ) { saved in
                     editing = nil
                     if let saved {
                         Task { await model.save(saved) }
@@ -67,35 +51,112 @@ struct MacsView: View {
             }
         }
     }
+
+    private var pairButton: some View {
+        Button {
+            model.pairing = AppModel.PairingRequest(offer: nil)
+        } label: {
+            HStack(spacing: 14) {
+                Image(systemName: "qrcode.viewfinder")
+                    .font(.system(size: 30))
+                    .foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Pair a Mac")
+                        .font(.headline)
+                    Text("Scan the code in Cherry on your Mac: Settings › Devices › Pair iPhone…")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.leading)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(14)
+            .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 14))
+            .contentShape(RoundedRectangle(cornerRadius: 14))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var byHand: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Set up by hand")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text("Turn on Remote Login on the Mac (System Settings › General › Sharing) and add this iPhone's key to ~/.ssh/authorized_keys there, then add the Mac by its address. With Tailscale, use its tailnet name.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            DeviceKeyView(key: model.deviceKey)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+            Button("Add a Mac by Hand…", systemImage: "plus") {
+                editing = MacEndpoint(name: "", host: "", user: "")
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    private var demoToggle: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle("Demo Mac", isOn: Binding(
+                get: { model.showsDemoMac },
+                set: { shows in Task { await model.setShowsDemoMac(shows) } }
+            ))
+            .font(.body.weight(.medium))
+            Text("A Mac inside the app, with agents in every state, to try Cherry without one.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
 }
 
-struct MacRow: View {
+/// A Mac: its name as a heading, how it stands, and where it is (its user
+/// and address); a tap edits it.
+struct MacSection: View {
     let mac: AppModel.Mac
     let sessionCount: Int
+    let edit: () -> Void
+    let remove: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: mac.isDemo ? "sparkles.tv" : "desktopcomputer")
-                .font(.title3)
-                .foregroundStyle(Color.accentColor)
-                .frame(width: 30)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(mac.endpoint.name)
-                    .font(.body.weight(.semibold))
+        Button(action: edit) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(mac.endpoint.name)
+                        .font(.title2.weight(.bold))
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    if !mac.isDemo {
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                status
+                    .font(.subheadline)
                 Text(mac.isDemo ? "In this app" : "\(mac.endpoint.user)@\(mac.endpoint.host)")
-                    .font(.footnote)
+                    .font(.footnote.monospaced())
                     .foregroundStyle(.secondary)
-                statusText
-                    .font(.footnote)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
-            Spacer()
+            .padding(.top, 24)
+            .contentShape(Rectangle())
         }
-        .contentShape(Rectangle())
-        .padding(.vertical, 2)
+        .buttonStyle(.plain)
+        .contextMenu {
+            if !mac.isDemo {
+                Button("Edit…", systemImage: "pencil", action: edit)
+                Button("Remove", systemImage: "trash", role: .destructive, action: remove)
+            }
+        }
     }
 
     @ViewBuilder
-    private var statusText: some View {
+    private var status: some View {
         switch mac.status {
         case .idle:
             Text("Not connected").foregroundStyle(.secondary)
@@ -169,13 +230,16 @@ struct MacEditor: View {
     @State private var port: String
     @State private var cherryPath: String
     let isNew: Bool
+    /// Removes the Mac; nil for a new one.
+    let remove: (() -> Void)?
     let done: (MacEndpoint?) -> Void
 
-    init(endpoint: MacEndpoint, isNew: Bool, done: @escaping (MacEndpoint?) -> Void) {
+    init(endpoint: MacEndpoint, isNew: Bool, remove: (() -> Void)? = nil, done: @escaping (MacEndpoint?) -> Void) {
         _endpoint = State(initialValue: endpoint)
         _port = State(initialValue: String(endpoint.port))
         _cherryPath = State(initialValue: endpoint.cherryPath ?? "")
         self.isNew = isNew
+        self.remove = remove
         self.done = done
     }
 
@@ -209,6 +273,11 @@ struct MacEditor: View {
                     Button("Forget Host Key", role: .destructive) {
                         endpoint.hostKeyFingerprint = nil
                     }
+                }
+            }
+            if let remove {
+                Section {
+                    Button("Remove Mac", role: .destructive, action: remove)
                 }
             }
         }

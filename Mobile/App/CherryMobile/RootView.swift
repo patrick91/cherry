@@ -40,6 +40,15 @@ struct RootView: View {
                 Text("First connection to \(mac.endpoint.host). Its host key is \(fingerprint). Check it matches the Mac's (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub) before you trust it.")
             }
         }
+        .sheet(item: Binding(get: { model.pairing }, set: { model.pairing = $0 })) { request in
+            PairingView(offer: request.offer)
+        }
+        // A Mac's pairing code, opened by the iPhone's camera.
+        .onOpenURL { url in
+            if let offer = PairingOffer(url: url) {
+                model.pairing = AppModel.PairingRequest(offer: offer)
+            }
+        }
         .task { await openLaunchScreen() }
     }
 

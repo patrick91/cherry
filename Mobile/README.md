@@ -30,7 +30,8 @@ current release pulls a personal fork of it):
   its `authorized_keys` line, `ssh-ed25519 … cherry-ios`.
   `InMemoryDeviceIdentity` is for tests and previews.
 - **Host key:** pinned on first use. With no `hostKeyFingerprint`, the key is
-  accepted and the returned connection's `endpoint` carries its OpenSSH
+  accepted (only one of `pairedHostKeyFingerprints`, a pairing code's, when
+  set) and the returned connection's `endpoint` carries its OpenSSH
   fingerprint (`SHA256:…`) for the app to show and save; a different key later
   is `.hostKeyMismatch`. The session host's identity is pinned the same way
   (`expectedHostID`, passed as `--expected-host-id`).
@@ -152,9 +153,23 @@ Screens:
     zooming scroll view, so nothing changes on the Mac.
   - *Fit to phone* attaches at the view's grid, so the session reflows
     there and on the Mac while it is open.
-- **Macs:** add, edit and remove Macs; this device's public key, with Copy;
-  each Mac's status; the Demo Mac switch. A first connect shows the Mac's
-  host key and pins it once you trust it.
+- **Pairing:** Pair a Mac scans the code the Mac's Cherry shows (Settings ›
+  Devices › Pair iPhone…), or the iPhone's camera opens it
+  (`cherry-mobile://pair?…`, `PairingOffer`; docs/specs/mobile-pairing.md on
+  main). `MacPairing` asks each of its addresses for `/hello` and keeps the
+  first, in the code's order, that answers (the ones before it get a second
+  more), sends this device's key with an HMAC proof of the one-time code
+  over plain HTTP on Network.framework (App Transport Security would refuse
+  it to `URLSession`), and waits while you allow it on the Mac, showing this
+  device's key to compare. The Mac is saved at the address that answered
+  with the code's host keys (`pairedHostKeyFingerprints`): its first connect
+  accepts only one of them and pins it without asking.
+- **Macs:** in the inbox's style: Pair a Mac first, then each Mac as a
+  heading with its status and `user@host` (a tap edits it, where it can be
+  removed; a long press too); setting one up by hand (this device's public
+  key, with Copy, and Add a Mac by Hand…); the Demo Mac switch. A Mac added
+  by hand shows its host key on the first connect and pins it once you
+  trust it.
 
 Launch arguments open a screen against the Demo Mac, and such a run connects
 nowhere else:
@@ -166,7 +181,8 @@ nowhere else:
 - `-screen macs`
 
 `-demoDropAfter <seconds>` makes the Demo Mac drop each connection that long
-after it opened, to show reconnecting.
+after it opened, to show reconnecting. `-pairing <cherry-mobile://pair?…>`
+opens that pairing code as the camera would, without iOS asking first.
 
 ## Rules for tests
 

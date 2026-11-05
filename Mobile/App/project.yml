@@ -32,6 +32,8 @@ targets:
         PRODUCT_NAME: CherryMobile
         TARGETED_DEVICE_FAMILY: "1,2"
         GENERATE_INFOPLIST_FILE: YES
+        # The URL scheme pairing codes open, which build settings cannot say.
+        INFOPLIST_FILE: Info.plist
         INFOPLIST_KEY_CFBundleDisplayName: Cherry
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
@@ -39,6 +41,7 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Cherry connects to your Macs on this network over SSH."
+        INFOPLIST_KEY_NSCameraUsageDescription: "Cherry reads the pairing code your Mac shows."
         # SSH's encryption is the system's: swift-crypto defers to CryptoKit on
         # Apple platforms and the app bundles no crypto library, so it is
         # exempt and App Store Connect asks no compliance question per build.

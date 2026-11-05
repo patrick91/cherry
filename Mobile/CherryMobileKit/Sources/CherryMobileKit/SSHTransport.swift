@@ -29,18 +29,19 @@ final class SSHConnection: Sendable {
 
     var isActive: Bool { channel.isActive }
 
-    /// Connects and logs in. With `pinnedFingerprint` nil any host key is
-    /// accepted (and reported in `presentedFingerprint`); otherwise only
-    /// that one.
+    /// Connects and logs in. With `pinnedFingerprint` nil any host key of
+    /// `acceptableFingerprints` (any at all when that is nil) is accepted
+    /// and reported in `presentedFingerprint`; otherwise only that one.
     static func connect(
         host: String,
         port: Int,
         user: String,
         key: Curve25519.Signing.PrivateKey,
         pinnedFingerprint: String?,
+        acceptableFingerprints: [String]? = nil,
         timeout: Duration = .seconds(15)
     ) async throws -> SSHConnection {
-        let hostKeys = HostKeyCheck(pinned: pinnedFingerprint)
+        let hostKeys = HostKeyCheck(pinned: pinnedFingerprint, acceptable: acceptableFingerprints)
         let login = LoginState()
         let group = MultiThreadedEventLoopGroup.singleton
         let authenticated = group.next().makePromise(of: Void.self)
@@ -340,10 +341,12 @@ private final class SessionState: Sendable {
 
 private final class HostKeyCheck: Sendable {
     let pinned: String?
+    let acceptable: [String]?
     private let values = NIOLockedValueBox<(presented: String?, mismatch: SSHConnection.Failure?)>((nil, nil))
 
-    init(pinned: String?) {
+    init(pinned: String?, acceptable: [String]? = nil) {
         self.pinned = pinned
+        self.acceptable = acceptable
     }
 
     var presented: String? { values.withLockedValue { $0.presented } }
@@ -355,6 +358,10 @@ private final class HostKeyCheck: Sendable {
             values.presented = fingerprint
             if let pinned, pinned != fingerprint {
                 values.mismatch = .hostKeyMismatch(expected: pinned, presented: fingerprint)
+                return false
+            }
+            if pinned == nil, let acceptable, !acceptable.contains(fingerprint) {
+                values.mismatch = .hostKeyMismatch(expected: acceptable.joined(separator: " or "), presented: fingerprint)
                 return false
             }
             return true

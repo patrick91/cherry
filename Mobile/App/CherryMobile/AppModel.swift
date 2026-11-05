@@ -56,6 +56,15 @@ final class AppModel {
     private(set) var screenRevisions: [SessionKey: Int] = [:]
     /// This device's public key, or why there is none.
     private(set) var deviceKey: Result<String, KeyUnavailable>?
+
+    /// A Mac to pair with: one whose code the iPhone's camera opened, or
+    /// none yet (the Macs screen's Pair a Mac, which scans first).
+    struct PairingRequest: Identifiable {
+        let id = UUID()
+        var offer: PairingOffer?
+    }
+
+    var pairing: PairingRequest?
     private var connections: [UUID: any MacConnection] = [:]
 
     struct KeyUnavailable: Error, Equatable {
@@ -113,6 +122,9 @@ final class AppModel {
         started = true
         loadDeviceKey()
         watchNetwork()
+        if let offer = launch.pairing.flatMap(PairingOffer.init(url:)) {
+            pairing = PairingRequest(offer: offer)
+        }
         await withTaskGroup(of: Void.self) { group in
             for mac in macs {
                 group.addTask { await self.connect(mac.id) }
@@ -209,6 +221,22 @@ final class AppModel {
         }
         update(endpoint)
         await connect(endpoint.id)
+    }
+
+    /// Sends this device's key to the Mac of `offer` and waits for it to
+    /// allow it (`reached` hears the address that answered), then adds the
+    /// Mac, or updates it when it was added before, and connects.
+    func pair(with offer: PairingOffer, reached: @escaping @Sendable (String) async -> Void) async throws -> MacEndpoint {
+        let key = try identity.publicKey()
+        var endpoint = try await MacPairing.pair(offer, publicKey: key, deviceName: UIDevice.current.name, reached: reached)
+        if let existing = macs.first(where: {
+            !$0.isDemo && $0.endpoint.user == endpoint.user && ($0.endpoint.host == endpoint.host || $0.endpoint.name == endpoint.name)
+        }) {
+            endpoint.id = existing.id
+            endpoint.cherryPath = existing.endpoint.cherryPath
+        }
+        await save(endpoint)
+        return endpoint
     }
 
     func remove(_ macID: UUID) async {
@@ -308,6 +336,17 @@ final class AppModel {
                 return
             }
             let presented = connection.endpoint.hostKeyFingerprint
+            // A Mac paired with its code accepted only a host key the code
+            // listed: it is pinned without asking.
+            if mac.endpoint.hostKeyFingerprint == nil, let presented,
+               mac.endpoint.pairedHostKeyFingerprints?.contains(presented) == true,
+               var endpoint = self.mac(macID)?.endpoint {
+                endpoint.hostKeyFingerprint = presented
+                endpoint.expectedHostID = connection.endpoint.expectedHostID
+                update(endpoint)
+                await adopt(connection, for: macID)
+                return
+            }
             if mac.endpoint.hostKeyFingerprint == nil, let presented, !mac.isDemo {
                 awaitingTrust[macID] = connection
                 setStatus(.awaitingTrust(fingerprint: presented), of: macID)

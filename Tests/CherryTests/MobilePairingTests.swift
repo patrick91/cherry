@@ -17,6 +17,14 @@ private func pairingHome() throws -> URL {
     return home
 }
 
+/// The `cherry` a phone's key runs, as the app's link is named.
+private let gateway = "/Users/me/Library/Application Support/Cherry/bin/cherry"
+private let limited = #"restrict,pty,command="'/Users/me/Library/Application Support/Cherry/bin/cherry' host mobile-gateway""#
+
+private func phoneKeys(home: URL, gateway: String? = gateway) -> AuthorizedPhoneKeys {
+    .standard(home: home, gateway: { gateway })
+}
+
 @Test func theOfferURLCarriesWhatThePhoneNeedsAndReadsBack() throws {
     let offer = MobilePairingOffer(
         name: "Patbook", user: "patrick", hosts: ["100.101.1.2", "Patbook.local", "192.168.1.20"],
@@ -62,22 +70,26 @@ private func pairingHome() throws -> URL {
     ])
 }
 
-@Test func phoneKeysAreAddedListedAndRemovedLeavingOtherLinesAlone() throws {
+@Test func phoneKeysAreAddedLimitedListedAndRemovedLeavingOtherLinesAlone() throws {
     let home = try pairingHome()
-    let keys = AuthorizedPhoneKeys.standard(home: home)
+    let keys = phoneKeys(home: home)
     let key = try #require(SSHPublicKeyLine(phoneKey))
-    // ~/.ssh is made 0700, the file 0600.
+    // ~/.ssh is made 0700, the file 0600; the line runs only the gateway.
     try keys.add(key, name: "Patrick's iPhone\nsecond line")
     let ssh = home.appendingPathComponent(".ssh")
     #expect(try FileManager.default.attributesOfItem(atPath: ssh.path)[.posixPermissions] as? Int == 0o700)
     #expect(try FileManager.default.attributesOfItem(atPath: keys.file.path)[.posixPermissions] as? Int == 0o600)
+    #expect(try String(contentsOf: keys.file, encoding: .utf8) == "\(limited) \(phoneKey) cherry-mobile Patrick's iPhone second line\n")
     #expect(keys.phones().map(\.name) == ["Patrick's iPhone second line"])
+    #expect(keys.phones().map(\.isLimited) == [true])
 
-    // Someone else's lines stay, and a key already there is not added again.
-    let mine = "\(otherKey) me@laptop"
+    // Someone else's lines stay, blank and comment lines too, and pairing
+    // the key again renames its line rather than adding another.
+    let mine = "# mine\n\n\(otherKey) me@laptop"
     try (mine + "\n" + String(contentsOf: keys.file, encoding: .utf8)).write(to: keys.file, atomically: true, encoding: .utf8)
     try keys.add(key, name: "Again")
-    #expect(keys.phones().count == 1)
+    #expect(keys.phones().map(\.name) == ["Again"])
+    #expect(try String(contentsOf: keys.file, encoding: .utf8) == "\(mine)\n\(limited) \(phoneKey) cherry-mobile Again\n")
     let phone = try #require(keys.phones().first)
     #expect(phone.key.fingerprint == phoneFingerprint)
     try keys.remove(phone)
@@ -85,15 +97,70 @@ private func pairingHome() throws -> URL {
     #expect(try String(contentsOf: keys.file, encoding: .utf8) == mine + "\n")
 }
 
+@Test func aPhonePairedBeforeKeysWereLimitedIsListedAsFullAccessThenLimited() throws {
+    let home = try pairingHome()
+    let keys = phoneKeys(home: home)
+    try FileManager.default.createDirectory(at: home.appendingPathComponent(".ssh"), withIntermediateDirectories: true)
+    try "\(otherKey) me@laptop\n\(phoneKey) cherry-mobile Old iPhone\n".write(to: keys.file, atomically: true, encoding: .utf8)
+    let phone = try #require(keys.phones().first)
+    #expect(phone.name == "Old iPhone")
+    #expect(!phone.isLimited)
+    try keys.limit(phone)
+    #expect(try String(contentsOf: keys.file, encoding: .utf8) == "\(otherKey) me@laptop\n\(limited) \(phoneKey) cherry-mobile Old iPhone\n")
+    #expect(keys.phones() == [AuthorizedPhoneKeys.Phone(name: "Old iPhone", key: phone.key, isLimited: true)])
+}
+
+@Test func aKeyTheUserAddedIsNotAPhoneAndIsLeftAsItIs() throws {
+    let home = try pairingHome()
+    let keys = phoneKeys(home: home)
+    try FileManager.default.createDirectory(at: home.appendingPathComponent(".ssh"), withIntermediateDirectories: true)
+    let text = "\(phoneKey) my phone, by hand\n"
+    try text.write(to: keys.file, atomically: true, encoding: .utf8)
+    try keys.add(try #require(SSHPublicKeyLine(phoneKey)), name: "iPhone")
+    #expect(keys.phones().isEmpty)
+    #expect(try String(contentsOf: keys.file, encoding: .utf8) == text)
+}
+
+@Test func nothingIsAddedWithoutAGatewayToRunOrToAFileThatIsNotText() throws {
+    let home = try pairingHome()
+    let key = try #require(SSHPublicKeyLine(phoneKey))
+    for path in [nil, "relative/cherry", "/Users/o'brien/cherry", "/tmp/a\"b/cherry"] {
+        #expect(throws: AuthorizedPhoneKeys.Failure.noGateway) {
+            try phoneKeys(home: home, gateway: path).add(key, name: "iPhone")
+        }
+    }
+    #expect(!FileManager.default.fileExists(atPath: phoneKeys(home: home).file.path))
+
+    let keys = phoneKeys(home: home)
+    try FileManager.default.createDirectory(at: home.appendingPathComponent(".ssh"), withIntermediateDirectories: true)
+    // "René" in Latin-1: rewriting it as text would lose every line.
+    var latin1 = Data("\(otherKey) Ren".utf8)
+    latin1.append(0xE9)
+    latin1.append(contentsOf: "\n".utf8)
+    try latin1.write(to: keys.file)
+    #expect(throws: AuthorizedPhoneKeys.Failure.self) { try keys.add(key, name: "iPhone") }
+    #expect(try Data(contentsOf: keys.file) == latin1)
+}
+
+@Test func optionsAreReadUpToTheKeyTypeQuotesAndAll() {
+    let (options, rest) = AuthorizedPhoneKeys.options(of: "\(limited) \(phoneKey) cherry-mobile iPhone")
+    #expect(options == limited)
+    #expect(rest == "\(phoneKey) cherry-mobile iPhone")
+    let (none, plain) = AuthorizedPhoneKeys.options(of: "\(phoneKey) me")
+    #expect(none == nil)
+    #expect(plain == "\(phoneKey) me")
+    #expect(AuthorizedPhoneKeys.options(of: #"command="echo \"a b\"",no-pty ssh-ed25519 AAAA x"#).options == #"command="echo \"a b\"",no-pty"#)
+}
+
 @Test func aLinkedAuthorizedKeysIsLeftAloneWithTheLineToAdd() throws {
     let home = try pairingHome()
     let managed = home.appendingPathComponent("managed_keys")
     try "ssh-ed25519 AAAA mine\n".write(to: managed, atomically: true, encoding: .utf8)
     try FileManager.default.createDirectory(at: home.appendingPathComponent(".ssh"), withIntermediateDirectories: true)
-    let keys = AuthorizedPhoneKeys.standard(home: home)
+    let keys = phoneKeys(home: home)
     try FileManager.default.createSymbolicLink(at: keys.file, withDestinationURL: managed)
     let key = try #require(SSHPublicKeyLine(phoneKey))
-    #expect(throws: AuthorizedPhoneKeys.Failure.linked(destination: managed.path, line: "\(phoneKey) cherry-mobile iPhone")) {
+    #expect(throws: AuthorizedPhoneKeys.Failure.linked(destination: managed.path, line: "\(limited) \(phoneKey) cherry-mobile iPhone")) {
         try keys.add(key, name: "iPhone")
     }
     #expect(try String(contentsOf: managed, encoding: .utf8) == "ssh-ed25519 AAAA mine\n")
@@ -191,7 +258,7 @@ private struct Phone: Sendable {
 @MainActor
 private func pairingModel(home: URL, remoteLogin: Bool = true) -> MobilePairingModel {
     MobilePairingModel(
-        keys: .standard(home: home),
+        keys: phoneKeys(home: home),
         environment: MobilePairingEnvironment(
             macName: { "Patbook" },
             user: { "patrick" },
@@ -234,7 +301,7 @@ private func pairingModel(home: URL, remoteLogin: Bool = true) -> MobilePairingM
     #expect(answered.fields["user"] == "patrick")
     #expect(model.state == .paired("Patrick's iPhone"))
     #expect(paired == 1)
-    #expect(AuthorizedPhoneKeys.standard(home: home).phones().map(\.name) == ["Patrick's iPhone"])
+    #expect(phoneKeys(home: home).phones().map(\.name) == ["Patrick's iPhone"])
 }
 
 @Test @MainActor func closingTheSheetDeclinesTheAskingPhone() async throws {

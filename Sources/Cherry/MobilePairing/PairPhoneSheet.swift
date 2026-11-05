@@ -84,7 +84,7 @@ struct PairPhoneSheet: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Allow “\(prompt.phone)” to connect?")
                     .font(.headline)
-                Text("It can then log in to this Mac over SSH as \(model.environment.user()), like your own keys can. Cherry for iOS uses that to reach your sessions. Its key is added to ~/.ssh/authorized_keys.")
+                Text("It can then reach your Cherry sessions on this Mac over SSH, as \(model.environment.user()): see them and type into them, and a terminal session runs what it types. Its key is added to ~/.ssh/authorized_keys limited to that: it can't log in, run other commands or forward ports.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 VStack(alignment: .leading, spacing: 2) {

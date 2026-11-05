@@ -286,6 +286,24 @@ at most 100 bytes, without spaces, quotes, backslashes, `=`, `${` or control
 characters. The Mac app passes the master connection it keeps per SSH
 destination.
 
+`cherry host mobile-gateway` is the forced command of the keys the Mac app
+adds for Cherry for iOS (`restrict,pty,command="'<cherry>' host
+mobile-gateway" <key> cherry-mobile <name>`, docs/specs/mobile-pairing.md).
+sshd runs it whatever the phone asks, with the phone's command line in
+`SSH_ORIGINAL_COMMAND`, and it runs, as this same `cherry`, only what Cherry
+for iOS sends: `host control --no-start`, which then relays only `list`,
+`subscribe`, `ping`, `screen` and `send_input` and answers any other request
+`not_allowed` itself (`--allow-requests`, hidden); `host attach ID
+--detach-key none --client-id mobile-…`; and `host transcript ID [--limit N]
+[--after CURSOR]`, each with `--expected-host-id` if given. The phone's
+locator (`/bin/sh -c SCRIPT cherry-mobile …`) is answered with this
+`cherry`'s path and never run. The program the phone names is ignored; any
+other command, option, a shell or a subsystem is refused (exit 1, "this key
+reaches only Cherry's sessions"). It reads the command line as the phone
+quotes it, single-quoted words, and refuses anything a shell would
+interpret. Attaching still types into a session, and a terminal session runs
+what it types: the key reaches Cherry's sessions, not a login.
+
 Multiple terminals can attach to the same session and type into it. Each
 receives the same output; closing one leaves the others connected. `attach`
 connects again by itself after a lost connection (see

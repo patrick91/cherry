@@ -2,6 +2,7 @@ mod agent;
 mod attach;
 mod control;
 mod diagnose;
+mod gateway;
 mod guard;
 mod handover;
 mod input;
@@ -177,6 +178,11 @@ enum Action {
         /// when none of this version runs, say so and fail.
         #[arg(long)]
         no_start: bool,
+        /// Relay only requests with these `op`s (comma-separated), and answer
+        /// any other with `not_allowed` without sending it on: what
+        /// `mobile-gateway` runs for a phone.
+        #[arg(long, hide = true, value_name = "OPS", value_delimiter = ',')]
+        allow_requests: Option<Vec<String>>,
     },
     /// Describe the host daemon: its pid, uptime, build and protocol, its
     /// socket, state directory and log, its sessions and connections against
@@ -212,6 +218,12 @@ enum Action {
         #[arg(long)]
         locate: bool,
     },
+    /// The forced command of the keys Cherry adds for Cherry for iOS
+    /// (`restrict,pty,command="… host mobile-gateway"`): runs the command
+    /// sshd got (`SSH_ORIGINAL_COMMAND`) only when it is one Cherry for iOS
+    /// sends, as this cherry, and refuses anything else.
+    #[command(hide = true)]
+    MobileGateway,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -230,7 +242,8 @@ impl Action {
             Action::List { .. }
             | Action::Status { .. }
             | Action::Doctor
-            | Action::Transcript { .. } => Kind::Query,
+            | Action::Transcript { .. }
+            | Action::MobileGateway => Kind::Query,
             Action::Attach { .. } => Kind::Attach,
             Action::Control { .. } => Kind::Control,
             Action::Shutdown
@@ -252,7 +265,10 @@ impl Action {
                 ..
             } | Action::New { .. }
                 | Action::Attach { .. }
-                | Action::Control { no_start: false }
+                | Action::Control {
+                    no_start: false,
+                    ..
+                }
         )
     }
 }
@@ -306,6 +322,9 @@ fn main() -> ExitCode {
             error.exit();
         }
     };
+    if let Action::MobileGateway = cli.command {
+        return ExitCode::from(gateway::run(&cli));
+    }
     let kind = cli.command.kind();
     let mut status = StatusFile::new(match &cli.command {
         Action::Attach { status_file, .. } => status_file.clone(),
@@ -465,7 +484,7 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
     let transport = slot.as_mut().expect("connected");
 
     match cli.command {
-        Action::Start | Action::Doctor => unreachable!(),
+        Action::Start | Action::Doctor | Action::MobileGateway => unreachable!(),
         Action::Status { json } => diagnose::status(
             transport,
             &diagnose::Greeting {
@@ -653,9 +672,9 @@ fn execute(cli: Cli, slot: &mut Option<Transport>, status: &mut StatusFile) -> R
             )?;
             attached(status, outcome)
         }
-        Action::Control { .. } => {
+        Action::Control { allow_requests, .. } => {
             transport.clear_deadline();
-            control::relay(transport, host_id, host_build)
+            control::relay(transport, host_id, host_build, allow_requests)
         }
     }
 }
@@ -2060,15 +2079,32 @@ mod tests {
             "control",
         ])
         .unwrap();
-        assert!(matches!(cli.command, Action::Control { no_start: false }));
+        assert!(matches!(
+            cli.command,
+            Action::Control {
+                no_start: false,
+                allow_requests: None
+            }
+        ));
         assert!(cli.command.starts_host());
         let looking =
             Cli::try_parse_from(["cherry", "--host", "studio", "control", "--no-start"]).unwrap();
         assert!(matches!(
             looking.command,
-            Action::Control { no_start: true }
+            Action::Control { no_start: true, .. }
         ));
         assert!(!looking.command.starts_host());
+        let limited = Cli::try_parse_from([
+            "cherry",
+            "control",
+            "--no-start",
+            "--allow-requests=list,ping",
+        ])
+        .unwrap();
+        let Action::Control { allow_requests, .. } = limited.command else {
+            panic!("expected control");
+        };
+        assert_eq!(allow_requests, Some(vec!["list".into(), "ping".into()]));
         assert_eq!(
             cli.ssh_control_path.as_deref(),
             Some(Path::new("/tmp/cherry-501/%h"))

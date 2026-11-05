@@ -126,7 +126,9 @@ struct MacsSettingsPage: View, SettingsPageContent {
     // MARK: Your iPhones
 
     /// Its title and Pair iPhone… above the paired phones (or the empty
-    /// state), each with its key's fingerprint and Remove….
+    /// state), each with its key's fingerprint and Remove…; one paired
+    /// before Cherry limited keys says it has full SSH access, with Limit to
+    /// Cherry.
     private var yourPhonesSection: some View {
         VStack(alignment: .leading, spacing: SettingsDesign.Metrics.columnSpacing) {
             SettingsSectionHeader("Your iPhones") {
@@ -143,8 +145,17 @@ struct MacsSettingsPage: View, SettingsPageContent {
                 SettingsSection {
                     ForEach(phones.phones) { phone in
                         SettingsListItem {
-                            SettingsListLabel(phone.name, subtitle: phone.key.fingerprint, monospacedSubtitle: true)
+                            SettingsListLabel(phone.name, subtitle: phone.key.fingerprint, monospacedSubtitle: true) {
+                                if !phone.isLimited {
+                                    SettingsTag("Full SSH access", style: .warning)
+                                        .help(Self.phoneFullAccessHelp)
+                                }
+                            }
                         } trailing: {
+                            if !phone.isLimited {
+                                Button("Limit to Cherry") { limit(phone) }
+                                    .settingsButton()
+                            }
                             Button("Remove…") { confirmation = removePhoneConfirmation(phone) }
                                 .settingsButton()
                         }
@@ -154,6 +165,19 @@ struct MacsSettingsPage: View, SettingsPageContent {
             }
         }
         .settingsRow(.macsPhones)
+    }
+
+    private func limit(_ phone: AuthorizedPhoneKeys.Phone) {
+        do {
+            try phones.limit(phone)
+        } catch {
+            let failure = error as? AuthorizedPhoneKeys.Failure
+            confirmation = SettingsConfirmation(
+                title: "Couldn't limit “\(phone.name)”",
+                message: [error.localizedDescription, failure?.line].compactMap(\.self).joined(separator: "\n\n"),
+                choices: [.init("OK", isDefault: true)]
+            )
+        }
     }
 
     private func removePhoneConfirmation(_ phone: AuthorizedPhoneKeys.Phone) -> SettingsConfirmation {
@@ -266,7 +290,8 @@ struct MacsSettingsPage: View, SettingsPageContent {
     static let projectsHelp = "Folders you added on this Mac, and ones you hid from the project picker."
     static let phonesEmptyTitle = "No iPhones yet"
     static let phonesEmptyMessage = "Pair Cherry for iOS to see your agents and sessions on your iPhone, and to answer them."
-    static let phonesCaption = "Each can log in to this Mac over SSH with its own key, which Cherry added to ~/.ssh/authorized_keys."
+    static let phonesCaption = "Each reaches your Cherry sessions over SSH with its own key, which Cherry added to ~/.ssh/authorized_keys limited to them: it can see them and type into them, but can't log in, run other commands or forward ports."
+    static let phoneFullAccessHelp = "Paired before Cherry limited iPhone keys: it can log in to this Mac over SSH like your own keys. Limit to Cherry lets it reach only Cherry's sessions."
     static let sshHostsCaption = "Hosts you saved for persistent sessions that aren't added as Macs. Sessions on SSH hosts always keep running when you close a tab, close a window or quit."
 
     // MARK: Search

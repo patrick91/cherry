@@ -112,12 +112,18 @@ struct PairPhoneSheet: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
                 if let line {
-                    Text(line)
-                        .font(.system(.callout, design: .monospaced))
-                        .textSelection(.enabled)
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+                    // One line that scrolls: a wrapped key gets hyphens it
+                    // does not have.
+                    ScrollView(.horizontal) {
+                        Text(line)
+                            .font(.system(.callout, design: .monospaced))
+                            .lineLimit(1)
+                            .fixedSize()
+                            .textSelection(.enabled)
+                            .padding(8)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
                     Button("Copy Line") {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(line, forType: .string)

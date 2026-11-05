@@ -30,6 +30,8 @@ private func session(
     #expect(here.agents.map(\.id) == ["fix"])
     #expect(here.others.map(\.id) == ["zsh"])
     #expect(projects.last?.root == "~")
+    #expect(session("x", directory: "/Users/me/github/me/cherry/Host").projectName == "Host")
+    #expect(session("x", in: "/Users/me", directory: "/tmp").projectName == "Home")
 }
 
 @Test func projectsThatNeedYouComeFirstThenWorkThenQuietOnesByName() {

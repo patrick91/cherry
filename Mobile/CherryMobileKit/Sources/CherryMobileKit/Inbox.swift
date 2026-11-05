@@ -51,6 +51,11 @@ public extension MobileSession {
         let root = DisplayPath.abbreviatingHome(project ?? directory ?? "~").trimmingSuffix("/")
         return root.isEmpty ? "/" : root
     }
+
+    /// Its project's name: its folder's, Home for the home folder.
+    var projectName: String {
+        Inbox.name(of: projectRoot)
+    }
 }
 
 /// Which of the inbox's sessions it shows.
@@ -85,7 +90,7 @@ public struct InboxProject: Identifiable, Hashable, Sendable {
 
     /// Its folder's name; the home folder's is Home, as on the Mac.
     public var name: String {
-        root == "~" ? "Home" : root.split(separator: "/").last.map(String.init) ?? root
+        Inbox.name(of: root)
     }
 
     /// The folder its folder is in (`~/github/patrick91`).
@@ -136,6 +141,10 @@ public enum Inbox {
     }
 
     static let quiet = 5
+
+    static func name(of root: String) -> String {
+        root == "~" ? "Home" : root.split(separator: "/").last.map(String.init) ?? root
+    }
 
     static func urgency(_ session: MobileSession) -> Int {
         guard session.isRunning else { return quiet }

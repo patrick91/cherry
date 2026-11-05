@@ -433,7 +433,17 @@ public actor DemoMacConnection: MacConnection {
             TranscriptEntry(id: "p1", kind: .user, text: "Tidy my notes: merge duplicates and fix broken links."),
             TranscriptEntry(id: "p2", kind: .tool, name: "bash", summary: "ls notes | wc -l", result: "214", status: .ok),
             TranscriptEntry(id: "p3", kind: .note, text: "Conversation compacted"),
-            TranscriptEntry(id: "p4", kind: .assistant, text: "Tidied 12 notes: merged 3 duplicates and fixed 9 broken links."),
+            TranscriptEntry(id: "p4", kind: .assistant, text: """
+            Tidied 12 notes: merged 3 duplicates and fixed 9 broken links.
+
+            **What changed:**
+
+            - **Merged:** `weekly/2026-40 (1).md` into `weekly/2026-40.md`, and two copies of `talks/pycon-outline.md`.
+            - **Links:** 9 pointed at notes renamed in September; they now use the new names.
+            - **Left alone:** `inbox.md`, which links to itself on purpose.
+
+            **One thing to decide:** `archive/` still has 41 notes nothing links to. Say so and I'll move them to `archive/old/`.
+            """),
         ],
     ]
 

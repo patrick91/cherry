@@ -219,6 +219,7 @@ struct MessageView: View {
                 Spacer(minLength: 44)
                 Text(entry.text ?? "")
                     .font(.subheadline)
+                    .lineSpacing(2)
                     .textSelection(.enabled)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -239,7 +240,9 @@ struct MessageView: View {
 }
 
 /// An agent's Markdown: paragraphs, headings, lists, code (and tables),
-/// quotes and rules, each with its inline emphasis, code and links.
+/// quotes and rules, each with its inline emphasis, code and links; lines
+/// a little apart, paragraphs more, inline code smaller than the text
+/// around it on a tint.
 struct MarkdownView: View {
     let blocks: [MarkdownBlock]
 
@@ -248,7 +251,7 @@ struct MarkdownView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 12) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                 switch block {
                 case .paragraph(let text):
@@ -256,14 +259,15 @@ struct MarkdownView: View {
                 case .heading(let level, let text):
                     Text(Self.inline(text))
                         .font(level <= 2 ? .headline : .subheadline.weight(.semibold))
-                        .padding(.top, 2)
+                        .padding(.top, 4)
                 case .list(let ordered, let items):
-                    VStack(alignment: .leading, spacing: 5) {
+                    VStack(alignment: .leading, spacing: 8) {
                         ForEach(Array(items.enumerated()), id: \.offset) { index, item in
-                            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
                                 Text(ordered ? "\(index + 1)." : "•")
                                     .monospacedDigit()
                                     .foregroundStyle(.secondary)
+                                    .frame(minWidth: ordered ? 18 : 8, alignment: .trailing)
                                 Text(Self.inline(item))
                             }
                         }
@@ -290,13 +294,30 @@ struct MarkdownView: View {
             }
         }
         .font(.subheadline)
+        .lineSpacing(3)
         .textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     static func inline(_ text: String) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        let parsed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        var styled = AttributedString()
+        for run in parsed.runs {
+            guard run.inlinePresentationIntent?.contains(.code) == true else {
+                styled.append(parsed[run.range])
+                continue
+            }
+            // Monospaced at the text's size reads larger and wider than it.
+            // A narrow space in the text's font each side keeps the tint
+            // off the letters, and a line never breaks at it.
+            var code = AttributedString(parsed[run.range])
+            code.font = .system(.footnote, design: .monospaced)
+            var padded = AttributedString("\u{202F}") + code + AttributedString("\u{202F}")
+            padded.backgroundColor = Color(.tertiarySystemFill)
+            styled.append(padded)
+        }
+        return styled
     }
 }
 

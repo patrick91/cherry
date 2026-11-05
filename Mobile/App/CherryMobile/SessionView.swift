@@ -40,9 +40,14 @@ struct SessionView: View {
         .toolbar {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 1) {
-                    Text(session?.title ?? "Session").font(.headline)
+                    Text(session?.title ?? "Session")
+                        .font(.headline)
+                        .lineLimit(1)
                     if let mac = model.mac(key.macID) {
-                        Text(subtitle(mac: mac)).font(.caption2).foregroundStyle(.secondary)
+                        Text([session?.projectName, mac.endpoint.name].compactMap { $0 }.joined(separator: " · "))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                 }
             }
@@ -108,10 +113,6 @@ struct SessionView: View {
     private var menu: ScreenMenu? {
         guard let screen, session?.attention != .working else { return nil }
         return ScreenMenu.find(in: screen.lines)
-    }
-
-    private func subtitle(mac: AppModel.Mac) -> String {
-        [mac.endpoint.name, session?.directory].compactMap { $0 }.joined(separator: " — ")
     }
 
     private func reload() async {

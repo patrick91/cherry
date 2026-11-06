@@ -244,6 +244,11 @@ pub mod error_code {
     /// (`cherry-host`'s `MAX_CONNECTIONS`); it sends this before the
     /// `Welcome` and closes the connection. Try again later.
     pub const TOO_MANY_CONNECTIONS: &str = "too_many_connections";
+    /// Not from a host: `cherry host control --allow-requests` answers a
+    /// request it does not allow with this, and sends it nowhere (a phone's
+    /// key reaches only what Cherry for iOS asks, `cherry host
+    /// mobile-gateway`).
+    pub const NOT_ALLOWED: &str = "not_allowed";
 }
 
 /// Why a session ended other than by its program exiting

@@ -4,13 +4,18 @@
 //! carries the host's Welcome followed by every byte the host sends, and
 //! standard input every byte for the host, relayed verbatim both ways: the
 //! app speaks the protocol, starting with its first request after Hello.
+//! With `--allow-requests` (a phone, through `mobile-gateway`) only requests
+//! with those `op`s go on, whole frames; any other is answered
+//! `not_allowed` here.
 use crate::{
     sys::{self, interrupted, poll, pollfd, read_some, write_some, NonBlocking},
     timing::timing,
     transport::{stopped_reading, Transport, RPC_TIMEOUT},
 };
-use anyhow::{Context, Result};
-use cherry_protocol::{encode_frame, ServerMessage, PROTOCOL_VERSION};
+use anyhow::{bail, Context, Result};
+use cherry_protocol::{
+    encode_frame, error_code, frame_length, Response, ServerMessage, PROTOCOL_VERSION,
+};
 use std::{
     os::fd::RawFd,
     time::{Duration, Instant},
@@ -32,8 +37,15 @@ pub const QUIET_WAIT: Duration = RPC_TIMEOUT;
 /// nothing only stops the relay from reading standard input once
 /// `HIGH_WATER` bytes wait for it; the app's own request timeouts judge it.
 /// A closed standard output ends the relay too, successfully: nothing can
-/// be relayed any more.
-pub fn relay(transport: &mut Transport, host_id: String, build: Option<String>) -> Result<u32> {
+/// be relayed any more. `allowed`: the only requests to send on (see the
+/// module documentation).
+pub fn relay(
+    transport: &mut Transport,
+    host_id: String,
+    build: Option<String>,
+    allowed: Option<Vec<String>>,
+) -> Result<u32> {
+    let mut filter = allowed.map(RequestFilter::new);
     let welcome = encode_frame(&ServerMessage::Welcome {
         version: PROTOCOL_VERSION,
         host_id,
@@ -137,7 +149,17 @@ pub fn relay(transport: &mut Transport, host_id: String, build: Option<String>) 
                     input_open = false;
                     closing = Some(Instant::now());
                 }
-                Ok(Some(n)) => transport.queue_bytes(&buffer[..n]),
+                Ok(Some(n)) => match filter.as_mut() {
+                    None => transport.queue_bytes(&buffer[..n]),
+                    Some(filter) => {
+                        for frame in filter.push(&buffer[..n])? {
+                            match frame {
+                                Filtered::Send(bytes) => transport.queue_bytes(&bytes),
+                                Filtered::Refuse(answer) => output.push(&answer),
+                            }
+                        }
+                    }
+                },
                 Err(error) => return Err(error).context("could not read standard input"),
             }
         }
@@ -215,5 +237,122 @@ impl Output {
         );
         self.bytes.clear();
         self.written = 0;
+    }
+}
+
+/// What becomes of a whole frame from standard input under
+/// `--allow-requests`.
+#[derive(Debug, PartialEq, Eq)]
+enum Filtered {
+    /// The frame as it came, for the host.
+    Send(Vec<u8>),
+    /// The `not_allowed` answer, for standard output.
+    Refuse(Vec<u8>),
+}
+
+/// Splits standard input into frames and lets through only JSON requests
+/// whose `op` is allowed.
+struct RequestFilter {
+    allowed: Vec<String>,
+    pending: Vec<u8>,
+}
+
+impl RequestFilter {
+    fn new(allowed: Vec<String>) -> Self {
+        Self {
+            allowed,
+            pending: Vec::new(),
+        }
+    }
+
+    /// The frames `bytes` completed; an error for bytes that are no frame.
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Filtered>> {
+        self.pending.extend_from_slice(bytes);
+        let mut frames = Vec::new();
+        let mut start = 0;
+        while self.pending.len() - start >= 4 {
+            let word: [u8; 4] = self.pending[start..start + 4].try_into().unwrap();
+            let Ok(length) = frame_length(word) else {
+                bail!("standard input sent something that is not a frame");
+            };
+            let end = start + 4 + length;
+            if self.pending.len() < end {
+                break;
+            }
+            frames.push(self.judge(&self.pending[start..end])?);
+            start = end;
+        }
+        self.pending.drain(..start);
+        Ok(frames)
+    }
+
+    fn judge(&self, frame: &[u8]) -> Result<Filtered> {
+        let body = &frame[4..];
+        // A binary frame (an attachment's input) has no `op`.
+        let request = (body.first() == Some(&b'{'))
+            .then(|| serde_json::from_slice::<serde_json::Value>(body).ok())
+            .flatten();
+        let op = request.as_ref().and_then(|value| value["op"].as_str());
+        if op.is_some_and(|op| self.allowed.iter().any(|allowed| allowed == op)) {
+            return Ok(Filtered::Send(frame.to_vec()));
+        }
+        let req = request.as_ref().and_then(|value| value["req"].as_u64());
+        let message = match op {
+            Some(op) => format!("this connection may not send {op}"),
+            None => "this connection sends only requests".to_owned(),
+        };
+        let answer = encode_frame(&Response::new(
+            req,
+            ServerMessage::error(error_code::NOT_ALLOWED, message),
+        ))
+        .context("could not encode a refusal")?;
+        Ok(Filtered::Refuse(answer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cherry_protocol::{read_frame, ClientMessage, Request};
+
+    fn frame(request: &Request) -> Vec<u8> {
+        encode_frame(request).unwrap()
+    }
+
+    #[test]
+    fn only_allowed_requests_go_on_and_the_rest_are_answered_not_allowed() {
+        let mut filter = RequestFilter::new(vec!["list".into(), "ping".into()]);
+        let list = frame(&Request::new(Some(1), ClientMessage::List));
+        let kill = frame(&Request::new(
+            Some(2),
+            ClientMessage::Kill { id: "s".into() },
+        ));
+        let ping = frame(&Request::new(None, ClientMessage::Ping));
+        let mut bytes = [list.clone(), kill, ping.clone()].concat();
+        // Split mid-frame: the filter waits for the rest.
+        let rest = bytes.split_off(list.len() + 3);
+        let first = filter.push(&bytes).unwrap();
+        assert_eq!(first, vec![Filtered::Send(list)]);
+        let second = filter.push(&rest).unwrap();
+        assert_eq!(second.len(), 2);
+        let Filtered::Refuse(answer) = &second[0] else {
+            panic!("expected the kill refused, got {:?}", second[0]);
+        };
+        let answer: Response = read_frame(&mut &answer[..]).unwrap().unwrap();
+        assert_eq!(answer.req, Some(2));
+        assert!(matches!(
+            answer.message,
+            ServerMessage::Error { ref code, .. } if code == error_code::NOT_ALLOWED
+        ));
+        assert_eq!(second[1], Filtered::Send(ping));
+    }
+
+    #[test]
+    fn binary_frames_and_bytes_that_are_no_frame_go_nowhere() {
+        let mut filter = RequestFilter::new(vec!["input".into()]);
+        let input = cherry_protocol::encode_input_frame(b"ls\r").unwrap();
+        let answers = filter.push(&input).unwrap();
+        assert!(matches!(answers[..], [Filtered::Refuse(_)]));
+        assert!(filter.push(&[0, 0, 0, 0]).is_err());
     }
 }

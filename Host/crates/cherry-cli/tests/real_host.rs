@@ -1536,6 +1536,140 @@ fn control_starts_a_remote_host_through_the_real_gateway() {
     assert!(remote.state_created());
 }
 
+/// `cherry host mobile-gateway` as sshd runs it for a phone's key, with the
+/// phone's command line (None: it asked for a shell), on this test's host.
+fn mobile_gateway(host: &Host, line: Option<&str>) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cherry"));
+    command
+        .args(["host", "mobile-gateway"])
+        .env("CHERRY_HOST_SOCKET", &host.socket)
+        .env("CHERRY_HOST_PATH", "/nonexistent/cherry-host")
+        .env("CHERRY_CLI_REPORT_WAIT_MS", "200")
+        .env_remove("CHERRY_SESSION_ID");
+    match line {
+        Some(line) => command.env("SSH_ORIGINAL_COMMAND", line),
+        None => command.env_remove("SSH_ORIGINAL_COMMAND"),
+    };
+    command
+}
+
+#[test]
+#[ignore = "requires a built cherry-host binary and permission to bind a socket and open PTYs"]
+fn the_mobile_gateway_runs_what_the_phone_sends_and_nothing_else() {
+    use cherry_protocol::{error_code, ClientMessage, Request, Response, ServerMessage};
+    let host = Host::start();
+    let host_id = host.host_id.clone().unwrap();
+    let created = host.json(&[
+        "new",
+        "--cwd=/",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'READY\\n'; while IFS= read -r line; do printf 'OUT:%s\\n' \"$line\"; done",
+    ]);
+    let id = created["id"].as_str().unwrap().to_owned();
+
+    // The phone's locator is answered with this cherry's path, never run.
+    let located = mobile_gateway(
+        &host,
+        Some("'/bin/sh' '-c' 'echo ran; exit 127' 'cherry-mobile' ''"),
+    )
+    .output()
+    .unwrap();
+    assert!(located.status.success());
+    let path = String::from_utf8(located.stdout).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(path.trim()).unwrap(),
+        std::fs::canonicalize(env!("CARGO_BIN_EXE_cherry")).unwrap()
+    );
+
+    // A shell, another command or another host command is refused.
+    for line in [
+        None,
+        Some("id".to_owned()),
+        Some(format!("'cherry' 'host' 'kill' '{id}'")),
+        Some("'cherry' 'host' 'shutdown'".to_owned()),
+    ] {
+        let refused = mobile_gateway(&host, line.as_deref()).output().unwrap();
+        assert_eq!(refused.status.code(), Some(1), "{line:?}");
+        let error = String::from_utf8_lossy(&refused.stderr);
+        assert!(error.contains("reaches only Cherry's sessions"), "{error}");
+        assert!(refused.stdout.is_empty(), "{line:?}");
+    }
+
+    // Control relays the phone's requests and answers any other itself.
+    let mut control = mobile_gateway(
+        &host,
+        Some(&format!(
+            "'/elsewhere/cherry' 'host' 'control' '--no-start' '--expected-host-id' '{host_id}'"
+        )),
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let mut stdin = control.stdin.take().unwrap();
+    let mut stdout = control.stdout.take().unwrap();
+    let welcome = next_response(&mut stdout);
+    assert!(
+        matches!(&welcome.message, ServerMessage::Welcome { host_id: welcomed, .. } if *welcomed == host_id),
+        "{welcome:?}"
+    );
+    let requests = [
+        frame(&Request::new(Some(1), ClientMessage::List)),
+        frame(&Request::new(
+            Some(2),
+            ClientMessage::Kill { id: id.clone() },
+        )),
+        frame(&Request::new(Some(3), ClientMessage::Shutdown)),
+        frame(&Request::new(Some(4), ClientMessage::Ping)),
+    ]
+    .concat();
+    stdin.write_all(&requests).unwrap();
+    // Refusals come from the relay at once, answers from the host later.
+    let mut answers: Vec<Response> = (0..4).map(|_| next_response(&mut stdout)).collect();
+    answers.sort_by_key(|answer| answer.req);
+    assert!(
+        matches!(&answers[0], Response { req: Some(1), message: ServerMessage::Sessions { sessions, .. } } if sessions.iter().any(|session| session.id == id)),
+        "{:?}",
+        answers[0]
+    );
+    for answer in &answers[1..3] {
+        assert!(
+            matches!(&answer.message, ServerMessage::Error { code, .. } if code == error_code::NOT_ALLOWED),
+            "{answer:?}"
+        );
+    }
+    assert_eq!(answers[3], Response::new(Some(4), ServerMessage::Pong));
+    drop(stdin);
+    assert!(control.wait().unwrap().success());
+    // The kill never reached the host.
+    let listing = host.json(&["list", "--json"]);
+    assert_eq!(listing["sessions"][0]["state"], "running");
+
+    // An attachment through the gateway types into the session.
+    let mut attached = Attached::with_command(
+        mobile_gateway(
+            &host,
+            Some(&format!(
+                "'/elsewhere/cherry' 'host' 'attach' '{id}' '--detach-key' 'none' \
+                 '--client-id' 'mobile-0123456789abcdef' '--expected-host-id' '{host_id}'"
+            )),
+        ),
+        80,
+        24,
+    );
+    attached.expect(b"READY");
+    attached.master.write_all(b"ping\n").unwrap();
+    attached.expect(b"OUT:ping");
+    assert_eq!(
+        unsafe { libc::kill(attached.child.id() as i32, libc::SIGTERM) },
+        0
+    );
+    attached.wait();
+}
+
 /// Wait until the status file satisfies `accept`, returning it.
 fn wait_for_status(
     path: &Path,

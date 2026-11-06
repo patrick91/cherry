@@ -228,4 +228,11 @@ final class PairedPhonesModel: ObservableObject {
         defer { reload() }
         try keys.remove(phone)
     }
+
+    /// Limits a phone paired before Cherry limited keys to Cherry's
+    /// sessions.
+    func limit(_ phone: AuthorizedPhoneKeys.Phone) throws {
+        defer { reload() }
+        try keys.limit(phone)
+    }
 }

@@ -1,9 +1,10 @@
 # Pairing Cherry for iOS with a Mac
 
 Status: implemented in the Mac app (Settings › Devices › Pair iPhone…,
-`Sources/Cherry/MobilePairing/`); Cherry for iOS reads the code on the
-`codex/ios-app` branch (`Mobile/`, docs/specs/ios-app.md › Identity and
-pairing).
+`Sources/Cherry/MobilePairing/`) and the gateway the phone's key runs
+(`cherry host mobile-gateway`, `Host/crates/cherry-cli/src/gateway.rs`);
+Cherry for iOS reads the code on the `codex/ios-app` branch (`Mobile/`,
+docs/specs/ios-app.md › Identity and pairing).
 
 Cherry for iOS reaches a Mac's sessions over SSH, with a key of its own.
 Pairing gets that key into the Mac's `~/.ssh/authorized_keys` and tells
@@ -24,8 +25,9 @@ an address or copying a key by hand.
    (`GET /hello` on each, in parallel), and sends its public key and name
    (`POST /pair`). The request waits.
 4. The Mac asks: "Allow “<phone>” to connect?", with the key's fingerprint,
-   which the phone shows too. Allow adds the key; Deny refuses it and shows
-   a new code. Either answer, or closing the sheet, answers the phone.
+   which the phone shows too. Allow adds the key, limited to Cherry's
+   sessions (see authorized_keys); Deny refuses it and shows a new code.
+   Either answer, or closing the sheet, answers the phone.
 5. The phone saves the Mac with the address that answered, the user, the
    SSH port and the host key fingerprints of the offer, and connects. Its
    first connect accepts only a host key the offer listed, then pins it.
@@ -73,16 +75,42 @@ Cherry may accept incoming connections.
 
 ## authorized_keys
 
-`AuthorizedPhoneKeys` adds `<type> <key> cherry-mobile <phone's name>`
-(the name on one line, at most 64 characters), unless the file has the key
-already. It writes a file beside it and renames it over, keeping the file's
-mode (0600 for a new file, in a `~/.ssh` made 0700), and never writes
-through a link: a linked file (home-manager's, say) is left alone and the
-sheet shows the line to add there. Settings › Devices lists the
-`cherry-mobile` lines as Your iPhones, each with Remove…, which deletes only
-that line. Other lines are never read as phones or changed.
+`AuthorizedPhoneKeys` adds
 
-The key is not restricted: the phone can log in as the user, as the user's
-own keys can, and the prompt says so. docs/specs/ios-app.md plans a
-`restrict,command="cherry mobile-gateway"` line that reaches only Cherry's
-sessions.
+```
+restrict,pty,command="'<cherry>' host mobile-gateway" <type> <key> cherry-mobile <phone's name>
+```
+
+(the name on one line, at most 64 characters). `<cherry>` is the `cherry`
+link in Cherry's Application Support folder (`TabCLIDirectory`,
+`~/Library/Application Support/Cherry/bin/cherry`), which stays put when the
+app moves or updates: each launch points it at the app's own. Without it, or
+at a path with a quote, a backslash or a control character, nothing is added
+and the sheet says why.
+
+`restrict` turns off port, agent and X11 forwarding and `~/.ssh/rc`; `pty`
+gives back the terminal an attachment needs. sshd runs the gateway, `cherry
+host mobile-gateway` (Host/README.md), for whatever the phone asks. It runs
+only what Cherry for iOS sends: `host control --no-start`, relaying only
+`list`, `subscribe`, `ping`, `screen` and `send_input` (no `create`, `kill`,
+`remove`, `shutdown`, `replace` or `update`), `host attach` with no detach
+key and a `mobile-…` client ID, and `host transcript`; its locator script is
+answered with the gateway's path, never run. A shell, any other command or
+option, a subsystem or another host is refused. The phone can still see and
+type into Cherry's sessions, and a terminal session runs what it types: the
+key narrows what the phone reaches, not what a session can do.
+
+A line for the key that Cherry wrote (with the marker) is replaced, so
+pairing again renames it. A line of the user's with the key is left alone.
+The file is written to a file beside it and renamed over, keeping its mode
+(0600 for a new file, in a `~/.ssh` made 0700), with every other line, blank
+and comment lines included, as it was. Cherry never writes through a link (a
+linked file, home-manager's say, is left alone and the sheet shows the line
+to add there), nor a file it can't read as UTF-8 text. Settings › Devices
+lists the `cherry-mobile` lines as Your iPhones, each with Remove…, which
+deletes only that line. Other lines are never read as phones or changed.
+
+Phones paired before keys were limited have a line without the options
+(`<type> <key> cherry-mobile <name>`), which logs in like the user's own
+keys. Your iPhones marks one "Full SSH access", with Limit to Cherry, which
+rewrites its line as above.

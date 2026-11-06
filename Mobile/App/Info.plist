@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyLists-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- What the build settings (INFOPLIST_KEY_*) cannot say; Xcode merges
+	     the generated keys into it. The scheme opens a Mac's pairing code
+	     (cherry-mobile://pair?…) from the iPhone's camera. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>dev.patrick.cherry.mobile.pairing</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>cherry-mobile</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

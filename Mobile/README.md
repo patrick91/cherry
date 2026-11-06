@@ -163,7 +163,12 @@ Screens:
   it to `URLSession`), and waits while you allow it on the Mac, showing this
   device's key to compare. The Mac is saved at the address that answered
   with the code's host keys (`pairedHostKeyFingerprints`): its first connect
-  accepts only one of them and pins it without asking.
+  accepts only one of them and pins it without asking. A code for another
+  of the user's Macs (version 2, `isForAnotherMac`) has the listener at its
+  `via` addresses (`listenerHosts`); before sending the key the phone looks
+  for the first of the Mac's own addresses that takes a TCP connection on
+  its SSH port (`reachableSSHHost`) and saves the Mac there, or says it
+  can't reach it (`PairingError.sshUnreachable`).
 - **Macs:** in the inbox's style: Pair a Mac first, then each Mac as a
   heading with its status and `user@host` (a tap edits it, where it can be
   removed; a long press too); setting one up by hand (this device's public

@@ -6,8 +6,15 @@ import Network
 /// iPhone… (docs/specs/mobile-pairing.md): how to reach the Mac over SSH,
 /// the fingerprints of its host keys, and where to send this device's key
 /// with a proof of the one-time code.
+///
+/// Version 1 pairs with the Mac that shows the code: its listener and SSH
+/// are at the same addresses. Version 2 pairs with another of the user's
+/// Macs (that Mac's card in Settings › Devices): the listener is at
+/// `listenerHosts` (the Mac showing the code), SSH at `hosts`.
 public struct PairingOffer: Equatable, Sendable {
+    /// Version 1's, and the listener's in either version.
     public static let version = 1
+    public static let otherMacVersion = 2
     public static let scheme = "cherry-mobile"
 
     public var name: String
@@ -18,8 +25,17 @@ public struct PairingOffer: Equatable, Sendable {
     public var hostKeyFingerprints: [String]
     public var pairingPort: UInt16
     public var code: Data
+    /// Where the listener is when the Mac is another one (version 2's
+    /// `via`): the addresses of the Mac showing the code. Empty in version 1.
+    public var listenerHosts: [String]
 
-    public init(name: String, user: String, hosts: [String], sshPort: Int = 22, hostKeyFingerprints: [String], pairingPort: UInt16, code: Data) {
+    /// Whether the code pairs with a Mac other than the one showing it.
+    public var isForAnotherMac: Bool { !listenerHosts.isEmpty }
+
+    public init(
+        name: String, user: String, hosts: [String], sshPort: Int = 22, hostKeyFingerprints: [String],
+        pairingPort: UInt16, code: Data, listenerHosts: [String] = []
+    ) {
         self.name = name
         self.user = user
         self.hosts = hosts
@@ -27,22 +43,27 @@ public struct PairingOffer: Equatable, Sendable {
         self.hostKeyFingerprints = hostKeyFingerprints
         self.pairingPort = pairingPort
         self.code = code
+        self.listenerHosts = listenerHosts
     }
 
-    /// The offer of `cherry-mobile://pair?v=1&…`, nil for any other URL.
+    /// The offer of `cherry-mobile://pair?v=1&…` (or `v=2&…&via=…`), nil for
+    /// any other URL.
     public init?(url: URL) {
         guard url.scheme == Self.scheme, url.host == "pair",
               let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
         else { return nil }
         func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
         func values(_ name: String) -> [String] { items.filter { $0.name == name }.compactMap(\.value) }
-        guard value("v") == String(Self.version), let name = value("name"), let user = value("user"),
+        let version = value("v").flatMap(Int.init)
+        let listenerHosts = values("via")
+        guard version == Self.version && listenerHosts.isEmpty || version == Self.otherMacVersion && !listenerHosts.isEmpty,
+              let name = value("name"), let user = value("user"),
               let sshPort = value("ssh").flatMap(Int.init), let port = value("port").flatMap(UInt16.init),
               let code = value("code").flatMap(Self.data(base64URL:)), code.count >= 16, !values("host").isEmpty
         else { return nil }
         self.init(
             name: name, user: user, hosts: values("host"), sshPort: sshPort,
-            hostKeyFingerprints: values("fp"), pairingPort: port, code: code
+            hostKeyFingerprints: values("fp"), pairingPort: port, code: code, listenerHosts: listenerHosts
         )
     }
 
@@ -63,6 +84,11 @@ public struct PairingOffer: Equatable, Sendable {
 public enum PairingError: Error, Equatable, LocalizedError {
     /// No address of the code reached the Mac's Cherry.
     case unreachable(mac: String)
+    /// No address reached the Cherry of the Mac showing a code for
+    /// another Mac.
+    case codeUnreachable
+    /// No address of another Mac's code took an SSH connection.
+    case sshUnreachable(mac: String)
     case declined(mac: String)
     /// The code was used, or is no longer shown.
     case used
@@ -76,6 +102,10 @@ public enum PairingError: Error, Equatable, LocalizedError {
         switch self {
         case .unreachable(let mac):
             "Couldn't reach \(mac). Your iPhone needs to be on the same network as the Mac, or both on Tailscale; if the Mac asked whether Cherry may accept incoming connections, allow it."
+        case .codeUnreachable:
+            "Couldn't reach the Mac showing the code. Your iPhone needs to be on the same network as that Mac, or both on Tailscale; if it asked whether Cherry may accept incoming connections, allow it."
+        case .sshUnreachable(let mac):
+            "Couldn't reach \(mac) over SSH. Your iPhone needs to be on the same network as \(mac), or both on Tailscale, with Remote Login on there."
         case .declined(let mac): "\(mac) didn't allow this iPhone."
         case .used: "This code was used or is no longer shown. Show a new one on the Mac."
         case .busy(let mac): "\(mac) is asking about another iPhone. Answer it, then scan again."
@@ -88,18 +118,35 @@ public enum PairingError: Error, Equatable, LocalizedError {
 /// Pairing with a Mac: finds which of its addresses reaches its Cherry,
 /// sends this device's key, and waits for the Mac's answer.
 public enum MacPairing {
-    /// The first of `offer`'s hosts, in its order, whose Cherry answers
+    /// The first of the listener's hosts (`offer.hosts`, or its
+    /// `listenerHosts` for another Mac), in its order, whose Cherry answers
     /// `/hello` within `timeout`; once one answered, the ones before it get
     /// `grace` more (a Tailscale address that does not answer would hold
     /// the LAN's up for its whole timeout).
     public static func reachableHost(of offer: PairingOffer, timeout: Duration = .seconds(4), grace: Duration = .seconds(1)) async -> String? {
         let path = "/hello?proof=\(offer.proof(of: "hello"))"
-        return await withTaskGroup(of: (Int, Bool).self) { group in
-            for (index, host) in offer.hosts.enumerated() {
-                group.addTask {
-                    let response = try? await PairingHTTP.send(host: host, port: offer.pairingPort, method: "GET", path: path, timeout: timeout)
-                    return (index, response?.status == 200)
-                }
+        return await firstAnswering(offer.isForAnotherMac ? offer.listenerHosts : offer.hosts, grace: grace) { host in
+            let response = try? await PairingHTTP.send(host: host, port: offer.pairingPort, method: "GET", path: path, timeout: timeout)
+            return response?.status == 200
+        }
+    }
+
+    /// The first of another Mac's `offer.hosts`, in its order, that takes
+    /// a TCP connection on its SSH port within `timeout` (with `grace`, as
+    /// `reachableHost`).
+    public static func reachableSSHHost(of offer: PairingOffer, timeout: Duration = .seconds(4), grace: Duration = .seconds(1)) async -> String? {
+        await firstAnswering(offer.hosts, grace: grace) { host in
+            await PairingHTTP.connects(host: host, port: UInt16(clamping: offer.sshPort), timeout: timeout)
+        }
+    }
+
+    /// The first of `hosts` for which `answers` is true, in their order:
+    /// all are asked at once, and once one answered, those before it get
+    /// `grace` more.
+    static func firstAnswering(_ hosts: [String], grace: Duration, _ answers: @escaping @Sendable (String) async -> Bool) async -> String? {
+        await withTaskGroup(of: (Int, Bool).self) { group in
+            for (index, host) in hosts.enumerated() {
+                group.addTask { (index, await answers(host)) }
             }
             var finished: Set<Int> = []
             var best: Int?
@@ -120,14 +167,16 @@ public enum MacPairing {
                 if let best, (0..<best).allSatisfy(finished.contains) { break }
             }
             group.cancelAll()
-            return best.map { offer.hosts[$0] }
+            return best.map { hosts[$0] }
         }
     }
 
     /// Sends `publicKey` (an OpenSSH line) and `deviceName` to the Mac of
     /// `offer`, and waits for it to allow them (`reached` is called with
-    /// the address meanwhile): the Mac to save, at the address that
-    /// answered, with the code's host keys to accept on its first connect.
+    /// the listener's address meanwhile): the Mac to save, at the address
+    /// that answered (for another Mac, the first of its addresses that
+    /// takes an SSH connection, found before the key is sent), with the
+    /// code's host keys to accept on its first connect.
     public static func pair(
         _ offer: PairingOffer,
         publicKey: String,
@@ -135,7 +184,14 @@ public enum MacPairing {
         decisionTimeout: Duration = .seconds(240),
         reached: @Sendable (String) async -> Void = { _ in }
     ) async throws -> MacEndpoint {
-        guard let host = await reachableHost(of: offer) else { throw PairingError.unreachable(mac: offer.name) }
+        guard let host = await reachableHost(of: offer) else {
+            throw offer.isForAnotherMac ? PairingError.codeUnreachable : PairingError.unreachable(mac: offer.name)
+        }
+        var sshHost = host
+        if offer.isForAnotherMac {
+            guard let found = await reachableSSHHost(of: offer) else { throw PairingError.sshUnreachable(mac: offer.name) }
+            sshHost = found
+        }
         await reached(host)
         let body = try JSONSerialization.data(withJSONObject: [
             "v": PairingOffer.version,
@@ -153,7 +209,7 @@ public enum MacPairing {
         case 200:
             return MacEndpoint(
                 name: response.fields["name"] ?? offer.name,
-                host: host,
+                host: sshHost,
                 port: offer.sshPort,
                 user: response.fields["user"] ?? offer.user,
                 pairedHostKeyFingerprints: offer.hostKeyFingerprints.isEmpty ? nil : offer.hostKeyFingerprints
@@ -219,6 +275,25 @@ enum PairingHTTP {
             if isComplete || received.count > 64 * 1024 { break }
         }
         return try parse(received)
+    }
+
+    /// Whether `host` takes a TCP connection on `port` within `timeout`.
+    static func connects(host: String, port: UInt16, timeout: Duration) async -> Bool {
+        guard let port = NWEndpoint.Port(rawValue: port) else { return false }
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: port, using: .tcp)
+        defer { connection.cancel() }
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask { (try? await ready(connection)) != nil }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return false
+            }
+            defer {
+                group.cancelAll()
+                connection.cancel()
+            }
+            return await group.next() ?? false
+        }
     }
 
     private static func ready(_ connection: NWConnection) async throws {

@@ -23,6 +23,26 @@ private let phoneKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINsyIgyIP7VL9sFdYMZo
     #expect(PairingOffer(url: URL(string: "https://example.com/pair?v=1")!) == nil)
 }
 
+@Test func anotherMacsCodeIsVersionTwoWithTheListenerElsewhere() throws {
+    let url = try #require(URL(string:
+        "cherry-mobile://pair?v=2&name=patstudio&user=pat&ssh=2222&port=53123&code=AAECAwQFBgcICQoLDA0ODw"
+        + "&host=100.124.84.74&host=patstudio.local&via=100.101.1.2&via=Patbook.local"
+        + "&fp=SHA256:w4eVI3TcBZZFR%2BdpMlGRFoDeYOl8S0DD9BtCkbOTUBU"))
+    let offer = try #require(PairingOffer(url: url))
+    #expect(offer == PairingOffer(
+        name: "patstudio", user: "pat", hosts: ["100.124.84.74", "patstudio.local"], sshPort: 2222,
+        hostKeyFingerprints: ["SHA256:w4eVI3TcBZZFR+dpMlGRFoDeYOl8S0DD9BtCkbOTUBU"], pairingPort: 53123, code: code,
+        listenerHosts: ["100.101.1.2", "Patbook.local"]
+    ))
+    #expect(offer.isForAnotherMac)
+    // Never one without the other: a version 1 phone would save the Mac
+    // showing the code under another's name.
+    let withoutVia = url.absoluteString.replacingOccurrences(of: "&via=100.101.1.2&via=Patbook.local", with: "")
+    #expect(PairingOffer(url: try #require(URL(string: withoutVia))) == nil)
+    let v1WithVia = url.absoluteString.replacingOccurrences(of: "v=2&", with: "v=1&")
+    #expect(PairingOffer(url: try #require(URL(string: v1WithVia))) == nil)
+}
+
 @Test func aProofIsTheHMACOfTheMessageUnderTheCode() {
     let offer = PairingOffer(name: "Mac", user: "me", hosts: ["h"], hostKeyFingerprints: [], pairingPort: 1, code: code)
     // Python's hmac.new(bytes(range(16)), …, sha256).hexdigest().
@@ -144,3 +164,61 @@ private final class FakeMac: @unchecked Sendable {
     wrongCode.code = Data(repeating: 7, count: 16)
     #expect(await MacPairing.reachableHost(of: wrongCode, timeout: .seconds(1)) == nil)
 }
+
+/// A port on 127.0.0.1 that takes connections, as another Mac's sshd.
+private func listeningPort() async throws -> (NWListener, UInt16) {
+    let listener = try NWListener(using: .tcp, on: .any)
+    listener.newConnectionHandler = { connection in connection.cancel() }
+    let once = OnceFlag()
+    let port: UInt16 = try await withCheckedThrowingContinuation { continuation in
+        listener.stateUpdateHandler = { [listener] state in
+            if case .ready = state, once.claim() { continuation.resume(returning: listener.port!.rawValue) }
+            if case .failed(let error) = state, once.claim() { continuation.resume(throwing: error) }
+        }
+        listener.start(queue: .global())
+    }
+    return (listener, port)
+}
+
+@Test func anotherMacIsPairedThroughTheCodesMacAndSavedAtItsAddressThatTakesSSH() async throws {
+    let mac = try FakeMac(pairStatus: 200)
+    let port = try await mac.start()
+    defer { mac.listener.cancel() }
+    let (sshd, sshPort) = try await listeningPort()
+    defer { sshd.cancel() }
+    // The listener answers only at `via`; of the other Mac's addresses,
+    // 192.0.2.1 (TEST-NET-1) takes no connection, 127.0.0.1 does.
+    let offer = PairingOffer(
+        name: "patstudio", user: "pat", hosts: ["192.0.2.1", "127.0.0.1"], sshPort: Int(sshPort),
+        hostKeyFingerprints: ["SHA256:abc"], pairingPort: port, code: code, listenerHosts: ["127.0.0.1"]
+    )
+    #expect(await MacPairing.reachableSSHHost(of: offer, timeout: .seconds(20), grace: .milliseconds(300)) == "127.0.0.1")
+    let endpoint = try await MacPairing.pair(offer, publicKey: phoneKey, deviceName: "iPhone")
+    #expect(endpoint.host == "127.0.0.1")
+    #expect(endpoint.port == Int(sshPort))
+    #expect(endpoint.pairedHostKeyFingerprints == ["SHA256:abc"])
+    #expect(mac.pairBodies.count == 1)
+}
+
+@Test func anotherMacTheIPhoneCannotReachOverSSHGetsNoKey() async throws {
+    let mac = try FakeMac(pairStatus: 200)
+    let port = try await mac.start()
+    defer { mac.listener.cancel() }
+    // Nothing listens on 127.0.0.1:9.
+    let offer = PairingOffer(
+        name: "patstudio", user: "pat", hosts: ["127.0.0.1"], sshPort: 9,
+        hostKeyFingerprints: [], pairingPort: port, code: code, listenerHosts: ["127.0.0.1"]
+    )
+    await #expect(throws: PairingError.sshUnreachable(mac: "patstudio")) {
+        try await MacPairing.pair(offer, publicKey: phoneKey, deviceName: "iPhone")
+    }
+    #expect(mac.pairBodies.isEmpty)
+    // A listener that is not at `via` is not looked for at the Mac's own
+    // addresses.
+    let elsewhere = PairingOffer(
+        name: "patstudio", user: "pat", hosts: ["127.0.0.1"], sshPort: 22,
+        hostKeyFingerprints: [], pairingPort: port, code: code, listenerHosts: ["192.0.2.1"]
+    )
+    #expect(await MacPairing.reachableHost(of: elsewhere, timeout: .seconds(1)) == nil)
+}
+

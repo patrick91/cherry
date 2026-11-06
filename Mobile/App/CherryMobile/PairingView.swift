@@ -15,7 +15,8 @@ struct PairingView: View {
     fileprivate enum Step: Equatable {
         case scanning
         case looking(mac: String)
-        case waiting(mac: String)
+        /// `elsewhere`: the Mac showing the code asks, for another Mac.
+        case waiting(mac: String, elsewhere: Bool)
         case paired(mac: String)
         case failed(String)
     }
@@ -60,15 +61,17 @@ struct PairingView: View {
                 Text("Looking for \(mac)…")
                     .foregroundStyle(.secondary)
             }
-        case .waiting(let mac):
+        case .waiting(let mac, let elsewhere):
             VStack(spacing: 16) {
                 Image(systemName: "desktopcomputer")
                     .font(.system(size: 44))
                     .foregroundStyle(.tint)
-                Text("Allow this iPhone on \(mac)")
+                Text(elsewhere ? "Allow this iPhone for \(mac)" : "Allow this iPhone on \(mac)")
                     .font(.title3.weight(.semibold))
                     .multilineTextAlignment(.center)
-                Text("Cherry on \(mac) asks whether to let it connect. Its key should match:")
+                Text(elsewhere
+                    ? "Cherry on the Mac showing the code asks whether to let it connect to \(mac). Its key should match:"
+                    : "Cherry on \(mac) asks whether to let it connect. Its key should match:")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -165,7 +168,7 @@ struct PairingView: View {
         step = .looking(mac: offer.name)
         do {
             let endpoint = try await model.pair(with: offer) { _ in
-                await MainActor.run { step = .waiting(mac: offer.name) }
+                await MainActor.run { step = .waiting(mac: offer.name, elsewhere: offer.isForAnotherMac) }
             }
             step = .paired(mac: endpoint.name)
         } catch {

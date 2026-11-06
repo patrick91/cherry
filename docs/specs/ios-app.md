@@ -168,11 +168,18 @@ trick.
   short-lived pairing listener with an HMAC proof of the code. The Mac app
   asks before adding it to `~/.ssh/authorized_keys`, and the phone's first
   connect accepts only a host key the code listed.
-- **Later:** the key is added unrestricted. A
-  `restrict,pty,command="…/cherry mobile-gateway"` line would let it reach
-  only Cherry: no port forwarding, no arbitrary commands, the gateway
-  allowing `host control` and `host attach`. A session is a shell, so this
-  narrows the surface, not what an attached user can do.
+- **Built (main):** the key is added as a
+  `restrict,pty,command="'<cherry>' host mobile-gateway"` line, which
+  reaches only Cherry: no port forwarding, no other commands, the gateway
+  allowing `host control` (the phone's requests only), `host attach` and
+  `host transcript`. A session is a shell, so this narrows the surface, not
+  what an attached user can do.
+- **Built:** pairing with another of the user's Macs from the Mac at hand
+  (that Mac's card in Settings › Devices › Pair iPhone…): a version 2 code
+  whose `via` addresses reach the listener on the Mac showing it and whose
+  `host`s are the other Mac's. The phone keeps the first of those that
+  takes a connection on the SSH port, and connects there directly from
+  then on (mobile-pairing.md › Another Mac).
 
 ### Notifications (P3)
 

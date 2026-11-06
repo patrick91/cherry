@@ -3,32 +3,37 @@ import SwiftUI
 
 /// Settings › Devices (the `macs` page): the user's other Macs, where tabs
 /// run over SSH, one card each (how it stands, its name, SSH destination
-/// and color, and what can be done with it), Add Mac…, the
-/// iPhones paired with this Mac (Pair iPhone…, `PairPhoneSheet`; Remove…),
-/// and the SSH hosts saved for persistent sessions that no Mac uses. It
-/// never connects a Mac: it shows what their connections know
-/// (`RemoteDeviceSettingsModel`). Only the copy of Cherry that keeps the
-/// Macs changes them; another copy shows them read-only. No page reset: a
-/// Mac's color resets on its row.
+/// and color, the iPhones paired with it, and what can be done with it:
+/// Pair iPhone… among them), Add Mac…, the iPhones paired with this Mac
+/// (Pair iPhone…, `PairPhoneSheet`; Remove…), and the SSH hosts saved for
+/// persistent sessions that no Mac uses. It never connects a Mac: it shows
+/// what their connections know (`RemoteDeviceSettingsModel`), and reads a
+/// Mac's iPhones only over its SSH master while that is up
+/// (`DevicePhonesModel`). Only the copy of Cherry that keeps the Macs
+/// changes them; another copy shows them read-only. No page reset: a Mac's
+/// color resets on its row.
 struct MacsSettingsPage: View, SettingsPageContent {
     @StateObject private var model: RemoteDeviceSettingsModel
     @StateObject private var phones: PairedPhonesModel
+    @StateObject private var devicePhones: DevicePhonesModel
 
     @Environment(\.settingsActions) private var actions
     @State private var isAddingMac = false
     @State private var isPairingPhone = false
     @State private var addingProject: RemoteDeviceReference?
+    @State private var pairingDevice: RemoteDeviceReference?
     @State private var confirmation: SettingsConfirmation?
     /// Whether a This Mac window is open for Persistent Sessions on <Mac>…
     /// (`tracksPersistentSessionsAvailability`).
     @State private var canShowPersistentSessions = false
 
     /// `model`: the app's Macs unless a test gives its own; `phones`: the
-    /// phones in the user's `~/.ssh/authorized_keys` unless a test gives
-    /// its own.
-    init(model: RemoteDeviceSettingsModel? = nil, phones: PairedPhonesModel? = nil) {
+    /// phones in the user's `~/.ssh/authorized_keys`, and `devicePhones`
+    /// those of the other Macs, unless a test gives its own.
+    init(model: RemoteDeviceSettingsModel? = nil, phones: PairedPhonesModel? = nil, devicePhones: DevicePhonesModel? = nil) {
         _model = StateObject(wrappedValue: model ?? RemoteDeviceSettingsModel())
         _phones = StateObject(wrappedValue: phones ?? PairedPhonesModel())
+        _devicePhones = StateObject(wrappedValue: devicePhones ?? DevicePhonesModel())
     }
 
     var body: some View {
@@ -61,14 +66,30 @@ struct MacsSettingsPage: View, SettingsPageContent {
                 actions.openProjectWindow(key)
             }
         }
+        .sheet(item: $pairingDevice, onDismiss: { devicePhones.reload(model.store.devices) }) { reference in
+            if let device = model.store.device(id: reference.id), let keys = devicePhones.keys(device, true) {
+                PairPhoneSheet(model: {
+                    let pairing = MobilePairingModel(target: RemotePhonePairing.target(for: device, keys: keys))
+                    pairing.onPaired = { [devicePhones] in devicePhones.reload(device, connects: true) }
+                    return pairing
+                }())
+            }
+        }
         .onAppear {
             // Reads the bundled cherry-host's build in the background, for
             // "Update available".
             RemoteHostHelpers.preloadApp()
             model.update()
             phones.reload()
+            devicePhones.reload(model.store.devices)
         }
+        // A Mac that connects shows its iPhones.
+        .onChange(of: connectedMacs) { _, _ in devicePhones.reload(model.store.devices) }
         .tracksPersistentSessionsAvailability($canShowPersistentSessions)
+    }
+
+    private var connectedMacs: Set<UUID> {
+        Set(model.rows.filter { if case .connected = $0.status { true } else { false } }.map(\.id))
     }
 
     // MARK: Your Macs
@@ -101,7 +122,11 @@ struct MacsSettingsPage: View, SettingsPageContent {
                             }
                         },
                         openProject: { key in actions.openProjectWindow(key) },
-                        addProject: { addingProject = RemoteDeviceReference(id: row.id) }
+                        addProject: { addingProject = RemoteDeviceReference(id: row.id) },
+                        phones: devicePhones.phones[row.id] ?? [],
+                        pairPhone: { pairingDevice = RemoteDeviceReference(id: row.id) },
+                        limitPhone: { phone in limit(phone, onMac: row) },
+                        removePhone: { phone in confirmation = removePhoneConfirmation(phone, fromMac: row) }
                     )
                 }
                 SettingsCaption(Self.listCaption)
@@ -143,20 +168,10 @@ struct MacsSettingsPage: View, SettingsPageContent {
             } else {
                 SettingsSection {
                     ForEach(phones.phones) { phone in
-                        SettingsListItem {
-                            SettingsListLabel(phone.name, subtitle: phone.key.fingerprint, monospacedSubtitle: true) {
-                                if !phone.isLimited {
-                                    SettingsTag("Full SSH access", style: .warning)
-                                        .help(Self.phoneFullAccessHelp)
-                                }
-                            }
-                        } trailing: {
-                            if !phone.isLimited {
-                                Button("Limit to Cherry") { limit(phone) }
-                                    .settingsButton()
-                            }
-                            Button("Remove…") { confirmation = removePhoneConfirmation(phone) }
-                                .settingsButton()
+                        PhoneListItem(phone: phone, mac: "this Mac") {
+                            limit(phone)
+                        } remove: {
+                            confirmation = removePhoneConfirmation(phone)
                         }
                     }
                 }
@@ -170,13 +185,52 @@ struct MacsSettingsPage: View, SettingsPageContent {
         do {
             try phones.limit(phone)
         } catch {
-            let failure = error as? AuthorizedPhoneKeys.Failure
-            confirmation = SettingsConfirmation(
-                title: "Couldn't limit “\(phone.name)”",
-                message: [error.localizedDescription, failure?.line].compactMap(\.self).joined(separator: "\n\n"),
-                choices: [.init("OK", isDefault: true)]
-            )
+            confirmation = Self.couldNotLimit(phone, error)
         }
+    }
+
+    /// Limit to Cherry of a phone paired with another Mac, over SSH.
+    private func limit(_ phone: AuthorizedPhoneKeys.Phone, onMac row: RemoteDeviceSettingsRow) {
+        guard let device = model.store.device(id: row.id) else { return }
+        Task {
+            do {
+                try await devicePhones.limit(phone, on: device)
+            } catch {
+                confirmation = Self.couldNotLimit(phone, error)
+            }
+        }
+    }
+
+    private static func couldNotLimit(_ phone: AuthorizedPhoneKeys.Phone, _ error: any Error) -> SettingsConfirmation {
+        SettingsConfirmation(
+            title: "Couldn't limit “\(phone.name)”",
+            message: [error.localizedDescription, (error as? any PhoneKeyFailure)?.line].compactMap(\.self).joined(separator: "\n\n"),
+            choices: [.init("OK", isDefault: true)]
+        )
+    }
+
+    private func removePhoneConfirmation(_ phone: AuthorizedPhoneKeys.Phone, fromMac row: RemoteDeviceSettingsRow) -> SettingsConfirmation {
+        SettingsConfirmation(
+            title: "Remove “\(phone.name)” from \(row.name)?",
+            message: "It can no longer reach \(row.name) over SSH: Cherry removes its key from ~/.ssh/authorized_keys there.",
+            choices: [
+                .init("Remove", role: .destructive) { [devicePhones, model] in
+                    guard let device = model.store.device(id: row.id) else { return }
+                    Task {
+                        do {
+                            try await devicePhones.remove(phone, from: device)
+                        } catch {
+                            confirmation = SettingsConfirmation(
+                                title: "Couldn't remove “\(phone.name)”",
+                                message: error.localizedDescription,
+                                choices: [.init("OK", isDefault: true)]
+                            )
+                        }
+                    }
+                },
+                .cancel(),
+            ]
+        )
     }
 
     private func removePhoneConfirmation(_ phone: AuthorizedPhoneKeys.Phone) -> SettingsConfirmation {
@@ -288,8 +342,10 @@ struct MacsSettingsPage: View, SettingsPageContent {
     static let colorHelp = "Marks this Mac's windows and tabs. Automatic picks a color from the Mac's identity."
     static let phonesEmptyTitle = "No iPhones yet"
     static let phonesEmptyMessage = "Pair Cherry for iOS to see your agents and sessions on your iPhone, and to answer them."
-    static let phonesCaption = "Each reaches your Cherry sessions over SSH with its own key, which Cherry added to ~/.ssh/authorized_keys limited to them: it can see them and type into them, but can't log in, run other commands or forward ports."
-    static let phoneFullAccessHelp = "Paired before Cherry limited iPhone keys: it can log in to this Mac over SSH like your own keys. Limit to Cherry lets it reach only Cherry's sessions."
+    static let phonesCaption = "Each reaches your Cherry sessions on this Mac over SSH with its own key, which Cherry added to ~/.ssh/authorized_keys limited to them: it can see them and type into them, but can't log in, run other commands or forward ports. To pair one with another of your Macs, use Pair iPhone… on its card."
+    static func phoneFullAccessHelp(mac: String) -> String {
+        "Paired before Cherry limited iPhone keys: it can log in to \(mac) over SSH like your own keys. Limit to Cherry lets it reach only Cherry's sessions."
+    }
     static let sshHostsCaption = "Hosts you saved for persistent sessions that aren't added as Macs. Sessions on SSH hosts always keep running when you close a tab, close a window or quit."
 
     // MARK: Search
@@ -364,6 +420,11 @@ private struct MacCard: View {
     let openProject: @MainActor (String) -> Void
     /// Add Project on <Mac>…'s sheet.
     let addProject: @MainActor () -> Void
+    /// The iPhones paired with it, as last read.
+    let phones: [AuthorizedPhoneKeys.Phone]
+    let pairPhone: @MainActor () -> Void
+    let limitPhone: @MainActor (AuthorizedPhoneKeys.Phone) -> Void
+    let removePhone: @MainActor (AuthorizedPhoneKeys.Phone) -> Void
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -395,6 +456,20 @@ private struct MacCard: View {
                     leading: .init(MacsSettingsPage.automaticColorTitle, value: nil)
                 )
                 .disabled(!model.canModify)
+            }
+
+            if !phones.isEmpty {
+                SettingsGroupLabel("iPhones")
+                    .settingsSeparatorAbove(false)
+                ForEach(Array(phones.enumerated()), id: \.element.id) { index, phone in
+                    PhoneListItem(phone: phone, mac: row.name) {
+                        limitPhone(phone)
+                    } remove: {
+                        removePhone(phone)
+                    }
+                    // No separator between the label and the list.
+                    .settingsSeparatorAbove(index > 0)
+                }
             }
 
             actionsRow
@@ -463,8 +538,8 @@ private struct MacCard: View {
 
     // MARK: Actions
 
-    /// Update Session Host… (or Reinstall) when one applies, and Remove…,
-    /// at the trailing end.
+    /// Update Session Host… (or Reinstall) when one applies, Pair iPhone…
+    /// (while it answers as itself), and Remove…, at the trailing end.
     private var actionsRow: some View {
         HStack(spacing: 8) {
             Spacer(minLength: 0)
@@ -475,6 +550,11 @@ private struct MacCard: View {
                 .settingsButton()
                 .disabled(!model.canModify)
             }
+            Button("Pair iPhone…") {
+                pairPhone()
+            }
+            .settingsButton()
+            .disabled(!row.allowsOpening)
             Button("Remove…", role: .destructive) {
                 model.confirmRemove(row.id)
             }
@@ -532,3 +612,33 @@ private struct MacNameField: View {
         }
     }
 }
+
+/// A paired iPhone's row: its name and key's fingerprint, Full SSH access
+/// with Limit to Cherry for one paired before Cherry limited keys, and
+/// Remove….
+private struct PhoneListItem: View {
+    let phone: AuthorizedPhoneKeys.Phone
+    /// The Mac it is paired with ("this Mac", "patstudio").
+    let mac: String
+    let limit: @MainActor () -> Void
+    let remove: @MainActor () -> Void
+
+    var body: some View {
+        SettingsListItem {
+            SettingsListLabel(phone.name, subtitle: phone.key.fingerprint, monospacedSubtitle: true) {
+                if !phone.isLimited {
+                    SettingsTag("Full SSH access", style: .warning)
+                        .help(MacsSettingsPage.phoneFullAccessHelp(mac: mac))
+                }
+            }
+        } trailing: {
+            if !phone.isLimited {
+                Button("Limit to Cherry") { limit() }
+                    .settingsButton()
+            }
+            Button("Remove…") { remove() }
+                .settingsButton()
+        }
+    }
+}
+

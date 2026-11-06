@@ -1,10 +1,11 @@
 # Pairing Cherry for iOS with a Mac
 
-Status: implemented in the Mac app (Settings › Devices › Pair iPhone…,
-`Sources/Cherry/MobilePairing/`) and the gateway the phone's key runs
-(`cherry host mobile-gateway`, `Host/crates/cherry-cli/src/gateway.rs`);
-Cherry for iOS reads the code on the `codex/ios-app` branch (`Mobile/`,
-docs/specs/ios-app.md › Identity and pairing).
+Status: implemented in the Mac app (Settings › Devices › Pair iPhone…, and
+each other Mac's card's, `Sources/Cherry/MobilePairing/`) and the gateway
+the phone's key runs (`cherry host mobile-gateway`,
+`Host/crates/cherry-cli/src/gateway.rs`); Cherry for iOS reads the code on
+the `codex/ios-app` branch (`Mobile/`, docs/specs/ios-app.md › Identity and
+pairing).
 
 Cherry for iOS reaches a Mac's sessions over SSH, with a key of its own.
 Pairing gets that key into the Mac's `~/.ssh/authorized_keys` and tells
@@ -38,7 +39,7 @@ an address or copying a key by hand.
 
 | Item | |
 |---|---|
-| `v` | 1 |
+| `v` | 1; 2 for another Mac (see Another Mac) |
 | `name` | the Mac's name (Sharing settings') |
 | `user` | the user Cherry runs as, whom the phone logs in as |
 | `ssh` | the SSH port, 22 |
@@ -46,6 +47,7 @@ an address or copying a key by hand.
 | `code` | the one-time code, base64url without padding |
 | `host` (repeated) | where the Mac may be reached, best first: Tailscale addresses (100.64.0.0/10), its Bonjour name (`<LocalHostName>.local`), other IPv4 addresses of interfaces that are up |
 | `fp` (repeated) | `SHA256:…` fingerprints of `/etc/ssh/ssh_host_ed25519_key.pub` and `ssh_host_ecdsa_key.pub` (the phone cannot use RSA host keys); a `+` is written `%2B` |
+| `via` (repeated, version 2 only) | where the listener is: this Mac's addresses, as `host` lists them in version 1 |
 
 The phone keeps the first `host`, in the offer's order, that answered
 `/hello`, so a Mac on Tailscale is saved by its Tailscale address and works
@@ -114,3 +116,51 @@ Phones paired before keys were limited have a line without the options
 (`<type> <key> cherry-mobile <name>`), which logs in like the user's own
 keys. Your iPhones marks one "Full SSH access", with Limit to Cherry, which
 rewrites its line as above.
+
+## Another Mac
+
+A phone pairs with one of the user's other Macs (Settings › Devices, that
+Mac's card › Pair iPhone…) from this Mac, without anyone at that Mac: this
+Mac shows the code and runs the listener, and does on that Mac, over the
+SSH connection it already has (`RemoteDeviceShell`, through its master when
+up), what pairing does here (`RemotePhonePairing`, `RemotePhoneKeys`).
+Afterwards the phone connects to that Mac directly; this Mac plays no part.
+
+1. Before showing a code, one script there reads the user it logs in as,
+   its home, its interfaces' IPv4 addresses, its Bonjour name, the address
+   and port its SSH connection reached (`SSH_CONNECTION`) and its host keys,
+   and readies the gateway (below). A Mac it cannot reach, whose install
+   predates the gateway, or with no address or host key gets no code; the
+   sheet says why (Update Session Host… for an old install).
+2. The code is version 2: `host` and `ssh` are that Mac's (its Tailscale
+   addresses, the address this Mac reached it at, its Bonjour name, other
+   addresses; the port this Mac reached), `name` its name in Cherry, `user`
+   its user, `fp` its host keys, and `via` this Mac's addresses for the
+   listener. A phone that reads only version 1 refuses it, so it never saves
+   this Mac's address for that Mac. The listener's answers name that Mac and
+   its user.
+3. The phone finds the listener at a `via` address (`/hello`), and keeps
+   the first `host`, in the offer's order, that takes a TCP connection on
+   `ssh`; with none it says it can't reach that Mac and sends no key.
+4. Allow writes the key's line into that Mac's `~/.ssh/authorized_keys` by
+   the rules above: read there (its text, mode and SHA-256), changed here,
+   then written to a file beside it and renamed over it, only while its
+   SHA-256 is still the one read (read again once if not); never through a
+   link, nor into a file that is not UTF-8, which get the line to add there.
+
+The line's `<cherry>` is
+`<home>/Library/Application Support/cherry-host/cherry`, a link beside this
+Cherry's installs there to `bin/<build>/cherry`
+(`RemoteHostInstall.gatewayLinkRelativePath`, docs/specs/remote-devices.md ›
+Phase 2 as built). Pairing points it at the device's install when that
+build's `cherry` runs the gateway (`cherry host mobile-gateway` without a
+command refuses, exit 1, saying it reaches only Cherry's sessions), else
+keeps a link that runs it. Each install points it at the build it placed,
+and no install's clean-up removes the build it points to, so the line
+outlives updates. The phone's `cherry host control` there reaches that
+Mac's daemon, shared by its own Cherry and this Mac's tabs on it.
+
+Each Mac's card lists the phones paired with it (read over its SSH master
+only while that is up: the page never connects a Mac), with Remove… and,
+for a line from before keys were limited, Limit to Cherry.
+

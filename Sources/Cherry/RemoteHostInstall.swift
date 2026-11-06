@@ -16,7 +16,9 @@ import Foundation
 // --strict`, `cherry-host version --json` and the SHA-256 of both files) and
 // only then renamed into place. The current build and the two installed
 // before it are kept; older directories go unless a running process (the
-// daemon, a holder, a gateway) or the daemon's sessions use them.
+// daemon, a holder, a gateway) or the daemon's sessions use them, or the
+// link a paired iPhone's key runs (`gatewayLinkRelativePath`) points into
+// them. Each install points that link at the build it placed.
 //
 // Which daemon runs there decides what happens (`RemoteHostInstallDecision`):
 // none, or one of this protocol: install ours (it relays to that daemon);
@@ -443,6 +445,33 @@ enum RemoteHostInstall {
     /// the two before it.
     static let keptBuilds = 3
 
+    /// The `cherry` an iPhone paired with that Mac runs (its
+    /// authorized_keys line names it, docs/specs/mobile-pairing.md ›
+    /// Another Mac): a link beside the builds to `bin/<build>/cherry`. Each
+    /// install points it at the build it placed and none removes the build
+    /// it points to, so the line outlives updates.
+    static let gatewayLinkRelativePath = "Library/Application Support/cherry-host/cherry"
+
+    /// sh lines that point the link at the build directory named by
+    /// `$<nameVariable>`: a new link beside it, renamed over it with
+    /// rename(2), so the link is never missing.
+    static func gatewayLinkLines(nameVariable: String) -> [String] {
+        [
+            "gateway_link=\"$HOME\"/" + RemoteDeviceProbe.singleQuoted(gatewayLinkRelativePath),
+            "if [ \"$(readlink \"$gateway_link\" 2>/dev/null)\" != \"bin/$\(nameVariable)/cherry\" ]; then",
+            "  rm -f \"$gateway_link.new-$$\"",
+            "  ln -s \"bin/$\(nameVariable)/cherry\" \"$gateway_link.new-$$\" && \(RemoteHostInstaller.Tool.perl) -e 'rename($ARGV[0], $ARGV[1]) or exit 1' \"$gateway_link.new-$$\" \"$gateway_link\" || rm -f \"$gateway_link.new-$$\"",
+            "fi",
+        ]
+    }
+
+    /// The build directory a link target (`bin/<build>/cherry`) names.
+    static func directoryName(ofGatewayLinkTarget target: String) -> String? {
+        guard target.hasPrefix("bin/"), target.hasSuffix("/cherry") else { return nil }
+        let name = target.dropFirst("bin/".count).dropLast("/cherry".count)
+        return name.isEmpty || name.contains("/") ? nil : String(name)
+    }
+
     /// The device's `remoteHostPath` for a build directory.
     static func remoteHostPath(directoryName: String) -> String {
         "~/\(rootRelativePath)/\(directoryName)/cherry-host"
@@ -697,6 +726,8 @@ enum RemoteHostInstall {
         case daemonBuild
         /// A running session's holder reports that build.
         case holderBuild
+        /// A paired iPhone's key runs its `cherry` (`gatewayLinkRelativePath`).
+        case phoneGateway
     }
 
     /// The build directories a process or the daemon uses, and why.
@@ -704,9 +735,11 @@ enum RemoteHostInstall {
         root: String,
         directories: [String],
         processes: [String],
-        status: RemoteCLIStatusReport?
+        status: RemoteCLIStatusReport?,
+        gateway: String? = nil
     ) -> [String: Set<BuildUse>] {
         var used: [String: Set<BuildUse>] = [:]
+        if let gateway, directories.contains(gateway) { used[gateway, default: []].insert(.phoneGateway) }
         for name in directories {
             let path = "\(root)/\(name)/"
             if processes.contains(where: { $0.contains(path) }) { used[name, default: []].insert(.process) }
@@ -1023,6 +1056,7 @@ struct RemoteHostInstaller: Sendable {
             "  echo installed=1",
         ]
         lines += markerLines(directoryVariable: "dir", installationID: installationID).map { "  " + $0 }
+        lines += RemoteHostInstall.gatewayLinkLines(nameVariable: "placed").map { "  " + $0 }
         lines += ["fi"]
         lines += reportLines()
         lines.append("printf '%s\\n' '\(RemoteDeviceProbe.endMarker)'")
@@ -1052,6 +1086,7 @@ struct RemoteHostInstaller: Sendable {
             "  done",
             "  printf 'directory=%s %s %s\\n' \"${t:-0}\" \"$m\" \"${d##*/}\"",
             "done",
+            "printf 'gateway=%s\\n' \"$(readlink \"$HOME\"/\(RemoteDeviceProbe.singleQuoted(RemoteHostInstall.gatewayLinkRelativePath)) 2>/dev/null)\"",
             "processes=$(\(Tool.ps) -axww -o command= 2>/dev/null)",
             "printf '%s\\n' \"$processes\" | grep -F -- \"$root/\" | sed 's/^/process=/'",
         ]
@@ -1181,6 +1216,8 @@ struct RemoteHostInstaller: Sendable {
         var hostStatus: RemoteHostStatusReport?
         var directories: [RemoteHostInstall.BuildDirectory] = []
         var processes: [String] = []
+        /// The build directory the iPhone link points into.
+        var gateway: String?
         var restart: String?
         var restartOutput: String?
 
@@ -1207,6 +1244,7 @@ struct RemoteHostInstaller: Sendable {
                         ))
                     }
                 case "process": processes.append(value)
+                case "gateway": gateway = RemoteHostInstall.directoryName(ofGatewayLinkTarget: value)
                 case "restart": restart = value
                 case "restart_output": restartOutput = value.trimmingCharacters(in: .whitespaces).nilIfEmpty
                 default: break
@@ -1309,6 +1347,7 @@ struct RemoteHostInstaller: Sendable {
                 report.hostStatus = after.hostStatus
                 report.directories = after.directories
                 report.processes = after.processes
+                report.gateway = after.gateway
             }
         }
 
@@ -1316,7 +1355,8 @@ struct RemoteHostInstaller: Sendable {
         var kept: [String: Set<RemoteHostInstall.BuildUse>] = [:]
         if let root = report.root {
             let inUse = RemoteHostInstall.directoriesInUse(
-                root: root, directories: report.directories.map(\.name), processes: report.processes, status: report.status
+                root: root, directories: report.directories.map(\.name), processes: report.processes, status: report.status,
+                gateway: report.gateway
             )
             kept = inUse.filter { $0.key != placed }
             let garbage = RemoteHostInstall.garbage(directories: report.directories, current: placed, inUse: Set(inUse.keys))

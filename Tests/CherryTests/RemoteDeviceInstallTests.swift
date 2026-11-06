@@ -546,6 +546,48 @@ private enum MachOFixture {
     #expect(used == ["daemon": [.daemonExecutable], "20260101000000.d": [.daemonBuild]])
 }
 
+/// The build the iPhone link points into is in use, so no install's clean-up
+/// removes what a paired phone's key runs; the report reads the link.
+@Test func remoteDeviceInstallKeepsTheBuildAPairedPhonesKeyRuns() {
+    let root = "/Users/me/Library/Application Support/cherry-host/bin"
+    let used = RemoteHostInstall.directoriesInUse(
+        root: root, directories: ["20250101000000.p", "idle"], processes: [], status: nil, gateway: "20250101000000.p"
+    )
+    #expect(used == ["20250101000000.p": [.phoneGateway]])
+    // A link to a directory that is not there names nothing.
+    #expect(RemoteHostInstall.directoriesInUse(root: root, directories: ["idle"], processes: [], status: nil, gateway: "gone").isEmpty)
+
+    #expect(RemoteHostInstaller.Report(fields: [("gateway", "bin/20250101000000.p/cherry")]).gateway == "20250101000000.p")
+    #expect(RemoteHostInstaller.Report(fields: [("gateway", "")]).gateway == nil)
+    #expect(RemoteHostInstaller.Report(fields: [("gateway", "/elsewhere/cherry")]).gateway == nil)
+    #expect(RemoteHostInstaller.Report(fields: [("gateway", "bin/a/b/cherry")]).gateway == nil)
+    #expect(RemoteHostInstaller.finishScript(directoryName: "b", sourceName: nil, expectedHashes: ["x"]).contains("gateway_link="))
+}
+
+/// The link's lines make it, point it elsewhere, and leave it alone when it
+/// points there already, never leaving a link of their own beside it.
+@Test func remoteDeviceInstallPointsTheIPhoneLinkAtTheBuildItPlaced() throws {
+    let home = FileManager.default.temporaryDirectory.appendingPathComponent("cherry-gateway-link-\(UUID().uuidString)")
+    let folder = home.appendingPathComponent("Library/Application Support/cherry-host")
+    try FileManager.default.createDirectory(at: folder.appendingPathComponent("bin"), withIntermediateDirectories: true)
+    func point(at build: String) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", (["placed=\(RemoteDeviceProbe.singleQuoted(build))"] + RemoteHostInstall.gatewayLinkLines(nameVariable: "placed")).joined(separator: "\n")]
+        process.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+        try process.run()
+        process.waitUntilExit()
+        #expect(process.terminationStatus == 0)
+    }
+    let link = folder.appendingPathComponent("cherry").path
+    try point(at: "20250101000000.a")
+    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: link) == "bin/20250101000000.a/cherry")
+    try point(at: "20250101000000.a")
+    try point(at: "20260101000000.b")
+    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: link) == "bin/20260101000000.b/cherry")
+    #expect(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted() == ["bin", "cherry"])
+}
+
 @Test func remoteDeviceInstallRechecksTheDaemonOnceItsBuildRunsThere() throws {
     let absent = RemoteHostInstallPlan(daemon: .absent, directoryName: "b", copyNeeded: true, isUpdate: false, warnings: [])
     func running(_ version: UInt32) -> RemoteHostStatusReport {

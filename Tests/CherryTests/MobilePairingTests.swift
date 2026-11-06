@@ -39,6 +39,26 @@ private func phoneKeys(home: URL, gateway: String? = gateway) -> AuthorizedPhone
     #expect(MobilePairingOffer(url: URL(string: "cherry-mobile://pair?v=2&name=x")!) == nil)
 }
 
+@Test func anotherMacsOfferIsVersionTwoWithThisMacsAddressesForTheListener() throws {
+    let offer = MobilePairingOffer(
+        name: "patstudio", user: "pat", hosts: ["100.124.84.74", "patstudio.local"], sshPort: 2222,
+        hostKeyFingerprints: [phoneFingerprint], pairingPort: 53123, code: Data(repeating: 0xFB, count: 16),
+        listenerHosts: ["100.101.1.2", "Patbook.local"]
+    )
+    #expect(offer.offerVersion == 2)
+    let url = offer.url.absoluteString
+    #expect(url.hasPrefix("cherry-mobile://pair?v=2&"))
+    #expect(url.contains("&host=100.124.84.74&host=patstudio.local&via=100.101.1.2&via=Patbook.local&"))
+    #expect(url.contains("&ssh=2222&"))
+    #expect(MobilePairingOffer(url: offer.url) == offer)
+    // A version says whether the listener is elsewhere: never one without
+    // the other.
+    let v2WithoutVia = url.replacingOccurrences(of: "&via=100.101.1.2&via=Patbook.local", with: "")
+    #expect(MobilePairingOffer(url: try #require(URL(string: v2WithoutVia))) == nil)
+    let v1WithVia = url.replacingOccurrences(of: "v=2&", with: "v=1&")
+    #expect(MobilePairingOffer(url: try #require(URL(string: v1WithVia))) == nil)
+}
+
 @Test func aProofIsTheMessagesHMACUnderTheCode() {
     let code = MobilePairingOffer.newCode()
     let proof = MobilePairingOffer.proof(of: "hello", code: code)
@@ -295,7 +315,7 @@ private func pairingModel(home: URL, remoteLogin: Bool = true) -> MobilePairingM
         try await Task.sleep(for: .milliseconds(10))
     }
     #expect(model.state == .asking(.init(phone: "Patrick's iPhone", fingerprint: phoneFingerprint)))
-    model.allow()
+    await model.allow()
     let answered = try await answer.value
     #expect(answered.status == 200)
     #expect(answered.fields["user"] == "patrick")
@@ -319,3 +339,97 @@ private func pairingModel(home: URL, remoteLogin: Bool = true) -> MobilePairingM
     let answered = try await answer.value
     #expect(answered.status == 403)
 }
+
+/// What a fake other Mac's pairing records: the keys its target was asked
+/// to add.
+private final class AddedKeys: @unchecked Sendable {
+    private let lock = NSLock()
+    private var added: [(key: String, name: String)] = []
+    var all: [(key: String, name: String)] { lock.withLock { added } }
+    func record(_ key: SSHPublicKeyLine, _ name: String) { lock.withLock { added.append((key.line, name)) } }
+}
+
+@MainActor
+private func anotherMacsModel(added: AddedKeys, failure: (any Error)? = nil) -> MobilePairingModel {
+    MobilePairingModel(
+        target: MobilePairingTarget(
+            displayName: "patstudio",
+            isThisMac: false,
+            describe: {
+                .success(MobilePairingMacDescription(
+                    name: "patstudio", user: "pat", hosts: ["100.124.84.74"], sshPort: 2222, hostKeyFingerprints: [phoneFingerprint]
+                ))
+            },
+            addKey: { key, name in
+                if let failure { throw failure }
+                added.record(key, name)
+            }
+        ),
+        listenerHosts: { ["127.0.0.1"] }
+    )
+}
+
+@Test @MainActor func aPhonePairsWithAnotherMacThroughThisMacsListener() async throws {
+    let added = AddedKeys()
+    let model = anotherMacsModel(added: added)
+    await model.start()
+    guard case .waiting(let offer) = model.state else {
+        Issue.record("no offer: \(model.state)")
+        return
+    }
+    // The phone reaches the listener here and SSH there.
+    #expect(offer.offerVersion == 2)
+    #expect(offer.listenerHosts == ["127.0.0.1"])
+    #expect(offer.hosts == ["100.124.84.74"])
+    #expect(offer.sshPort == 2222)
+
+    let phone = Phone(port: offer.pairingPort, code: offer.code)
+    let answer = Task { try await phone.pair(name: "Patrick's iPhone") }
+    for _ in 0..<200 where model.state == .waiting(offer) {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(model.state == .asking(.init(phone: "Patrick's iPhone", fingerprint: phoneFingerprint)))
+    #expect(model.describedMac?.user == "pat")
+    await model.allow()
+    let answered = try await answer.value
+    #expect(answered.status == 200)
+    #expect(answered.fields["user"] == "pat")
+    #expect(answered.fields["name"] == "patstudio")
+    #expect(model.state == .paired("Patrick's iPhone"))
+    #expect(added.all.map(\.key) == [phoneKey] && added.all.map(\.name) == ["Patrick's iPhone"])
+}
+
+@Test @MainActor func anotherMacThatCannotTakeTheKeyShowsTheLineAndTellsThePhone() async throws {
+    let line = "restrict,pty,command=\"'/Users/pat/Library/Application Support/cherry-host/cherry' host mobile-gateway\" \(phoneKey) cherry-mobile Patrick's iPhone"
+    let model = anotherMacsModel(added: AddedKeys(), failure: RemotePhoneKeys.Failure.linked(machine: "patstudio", destination: "/nix/store/keys", line: line))
+    await model.start()
+    guard case .waiting(let offer) = model.state else {
+        Issue.record("no offer: \(model.state)")
+        return
+    }
+    let answer = Task { try await Phone(port: offer.pairingPort, code: offer.code).pair(name: "Patrick's iPhone") }
+    for _ in 0..<200 where model.state == .waiting(offer) {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    await model.allow()
+    #expect(try await answer.value.status == 500)
+    guard case .failed(let message, let shownLine) = model.state else {
+        Issue.record("not failed: \(model.state)")
+        return
+    }
+    #expect(message.contains("on patstudio is a link to /nix/store/keys"))
+    #expect(shownLine == line)
+}
+
+@Test @MainActor func anotherMacThatCannotBePairedWithSaysWhyAndShowsNoCode() async throws {
+    let model = MobilePairingModel(
+        target: MobilePairingTarget(
+            displayName: "patstudio", isThisMac: false,
+            describe: { .failure(.unavailable(RemotePhoneKeys.noGatewayMessage(machine: "patstudio"))) },
+            addKey: { _, _ in Issue.record("a key was added") }
+        )
+    )
+    await model.start()
+    #expect(model.state == .failed(RemotePhoneKeys.noGatewayMessage(machine: "patstudio"), line: nil))
+}
+

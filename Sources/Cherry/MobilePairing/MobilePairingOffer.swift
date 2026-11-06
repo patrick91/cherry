@@ -4,22 +4,33 @@ import Foundation
 import SystemConfiguration
 
 /// What the QR code of Settings › Devices › Pair iPhone… carries
-/// (docs/specs/mobile-pairing.md): how Cherry for iOS reaches this Mac over
-/// SSH (its addresses, best first, the user and the port), the fingerprints
-/// of its SSH host keys, which the phone accepts on its first connect and no
-/// others, and where it sends its key (`MobilePairingListener`'s port) with
-/// what proves it read this code: an HMAC under the one-time code, which
-/// never travels.
+/// (docs/specs/mobile-pairing.md): how Cherry for iOS reaches the Mac it
+/// pairs with over SSH (its addresses, best first, the user and the port),
+/// the fingerprints of its SSH host keys, which the phone accepts on its
+/// first connect and no others, and where it sends its key
+/// (`MobilePairingListener`'s port, on this Mac) with what proves it read
+/// this code: an HMAC under the one-time code, which never travels.
+///
+/// Version 1 pairs with this Mac: the phone reaches the listener and SSH at
+/// the same addresses. Version 2 pairs with another of the user's Macs
+/// (Settings › Devices, a Mac's Pair iPhone…): `listenerHosts` are this
+/// Mac's, `hosts` that Mac's. A phone that reads only version 1 refuses a
+/// version 2 code instead of saving this Mac's address for that Mac.
 struct MobilePairingOffer: Equatable, Sendable {
+    /// Version 1's, and the listener's answers' in either version.
     static let version = 1
+    /// A code for another Mac.
+    static let otherMacVersion = 2
     static let scheme = "cherry-mobile"
 
-    /// This Mac's name ("Patbook").
+    /// The Mac's name ("Patbook").
     var name: String
     var user: String
-    /// Where the phone may reach it: Tailscale addresses, its `.local` name,
-    /// then LAN addresses. The phone tries them all and keeps the first of
-    /// these that answers.
+    /// Where the phone may reach it over SSH: Tailscale addresses, its
+    /// `.local` name, then LAN addresses. In version 1 these reach the
+    /// listener too: the phone tries them all and keeps the first that
+    /// answers. In version 2 it keeps the first that takes a connection on
+    /// `sshPort`.
     var hosts: [String]
     var sshPort: Int
     /// `SHA256:…`, as `ssh-keygen -l` prints them.
@@ -27,28 +38,40 @@ struct MobilePairingOffer: Equatable, Sendable {
     var pairingPort: UInt16
     /// The one-time code, 16 random bytes.
     var code: Data
+    /// Where the phone reaches the listener when the Mac is another one
+    /// (version 2, `via`): this Mac's addresses. Empty for this Mac.
+    var listenerHosts: [String]
 
-    /// `cherry-mobile://pair?v=1&name=…&user=…&ssh=22&port=…&code=…&host=…&fp=…`:
-    /// the iPhone's camera opens it in Cherry for iOS. The code is base64url;
-    /// a fingerprint's `+` is escaped, as some parsers read it as a space.
+    var offerVersion: Int {
+        listenerHosts.isEmpty ? Self.version : Self.otherMacVersion
+    }
+
+    /// `cherry-mobile://pair?v=1&name=…&user=…&ssh=22&port=…&code=…&host=…&fp=…`,
+    /// with `v=2` and `via=…` for another Mac: the iPhone's camera opens it
+    /// in Cherry for iOS. The code is base64url; a fingerprint's `+` is
+    /// escaped, as some parsers read it as a space.
     var url: URL {
         var components = URLComponents()
         components.scheme = Self.scheme
         components.host = "pair"
         components.queryItems = [
-            URLQueryItem(name: "v", value: String(Self.version)),
+            URLQueryItem(name: "v", value: String(offerVersion)),
             URLQueryItem(name: "name", value: name),
             URLQueryItem(name: "user", value: user),
             URLQueryItem(name: "ssh", value: String(sshPort)),
             URLQueryItem(name: "port", value: String(pairingPort)),
             URLQueryItem(name: "code", value: Self.base64URL(code)),
         ] + hosts.map { URLQueryItem(name: "host", value: $0) }
+            + listenerHosts.map { URLQueryItem(name: "via", value: $0) }
             + hostKeyFingerprints.map { URLQueryItem(name: "fp", value: $0) }
         components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         return components.url!
     }
 
-    init(name: String, user: String, hosts: [String], sshPort: Int = 22, hostKeyFingerprints: [String], pairingPort: UInt16, code: Data) {
+    init(
+        name: String, user: String, hosts: [String], sshPort: Int = 22, hostKeyFingerprints: [String],
+        pairingPort: UInt16, code: Data, listenerHosts: [String] = []
+    ) {
         self.name = name
         self.user = user
         self.hosts = hosts
@@ -56,6 +79,7 @@ struct MobilePairingOffer: Equatable, Sendable {
         self.hostKeyFingerprints = hostKeyFingerprints
         self.pairingPort = pairingPort
         self.code = code
+        self.listenerHosts = listenerHosts
     }
 
     /// The offer `url` reads, as the phone reads it.
@@ -65,13 +89,16 @@ struct MobilePairingOffer: Equatable, Sendable {
         else { return nil }
         func value(_ name: String) -> String? { items.first { $0.name == name }?.value }
         func values(_ name: String) -> [String] { items.filter { $0.name == name }.compactMap(\.value) }
-        guard value("v") == String(Self.version), let name = value("name"), let user = value("user"),
+        let version = value("v").flatMap(Int.init)
+        let listenerHosts = values("via")
+        guard version == Self.version && listenerHosts.isEmpty || version == Self.otherMacVersion && !listenerHosts.isEmpty,
+              let name = value("name"), let user = value("user"),
               let sshPort = value("ssh").flatMap(Int.init), let port = value("port").flatMap(UInt16.init),
               let code = value("code").flatMap(Self.data(base64URL:)), !values("host").isEmpty
         else { return nil }
         self.init(
             name: name, user: user, hosts: values("host"), sshPort: sshPort,
-            hostKeyFingerprints: values("fp"), pairingPort: port, code: code
+            hostKeyFingerprints: values("fp"), pairingPort: port, code: code, listenerHosts: listenerHosts
         )
     }
 
@@ -154,13 +181,16 @@ enum MobilePairingMac {
     /// The fingerprints of the SSH host keys the phone can be shown:
     /// Ed25519 and ECDSA (it cannot use RSA host keys).
     static func hostKeyFingerprints(directory: URL = URL(fileURLWithPath: "/etc/ssh")) -> [String] {
-        ["ssh_host_ed25519_key.pub", "ssh_host_ecdsa_key.pub"].compactMap { file in
+        hostKeyFiles.compactMap { file in
             (try? String(contentsOf: directory.appendingPathComponent(file), encoding: .utf8))
                 .flatMap(SSHPublicKeyLine.init(_:))?.fingerprint
         }
     }
 
-    private static func unique(_ values: [String]) -> [String] {
+    /// The host keys an offer lists, in /etc/ssh.
+    static let hostKeyFiles = ["ssh_host_ed25519_key.pub", "ssh_host_ecdsa_key.pub"]
+
+    static func unique(_ values: [String]) -> [String] {
         var seen = Set<String>()
         return values.filter { seen.insert($0).inserted }
     }

@@ -2,10 +2,11 @@ import AppKit
 import CoreImage.CIFilterBuiltins
 import SwiftUI
 
-/// Settings › Devices › Pair iPhone…: the offer as a QR code that the
-/// iPhone's camera (or Cherry for iOS) reads, then Allow or Deny for the
-/// phone that sends its key, and what is wrong when Remote Login is off or
-/// the key could not be added.
+/// Settings › Devices › Pair iPhone… (this Mac's, or one of the other Macs'
+/// cards'): the offer as a QR code that the iPhone's camera (or Cherry for
+/// iOS) reads, then Allow or Deny for the phone that sends its key, and
+/// what is wrong when Remote Login is off, the other Mac can't be paired
+/// with, or the key could not be added.
 struct PairPhoneSheet: View {
     @StateObject private var model: MobilePairingModel
     @Environment(\.dismiss) private var dismiss
@@ -17,8 +18,8 @@ struct PairPhoneSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Pair iPhone").font(.title2.weight(.semibold))
-                Text("Cherry for iOS reaches this Mac over SSH to show your agents and sessions, and to answer them.")
+                Text(target.isThisMac ? "Pair iPhone" : "Pair iPhone with \(target.displayName)").font(.title2.weight(.semibold))
+                Text("Cherry for iOS reaches \(target.displayName) over SSH to show your agents and sessions, and to answer them.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -36,6 +37,8 @@ struct PairPhoneSheet: View {
         .onDisappear { model.stop() }
     }
 
+    private var target: MobilePairingTarget { model.target }
+
     private var isDone: Bool {
         if case .paired = model.state { return true }
         return false
@@ -47,7 +50,7 @@ struct PairPhoneSheet: View {
         case .starting:
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small)
-                Text("Checking Remote Login…").foregroundStyle(.secondary)
+                Text(target.isThisMac ? "Checking Remote Login…" : "Reaching \(target.displayName)…").foregroundStyle(.secondary)
             }
             .frame(minHeight: 120)
         case .remoteLoginOff:
@@ -74,7 +77,7 @@ struct PairPhoneSheet: View {
                         ProgressView().controlSize(.small)
                         Text("Waiting for your iPhone…").foregroundStyle(.secondary)
                     }
-                    Text("The code works once, for 10 minutes. Your iPhone needs to reach this Mac: on the same network, or both on Tailscale. If macOS asks whether Cherry may accept incoming connections, allow it.")
+                    Text("The code works once, for 10 minutes. \(reachSentence) If macOS asks whether Cherry may accept incoming connections, allow it.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -84,7 +87,7 @@ struct PairPhoneSheet: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Allow “\(prompt.phone)” to connect?")
                     .font(.headline)
-                Text("It can then reach your Cherry sessions on this Mac over SSH, as \(model.environment.user()): see them and type into them, and a terminal session runs what it types. Its key is added to ~/.ssh/authorized_keys limited to that: it can't log in, run other commands or forward ports.")
+                Text("It can then reach your Cherry sessions on \(target.displayName) over SSH, as \(model.describedMac?.user ?? NSUserName()): see them and type into them, and a terminal session runs what it types. Its key is added to ~/.ssh/authorized_keys\(target.isThisMac ? "" : " on \(target.displayName)") limited to that: it can't log in, run other commands or forward ports.")
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 VStack(alignment: .leading, spacing: 2) {
@@ -97,12 +100,18 @@ struct PairPhoneSheet: View {
                 }
                 HStack {
                     Button("Deny") { Task { await model.deny() } }
-                    Button("Allow") { model.allow() }
+                    Button("Allow") { Task { await model.allow() } }
                         .keyboardShortcut(.defaultAction)
                 }
             }
+        case .adding(let phone):
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Adding “\(phone)”\(target.isThisMac ? "" : " to \(target.displayName)")…").foregroundStyle(.secondary)
+            }
+            .frame(minHeight: 60, alignment: .leading)
         case .paired(let phone):
-            Label("“\(phone)” can reach this Mac now.", systemImage: "checkmark.circle.fill")
+            Label("“\(phone)” can reach \(target.displayName) now.", systemImage: "checkmark.circle.fill")
                 .foregroundStyle(.green)
                 .fontWeight(.medium)
                 .frame(minHeight: 60, alignment: .leading)
@@ -138,6 +147,14 @@ struct PairPhoneSheet: View {
                 Button("Show a New Code") { Task { await model.start() } }
             }
         }
+    }
+
+    /// Where the phone must be: near this Mac, and for another Mac able to
+    /// reach that one too.
+    private var reachSentence: String {
+        target.isThisMac
+            ? "Your iPhone needs to reach this Mac: on the same network, or both on Tailscale."
+            : "Your iPhone needs to reach this Mac to pair, and \(target.displayName) from then on: on the same network, or on Tailscale."
     }
 
     static func openSharingSettings() {

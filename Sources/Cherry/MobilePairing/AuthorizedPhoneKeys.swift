@@ -22,7 +22,7 @@ struct AuthorizedPhoneKeys: Sendable {
         var id: String { key.base64 }
     }
 
-    enum Failure: Error, Equatable, LocalizedError {
+    enum Failure: PhoneKeyFailure, Equatable {
         /// The file is a link: `line` is what to add to where it points.
         case linked(destination: String, line: String)
         case unwritable(String, line: String)
@@ -93,26 +93,14 @@ struct AuthorizedPhoneKeys: Sendable {
 
     /// The phones Cherry added, in the file's order.
     func phones() -> [Phone] {
-        (lines() ?? []).compactMap(Self.phone(in:))
+        Self.phones(in: lines() ?? [])
     }
 
-    /// Adds `key` for the phone `name`, limited to the gateway: replaces a
-    /// line Cherry wrote for it (limiting one written before, renaming
-    /// it), and leaves a line of the user's that has it alone.
+    /// Adds `key` for the phone `name`, limited to the gateway
+    /// (`adding(_:line:to:)`).
     func add(_ key: SSHPublicKeyLine, name: String) throws {
         guard let line = Self.line(for: key, name: name, gateway: gateway()) else { throw Failure.noGateway }
-        try rewrite(line: line) { lines in
-            if let index = lines.firstIndex(where: { Self.phone(in: $0)?.key == key }) {
-                var changed = lines
-                changed[index] = line
-                // Another line of Cherry's for the key (written by hand
-                // twice, say) would let it in unlimited.
-                changed = changed.enumerated().filter { $0.offset == index || Self.phone(in: $0.element)?.key != key }.map(\.element)
-                return changed == lines ? nil : changed
-            }
-            guard !lines.contains(where: { Self.fields(of: $0).contains(key.base64) }) else { return nil }
-            return lines + [line]
-        }
+        try rewrite(line: line) { Self.adding(key, line: line, to: $0) }
     }
 
     /// Limits `phone`'s line, written before Cherry limited keys, to the
@@ -124,22 +112,62 @@ struct AuthorizedPhoneKeys: Sendable {
     /// Removes the lines Cherry wrote for `phone`'s key.
     func remove(_ phone: Phone) throws {
         let line = Self.line(for: phone.key, name: phone.name, gateway: gateway()) ?? "\(phone.key.line) \(Self.marker) \(phone.name)"
-        try rewrite(line: line) { lines in
-            let kept = lines.filter { Self.phone(in: $0)?.key != phone.key }
-            return kept.count == lines.count ? nil : kept
+        try rewrite(line: line) { Self.removing(phone.key, from: $0) }
+    }
+
+    // MARK: Lines
+
+    // What a file's lines become, for this Mac's file and another Mac's
+    // (`RemotePhoneKeys`) alike.
+
+    /// The phones Cherry added among `lines`, in their order.
+    static func phones(in lines: [String]) -> [Phone] {
+        lines.compactMap(phone(in:))
+    }
+
+    /// `lines` with `line` for `key`: it replaces a line Cherry wrote for
+    /// the key (limiting one written before, renaming it) and any other of
+    /// Cherry's for it, else it goes last; nil when nothing changes, or
+    /// when a line of the user's has the key (left alone).
+    static func adding(_ key: SSHPublicKeyLine, line: String, to lines: [String]) -> [String]? {
+        if let index = lines.firstIndex(where: { phone(in: $0)?.key == key }) {
+            var changed = lines
+            changed[index] = line
+            // Another line of Cherry's for the key (written by hand
+            // twice, say) would let it in unlimited.
+            changed = changed.enumerated().filter { $0.offset == index || phone(in: $0.element)?.key != key }.map(\.element)
+            return changed == lines ? nil : changed
         }
+        guard !lines.contains(where: { fields(of: $0).contains(key.base64) }) else { return nil }
+        return lines + [line]
+    }
+
+    /// `lines` without Cherry's lines for `key`; nil when it has none.
+    static func removing(_ key: SSHPublicKeyLine, from lines: [String]) -> [String]? {
+        let kept = lines.filter { phone(in: $0)?.key != key }
+        return kept.count == lines.count ? nil : kept
+    }
+
+    /// A file's text as its lines, blank and comment lines included.
+    static func lines(of text: String) -> [String] {
+        var lines = text.components(separatedBy: "\n")
+        if lines.last == "" { lines.removeLast() }
+        return lines
+    }
+
+    /// The text of a file of `lines`.
+    static func text(of lines: [String]) -> String {
+        lines.joined(separator: "\n") + "\n"
     }
 
     // MARK: The file
 
-    /// The file's lines, blank and comment lines included; none for no
-    /// file, nil for one that can't be read as UTF-8 text.
+    /// The file's lines; none for no file, nil for one that can't be read
+    /// as UTF-8 text.
     private func lines() -> [String]? {
         guard FileManager.default.fileExists(atPath: file.path) else { return [] }
         guard let text = try? String(contentsOf: file, encoding: .utf8) else { return nil }
-        var lines = text.components(separatedBy: "\n")
-        if lines.last == "" { lines.removeLast() }
-        return lines
+        return Self.lines(of: text)
     }
 
     private static func fields(of line: Substring) -> [String] {
@@ -213,7 +241,7 @@ struct AuthorizedPhoneKeys: Sendable {
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             }
             let temporary = directory.appendingPathComponent(".authorized_keys.cherry-\(UUID().uuidString)")
-            let text = changed.joined(separator: "\n") + "\n"
+            let text = Self.text(of: changed)
             guard FileManager.default.createFile(atPath: temporary.path, contents: Data(text.utf8), attributes: [.posixPermissions: mode]) else {
                 throw CocoaError(.fileWriteNoPermission)
             }
@@ -229,3 +257,10 @@ struct AuthorizedPhoneKeys: Sendable {
         }
     }
 }
+
+/// A phone's key that could not be added, with the line to add by hand
+/// when there is one.
+protocol PhoneKeyFailure: LocalizedError {
+    var line: String? { get }
+}
+

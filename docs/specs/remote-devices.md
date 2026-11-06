@@ -440,12 +440,15 @@ Update Session Host sheets in `RemoteDeviceViews.swift`, the probe in
      copies an older installer nested inside a build are removed. Without a
      copy (the check saw the same hashes), the directory must pass
      `verify_dir`, or the install copies after all. The placed build gets
-     `.installed` and this installation's `.used-by/<id>` marker. Then the
-     report: `cherry status --json` and `cherry-host status --json` of the
-     new build (neither starts a daemon), each directory with its install
-     time and newest marker, and the processes running from the install
-     root (`/bin/ps`, read into a variable first so no `grep` matches
-     itself);
+     `.installed` and this installation's `.used-by/<id>` marker, and the
+     link paired iPhones' keys run, `cherry-host/cherry`, is pointed at its
+     `cherry` (`bin/<build>/cherry`, replaced with rename(2);
+     docs/specs/mobile-pairing.md › Another Mac). Then the report: `cherry
+     status --json` and `cherry-host status --json` of the new build
+     (neither starts a daemon), each directory with its install time and
+     newest marker, where that link points, and the processes running from
+     the install root (`/bin/ps`, read into a variable first so no `grep`
+     matches itself);
   4. recheck (`RemoteHostInstall.recheck`): the daemon as the new build
      sees it; a newer protocol or one before 4 is refused (the device is
      not changed), a daemon the check could not see is reported;
@@ -460,8 +463,9 @@ Update Session Host sheets in `RemoteDeviceViews.swift`, the probe in
   6. collect (`RemoteHostInstall.garbage`): a build goes only when it is not
      the current one nor one of the two most recently installed others, no
      process runs from it, the daemon's executable is not there, neither the
-     daemon's nor a running session's holder build names it
-     (`directoriesInUse` says which of these keeps it), no `.used-by` marker
+     daemon's nor a running session's holder build names it, the iPhone
+     link does not point into it (`directoriesInUse` says which of these
+     keeps it), no `.used-by` marker
      is younger than 30 days, and it was installed more than 7 days ago;
      partial and moved-aside directories go after an hour unless in use;
      the removal re-reads the process list and keeps what runs.

@@ -1,4 +1,5 @@
 import AppKit
+import CherryControl
 import Darwin
 import Foundation
 import Testing
@@ -2626,4 +2627,15 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
     _ = try await harness.control.list()
     model.refresh()
     #expect(model.unreadSessionIDs == ["s-rang"])
+}
+
+/// A tab's notification names its project (and its Mac, when it is not
+/// This Mac) in the subtitle, as a background session's does, so a
+/// "Finished." from one of several projects says which.
+@Test func aTabsNotificationSubtitleNamesItsProjectAndItsMac() {
+    #expect(TerminalNotificationCenter.tabSubtitle(projectRoot: "/Users/me/github/cherry", machine: nil) == "cherry")
+    #expect(TerminalNotificationCenter.tabSubtitle(projectRoot: "/Users/me/github/cherry", machine: "") == "cherry")
+    let deviceKey = ProjectLocation.remote(deviceID: UUID(), path: "/Users/me/site").key
+    #expect(TerminalNotificationCenter.tabSubtitle(projectRoot: deviceKey, machine: "patmini") == "site on patmini")
+    #expect(TerminalNotificationCenter.tabSubtitle(projectRoot: HomePlace.thisMacKey, machine: nil) == "Home")
 }

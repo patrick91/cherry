@@ -108,6 +108,17 @@ final class TerminalNotificationCenter {
         }
     }
 
+    /// The subtitle of a tab's notification: its window's project, as
+    /// Background Sessions' notifications name theirs ("Home" for a Mac's
+    /// Home), and the Mac it runs on when that is not This Mac (`machine`,
+    /// nil for This Mac). Notification Center groups by app, so without it
+    /// "Claude Code · Finished." says nothing of which project finished.
+    nonisolated static func tabSubtitle(projectRoot: String, machine: String?) -> String {
+        let project = MenuBarAgentPresentation.projectName(projectRoot: projectRoot)
+        guard let machine = machine?.nilIfEmpty else { return project }
+        return "\(project) on \(machine)"
+    }
+
     /// A tab's program blocked on the user, finished or failed (OSC 7501)
     /// while the tab is not on screen.
     func postProgramStatus(_ status: ProgramStatus, for session: TerminalSession) {
@@ -154,6 +165,12 @@ final class TerminalNotificationCenter {
         let projectRoot = ProjectWindowRegistry.shared.projectRoot(containing: session.id)
         let content = UNMutableNotificationContent()
         content.title = title
+        if let projectRoot {
+            content.subtitle = Self.tabSubtitle(
+                projectRoot: projectRoot,
+                machine: RemoteDeviceStore.shared.device(forProjectKey: projectRoot)?.name
+            )
+        }
         content.body = body
         content.sound = .default
         content.userInfo = [

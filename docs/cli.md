@@ -823,6 +823,21 @@ Codex, Pi and others.
   (the caller, which the tool layer names by default, or an explicit
   `parent_agent_id`) owns the task that way; a project that is not open is
   `project_unavailable`, whose message names `cherry project open DIR`.
+- `working_directory` (`cherry spawn agent NAME --working-directory DIR
+  --task -`) starts the worker in another folder, usually a git worktree the
+  orchestrator made for it (`git worktree add ../app-fix -b fix`), while it
+  stays in the caller's project: nested under the caller in its window, with
+  the project's `CHERRY_PROJECT_ROOT`, commands and agents. The worktree is
+  never added as a project. A relative folder is the caller's own
+  directory's (the project's folder when the caller's directory is unknown,
+  or when `device` names another Mac's project); `.` and `..` are taken out
+  by name, as `cd` does. On This Mac the folder must exist, else
+  `invalid_working_directory` before anything is spawned (a task included);
+  on another Mac it is that Mac's path (its host expands `~` and `~/…`, and
+  refuses a missing folder when the tab starts). The tab restarts
+  there. `spawn_process` takes `working_directory` for a terminal the same
+  way. Removing the worktree once its branch is merged is the orchestrator's
+  job.
 - Once the worker is ready, Cherry types one line into it:
 
   ```text

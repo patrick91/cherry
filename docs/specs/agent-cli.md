@@ -39,6 +39,7 @@ cherry keys ID KEYS…                               send_process_input raw (nam
 cherry answer ID CHOICE                            answer_prompt
 cherry spawn agent NAME [--task - | --message -] [--label L] [--phase P]
              [--schema FILE|-] [--run RUN] [--allow-subagents]
+             [--working-directory DIR]
 cherry spawn terminal|command …                    spawn_process
 cherry start|stop|restart|close ID                 start/stop/restart/close_process
 cherry rename ID NAME, cherry select ID

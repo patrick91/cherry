@@ -507,6 +507,9 @@
       "wait_ms": {
         "type": "integer"
       },
+      "working_directory": {
+        "type": "string"
+      },
       "device": {
         "type": "string"
       }

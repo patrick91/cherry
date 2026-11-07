@@ -264,7 +264,7 @@ public enum CherryToolLayer {
             model: stringArgument("model", in: arguments),
             effort: stringArgument("effort", in: arguments),
             title: stringArgument("title", in: arguments),
-            workingDirectory: nil,
+            workingDirectory: workingDirectoryArgument(in: arguments, caller: caller),
             text: message,
             rawBase64: nil,
             submit: message == nil ? nil : true,
@@ -627,7 +627,7 @@ public enum CherryToolLayer {
                 model: stringArgument("model", in: arguments),
                 effort: stringArgument("effort", in: arguments),
                 title: stringArgument("title", in: arguments),
-                workingDirectory: stringArgument("working_directory", in: arguments),
+                workingDirectory: workingDirectoryArgument(in: arguments, caller: caller),
                 text: stringArgument("text", in: arguments),
                 rawBase64: stringArgument("raw_base64", in: arguments),
                 submit: boolArgument("submit", in: arguments),
@@ -915,6 +915,29 @@ public enum CherryToolLayer {
 
     private static func stringArgument(_ key: String, in arguments: [String: JSONValue]) -> String? {
         arguments[key]?.stringValue
+    }
+
+    /// A spawn's `working_directory` as its caller means it: a relative
+    /// path is the caller's own directory's (`cherry spawn agent claude
+    /// --working-directory ../app-fix`), joined, not resolved (the server
+    /// takes `.` and `..` out and checks the folder). Left relative, for the
+    /// server to take from the project's folder, when the caller's directory
+    /// is unknown or the call names another Mac's project (`device`), whose
+    /// folders the caller's directory is not one of.
+    private static func workingDirectoryArgument(in arguments: [String: JSONValue], caller: CherryToolCaller) -> String? {
+        guard let path = stringArgument("working_directory", in: arguments)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        else {
+            return nil
+        }
+        guard !path.hasPrefix("/"), !path.hasPrefix("~"),
+              explicitProjectRoot(in: arguments).map(ProjectLocation.isRemoteKey) != true,
+              let base = caller.workingDirectory?.nilIfEmpty, base.hasPrefix("/")
+        else {
+            return path
+        }
+        return base.hasSuffix("/") ? base + path : base + "/" + path
     }
 
     /// A whole number, also when the client sent it as one with a

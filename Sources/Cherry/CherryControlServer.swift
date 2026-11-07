@@ -1887,6 +1887,52 @@ final class CherryControlServer: @unchecked Sendable {
         return (session, workspace)
     }
 
+    /// Where a spawned terminal or agent of the project `projectRoot` (its
+    /// key) starts (`working_directory`), as the Mac that runs it names it,
+    /// or nil for the workspace's default. The tool layer made a relative
+    /// path the caller's own directory's when it could; one still relative
+    /// is the project folder's. `.` and `..` are taken out by name, as `cd`
+    /// does. On This Mac the folder must exist (an agent in a worktree the
+    /// caller has not made yet would start somewhere else); another Mac's
+    /// host expands `~` and `~/…` and refuses a missing folder when the tab
+    /// starts.
+    static func spawnWorkingDirectory(_ requested: String?, projectRoot: String?) throws -> String? {
+        guard let requested = requested?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty else {
+            return nil
+        }
+        let onThisMac = projectRoot.map { !ProjectLocation.isRemoteKey($0) } ?? true
+        if !onThisMac, requested == "~" || requested.hasPrefix("~/") {
+            return requested
+        }
+        var path = onThisMac ? (requested as NSString).expandingTildeInPath : requested
+        if path.hasPrefix("~") {
+            throw CherryControlError(
+                code: "invalid_working_directory",
+                message: "working_directory \(requested): no such home folder. Pass an absolute path."
+            )
+        }
+        if !path.hasPrefix("/") {
+            guard let base = projectRoot.map(ProjectLocation.launchPath(forKey:)), base.hasPrefix("/") else {
+                throw CherryControlError(
+                    code: "invalid_working_directory",
+                    message: "working_directory \(requested) is relative and the window has no folder: pass an absolute path."
+                )
+            }
+            path = base + "/" + path
+        }
+        path = URL(fileURLWithPath: path, isDirectory: true).standardized.path
+        if onThisMac {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                throw CherryControlError(
+                    code: "invalid_working_directory",
+                    message: "No folder at \(path). Make it first (a worktree: git worktree add \(path) -b BRANCH), then spawn."
+                )
+            }
+        }
+        return path
+    }
+
     /// The new process, the bytes of its first input that reached it, and
     /// why that input did not when it was refused or failed (the process
     /// runs either way).
@@ -1914,7 +1960,11 @@ final class CherryControlServer: @unchecked Sendable {
             guard request.model == nil, request.effort == nil else {
                 throw CherryControlError(code: "invalid_process_request", message: "Model and effort overrides are only valid for agent processes.")
             }
-            session = workspace.addSession(title: request.title, workingDirectory: request.workingDirectory, select: false)
+            session = workspace.addSession(
+                title: request.title,
+                workingDirectory: try Self.spawnWorkingDirectory(request.workingDirectory, projectRoot: workspace.projectRoot),
+                select: false
+            )
             agent = nil
         case .agent:
             guard let projectRoot = workspace.projectRoot else {
@@ -1925,12 +1975,14 @@ final class CherryControlServer: @unchecked Sendable {
                 throw CherryControlError(code: "agent_not_launchable", message: "Agent '\(resolvedAgent.name)' is not launchable.")
             }
             let agentDefinition = try agentDefinition(resolvedAgent, overridingModel: request.model, effort: request.effort)
+            let workingDirectory = try Self.spawnWorkingDirectory(request.workingDirectory, projectRoot: workspace.projectRoot)
             let parent = try spawnParent(from: request.parentAgentID, workspace: workspace)
             // Checked (its schema too) before anything is spawned.
             let taskPlan = try prepareTaskSpawn(request, parentAgentID: parent.owner, workspace: workspace)
             session = workspace.addAgentSession(
                 agent: agentDefinition,
                 projectRoot: projectRoot,
+                workingDirectory: workingDirectory,
                 title: request.title ?? taskPlan?.label,
                 parentAgentID: parent.tab,
                 select: false

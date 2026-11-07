@@ -465,6 +465,121 @@ private let controlToolClaudeProfile = ToolClientProfile(client: ToolClientInfo(
     #expect(blank.structured?.objectValue?["callerProcessID"] == nil, "\(blank.text)")
 }
 
+/// An agent given its own folder (`working_directory`, e.g. a git worktree
+/// of the project) starts there and stays in the caller's project: nested
+/// under the caller in its window, with the project's root, never a
+/// project of its own. A relative folder is the caller's directory's, else
+/// the project's; a folder that does not exist is refused and nothing is
+/// spawned.
+@MainActor
+@Test func controlToolServerStartsAnAgentInItsOwnFolderInsideTheCallersProject() async throws {
+    let harness = try ControlAgentWaitHarness()
+    defer {
+        harness.stop()
+    }
+    let root = harness.projectRoot.path
+    let socketURL = harness.socketURL
+    harness.server.start()
+    try harness.settings.upsertAgent(AgentToolDefinition(name: "Worker", command: "/bin/cat"))
+    let lead = try await harness.spawnAgent(named: "Lead")
+    harness.server.callerSessionResolverForTesting = { _ in lead }
+    let worktree = harness.projectRoot.appendingPathComponent(".worktrees/fix", isDirectory: true)
+    let sources = harness.projectRoot.appendingPathComponent("Sources", isDirectory: true)
+    try FileManager.default.createDirectory(at: worktree, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+    let projectsBefore = harness.settings.projects.count
+    let callerInSources = ToolCallContext(projectRoot: root, workingDirectory: sources.path)
+
+    let spawned = try await controlToolCall(
+        "spawn_agent",
+        ["name": .string("Worker"), "working_directory": .string("../.worktrees/fix")],
+        context: callerInSources,
+        socketURL: socketURL
+    )
+    let worker = try #require(controlToolProcessID(spawned).flatMap { harness.workspace.session(id: $0) }, "\(spawned.text)")
+    #expect(worker.workingDirectory == worktree.path)
+    #expect(worker.launchWorkingDirectory == worktree.path)
+    #expect(worker.projectRoot == root)
+    #expect(worker.parentAgentID == lead.id)
+    #expect(harness.settings.projects.count == projectsBefore)
+
+    // With no directory of the caller's, a relative folder is the project's.
+    let fromProject = try await controlToolCall(
+        "spawn_agent",
+        ["name": .string("Worker"), "working_directory": .string(".worktrees/fix")],
+        context: .init(projectRoot: root),
+        socketURL: socketURL
+    )
+    let second = try #require(controlToolProcessID(fromProject).flatMap { harness.workspace.session(id: $0) }, "\(fromProject.text)")
+    #expect(second.workingDirectory == worktree.path)
+
+    // A terminal's folder is taken the same way.
+    let terminal = try await controlToolCall(
+        "spawn_process",
+        ["kind": .string("terminal"), "working_directory": .string("../.worktrees/fix")],
+        context: callerInSources,
+        socketURL: socketURL
+    )
+    let shell = try #require(controlToolProcessID(terminal).flatMap { harness.workspace.session(id: $0) }, "\(terminal.text)")
+    #expect(shell.workingDirectory == worktree.path)
+
+    // A folder that is not there yet: refused before anything is spawned,
+    // a task included.
+    let sessionsBefore = harness.workspace.sessions.count
+    for kind in ["spawn_agent", "spawn_process"] {
+        let arguments: [String: JSONValue] = kind == "spawn_agent"
+            ? ["name": .string("Worker"), "task": .string("Fix it"), "working_directory": .string("../.worktrees/gone")]
+            : ["kind": .string("terminal"), "working_directory": .string("../.worktrees/gone")]
+        let missing = try await controlToolCall(kind, arguments, context: callerInSources, socketURL: socketURL)
+        #expect(controlToolErrorCode(missing) == "invalid_working_directory", "\(missing.text)")
+        let message = missing.structured?.objectValue?["error"]?.objectValue?["message"]?.stringValue ?? ""
+        #expect(message.contains(harness.projectRoot.appendingPathComponent(".worktrees/gone").path), "\(message)")
+    }
+    #expect(harness.workspace.sessions.count == sessionsBefore)
+}
+
+/// The folder a spawn starts in: on This Mac a folder that exists, a
+/// relative one the project's, `.` and `..` taken out by name; another
+/// Mac's path is not looked for here, and its host expands `~`.
+@Test func controlToolServerSpawnFoldersAreCheckedOnThisMacAndPassedToAnotherMac() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let worktree = root.appendingPathComponent(".worktrees/fix", isDirectory: true)
+    try FileManager.default.createDirectory(at: worktree, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+    }
+    let file = root.appendingPathComponent("README")
+    try Data().write(to: file)
+    func folder(_ requested: String?, _ projectRoot: String?) throws -> String? {
+        try CherryControlServer.spawnWorkingDirectory(requested, projectRoot: projectRoot)
+    }
+    func refusal(_ requested: String, _ projectRoot: String?) -> String? {
+        do {
+            _ = try folder(requested, projectRoot)
+            return nil
+        } catch {
+            return (error as? CherryControlError)?.code ?? "\(error)"
+        }
+    }
+
+    #expect(try folder(nil, root.path) == nil)
+    #expect(try folder("  ", root.path) == nil)
+    #expect(try folder(".worktrees/fix", root.path) == worktree.path)
+    #expect(try folder(" \(root.path)/Sources/../.worktrees/./fix/ ", root.path) == worktree.path)
+    #expect(try folder("~", root.path) == ("~" as NSString).expandingTildeInPath)
+    #expect(refusal(".worktrees/gone", root.path) == "invalid_working_directory")
+    #expect(refusal(file.path, root.path) == "invalid_working_directory")
+    #expect(refusal("~no-such-user-\(UUID().uuidString)/fix", root.path) == "invalid_working_directory")
+    #expect(refusal("fix", nil) == "invalid_working_directory")
+
+    let device = "device:11111111-1111-1111-1111-111111111111:/Users/me/app"
+    #expect(try folder("../app-fix", device) == "/Users/me/app-fix")
+    #expect(try folder("/Users/me/wt/./fix/", device) == "/Users/me/wt/fix")
+    #expect(try folder("~", device) == "~")
+    #expect(try folder("~/wt/fix", device) == "~/wt/fix")
+    #expect(refusal("~me/wt", device) == "invalid_working_directory")
+}
+
 /// A tool call is never scoped (its project is an argument), and its
 /// requests never include another tool request.
 @MainActor

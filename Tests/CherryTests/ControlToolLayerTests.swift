@@ -433,6 +433,49 @@ private func controlToolLayerProcess(id: String = controlToolLayerAgentID, kind:
     #expect(status.requests == [.scoped(.init(projectRoot: "/caller", request: .listTerminals))])
 }
 
+/// A spawn's relative `working_directory` is the caller's own directory's
+/// (`cherry spawn agent claude --working-directory ../app-fix`), joined
+/// and left for the server to resolve; it stays relative, for the server
+/// to take from the project's folder, when the caller's directory is
+/// unknown or the call names another Mac's project.
+@Test func controlToolLayerTakesARelativeWorkingDirectoryFromTheCallersDirectory() async {
+    func spawnDirectory(
+        _ name: String,
+        _ arguments: [String: JSONValue],
+        caller: CherryToolCaller = CherryToolCaller(projectRoot: "/work/app", workingDirectory: "/work/app/Sources")
+    ) async -> String?? {
+        let recorder = ControlToolLayerRecorder()
+        _ = await CherryToolLayer.call(name: name, arguments: arguments, caller: caller, transport: recorder)
+        for request in recorder.requests {
+            if case .spawnProcess(let spawn) = request { return .some(spawn.workingDirectory) }
+            if case .scoped(let scoped) = request, case .spawnProcess(let spawn) = scoped.request {
+                return .some(spawn.workingDirectory)
+            }
+        }
+        return nil
+    }
+    let worker: [String: JSONValue] = ["name": .string("claude"), "task": .string("Fix it")]
+    func agent(_ directory: String) -> [String: JSONValue] {
+        worker.merging(["working_directory": .string(directory)]) { $1 }
+    }
+
+    #expect(await spawnDirectory("spawn_agent", worker) == .some(nil))
+    #expect(await spawnDirectory("spawn_agent", agent("../../app-fix")) == "/work/app/Sources/../../app-fix")
+    #expect(await spawnDirectory("spawn_agent", agent(" /work/app-fix ")) == "/work/app-fix")
+    #expect(await spawnDirectory("spawn_agent", agent("~/app-fix")) == "~/app-fix")
+    #expect(await spawnDirectory("spawn_agent", agent("  ")) == .some(nil))
+    // A terminal's is taken the same way.
+    #expect(await spawnDirectory("spawn_process", ["kind": .string("terminal"), "working_directory": .string("web")])
+        == "/work/app/Sources/web")
+    // No directory to start from: the server takes the project's folder.
+    #expect(await spawnDirectory("spawn_agent", agent(".worktrees/fix"), caller: CherryToolCaller(projectRoot: "/work/app"))
+        == ".worktrees/fix")
+    // Another Mac's project: the caller's directory is not one of its folders.
+    let device = "device:11111111-1111-1111-1111-111111111111:/Users/me/app"
+    #expect(await spawnDirectory("spawn_agent", agent("../app-fix").merging(["project_root": .string(device)]) { $1 })
+        == "../app-fix")
+}
+
 @Test func controlToolLayerBindsOnlyForACallerWithASession() async {
     let process = controlToolLayerProcess(id: controlToolLayerOtherID)
     let answering = { @Sendable (request: CherryControlRequest) -> CherryControlResponse in

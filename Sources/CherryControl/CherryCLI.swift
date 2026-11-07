@@ -136,7 +136,7 @@ public enum CherryCLI {
 
     static let commands: [Command] = [
         Command(words: ["ls"], tool: "list_processes", usage: "cherry ls [--kind agent|terminal|command]",
-                summary: "List the project's tabs: terminals, agents and commands."),
+                summary: "List the project's tabs."),
         Command(words: ["show"], tool: "get_process_status", positionals: [.process(optional: true)],
                 usage: "cherry show [ID]", summary: "A tab's status (your own without ID)."),
         Command(words: ["read"], tool: "get_process_output", positionals: [.process(optional: true)],
@@ -151,7 +151,7 @@ public enum CherryCLI {
                 aliases: [timeout, Alias(flag: "quiet", parameter: "quiet_ms"), Alias(flag: "wait", parameter: "wait_for_idle")],
                 fallbackTool: "send_process_input",
                 usage: "cherry send ID [TEXT | -] [--no-wait]",
-                summary: "Message an agent (or type a line into a terminal); several lines arrive as one message."),
+                summary: "Message an agent (or type a line into a terminal)."),
         Command(words: ["keys"], tool: "send_process_input", positionals: [.process(optional: false), .keys],
                 fixed: ["submit": .bool(false)],
                 usage: "cherry keys ID KEY…", summary: "Press keys: up down left right enter esc tab space backspace ctrl-c, a character…"),

@@ -300,6 +300,7 @@ public enum CherryToolCatalog {
                     "run_id": string("With task: run to join; default your current one."),
                     "result_schema": object("With task: JSON Schema of the value: type, properties, required, items, enum, additionalProperties; other keywords are refused before anything is spawned."),
                     "allow_subagents": boolean("With task: it may use its CLI's subagents."),
+                    "working_directory": string("Folder to start in, e.g. a git worktree you made for it, not a new project; relative to your directory. Default: the project's."),
                     "project_root": string("Default: yours."),
                     "device": string(deviceParameter),
                     "parent_agent_id": string(defaultCallerAgent),

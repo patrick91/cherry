@@ -1508,6 +1508,7 @@ final class TerminalWorkspace: ObservableObject {
         id: UUID = UUID(),
         agent: AgentToolDefinition,
         projectRoot: String,
+        workingDirectory: String? = nil,
         title: String? = nil,
         parentAgentID: UUID? = nil,
         select: Bool = true
@@ -1517,7 +1518,11 @@ final class TerminalWorkspace: ObservableObject {
             id: unusedSessionID(id),
             index: agentSessions.count + 1,
             agent: agent,
-            workingDirectory: ProjectLocation.launchPath(forKey: projectRoot),
+            // A folder of the caller's choosing (`spawn_agent`'s
+            // `working_directory`, e.g. a worktree) keeps the project: the
+            // tab stays in this window, nested under its parent, with the
+            // project's CHERRY_PROJECT_ROOT.
+            workingDirectory: workingDirectory ?? ProjectLocation.launchPath(forKey: projectRoot),
             projectRoot: projectRoot,
             title: title,
             parentAgentID: normalizedParentAgentID,

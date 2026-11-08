@@ -25,7 +25,8 @@ final class SessionTests: XCTestCase {
 
     private func launch(_ extra: [String] = [], claude: Bool = false) {
         app = XCUIApplication()
-        app.launchArguments = ["-screen", "session:\(claude ? "demo-claude" : "demo-pi")", "-demoLongConversation", "YES", "-demoTurnSeconds", "4"] + extra
+        app.launchArguments = ["-screen", "session:\(claude ? "demo-claude" : "demo-pi")", "-demoLongConversation", "YES"] + extra
+        if !extra.contains("-demoTurnSeconds") { app.launchArguments += ["-demoTurnSeconds", "4"] }
         app.launch()
         XCTAssertTrue(list.waitForExistence(timeout: 8))
         if !claude { XCTAssertTrue(message(ending).waitForExistence(timeout: 5)) }
@@ -82,10 +83,15 @@ final class SessionTests: XCTestCase {
         XCTAssertFalse(send.isEnabled)
     }
 
-    func testKeyboardPreservesEndAndDragDismisses() {
+    func testKeyboardPreservesEnd() {
         launch(); field.tap()
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
         visible(message(ending))
+    }
+
+    func testConversationDragDismissesKeyboard() {
+        launch(); field.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
         list.swipeDown()
         wait("exists == false", on: app.keyboards.firstMatch, timeout: 3)
     }
@@ -188,7 +194,7 @@ final class SessionTests: XCTestCase {
 
     func testAssistantTextOffersCopyOrSelection() {
         launch(); message(ending).press(forDuration: 1)
-        let action = app.menuItems.matching(NSPredicate(format: "label CONTAINS[c] 'copy' OR label CONTAINS[c] 'select'")).firstMatch
+        let action = app.descendants(matching: .any).matching(NSPredicate(format: "label ==[c] 'Copy' OR label BEGINSWITH[c] 'Select'")).firstMatch
         XCTAssertTrue(action.waitForExistence(timeout: 3))
     }
 

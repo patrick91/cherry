@@ -109,7 +109,7 @@ final class AppModel {
     ) {
         self.launch = launch
         self.store = store
-        self.demo = demo ?? DemoMac(dropsAfter: launch.demoDropsAfter)
+        self.demo = demo ?? DemoMac(turnDuration: launch.demoTurnDuration, dropsAfter: launch.demoDropsAfter, longConversation: launch.demoLongConversation, incremental: launch.demoIncremental)
         self.identity = identity
         ssh = SSHMacConnector(identity: identity)
         macs = Self.macs(from: store, demoOnly: launch.demoOnly)

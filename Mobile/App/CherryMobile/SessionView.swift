@@ -238,8 +238,10 @@ struct Composer: View {
                         .background(Color(.secondarySystemBackground), in: Circle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("show-keys")
                 .accessibilityLabel(showsKeys ? "Hide Keys" : "Show Keys")
                 TextField("Reply", text: $reply, axis: .vertical)
+                    .accessibilityIdentifier("reply-field")
                     .lineLimit(1...5)
                     .textInputAutocapitalization(.sentences)
                     .focused($replyFocused)
@@ -253,6 +255,7 @@ struct Composer: View {
                 }
                 .disabled(reply.isEmpty)
                 .accessibilityLabel("Send")
+                .accessibilityIdentifier("send-reply")
             }
         }
         .disabled(!isRunning)

@@ -1,0 +1,24 @@
+#!/bin/bash
+# Runs the session UI tests on an isolated simulator, unless one is supplied.
+set -euo pipefail
+app_dir=$(cd "$(dirname "$0")/../App" && pwd)
+xcodegen=${XCODEGEN:-$(command -v xcodegen || echo "$HOME/.local/xcodegen/bin/xcodegen")}
+created=
+cleanup() {
+    if [[ -n "$created" ]]; then
+        xcrun simctl shutdown "$created" || true
+        xcrun simctl delete "$created" || true
+    fi
+}
+trap cleanup EXIT
+cd "$app_dir"
+"$xcodegen" generate --quiet
+if [[ -z "${SIMULATOR_ID:-}" ]]; then
+    runtime=$(xcrun simctl list runtimes -j | python3 -c 'import json,sys; r=[r for r in json.load(sys.stdin)["runtimes"] if r["isAvailable"] and r["identifier"].startswith("com.apple.CoreSimulator.SimRuntime.iOS-")]; print(max(r,key=lambda r:tuple(map(int,r["version"].split("."))))["identifier"])')
+    created=$(xcrun simctl create "CherryMobile-E2E-$$" com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro "$runtime")
+    SIMULATOR_ID=$created
+fi
+state=$(xcrun simctl list devices -j | python3 -c 'import json,sys; print(next(d["state"] for ds in json.load(sys.stdin)["devices"].values() for d in ds if d["udid"] == sys.argv[1]))' "$SIMULATOR_ID")
+if [[ "$state" != Booted ]]; then xcrun simctl boot "$SIMULATOR_ID"; fi
+xcrun simctl bootstatus "$SIMULATOR_ID" -b
+xcodebuild test -project CherryMobile.xcodeproj -scheme CherryMobile -configuration Debug -destination "platform=iOS Simulator,id=$SIMULATOR_ID" -derivedDataPath build/DerivedData -parallel-testing-enabled NO CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= "$@"

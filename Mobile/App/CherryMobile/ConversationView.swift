@@ -47,6 +47,7 @@ struct ConversationView: View {
                 }
                 if let question {
                     QuestionCard(menu: question, answer: answer)
+                        .accessibilityIdentifier("question-card")
                         // A new question starts unanswered.
                         .id([question.question ?? ""] + question.options.map(\.label))
                 } else if let working, loaded {
@@ -58,12 +59,14 @@ struct ConversationView: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
                     }
+                    .accessibilityIdentifier("working-row")
                     .padding(.leading, 4)
                 }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 12)
         }
+        .accessibilityIdentifier("conversation")
         .defaultScrollAnchor(.bottom, for: .initialOffset)
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
         .overlay { emptyState }
@@ -345,9 +348,11 @@ struct ToolGroupView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("more-tool-calls")
             }
             ForEach(showsAll ? tools : Array(tools.suffix(Self.shown))) { tool in
                 ToolLine(entry: tool, project: project)
+                    .accessibilityIdentifier("tool-line")
             }
         }
         .padding(.horizontal, 10)

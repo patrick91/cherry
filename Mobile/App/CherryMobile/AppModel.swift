@@ -300,6 +300,16 @@ final class AppModel {
         screenRevisions[key, default: 0] += 1
     }
 
+    /// Types `text` into the session and submits it, its Enter sent on its
+    /// own (`MacConnection.submit`).
+    func submit(_ text: String, to key: SessionKey) async throws {
+        guard let connection = connections[key.macID] else {
+            throw MacConnectionError.unreachable("not connected")
+        }
+        try await connection.submit(text, to: key.sessionID)
+        screenRevisions[key, default: 0] += 1
+    }
+
     /// Waits until the Mac listed its sessions once, at most `limit`.
     func waitUntilListed(_ macID: UUID, limit: Duration = .seconds(5)) async {
         let deadline = ContinuousClock.now + limit

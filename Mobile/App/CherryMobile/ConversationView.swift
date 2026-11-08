@@ -4,7 +4,7 @@ import SwiftUI
 /// An agent's conversation, read from its own session on the Mac (`cherry
 /// host transcript`): the latest messages and tool calls, then what comes
 /// after them every few seconds, kept to the bottom, and a menu its screen
-/// asks with under them.
+/// asks with under them (`ConversationList`).
 struct ConversationView: View {
     @Environment(AppModel.self) private var model
     let key: SessionKey
@@ -18,6 +18,9 @@ struct ConversationView: View {
     /// The menu the agent's screen shows (a permission prompt, a question),
     /// answered in place.
     let question: ScreenMenu?
+    /// Goes up each time a reply is sent: the list goes to its end, and the
+    /// conversation is read again soon.
+    let endRequests: Int
     let answer: @MainActor ([MobileKey]) async -> Void
     let showScreen: () -> Void
 
@@ -29,43 +32,12 @@ struct ConversationView: View {
     private static let limit = 150
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 14) {
-                if conversation.moreBefore {
-                    Text("Earlier messages aren't shown.")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                        .frame(maxWidth: .infinity)
-                }
-                ForEach(ConversationRow.rows(of: conversation.entries)) { row in
-                    switch row {
-                    case .entry(let entry):
-                        MessageView(entry: entry)
-                    case .tools(let tools):
-                        ToolGroupView(tools: tools, project: project)
-                    }
-                }
-                if let question {
-                    QuestionCard(menu: question, answer: answer)
-                        // A new question starts unanswered.
-                        .id([question.question ?? ""] + question.options.map(\.label))
-                } else if let working, loaded {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text(working.isEmpty ? "Working…" : "Working · \(working)")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
-                    .padding(.leading, 4)
-                }
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-        }
-        .defaultScrollAnchor(.bottom, for: .initialOffset)
-        .defaultScrollAnchor(.bottom, for: .sizeChanges)
+        ConversationList(
+            items: ConversationItem.items(of: conversation, question: question, working: loaded ? working : nil),
+            project: project,
+            endRequests: endRequests,
+            answer: answer
+        )
         .overlay { emptyState }
         .overlay(alignment: .bottom) {
             if let note = reconnecting ?? (loaded && (!conversation.entries.isEmpty || question != nil) ? problem?.localizedDescription : nil) {
@@ -79,6 +51,13 @@ struct ConversationView: View {
         // Again on a new connection (the Mac reconnected).
         .task(id: model.connection(for: key.macID).map(ObjectIdentifier.init)) {
             await follow()
+        }
+        // A reply sent: its message shows without waiting for the next read.
+        .task(id: endRequests) {
+            guard endRequests > 0 else { return }
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled else { return }
+            await load()
         }
     }
 
@@ -156,6 +135,8 @@ struct QuestionCard: View {
         .padding(12)
         .background(Color.accentColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.accentColor.opacity(0.3)))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("question-card")
     }
 
     private func optionButton(_ option: ScreenMenu.Option) -> some View {
@@ -322,11 +303,15 @@ struct MarkdownView: View {
 }
 
 /// A run of tool calls between messages: one line each, the latest few
-/// shown and the rest a tap away.
+/// shown and the rest a tap away. The list keeps which are open.
 struct ToolGroupView: View {
     let tools: [TranscriptEntry]
     let project: String?
-    @State private var showsAll = false
+    let showsAll: Bool
+    /// Tool calls showing their result, by entry id.
+    let expanded: Set<String>
+    let showAll: () -> Void
+    let toggle: (String) -> Void
 
     private static let shown = 3
 
@@ -334,9 +319,7 @@ struct ToolGroupView: View {
         VStack(alignment: .leading, spacing: 0) {
             if tools.count > Self.shown, !showsAll {
                 let hidden = tools.count - Self.shown
-                Button {
-                    withAnimation(.snappy) { showsAll = true }
-                } label: {
+                Button(action: showAll) {
                     Label("\(hidden) more tool call\(hidden == 1 ? "" : "s")", systemImage: "chevron.up")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -345,9 +328,12 @@ struct ToolGroupView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("more-tool-calls")
             }
             ForEach(showsAll ? tools : Array(tools.suffix(Self.shown))) { tool in
-                ToolLine(entry: tool, project: project)
+                ToolLine(entry: tool, project: project, expanded: expanded.contains(tool.id)) {
+                    toggle(tool.id)
+                }
             }
         }
         .padding(.horizontal, 10)
@@ -361,14 +347,13 @@ struct ToolGroupView: View {
 struct ToolLine: View {
     let entry: TranscriptEntry
     let project: String?
-    @State private var expanded = false
+    let expanded: Bool
+    let toggle: () -> Void
 
     var body: some View {
         let shown = ToolPresentation(entry, project: project)
         VStack(alignment: .leading, spacing: 4) {
-            Button {
-                withAnimation(.snappy) { expanded.toggle() }
-            } label: {
+            Button(action: toggle) {
                 HStack(spacing: 8) {
                     Image(systemName: shown.symbol)
                         .font(.caption)
@@ -385,6 +370,7 @@ struct ToolLine: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("tool-line")
             if expanded, let result = entry.result, !result.isEmpty {
                 ScrollView([.horizontal, .vertical]) {
                     Text(result)

@@ -24,6 +24,22 @@ import Testing
     #expect(screen.lines.contains { $0.contains("tests passed") })
 }
 
+@Test func aDemoAgentTakesTextAndEnterInOneInputAsAPaste() async throws {
+    let connection = try await DemoMac(turnDuration: .seconds(60)).connect(to: DemoMac.endpoint)
+    try await connection.send([.text("hello"), .enter], to: "demo-pi")
+    #expect(try await connection.sessions().first { $0.id == "demo-pi" }?.attention == .resultReady)
+    #expect(try await connection.screen(of: "demo-pi").lines.last == "› hello\n")
+}
+
+@Test func aSubmittedReplyReachesTheDemoAgentAsATurn() async throws {
+    let connection = try await DemoMac(turnDuration: .seconds(60)).connect(to: DemoMac.endpoint)
+    try await connection.submit("hello", to: "demo-pi")
+    #expect(try await connection.sessions().first { $0.id == "demo-pi" }?.attention == .working)
+    let read = try await connection.transcript(of: "demo-pi", after: nil, limit: 10)
+    #expect(read.entries.last?.kind == .user)
+    #expect(read.entries.last?.text == "hello")
+}
+
 @Test func aDigitAloneAnswersTheDemoMenuAsClaudesDo() async throws {
     let connection = try await DemoMac(turnDuration: .seconds(60)).connect(to: DemoMac.endpoint)
     let menu = try #require(ScreenMenu.find(in: try await connection.screen(of: "demo-claude").lines))

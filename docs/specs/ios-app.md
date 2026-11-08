@@ -102,6 +102,14 @@ phone. Only agents running in a session count, and the same lookup gives the
 agent's own session id, with which the Mac app can later resume an agent
 after a reboot.
 
+The phone shows them in a `UICollectionView` laid out by
+[ChatLayout](https://github.com/ekazaev/ChatLayout) (`ConversationList`),
+each row SwiftUI, because SwiftUI's scroll views can't keep their place while
+rows change or scroll exactly to a row they haven't laid out. It opens at
+the end, follows the end as entries come, change or the keyboard opens while
+the end is on screen, leaves what's on screen still while the person reads
+further up, and goes to the end when they send a reply.
+
 ### Agent state (attention)
 
 The phone reads each session's program status from the host, as the Mac
@@ -129,7 +137,10 @@ host reports for the program (`kitty_keyboard_flags`,
 Mac: arrows as `ESC O x` under application cursor keys unless the kitty
 flags are on, Tab as `CSI 9 u` when they report every key, and a reply of
 several lines as one bracketed paste, unless the program turned bracketed
-paste off.
+paste off. A reply is its text, then Enter on its own 150 ms later
+(`MacConnection.submit`), as the Mac's Cherry submits a message: an agent
+such as Claude Code takes text and an Enter that arrive together as a paste,
+and the Enter only starts a new line in its composer.
 
 ### Full terminal
 

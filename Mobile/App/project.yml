@@ -11,6 +11,10 @@ packages:
     path: ../CherryMobileKit
   GhosttyKit:
     path: ../../ThirdParty/libghostty-spm
+  # The conversation's collection view layout (ConversationList.swift).
+  ChatLayout:
+    url: https://github.com/ekazaev/ChatLayout
+    exactVersion: 2.5.2
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -26,6 +30,8 @@ targets:
       - package: CherryMobileKit
       - package: GhosttyKit
         product: GhosttyTerminal
+      - package: ChatLayout
+        product: ChatLayout
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.patrick.cherry.mobile

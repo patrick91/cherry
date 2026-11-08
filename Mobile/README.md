@@ -130,7 +130,9 @@ Screens:
 - **Session:** for an agent, its conversation by default: what the Mac's
   `cherry host transcript` reads from the agent's own session (Claude Code,
   Codex, Pi, Amp; Host/README.md), followed every 2 s (5 s for Amp) from
-  its cursor. Messages are Markdown (`Markdown.blocks`: paragraphs,
+  its cursor, in a collection view laid out by ChatLayout
+  (`ConversationList`: it opens at the end, follows the end while it's on
+  screen, and keeps still while you read further up). Messages are Markdown (`Markdown.blocks`: paragraphs,
   headings, lists, code, tables as code, quotes); each run of tool calls is
   one group of one-line rows, a verb and what it acted on with paths
   relative to the session's folder (`ToolPresentation`, `DisplayPath`),
@@ -143,7 +145,8 @@ Screens:
   the session's width (scrolling sideways, for its boxes), a terminal's or
   command's wrapped at the phone's (the host joins wrapped rows, so it
   reflows; the toolbar switches back to the session's width). Under either is the composer: on the screen, its menu as
-  compact buttons, a reply field (text, then Enter) and, behind the
+  compact buttons, a reply field (Return starts a new line; Send types the
+  text, then Enter on its own 150 ms later, `MacConnection.submit`) and, behind the
   keyboard button, keys: Esc, arrows, Enter, Tab, ⌃C. The program's status
   shows in the inbox, not here. A Mac whose `cherry` predates
   `host transcript` says to update Cherry there.

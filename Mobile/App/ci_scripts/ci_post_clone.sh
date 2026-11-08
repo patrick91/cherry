@@ -3,9 +3,9 @@
 # beside the project). The project is xcodegen's and git-ignored, so it is
 # generated here. Xcode Cloud resolves no packages itself
 # (-disableAutomaticPackageResolution) and wants the project's own
-# Package.resolved, so the kit's (the app's only remote packages come through
-# it) is copied in and resolved once, which keeps its pins and writes the
-# project's origin hash.
+# Package.resolved, so the kit's is copied in and resolved once, which keeps
+# its pins, adds ChatLayout's (the app's one remote package of its own, at an
+# exact version in project.yml) and writes the project's origin hash.
 set -eu
 
 app_dir=$(cd "$(dirname "$0")/.." && pwd)

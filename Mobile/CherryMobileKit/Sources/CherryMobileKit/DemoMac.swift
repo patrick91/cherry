@@ -149,6 +149,10 @@ public actor DemoMacConnection: MacConnection {
         guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else {
             throw MacConnectionError.sessionGone(sessionID)
         }
+        // An agent takes text and an Enter typed in one input as a paste,
+        // as Claude Code does: the Enter starts a new line in the draft.
+        let isAgent = if case .agent = sessions[index].kind { true } else { false }
+        var pasting = false
         for key in keys {
             switch key {
             case .text(let text):
@@ -156,11 +160,14 @@ public actor DemoMacConnection: MacConnection {
                     choose(digit, at: index)
                 } else {
                     drafts[sessionID, default: ""] += text
+                    pasting = true
                 }
             case .backspace:
                 _ = drafts[sessionID]?.popLast()
             case .controlC, .escape:
                 drafts[sessionID] = nil
+            case .enter where pasting && isAgent:
+                drafts[sessionID, default: ""] += "\n"
             case .enter:
                 submit(at: index)
             case .tab, .up, .down, .left, .right:

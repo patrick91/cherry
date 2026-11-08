@@ -44,6 +44,18 @@ public protocol MacConnection: AnyObject, Sendable {
     func disconnect() async
 }
 
+extension MacConnection {
+    /// Types `text` into the session and submits it: the text, then Enter
+    /// on its own `MobileKey.submitPause` later. Sent as one input, an
+    /// agent such as Claude Code takes both as a paste, and the Enter only
+    /// starts a new line in its composer.
+    public func submit(_ text: String, to sessionID: String) async throws {
+        try await send([.text(text)], to: sessionID)
+        try? await Task.sleep(for: MobileKey.submitPause)
+        try await send([.enter], to: sessionID)
+    }
+}
+
 /// A terminal attached to a session (`cherry attach` on the Mac): its
 /// output for a `UITerminalView`, and the bytes typed into it.
 public protocol TerminalAttachment: AnyObject, Sendable {

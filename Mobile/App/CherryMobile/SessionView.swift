@@ -13,6 +13,11 @@ struct SessionView: View {
     @State private var problem: String?
     @State private var showsScreen = false
     @State private var wrapsLines = true
+    /// Goes up each time a reply is sent, so the conversation goes to its end.
+    @State private var endRequests = 0
+    /// Why the last reply or key didn't reach the session, shown above the
+    /// composer.
+    @State private var sendProblem: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -22,7 +27,8 @@ struct SessionView: View {
                     project: session?.directory,
                     working: session?.attention == .working ? (session?.detail ?? "") : nil,
                     reconnecting: reconnecting,
-                    question: menu
+                    question: menu,
+                    endRequests: endRequests
                 ) { keys in
                     await send(keys)
                 } showScreen: {
@@ -31,8 +37,14 @@ struct SessionView: View {
             } else {
                 ScreenTextView(screen: screen, problem: reconnecting ?? problem, wraps: !isAgent && wrapsLines)
             }
-            Composer(menu: showsConversation ? nil : menu, isRunning: session?.isRunning ?? true) { keys in
+            Composer(
+                menu: showsConversation ? nil : menu,
+                isRunning: session?.isRunning ?? true,
+                problem: sendProblem
+            ) { keys in
                 await send(keys)
+            } submit: { text in
+                await submit(text)
             }
         }
         .navigationTitle(session?.title ?? "Session")
@@ -127,9 +139,25 @@ struct SessionView: View {
     private func send(_ keys: [MobileKey]) async {
         do {
             try await model.send(keys, to: key)
+            sendProblem = nil
             await reload()
         } catch {
-            problem = error.localizedDescription
+            sendProblem = error.localizedDescription
+        }
+    }
+
+    /// Sends a reply and goes to the conversation's end; false when it
+    /// didn't reach the session, so the composer keeps it.
+    private func submit(_ text: String) async -> Bool {
+        endRequests += 1
+        do {
+            try await model.submit(text, to: key)
+            sendProblem = nil
+            await reload()
+            return true
+        } catch {
+            sendProblem = error.localizedDescription
+            return false
         }
     }
 }
@@ -198,11 +226,15 @@ struct ScreenTextView: View {
 /// Answers without opening a terminal: the menu the screen shows as
 /// buttons, the keys a terminal has (behind a button), and a reply field.
 /// What the program says it does is the inbox's: the conversation and the
-/// screen show it.
+/// screen show it. Return starts a new line; the button sends.
 struct Composer: View {
     let menu: ScreenMenu?
     let isRunning: Bool
+    /// Why the last reply or key didn't reach the session.
+    let problem: String?
     let send: @MainActor ([MobileKey]) async -> Void
+    /// Sends a reply; false when it didn't reach the session.
+    let submit: @MainActor (String) async -> Bool
 
     @State private var reply = ""
     @State private var showsKeys = false
@@ -210,6 +242,12 @@ struct Composer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if let problem {
+                Label(problem, systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .accessibilityIdentifier("send-problem")
+            }
             if let menu {
                 MenuCard(menu: menu, send: send)
             }
@@ -239,6 +277,7 @@ struct Composer: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(showsKeys ? "Hide Keys" : "Show Keys")
+                .accessibilityIdentifier("show-keys")
                 TextField("Reply", text: $reply, axis: .vertical)
                     .lineLimit(1...5)
                     .textInputAutocapitalization(.sentences)
@@ -246,13 +285,14 @@ struct Composer: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                     .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
-                    .onSubmit(sendReply)
+                    .accessibilityIdentifier("reply-field")
                 Button(action: sendReply) {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.system(size: 32))
                 }
-                .disabled(reply.isEmpty)
+                .disabled(trimmedReply.isEmpty)
                 .accessibilityLabel("Send")
+                .accessibilityIdentifier("send-reply")
             }
         }
         .disabled(!isRunning)
@@ -262,11 +302,22 @@ struct Composer: View {
         .background(.bar)
     }
 
+    private var trimmedReply: String {
+        reply.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Sends the reply, its Enter on its own (`MacConnection.submit`). A
+    /// reply that didn't reach the session comes back to the field, unless
+    /// something else was typed meanwhile.
     private func sendReply() {
-        let text = reply
+        let text = trimmedReply
         guard !text.isEmpty else { return }
         reply = ""
-        Task { await send([.text(text), .enter]) }
+        Task {
+            if await !submit(text), reply.isEmpty {
+                reply = text
+            }
+        }
     }
 }
 

@@ -188,6 +188,11 @@ public enum MobileKey: Hashable, Sendable {
     case right
     case controlC
 
+    /// Between a reply's text and the Enter that submits it
+    /// (`MacConnection.submit`), as the Mac's Cherry waits
+    /// (`terminalSubmitPause`).
+    public static let submitPause: Duration = .milliseconds(150)
+
     /// The bytes a terminal in legacy key mode types for it.
     public var bytes: Data { bytes(in: KeyModes()) }
 

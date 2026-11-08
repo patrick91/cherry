@@ -11,6 +11,8 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 cd "$app_dir"
 "$xcodegen" generate --quiet
 if [[ -z "${SIMULATOR_ID:-}" ]]; then

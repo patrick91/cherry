@@ -109,9 +109,15 @@ final class SessionTests: XCTestCase {
         launch(["-demoIncremental", "YES", "-demoTurnSeconds", "10"])
         reply("Read while working")
         list.swipeDown(); list.swipeDown()
-        let anchor = app.staticTexts.allElementsBoundByIndex.first { $0.label.hasPrefix("History message") && $0.isHittable }!
+        guard let anchor = app.staticTexts.allElementsBoundByIndex.first(where: { $0.label.hasPrefix("History message") && $0.isHittable }) else {
+            return XCTFail("Scrolling up should reveal a history message")
+        }
         let before = anchor.frame
-        wait("exists == false", on: app.descendants(matching: .any)["working-row"].firstMatch, timeout: 14)
+        let moved = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            !anchor.exists || abs(anchor.frame.minY - before.minY) > 2
+        }, object: anchor)
+        moved.isInverted = true
+        XCTAssertEqual(XCTWaiter.wait(for: [moved], timeout: 12), .completed)
         XCTAssertEqual(anchor.frame.minY, before.minY, accuracy: 2)
         XCTAssertFalse(answer("Read while working").isHittable)
     }
@@ -132,7 +138,9 @@ final class SessionTests: XCTestCase {
         more.tap()
         let rows = app.descendants(matching: .any).matching(identifier: "tool-line")
         XCTAssertGreaterThan(rows.count, before)
-        let row = rows.allElementsBoundByIndex.first { $0.isHittable }!
+        guard let row = rows.allElementsBoundByIndex.first(where: { $0.isHittable }) else {
+            return XCTFail("Expanded tools should have a visible row")
+        }
         let oldHeight = row.frame.height
         row.tap()
         wait("frame.size.height > \(oldHeight)", on: row, timeout: 3)

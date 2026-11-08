@@ -60,11 +60,11 @@ final class SessionTests: XCTestCase {
     func testOpeningShowsEnd() { launch(); visible(message(ending)) }
 
     func testSendSubmitsAndFollowsAnswer() {
-        launch()
+        launch(["-demoTurnSeconds", "8"])
         reply("UI reply")
+        XCTAssertTrue(app.descendants(matching: .any)["working-row"].firstMatch.waitForExistence(timeout: 4))
         XCTAssertTrue(message("UI reply").waitForExistence(timeout: 4))
         wait("value == '' OR value == 'Reply'", on: field, timeout: 3)
-        XCTAssertTrue(app.descendants(matching: .any)["working-row"].firstMatch.waitForExistence(timeout: 3))
         XCTAssertTrue(answer("UI reply").waitForExistence(timeout: 8))
         visible(answer("UI reply"))
     }

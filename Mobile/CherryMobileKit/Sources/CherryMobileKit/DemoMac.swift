@@ -17,13 +17,18 @@ public struct DemoMac: MacConnector {
     /// network would (to show reconnecting).
     public let dropsAfter: Duration?
 
-    public init(turnDuration: Duration = .seconds(4), dropsAfter: Duration? = nil) {
+    public let longConversation: Bool
+    public let incremental: Bool
+
+    public init(turnDuration: Duration = .seconds(4), dropsAfter: Duration? = nil, longConversation: Bool = false, incremental: Bool = false) {
         self.turnDuration = turnDuration
         self.dropsAfter = dropsAfter
+        self.longConversation = longConversation
+        self.incremental = incremental
     }
 
     public func connect(to endpoint: MacEndpoint) async throws -> any MacConnection {
-        let connection = DemoMacConnection(endpoint: endpoint, turnDuration: turnDuration)
+        let connection = DemoMacConnection(endpoint: endpoint, turnDuration: turnDuration, longConversation: longConversation, incremental: incremental)
         if let dropsAfter {
             Task { [weak connection] in
                 try? await Task.sleep(for: dropsAfter)
@@ -37,6 +42,7 @@ public struct DemoMac: MacConnector {
 public actor DemoMacConnection: MacConnection {
     public nonisolated let endpoint: MacEndpoint
     private let turnDuration: Duration
+    private let incremental: Bool
     private var sessions: [MobileSession]
     private var screens: [String: [String]]
     private var drafts: [String: String] = [:]
@@ -52,7 +58,9 @@ public actor DemoMacConnection: MacConnection {
     private var toolsAwaitingApproval = ["demo-claude": "c5"]
     private var nextEntry = 0
 
-    init(endpoint: MacEndpoint, turnDuration: Duration) {
+    init(endpoint: MacEndpoint, turnDuration: Duration, longConversation: Bool = false, incremental: Bool = false) {
+        self.incremental = incremental
+        if longConversation { conversations["demo-pi"] = Self.longHistory }
         self.endpoint = endpoint
         self.turnDuration = turnDuration
         let mac = endpoint.id
@@ -363,7 +371,15 @@ public actor DemoMacConnection: MacConnection {
         sessions[index].detail = nil
         let duration = turnDuration
         Task {
-            try? await Task.sleep(for: duration)
+            if incremental {
+                for step in 1...2 {
+                    try? await Task.sleep(for: duration / 3)
+                    self.record(TranscriptEntry(id: self.entryID(), kind: .tool, name: "Read", summary: "Streaming file \(step).swift", result: "Streaming result \(step)", status: .ok), in: id)
+                }
+                try? await Task.sleep(for: duration / 3)
+            } else {
+                try? await Task.sleep(for: duration)
+            }
             self.finishTurn(id, answer: answer)
         }
     }
@@ -404,6 +420,18 @@ public actor DemoMacConnection: MacConnection {
     private func entryID() -> String {
         nextEntry += 1
         return "demo-\(nextEntry)"
+    }
+
+    /// A varied history that makes scrolling and expanding tools observable.
+    private static var longHistory: [TranscriptEntry] {
+        (0..<200).map { index in
+            let id = "history-\(index)"
+            if index == 199 { return TranscriptEntry(id: id, kind: .assistant, text: "History end. Ready for your reply.") }
+            if (index % 10) >= 3 && (index % 10) <= 7 {
+                return TranscriptEntry(id: id, kind: .tool, name: "Read", summary: "History file \(index).swift", result: "History result \(index)\nSecond result line", status: .ok)
+            }
+            return TranscriptEntry(id: id, kind: index % 2 == 0 ? .user : .assistant, text: "History message \(index). Reading this paragraph takes several lines on a phone. It describes the changes and their verification.\n\nAnother paragraph with context for the reader.\n\n```swift\nlet entry = \(index)\nprint(entry)\n```")
+        }
     }
 
     /// What the demo's agents said before the app connected.

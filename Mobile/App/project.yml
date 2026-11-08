@@ -20,6 +20,9 @@ settings:
     SWIFT_VERSION: "6.0"
     MARKETING_VERSION: "0.1"
     CURRENT_PROJECT_VERSION: "1"
+  configs:
+    Debug:
+      ONLY_ACTIVE_ARCH: YES
 targets:
   CherryMobile:
     type: application
@@ -57,10 +60,26 @@ targets:
         CODE_SIGN_STYLE: Automatic
         SWIFT_STRICT_CONCURRENCY: complete
         ENABLE_USER_SCRIPT_SANDBOXING: YES
+  CherryMobileUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: CherryMobileUITests
+    dependencies:
+      - target: CherryMobile
+    settings:
+      base:
+        PRODUCT_NAME: CherryMobileUITests
+        PRODUCT_BUNDLE_IDENTIFIER: dev.patrick.cherry.mobile.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: CherryMobile
 schemes:
   CherryMobile:
     build:
       targets:
         CherryMobile: all
+    test:
+      targets:
+        - CherryMobileUITests
     run:
       config: Debug

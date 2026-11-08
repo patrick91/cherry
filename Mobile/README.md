@@ -204,3 +204,27 @@ Tests never reach the user's real Macs, daemon or Cherry:
 
 CI (`.github/workflows/mobile.yml`) runs the kit tests, `test-loopback` and
 `build-app` on macOS.
+
+## Session UI tests
+
+`Mobile/Scripts/e2e` generates the project and runs `CherryMobileUITests`
+against only the Demo Mac. It needs Xcode, an installed iOS simulator
+runtime, the iPhone 17 Pro device type, and xcodegen (on PATH, at
+`~/.local/xcodegen/bin/xcodegen`, or named by `XCODEGEN`). It creates, boots
+and removes its own simulator, including on failure. `SIMULATOR_ID` uses
+an existing simulator and leaves it intact and running.
+
+```bash
+Mobile/Scripts/e2e -resultBundlePath /tmp/cherry-session-tests.xcresult
+Mobile/Scripts/e2e -only-testing:CherryMobileUITests/SessionTests/testOpeningShowsEnd
+```
+
+Results include a screenshot after every test. Export them with
+`xcrun xcresulttool export attachments --path RESULT --output-path DIR`.
+The generated project stays untracked. Test runs are signed ad hoc and use
+`Mobile/App/build/DerivedData`. The `CherryMobile` scheme runs the UI target.
+
+The session scenarios use `-screen session:demo-pi` with
+`-demoLongConversation YES` for 200 mixed entries, `-demoTurnSeconds N` for
+the turn duration, and `-demoIncremental YES` for two tool calls arriving
+separately before the answer. `demo-claude` retains its approval menu.

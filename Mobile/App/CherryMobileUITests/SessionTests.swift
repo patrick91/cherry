@@ -50,6 +50,8 @@ final class SessionTests: XCTestCase {
     private func reply(_ text: String) {
         field.tap()
         field.typeText(text)
+        let typed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", text), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [typed], timeout: 3), .completed)
         send.tap()
     }
 
@@ -74,7 +76,8 @@ final class SessionTests: XCTestCase {
         XCTAssertFalse(message("First line").exists)
         send.tap()
         XCTAssertTrue(message("First line\nSecond line").waitForExistence(timeout: 4))
-        XCTAssertTrue(answer("First line\nSecond line").waitForExistence(timeout: 8))
+        let response = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@ AND label CONTAINS %@", "(pi in the demo) Done: First line", "Second line")).firstMatch
+        XCTAssertTrue(response.waitForExistence(timeout: 8))
     }
 
     func testEmptyAndWhitespaceDisableSend() {
@@ -99,7 +102,7 @@ final class SessionTests: XCTestCase {
     func testConversationTapDismissesKeyboard() {
         launch(); field.tap()
         XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
-        message(ending).tap()
+        list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4)).tap()
         wait("exists == false", on: app.keyboards.firstMatch, timeout: 3)
     }
 
@@ -144,19 +147,22 @@ final class SessionTests: XCTestCase {
             list.swipeDown()
         }
         guard let more else { return XCTFail("Scrolling should reveal a collapsed tool group") }
-        let before = app.descendants(matching: .any).matching(identifier: "tool-line").count
+        let before = app.buttons.matching(identifier: "tool-line").count
         more.tap()
-        let rows = app.descendants(matching: .any).matching(identifier: "tool-line")
+        let rows = app.buttons.matching(identifier: "tool-line")
         XCTAssertGreaterThan(rows.count, before)
-        guard let row = rows.allElementsBoundByIndex.first(where: { $0.isHittable }) else {
-            return XCTFail("Expanded tools should have a visible row")
-        }
-        let oldHeight = row.frame.height
-        row.tap()
-        wait("frame.size.height > \(oldHeight)", on: row, timeout: 3)
         let visibleRows = rows.allElementsBoundByIndex.filter { $0.isHittable }.sorted { $0.frame.minY < $1.frame.minY }
-        for (a, b) in zip(visibleRows, visibleRows.dropFirst()) { XCTAssertLessThanOrEqual(a.frame.maxY, b.frame.minY + 1) }
-        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "History result")).firstMatch.exists)
+        guard visibleRows.count >= 2 else { return XCTFail("Expanded tools should have two visible rows") }
+        let row = visibleRows[0]
+        let following = app.buttons.matching(identifier: "tool-line").matching(NSPredicate(format: "label == %@", visibleRows[1].label)).firstMatch
+        let previousY = following.frame.minY
+        row.tap()
+        let result = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "History result")).firstMatch
+        XCTAssertTrue(result.waitForExistence(timeout: 3))
+        XCTAssertGreaterThan(following.frame.minY, previousY)
+        let expandedRows = rows.allElementsBoundByIndex.filter { $0.isHittable }.sorted { $0.frame.minY < $1.frame.minY }
+        for (a, b) in zip(expandedRows, expandedRows.dropFirst()) { XCTAssertLessThanOrEqual(a.frame.maxY, b.frame.minY + 1) }
+        XCTAssertLessThanOrEqual(result.frame.maxY, following.frame.minY + 1)
     }
 
     func testApprovalStartsTurnAndAnswers() {

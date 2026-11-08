@@ -60,6 +60,7 @@ targets:
       - target: CherryMobile
     settings:
       base:
+        PRODUCT_NAME: CherryMobileUITests
         PRODUCT_BUNDLE_IDENTIFIER: dev.patrick.cherry.mobile.uitests
         GENERATE_INFOPLIST_FILE: YES
         TEST_TARGET_NAME: CherryMobile

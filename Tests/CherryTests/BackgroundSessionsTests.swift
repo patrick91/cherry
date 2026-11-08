@@ -2630,12 +2630,15 @@ private let backgroundSessionsLinePlural = "Open or end them from Background Ses
 }
 
 /// A tab's notification names its project (and its Mac, when it is not
-/// This Mac) in the subtitle, as a background session's does, so a
-/// "Finished." from one of several projects says which.
-@Test func aTabsNotificationSubtitleNamesItsProjectAndItsMac() {
-    #expect(TerminalNotificationCenter.tabSubtitle(projectRoot: "/Users/me/github/cherry", machine: nil) == "cherry")
-    #expect(TerminalNotificationCenter.tabSubtitle(projectRoot: "/Users/me/github/cherry", machine: "") == "cherry")
+/// This Mac) before the tab's title, as a background session's names it, so
+/// a "Finished." from one of several projects says which.
+@Test func aTabsNotificationTitleNamesItsProjectAndItsMac() {
+    let center = TerminalNotificationCenter.self
+    #expect(center.tabTitle("Claude Code", projectRoot: "/Users/me/github/duck", machine: nil) == "duck · Claude Code")
+    #expect(center.tabTitle("Claude Code", projectRoot: "/Users/me/github/duck", machine: "") == "duck · Claude Code")
     let deviceKey = ProjectLocation.remote(deviceID: UUID(), path: "/Users/me/site").key
-    #expect(TerminalNotificationCenter.tabSubtitle(projectRoot: deviceKey, machine: "patmini") == "site on patmini")
-    #expect(TerminalNotificationCenter.tabSubtitle(projectRoot: HomePlace.thisMacKey, machine: nil) == "Home")
+    #expect(center.tabTitle("zsh", projectRoot: deviceKey, machine: "patmini") == "site on patmini · zsh")
+    #expect(center.tabTitle("zsh", projectRoot: HomePlace.thisMacKey, machine: nil) == "Home · zsh")
+    // A tab with no title: the project alone, no dangling separator.
+    #expect(center.tabTitle("", projectRoot: "/Users/me/github/duck", machine: nil) == "duck")
 }

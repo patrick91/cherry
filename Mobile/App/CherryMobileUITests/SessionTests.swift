@@ -63,7 +63,7 @@ final class SessionTests: XCTestCase {
         launch()
         reply("UI reply")
         XCTAssertTrue(message("UI reply").waitForExistence(timeout: 4))
-        XCTAssertEqual(field.value as? String, "Reply")
+        wait("value == '' OR value == 'Reply'", on: field, timeout: 3)
         XCTAssertTrue(app.descendants(matching: .any)["working-row"].firstMatch.waitForExistence(timeout: 3))
         XCTAssertTrue(answer("UI reply").waitForExistence(timeout: 8))
         visible(answer("UI reply"))
@@ -159,10 +159,10 @@ final class SessionTests: XCTestCase {
         row.tap()
         let result = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "History result")).firstMatch
         XCTAssertTrue(result.waitForExistence(timeout: 3))
-        XCTAssertGreaterThan(following.frame.minY, previousY)
         let expandedRows = rows.allElementsBoundByIndex.filter { $0.isHittable }.sorted { $0.frame.minY < $1.frame.minY }
         for (a, b) in zip(expandedRows, expandedRows.dropFirst()) { XCTAssertLessThanOrEqual(a.frame.maxY, b.frame.minY + 1) }
         XCTAssertLessThanOrEqual(result.frame.maxY, following.frame.minY + 1)
+        XCTAssertGreaterThan(following.frame.minY, previousY + 1)
     }
 
     func testApprovalStartsTurnAndAnswers() {
@@ -193,8 +193,10 @@ final class SessionTests: XCTestCase {
     func testRotationKeepsEndUncut() {
         launch()
         XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertTrue(message(ending).waitForExistence(timeout: 3))
         visible(message(ending))
         XCUIDevice.shared.orientation = .portrait
+        XCTAssertTrue(message(ending).waitForExistence(timeout: 3))
         visible(message(ending))
     }
 

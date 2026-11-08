@@ -149,6 +149,7 @@ final class ConversationListController: UIViewController {
         // buttons still get it.
         let tap = UITapGestureRecognizer(target: self, action: #selector(didTap))
         tap.cancelsTouchesInView = false
+        tap.delegate = self
         collectionView.addGestureRecognizer(tap)
 
         view = collectionView
@@ -308,6 +309,17 @@ extension ConversationListController: UICollectionViewDelegate {
 
     func scrollViewDidScrollToTop(_ scrollView: UIScrollView) {
         followsEnd = false
+    }
+}
+
+extension ConversationListController: UIGestureRecognizerDelegate {
+    /// The tap that puts the keyboard away never keeps a row's own button
+    /// from taking the same tap.
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        true
     }
 }
 

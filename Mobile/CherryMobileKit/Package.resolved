@@ -1,6 +1,15 @@
 {
-  "originHash" : "42d787462c25b5ee6b852afd8091a95303a98a62bf5280f9a237cef50dfc34ab",
+  "originHash" : "38a6f3846a06f9abcd89219d5921864e86c4f067d2b5273fad5039cd38cb8dd5",
   "pins" : [
+    {
+      "identity" : "chatlayout",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ekazaev/ChatLayout",
+      "state" : {
+        "revision" : "dd4cb5c8f91623331ba023d0ab64d844f8436204",
+        "version" : "2.5.2"
+      }
+    },
     {
       "identity" : "swift-asn1",
       "kind" : "remoteSourceControl",

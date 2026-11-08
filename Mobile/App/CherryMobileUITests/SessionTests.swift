@@ -131,9 +131,13 @@ final class SessionTests: XCTestCase {
 
     func testToolExpansionMovesRowsWithoutOverlap() {
         launch()
-        let more = app.buttons["more-tool-calls"].firstMatch
-        for _ in 0..<5 { if more.isHittable { break }; list.swipeDown() }
-        XCTAssertTrue(more.isHittable)
+        var more: XCUIElement?
+        for _ in 0..<5 {
+            more = app.buttons.matching(identifier: "more-tool-calls").allElementsBoundByIndex.first { $0.isHittable }
+            if more != nil { break }
+            list.swipeDown()
+        }
+        guard let more else { return XCTFail("Scrolling should reveal a collapsed tool group") }
         let before = app.descendants(matching: .any).matching(identifier: "tool-line").count
         more.tap()
         let rows = app.descendants(matching: .any).matching(identifier: "tool-line")

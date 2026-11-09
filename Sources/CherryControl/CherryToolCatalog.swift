@@ -363,7 +363,7 @@ public enum CherryToolCatalog {
             ),
             tool(
                 "send_agent_message",
-                "Message an agent and wait until it is idle. Never typed into a permission prompt (agent_awaiting_permission) or a question (agent_awaiting_input): nothing is sent; use answer_prompt. For long work, send with wait_for_idle false, subscribe and end your turn.",
+                "Message an agent and wait until it is idle. Never typed into a permission prompt (agent_awaiting_permission) or a question (agent_awaiting_input): nothing is sent; use answer_prompt. When it returns before the agent's turn ended (timed out, or wait_for_idle false), Cherry watches that turn for you (reply_watch) and types a line into your tab when it ends: end your turn.",
                 properties: processSelectorProperties([
                     "message": string("Enter is added."),
                     "wait_for_idle": boolean(defaultTrue),

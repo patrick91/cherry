@@ -18,6 +18,15 @@ import Foundation
 // event counts, never a watched process's text. Subscriptions live in
 // memory: a relaunch of Cherry ends them (`unknown_subscription`), and
 // callers subscribe again.
+//
+// A reply watch is a subscription Cherry makes by itself: an agent tab it
+// confirmed is the caller submitted a message to another agent (`send`,
+// `answer`), and no wait of the caller's saw that turn end. It watches
+// that agent until its turn ends (done, error, exited, closed; a question
+// on the way is told and watched past), wakes the caller as any
+// subscription does, and goes once that end was read or the caller's own
+// wait saw it (`callerSawWaitEnd`). Without it an orchestrator whose
+// `send` timed out learned of the reply only by asking again.
 
 /// A subscription's state (main actor only).
 @MainActor
@@ -35,6 +44,8 @@ final class MonitorSubscription {
     let outputPattern: String?
     let wakeRequested: Bool
     let wakeUnavailableReason: String?
+    /// A reply watch (`startReplyWatch`): one agent, until its turn ends.
+    let isReply: Bool
     var watched: [WatchedProcess] = []
     var pending: [MonitorEvent] = []
     var nextSeq = 1
@@ -62,7 +73,8 @@ final class MonitorSubscription {
         events: [MonitorEventType],
         outputPattern: String?,
         wakeRequested: Bool,
-        wakeUnavailableReason: String?
+        wakeUnavailableReason: String?,
+        isReply: Bool = false
     ) {
         self.id = id
         self.createdAt = Date()
@@ -75,6 +87,7 @@ final class MonitorSubscription {
         self.outputPattern = outputPattern
         self.wakeRequested = wakeRequested
         self.wakeUnavailableReason = wakeUnavailableReason
+        self.isReply = isReply
         self.lastReadAt = createdAt
     }
 
@@ -261,7 +274,8 @@ final class AgentMonitorRegistry {
             counts[type].map { "\($0) \(type.rawValue)" }
         }
         let noun = unread.count == 1 ? "event" : "events"
-        return "[cherry] Monitor \(subscription.id): \(unread.count) \(noun) ready (\(parts.joined(separator: ", ")))."
+        let whose = subscription.isReply ? " (the agent you messaged)" : ""
+        return "[cherry] Monitor \(subscription.id)\(whose): \(unread.count) \(noun) ready (\(parts.joined(separator: ", ")))."
             + " Run cherry events \(subscription.id) to read them."
     }
 }
@@ -555,6 +569,14 @@ extension CherryControlServer {
                 monitors.remove(subscription.id)
                 continue
             }
+            // A reply watch whose turn ended goes once that end was read
+            // (or after an hour unread).
+            if subscription.isReply, subscription.activeWaits == 0, subscription.watched.allSatisfy(\.finished),
+               subscription.pending.isEmpty
+                || now.timeIntervalSince(subscription.lastReadAt) > AgentMonitorRegistry.unreadSubscriptionLifetime {
+                monitors.remove(subscription.id)
+                continue
+            }
             for watched in subscription.watched where !watched.finished {
                 // A closed tab kept for its task's settle has no screen.
                 if let session = watched.session, watched.lastStatus != "closed" {
@@ -724,6 +746,13 @@ extension CherryControlServer {
     /// finds (`initial`).
     @MainActor
     func evaluate(_ watched: WatchedProcess, in subscription: MonitorSubscription, now: Date) {
+        let firstNewSeq = subscription.nextSeq
+        defer {
+            // A reply watch's turn ended: nothing after it is its news.
+            if subscription.isReply, subscription.pending.contains(where: { $0.seq >= firstNewSeq && $0.type.endsReplyTurn }) {
+                watched.finished = true
+            }
+        }
         let current = monitorStatus(of: watched, now: now)
         let previous = watched.lastStatus
         let initial = previous == nil
@@ -888,8 +917,10 @@ extension CherryControlServer {
         // A turn's `done` whose agent began another turn since, and a
         // question the subscriber already knows of or that is gone, are old
         // news: they stay readable and counted, but wake nobody.
+        // A reply watch's `done` is the reply, whatever turn followed.
         guard let newest = unread.last(where: {
-                  !Self.turnDoneIsSuperseded($0, in: subscription) && !Self.questionIsOldNews($0, in: subscription)
+                  (subscription.isReply || !Self.turnDoneIsSuperseded($0, in: subscription))
+                      && !Self.questionIsOldNews($0, in: subscription)
               }),
               newest.seq > subscription.lastWokenSeq
         else { return }
@@ -1006,8 +1037,103 @@ extension CherryControlServer {
             wakeUnavailableReason: reason,
             createdAt: subscription.createdAt,
             cursor: subscription.ackCursor,
-            pendingEvents: subscription.pending.filter { $0.seq > subscription.ackCursor }.count
+            pendingEvents: subscription.pending.filter { $0.seq > subscription.ackCursor }.count,
+            reply: subscription.isReply ? true : nil
         )
+    }
+
+    // MARK: Reply watches
+
+    /// Starts a reply watch for the caller on `target`, which a request of
+    /// the caller's just submitted a message (or an answer) to; returns its
+    /// id. None when the caller is no agent tab Cherry confirmed, `target`
+    /// is the caller or no agent, wake lines are off, the caller already
+    /// watches `target` with a wake subscription of its own, or `target`'s
+    /// open task is the caller's (its run's settle wakes it). A reply watch
+    /// the caller had on `target` goes: the new message is the turn to tell.
+    @MainActor
+    func startReplyWatch(on target: TerminalSession) async -> String? {
+        guard monitors.wakeLinesEnabled, target.kind == .agent,
+              let caller = verifiedCallerSession(), caller !== target, caller.kind == .agent,
+              let workspace = allOpenWorkspaces().first(where: { $0.sessions.contains { $0 === target } })
+        else { return nil }
+        let device = Self.remoteDevice
+        let callerID = caller.id.uuidString
+        let mine = monitors.ordered.filter { $0.device == device && $0.subscriberID == callerID }
+        if mine.contains(where: { subscription in
+            !subscription.isReply && subscription.wakeRequested && subscription.events.contains(.done)
+                && subscription.watched.contains { $0.session === target && !$0.finished }
+        }) {
+            return nil
+        }
+        if let task = tasks.latestTask(forWorker: target.id), !task.state.isSettled,
+           let run = tasks.run(task.runID, device: device), run.ownerWakes, run.ownerID == caller.id {
+            return nil
+        }
+        for previous in mine where previous.isReply && previous.watched.contains(where: { $0.session === target }) {
+            monitors.remove(previous.id)
+        }
+        guard mine.filter({ monitors.subscriptions[$0.id] != nil }).count < AgentMonitorRegistry.maximumSubscriptionsPerCaller else {
+            return nil
+        }
+        let subscription = MonitorSubscription(
+            id: "mon-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(16),
+            device: device,
+            subscriber: caller,
+            subAgents: false,
+            events: MonitorEventType.defaults,
+            outputPattern: nil,
+            wakeRequested: true,
+            wakeUnavailableReason: nil,
+            isReply: true
+        )
+        let watched = WatchedProcess(session: target, workspace: workspace, name: processName(for: target))
+        // A task of the worker's that settled before the message is not
+        // its reply.
+        if let task = tasks.latestTask(forWorker: target.id), task.state.isSettled {
+            watched.settledTaskIDs.insert(task.id)
+        }
+        subscription.watched.append(watched)
+        await refreshForMonitor(target)
+        evaluate(watched, in: subscription, now: Date())
+        // The question the caller just answered is not news.
+        subscription.pending.removeAll { $0.initial && ($0.type == .needsInput || $0.type == .permission) }
+        monitors.add(subscription)
+        startMonitorSamplerIfNeeded()
+        return subscription.id
+    }
+
+    /// A wait of the caller's on `session` ended (`reason`): an end of its
+    /// turn is no news to the caller's reply watch on it, which goes; a
+    /// question or permission it saw is no news to its subscriptions.
+    @MainActor
+    func callerSawWaitEnd(of session: TerminalSession, reason: ProcessIdleWaitReason) {
+        switch reason {
+        case .idle, .exited, .closed, .agentError:
+            guard let caller = verifiedCallerSession(), caller !== session else { return }
+            let device = Self.remoteDevice
+            for subscription in monitors.ordered
+            where subscription.isReply && subscription.device == device && subscription.subscriber === caller
+                && subscription.watched.contains(where: { $0.session === session }) {
+                monitors.remove(subscription.id)
+            }
+        case .permission:
+            callerLearnedState(of: session, status: .permission)
+        case .needsInput:
+            callerLearnedState(of: session, status: .needsInput)
+        case .timedOut, .disconnected:
+            break
+        }
+    }
+}
+
+extension MonitorEventType {
+    /// The event ends the turn a reply watch waits on.
+    var endsReplyTurn: Bool {
+        switch self {
+        case .done, .error, .exited, .closed: true
+        case .needsInput, .permission, .outputMatch: false
+        }
     }
 }
 

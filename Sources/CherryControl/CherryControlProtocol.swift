@@ -1508,13 +1508,24 @@ public struct AnswerPromptResult: Codable, Equatable, Sendable {
     public let answered: AgentPromptOption
     public let sentBytes: Int
     public let output: TerminalOutputResult?
+    /// The subscription that wakes the caller when the agent's turn ends
+    /// (`SendProcessInputResult.replyWatchSubscriptionID`).
+    public let replyWatchSubscriptionID: String?
 
-    public init(processID: String, prompt: AgentPromptInfo, answered: AgentPromptOption, sentBytes: Int, output: TerminalOutputResult?) {
+    public init(
+        processID: String,
+        prompt: AgentPromptInfo,
+        answered: AgentPromptOption,
+        sentBytes: Int,
+        output: TerminalOutputResult?,
+        replyWatchSubscriptionID: String? = nil
+    ) {
         self.processID = processID
         self.prompt = prompt
         self.answered = answered
         self.sentBytes = sentBytes
         self.output = output
+        self.replyWatchSubscriptionID = replyWatchSubscriptionID
     }
 }
 
@@ -1619,11 +1630,18 @@ public struct SendProcessInputResult: Codable, Equatable, Sendable {
     public let processID: String
     public let sentBytes: Int
     public let output: TerminalOutputResult?
+    /// The subscription that wakes the caller when the turn its message
+    /// started ends: a reply watch (`SubscriptionInfo.reply`), made when an
+    /// agent tab Cherry confirmed is the caller submitted a message to
+    /// another agent. A wait of the caller's that sees the turn end
+    /// removes it.
+    public let replyWatchSubscriptionID: String?
 
-    public init(processID: String, sentBytes: Int, output: TerminalOutputResult?) {
+    public init(processID: String, sentBytes: Int, output: TerminalOutputResult?, replyWatchSubscriptionID: String? = nil) {
         self.processID = processID
         self.sentBytes = sentBytes
         self.output = output
+        self.replyWatchSubscriptionID = replyWatchSubscriptionID
     }
 }
 
@@ -2183,6 +2201,9 @@ public struct SubscriptionInfo: Codable, Equatable, Sendable {
     public let cursor: Int
     /// Events not read yet.
     public let pendingEvents: Int
+    /// A reply watch: Cherry made it when the subscriber messaged the
+    /// process, and it ends with that turn (true; absent otherwise).
+    public let reply: Bool?
 
     public init(
         subscriptionID: String,
@@ -2195,7 +2216,8 @@ public struct SubscriptionInfo: Codable, Equatable, Sendable {
         wakeUnavailableReason: String?,
         createdAt: Date,
         cursor: Int,
-        pendingEvents: Int
+        pendingEvents: Int,
+        reply: Bool? = nil
     ) {
         self.subscriptionID = subscriptionID
         self.subscriberProcessID = subscriberProcessID
@@ -2208,6 +2230,7 @@ public struct SubscriptionInfo: Codable, Equatable, Sendable {
         self.createdAt = createdAt
         self.cursor = cursor
         self.pendingEvents = pendingEvents
+        self.reply = reply
     }
 }
 

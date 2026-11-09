@@ -169,6 +169,28 @@ private extension ControlAgentWaitHarness {
         return session
     }
 
+    /// Submits `text` to `session` as the caller the resolver names.
+    func sendInput(_ text: String, to session: TerminalSession, submit: Bool = true) async throws -> SendProcessInputResult {
+        let response = try await send(.sendProcessInput(.init(processID: session.id.uuidString, text: text, submit: submit)))
+        guard case .sendProcessInput(let sent)? = response.result else {
+            throw CherryControlError(code: "send_failed", message: "Expected sendProcessInput result, got \(String(describing: response))")
+        }
+        return sent
+    }
+
+    /// Waits until `orchestrator`'s screen shows a wake line it handled, at
+    /// most `seconds`; returns its output.
+    func handledWakeLine(of orchestrator: TerminalSession, seconds: Double = 6) async throws -> String {
+        var typed = ""
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            typed = try await output(of: orchestrator)
+            if typed.contains("handled [cherry] Monitor") { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        return typed
+    }
+
     func reportResult(_ summary: String, from worker: TerminalSession) async throws {
         let resolver = server.callerSessionResolverForTesting
         server.callerSessionResolverForTesting = { _ in worker }
@@ -615,6 +637,166 @@ struct ControlAgentMonitorTests {
         #expect(!(try await harness.output(of: orchestrator)).contains("[cherry] Monitor"))
         let events = try await harness.events(id, timeoutMilliseconds: 0)
         #expect(events.events.map(\.type) == [.needsInput])
+    }
+
+    // MARK: Reply watches
+
+    /// An orchestrator messages its worker and its wait ends before the
+    /// worker's turn does (a `send` that timed out): once that turn ends
+    /// and the orchestrator is idle, Cherry wakes it, without its having
+    /// subscribed. Read, the reply watch goes.
+    @Test func messageWhoseTurnOutlastsTheSendWakesTheSenderWhenItEnds() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        let worker = try await harness.spawnAgent(named: "Claude")
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(200))
+        harness.report("state=done:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(600))
+
+        harness.report("state=working:app=fake", on: orchestrator)
+        let sent = try await harness.sendInput("apply the phone test feedback", to: worker)
+        let id = try #require(sent.replyWatchSubscriptionID)
+        harness.report("state=working:app=claude-code", on: worker)
+        let timedOut = try await harness.wait(worker, quietMilliseconds: 300, timeoutMilliseconds: 400)
+        #expect(timedOut.reason == .timedOut)
+        #expect(harness.server.monitors.subscriptions[id]?.isReply == true, "a wait that timed out keeps it")
+        let listed = try await harness.send(.listSubscriptions)
+        guard case .listSubscriptions(let subscriptions)? = listed.result else {
+            Issue.record("Expected listSubscriptions, got \(listed)")
+            return
+        }
+        #expect(subscriptions.subscriptions.map(\.subscriptionID) == [id])
+        #expect(subscriptions.subscriptions.first?.reply == true)
+        #expect(subscriptions.subscriptions.first?.wake == true)
+
+        // The orchestrator ends its turn while the worker works: nothing yet.
+        harness.report("state=done:app=fake", on: orchestrator)
+        try await Task.sleep(for: .milliseconds(1_000))
+        #expect(!(try await harness.output(of: orchestrator)).contains("[cherry] Monitor"))
+
+        harness.screen("⏺ Pushed the fixes.\n\n❯ \n", on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
+        let typed = try await harness.handledWakeLine(of: orchestrator)
+        #expect(typed.contains(
+            "[cherry] Monitor \(id) (the agent you messaged): 1 event ready (1 done). Run cherry events \(id) to read them."
+        ), "\(typed)")
+        #expect(!typed.contains("Pushed the fixes"), "the wake line carries no worker text")
+
+        let events = try await harness.events(id, timeoutMilliseconds: 0)
+        #expect(events.events.map(\.type) == [.done])
+        #expect(events.events.first?.processID == worker.id.uuidString)
+        for _ in 0..<40 where harness.server.monitors.subscriptions[id] != nil {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(harness.server.monitors.subscriptions[id] == nil, "read, it goes")
+    }
+
+    /// A wait of the sender's that sees the turn end (its `send` waited it
+    /// out, or a later `cherry wait`) takes the reply watch away: the end is
+    /// no news, and no wake line follows.
+    @Test func waitThatSeesTheTurnEndTakesTheReplyWatchAway() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        let worker = try await harness.spawnAgent(named: "Claude")
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(200))
+        harness.report("state=done:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(600))
+
+        harness.report("state=working:app=fake", on: orchestrator)
+        let id = try #require(try await harness.sendInput("rebase it", to: worker).replyWatchSubscriptionID)
+        harness.report("state=working:app=claude-code", on: worker)
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(500))
+            harness.screen("⏺ Rebased.\n\n❯ \n", on: worker)
+            harness.report("state=done:app=claude-code", on: worker)
+        }
+        let waited = try await harness.wait(worker, quietMilliseconds: 300, timeoutMilliseconds: 10_000)
+        #expect(waited.reason == .idle)
+        #expect(harness.server.monitors.subscriptions[id] == nil)
+
+        harness.report("state=done:app=fake", on: orchestrator)
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(!(try await harness.output(of: orchestrator)).contains("[cherry] Monitor"))
+    }
+
+    /// No reply watch for a caller Cherry cannot tell (a script) or one
+    /// that watches the agent with a wake subscription of its own, nor for
+    /// keys; the latest message to an agent replaces the watch of the one
+    /// before.
+    @Test func replyWatchOnlyForAnAgentCallerThatDoesNotWatchTheAgentItself() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        let worker = try await harness.spawnAgent(named: "Claude")
+        harness.report("state=done:app=claude-code", on: worker)
+
+        #expect(try await harness.sendInput("hello", to: worker).replyWatchSubscriptionID == nil)
+
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        harness.report("state=working:app=fake", on: orchestrator)
+        let own = try await harness.subscribe(.init(
+            processIDs: [worker.id.uuidString], subscriberProcessID: orchestrator.id.uuidString
+        )).subscription.subscriptionID
+        #expect(try await harness.sendInput("hello again", to: worker).replyWatchSubscriptionID == nil)
+        #expect(Array(harness.server.monitors.subscriptions.keys) == [own])
+
+        _ = try await harness.send(.unsubscribe(.init(subscriptionID: own)))
+        #expect(try await harness.sendInput("x", to: worker, submit: false).replyWatchSubscriptionID == nil)
+        let first = try #require(try await harness.sendInput("one", to: worker).replyWatchSubscriptionID)
+        let second = try #require(try await harness.sendInput("two", to: worker).replyWatchSubscriptionID)
+        #expect(first != second)
+        #expect(Array(harness.server.monitors.subscriptions.keys) == [second])
+    }
+
+    /// The worker of a task the sender owns: while the task is open, its
+    /// run's settle tells the sender, so a message makes no reply watch.
+    /// Settled, a follow-up message's turn is watched, and the settle that
+    /// came before it is none of its news.
+    @Test func replyWatchOfASettledWorkerTellsItsNewTurnOnly() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.tasks.reportInterval = 0
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        harness.report("state=working:app=fake", on: orchestrator)
+        let (worker, _) = try await harness.spawnTaskWorker(named: "Worker", task: "Review the parser")
+        harness.report("state=working:app=claude-code", on: worker)
+
+        #expect(try await harness.sendInput("and the lexer", to: worker).replyWatchSubscriptionID == nil)
+
+        try await harness.reportResult("Two findings", from: worker)
+        harness.screen("⏺ Reported.\n\n❯ \n", on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(600))
+
+        let id = try #require(try await harness.sendInput("one more thing", to: worker).replyWatchSubscriptionID)
+        let none = try await harness.events(id, timeoutMilliseconds: 500)
+        #expect(none.events.isEmpty, "\(none.events)")
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(300))
+        harness.screen("⏺ Done too.\n\n❯ \n", on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
+        let ended = try await harness.events(id) { $0.contains { $0.type == .done } }
+        #expect(ended.map(\.type) == [.done], "\(ended)")
+        #expect(ended.first?.taskID == nil)
     }
 
     @Test func wakeLineSettingOffAndUnconfirmedSubscriberOnlyPoll() async throws {

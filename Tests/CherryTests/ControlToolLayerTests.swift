@@ -666,6 +666,59 @@ private func controlToolLayerProcess(id: String = controlToolLayerAgentID, kind:
     #expect(lookup.requests.count == 1)
 }
 
+/// send_agent_message names the reply watch Cherry made while the agent's
+/// turn goes on (its wait timed out, or it did not wait), and not once its
+/// wait saw the turn end.
+@Test func controlToolLayerSendNamesTheReplyWatchOnlyWhileTheTurnGoesOn() async {
+    let agent = controlToolLayerProcess()
+    let output = TerminalOutputResult(terminalID: agent.id, startLine: 0, endLineExclusive: 1, totalLines: 1, lines: ["…"])
+    func sending(waitReason: ProcessIdleWaitReason) -> ControlToolLayerRecorder {
+        ControlToolLayerRecorder { request in
+            switch request {
+            case .getProcessStatus:
+                return CherryControlResponse(result: .getProcessStatus(ProcessStatusResult(process: agent)))
+            case .sendProcessInput:
+                return CherryControlResponse(result: .sendProcessInput(SendProcessInputResult(
+                    processID: agent.id, sentBytes: 6, output: nil, replyWatchSubscriptionID: "mon-abc"
+                )))
+            default:
+                return CherryControlResponse(result: .waitForProcessIdle(WaitForProcessIdleResult(
+                    process: agent, reason: waitReason, observedNewOutput: true,
+                    sinceOutputVersion: 0, outputVersion: 1, lastOutputAt: nil, output: output
+                )))
+            }
+        }
+    }
+    let caller = CherryToolCaller(boundProcessID: controlToolLayerAgentID)
+    let timedOut = await CherryToolLayer.call(
+        name: "send_agent_message", arguments: ["message": .string("Review it")], caller: caller,
+        transport: sending(waitReason: .timedOut)
+    )
+    #expect(timedOut.text.contains(#""reply_watch":{"#), "\(timedOut.text)")
+    #expect(timedOut.text.contains(#""subscription_id":"mon-abc""#), "\(timedOut.text)")
+    #expect(timedOut.text.contains("end your turn now rather than poll, then read it with cherry events mon-abc"), "\(timedOut.text)")
+
+    let noWait = await CherryToolLayer.call(
+        name: "send_agent_message", arguments: ["message": .string("Review it"), "wait_for_idle": .bool(false)], caller: caller,
+        transport: sending(waitReason: .idle)
+    )
+    #expect(noWait.text.contains(#""subscription_id":"mon-abc""#), "\(noWait.text)")
+
+    let answered = await CherryToolLayer.call(
+        name: "send_agent_message", arguments: ["message": .string("Review it")], caller: caller,
+        transport: sending(waitReason: .idle)
+    )
+    #expect(!answered.isError)
+    #expect(!answered.text.contains("reply_watch"), "\(answered.text)")
+
+    // Optional on the wire: an answer without it (an app that predates it)
+    // decodes.
+    let older = try? JSONDecoder().decode(
+        SendProcessInputResult.self, from: Data(#"{"processID":"a","sentBytes":1}"#.utf8)
+    )
+    #expect(older?.replyWatchSubscriptionID == nil && older?.sentBytes == 1)
+}
+
 @Test func controlToolLayerWhoamiNamesTheCallerAndItsScope() async {
     let recorder = ControlToolLayerRecorder { request in
         if case .listProjects = request {

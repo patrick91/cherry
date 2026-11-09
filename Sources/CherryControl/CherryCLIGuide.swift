@@ -48,14 +48,15 @@ public enum CherryCLIGuide {
         Other `--options` are the tool's own parameters in kebab case (`--line-limit 50`).
 
         ## Talking to agents
-        - `cherry send ID TEXT` waits until the agent is idle and returns its new output;
-          `--no-wait` returns at once. Several lines arrive as one message:
+        - `cherry send ID TEXT` waits until the agent is idle and returns its new output:
 
               cherry send 3F2A… <<'EOF'
               Review these fixes:
               1. …
               EOF
 
+        - Returned first (`--no-wait`, a timeout: `reply_watch`)? End your turn: Cherry
+          types a line into your tab when the agent's turn ends.
         - A message to a working agent is queued by its CLI and runs after its turn.
         - When the agent shows a permission or question menu, `send` refuses
           (agent_awaiting_permission, agent_awaiting_input) and lists the menu's options:
@@ -105,9 +106,8 @@ public enum CherryCLIGuide {
         - If you cannot finish, report status failed with the reason in summary.
 
         ## Watching tabs
-        - `cherry subscribe ID… --wake` (or `--sub-agents`) and end your turn: when events
-          are ready and you are idle, Cherry types one line into your tab; read them with
-          `cherry events SUB`.
+        - `cherry subscribe ID… --wake` (or `--sub-agents`), end your turn, then
+          `cherry events SUB` once Cherry's line arrives.
         - An agent can work for many minutes (running its own subagents): don't nudge it.
         """
         return text + "\n"

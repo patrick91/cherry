@@ -1189,8 +1189,14 @@ final class CherryControlServer: @unchecked Sendable {
             )
             // A message to a worker waiting for approval is the answer.
             noteRequestInput(to: session)
+            // A message another agent submitted: its turn's end wakes the
+            // caller unless a wait of the caller's sees it.
+            let submitsMessage = request.submit == true && !(request.text ?? "").isEmpty
+            let replyWatch = submitsMessage ? await startReplyWatch(on: session) : nil
             let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
-            return .init(result: .sendProcessInput(.init(processID: session.id.uuidString, sentBytes: sentBytes, output: output)))
+            return .init(result: .sendProcessInput(.init(
+                processID: session.id.uuidString, sentBytes: sentBytes, output: output, replyWatchSubscriptionID: replyWatch
+            )))
         case .answerPrompt(let request):
             let session = try resolveProcess(workspace: workspace, processID: request.processID, processName: request.processName)
             return .init(result: .answerPrompt(try await answerPrompt(request, of: session)))
@@ -2326,6 +2332,8 @@ final class CherryControlServer: @unchecked Sendable {
         )
 
         func result(reason: ProcessIdleWaitReason) async -> WaitForProcessIdleResult {
+            // What the caller saw is no news to its monitors.
+            callerSawWaitEnd(of: session, reason: reason)
             // The loop read only the host's last lines: the output (and its
             // line numbers) comes from the whole history.
             await session.refreshContentFromHostIfNeeded()
@@ -3342,8 +3350,13 @@ final class CherryControlServer: @unchecked Sendable {
         try await deliver(enter, raw: false, to: session, alreadySent: sent)
         sent += enter.count
         mcpControlDebugLog("answer_prompt session=\(session.id.uuidString) option=\(option.number) bytes=\(sent)")
+        // The answered turn goes on: its end wakes the caller.
+        let replyWatch = await startReplyWatch(on: session)
         let output = try await lifecycleOutput(for: session, waitMilliseconds: request.waitMilliseconds, lineLimit: request.lineLimit)
-        return AnswerPromptResult(processID: session.id.uuidString, prompt: prompt, answered: option, sentBytes: sent, output: output)
+        return AnswerPromptResult(
+            processID: session.id.uuidString, prompt: prompt, answered: option, sentBytes: sent, output: output,
+            replyWatchSubscriptionID: replyWatch
+        )
     }
 
     /// The menu answer_prompt answers, read now: from the agent's screen (its

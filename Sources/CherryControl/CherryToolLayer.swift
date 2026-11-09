@@ -346,7 +346,8 @@ public enum CherryToolLayer {
                 process: status.process,
                 sentBytes: sent.sentBytes,
                 output: sent.output,
-                wait: nil
+                wait: nil,
+                replyWatch: sent.replyWatchSubscriptionID.map(MCPReplyWatch.init)
             ))
         }
 
@@ -366,11 +367,17 @@ public enum CherryToolLayer {
             return value
         }
 
+        // A wait that saw the turn end removed the reply watch.
+        let turnGoesOn: Bool = switch wait.reason {
+        case .idle, .exited, .closed, .agentError: false
+        case .timedOut, .permission, .needsInput, .disconnected: true
+        }
         return try encodedResult(MCPSendAgentMessagePayload(
             process: wait.process,
             sentBytes: sent.sentBytes,
             output: wait.output,
-            wait: wait
+            wait: wait,
+            replyWatch: turnGoesOn ? sent.replyWatchSubscriptionID.map(MCPReplyWatch.init) : nil
         ))
     }
 
@@ -1305,6 +1312,20 @@ private struct MCPSendAgentMessagePayload: Codable {
     let sentBytes: Int
     let output: TerminalOutputResult?
     let wait: WaitForProcessIdleResult?
+    /// The agent's turn goes on, and Cherry watches it for the caller.
+    let replyWatch: MCPReplyWatch?
+}
+
+/// send_agent_message's `reply_watch`: the subscription that wakes the
+/// caller when the agent's turn ends (`SendProcessInputResult`).
+private struct MCPReplyWatch: Codable {
+    let subscriptionID: String
+    let note: String
+
+    init(subscriptionID: String) {
+        self.subscriptionID = subscriptionID
+        note = "Its turn goes on. When it ends (or the agent asks something) and you are idle, Cherry types a line naming \(subscriptionID) into your tab: end your turn now rather than poll, then read it with cherry events \(subscriptionID). A wait of yours that sees the turn end (cherry wait) removes it."
+    }
 }
 
 /// get_status: the socket the caller uses (none when the transport has no

@@ -73,7 +73,7 @@ private let controlToolCatalogFacts: [String: [String]] = [
     "answer_prompt": ["permission or question menu", "(its prompt)", "presses Enter", "Number or label"],
     "send_agent_message": [
         "permission prompt (agent_awaiting_permission)", "a question (agent_awaiting_input)", "nothing is sent",
-        "For long work, send with wait_for_idle false, subscribe and end your turn", "Default 40000, max 300000",
+        "Cherry watches that turn for you (reply_watch)", "when it ends: end your turn", "Default 40000, max 300000",
     ],
     "wait_for_process_idle": ["OSC 7501", "4 s", "Default 50000, max 300000", "timed_out is normal: call again"],
     "wait_for_events": ["0 returns at once", "cursor", "timed_out is normal: call again", "wake line"],

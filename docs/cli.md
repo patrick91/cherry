@@ -772,6 +772,36 @@ to their events and ends its turn; Cherry tells it when something happened.
   `subscriber_process_id` that is not the caller, or a `cherry` that does
   not run under its tab) only polls.
 - The wake line is typed input, which every agent CLI takes.
+- **Reply watches.** An agent that messages another agent should not have to
+  ask again whether it answered. When an agent tab Cherry confirms is the
+  caller submits a message to another agent (`send_process_input` with
+  `submit` and text, `send_agent_message`, `cherry send`) or answers its menu
+  (`answer_prompt`), Cherry makes a subscription for it, a reply watch
+  (`reply: true` in `list_subscriptions`; `reply_watch_subscription_id` in
+  the input's answer). It watches that agent for the default events until
+  the turn ends (`done`, `error`, `exited` or `closed`; a question on the
+  way is told and watched past) and wakes the caller as any subscription
+  does, with `(the agent you messaged)` after its id:
+
+  ```text
+  [cherry] Monitor mon-… (the agent you messaged): 1 event ready (1 done). Run cherry events mon-… to read them.
+  ```
+
+  A `done` of a reply watch wakes the caller even when the agent began
+  another turn since. The watch goes once its turn's end was read (or an
+  hour after it ended unread), when a wait of the caller's on that agent
+  ends with the turn (`wait_for_process_idle` returning `idle`, `exited`,
+  `closed` or `agent_error`: the `send` that waited it out, or a later
+  `cherry wait`), or when the caller messages that agent again (the new
+  message's watch replaces it). `send_agent_message` names it as
+  `reply_watch` (`subscription_id` and a `note`) only while the turn goes
+  on: its wait timed out, or `wait_for_idle` was false. There is none for a
+  caller Cherry cannot confirm or that is not an agent, for a caller that
+  already watches the agent with a wake subscription of its own, for the
+  worker of an open task the caller's run owns (its run's settle wakes the
+  caller), or with wake lines turned off. A task's settle that came before
+  the message is none of its news. It counts toward the caller's 32
+  subscriptions.
 - A subscription ends with `unsubscribe`, when its subscriber's tab closes,
   or, without a subscriber, after an hour without a `wait_for_events` call.
   Subscriptions live in memory: after Cherry relaunches, `wait_for_events`

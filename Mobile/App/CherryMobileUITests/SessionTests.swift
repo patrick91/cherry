@@ -94,9 +94,14 @@ final class SessionTests: XCTestCase {
 
     func testConversationDragDismissesKeyboard() {
         launch(); field.tap()
-        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
-        list.swipeDown()
-        wait("exists == false", on: app.keyboards.firstMatch, timeout: 3)
+        let keyboard = app.keyboards.firstMatch
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 3))
+        // As in Messages, the keyboard follows a drag that reaches it; a
+        // scroll through the history alone leaves it open.
+        let start = list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+        let end = keyboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.95))
+        start.press(forDuration: 0.1, thenDragTo: end)
+        wait("exists == false", on: keyboard, timeout: 3)
     }
 
     func testConversationTapDismissesKeyboard() {

@@ -489,3 +489,18 @@ private final class LaunchSwitch {
     toggle.isOn = false
     #expect(connecting.launchDevice(id: studio.id)?.connectsAgentsAtLaunch == false)
 }
+
+@Test func RemoteDeviceMCPLaunchALineThatResumesAConversationGetsTheFlagsToo() throws {
+    // `TerminalSession.commandWithAgentFlags` hands a device's launch the
+    // line that resumes its agent's conversation (`AgentConversationResume`).
+    let launch = DeviceAgentLaunch()
+    let id = UUID().uuidString.lowercased()
+    let claudeLine = "claude" + AgentLaunch.shellSuffix(["--resume", id])
+    let claude = try #require(launch.spec(launch.configuration(claudeLine), device: launch.device()).argv.last)
+    let words = AgentLaunch.shellSuffix(["--append-system-prompt", instructions(launch), "--settings", claudeSettings])
+    #expect(claude.contains("then exec \(claudeLine)\(words); else exec \(claudeLine); fi"))
+    let codexLine = "codex" + AgentLaunch.shellSuffix(["resume", id])
+    let codex = try #require(launch.spec(launch.configuration(codexLine), device: launch.device()).argv.last)
+    #expect(codex.contains("then exec \(codexLine) '--no-daemon' '-c' "))
+    #expect(codex.contains("; else exec \(codexLine); fi"))
+}

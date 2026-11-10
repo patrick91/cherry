@@ -442,12 +442,28 @@ final class ProjectWindowRegistry {
             .filter { $0.mayOwnSession(on: host) }
     }
 
-    /// Saves every window's tabs and the open windows now, synchronously.
+    /// Saves every window's tabs and the open windows now, synchronously
+    /// (Cherry quits), with each agent's conversation as its CLI has it now
+    /// (`captureAgentConversations`).
     func flushWorkspacePersistence() {
         pruneStaleWindows()
+        captureAgentConversations()
         entries.values.compactMap(\.repository).forEach { $0.flushPersistentState() }
         saveOpenWindowsIfChanged(synchronously: true)
         workspaceStateStore?.flush()
+    }
+
+    /// Each running agent tab's conversation, read now
+    /// (`TerminalSession.captureAgentConversationNow`): a restart or log out
+    /// that ends the programs after Cherry quit leaves the latest one
+    /// resumable, `/clear` included. One read of the process table for all.
+    private func captureAgentConversations() {
+        let agents = entries.values.compactMap(\.repository)
+            .flatMap(\.workspace.sessions)
+            .filter { $0.kind == .agent && $0.isRunning }
+        guard !agents.isEmpty else { return }
+        let processes = ShellProcessController.enumerateProcesses()
+        agents.forEach { $0.captureAgentConversationNow(processes: processes) }
     }
 
     /// Right before quit tears anything down: saves, then keeps the saved

@@ -1546,7 +1546,9 @@ private struct ProjectWorkspaceView: View {
         _repository = StateObject(wrappedValue: RepositoryWorkspace(
             projectRoot: projectRoot,
             windowID: windowID,
-            backendPolicy: hosting.profile.isThisMac ? .userSettings : .remote(hosting, windowGridWait: .standard),
+            backendPolicy: hosting.profile.isThisMac
+                ? .userSettings
+                : .remote(hosting, windowGridWait: .standard, agentConversations: .app(for: hosting)),
             stateStore: .shared,
             // An unknown device's saved tabs stay saved as they are.
             sessionRestorer: hosting.profile.isKnownDevice

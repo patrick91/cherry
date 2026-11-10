@@ -354,6 +354,12 @@ final class HostControl: ObservableObject {
     /// daemon that just restarted): running sessions it did not list may
     /// still come back (`holdersRegistered()`).
     @Published private(set) var expectsHolders = false
+    /// The sessions the host's lists reported lost, by host identity
+    /// (`HostedSessionList.lostSessionIDs`: a daemon that started again
+    /// found their holders killed, as a restart or log out of that Mac kills
+    /// them), for as long as this app runs: a tab whose session is gone
+    /// tells that from an exit (`PersistentHostSessions.reportedLost`).
+    private var lostSessions: [String: Set<String>] = [:]
     /// How many connections have come up so far. It grows before `state`
     /// turns `.connected`, so an observer of that change sees the new count.
     private(set) var connectionCount = 0
@@ -618,6 +624,12 @@ final class HostControl: ObservableObject {
             })
             .first()
             .eraseToAnyPublisher()
+    }
+
+    /// Whether a list of host `hostID` reported session `sessionID` lost
+    /// (`lostSessions`).
+    func reportedLost(sessionID: String, hostID: String) -> Bool {
+        lostSessions[hostID]?.contains(sessionID) == true
     }
 
     /// Closes the connection; the next request (or lease) connects again.
@@ -1031,6 +1043,9 @@ final class HostControl: ObservableObject {
     /// known state (no `.removed`), and the host is listed again until the
     /// list is complete (at most `pendingHolderRelists` times).
     private func applyList(_ list: HostedSessionList, sentAtEvent: UInt64) {
+        if !list.lostSessionIDs.isEmpty {
+            lostSessions[list.hostID, default: []].formUnion(list.lostSessionIDs)
+        }
         let previous = sessions
         let known = Dictionary(previous.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         // Sessions an event told about after the list was asked for keep

@@ -3926,8 +3926,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// The surface reported its grid (`resize`): a seed no longer applies.
     private var viewportWasReported = false
     /// Tells the user a program finished or needs them while its tab is
-    /// not in front (`TerminalNotificationCenter.postProgramStatus`).
-    private let programStatusNotificationHandler: @MainActor (ProgramStatus, TerminalSession) -> Void
+    /// not in front (`TerminalNotificationCenter.postProgramStatus`; tests
+    /// replace it).
+    var programStatusNotificationHandler: @MainActor (ProgramStatus, TerminalSession) -> Void
     /// What a worker's notifications say (Settings › Notifications ›
     /// Workers), read only while this tab is one (`isWorker`).
     private let workerNotifications: @MainActor () -> WorkerNotifications
@@ -3969,6 +3970,27 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// The program reported `working` when that turn was submitted: a
     /// message the CLI queues behind the running turn.
     private(set) var agentWasWorkingAtLastSubmit = false
+    /// While Cherry types a line of its own into this agent
+    /// (`CherryControlServer.typeCherryLine`: a wake line, a task's
+    /// kickoff or nudge): asks whether the agent still waits on agents at
+    /// work for it (`CherryControlServer.awaitsAgentsAtWork`).
+    private var cherryLineAwaitsAgents: (@MainActor () -> Bool)?
+    /// The latest turn submitted to this agent is a line of Cherry's: its
+    /// `done` is news only once the agent waits on no agent at work, since
+    /// each of those wakes it again when it finishes
+    /// (`notifyProgramStatus`). Nil for a turn the user or another agent
+    /// submitted, and once that turn ended.
+    private var cherryTurnAwaitsAgents: (@MainActor () -> Bool)?
+
+    /// Cherry types a line of its own into this agent until
+    /// `endCherryLine`: the turn its Enter submits is Cherry's.
+    func beginCherryLine(awaitsAgents: @escaping @MainActor () -> Bool) {
+        cherryLineAwaitsAgents = awaitsAgents
+    }
+
+    func endCherryLine() {
+        cherryLineAwaitsAgents = nil
+    }
     private var auxiliaryProcessingSuspensionTask: Task<Void, Never>?
     private var lastContentFingerprint: Int?
     private var pendingMetadataOutput = Data()
@@ -7518,7 +7540,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         ghosttyBridgeStorage?.noteHostInputForOutputLatency()
         noteInputOutputBaseline()
         guard kind == .agent else { return }
-        applyAgentDraftInputEffect(Self.agentDraftInputEffect(input))
+        applyAgentDraftInputEffect(Self.agentDraftInputEffect(input), cherryLine: cherryLineAwaitsAgents)
     }
 
     /// Where the output was when input last came: every keystroke comes
@@ -8283,6 +8305,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         agentTurnState = .notStarted
         hasUnseenAgentResult = false
         lastProgramStatusNotificationAt = nil
+        cherryTurnAwaitsAgents = nil
         if agentActivityState != .unknown {
             agentActivityState = .unknown
             bumpRevision()
@@ -8302,6 +8325,19 @@ final class TerminalSession: ObservableObject, Identifiable {
     var isWorker: Bool { kind == .agent && parentAgentID != nil }
 
     private func notifyProgramStatus(_ status: ProgramStatus) {
+        // The end of a turn a line of Cherry's started (a wake line: an
+        // orchestrator told one of its workers finished) is no news while
+        // the agent still waits on agents at work for it: each wakes it
+        // again when it finishes, and the turn after the last one tells
+        // the user. Blocked or failed, it is news. (The turn goes on after
+        // a blocked report.)
+        if status.state != .blocked, let awaitsAgents = cherryTurnAwaitsAgents {
+            cherryTurnAwaitsAgents = nil
+            if status.state == .done, awaitsAgents() {
+                SessionLog.debug("[notify] \(id.uuidString.prefix(8)): no notification for the end of a turn Cherry started, while agents it waits on work")
+                return
+            }
+        }
         // Before the rate limit: a report a worker keeps to itself leaves
         // room for one it may post.
         if isWorker, !workerNotifications().allows(status) { return }
@@ -8488,7 +8524,12 @@ final class TerminalSession: ObservableObject, Identifiable {
             : .none
     }
 
-    private func applyAgentDraftInputEffect(_ effect: AgentDraftInputEffect) {
+    /// `cherryLine`: the input is a line Cherry types (`beginCherryLine`);
+    /// a key the user typed into the surface is never one.
+    private func applyAgentDraftInputEffect(
+        _ effect: AgentDraftInputEffect,
+        cherryLine: (@MainActor () -> Bool)? = nil
+    ) {
         guard kind == .agent, effect != .none else { return }
         lastHumanKeystrokeAt = Date()
 
@@ -8514,6 +8555,7 @@ final class TerminalSession: ObservableObject, Identifiable {
             agentWasWorkingAtLastSubmit = agentActivityState == .working
             agentSubmittedTurnCount &+= 1
             lastAgentSubmitAt = Date()
+            cherryTurnAwaitsAgents = cherryLine
             // A first message, `/clear`, `/new` or `/resume` changes which
             // conversation the CLI has.
             scheduleAgentConversationCapture()

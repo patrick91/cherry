@@ -529,6 +529,83 @@ struct ControlAgentMonitorTests {
         #expect(events.events.map(\.type) == [.done])
     }
 
+    /// The end of a turn a wake line started tells the user (a program
+    /// status notification) only once no agent the subscriber watches is
+    /// at work: woken for one worker while another still works, its turn
+    /// ends with its row marked and nothing posted; woken for the last, it
+    /// posts. A turn anyone else submits posts as before.
+    @Test func aWakeLinesTurnNotifiesOnlyOnceNoAgentTheSubscriberWatchesIsAtWork() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.2, working: 0.4)
+        let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        var notified: [ProgramStatus.State] = []
+        orchestrator.programStatusNotificationHandler = { status, _ in notified.append(status.state) }
+        let first = try await harness.spawnAgent(named: "Claude")
+        let second = try await harness.spawnAgent(named: "Claude")
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        harness.report("state=working:app=claude-code", on: first)
+        harness.report("state=working:app=claude-code", on: second)
+        try await Task.sleep(for: .milliseconds(800))
+        func turnsEnded(_ count: Int) async throws {
+            var handled = 0
+            for _ in 0..<80 {
+                handled = try await harness.output(of: orchestrator).components(separatedBy: "handled ").count - 1
+                if handled >= count, orchestrator.agentActivityState == .idle { return }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            Issue.record("the orchestrator ended \(handled) turns, not \(count)")
+        }
+
+        let subscribed = try await harness.subscribe(.init(
+            processIDs: [first.id.uuidString, second.id.uuidString], subscriberProcessID: orchestrator.id.uuidString
+        ))
+        #expect(subscribed.subscription.wake == true)
+        #expect(harness.server.awaitsAgentsAtWork(orchestrator))
+
+        // The first finishes: the orchestrator's wake turn ends while the
+        // second still works.
+        harness.screen("⏺ Done.\n\n❯ \n", on: first)
+        harness.report("state=done:app=claude-code", on: first)
+        try await turnsEnded(1)
+        #expect(try await harness.output(of: orchestrator).contains("handled [cherry] Monitor"))
+        #expect(notified.isEmpty)
+        #expect(orchestrator.hasUnseenAgentResult)
+
+        // The user's turn meanwhile is news.
+        orchestrator.send(text: "how is it going?\r")
+        try await turnsEnded(2)
+        #expect(notified == [.done])
+
+        // The last one finishes (after the 2 s between two notifications).
+        try await Task.sleep(for: .milliseconds(2_100))
+        harness.screen("⏺ Done.\n\n❯ \n", on: second)
+        harness.report("state=done:app=claude-code", on: second)
+        try await turnsEnded(3)
+        #expect(!harness.server.awaitsAgentsAtWork(orchestrator))
+        #expect(notified == [.done, .done])
+    }
+
+    /// An orchestrator waits on its workers while their tasks are queued or
+    /// being worked on, and no longer once they reported.
+    @Test func anOrchestratorAwaitsItsWorkersWhileTheirTasksAreOpen() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.tasks.reportInterval = 0
+        harness.server.start()
+        let orchestrator = try await harness.spawnAgent(named: "Claude")
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        let (worker, _) = try await harness.spawnTaskWorker(named: "Worker", task: "Review the parser")
+        #expect(harness.server.awaitsAgentsAtWork(orchestrator))
+        #expect(!harness.server.awaitsAgentsAtWork(worker))
+
+        try await harness.reportResult("Two findings", from: worker)
+        #expect(!harness.server.awaitsAgentsAtWork(orchestrator))
+    }
+
     /// The subscriber answered the worker's turn while busy (the turn's
     /// `done` came meanwhile): that `done` is old news by the time the
     /// subscriber is idle. It stays readable, but no wake line names it.

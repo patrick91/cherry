@@ -2,8 +2,8 @@ import AppKit
 import SwiftUI
 
 /// Settings › Notifications: whether macOS lets Cherry post notifications,
-/// what Cherry tells you about background sessions, and what a program's
-/// bell does in a tab.
+/// what Cherry tells you about background sessions and about workers (agents
+/// another agent runs), and what a program's bell does in a tab.
 struct NotificationsSettingsPage: View, SettingsPageContent {
     /// What Reset Notifications… resets: this page only.
     static let resetSettings = TerminalSettings.Setting.notificationsPage
@@ -24,6 +24,7 @@ struct NotificationsSettingsPage: View, SettingsPageContent {
                 permissionBanner(banner)
             }
             backgroundSessionsSection
+            workersSection
             terminalBellSection
             SettingsPageFooter(caption: "Resets this page only.") {
                 SettingsPageResetButton("Reset Notifications…", settings: Self.resetSettings, in: settings)
@@ -95,6 +96,29 @@ struct NotificationsSettingsPage: View, SettingsPageContent {
         navigator.open(.page(.sessions), row: .sessionsBackground)
     }
 
+    // MARK: Workers
+
+    private var workersSection: some View {
+        SettingsSection("Workers") {
+            let workers = SettingsSourceState.terminal(.workerNotifications, in: settings)
+            SettingsItem(
+                id: .notificationsWorkers,
+                TerminalSettings.Setting.workerNotifications.title,
+                help: Self.workersHelp,
+                source: workers
+            ) {
+                Picker(TerminalSettings.Setting.workerNotifications.title, selection: $settings.workerNotifications) {
+                    ForEach(WorkerNotifications.allCases) { option in
+                        Text(option.label)
+                            .tag(option)
+                    }
+                }
+                .settingsMenuPicker()
+                .disabled(!workers.source.isEditable)
+            }
+        }
+    }
+
     // MARK: Terminal bell
 
     private var terminalBellSection: some View {
@@ -123,6 +147,9 @@ struct NotificationsSettingsPage: View, SettingsPageContent {
     private static let finishesHelp = "Also when it fails. Either way, Background Sessions marks it until you open it."
     private static let launchNoticeHelp = "When Cherry opens and agents, commands or busy terminals from closed tabs "
         + "still run, a notice says so once. Sessions you kept running on purpose aren't mentioned."
+    private static let workersHelp = "Workers are agents another agent started, nested under it in the sidebar. "
+        + "It hears when they finish or need something, so it can tell you instead. "
+        + "The sidebar still marks them."
     private static let bellHelp = "What a program's bell does in a tab."
 
     // MARK: Search
@@ -158,6 +185,15 @@ struct NotificationsSettingsPage: View, SettingsPageContent {
                 value: terminal.valueText(.noticeBackgroundSessionsAtLaunch)
             ),
             SettingsSearchRow(
+                id: .notificationsWorkers,
+                route: .page(.notifications),
+                section: "Workers",
+                title: TerminalSettings.Setting.workerNotifications.title,
+                help: workersHelp,
+                keywords: ["subagents", "agents", "orchestrator", "tasks"],
+                value: terminal.valueText(.workerNotifications)
+            ),
+            SettingsSearchRow(
                 id: .notificationsBell,
                 route: .page(.notifications),
                 section: "Terminal bell",
@@ -173,6 +209,7 @@ struct NotificationsSettingsPage: View, SettingsPageContent {
 extension SettingsRowID {
     static let notificationsBackgroundFinished: Self = "notifications.backgroundFinished"
     static let notificationsLaunchNotice: Self = "notifications.launchNotice"
+    static let notificationsWorkers: Self = "notifications.workers"
     static let notificationsBell: Self = "notifications.bell"
 }
 

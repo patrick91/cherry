@@ -151,6 +151,7 @@ private func ratioText(_ ratio: Double) -> String {
         .notifyWhenBackgroundProgramFinishes: "Off",
         .noticeBackgroundSessionsAtLaunch: "On",
         .terminalBell: "Beep",
+        .workerNotifications: "Never",
         .persistLocalSessions: "On",
         .localSessionsOnQuit: "Ask",
         .closeTabsOnCleanExit: "On",
@@ -205,6 +206,7 @@ private func ratioText(_ ratio: Double) -> String {
         "Notify me when a background program needs me",
         "Notify me when a background program finishes",
         "Tell me about background sessions when Cherry opens",
+        "Notify me about workers",
         "Bell",
     ])
 }

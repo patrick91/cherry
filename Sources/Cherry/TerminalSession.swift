@@ -3951,6 +3951,9 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// Tells the user a program finished or needs them while its tab is
     /// not in front (`TerminalNotificationCenter.postProgramStatus`).
     private let programStatusNotificationHandler: @MainActor (ProgramStatus, TerminalSession) -> Void
+    /// What a worker's notifications say (Settings › Notifications ›
+    /// Workers), read only while this tab is one (`isWorker`).
+    private let workerNotifications: @MainActor () -> WorkerNotifications
     /// The records of output Cherry parses itself (`ingestTerminalMetadata`:
     /// the host-managed path, tests); a persistent tab's host keeps its own.
     private var parsedProgramStatus = ProgramStatusRecords()
@@ -4051,6 +4054,9 @@ final class TerminalSession: ObservableObject, Identifiable {
         deviceAgentConversations: DeviceAgentConversations? = nil,
         programStatusNotificationHandler: @escaping @MainActor (ProgramStatus, TerminalSession) -> Void = { status, session in
             TerminalNotificationCenter.shared.postProgramStatus(status, for: session)
+        },
+        workerNotifications: @escaping @MainActor () -> WorkerNotifications = {
+            TerminalSettings.shared.workerNotifications
         }
     ) {
         self.id = id
@@ -4080,6 +4086,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.launchEnvironment = launchEnvironment
         self.restartOnExit = restartOnExit
         self.programStatusNotificationHandler = programStatusNotificationHandler
+        self.workerNotifications = workerNotifications
         self.systemTitle = title
         let processorMaxScrollback = Self.processorMaxScrollback(for: kind, configuredMaxScrollback: maxScrollback)
         let processorBuffer = buffer ?? LiveTerminalOutputBuffer(maxScrollback: processorMaxScrollback)
@@ -7796,7 +7803,7 @@ final class TerminalSession: ObservableObject, Identifiable {
         marksUnread: Bool = true
     ) {
         guard !ProjectWindowRegistry.shared.isSessionVisible(self) else { return }
-        guard !(kind == .agent && parentAgentID != nil) else { return }
+        guard !isWorker || workerNotifications().allowsTerminalNotifications else { return }
         if marksUnread {
             lastNotification = notification
             hasUnreadNotification = true
@@ -8415,7 +8422,17 @@ final class TerminalSession: ObservableObject, Identifiable {
     private static let programStatusNotificationInterval: TimeInterval = 2
     private var lastProgramStatusNotificationAt: Date?
 
+    /// An agent tab nested under the agent that runs it (its orchestrator,
+    /// which hears when it finishes or needs something): it notifies only as
+    /// Settings › Notifications › Workers says. Its orchestrator's close
+    /// makes it top-level again (`promoteChildAgents`), and it notifies as
+    /// any tab then.
+    var isWorker: Bool { kind == .agent && parentAgentID != nil }
+
     private func notifyProgramStatus(_ status: ProgramStatus) {
+        // Before the rate limit: a report a worker keeps to itself leaves
+        // room for one it may post.
+        if isWorker, !workerNotifications().allows(status) { return }
         let now = Date()
         if let lastProgramStatusNotificationAt,
            now.timeIntervalSince(lastProgramStatusNotificationAt) < Self.programStatusNotificationInterval {

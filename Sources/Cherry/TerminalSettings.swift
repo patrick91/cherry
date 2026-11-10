@@ -94,6 +94,47 @@ extension Notification.Name {
     static let terminalSettingsDidChange = Notification.Name("Cherry.terminalSettingsDidChange")
 }
 
+/// What a worker (an agent tab nested under the agent that runs it, its
+/// orchestrator) tells you through notifications (Settings › Notifications
+/// › Workers): its orchestrator hears when it finishes or needs something,
+/// so a notification of its own is usually a second one. The sidebar marks
+/// its row either way, and a worker the orchestrator no longer runs (its
+/// tab closed: the worker is top-level again) notifies as any tab.
+enum WorkerNotifications: String, CaseIterable, Identifiable, Sendable {
+    /// None: no program status notification, no OSC 9/777 notification.
+    case never
+    /// Only when its program blocks on you (program status `blocked`:
+    /// permission, a question, a sign-in), which its orchestrator may not
+    /// be able to answer.
+    case needsYou
+    /// As any tab.
+    case always
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .never: "Never"
+        case .needsYou: "When they need you"
+        case .always: "Always"
+        }
+    }
+
+    /// Whether a worker's program status notification goes out.
+    func allows(_ status: ProgramStatus) -> Bool {
+        switch self {
+        case .never: false
+        case .needsYou: status.state == .blocked
+        case .always: true
+        }
+    }
+
+    /// Whether a worker's own notification (OSC 9/777) goes out and marks
+    /// its row: it says nothing Cherry can tell needs you, so only with
+    /// `always`.
+    var allowsTerminalNotifications: Bool { self == .always }
+}
+
 /// What quitting Cherry or closing a project window does with the local
 /// sessions still running there (Settings › Sessions). "Don't ask again" in
 /// that question stores the answer here.
@@ -461,6 +502,12 @@ final class TerminalSettings: ObservableObject {
         didSet { save(terminalBell.rawValue, for: .terminalBell) }
     }
 
+    /// What workers' notifications say (`WorkerNotifications`): read by a
+    /// nested agent tab as it would post one (`TerminalSession`).
+    @Published var workerNotifications: WorkerNotifications {
+        didSet { save(workerNotifications.rawValue, for: .workerNotifications) }
+    }
+
     var sessionPersistenceSettings: SessionPersistenceSettings {
         SessionPersistenceSettings(
             persistLocalSessions: persistLocalSessions,
@@ -515,6 +562,8 @@ final class TerminalSettings: ObservableObject {
         notifyWhenBackgroundProgramFinishes = stored(.notifyWhenBackgroundProgramFinishes) as? Bool
             ?? Defaults.notifyWhenBackgroundProgramFinishes
         terminalBell = (stored(.terminalBell) as? String).flatMap(TerminalBell.init(rawValue:)) ?? Defaults.terminalBell
+        workerNotifications = (stored(.workerNotifications) as? String)
+            .flatMap(WorkerNotifications.init(rawValue:)) ?? Defaults.workerNotifications
     }
 
     func toggleLightDarkAppearance(currentColorScheme: ColorScheme) {
@@ -1030,6 +1079,7 @@ final class TerminalSettings: ObservableObject {
         static let notifyWhenBackgroundProgramNeedsInput = true
         static let notifyWhenBackgroundProgramFinishes = false
         static let terminalBell = TerminalBell.beep
+        static let workerNotifications = WorkerNotifications.never
     }
 
     /// The terminal theme `colorScheme` shows: the light one in light mode,
@@ -1069,6 +1119,7 @@ extension TerminalSettings {
         case notifyWhenBackgroundProgramFinishes = "sessions.background.notifyFinished"
         case noticeBackgroundSessionsAtLaunch = "sessions.backgroundNoticeAtLaunch"
         case terminalBell = "terminal.bell"
+        case workerNotifications = "notifications.workers"
         case persistLocalSessions = "sessions.persistLocal"
         case localSessionsOnQuit = "sessions.onQuit"
         case closeTabsOnCleanExit = "sessions.closeTabOnExit"
@@ -1090,6 +1141,7 @@ extension TerminalSettings {
             case .notifyWhenBackgroundProgramFinishes: "Notify me when a background program finishes"
             case .noticeBackgroundSessionsAtLaunch: "Tell me about background sessions when Cherry opens"
             case .terminalBell: "Bell"
+            case .workerNotifications: "Notify me about workers"
             case .persistLocalSessions: "Run local terminals as persistent sessions"
             case .localSessionsOnQuit: "When quitting or closing a window"
             case .closeTabsOnCleanExit: "Close a tab when its shell exits"
@@ -1107,8 +1159,8 @@ extension TerminalSettings {
                 true
             case .sidebarTerminalPathDisplayMode, .projectColorDisplayMode, .sidebarBackgroundDepth,
                  .notifyWhenBackgroundProgramNeedsInput, .notifyWhenBackgroundProgramFinishes,
-                 .noticeBackgroundSessionsAtLaunch, .terminalBell, .persistLocalSessions, .localSessionsOnQuit,
-                 .closeTabsOnCleanExit, .defaultEditorID:
+                 .noticeBackgroundSessionsAtLaunch, .terminalBell, .workerNotifications, .persistLocalSessions,
+                 .localSessionsOnQuit, .closeTabsOnCleanExit, .defaultEditorID:
                 false
             }
         }
@@ -1125,7 +1177,7 @@ extension TerminalSettings {
         /// What Reset Notifications… resets.
         static let notificationsPage: [Setting] = [
             .notifyWhenBackgroundProgramNeedsInput, .notifyWhenBackgroundProgramFinishes,
-            .noticeBackgroundSessionsAtLaunch, .terminalBell,
+            .noticeBackgroundSessionsAtLaunch, .workerNotifications, .terminalBell,
         ]
         /// The Sessions page's settings, for their badges: it has no page
         /// reset.
@@ -1154,6 +1206,8 @@ extension TerminalSettings {
                 (object as? String).flatMap(LocalSessionsOnQuit.init(rawValue:)) != nil
             case .terminalBell:
                 (object as? String).flatMap(TerminalBell.init(rawValue:)) != nil
+            case .workerNotifications:
+                (object as? String).flatMap(WorkerNotifications.init(rawValue:)) != nil
             }
         }
     }
@@ -1198,6 +1252,7 @@ extension TerminalSettings {
         case .noticeBackgroundSessionsAtLaunch:
             noticeBackgroundSessionsAtLaunch == Defaults.noticeBackgroundSessionsAtLaunch
         case .terminalBell: terminalBell == Defaults.terminalBell
+        case .workerNotifications: workerNotifications == Defaults.workerNotifications
         case .persistLocalSessions: persistLocalSessions == Defaults.sessions.persistLocalSessions
         case .localSessionsOnQuit: localSessionsOnQuit == Defaults.sessions.localSessionsOnQuit
         case .closeTabsOnCleanExit: closeTabsOnCleanExit == Defaults.sessions.closeTabsOnCleanExit
@@ -1266,6 +1321,7 @@ extension TerminalSettings {
         case .noticeBackgroundSessionsAtLaunch:
             assign(\.noticeBackgroundSessionsAtLaunch, Defaults.noticeBackgroundSessionsAtLaunch)
         case .terminalBell: assign(\.terminalBell, Defaults.terminalBell)
+        case .workerNotifications: assign(\.workerNotifications, Defaults.workerNotifications)
         case .persistLocalSessions: assign(\.persistLocalSessions, Defaults.sessions.persistLocalSessions)
         case .localSessionsOnQuit: assign(\.localSessionsOnQuit, Defaults.sessions.localSessionsOnQuit)
         case .closeTabsOnCleanExit: assign(\.closeTabsOnCleanExit, Defaults.sessions.closeTabsOnCleanExit)
@@ -1311,6 +1367,7 @@ extension TerminalSettings {
                 SettingSource.onOff(Defaults.noticeBackgroundSessionsAtLaunch)
             )
         case .terminalBell: (terminalBell.label, Defaults.terminalBell.label)
+        case .workerNotifications: (workerNotifications.label, Defaults.workerNotifications.label)
         case .persistLocalSessions:
             (SettingSource.onOff(persistLocalSessions), SettingSource.onOff(Defaults.sessions.persistLocalSessions))
         case .localSessionsOnQuit: (localSessionsOnQuit.label, Defaults.sessions.localSessionsOnQuit.label)

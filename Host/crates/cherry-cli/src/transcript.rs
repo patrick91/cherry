@@ -6,11 +6,19 @@
 //! this machine; Amp keeps it on its server, which `amp threads export`
 //! reads. The agent and its session come from the session's processes:
 //! Claude Code's `sessions/<pid>.json` names each of its processes'
-//! sessions; a Codex rollout or a Pi session file is the one the agent's
-//! process started in the session's folder; Amp's thread logs name the
-//! process that runs each thread. Entries are trimmed (a tool call to a
-//! one-line summary and the start of its result), and a cursor lets the next
-//! read return only what is new.
+//! sessions; a Codex rollout is the one the session's processes have open,
+//! else (a Codex writing through its shared app server) one it started or
+//! resumed in the session's folder; a Pi session file is the one the
+//! agent's process started in the session's folder; Amp's thread logs name
+//! the process that runs each thread. An agent that has no conversation yet
+//! (it writes its file with the first message) has an empty one, with no
+//! `session_id`: there is nothing to resume yet. Entries are
+//! trimmed (a tool call to a one-line summary and the start of its result),
+//! and a cursor lets the next read return only what is new.
+//!
+//! Cherry asks `--locate` too, while an agent tab runs, for the conversation
+//! it resumes should the system end the program (Sources/Cherry/
+//! AgentConversations.swift): one lookup for both.
 
 use anyhow::{bail, Context, Result};
 use cherry_protocol::SessionInfo;
@@ -180,8 +188,30 @@ pub struct Located {
     amp: Option<PathBuf>,
 }
 
+impl Located {
+    /// An agent that has not written its conversation yet.
+    fn empty(agent: Agent) -> Located {
+        Located {
+            agent,
+            session_id: None,
+            path: None,
+            amp: None,
+        }
+    }
+}
+
 /// Which agent session `session` runs, from its processes.
 pub fn locate(session: &SessionInfo, all: &[Process], dirs: &Dirs) -> Result<Located> {
+    locate_with(session, all, dirs, &open_files)
+}
+
+/// `locate`, with `open` naming the files of processes.
+fn locate_with(
+    session: &SessionInfo,
+    all: &[Process],
+    dirs: &Dirs,
+    open: &dyn Fn(&[u32]) -> Vec<PathBuf>,
+) -> Result<Located> {
     let Some(pid) = session.pid else {
         bail!("session {} runs no program", session.id);
     };
@@ -205,10 +235,14 @@ pub fn locate(session: &SessionInfo, all: &[Process], dirs: &Dirs) -> Result<Loc
         let agent = agent_named(process)
             .or_else(|| (process.pid == pid).then(|| agent_hinted(&hint)).flatten());
         let found = match agent {
-            Some(Agent::Codex) => codex(dirs, process, &folders),
+            // The tree's first: a wrapper starts before the binary.
+            Some(Agent::Codex) => Some(codex(dirs, process, &tree, &folders, open)),
             Some(Agent::Pi) => pi(dirs, process, &folders),
             Some(Agent::Amp) => amp(dirs, process),
-            Some(Agent::Claude) | None => None,
+            // No record of its own (above) yet: Claude Code writes it a
+            // moment after it starts.
+            Some(Agent::Claude) => Some(Located::empty(Agent::Claude)),
+            None => None,
         };
         if let Some(found) = found {
             return Ok(found);
@@ -242,12 +276,17 @@ fn agent_named(process: &Process) -> Option<Agent> {
         if word.contains("/pi-coding-agent/") {
             return Some(Agent::Pi);
         }
+        // Claude Code's native build runs as `claude/versions/<version>`.
+        if word.contains("/claude/versions/") {
+            return Some(Agent::Claude);
+        }
         let name = Path::new(word)
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or(word);
         let name = name.strip_suffix(".js").unwrap_or(name);
         match name {
+            "claude" => return Some(Agent::Claude),
             "codex" => return Some(Agent::Codex),
             "pi" => return Some(Agent::Pi),
             "amp" => return Some(Agent::Amp),
@@ -295,9 +334,15 @@ fn claude(dirs: &Dirs, process: &Process) -> Option<Located> {
         .get("cwd")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let path = claude_transcript(&dirs.claude, cwd, &session_id);
+    // Claude Code writes it with the session's first message: until then
+    // there is nothing to show or resume (`claude --resume` refuses it).
+    if !path.is_file() {
+        return Some(Located::empty(Agent::Claude));
+    }
     Some(Located {
         agent: Agent::Claude,
-        path: Some(claude_transcript(&dirs.claude, cwd, &session_id)),
+        path: Some(path),
         session_id: Some(session_id),
         amp: None,
     })
@@ -325,49 +370,48 @@ fn claude_transcript(dir: &Path, cwd: &str, session_id: &str) -> PathBuf {
         .unwrap_or(direct)
 }
 
-fn codex(dirs: &Dirs, process: &Process, folders: &[String]) -> Option<Located> {
-    // `sessions/YYYY/MM/DD/rollout-….jsonl`, from the day before the
-    // process started (the folders are named for the local day).
-    let since = process
-        .started
-        .checked_sub(Duration::from_secs(86_400))
-        .unwrap_or(UNIX_EPOCH);
-    let first_day = civil_day(since);
-    let mut files = Vec::new();
-    for (year, year_dir) in numbered(&dirs.codex.join("sessions")) {
-        for (month, month_dir) in numbered(&year_dir) {
-            for (day, day_dir) in numbered(&month_dir) {
-                if (year, month, day) < first_day {
-                    continue;
-                }
-                files.extend(
-                    fs::read_dir(&day_dir)
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .map(|entry| entry.path())
-                        .filter(|path| {
-                            path.file_name()
-                                .and_then(|name| name.to_str())
-                                .is_some_and(|name| {
-                                    name.starts_with("rollout-") && name.ends_with(".jsonl")
-                                })
-                        }),
-                );
-            }
-        }
-    }
-    let (path, header) = started_by(process, files, |header| {
-        header
-            .pointer("/payload/cwd")
-            .and_then(Value::as_str)
-            .is_some_and(|cwd| {
-                folders
-                    .iter()
-                    .any(|folder| folder == cwd.trim_end_matches('/'))
-            })
-    })?;
-    Some(Located {
+/// The conversation of the Codex that `process` (the tree's first) runs:
+/// the rollout the tree has open (Codex writes its own with `--no-daemon`,
+/// which Cherry gives every Codex it starts), else (through its shared app
+/// server) one in the session's folder that it started or resumed
+/// (`started_by`), in any day's folder (a thread it resumed can be older);
+/// never a subagent's (Codex's reviewer keeps its own rollout, open in the
+/// same process). Empty before its first message, when it writes the file.
+fn codex(
+    dirs: &Dirs,
+    process: &Process,
+    tree: &[&Process],
+    folders: &[String],
+    open: &dyn Fn(&[u32]) -> Vec<PathBuf>,
+) -> Located {
+    let pids: Vec<u32> = tree.iter().map(|process| process.pid).collect();
+    let held = open(&pids)
+        .into_iter()
+        .filter(|path| is_rollout(path))
+        .filter_map(|path| {
+            let modified = fs::metadata(&path).and_then(|meta| meta.modified()).ok()?;
+            let header = header(&path)?;
+            is_codex_thread(&header).then_some((modified, path, header))
+        })
+        .max_by_key(|(modified, ..)| *modified)
+        .map(|(_, path, header)| (path, header));
+    let found = held.or_else(|| {
+        started_by(process, rollouts(&dirs.codex.join("sessions")), |header| {
+            is_codex_thread(header)
+                && header
+                    .pointer("/payload/cwd")
+                    .and_then(Value::as_str)
+                    .is_some_and(|cwd| {
+                        folders
+                            .iter()
+                            .any(|folder| folder == cwd.trim_end_matches('/'))
+                    })
+        })
+    });
+    let Some((path, header)) = found else {
+        return Located::empty(Agent::Codex);
+    };
+    Located {
         agent: Agent::Codex,
         session_id: header
             .pointer("/payload/id")
@@ -375,7 +419,152 @@ fn codex(dirs: &Dirs, process: &Process, folders: &[String]) -> Option<Located> 
             .map(str::to_owned),
         path: Some(path),
         amp: None,
-    })
+    }
+}
+
+/// `rollout-….jsonl` (a compressed one, `.jsonl.zst`, is no longer written).
+fn is_rollout(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+}
+
+/// Codex's `sessions/YYYY/MM/DD/rollout-….jsonl`, every day's.
+fn rollouts(sessions: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for (_, year) in numbered(sessions) {
+        for (_, month) in numbered(&year) {
+            for (_, day) in numbered(&month) {
+                files.extend(
+                    fs::read_dir(&day)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| is_rollout(path)),
+                );
+            }
+        }
+    }
+    files
+}
+
+/// A rollout's header (`session_meta`) of a thread of the user's, not of a
+/// subagent (its `source` names one, and `parent_thread_id` its thread).
+fn is_codex_thread(header: &Value) -> bool {
+    header.get("type").and_then(Value::as_str) == Some("session_meta")
+        && !header
+            .pointer("/payload/source")
+            .is_some_and(Value::is_object)
+        && header
+            .pointer("/payload/parent_thread_id")
+            .is_none_or(Value::is_null)
+}
+
+/// The files processes `pids` have open, by the paths the kernel keeps.
+#[cfg(target_os = "macos")]
+fn open_files(pids: &[u32]) -> Vec<PathBuf> {
+    use std::{ffi::OsString, mem::size_of, os::unix::ffi::OsStringExt};
+
+    /// `struct proc_fileinfo` and `struct vnode_fdinfowithpath` of
+    /// <sys/proc_info.h>, which libc does not have.
+    #[repr(C)]
+    struct ProcFileInfo {
+        openflags: u32,
+        status: u32,
+        offset: i64,
+        kind: i32,
+        guardflags: u32,
+    }
+    #[repr(C)]
+    struct VnodeFdInfoWithPath {
+        file: ProcFileInfo,
+        vnode: libc::vnode_info_path,
+    }
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+    let mut paths = Vec::new();
+    for &pid in pids {
+        let Ok(pid) = libc::c_int::try_from(pid) else {
+            continue;
+        };
+        // SAFETY: a null buffer asks only how many bytes the list takes.
+        let needed =
+            unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+        if needed <= 0 {
+            continue;
+        }
+        // Room for descriptors opened meanwhile.
+        let capacity = needed as usize / size_of::<libc::proc_fdinfo>() + 16;
+        let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(capacity);
+        // SAFETY: the buffer has room for `capacity` entries.
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                fds.as_mut_ptr().cast(),
+                (capacity * size_of::<libc::proc_fdinfo>()) as libc::c_int,
+            )
+        };
+        if bytes <= 0 {
+            continue;
+        }
+        // SAFETY: the kernel wrote `bytes` of whole entries.
+        unsafe { fds.set_len((bytes as usize / size_of::<libc::proc_fdinfo>()).min(capacity)) };
+        for fd in fds {
+            if fd.proc_fdtype != libc::PROX_FDTYPE_VNODE as u32 {
+                continue;
+            }
+            let mut info = std::mem::MaybeUninit::<VnodeFdInfoWithPath>::zeroed();
+            let size = size_of::<VnodeFdInfoWithPath>() as libc::c_int;
+            // SAFETY: the buffer is `size` bytes, as the flavor writes.
+            let written = unsafe {
+                libc::proc_pidfdinfo(
+                    pid,
+                    fd.proc_fd,
+                    PROC_PIDFDVNODEPATHINFO,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            if written != size {
+                continue;
+            }
+            // SAFETY: zeroed, then written by the kernel: plain data.
+            let info = unsafe { info.assume_init() };
+            let bytes: Vec<u8> = info
+                .vnode
+                .vip_path
+                .iter()
+                .flatten()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
+            if !bytes.is_empty() {
+                paths.push(PathBuf::from(OsString::from_vec(bytes)));
+            }
+        }
+    }
+    paths
+}
+
+#[cfg(target_os = "linux")]
+fn open_files(pids: &[u32]) -> Vec<PathBuf> {
+    pids.iter()
+        .flat_map(|pid| {
+            fs::read_dir(format!("/proc/{pid}/fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| fs::read_link(entry.path()).ok())
+        })
+        .collect()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn open_files(_pids: &[u32]) -> Vec<PathBuf> {
+    Vec::new()
 }
 
 fn pi(dirs: &Dirs, process: &Process, folders: &[String]) -> Option<Located> {
@@ -561,6 +750,7 @@ fn numbered(dir: &Path) -> Vec<(u32, PathBuf)> {
 }
 
 /// The UTC date of `time` (year, month, day).
+#[cfg(test)]
 fn civil_day(time: SystemTime) -> (u32, u32, u32) {
     let days = time
         .duration_since(UNIX_EPOCH)
@@ -804,25 +994,26 @@ pub fn read(located: Located, after: Option<&str>, limit: usize) -> Result<Trans
 }
 
 fn read_file(located: Located, after: Option<Cursor>, limit: usize) -> Result<Transcript> {
-    let path = located.path.clone().context("the session has no file")?;
+    // Agents write the file with the session's first message.
+    let empty = |located| Transcript {
+        located,
+        title: None,
+        cursor: Cursor::File {
+            device: 0,
+            inode: 0,
+            offset: 0,
+        }
+        .render(),
+        reset: true,
+        more_before: false,
+        entries: Vec::new(),
+    };
+    let Some(path) = located.path.clone() else {
+        return Ok(empty(located));
+    };
     let mut file = match File::open(&path) {
         Ok(file) => file,
-        // Agents write the file with the session's first message.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Transcript {
-                located,
-                title: None,
-                cursor: Cursor::File {
-                    device: 0,
-                    inode: 0,
-                    offset: 0,
-                }
-                .render(),
-                reset: true,
-                more_before: false,
-                entries: Vec::new(),
-            });
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(empty(located)),
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     };
     let meta = file.metadata()?;

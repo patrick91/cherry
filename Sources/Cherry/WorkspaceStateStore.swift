@@ -188,14 +188,9 @@ struct WorkspaceSessionRecord: Codable, Equatable, Sendable {
     /// The tab had a bell or notification not seen yet (its unread dot):
     /// the tab comes back unread. Saved only when true.
     var hasUnreadNotification: Bool?
-    /// The conversation an agent tab's CLI keeps (`AgentConversation`):
-    /// a tab the system ended comes back with Resume when its CLI still
-    /// has it. Older builds ignore it.
+    /// The conversation an agent tab's CLI has (`AgentConversation`): a
+    /// tab the system ended comes back with Resume. Older builds ignore it.
     var agentConversation: AgentConversationRecord?
-    /// When a Codex tab last started its program (a launch, not an
-    /// attach): its threads are looked for from then
-    /// (`AgentConversations.codexThread`). Older builds ignore it.
-    var agentStartedAt: Date?
 
     /// A tab whose program can still be running after Cherry quit.
     var isRestorable: Bool {
@@ -296,8 +291,7 @@ extension WorkspaceSessionRecord {
             systemEnd: session.systemSessionEnd,
             exitStatus: session.savedExitStatus,
             hasUnreadNotification: session.hasUnreadNotification ? true : nil,
-            agentConversation: session.agentConversation?.record,
-            agentStartedAt: session.agentProgramStartedAt
+            agentConversation: session.agentConversation?.record
         )
     }
 }

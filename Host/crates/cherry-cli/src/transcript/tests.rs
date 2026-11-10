@@ -511,15 +511,18 @@ fn claude_code_names_the_session_of_its_process() {
         &[json!({
         "pid": 300, "sessionId": "abc", "cwd": "/Users/me/my.project", "startedAt": millis + 900})],
     );
-    write_lines(
-        &dirs.claude.join("projects/-Users-me-my-project/abc.jsonl"),
-        &[json!({"type": "mode"})],
-    );
     let all = [
         process(200, 1, started, "/bin/zsh -l"),
         process(300, 200, started, "claude --dangerously-skip-permissions"),
         process(400, 1, started, "unrelated"),
     ];
+    // Before its first message: nothing to show or resume yet.
+    let found = locate(&session(200, "/Users/me/my.project"), &all, &dirs).unwrap();
+    assert_eq!(found, Located::empty(Agent::Claude));
+    write_lines(
+        &dirs.claude.join("projects/-Users-me-my-project/abc.jsonl"),
+        &[json!({"type": "mode"})],
+    );
     let found = locate(&session(200, "/Users/me/my.project"), &all, &dirs).unwrap();
     assert_eq!(found.agent, Agent::Claude);
     assert_eq!(found.session_id.as_deref(), Some("abc"));
@@ -528,12 +531,14 @@ fn claude_code_names_the_session_of_its_process() {
         Some(dirs.claude.join("projects/-Users-me-my-project/abc.jsonl"))
     );
 
-    // A record a gone process left, whose pid came back for another.
+    // A record a gone process left, whose pid came back for a Claude Code
+    // that has not written its own yet.
     let again = [
         process(200, 1, started, "/bin/zsh -l"),
         process(300, 200, SystemTime::now(), "claude"),
     ];
-    assert!(locate(&session(200, "/Users/me/my.project"), &again, &dirs).is_err());
+    let found = locate(&session(200, "/Users/me/my.project"), &again, &dirs).unwrap();
+    assert_eq!(found, Located::empty(Agent::Claude));
 }
 
 #[test]
@@ -561,14 +566,146 @@ fn a_codex_rollout_is_the_one_its_process_started_in_the_folder() {
     assert_eq!(found.agent, Agent::Codex);
     assert_eq!(found.session_id.as_deref(), Some("mine"));
 
-    // A process started after every rollout was written last has none.
+    // A process started after every rollout was written last has none
+    // yet: Codex writes its rollout with the first message.
     let later = [process(
         10,
         1,
         SystemTime::now() + Duration::from_secs(60),
         "codex",
     )];
-    assert!(locate(&session(10, "/work"), &later, &dirs).is_err());
+    let empty = locate(&session(10, "/work"), &later, &dirs).unwrap();
+    assert_eq!(empty, Located::empty(Agent::Codex));
+    let transcript = read(empty, None, 10).unwrap();
+    assert!(transcript.entries.is_empty() && transcript.reset);
+}
+
+fn codex_header(id: &str, cwd: &str) -> Value {
+    json!({"type": "session_meta", "payload": {"id": id, "cwd": cwd, "source": "cli"}})
+}
+
+fn reviewer_header(id: &str, parent: &str, cwd: &str) -> Value {
+    json!({"type": "session_meta", "payload": {
+        "id": id, "session_id": parent, "parent_thread_id": parent, "cwd": cwd,
+        "source": {"subagent": {"other": "guardian"}}, "thread_source": "guardian_review"}})
+}
+
+#[test]
+fn a_codex_thread_is_the_rollout_its_processes_have_open_never_a_reviewers() {
+    let directory = tempfile::tempdir().unwrap();
+    let dirs = dirs(directory.path());
+    // A thread from days before, which this Codex resumed, and the rollout
+    // its reviewer started since, which it has open too.
+    let mine = dirs
+        .codex
+        .join("sessions/2026/10/12/rollout-2026-10-12T19-49-50-mine.jsonl");
+    let reviewer = dirs
+        .codex
+        .join("sessions/2026/10/20/rollout-2026-10-20T13-17-55-reviewer.jsonl");
+    write_lines(&mine, &[codex_header("mine", "/work")]);
+    write_lines(&reviewer, &[reviewer_header("reviewer", "mine", "/work")]);
+    let started = SystemTime::now() - Duration::from_secs(1);
+    let all = [
+        process(
+            10,
+            1,
+            started,
+            "node /opt/bin/codex --sandbox workspace-write",
+        ),
+        process(
+            11,
+            10,
+            started,
+            "/opt/vendor/bin/codex --sandbox workspace-write",
+        ),
+    ];
+    let open = |pids: &[u32]| {
+        assert_eq!(pids, [10, 11]);
+        vec![PathBuf::from("/dev/null"), reviewer.clone(), mine.clone()]
+    };
+    let found = locate_with(&session(10, "/work"), &all, &dirs, &open).unwrap();
+    assert_eq!(
+        (
+            found.agent,
+            found.session_id.as_deref(),
+            found.path.as_ref()
+        ),
+        (Agent::Codex, Some("mine"), Some(&mine))
+    );
+}
+
+#[test]
+fn a_codex_writing_through_its_app_server_has_the_thread_it_started_never_a_reviewers() {
+    // The app server has the files open, so it is the first rollout this
+    // Codex started in the folder: never its reviewer's, though that came
+    // first.
+    let directory = tempfile::tempdir().unwrap();
+    let dirs = dirs(directory.path());
+    let started = SystemTime::now() - Duration::from_secs(1);
+    let day = dirs.codex.join("sessions/2026/10/20");
+    write_lines(
+        &day.join("rollout-1-reviewer.jsonl"),
+        &[reviewer_header("reviewer", "mine", "/work")],
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    write_lines(
+        &day.join("rollout-2-mine.jsonl"),
+        &[codex_header("mine", "/work")],
+    );
+    write_lines(
+        &day.join("rollout-3-elsewhere.jsonl"),
+        &[codex_header("x", "/else")],
+    );
+    let all = [process(10, 1, started, "codex")];
+    let none = |_: &[u32]| Vec::new();
+    let found = locate_with(&session(10, "/work"), &all, &dirs, &none).unwrap();
+    assert_eq!(found.session_id.as_deref(), Some("mine"));
+}
+
+#[test]
+fn a_codex_resumed_from_another_day_writes_that_days_rollout() {
+    let directory = tempfile::tempdir().unwrap();
+    let dirs = dirs(directory.path());
+    let old = dirs
+        .codex
+        .join("sessions/2020/01/02/rollout-2020-01-02T10-00-00-old.jsonl");
+    write_lines(&old, &[codex_header("old", "/work")]);
+    let started = SystemTime::now() - Duration::from_secs(1);
+    write_lines(&old, &[json!({"type": "event_msg"})]);
+    let all = [process(10, 1, started, "codex resume old")];
+    let none = |_: &[u32]| Vec::new();
+    let found = locate_with(&session(10, "/work"), &all, &dirs, &none).unwrap();
+    assert_eq!(found.session_id.as_deref(), Some("old"));
+}
+
+#[test]
+fn a_claude_code_that_wrote_no_record_yet_has_an_empty_conversation() {
+    let directory = tempfile::tempdir().unwrap();
+    let dirs = dirs(directory.path());
+    let started = SystemTime::now();
+    for command in [
+        "claude --dangerously-skip-permissions",
+        "/Users/me/.local/share/claude/versions/2.1.322 --resume abc",
+    ] {
+        let all = [
+            process(50, 1, started, "/bin/zsh -l"),
+            process(51, 50, started, command),
+        ];
+        let found = locate(&session(50, "/work"), &all, &dirs).unwrap();
+        assert_eq!(found, Located::empty(Agent::Claude));
+    }
+}
+
+#[test]
+fn open_files_are_named_by_their_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("rollout-open.jsonl");
+    let _file = File::create(&path).unwrap();
+    let path = fs::canonicalize(&path).unwrap();
+    let open = open_files(&[std::process::id()]);
+    assert!(open.contains(&path), "{open:?} has no {path:?}");
+    // A process of no one's: nothing, no failure.
+    assert!(open_files(&[u32::MAX]).is_empty());
 }
 
 #[test]

@@ -3,11 +3,12 @@ import Testing
 @testable import Cherry
 
 // Agent tabs whose program the system ended (a restart, a log out, a lost
-// holder) resume their CLI's conversation: Claude Code's session, read from
-// its registry while it runs, and Codex's latest thread of the tab, found in
-// its rollouts (AgentConversations, AgentConversationResume,
-// TerminalSession.conversationToResume). The CLIs' folders are temporary
-// ones here, never the user's ~/.claude or ~/.codex.
+// holder) resume their CLI's conversation: the one their session's Mac last
+// named while the program ran (`cherry host transcript --locate`, whose
+// rules Host/crates/cherry-cli/src/transcript/tests.rs tests;
+// AgentConversationLocator, AgentConversationResume,
+// TerminalSession.conversationToResume). Here a stand-in answers for the
+// Mac, and nothing reads the user's ~/.claude or ~/.codex.
 
 private let claudeSession = "6f1c1b7e-2d8a-4c55-9a5e-3f0d2b9c7a11"
 private let codexThread = "01a1bd88-2281-7b41-a0cf-d4b49d36a1a4"
@@ -16,84 +17,38 @@ private func conversation(_ cli: AgentLaunch.CLI, _ id: String) throws -> AgentC
     try #require(AgentConversation(cli: cli, id: id))
 }
 
-/// A temporary home for both CLIs' folders.
-private func agentFolders(_ prefix: String) throws -> (root: URL, conversations: AgentConversations) {
-    let root = try canonicalTemporaryDirectory(prefix)
-    return (root, AgentConversations(
-        claudeConfigDirectory: root.appendingPathComponent("claude", isDirectory: true),
-        codexHome: root.appendingPathComponent("codex", isDirectory: true)
-    ))
-}
+/// `cherry host transcript <session> --locate` as a test's Mac answers it:
+/// what each session's agent has (`agent`, `session_id`), and every ask.
+final class StandInConversations: @unchecked Sendable {
+    private let lock = NSLock()
+    private var answers: [String: (agent: String, id: String?)] = [:]
+    private var asked: [(session: String, variables: [String: String])] = []
+    private var answering = true
 
-/// What Claude Code writes for a running session: `sessions/<pid>.json`.
-func registerClaudeSession(
-    _ session: String, pid: Int32, startedAt: Date = Date(), in conversations: AgentConversations
-) throws {
-    let folder = conversations.claudeConfigDirectory.appendingPathComponent("sessions", isDirectory: true)
-    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-    let object: [String: Any] = [
-        "pid": Int(pid), "sessionId": session, "cwd": "/Users/me/app",
-        "startedAt": Int(startedAt.timeIntervalSince1970 * 1000), "kind": "interactive", "status": "idle",
-    ]
-    try JSONSerialization.data(withJSONObject: object).write(to: folder.appendingPathComponent("\(pid).json"))
-}
-
-/// A Claude Code conversation: `projects/<folder>/<session>.jsonl`.
-func writeClaudeTranscript(_ session: String, contents: String = #"{"type":"user"}"# + "\n", in conversations: AgentConversations) throws {
-    let folder = conversations.claudeConfigDirectory
-        .appendingPathComponent("projects", isDirectory: true)
-        .appendingPathComponent("-Users-me-app", isDirectory: true)
-    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-    try Data(contents.utf8).write(to: folder.appendingPathComponent("\(session).jsonl"))
-}
-
-/// A Codex rollout as Codex 0.166 writes one: its metadata, a turn's start,
-/// developer messages (Cherry's instructions line naming `tab` among them,
-/// or in `role`'s message), then the user's first message.
-func writeCodexRollout(
-    thread: String,
-    source: Any = "cli",
-    tab: UUID?,
-    role: String = "developer",
-    modified: Date,
-    created: Date? = nil,
-    in conversations: AgentConversations
-) throws {
-    let folder = conversations.codexHome.appendingPathComponent("sessions/2026/11/09", isDirectory: true)
-    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-    func message(_ role: String, _ text: String) -> [String: Any] {
-        ["type": "response_item", "payload": [
-            "type": "message", "role": role, "content": [["type": "input_text", "text": text]],
-        ] as [String: Any]]
+    func answer(_ session: String, agent: String, id: String?) {
+        lock.withLock { answers[session] = (agent, id) }
     }
-    // The line Cherry gives a Codex it starts (`-c developer_instructions`).
-    let line = tab.map { AgentCLILaunch.instructionLine(processID: $0.uuidString, hasSkill: false) } ?? "No tab here."
-    let items: [[String: Any]] = [
-        ["type": "session_meta", "payload": [
-            "id": thread, "source": source, "cwd": "/Users/me/app", "originator": "codex-tui",
-            "base_instructions": ["text": String(repeating: "Codex's own instructions. ", count: 400)],
-        ] as [String: Any]],
-        ["type": "event_msg", "payload": ["type": "task_started"]],
-        message("developer", "<permissions instructions>"),
-        message(role, line),
-        message("user", "Fix the tests"),
-    ]
-    let text = try items.map { String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }
-        .joined(separator: "\n") + "\n"
-    let url = folder.appendingPathComponent("rollout-2026-11-09T10-00-00-\(thread).jsonl")
-    try Data(text.utf8).write(to: url)
-    try FileManager.default.setAttributes(
-        [.creationDate: created ?? modified, .modificationDate: modified], ofItemAtPath: url.path
-    )
-}
 
-/// A child process that stands in for an agent's program.
-func standInProgram() throws -> Process {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/sleep")
-    process.arguments = ["60"]
-    try process.run()
-    return process
+    /// While false it answers as a Mac that cannot be reached (nothing).
+    var reachable: Bool {
+        get { lock.withLock { answering } }
+        set { lock.withLock { answering = newValue } }
+    }
+
+    var asks: [(session: String, variables: [String: String])] { lock.withLock { asked } }
+
+    /// Asks at once, and again after 0.2 s at the soonest.
+    var locator: AgentConversationLocator {
+        AgentConversationLocator(delay: 0.02, interval: 0.2) { [self] session, variables in
+            lock.withLock {
+                asked.append((session, variables))
+                guard answering, let answer = answers[session] else { return nil }
+                return try? JSONSerialization.data(withJSONObject: [
+                    "agent": answer.agent, "session_id": answer.id ?? NSNull(), "path": NSNull(),
+                ])
+            }
+        }
+    }
 }
 
 private func agentRecord(
@@ -103,7 +58,6 @@ private func agentRecord(
     sessionID: String,
     conversation: AgentConversation? = nil,
     exitStatus: Int32? = nil,
-    startedAt: Date? = nil,
     workingDirectory: String
 ) -> WorkspaceSessionRecord {
     WorkspaceSessionRecord(
@@ -117,8 +71,7 @@ private func agentRecord(
         projectRoot: workingDirectory,
         hosted: HostedSessionBindingRecord(host: "local", hostID: "host-a", sessionID: sessionID, owned: true),
         exitStatus: exitStatus,
-        agentConversation: conversation?.record,
-        agentStartedAt: startedAt
+        agentConversation: conversation?.record
     )
 }
 
@@ -205,111 +158,85 @@ private extension PersistentHarness {
     #expect(read.id == record.id)
 }
 
-// MARK: - What the CLIs keep
+// MARK: - Asking the Mac
 
-@Test func claudeCodesRegistryNamesTheSessionOfTheClaudeUnderATabsProgram() throws {
-    let (root, conversations) = try agentFolders("cherry-resume-claude-registry")
-    defer { try? FileManager.default.removeItem(at: root) }
-    let program = try standInProgram()
-    defer {
-        program.terminate()
-        program.waitUntilExit()
+@Test func theMacsAnswerNamesAConversationOnlyOfTheTabsOwnCLI() throws {
+    func found(_ json: String, _ cli: AgentLaunch.CLI) -> AgentConversation? {
+        AgentConversationLocator.conversation(in: Data(json.utf8), cli: cli)
     }
-    let pid = program.processIdentifier
-    func session(under root: Int32) -> String? {
-        conversations.claudeSession(runningUnder: root, processes: ShellProcessController.enumerateProcesses())
-    }
-    #expect(session(under: pid) == nil)
-
-    try registerClaudeSession(claudeSession, pid: pid, in: conversations)
-    #expect(session(under: pid) == claudeSession)
-    // Under the tab's program: an alias or wrapper starts it as a child.
-    #expect(session(under: getpid()) == claudeSession)
-
-    // A file an earlier process with this pid left (started before it).
-    try registerClaudeSession(claudeSession, pid: pid, startedAt: Date().addingTimeInterval(-600), in: conversations)
-    #expect(session(under: pid) == nil)
-    // Another process's file, or no session id in it.
-    let file = conversations.claudeConfigDirectory.appendingPathComponent("sessions/\(pid).json")
-    try JSONSerialization.data(withJSONObject: ["pid": Int(pid) + 1, "sessionId": claudeSession, "startedAt": Int(Date().timeIntervalSince1970 * 1000)])
-        .write(to: file)
-    #expect(session(under: pid) == nil)
-    try registerClaudeSession("not-a-session", pid: pid, in: conversations)
-    #expect(session(under: pid) == nil)
-    // A link is not followed.
-    let elsewhere = root.appendingPathComponent("elsewhere.json")
-    try registerClaudeSession(claudeSession, pid: pid, in: conversations)
-    try FileManager.default.moveItem(at: file, to: elsewhere)
-    try FileManager.default.createSymbolicLink(at: file, withDestinationURL: elsewhere)
-    #expect(session(under: pid) == nil)
+    let path = #""path":"/Users/me/.claude/projects/-Users-me-app/\#(claudeSession).jsonl""#
+    #expect(found(#"{"agent":"claude","session_id":"\#(claudeSession)",\#(path)}"#, .claudeCode) == (try conversation(.claudeCode, claudeSession)))
+    #expect(found(#"{"agent":"codex","session_id":"\#(codexThread)","path":"/x"}"#, .codex) == (try conversation(.codex, codexThread)))
+    // Another agent than the tab's, none yet (before its first message), an
+    // id that is not one, or nothing readable.
+    #expect(found(#"{"agent":"codex","session_id":"\#(codexThread)","path":"/x"}"#, .claudeCode) == nil)
+    #expect(found(#"{"agent":"amp","session_id":"T-1"}"#, .claudeCode) == nil)
+    #expect(found(#"{"agent":"claude","session_id":null,"path":null}"#, .claudeCode) == nil)
+    #expect(found(#"{"agent":"claude","session_id":"'; rm -rf ~; '"}"#, .claudeCode) == nil)
+    #expect(found("cherry: no session s1", .claudeCode) == nil)
 }
 
-@Test func claudeCodeHasAConversationOnlyWhileItsTranscriptHasSomethingInIt() throws {
-    let (root, conversations) = try agentFolders("cherry-resume-claude-transcripts")
-    defer { try? FileManager.default.removeItem(at: root) }
-    #expect(!conversations.claudeHasConversation(claudeSession))
-    try writeClaudeTranscript(claudeSession, in: conversations)
-    #expect(conversations.claudeHasConversation(claudeSession))
-    let empty = UUID().uuidString.lowercased()
-    try writeClaudeTranscript(empty, contents: "", in: conversations)
-    #expect(!conversations.claudeHasConversation(empty))
-    #expect(!conversations.claudeHasConversation(UUID().uuidString.lowercased()))
-    #expect(!conversations.claudeHasConversation("../\(claudeSession)"))
+@Test func aTabsOwnFoldersGoWithTheAskAndADevicesScriptAsksItsInstallsCherry() async throws {
+    let stand = StandInConversations()
+    let locator = stand.locator
+    stand.answer("s1", agent: "codex", id: codexThread)
+    let environment = [
+        "CODEX_HOME": "/Volumes/work/codex", "CLAUDE_CONFIG_DIR": "claude", "PATH": "/usr/bin", "OPENAI_API_KEY": "secret",
+    ]
+    #expect(await locator.conversation(ofSession: "s1", cli: .codex, environment: environment) == (try conversation(.codex, codexThread)))
+    // Only the CLIs' folders, absolute ones: never the rest of the tab's
+    // environment.
+    #expect(stand.asks.last?.variables == ["CODEX_HOME": "/Volumes/work/codex"])
+    stand.reachable = false
+    #expect(await locator.conversation(ofSession: "s1", cli: .codex, environment: [:]) == nil)
+
+    // A device's script, run as its `sh -s` would: its `cherry` (here one
+    // that says what it was asked) gets the session and the folders.
+    let directory = try canonicalTemporaryDirectory("cherry-device-locate")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let cli = directory.appendingPathComponent("cherry")
+    try Data("""
+    #!/bin/sh
+    printf '{"agent":"codex","session_id":"%s","path":null,"args":"%s","home":"%s"}\\n' '\(codexThread)' "$*" "$CODEX_HOME"
+
+    """.utf8).write(to: cli)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+    let script = AgentConversationLocator.deviceScript(
+        session: "s1'; touch pwned; '", cli: cli.path, variables: ["CODEX_HOME": "/Users/me/it's here"]
+    )
+    let output = try runShellScript(script, in: directory)
+    let answer = try #require(AgentConversationLocator.deviceAnswer(output))
+    let object = try #require(JSONSerialization.jsonObject(with: answer) as? [String: Any])
+    #expect(object["args"] as? String == "host transcript s1'; touch pwned; ' --locate")
+    #expect(object["home"] as? String == "/Users/me/it's here")
+    #expect(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("pwned").path))
+    #expect(AgentConversationLocator.conversation(in: answer, cli: .codex) == (try conversation(.codex, codexThread)))
+    // ssh failed, took too long, or the script never ran its cherry.
+    let begin = Data((AgentConversationLocator.deviceBegin + "\n").utf8)
+    #expect(AgentConversationLocator.deviceAnswer(.init(status: 255, standardOutput: Data(), standardError: "ssh: timed out")) == nil)
+    #expect(AgentConversationLocator.deviceAnswer(.init(status: 0, standardOutput: begin, standardError: "", timedOut: true)) == nil)
+    #expect(AgentConversationLocator.deviceAnswer(.init(status: 1, standardOutput: begin, standardError: "cherry: no session s1")) == nil)
+    #expect(AgentConversationLocator.deviceAnswer(.init(status: 0, standardOutput: Data("{}".utf8), standardError: "")) == nil)
 }
 
-@Test func codexsThreadOfATabIsTheNewestRolloutWhoseDeveloperMessageNamesIt() throws {
-    let (root, conversations) = try agentFolders("cherry-resume-codex-rollouts")
-    defer { try? FileManager.default.removeItem(at: root) }
-    let tab = UUID()
-    let now = Date()
-    let older = UUID().uuidString.lowercased()
-    try writeCodexRollout(thread: older, tab: tab, modified: now.addingTimeInterval(-3_600), in: conversations)
-    #expect(conversations.codexThread(launchedInTab: tab, now: now) == older)
-    // A /new in the tab: a newer thread with the line again.
-    try writeCodexRollout(thread: codexThread, tab: tab, modified: now.addingTimeInterval(-60), in: conversations)
-    #expect(conversations.codexThread(launchedInTab: tab, now: now) == codexThread)
-    // Newer ones that do not count: a subagent's (Codex's reviewer quotes its
-    // parent's messages), the line in a user's message, another tab's.
-    try writeCodexRollout(
-        thread: UUID().uuidString.lowercased(), source: ["subagent": ["other": "guardian"]], tab: tab, modified: now,
-        in: conversations
-    )
-    try writeCodexRollout(thread: UUID().uuidString.lowercased(), tab: tab, role: "user", modified: now, in: conversations)
-    try writeCodexRollout(thread: UUID().uuidString.lowercased(), tab: UUID(), modified: now, in: conversations)
-    #expect(conversations.codexThread(launchedInTab: tab, now: now) == codexThread)
-    // None names this tab; and one older than the look-back is not looked at.
-    #expect(conversations.codexThread(launchedInTab: UUID(), now: now) == nil)
-    let stale = UUID()
-    try writeCodexRollout(
-        thread: UUID().uuidString.lowercased(), tab: stale,
-        modified: now.addingTimeInterval(-AgentConversations.codexThreadsLookBack - 60), in: conversations
-    )
-    #expect(conversations.codexThread(launchedInTab: stale, now: now) == nil)
-    // A thread made before the tab's agent last started is an earlier
-    // launch's (or the one that start resumed), not this launch's.
-    let restarted = UUID()
-    try writeCodexRollout(
-        thread: UUID().uuidString.lowercased(), tab: restarted, modified: now, created: now.addingTimeInterval(-7_200),
-        in: conversations
-    )
-    #expect(conversations.codexThread(launchedInTab: restarted, createdSince: now.addingTimeInterval(-600), now: now) == nil)
-    #expect(conversations.codexThread(launchedInTab: restarted, now: now) != nil)
-    let newer = UUID().uuidString.lowercased()
-    try writeCodexRollout(thread: newer, tab: restarted, modified: now, created: now.addingTimeInterval(-300), in: conversations)
-    #expect(conversations.codexThread(launchedInTab: restarted, createdSince: now.addingTimeInterval(-600), now: now) == newer)
-}
-
-@Test func aTabsOwnVariablesMoveTheCLIsFolders() {
-    let base = AgentConversations(
-        claudeConfigDirectory: URL(fileURLWithPath: "/Users/me/.claude"), codexHome: URL(fileURLWithPath: "/Users/me/.codex")
-    )
-    let moved = base.applying(environment: ["CLAUDE_CONFIG_DIR": "/Volumes/work/claude", "CODEX_HOME": "/Volumes/work/codex"])
-    #expect(moved.claudeConfigDirectory.path == "/Volumes/work/claude")
-    #expect(moved.codexHome.path == "/Volumes/work/codex")
-    // Only absolute paths.
-    let relative = base.applying(environment: ["CLAUDE_CONFIG_DIR": "claude", "CODEX_HOME": "~/codex"])
-    #expect(relative.claudeConfigDirectory.path == "/Users/me/.claude")
-    #expect(relative.codexHome.path == "/Users/me/.codex")
+/// Runs `script` with `/bin/sh -s` in `directory`, as a device's ssh does.
+private func runShellScript(_ script: String, in directory: URL) throws -> RemoteDeviceShell.DataOutput {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-s"]
+    process.currentDirectoryURL = directory
+    process.environment = ["HOME": directory.path, "PATH": "/usr/bin:/bin"]
+    let input = Pipe()
+    let output = Pipe()
+    process.standardInput = input
+    process.standardOutput = output
+    process.standardError = FileHandle.nullDevice
+    try process.run()
+    input.fileHandleForWriting.write(Data(script.utf8))
+    try input.fileHandleForWriting.close()
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return RemoteDeviceShell.DataOutput(status: process.terminationStatus, standardOutput: data, standardError: "")
 }
 
 // MARK: - Tabs
@@ -318,56 +245,34 @@ private extension PersistentHarness {
     let harness = try PersistentHarness()
     let root = try canonicalTemporaryDirectory("cherry-resume-restore")
     let storeDirectory = try canonicalTemporaryDirectory("cherry-resume-restore-store")
-    let (agentRoot, conversations) = try agentFolders("cherry-resume-restore-agents")
     let store = WorkspaceStateStore(directory: storeDirectory)
     let claude = try conversation(.claudeCode, claudeSession)
-    // Claude Code still has this one's conversation...
+    let codex = try conversation(.codex, codexThread)
     let lead = agentRecord(title: "Lead", command: "claude", sessionID: "s-lead", conversation: claude, workingDirectory: root.path)
-    try writeClaudeTranscript(claudeSession, in: conversations)
-    // ...not this one's.
-    let gone = agentRecord(
-        title: "Gone", command: "claude", sessionID: "s-gone",
-        conversation: try conversation(.claudeCode, UUID().uuidString.lowercased()), workingDirectory: root.path
-    )
-    // Codex's rollouts name its tab.
-    let helper = agentRecord(title: "Helper", command: "codex", sessionID: "s-helper", workingDirectory: root.path)
-    try writeCodexRollout(thread: codexThread, tab: helper.id, modified: Date(), in: conversations)
-    // A Codex tab whose last start resumed a thread (made before it): that
-    // thread again. One restarted afresh without Cherry's line: an earlier
-    // launch's thread is not its.
-    let startedAt = Date().addingTimeInterval(-600)
-    let resumedThread = UUID().uuidString.lowercased()
-    let codexResumed = agentRecord(
-        title: "Resumed", command: "codex", sessionID: "s-codex-resumed",
-        conversation: try conversation(.codex, resumedThread), startedAt: startedAt, workingDirectory: root.path
-    )
-    try writeCodexRollout(
-        thread: resumedThread, tab: codexResumed.id, modified: Date(), created: startedAt.addingTimeInterval(-7_200),
-        in: conversations
-    )
-    let codexFresh = agentRecord(
-        title: "Fresh", command: "codex", sessionID: "s-codex-fresh", startedAt: startedAt, workingDirectory: root.path
-    )
-    try writeCodexRollout(
-        thread: UUID().uuidString.lowercased(), tab: codexFresh.id, modified: startedAt,
-        created: startedAt.addingTimeInterval(-7_200), in: conversations
-    )
+    let helper = agentRecord(title: "Helper", command: "codex", sessionID: "s-helper", conversation: codex, workingDirectory: root.path)
+    // Its Mac never named a conversation (no first message).
+    let fresh = agentRecord(title: "Fresh", command: "codex", sessionID: "s-fresh", workingDirectory: root.path)
     // It had exited by itself: Restart starts a new conversation.
     let exited = agentRecord(
         title: "Exited", command: "claude", sessionID: "s-exited", conversation: claude, exitStatus: 3,
         workingDirectory: root.path
     )
+    // A command Cherry cannot add the CLI's resume to.
+    let prompted = agentRecord(
+        title: "Prompted", command: #"claude "fix the tests""#, sessionID: "s-prompted", conversation: claude,
+        workingDirectory: root.path
+    )
+    let records = [lead, helper, fresh, exited, prompted]
     store.saveSynchronously(RepositoryStateRecord(
         repositoryRoot: repositoryKey(root),
         activeWorktreeRoot: root.path,
-        worktrees: [WorktreeStateRecord(
-            root: root.path, sessions: [lead, gone, helper, codexResumed, codexFresh, exited], selectedSessionID: lead.id
-        )],
+        worktrees: [WorktreeStateRecord(root: root.path, sessions: records, selectedSessionID: lead.id)],
         savedAt: try beforeTheLastBoot()
     ))
     harness.fake.pendingHolders = 0
+    let stand = StandInConversations()
     var policy = harness.policy
-    policy.agentConversations = conversations
+    policy.agentConversations = stand.locator
     let repository = RepositoryWorkspace(
         projectRoot: root.path,
         backendPolicy: policy,
@@ -379,33 +284,16 @@ private extension PersistentHarness {
     defer {
         repository.closeAllSessions(intent: .windowClosed)
         harness.cleanUp()
-        [root, storeDirectory, agentRoot].forEach { try? FileManager.default.removeItem(at: $0) }
+        [root, storeDirectory].forEach { try? FileManager.default.removeItem(at: $0) }
     }
     repository.beginRestoringSavedStateIfNeeded(chromeState: quietChromeState())
     await repository.waitForPendingRestores()
     let workspace = repository.workspace
-    let leadTab = try #require(workspace.session(withID: lead.id))
-    let goneTab = try #require(workspace.session(withID: gone.id))
-    let helperTab = try #require(workspace.session(withID: helper.id))
-    let exitedTab = try #require(workspace.session(withID: exited.id))
-    let resumedTab = try #require(workspace.session(withID: codexResumed.id))
-    let freshTab = try #require(workspace.session(withID: codexFresh.id))
-    let tabs = [leadTab, goneTab, helperTab, resumedTab, freshTab, exitedTab]
+    let tabs = try records.map { try #require(workspace.session(withID: $0.id)) }
     #expect(tabs.allSatisfy { $0.systemSessionEnd == .restart && !$0.isRunning })
-    #expect(!exitedTab.isLookingForConversationToResume)
-    #expect(await harness.fake.wait { !tabs.contains(where: \.isLookingForConversationToResume) })
-    #expect(leadTab.conversationToResume == claude)
-    #expect(helperTab.conversationToResume == (try conversation(.codex, codexThread)))
-    #expect(resumedTab.conversationToResume == (try conversation(.codex, resumedThread)))
-    #expect(goneTab.conversationToResume == nil)
-    #expect(freshTab.conversationToResume == nil)
-    #expect(exitedTab.conversationToResume == nil)
-
-    // Saved with the thread found, so a relaunch before Resume still has it.
-    repository.flushPersistentState()
-    let saved = try #require(store.load(repositoryRoot: repository.repositoryRoot)?.worktree(root: root.path))
-    #expect(saved.sessions.first { $0.id == helper.id }?.agentConversation == AgentConversationRecord(cli: "codex", id: codexThread))
-    #expect(saved.sessions.first { $0.id == lead.id }?.agentConversation == claude.record)
+    // Resume what each had last; nothing is asked (no program runs).
+    #expect(tabs.map(\.conversationToResume) == [claude, codex, nil, nil, nil])
+    #expect(stand.asks.isEmpty)
 
     // Resume: Claude Code's --resume, Codex's resume; the others anew.
     for tab in tabs {
@@ -417,75 +305,63 @@ private extension PersistentHarness {
     }
     #expect(try startupCommand(lead) == "claude '--resume' '\(claudeSession)'")
     #expect(try startupCommand(helper) == "codex 'resume' '\(codexThread)'")
-    #expect(try startupCommand(codexResumed) == "codex 'resume' '\(resumedThread)'")
-    #expect(try startupCommand(gone) == "claude")
-    #expect(try startupCommand(codexFresh) == "codex")
+    #expect(try startupCommand(fresh) == "codex")
     #expect(try startupCommand(exited) == "claude")
+    #expect(try startupCommand(prompted) == #"claude "fix the tests""#)
     // Once: a resumed tab keeps its conversation; a new one has none yet.
     #expect(tabs.allSatisfy { $0.conversationToResume == nil })
-    // Only a Codex tab keeps when it started (its threads are looked for
-    // from then).
-    #expect([helperTab, resumedTab, freshTab].allSatisfy { ($0.agentProgramStartedAt ?? .distantPast) > startedAt })
-    #expect([leadTab, goneTab, exitedTab].allSatisfy { $0.agentProgramStartedAt == nil })
-    #expect(leadTab.agentConversation == claude)
-    #expect(goneTab.agentConversation == nil)
-    #expect(exitedTab.agentConversation == nil)
+    #expect(tabs.map(\.agentConversation) == [claude, codex, nil, nil, nil])
 }
 
-@Test @MainActor func aClaudeAgentWhoseHolderDiedResumesTheSessionItHadLast() async throws {
+@Test @MainActor func anAgentAsksItsMacForItsConversationWhileItRunsAndResumesItAfterItsHolderDied() async throws {
     let harness = try PersistentHarness()
-    let (agentRoot, conversations) = try agentFolders("cherry-resume-holder-lost")
+    let stand = StandInConversations()
     var policy = harness.policy
-    policy.agentConversations = conversations
+    policy.agentConversations = stand.locator
     let workspace = TerminalWorkspace(projectRoot: harness.project.path, createInitialSession: false, backendPolicy: policy)
-    let program = try standInProgram()
     defer {
         workspace.closeAllSessions(intent: .windowClosed)
         harness.cleanUp()
-        program.terminate()
-        program.waitUntilExit()
-        try? FileManager.default.removeItem(at: agentRoot)
     }
     let keep = workspace.addSession(title: "Keep")
     let tab = workspace.addAgentSession(
         agent: AgentToolDefinition(name: "Claude", command: "claude", arguments: ""), projectRoot: harness.project.path
     )
+    let shell = workspace.addSession(title: "Shell")
     #expect(await harness.waitUntilAttached(keep))
     #expect(await harness.waitUntilAttached(tab))
+    #expect(await harness.waitUntilAttached(shell))
     let sessionID = try #require(tab.persistentSession?.sessionID)
-    // Its program, as the host reports it: the stand-in.
-    let info = try #require(harness.fake.sessions.first { $0.id == sessionID })
-    let running = HostedSessionInfo(
-        id: info.id, name: info.name, cwd: info.cwd, command: info.command, pid: UInt32(program.processIdentifier),
-        owner: info.owner, tags: info.tags, createdAt: info.createdAt
-    )
-    harness.fake.sessions = harness.fake.sessions.map { $0.id == sessionID ? running : $0 }
-    harness.fake.connections.last(where: { !$0.isClosed })?.push(.event(.changed(running)))
-    #expect(await harness.fake.wait { tab.programProcessID == program.processIdentifier })
+    // Its session started: asked, with nothing to say yet. A terminal is
+    // never asked.
+    #expect(await harness.fake.wait { stand.asks.contains { $0.session == sessionID } })
+    #expect(stand.asks.allSatisfy { $0.session == sessionID })
+    #expect(tab.agentConversation == nil)
 
-    // A turn starts: Cherry reads which session it belongs to.
-    try registerClaudeSession(claudeSession, pid: program.processIdentifier, in: conversations)
-    tab.applyProgramStatus([ProgramStatus(state: .working, app: "claude-code")])
+    // The first message: asked again (once the asks' interval passed).
+    stand.answer(sessionID, agent: "claude", id: claudeSession)
+    tab.send(text: "fix the tests\r")
     #expect(await harness.fake.wait { tab.agentConversation?.id == claudeSession })
     #expect(WorkspaceSessionRecord(session: tab, restoredRecord: nil).agentConversation
         == AgentConversationRecord(cli: "claudeCode", id: claudeSession))
-    // /clear made another; the next report, or a quit, reads it.
+    // /clear made another; the turn it reports asks again.
     let cleared = UUID().uuidString.lowercased()
-    try registerClaudeSession(cleared, pid: program.processIdentifier, in: conversations)
-    tab.applyProgramStatus([ProgramStatus(state: .idle, app: "claude-code")])
+    stand.answer(sessionID, agent: "claude", id: cleared)
+    tab.applyProgramStatus([ProgramStatus(state: .working, app: "claude-code")])
     #expect(await harness.fake.wait { tab.agentConversation?.id == cleared })
-    let resumed = UUID().uuidString.lowercased()
-    try registerClaudeSession(resumed, pid: program.processIdentifier, in: conversations)
-    tab.captureAgentConversationNow(processes: ShellProcessController.enumerateProcesses())
-    #expect(tab.agentConversation?.id == resumed)
-    try writeClaudeTranscript(resumed, in: conversations)
+    // An answer of nothing (the Mac could not say) keeps what it had.
+    stand.reachable = false
+    let asks = stand.asks.count
+    tab.applyProgramStatus([ProgramStatus(state: .idle, app: "claude-code")])
+    #expect(await harness.fake.wait { stand.asks.count > asks })
+    #expect(tab.agentConversation?.id == cleared)
 
     harness.reportLostHolder(of: sessionID)
     #expect(await harness.fake.wait { !tab.isRunning })
     #expect(tab.hostSessionEnd?.isHolderLost == true)
-    #expect(await harness.fake.wait { tab.conversationToResume?.id == resumed })
+    #expect(tab.conversationToResume?.id == cleared)
     let launches = harness.configurations.value.count
     #expect(tab.restart())
     #expect(await harness.fake.wait { harness.configurations.value.count == launches + 1 })
-    #expect(harness.configurations.value.last?.startupCommand == "claude '--resume' '\(resumed)'")
+    #expect(harness.configurations.value.last?.startupCommand == "claude '--resume' '\(cleared)'")
 }

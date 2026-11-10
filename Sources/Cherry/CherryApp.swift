@@ -1548,7 +1548,7 @@ private struct ProjectWorkspaceView: View {
             windowID: windowID,
             backendPolicy: hosting.profile.isThisMac
                 ? .userSettings
-                : .remote(hosting, windowGridWait: .standard, agentConversations: .app(for: hosting)),
+                : .remote(hosting, windowGridWait: .standard, agentConversations: .device(hosting)),
             stateStore: .shared,
             // An unknown device's saved tabs stay saved as they are.
             sessionRestorer: hosting.profile.isKnownDevice

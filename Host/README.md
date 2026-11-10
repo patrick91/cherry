@@ -244,17 +244,29 @@ its descendants, from `ps`):
   for each of its processes, which names its session
   (`projects/<folder>/<session>.jsonl`). A record whose `startedAt` is more
   than two minutes from when the process started is a gone process's.
-- Codex (a process named `codex`): the rollout in
-  `~/.codex/sessions/YYYY/MM/DD/` (`CODEX_HOME`) whose `session_meta` names
-  the session's folder (its `cwd` or its shell's `pwd`) and that was created
-  first since the process started, else (a resumed session) written last.
+- Codex (a process named `codex`): the rollout (`~/.codex/sessions/YYYY/MM/DD/
+  rollout-*.jsonl`, `CODEX_HOME`) the session's processes have open (Codex
+  writes its own with `--no-daemon`, which Cherry gives every Codex it
+  starts; `proc_pidinfo` on macOS, `/proc/<pid>/fd` on Linux), else (a Codex
+  writing through its shared app server) the one in any day's folder whose
+  `session_meta` names the session's folder (its `cwd` or its shell's `pwd`)
+  and that was created first since the process started, else (a resumed
+  session) written last. Never a subagent's (`source` an object,
+  `parent_thread_id`): Codex's reviewer keeps its own rollout, open in the
+  same process.
 - Pi (`pi`): the same rule over `~/.pi/agent/sessions/--<folder>--/`
   (`PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR`).
 - Amp (`amp`): the thread whose log in `~/.cache/amp/logs/threads/` names the
   process (`"pid":PID`), written last; the conversation comes from
   `amp threads export`, as Amp keeps it on its server.
 
-A session's `cherry.agent` tag stands in for a program that runs the agent
+An agent that has written no conversation yet (Claude Code and Codex write
+theirs with the first message, Claude Code its record a moment after it
+starts) has an empty one, with no `session_id`, rather than "no conversation
+found", so a client keeps reading and sees it fill. Cherry asks `--locate`
+while an agent tab runs for the conversation it resumes should the system end
+the program (docs/specs/multiplexer-default.md › An agent's conversation). A
+session's `cherry.agent` tag stands in for a program that runs the agent
 under another name. The output is `{"agent", "session_id", "path", "title",
 "cursor", "reset", "more_before", "entries"}`; each entry has a `kind`
 (`user`, `assistant`, `tool`, `tool_result`, `note`), an `id` and, but for

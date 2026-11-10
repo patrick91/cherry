@@ -27,7 +27,7 @@ public enum CherryCLIGuide {
         with `code: message` on standard error.
 
         ## Which tab
-        - No ID: your own tab. An ID is a tab's UUID (from `cherry ls`) or its name.
+        - No ID: your own tab. An ID is a tab's UUID (`cherry ls`; its first 8 do) or its name.
         - "The focused tab" means the one the user sees: `cherry ls` marks it `selected`.
         - Another open project's tabs: `cherry ls --project-root ROOT` (`cherry project ls`
           lists roots). An ID works from anywhere; a name needs `--project-root` too.

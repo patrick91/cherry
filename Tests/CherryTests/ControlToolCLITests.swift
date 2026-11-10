@@ -491,6 +491,73 @@ private func runCommand(_ request: RunCommandRequest, on server: CherryControlSe
     #expect(deviceOnly.exitCode == 1 && deviceOnly.standardError.hasPrefix("invalid_arguments:"), "\(deviceOnly)")
 }
 
+/// The start of a tab's ID finds it, as agents shorten what `cherry ls`
+/// printed: at least its first 8 characters, from any project, once no
+/// tab has that name; when it starts several tabs' IDs nothing is sent.
+@MainActor
+@Test func ControlToolCLIFindsATabByTheStartOfItsID() async throws {
+    let projects = try TwoProjects()
+    defer { projects.stop() }
+    let lead = projects.cloudWindow.addAgentSession(
+        agent: projects.echo, projectRoot: projects.cloud.path, title: "Lead", select: false
+    )
+    let worker = projects.authWindow.addSession(
+        id: try #require(UUID(uuidString: "1F3E3828-1EE9-43AF-909C-5DA99EC4C3F5")), title: "worker", select: false
+    )
+    let twin = projects.cloudWindow.addSession(
+        id: try #require(UUID(uuidString: "ABCDEF01-0000-4000-8000-000000000001")), title: "twin", select: false
+    )
+    let otherTwin = projects.authWindow.addSession(
+        id: try #require(UUID(uuidString: "ABCDEF01-1111-4000-8000-000000000002")), title: "other twin", select: false
+    )
+    projects.caller = lead
+    var sent: [CherryControlRequest] = []
+    projects.server.toolDispatchWillSendForTesting = { sent.append($0) }
+    func run(_ words: [String]) async throws -> RunCommandResult {
+        try await runCommand(.init(arguments: words), on: projects.server)
+    }
+    func shows(_ word: String, _ tab: TerminalSession) async throws {
+        let shown = try await run(["show", word])
+        #expect(shown.exitCode == 0, "\(word): \(shown.standardError)")
+        #expect(shown.standardOutput.contains(tab.id.uuidString), "\(word): \(shown.standardOutput)")
+    }
+
+    // Its first group, in another project; any case, more of it.
+    try await shows("1F3E3828", worker)
+    try await shows("1f3e3828-1ee9", worker)
+    try await shows("ABCDEF01-1", otherTwin)
+    // `process_id` takes it too.
+    let byID = try await run(["tool", "get_process_status", #"{"process_id":"1F3E3828"}"#])
+    #expect(byID.exitCode == 0 && byID.standardOutput.contains(worker.id.uuidString), "\(byID)")
+
+    // Fewer than 8 characters are only a name.
+    let short = try await run(["show", "1F3E382"])
+    #expect(short.exitCode == 1 && short.standardError.hasPrefix("process_not_found:"), "\(short)")
+
+    // Two tabs' IDs start so: refused, and the message goes nowhere.
+    let ambiguous = try await run(["send", "ABCDEF01", "hello"])
+    #expect(ambiguous.exitCode == 1 && ambiguous.standardError.hasPrefix("ambiguous_process_id:"), "\(ambiguous)")
+    #expect(!sent.contains { request in
+        if case .scoped(let scoped) = request, case .sendProcessInput = scoped.request { return true }
+        if case .sendProcessInput = request { return true }
+        return false
+    }, "\(sent)")
+    #expect(twin.id != otherTwin.id)
+
+    // A tab with that name is that tab.
+    let named = projects.cloudWindow.addSession(title: "abcdef01", select: false)
+    try await shows("ABCDEF01", named)
+}
+
+@Test func ControlToolCLITabIDPrefixIsTheStartOfAUUID() {
+    #expect(CherryControlServer.tabIDPrefix("1f3e3828") == "1F3E3828")
+    #expect(CherryControlServer.tabIDPrefix(" 1F3E3828-1EE9-4 ") == "1F3E3828-1EE9-4")
+    #expect(CherryControlServer.tabIDPrefix("1F3E3828-") == "1F3E3828-")
+    for word in ["1F3E382", "1F3E38281EE9", "1F3E3828-1EE9-43AF-909C-5DA99EC4C3F5", "worker12", "1F3E3828 1EE9", ""] {
+        #expect(CherryControlServer.tabIDPrefix(word) == nil, "\(word)")
+    }
+}
+
 // MARK: - End to end
 
 /// The Rust `cherry` against the app's control server: a multi-line message

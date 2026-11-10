@@ -1534,49 +1534,31 @@ differs from the design above.
   prompt, subcommand, unknown option's value, or option of Claude Code's
   that picks the session itself) and whose program the system ended (this
   rule, without an `exitStatus`; or its holder died while Cherry ran,
-  `HostSessionEnd.isHolderLost`) looks for its conversation off the main
-  thread (`prepareConversationResume`). When its CLI still has it, the bar
-  says **Resume**, and the next start (the bar, the menu, Restart All, MCP)
-  runs `claude … --resume <id>` or `codex … resume <id>` (Codex takes its
-  options before the subcommand), with Cherry's flags after it when they
-  apply (`commandWithAgentFlags`); one start takes it, and a start that
-  resumes nothing clears the tab's conversation.
-  - Claude Code's is its session id, read from its own registry,
-    `<config>/sessions/<pid>.json`, of the Claude closest to the tab's
-    program in its process tree (written by that process: `pid` matches and
-    `startedAt` is not before it started; it follows `/clear` and
-    `/resume`), a second after each change of the program's status and at
-    once at every quit's save (`ProjectWindowRegistry.captureAgentConversations`).
-    It is saved with the tab (`WorkspaceSessionRecord.agentConversation`,
-    two strings, which older builds ignore) and resumed only while
-    `<config>/projects/*/<id>.jsonl` has something in it (`claude --resume`
-    of a session it does not have says so and exits).
-  - Codex runs its threads in a background server every tab shares, so
-    nothing of the running program names one: once the program ended,
-    its thread is the newest rollout (`<home>/sessions/**/rollout-*.jsonl`
-    changed in the last 30 days; its first 1 MiB) whose developer messages
-    carry Cherry's instructions line naming the tab
-    (`(CHERRY_PROCESS_ID <tab id>)`, from `-c developer_instructions`), and
-    not a subagent's (`session_meta`'s `source` is an object: Codex's
-    reviewer threads quote their parent's messages). A Codex that started
-    without the line (its configuration sets its own instructions, or its
-    version was not known yet) has none.
+  `HostSessionEnd.isHolderLost`) resumes the conversation Cherry last knew
+  of (`prepareConversationResume`): the bar says **Resume**, and the next
+  start (the bar, the menu, Restart All, MCP) runs `claude … --resume <id>`
+  or `codex … resume <id>` (Codex takes its options before the subcommand),
+  with Cherry's flags after it when they apply (`commandWithAgentFlags`);
+  one start takes it, and a start that resumes nothing clears the tab's
+  conversation.
 
-  Only the app's windows read the CLIs' files
-  (`SessionBackendPolicy.agentConversations` for This Mac's,
-  `deviceAgentConversations` for a device's; `CLAUDE_CONFIG_DIR` and
-  `CODEX_HOME` in the tab's own environment move them), never writing them.
-  A device's tabs follow the same rules on that Mac
-  (`DeviceAgentConversations`): `sh -s` scripts over its ssh (its master
-  while it is up) read Claude Code's registry under the program its host
-  reports (`SessionInfo.pid`, at most every 15 s as its status changes; no
-  read at quit), and look for the transcript and Codex's rollouts there
-  (device launches carry Cherry's line too). Their times are that Mac's: an
-  answer says what time it is there. A device that cannot be asked is asked
-  again on its next connection. Attached sessions, Pi and any other agent
-  start fresh. These files are the CLIs' own (checked with Claude Code
-  2.1.319 and Codex 0.166.0): when one changes them Cherry finds nothing
-  and Restart starts a new conversation, as before.
+  Cherry learns the conversation while the program runs, from the Mac it
+  runs on: `cherry host transcript <session> --locate` there (Host/README.md
+  › transcript), the lookup Cherry for iPhone shows conversations by, so the
+  two never disagree (`AgentConversationLocator`: This Mac's bundled
+  `cherry` with the helpers' environment; a device's install's `cherry`
+  over its ssh, its master while it is up; the tab's own `CLAUDE_CONFIG_DIR`
+  and `CODEX_HOME` go with the ask). A tab asks `delay` (3 s) after its
+  session is bound (a launch, a restore, an adoption), after a line is
+  submitted (a first message, `/clear`, `/new`, `/resume`) and after its
+  program reports a turn starting or ending, at most every `interval` (5 s;
+  a device's 15 s); an answer with no `session_id` (no first message yet,
+  another agent, a Mac that could not be asked) changes nothing. The answer
+  is saved with the tab (`WorkspaceSessionRecord.agentConversation`, two
+  strings, which older builds ignore). Nothing is asked once the program
+  ended, so a device that cannot be reached still resumes. Only the app's
+  windows ask (`SessionBackendPolicy.agentConversations`). Attached
+  sessions, Pi and any other agent start fresh.
 
   **A device that restarted while Cherry ran.** Its daemon starts again
   and reports the sessions whose holders it found killed (`lost_sessions`;

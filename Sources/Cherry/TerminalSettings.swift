@@ -234,15 +234,12 @@ struct SessionBackendPolicy {
     /// test's workspace, `.native`, a device's window) starts every agent
     /// as its command says, and asks no CLI its version.
     var agentLaunch: AgentLaunchContext?
-    /// Where This Mac's agent CLIs keep their conversations, which a tab
-    /// the system ended resumes (`AgentConversations`). Only the app's This
-    /// Mac windows have it; nil (a test's workspace, `.native`, a device's
-    /// window) reads no CLI's files, and Restart starts a new conversation.
-    var agentConversations: AgentConversations?
-    /// The same for a device's window: its CLIs' files there, read over its
-    /// ssh (`DeviceAgentConversations`). Only the app's device windows have
-    /// it (`remote(_:agentConversations:)`).
-    var deviceAgentConversations: DeviceAgentConversations?
+    /// How Cherry asks which conversation an agent tab's CLI has, which a
+    /// tab the system ended resumes (`AgentConversationLocator`: This Mac's
+    /// `cherry`, or a device's over its ssh). Only the app's windows have
+    /// it; nil (a test's workspace, `.native`) asks nothing, and Restart
+    /// starts a new conversation.
+    var agentConversations: AgentConversationLocator?
 
     static let native = SessionBackendPolicy(settings: { .native })
 
@@ -254,7 +251,7 @@ struct SessionBackendPolicy {
         hostReconnects: .shared,
         windowGridWait: .standard,
         agentLaunch: .app,
-        agentConversations: .app
+        agentConversations: .thisMac
     )
 
     /// Whether new local tabs should be persistent sessions (the setting;
@@ -268,13 +265,13 @@ struct SessionBackendPolicy {
     /// A device's window (docs/specs/remote-devices.md): its tabs run on
     /// another Mac's host, `localSessions`. `windowGridWait`: the app's
     /// device windows wait as This Mac's do (`.standard`).
-    /// `agentConversations`: the app's (`DeviceAgentConversations.app(for:)`).
+    /// `agentConversations`: the app's (`AgentConversationLocator.device(_:)`).
     static func remote(
         _ hosting: PersistentHostSessions,
         settings: @escaping @MainActor () -> SessionPersistenceSettings = { TerminalSettings.shared.sessionPersistenceSettings },
         hostReconnects: HostedReconnects? = .shared,
         windowGridWait: TerminalWindowGridWait? = nil,
-        agentConversations: DeviceAgentConversations? = nil
+        agentConversations: AgentConversationLocator? = nil
     ) -> SessionBackendPolicy {
         precondition(!hosting.profile.allowsNativeFallback, "a device's hosting never falls back to native tabs")
         return SessionBackendPolicy(
@@ -283,7 +280,7 @@ struct SessionBackendPolicy {
             rememberLocalSessionsOnQuit: { TerminalSettings.shared.localSessionsOnQuit = $0 },
             hostReconnects: hostReconnects,
             windowGridWait: windowGridWait,
-            deviceAgentConversations: agentConversations
+            agentConversations: agentConversations
         )
     }
 

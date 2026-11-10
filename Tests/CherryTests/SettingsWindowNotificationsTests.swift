@@ -287,6 +287,31 @@ private func permissionModel(
     #expect(notificationsSettings(defaults).terminalBell == .beep)
 }
 
+// MARK: - Workers
+
+@Test @MainActor func settingsWindowNotificationsWorkersAreStoredAndReadBack() {
+    let defaults = privateDefaults("SettingsWindowNotifications")
+    let settings = notificationsSettings(defaults)
+    // Workers keep to themselves by default: their orchestrator hears first.
+    #expect(settings.workerNotifications == .never)
+    #expect(settings.source(of: .workerNotifications) == .cherryDefault)
+
+    settings.workerNotifications = .needsYou
+    #expect(defaults.string(forKey: "notifications.workers") == "needsYou")
+    #expect(settings.source(of: .workerNotifications) == .setHere)
+    #expect(notificationsSettings(defaults).workerNotifications == .needsYou)
+
+    // A value it does not know is the default's.
+    defaults.set("sometimes", forKey: "notifications.workers")
+    let unknown = notificationsSettings(defaults)
+    #expect(unknown.workerNotifications == .never)
+    #expect(unknown.source(of: .workerNotifications) == .cherryDefault)
+
+    let launched = notificationsSettings(defaults, launchArguments: ["notifications.workers": "always"])
+    #expect(launched.workerNotifications == .always)
+    #expect(SettingsSourceState.terminal(.workerNotifications, in: launched).source.isEditable == false)
+}
+
 // MARK: - Background sessions
 
 @Test @MainActor func settingsWindowNotificationsBackgroundSwitchesKeepTheirKeys() {
@@ -303,7 +328,7 @@ private func permissionModel(
     #expect(defaults.object(forKey: "sessions.background.notifyNeedsInput") as? Bool == false)
     #expect(defaults.object(forKey: "sessions.background.notifyFinished") as? Bool == true)
     #expect(defaults.object(forKey: "sessions.backgroundNoticeAtLaunch") as? Bool == false)
-    for setting in NotificationsSettingsPage.resetSettings where setting != .terminalBell {
+    for setting in NotificationsSettingsPage.resetSettings where ![.terminalBell, .workerNotifications].contains(setting) {
         #expect(settings.source(of: setting) == .setHere, Comment(rawValue: setting.rawValue))
     }
 }
@@ -343,12 +368,13 @@ private func permissionModel(
 
 // MARK: - Reset Notifications…
 
-@Test @MainActor func settingsWindowNotificationsResetListsAndResetsOnlyItsFourSettings() throws {
+@Test @MainActor func settingsWindowNotificationsResetListsAndResetsOnlyItsFiveSettings() throws {
     let defaults = privateDefaults("SettingsWindowNotifications")
     let settings = notificationsSettings(defaults)
     settings.notifyWhenBackgroundProgramNeedsInput = false
     settings.notifyWhenBackgroundProgramFinishes = true
     settings.noticeBackgroundSessionsAtLaunch = false
+    settings.workerNotifications = .needsYou
     settings.terminalBell = .silent
     settings.closeTabsOnCleanExit = false
     settings.fontSize = 16
@@ -356,13 +382,14 @@ private func permissionModel(
 
     #expect(NotificationsSettingsPage.resetSettings == [
         .notifyWhenBackgroundProgramNeedsInput, .notifyWhenBackgroundProgramFinishes,
-        .noticeBackgroundSessionsAtLaunch, .terminalBell,
+        .noticeBackgroundSessionsAtLaunch, .workerNotifications, .terminalBell,
     ])
     let changes = settings.changes(in: NotificationsSettingsPage.resetSettings)
     #expect(changes.map(\.title) == [
         "Notify me when a background program needs me",
         "Notify me when a background program finishes",
         "Tell me about background sessions when Cherry opens",
+        "Notify me about workers",
         "Bell",
     ])
 
@@ -377,16 +404,18 @@ private func permissionModel(
     let confirmation = SettingsConfirmation.pageReset(changes: changes, mentionsGhosttyConfig: false) {
         settings.reset(NotificationsSettingsPage.resetSettings)
     }
-    #expect(confirmation.title == "Reset 4 settings?")
+    #expect(confirmation.title == "Reset 5 settings?")
     #expect(confirmation.message == "Notify me when a background program needs me Off → On · "
         + "Notify me when a background program finishes On → Off · "
-        + "Tell me about background sessions when Cherry opens Off → On · Bell Silent → Beep.")
+        + "Tell me about background sessions when Cherry opens Off → On · "
+        + "Notify me about workers When they need you → Never · Bell Silent → Beep.")
     #expect(confirmation.choices.map(\.title) == ["Reset", "Cancel"])
     try #require(confirmation.choices.first).perform()
 
     #expect(settings.notifyWhenBackgroundProgramNeedsInput)
     #expect(!settings.notifyWhenBackgroundProgramFinishes)
     #expect(settings.noticeBackgroundSessionsAtLaunch)
+    #expect(settings.workerNotifications == .never)
     #expect(settings.terminalBell == .beep)
     for setting in NotificationsSettingsPage.resetSettings {
         #expect(defaults.object(forKey: setting.rawValue) == nil, Comment(rawValue: setting.rawValue))
@@ -420,17 +449,21 @@ private func notificationsSearchContext(_ settings: TerminalSettings, defaults: 
 
     let rows = NotificationsSettingsPage.searchRows(in: context)
     #expect(rows.map(\.id) == [
-        .notificationsBackground, .notificationsBackgroundFinished, .notificationsLaunchNotice, .notificationsBell,
+        .notificationsBackground, .notificationsBackgroundFinished, .notificationsLaunchNotice,
+        .notificationsWorkers, .notificationsBell,
     ])
-    #expect(rows.map(\.section) == ["Background sessions", "Background sessions", "Background sessions", "Terminal bell"])
-    #expect(rows.map(\.value) == ["On", "Off", "On", "Beep"])
+    #expect(rows.map(\.section) == [
+        "Background sessions", "Background sessions", "Background sessions", "Workers", "Terminal bell",
+    ])
+    #expect(rows.map(\.value) == ["On", "Off", "On", "Never", "Beep"])
     #expect(rows.allSatisfy { $0.route == .page(.notifications) })
     #expect(rows.last?.help == "What a program's bell does in a tab.")
 
     settings.terminalBell = .silent
     settings.notifyWhenBackgroundProgramFinishes = true
+    settings.workerNotifications = .needsYou
     let changed = NotificationsSettingsPage.searchRows(in: context)
-    #expect(changed.map(\.value) == ["On", "On", "On", "Silent"])
+    #expect(changed.map(\.value) == ["On", "On", "On", "When they need you", "Silent"])
 }
 
 @Test @MainActor func settingsWindowNotificationsSearchFindsTheBellAndTheNotifySwitches() throws {
@@ -460,4 +493,6 @@ private func notificationsSearchContext(_ settings: TerminalSettings, defaults: 
     #expect(notify.contains(.notificationsBackgroundFinished))
     // "startup": the launch notice, by its words.
     #expect(results("startup") == [.notificationsLaunchNotice])
+    // "subagents": the workers' picker, by its words.
+    #expect(results("subagents") == [.notificationsWorkers])
 }

@@ -893,6 +893,31 @@ extension CherryControlServer {
         }
     }
 
+    /// `agent` waits on agents at work for it, each of which wakes it with a
+    /// line when it finishes: a task of a run it owns is queued or being
+    /// worked on, or an agent its wake subscription (or reply watch)
+    /// watches is in a turn (it reports `working`, or reports nothing and
+    /// its submitted turn has not gone quiet yet). The end of a turn a wake
+    /// line started in `agent` is no news for the user then
+    /// (`TerminalSession.notifyProgramStatus`). A worker that waits on its
+    /// orchestrator or the user (a question, an approval) is not at work.
+    @MainActor
+    func awaitsAgentsAtWork(_ agent: TerminalSession) -> Bool {
+        guard monitors.wakeLinesEnabled else { return false }
+        let busyTask = tasks.orderedRuns.contains { run in
+            run.ownerID == agent.id && run.wakes
+                && tasks.tasks(of: run).contains { $0.state == .queued || $0.state == .working }
+        }
+        if busyTask { return true }
+        return monitors.subscriptions.values.contains { subscription in
+            subscription.wakeRequested && subscription.subscriber === agent
+                && subscription.watched.contains { watched in
+                    guard let session = watched.session, session !== agent, session.kind == .agent else { return false }
+                    return monitorStatus(of: watched) == "working" || awaitsOutputQuiet(watched, in: subscription)
+                }
+        }
+    }
+
     /// The subscriber cancelled the task itself (`cancel_tasks`): it knows.
     @MainActor
     static func subscriberCancelled(_ task: AgentTask, _ subscription: MonitorSubscription) -> Bool {

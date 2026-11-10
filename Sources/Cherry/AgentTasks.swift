@@ -1011,7 +1011,14 @@ extension CherryControlServer {
     @MainActor
     func typeCherryLine(_ text: String, into session: TerminalSession) async throws -> Int {
         await tasks.typingLocks.acquire(session.id)
+        // The turn this line submits is Cherry's: its end tells the user
+        // nothing while the agent waits on agents at work for it.
+        session.beginCherryLine { [weak self, weak session] in
+            guard let self, let session else { return false }
+            return self.awaitsAgentsAtWork(session)
+        }
         defer {
+            session.endCherryLine()
             noteCherryLineTyped(into: session)
             tasks.typingLocks.release(session.id)
         }

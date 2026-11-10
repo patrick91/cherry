@@ -26,7 +26,9 @@ import Foundation
 enum AgentCLILaunch {
     /// The line a launch appends to the agent's instructions: no `'`, `"`
     /// or `\`, so it reads the same in every shell's single quotes and as a
-    /// TOML basic string.
+    /// TOML basic string. Its "(CHERRY_PROCESS_ID <tab id>)" is how Cherry
+    /// finds a Codex tab's thread in Codex's rollouts
+    /// (`AgentConversations.codexTabMarker`): keep it.
     static func instructionLine(processID: String?, hasSkill: Bool) -> String {
         let tab = processID.map { "You run in a Cherry tab (CHERRY_PROCESS_ID \($0))." } ?? "You run in a Cherry tab."
         let how = hasSkill

@@ -1268,6 +1268,15 @@ final class PersistentHostSessions {
         store.addLostSessions(fresh, hostID: list.hostID)
     }
 
+    /// Whether the host reported `binding`'s session lost (its holder was
+    /// killed while no daemon ran there: that Mac restarted, or its user
+    /// logged out): in a list of this run (`HostControl.reportedLost`), or
+    /// as `endedSessionsStore` recorded it from an earlier one.
+    func reportedLost(_ binding: HostedSessionAttachment) -> Bool {
+        control.reportedLost(sessionID: binding.sessionID, hostID: binding.hostID)
+            || endedSessionsStore?.lostSessions(hostID: binding.hostID).contains(binding.sessionID) == true
+    }
+
     func programState(of binding: HostedSessionAttachment) -> PersistentProgramState {
         let control = control
         let connected = control.state == .connected

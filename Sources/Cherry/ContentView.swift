@@ -8084,7 +8084,9 @@ private struct SharedSessionBar: View {
 // Sessions keeps such tabs or it ended within its first second. Also a tab
 // of any kind whose session the system ended while Cherry was closed ("Ended
 // when the Mac restarted", TerminalSession.systemSessionEnd): it has no
-// session, and Restart starts its program again.
+// session, and Restart starts its program again. An agent's whose CLI still
+// has its conversation (TerminalSession.conversationToResume, also after a
+// lost holder) says Resume instead, and starts in that conversation.
 private struct PersistentSessionEndedBar: View {
     @ObservedObject var session: TerminalSession
     /// nil when the tab cannot be closed (the workspace's last tab).
@@ -8103,10 +8105,18 @@ private struct PersistentSessionEndedBar: View {
                     .truncationMode(.tail)
                     .help(message)
 
-                Button("Restart") {
-                    session.restart()
+                if let conversation = session.conversationToResume {
+                    Button("Resume") {
+                        session.restart()
+                    }
+                    .controlSize(.small)
+                    .help("Start \(conversation.cli.executableName) again in this conversation")
+                } else {
+                    Button("Restart") {
+                        session.restart()
+                    }
+                    .controlSize(.small)
                 }
-                .controlSize(.small)
 
                 Button("Close") {
                     close?()

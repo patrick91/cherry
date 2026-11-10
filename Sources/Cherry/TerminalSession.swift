@@ -1528,7 +1528,9 @@ final class TerminalWorkspace: ObservableObject {
             parentAgentID: normalizedParentAgentID,
             launchBackend: launchBackend,
             persistentHosting: persistentHostingForNewTab(),
-            agentLaunch: backendPolicy.agentLaunch
+            agentLaunch: backendPolicy.agentLaunch,
+            agentConversations: backendPolicy.agentConversations,
+            deviceAgentConversations: backendPolicy.deviceAgentConversations
         )
         sessions.append(session)
         if select {
@@ -1767,8 +1769,12 @@ final class TerminalWorkspace: ObservableObject {
             adoptingPersistentSession: launch,
             deferredLaunch: deferringLaunch,
             provisionalRestore: provisional,
-            agentLaunch: backendPolicy.agentLaunch
+            agentLaunch: backendPolicy.agentLaunch,
+            agentConversations: backendPolicy.agentConversations,
+            deviceAgentConversations: backendPolicy.deviceAgentConversations
         )
+        session.agentConversation = AgentConversation(record.agentConversation)
+        session.agentProgramStartedAt = record.agentStartedAt
         if record.hasUnreadNotification == true { session.markUnread() }
         return session
     }
@@ -1820,8 +1826,12 @@ final class TerminalWorkspace: ObservableObject {
             restartOnExit: record.restartOnExit,
             launchBackend: launchBackend,
             persistentHosting: hosting,
-            agentLaunch: backendPolicy.agentLaunch
+            agentLaunch: backendPolicy.agentLaunch,
+            agentConversations: backendPolicy.agentConversations,
+            deviceAgentConversations: backendPolicy.deviceAgentConversations
         )
+        session.agentConversation = AgentConversation(record.agentConversation)
+        session.agentProgramStartedAt = record.agentStartedAt
         session.showSystemSessionEnd(end, exitStatus: record.exitStatus)
         if record.hasUnreadNotification == true { session.markUnread() }
         return session
@@ -3197,7 +3207,9 @@ final class TerminalWorkspace: ObservableObject {
         parentAgentID: UUID?,
         launchBackend: TerminalSessionLaunchBackend,
         persistentHosting: PersistentLocalSessions?,
-        agentLaunch: AgentLaunchContext?
+        agentLaunch: AgentLaunchContext?,
+        agentConversations: AgentConversations?,
+        deviceAgentConversations: DeviceAgentConversations?
     ) -> TerminalSession {
         let baseTitle = agent.name.isEmpty ? "Agent" : agent.name
         let explicitTitle = requestedTitle?
@@ -3217,7 +3229,9 @@ final class TerminalWorkspace: ObservableObject {
             launchCommand: agent.commandLine,
             launchBackend: launchBackend,
             persistentHosting: persistentHosting,
-            agentLaunch: agentLaunch
+            agentLaunch: agentLaunch,
+            agentConversations: agentConversations,
+            deviceAgentConversations: deviceAgentConversations
         )
     }
 
@@ -3728,6 +3742,42 @@ final class TerminalSession: ObservableObject, Identifiable {
     private(set) var lastAgentLaunchOutcome: AgentLaunch.Outcome?
     /// The workspace policy's `agentLaunch`: nil adds nothing.
     private let agentLaunch: AgentLaunchContext?
+    /// The workspace policy's `agentConversations`: nil reads no CLI's
+    /// files, so nothing resumes.
+    private let agentConversations: AgentConversations?
+    /// The workspace policy's `deviceAgentConversations`, for a device's
+    /// tabs: nil reads nothing there.
+    private let deviceAgentConversations: DeviceAgentConversations?
+    /// The conversation this agent tab's CLI keeps (`AgentConversation`),
+    /// saved with the tab: Claude Code's session, read from its registry
+    /// while it runs (`scheduleAgentConversationCapture`,
+    /// `captureAgentConversationNow`); Codex's thread, looked
+    /// for in its rollouts once the system ended it
+    /// (`prepareConversationResume`). Nil for other tabs, until known, and
+    /// from a launch that starts a new conversation.
+    @Published fileprivate(set) var agentConversation: AgentConversation?
+    /// What the next launch resumes: the conversation of an agent whose
+    /// program the system ended (a restart, a log out, a lost holder) that
+    /// its CLI still has (`prepareConversationResume`). The ended tab's
+    /// Restart says Resume; one launch takes it (`startShell`).
+    @Published private(set) var conversationToResume: AgentConversation?
+    /// When this Codex tab last started its program (not an attach or an
+    /// adoption; only while Cherry follows its conversation), saved with
+    /// the tab: its threads are looked for from then, so an earlier
+    /// launch's is never taken for a later one's that Cherry's line did not
+    /// mark.
+    fileprivate(set) var agentProgramStartedAt: Date?
+    /// Reading the CLI's files for `agentConversation`: one at a time.
+    private var agentConversationCapture: Task<Void, Never>?
+    /// When the last such read of a device's tab finished: they are at
+    /// least `deviceConversationCaptureInterval` apart.
+    private var lastDeviceConversationCaptureAt: Date?
+    private var conversationResumeCheck: Task<Void, Never>?
+    /// A device that could not be asked for the conversation: looked for
+    /// again once it answers (`prepareConversationResume`).
+    private var conversationResumeRetry: AnyCancellable?
+    /// `prepareConversationResume` is still looking (tests wait for it).
+    var isLookingForConversationToResume: Bool { conversationResumeCheck != nil || conversationResumeRetry != nil }
     private(set) var launchEnvironment: [String: String]
     private(set) var restartOnExit: Bool
     /// Set by the owning workspace: called after a rename, a managed command
@@ -3997,6 +4047,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         deferredLaunch: Bool = false,
         provisionalRestore: Bool = false,
         agentLaunch: AgentLaunchContext? = nil,
+        agentConversations: AgentConversations? = nil,
+        deviceAgentConversations: DeviceAgentConversations? = nil,
         programStatusNotificationHandler: @escaping @MainActor (ProgramStatus, TerminalSession) -> Void = { status, session in
             TerminalNotificationCenter.shared.postProgramStatus(status, for: session)
         }
@@ -4023,6 +4075,8 @@ final class TerminalSession: ObservableObject, Identifiable {
         self.commandName = commandName
         self.launchCommand = launchCommand?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.agentLaunch = agentLaunch
+        self.agentConversations = agentConversations
+        self.deviceAgentConversations = deviceAgentConversations
         self.launchEnvironment = launchEnvironment
         self.restartOnExit = restartOnExit
         self.programStatusNotificationHandler = programStatusNotificationHandler
@@ -5576,18 +5630,29 @@ final class TerminalSession: ObservableObject, Identifiable {
     /// `RemoteLaunchSpec`. The log says why an agent did or did not get them.
     /// `outcome` is what was decided, nil when nothing was (not a This Mac
     /// agent's launch, or no context).
-    private func commandWithAgentFlags() -> (command: String?, outcome: AgentLaunch.Outcome?) {
-        guard kind == .agent, let agentLaunch, let launchCommand, hostedAttachment == nil,
-              persistentHosting?.profile.isThisMac ?? true
-        else { return (nil, nil) }
-        let outcome = agentLaunch.outcome(commandLine: launchCommand, processID: id.uuidString)
+    ///
+    /// `resuming`: the conversation this launch resumes
+    /// (`conversationToResume`): the command is then the line that resumes
+    /// it (`AgentConversationResume`), with Cherry's flags when they apply;
+    /// a device's tab's too, to which its launch adds the device's.
+    private func commandWithAgentFlags(resuming conversation: AgentConversation?) -> (command: String?, outcome: AgentLaunch.Outcome?) {
+        guard kind == .agent, let launchCommand, hostedAttachment == nil else { return (nil, nil) }
+        let resumeLine = conversation.flatMap { AgentConversationResume.commandLine(resuming: $0, from: launchCommand) }
+        if let conversation, resumeLine != nil {
+            SessionLog.notice("[agent] tab \(id.uuidString) resumes its \(conversation.cli.executableName) conversation \(conversation.id)")
+        }
+        // Another Mac's launch adds its flags to that line (`RemoteLaunchSpec`).
+        guard persistentHosting?.profile.isThisMac ?? true else { return (resumeLine, nil) }
+        guard let agentLaunch else { return (resumeLine, nil) }
+        let commandLine = resumeLine ?? launchCommand
+        let outcome = agentLaunch.outcome(commandLine: commandLine, processID: id.uuidString)
         switch outcome {
         case .appended(let suffix):
             SessionLog.debug("[agent] tab \(id.uuidString) starts its agent with the cherry CLI's flags:\(suffix)")
-            return (launchCommand + suffix, outcome)
+            return (commandLine + suffix, outcome)
         case .skipped(let reason):
             SessionLog.debug("[agent] tab \(id.uuidString) starts its agent without Cherry's flags: \(reason)")
-            return (nil, outcome)
+            return (resumeLine, outcome)
         }
     }
 
@@ -5674,7 +5739,21 @@ final class TerminalSession: ObservableObject, Identifiable {
         // before this launch.
         startedCurrentProgram = hostedAttachment == nil
             && (persistentHosting == nil || persistentSessionToAdopt == nil)
-        (launchStartupCommand, lastAgentLaunchOutcome) = startedCurrentProgram ? commandWithAgentFlags() : (nil, nil)
+        // A program this launch starts has a new conversation, unless it
+        // resumes the one the system ended (once).
+        conversationResumeCheck?.cancel()
+        conversationResumeCheck = nil
+        conversationResumeRetry = nil
+        let resuming = startedCurrentProgram ? conversationToResume : nil
+        conversationToResume = nil
+        if startedCurrentProgram, resuming == nil, agentConversation != nil {
+            agentConversation = nil
+        }
+        if startedCurrentProgram, conversationCLI?.cli == .codex {
+            agentProgramStartedAt = Date()
+        }
+        (launchStartupCommand, lastAgentLaunchOutcome) = startedCurrentProgram
+            ? commandWithAgentFlags(resuming: resuming) : (nil, nil)
         cancelPersistentReconnect()
         if let hostedAttachment {
             hostedAttachmentStatus = .active
@@ -6563,13 +6642,22 @@ final class TerminalSession: ObservableObject, Identifiable {
         // The host's own report of how it ended (its holder died), else
         // what the list says of the session.
         let end = end ?? persistentSession.flatMap { persistentHosting?.sessionInfo($0.sessionID)?.end }
-        if let end, end.isHolderLost, hostSessionEnd != end {
+        let holderLost = end.map { $0.isHolderLost && hostSessionEnd != $0 } ?? false
+        if let end, holderLost {
             hostSessionEnd = end
             SessionLog.notice("tab \(id.uuidString): \(end.message)")
         }
+        // Gone with its Mac: the tab says so, as one restored after it.
+        let systemEnd = end == nil ? lostWithItsMac() : nil
+        if let systemEnd {
+            systemSessionEnd = systemEnd
+            systemEndExitStatus = nil
+            SessionLog.notice("tab \(id.uuidString): \(systemEnd.message(machine: remoteMachineName))")
+        }
         // A restored tab whose adapter never ran: no surface showed the
-        // program, so its final screen comes from the host.
-        let showsHostFinalScreen = persistentAdapterDeferred
+        // program, so its final screen comes from the host (which has none
+        // of a session it lost).
+        let showsHostFinalScreen = persistentAdapterDeferred && systemEnd == nil
         persistentAdapterDeferred = false
         cancelPersistentReconnect()
         persistentPhase = .idle
@@ -6585,6 +6673,34 @@ final class TerminalSession: ObservableObject, Identifiable {
         if showsHostFinalScreen, let persistentHosting, let binding = persistentSession {
             showFinalScreen(of: binding) { try await persistentHosting.screen(of: binding) }
         }
+        if systemEnd != nil {
+            // Like a tab restored after its Mac restarted, it names no
+            // session (its host has none).
+            persistentSession = nil
+            persistentLaunchRequestID = nil
+            persistentStateDidChange?()
+        }
+        if holderLost || systemEnd != nil, kind == .agent {
+            // Its program was killed with its holder, or with its Mac:
+            // Restart resumes its conversation, as after a restart of This
+            // Mac.
+            prepareConversationResume()
+        }
+    }
+
+    /// `.hostRestart` when this device tab's session is gone and its host
+    /// reported it lost (`PersistentHostSessions.reportedLost`): the daemon
+    /// there started again and found its holder killed, as a restart or log
+    /// out of that Mac kills it ("Ended when Studio restarted"). Nil for
+    /// This Mac's tabs, whose sessions a restart ends with Cherry
+    /// (`SystemEndedSessions` at the next launch), and for a session its
+    /// host still lists.
+    private func lostWithItsMac() -> SystemSessionEnd? {
+        guard let persistentHosting, !persistentHosting.profile.isThisMac, let persistentSession,
+              persistentHosting.sessionInfo(persistentSession.sessionID) == nil,
+              persistentHosting.reportedLost(persistentSession)
+        else { return nil }
+        return .hostRestart
     }
 
     /// The host reported the program exited (`PersistentLocalSessions`).
@@ -7063,9 +7179,10 @@ final class TerminalSession: ObservableObject, Identifiable {
                 }
             }
         } else if appendsExitNotice {
+            let notice = hostSessionEnd?.message ?? systemSessionEnd?.message(machine: remoteMachineName)
             processor.appendPlainLines([
                 "",
-                hostSessionEnd.map { "[\($0.message)]" } ?? "[shell exited with status \(status)]"
+                notice.map { "[\($0)]" } ?? "[shell exited with status \(status)]"
             ])
         }
         bumpRevision()
@@ -7164,8 +7281,176 @@ final class TerminalSession: ObservableObject, Identifiable {
             exitCode = exitStatus
         } else if kind == .command, restartOnExit {
             scheduleAutoRestartAfterExit()
+        } else if kind == .agent {
+            prepareConversationResume()
         }
         bumpRevision()
+    }
+
+    // MARK: Agent conversations
+
+    /// The CLI of this tab's agent, when Cherry follows its conversation,
+    /// and where it keeps it: an agent tab (never an attached session) whose
+    /// command is a plain `claude` or `codex` (`AgentLaunch.detection`), on
+    /// This Mac (native, or in This Mac's host) in a workspace that reads
+    /// its CLIs' files, or on a device in one that reads that Mac's.
+    private var conversationCLI: (cli: AgentLaunch.CLI, reader: AgentConversationReader)? {
+        guard kind == .agent, let launchCommand, hostedAttachment == nil,
+              let cli = AgentLaunch.detect(commandLine: launchCommand)?.cli, cli != .pi
+        else { return nil }
+        if let persistentHosting, !persistentHosting.profile.isThisMac {
+            guard let deviceAgentConversations else { return nil }
+            return (cli, .device(deviceAgentConversations.applying(environment: launchEnvironment)))
+        }
+        guard let agentConversations else { return nil }
+        return (cli, .thisMac(agentConversations.applying(environment: launchEnvironment)))
+    }
+
+    /// The process Claude Code is looked for under: This Mac's program, or
+    /// the one a device's host reports there.
+    private func conversationProcessID(on reader: AgentConversationReader) -> Int32? {
+        reader.isDevice ? remoteProgramProcessID : programProcessID
+    }
+
+    /// How far apart a device tab's reads of its Claude Code's session are
+    /// (each is a script over ssh).
+    static let deviceConversationCaptureInterval: TimeInterval = 15
+
+    /// Reads which session this tab's Claude Code has now, off the main
+    /// thread, a moment after its program reported its status (a turn
+    /// starts or ends; `/clear` and `/resume` change it): a device tab's at
+    /// most every `deviceConversationCaptureInterval`. A read under way or
+    /// waiting is not repeated. Codex's threads are looked for once it
+    /// ended (`prepareConversationResume`).
+    private func scheduleAgentConversationCapture() {
+        guard agentConversationCapture == nil, isRunning,
+              let (cli, reader) = conversationCLI, cli == .claudeCode,
+              let pid = conversationProcessID(on: reader)
+        else { return }
+        let launchID = activeLaunchID
+        var delay: TimeInterval = 1
+        if reader.isDevice, let last = lastDeviceConversationCaptureAt {
+            delay = max(delay, Self.deviceConversationCaptureInterval - Date().timeIntervalSince(last))
+        }
+        agentConversationCapture = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            let answer = await reader.claudeSession(runningUnder: pid)
+            guard let self else { return }
+            self.agentConversationCapture = nil
+            if reader.isDevice { self.lastDeviceConversationCaptureAt = Date() }
+            guard self.activeLaunchID == launchID, self.isRunning, self.conversationProcessID(on: reader) == pid,
+                  case .answered(let session) = answer
+            else { return }
+            self.noteAgentConversation(session.flatMap { AgentConversation(cli: .claudeCode, id: $0) })
+        }
+    }
+
+    /// Reads which session this tab's Claude Code has now, at once: Cherry
+    /// quits, and a restart or log out may end the program next.
+    /// `processes`: the process table, read once for every tab. This Mac's
+    /// tabs only (a device's are read as they report).
+    func captureAgentConversationNow(processes: [ShellProcessController.ProcessSnapshotEntry]) {
+        guard isRunning, let pid = programProcessID,
+              let (cli, reader) = conversationCLI, cli == .claudeCode,
+              case .thisMac(let conversations) = reader,
+              let session = conversations.claudeSession(runningUnder: pid, processes: processes)
+        else { return }
+        noteAgentConversation(AgentConversation(cli: .claudeCode, id: session))
+    }
+
+    private func noteAgentConversation(_ conversation: AgentConversation?) {
+        guard let conversation, conversation != agentConversation else { return }
+        agentConversation = conversation
+        SessionLog.debug("[agent] tab \(id.uuidString): its \(conversation.cli.executableName) conversation is \(conversation.id)")
+        persistentStateDidChange?()
+    }
+
+    /// The system ended this agent's program (`showSystemSessionEnd`, a
+    /// lost holder, its device restarted): looks, off the main thread, for
+    /// its conversation, and when its CLI still has it the next start
+    /// resumes it (`conversationToResume`). Claude Code's is the session
+    /// saved with the tab, kept by Claude Code; Codex's, the latest thread
+    /// its rollouts tie to this tab since its agent last started, else the
+    /// one that start resumed. A device that cannot be asked is asked once
+    /// more when it answers again. A launch meanwhile starts a new one.
+    private func prepareConversationResume(retryingWhenReachable: Bool = true) {
+        guard !isRunning, let (cli, reader) = conversationCLI, let launchCommand else { return }
+        let tabID = id
+        let saved = agentConversation
+        let startedAt = agentProgramStartedAt
+        // A device is asked again on a connection that came up after this
+        // look began.
+        let control = reader.isDevice ? persistentHosting?.control : nil
+        let connections = control?.connectionCount ?? 0
+        conversationResumeCheck?.cancel()
+        conversationResumeRetry = nil
+        conversationResumeCheck = Task { [weak self] in
+            let answer = await Self.lookUpConversation(
+                cli: cli, reader: reader, tabID: tabID, saved: saved, startedAt: startedAt
+            )
+            guard let self, !Task.isCancelled, !self.isRunning else { return }
+            self.conversationResumeCheck = nil
+            guard case .answered(let found) = answer else {
+                SessionLog.debug("[agent] tab \(tabID.uuidString): its Mac could not be asked for its \(cli.executableName) conversation")
+                guard retryingWhenReachable, let control else { return }
+                if control.state == .connected, control.connectionCount > connections {
+                    self.prepareConversationResume(retryingWhenReachable: false)
+                    return
+                }
+                self.conversationResumeRetry = control.$state
+                    .filter { [weak control] state in
+                        MainActor.assumeIsolated { state == .connected && (control?.connectionCount ?? 0) > connections }
+                    }
+                    .first()
+                    .sink { [weak self] _ in
+                        MainActor.assumeIsolated {
+                            guard let self, self.conversationResumeRetry != nil else { return }
+                            self.conversationResumeRetry = nil
+                            self.prepareConversationResume(retryingWhenReachable: false)
+                        }
+                    }
+                return
+            }
+            guard let found, AgentConversationResume.commandLine(resuming: found, from: launchCommand) != nil else {
+                SessionLog.debug("[agent] tab \(tabID.uuidString): no \(cli.executableName) conversation to resume")
+                return
+            }
+            self.conversationToResume = found
+            if found != self.agentConversation {
+                self.agentConversation = found
+                self.persistentStateDidChange?()
+            }
+            self.bumpRevision()
+        }
+    }
+
+    /// The conversation `prepareConversationResume` resumes, as `reader`
+    /// finds it (see there).
+    nonisolated private static func lookUpConversation(
+        cli: AgentLaunch.CLI,
+        reader: AgentConversationReader,
+        tabID: UUID,
+        saved: AgentConversation?,
+        startedAt: Date?
+    ) async -> DeviceAgentConversations.Answer<AgentConversation?> {
+        switch cli {
+        case .claudeCode:
+            guard let saved, saved.cli == .claudeCode else { return .answered(nil) }
+            switch await reader.claudeHasConversation(saved.id) {
+            case .answered(let has): return .answered(has ? saved : nil)
+            case .unreachable: return .unreachable
+            }
+        case .codex:
+            switch await reader.codexThread(launchedInTab: tabID, createdSince: startedAt) {
+            case .answered(let thread):
+                if let found = thread.flatMap({ AgentConversation(cli: .codex, id: $0) }) { return .answered(found) }
+                return .answered(saved?.cli == .codex ? saved : nil)
+            case .unreachable:
+                return .unreachable
+            }
+        case .pi:
+            return .answered(nil)
+        }
     }
 
     /// How this tab's program ended, as its saved record keeps it
@@ -8083,6 +8368,11 @@ final class TerminalSession: ObservableObject, Identifiable {
             case .idle, .working, .unknown:
                 break
             }
+        }
+        if firstReport || previousRoot?.state != root?.state {
+            // A turn began or ended: the session it belongs to is worth
+            // knowing should the system end the program.
+            scheduleAgentConversationCapture()
         }
         if stateChanged {
             bumpRevision()

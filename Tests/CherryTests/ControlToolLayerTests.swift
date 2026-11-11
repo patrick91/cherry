@@ -336,6 +336,51 @@ private func controlToolLayerProcess(id: String = controlToolLayerAgentID, kind:
     let features = project.structured?.objectValue?["features"]
     #expect(features == .object(["todosEnabled": .bool(true)]))
 
+    // A subscription's processes are `process_ids` in the text, as subscribe
+    // takes them, not snake case's `process_i_ds`; structured content and the
+    // wire keep `processIDs`.
+    let subscription = SubscriptionInfo(
+        subscriptionID: "sub-1",
+        subscriberProcessID: nil,
+        processIDs: [controlToolLayerAgentID],
+        subAgents: false,
+        events: [.done],
+        outputPattern: nil,
+        wake: false,
+        wakeUnavailableReason: nil,
+        createdAt: Date(timeIntervalSince1970: 0),
+        cursor: 0,
+        pendingEvents: 0
+    )
+    let subscribing = ControlToolLayerRecorder { request in
+        if case .listSubscriptions = request {
+            return CherryControlResponse(result: .listSubscriptions(ListSubscriptionsResult(subscriptions: [subscription])))
+        }
+        return CherryControlResponse(result: .subscribe(SubscribeResult(subscription: subscription, watching: [])))
+    }
+    for (name, arguments) in [
+        ("subscribe", ["process_ids": JSONValue.array([.string(controlToolLayerAgentID)])]),
+        ("list_subscriptions", [:]),
+    ] {
+        let listed = await CherryToolLayer.call(name: name, arguments: arguments, caller: CherryToolCaller(), transport: subscribing)
+        #expect(!listed.isError, "\(name): \(listed.text)")
+        #expect(listed.text.contains(#""process_ids":["\#(controlToolLayerAgentID)"]"#), "\(name): \(listed.text)")
+        #expect(!listed.text.contains("process_i_ds"), "\(name): \(listed.text)")
+        let structured = String(decoding: try JSONEncoder().encode(try #require(listed.structured)), as: UTF8.self)
+        #expect(structured.contains(#""processIDs":["\#(controlToolLayerAgentID)"]"#), "\(name): \(structured)")
+    }
+    let subscribed = await CherryToolLayer.call(
+        name: "subscribe",
+        arguments: ["process_ids": .array([.string(controlToolLayerAgentID)])],
+        caller: CherryToolCaller(),
+        transport: subscribing
+    )
+    let structured = try #require(subscribed.structured)
+    #expect(try JSONDecoder().decode(SubscribeResult.self, from: JSONEncoder().encode(structured)).subscription == subscription)
+    let wire = String(decoding: try JSONEncoder().encode(subscription), as: UTF8.self)
+    #expect(wire.contains(#""processIDs":["\#(controlToolLayerAgentID)"]"#), "\(wire)")
+    #expect(try JSONDecoder().decode(SubscriptionInfo.self, from: Data(wire.utf8)) == subscription)
+
     // Cherry's error, with its details.
     let refusing = ControlToolLayerRecorder { _ in
         CherryControlResponse(error: CherryControlError(

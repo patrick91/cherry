@@ -847,6 +847,10 @@ extension CodingUserInfoKey {
     /// results), not the control wire: fields the wire keeps only for older
     /// helpers stay out of it.
     public static let cherryAgentFacingOutput = CodingUserInfoKey(rawValue: "cherry.agentFacingOutput")!
+    /// True on an encoder that writes its keys in snake case (the text of a
+    /// tool's result), where a key snake case would mangle is written so it
+    /// converts as agents expect (`SubscriptionInfo.processIDs`).
+    public static let cherrySnakeCaseKeys = CodingUserInfoKey(rawValue: "cherry.snakeCaseKeys")!
 }
 
 /// A project's optional features. The wire still carries `notesEnabled`,
@@ -2231,6 +2235,39 @@ public struct SubscriptionInfo: Codable, Equatable, Sendable {
         self.cursor = cursor
         self.pendingEvents = pendingEvents
         self.reply = reply
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case subscriptionID, subscriberProcessID, processIDs, subAgents, events, outputPattern
+        case wake, wakeUnavailableReason, createdAt, cursor, pendingEvents, reply
+    }
+
+    /// `processIDs` for snake case (`cherrySnakeCaseKeys`): it would make
+    /// `processIDs` `process_i_ds`, where `subscribe` takes `process_ids`.
+    /// The wire and structured content keep `processIDs`.
+    private enum SnakeCaseKeys: String, CodingKey {
+        case processIDs = "processIds"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(subscriptionID, forKey: .subscriptionID)
+        try container.encodeIfPresent(subscriberProcessID, forKey: .subscriberProcessID)
+        if encoder.userInfo[.cherrySnakeCaseKeys] as? Bool == true {
+            var snakeCase = encoder.container(keyedBy: SnakeCaseKeys.self)
+            try snakeCase.encode(processIDs, forKey: .processIDs)
+        } else {
+            try container.encode(processIDs, forKey: .processIDs)
+        }
+        try container.encode(subAgents, forKey: .subAgents)
+        try container.encode(events, forKey: .events)
+        try container.encodeIfPresent(outputPattern, forKey: .outputPattern)
+        try container.encode(wake, forKey: .wake)
+        try container.encodeIfPresent(wakeUnavailableReason, forKey: .wakeUnavailableReason)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(cursor, forKey: .cursor)
+        try container.encode(pendingEvents, forKey: .pendingEvents)
+        try container.encodeIfPresent(reply, forKey: .reply)
     }
 }
 

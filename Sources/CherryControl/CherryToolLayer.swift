@@ -900,6 +900,7 @@ public enum CherryToolLayer {
     private static func jsonString<Payload: Encodable>(_ payload: Payload) throws -> String {
         let encoder = agentFacingEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.userInfo[.cherrySnakeCaseKeys] = true
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(payload)
         return String(decoding: data, as: UTF8.self)

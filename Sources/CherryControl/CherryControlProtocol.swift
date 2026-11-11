@@ -847,6 +847,10 @@ extension CodingUserInfoKey {
     /// results), not the control wire: fields the wire keeps only for older
     /// helpers stay out of it.
     public static let cherryAgentFacingOutput = CodingUserInfoKey(rawValue: "cherry.agentFacingOutput")!
+    /// True on an encoder that writes its keys in snake case (the text of a
+    /// tool's result), where a key snake case would mangle is written so it
+    /// converts as agents expect (`SubscriptionInfo.processIDs`).
+    public static let cherrySnakeCaseKeys = CodingUserInfoKey(rawValue: "cherry.snakeCaseKeys")!
 }
 
 /// A project's optional features. The wire still carries `notesEnabled`,
@@ -2238,10 +2242,10 @@ public struct SubscriptionInfo: Codable, Equatable, Sendable {
         case wake, wakeUnavailableReason, createdAt, cursor, pendingEvents, reply
     }
 
-    /// `processIDs` as agents read it: snake case would make `processIDs`
-    /// `process_i_ds`, where `subscribe` takes `process_ids`. The wire keeps
-    /// `processIDs`, which older helpers decode.
-    private enum AgentFacingKeys: String, CodingKey {
+    /// `processIDs` for snake case (`cherrySnakeCaseKeys`): it would make
+    /// `processIDs` `process_i_ds`, where `subscribe` takes `process_ids`.
+    /// The wire and structured content keep `processIDs`.
+    private enum SnakeCaseKeys: String, CodingKey {
         case processIDs = "processIds"
     }
 
@@ -2249,9 +2253,9 @@ public struct SubscriptionInfo: Codable, Equatable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(subscriptionID, forKey: .subscriptionID)
         try container.encodeIfPresent(subscriberProcessID, forKey: .subscriberProcessID)
-        if encoder.userInfo[.cherryAgentFacingOutput] as? Bool == true {
-            var agentFacing = encoder.container(keyedBy: AgentFacingKeys.self)
-            try agentFacing.encode(processIDs, forKey: .processIDs)
+        if encoder.userInfo[.cherrySnakeCaseKeys] as? Bool == true {
+            var snakeCase = encoder.container(keyedBy: SnakeCaseKeys.self)
+            try snakeCase.encode(processIDs, forKey: .processIDs)
         } else {
             try container.encode(processIDs, forKey: .processIDs)
         }

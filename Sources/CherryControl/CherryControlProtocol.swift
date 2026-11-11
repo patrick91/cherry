@@ -2232,6 +2232,39 @@ public struct SubscriptionInfo: Codable, Equatable, Sendable {
         self.pendingEvents = pendingEvents
         self.reply = reply
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case subscriptionID, subscriberProcessID, processIDs, subAgents, events, outputPattern
+        case wake, wakeUnavailableReason, createdAt, cursor, pendingEvents, reply
+    }
+
+    /// `processIDs` as agents read it: snake case would make `processIDs`
+    /// `process_i_ds`, where `subscribe` takes `process_ids`. The wire keeps
+    /// `processIDs`, which older helpers decode.
+    private enum AgentFacingKeys: String, CodingKey {
+        case processIDs = "processIds"
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(subscriptionID, forKey: .subscriptionID)
+        try container.encodeIfPresent(subscriberProcessID, forKey: .subscriberProcessID)
+        if encoder.userInfo[.cherryAgentFacingOutput] as? Bool == true {
+            var agentFacing = encoder.container(keyedBy: AgentFacingKeys.self)
+            try agentFacing.encode(processIDs, forKey: .processIDs)
+        } else {
+            try container.encode(processIDs, forKey: .processIDs)
+        }
+        try container.encode(subAgents, forKey: .subAgents)
+        try container.encode(events, forKey: .events)
+        try container.encodeIfPresent(outputPattern, forKey: .outputPattern)
+        try container.encode(wake, forKey: .wake)
+        try container.encodeIfPresent(wakeUnavailableReason, forKey: .wakeUnavailableReason)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(cursor, forKey: .cursor)
+        try container.encode(pendingEvents, forKey: .pendingEvents)
+        try container.encodeIfPresent(reply, forKey: .reply)
+    }
 }
 
 public struct SubscribeResult: Codable, Equatable, Sendable {

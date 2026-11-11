@@ -15,7 +15,7 @@
 # Prints, on stdout: build= publish= appcast_tag= version= tag= build_id=
 # prev_tag= reason=. A dry run always builds, never publishes, deletes nothing
 # and gives no appcast_tag. --no-fetch reads the local refs and tags instead
-# of origin's. Writes DIR/notes.md (the release body) and DIR/notes.html (the
+# of origin's. Writes DIR/notes.md (the release body) and DIR/notes-appcast.md (the
 # appcast item's description). The only write is deleting stale drafts.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -160,7 +160,7 @@ else
 fi
 git log --no-merges --format='%H%x09%s' "${range[@]}" \
   | cherry_release notes --repo "$GH_REPO" --tag "$tag" ${prev_tag:+--prev-tag "$prev_tag"} \
-      --build "$build_id" --md "$out/notes.md" --html "$out/notes.html"
+      --build "$build_id" --md "$out/notes.md" --appcast "$out/notes-appcast.md"
 
 if [ "$dry_run" = true ]; then
   emit true false "" "$version" "$tag" "$build_id" "$prev_tag" "dry run of $tag; nothing is published"

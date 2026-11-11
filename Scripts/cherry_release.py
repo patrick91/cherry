@@ -21,7 +21,6 @@ import base64
 import calendar
 import datetime
 import email.utils
-import html
 import json
 import os
 import plistlib
@@ -53,7 +52,7 @@ PRERELEASE_CHANNEL = "prerelease"
 # return, surrogates (undecodable bytes), U+FFFE and U+FFFF. ElementTree
 # writes them as they are, and no parser reads the result back.
 XML_INVALID = re.compile(r'[^\t\n\r\x20-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]')
-NOTES_HTML_CAP = 50
+NOTES_APPCAST_CAP = 50
 NOTES_MARKDOWN_CAP = 100
 MINIMUM_MACOS_TEXT = "requires macOS 26 or later"
 
@@ -241,18 +240,12 @@ def parse_log(text):
     return entries
 
 
-def notes_html(repo, entries):
-    """The appcast item's description: a list of the commits, at most 50."""
-    if not entries:
-        return "<p>No changes besides merges.</p>"
-    rows = []
-    for sha, subject in entries[:NOTES_HTML_CAP]:
-        link = f'<a href="https://github.com/{repo}/commit/{sha}">{sha[:7]}</a>'
-        rows.append(f"<li>{html.escape(subject, quote=True)} ({link})</li>")
-    text = "<ul>" + "".join(rows) + "</ul>"
-    if len(entries) > NOTES_HTML_CAP:
-        text += f"<p>…and {len(entries) - NOTES_HTML_CAP} more changes.</p>"
-    return text
+def notes_appcast(repo, entries):
+    """The appcast item's description, in markdown (`sparkle:format`): a list
+    of the commits, at most 50. Cherry's update window joins these lists for
+    every release between the running build and the update, which Sparkle
+    lets it do only for markdown or plain-text notes."""
+    return "\n\n".join(_markdown_commits(repo, entries, NOTES_APPCAST_CAP))
 
 
 def _markdown_text(subject):
@@ -261,18 +254,23 @@ def _markdown_text(subject):
     return subject.replace("\\", "\\\\").replace("<", "\\<")
 
 
+def _markdown_commits(repo, entries, cap):
+    """The commits as markdown blocks: their list (at most `cap`), then how
+    many more there are; a line saying so when there are none."""
+    if not entries:
+        return ["No changes besides merges."]
+    lines = [f"- {_markdown_text(subject)} ([{sha[:7]}](https://github.com/{repo}/commit/{sha}))"
+             for sha, subject in entries[:cap]]
+    blocks = ["\n".join(lines)]
+    if len(entries) > cap:
+        blocks.append(f"…and {len(entries) - cap} more changes.")
+    return blocks
+
+
 def notes_markdown(repo, tag, prev_tag, build, entries):
     """The GitHub release body: the commits (at most 100), the compare link
     when there is a previous tag, then the build."""
-    parts = []
-    if entries:
-        lines = [f"- {_markdown_text(subject)} ([{sha[:7]}](https://github.com/{repo}/commit/{sha}))"
-                 for sha, subject in entries[:NOTES_MARKDOWN_CAP]]
-        parts.append("\n".join(lines))
-        if len(entries) > NOTES_MARKDOWN_CAP:
-            parts.append(f"…and {len(entries) - NOTES_MARKDOWN_CAP} more changes.")
-    else:
-        parts.append("No changes besides merges.")
+    parts = _markdown_commits(repo, entries, NOTES_MARKDOWN_CAP)
     if prev_tag:
         parts.append(f"**Full changes:** [{prev_tag}...{tag}](https://github.com/{repo}/compare/{prev_tag}...{tag})")
     parts.append(f"Build `{build}` · {MINIMUM_MACOS_TEXT}")
@@ -754,7 +752,9 @@ def make_item(manifest_path, channel, tag, repo, notes_path, conf, sign_tool=Non
         ET.SubElement(item, sparkle("channel")).text = PRERELEASE_CHANNEL
     ET.SubElement(item, sparkle("fullReleaseNotesLink")).text = page
     if notes:
-        ET.SubElement(item, "description").text = notes
+        description = ET.SubElement(item, "description")
+        description.set(sparkle("format"), "markdown")
+        description.text = notes
     enclosure = ET.SubElement(item, "enclosure")
     enclosure.set("url", download_url(repo, tag, zip_name))
     enclosure.set("length", str(size))
@@ -886,7 +886,7 @@ def run_notes(arguments):
     entries = parse_log(sys.stdin.buffer.read().decode("utf-8", errors="replace"))
     write_output(arguments.md, notes_markdown(arguments.repo, arguments.tag, arguments.prev_tag,
                                               arguments.build, entries).encode("utf-8"))
-    write_output(arguments.html, (notes_html(arguments.repo, entries) + "\n").encode("utf-8"))
+    write_output(arguments.appcast, (notes_appcast(arguments.repo, entries) + "\n").encode("utf-8"))
     return 0
 
 
@@ -922,7 +922,7 @@ def parser():
     command.add_argument("--prev-tag")
     command.add_argument("--build", required=True)
     command.add_argument("--md", required=True)
-    command.add_argument("--html", required=True)
+    command.add_argument("--appcast", required=True)
 
     appcast = commands.add_parser("appcast", help="the Sparkle appcast")
     actions = appcast.add_subparsers(dest="action", metavar="ACTION")

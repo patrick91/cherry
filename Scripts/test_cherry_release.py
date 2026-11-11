@@ -743,7 +743,9 @@ def item_element(version, build, channel="prerelease", length=1234, signature=No
     if channel == "prerelease":
         ET.SubElement(item, release.sparkle("channel")).text = "prerelease"
     ET.SubElement(item, release.sparkle("fullReleaseNotesLink")).text = page
-    ET.SubElement(item, "description").text = "<ul><li>A &amp; B</li></ul>"
+    description = ET.SubElement(item, "description")
+    description.set(release.sparkle("format"), "markdown")
+    description.text = "- A & B ([abc1234](https://github.com/x/y/commit/abc1234))"
     enclosure = ET.SubElement(item, "enclosure")
     enclosure.set("url", release.download_url(repo, tag, zip_name or f"Cherry-{version}.zip"))
     enclosure.set("length", str(length))
@@ -881,24 +883,24 @@ class NotesTests(unittest.TestCase):
     def entries(self, count):
         return [(f"{index:040x}", f"Change {index}") for index in range(count)]
 
-    def test_escapes_html(self):
-        text = release.notes_html(REPO, [("a" * 40, 'Use <Tab> & "quotes"')])
-        self.assertIn("Use &lt;Tab&gt; &amp; &quot;quotes&quot;", text)
-        self.assertIn(f'<a href="https://github.com/{REPO}/commit/{"a" * 40}">aaaaaaa</a>', text)
-        self.assertTrue(text.startswith("<ul><li>") and text.endswith("</li></ul>"))
+    def test_the_appcast_notes_are_a_markdown_list(self):
+        text = release.notes_appcast(REPO, [("a" * 40, 'Use <Tab> & "quotes"'), ("b" * 40, "Add `cherry ls`")])
+        self.assertEqual(text, f'- Use \\<Tab> & "quotes" ([aaaaaaa](https://github.com/{REPO}/commit/{"a" * 40}))\n'
+                               f"- Add `cherry ls` ([bbbbbbb](https://github.com/{REPO}/commit/{'b' * 40}))")
 
     def test_caps_at_50_and_100(self):
-        text = release.notes_html(REPO, self.entries(120))
-        self.assertEqual(text.count("<li>"), 50)
-        self.assertIn("…and 70 more changes.", text)
+        text = release.notes_appcast(REPO, self.entries(120))
+        self.assertEqual(sum(1 for line in text.splitlines() if line.startswith("- ")), 50)
+        # A paragraph of its own, not the last item's continuation.
+        self.assertTrue(text.endswith("))\n\n…and 70 more changes."), text[-80:])
         markdown = release.notes_markdown(REPO, "v2026.10.11.2-pre", None, "20261011120000.abcdef0",
                                           self.entries(120))
         self.assertEqual(sum(1 for line in markdown.splitlines() if line.startswith("- ")), 100)
         self.assertIn("…and 20 more changes.", markdown)
-        self.assertNotIn("more changes", release.notes_html(REPO, self.entries(50)))
+        self.assertNotIn("more changes", release.notes_appcast(REPO, self.entries(50)))
 
     def test_an_empty_range(self):
-        self.assertEqual(release.notes_html(REPO, []), "<p>No changes besides merges.</p>")
+        self.assertEqual(release.notes_appcast(REPO, []), "No changes besides merges.")
         markdown = release.notes_markdown(REPO, "v2026.10.11.1-pre", None, "20261011120000.abcdef0", [])
         self.assertTrue(markdown.startswith("No changes besides merges."))
         self.assertIn("Build `20261011120000.abcdef0` · requires macOS 26 or later", markdown)
@@ -915,16 +917,18 @@ class NotesTests(unittest.TestCase):
         log = f"{'b' * 40}\tFix <this>\n{'c' * 40}\tAdd that\n"
         result = sandbox.run(CLI, "notes", "--repo", REPO, "--tag", "v2026.10.11.2-pre", "--prev-tag",
                              "v2026.10.11.1-pre", "--build", "20261011120000.bbbbbbb", "--md",
-                             sandbox.root / "notes.md", "--html", sandbox.root / "notes.html", stdin=log)
+                             sandbox.root / "notes.md", "--appcast", sandbox.root / "notes-appcast.md", stdin=log)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Fix &lt;this&gt;", (sandbox.root / "notes.html").read_text())
+        appcast = (sandbox.root / "notes-appcast.md").read_text()
+        self.assertTrue(appcast.startswith("- Fix \\<this> ([bbbbbbb]"), appcast)
+        self.assertNotIn("Build", appcast)
         self.assertIn("- Fix \\<this> ([bbbbbbb]", (sandbox.root / "notes.md").read_text())
 
     def test_characters_xml_cannot_hold_are_dropped(self):
         entries = release.parse_log(f"{'a' * 40}\tFix \x1b[K redraw\x00 \ud800\ufffe\t\U0001F352")
         self.assertEqual(entries, [("a" * 40, "Fix [K redraw \t\U0001F352")])
         item = ET.Element("item")
-        ET.SubElement(item, "description").text = release.notes_html(REPO, entries)
+        ET.SubElement(item, "description").text = release.notes_appcast(REPO, entries)
         self.assertIn("Fix [K redraw", ET.fromstring(release.serialize(item)).findtext("description"))
 
     def test_the_command_line_reads_control_characters_and_bytes_that_are_not_utf8(self):
@@ -932,10 +936,10 @@ class NotesTests(unittest.TestCase):
         log = b"b" * 40 + b"\tFix \x1b[K redraw\n" + b"c" * 40 + b"\tCaf\xe9 \xff\n"
         result = subprocess.run(
             [str(CLI), "notes", "--repo", REPO, "--tag", "v2026.10.11.2-pre", "--build", "20261011120000.bbbbbbb",
-             "--md", str(sandbox.root / "notes.md"), "--html", str(sandbox.root / "notes.html")],
+             "--md", str(sandbox.root / "notes.md"), "--appcast", str(sandbox.root / "notes-appcast.md")],
             input=log, capture_output=True, timeout=120, cwd=str(sandbox.root), env=sandbox.environment())
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
-        notes = (sandbox.root / "notes.html").read_text(encoding="utf-8")
+        notes = (sandbox.root / "notes-appcast.md").read_text(encoding="utf-8")
         self.assertNotIn("\x1b", notes)
         self.assertIn("Fix [K redraw", notes)
         self.assertIn("Caf\ufffd \ufffd", notes)
@@ -956,8 +960,8 @@ class ItemTests(unittest.TestCase):
         self.sandbox = Sandbox(self)
         self.out = self.sandbox.root / "out"
         self.out.mkdir()
-        self.notes = self.sandbox.root / "notes.html"
-        self.notes.write_text('<ul><li>Fix &lt;x&gt; (<a href="https://github.com/x">abc</a>)</li></ul>\n')
+        self.notes = self.sandbox.root / "notes-appcast.md"
+        self.notes.write_text("- Fix \\<x> & `y` ([abc1234](https://github.com/x))\n")
 
     def make_zip(self, build=None, public_key=None, version=None):
         info = {"CFBundleIdentifier": "dev.patrick.cherry", "CFBundleVersion": build or self.BUILD,
@@ -1004,7 +1008,10 @@ class ItemTests(unittest.TestCase):
         self.assertEqual(root.findtext(release.sparkle("channel")), "prerelease")
         self.assertEqual(root.findtext("pubDate"), "Sun, 11 Oct 2026 12:00:00 +0000")
         self.assertEqual(root.findtext("description"), self.notes.read_text().strip())
-        self.assertIn(b"&lt;ul&gt;", output.read_bytes())
+        # Markdown, which Sparkle reads from `sparkle:format` (not the
+        # `sparkle:descriptionFormat` its header names).
+        self.assertEqual(root.find("description").get(release.sparkle("format")), "markdown")
+        self.assertIn(b'<description sparkle:format="markdown">- Fix \\&lt;x&gt; &amp; `y`', output.read_bytes())
         enclosure = root.find("enclosure")
         self.assertEqual(enclosure.get("url"),
                          f"https://github.com/{REPO}/releases/download/v{self.VERSION}-pre/{zip_path.name}")
@@ -1016,11 +1023,10 @@ class ItemTests(unittest.TestCase):
         self.assertNotIn(self.KEY, result.stdout + result.stderr)
 
     def test_notes_with_characters_xml_cannot_hold_still_make_a_readable_item(self):
-        self.notes.write_text("<ul><li>Fix \x1b[K redraw\x07</li></ul>\n")
+        self.notes.write_text("- Fix \x1b[K redraw\x07\n")
         result, output = self.run_item(self.make_manifest(self.make_zip()))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(ET.fromstring(output.read_bytes()).findtext("description"),
-                         "<ul><li>Fix [K redraw</li></ul>")
+        self.assertEqual(ET.fromstring(output.read_bytes()).findtext("description"), "- Fix [K redraw")
         self.assertEqual(release.load_item(str(output)).problems(), [])
         with self.assertRaises(release.ReleaseError):
             release.readable_item(b"<item><title>\x1b</title></item>")
@@ -1098,6 +1104,21 @@ class MergeTests(unittest.TestCase):
         feed = reload(merged([item("2026.10.11.1", build_of(11))]))
         self.assertEqual([i.build for i in feed.items], [build_of(11)])
         self.assertEqual(release.check(feed), [])
+
+    def test_items_keep_their_notes_and_their_format(self):
+        # An item from before the notes were markdown keeps its HTML.
+        older = item_element("2026.10.10.1", build_of(10))
+        older.find("description").attrib.clear()
+        older.find("description").text = "<ul><li>A &amp; B</li></ul>"
+        feed = release.Feed.empty(REPO)
+        with quiet():
+            release.merge(feed, release.Item(older), 20, 10)
+        data = merged([item("2026.10.11.1", build_of(11))], feed=feed)
+        self.assertIn(b'<description sparkle:format="markdown">- A &amp; B ([abc1234]', data)
+        descriptions = {i.build: i.element.find("description") for i in reload(data).items}
+        self.assertEqual(descriptions[build_of(11)].get(release.sparkle("format")), "markdown")
+        self.assertIsNone(descriptions[build_of(10)].get(release.sparkle("format")))
+        self.assertEqual(descriptions[build_of(10)].text, "<ul><li>A &amp; B</li></ul>")
 
     def test_newest_first(self):
         builds = [build_of(12), build_of(10), build_of(11, minute=5), build_of(11)]
@@ -1749,7 +1770,7 @@ class ReleasePlanTests(unittest.TestCase):
         self.assertNotIn("Merge something", markdown)
         self.assertIn(f"compare/v2026.10.10.1-pre...v2026.10.10.3-pre", markdown)
         self.assertIn(f"Build `20261010120001.{head[:7]}`", markdown)
-        self.assertIn("Third &lt;with&gt; &amp; stuff", (self.out / "notes.html").read_text())
+        self.assertIn("- Third \\<with> & stuff", (self.out / "notes-appcast.md").read_text())
 
     def test_a_dry_run_builds_and_never_deletes_or_publishes(self):
         self.sandbox.add_release("v2026.10.10.5-pre", draft=True)

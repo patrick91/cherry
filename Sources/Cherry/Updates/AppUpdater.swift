@@ -172,11 +172,13 @@ final class SparkleBridge: NSObject, SPUUpdaterDelegate, @preconcurrency SPUStan
         "updater:didAbortWithError:",
         "updater:didFinishUpdateCycleForUpdateCheck:error:",
         "updater:mayPerformUpdateCheck:error:",
+        "updater:didFinishLoadingAppcast:",
         "supportsGentleScheduledUpdateReminders",
         "standardUserDriverShouldHandleShowingScheduledUpdate:andInImmediateFocus:",
         "standardUserDriverWillHandleShowingUpdate:forUpdate:state:",
         "standardUserDriverDidReceiveUserAttentionForUpdate:",
         "standardUserDriverWillFinishUpdateSession",
+        "standardUserDriverWillShowReleaseNotesText:forUpdate:withBundleDisplayVersion:bundleVersion:",
     ]
 
     /// `AppUpdateModel`'s copies of Sparkle's error domain and codes are Sparkle's.
@@ -187,6 +189,9 @@ final class SparkleBridge: NSObject, SPUUpdaterDelegate, @preconcurrency SPUStan
     }
 
     private let model: AppUpdateModel
+    /// The items of the appcast Sparkle loaded last, for the update
+    /// window's notes (`UpdateReleaseNotes`).
+    private var appcastReleases: [UpdateReleaseNotes.Release] = []
 
     init(model: AppUpdateModel) {
         self.model = model
@@ -238,6 +243,23 @@ final class SparkleBridge: NSObject, SPUUpdaterDelegate, @preconcurrency SPUStan
         if let refusal = model.checkRefusal() { throw refusal }
     }
 
+    /// Every item, before Sparkle keeps those of the allowed channels: the
+    /// update window's notes count a stable update's pre-releases too.
+    func updater(_ updater: SPUUpdater, didFinishLoading appcast: SUAppcast) {
+        appcastReleases = appcast.items.map(Self.release)
+    }
+
+    static func release(_ item: SUAppcastItem) -> UpdateReleaseNotes.Release {
+        UpdateReleaseNotes.Release(
+            build: item.versionString,
+            version: item.displayVersionString,
+            channel: item.channel,
+            notes: item.itemDescription,
+            format: item.itemDescriptionFormat,
+            page: item.fullReleaseNotesURL ?? item.infoURL
+        )
+    }
+
     // MARK: SPUStandardUserDriverDelegate
 
     var supportsGentleScheduledUpdateReminders: Bool { true }
@@ -268,5 +290,23 @@ final class SparkleBridge: NSObject, SPUUpdaterDelegate, @preconcurrency SPUStan
 
     func standardUserDriverWillFinishUpdateSession() {
         model.sessionFinished()
+    }
+
+    /// The window's notes: every release since this build's, not only the
+    /// update's (`UpdateReleaseNotes`). Sparkle asks only for markdown and
+    /// plain-text notes, which the appcast's are; nil keeps its own.
+    func standardUserDriverWillShowReleaseNotesText(
+        _ releaseNotesAttributedString: NSAttributedString,
+        forUpdate update: SUAppcastItem,
+        withBundleDisplayVersion bundleDisplayVersion: String,
+        bundleVersion: String
+    ) -> NSAttributedString? {
+        UpdateReleaseNotes.attributedNotes(
+            appcast: appcastReleases,
+            update: Self.release(update),
+            runningVersion: bundleDisplayVersion,
+            runningBuild: bundleVersion,
+            compare: { SUStandardVersionComparator.default.compareVersion($0, toVersion: $1) }
+        )
     }
 }

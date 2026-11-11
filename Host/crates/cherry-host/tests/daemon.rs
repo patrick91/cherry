@@ -1820,9 +1820,13 @@ fn a_connection_over_the_limit_is_told_why_and_the_log_says_so_once() {
     // Every one after that gets an Error before its Welcome, and is closed.
     for _ in 0..3 {
         let mut refused = UnixStream::connect(&host.socket).unwrap();
-        refused
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+        // The daemon refuses without waiting for a Hello, so it may have
+        // written its Error and closed already: macOS then refuses the
+        // option (EINVAL once both directions are shut), and the reads
+        // below cannot block, the Error being buffered before the close.
+        if let Err(error) = refused.set_read_timeout(Some(Duration::from_secs(5))) {
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+        }
         match read_frame::<_, ServerMessage>(&mut refused) {
             Ok(Some(ServerMessage::Error { code, message })) => {
                 assert_eq!(code, error_code::TOO_MANY_CONNECTIONS);

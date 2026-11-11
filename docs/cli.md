@@ -118,6 +118,13 @@ identifies, scopes and refuses the caller (Scope And Identity).
   (Scope And Identity). So `cherry ls --project-root ROOT` lists another
   project's tabs and `cherry send NAME TEXT --project-root ROOT` finds a
   tab there by name; a tab's ID finds it from any project.
+- A tab's ID can be shortened to its start, at least its first 8
+  characters (`cherry send 1F3E3828 …`), wherever an ID or a name goes
+  (`process_id`, `process_name`, `cherry subscribe`'s IDs): it finds the
+  one tab, in any window the caller may reach, whose ID starts so, once no
+  tab has that name. When several tabs' IDs start so it is
+  `ambiguous_process_id` and nothing is sent; fewer than 8 characters are
+  only a name.
 - Long text (a brief, a message, a report, a schema) comes on standard
   input: `-`, or nothing when standard input is a pipe or a file (never a
   terminal or `/dev/null`). The app asks `cherry` for it, and for a file a

@@ -1884,6 +1884,13 @@ final class CherryControlServer: @unchecked Sendable {
                     return (tab, other)
                 }
             }
+            // No tab has that name: the start of a tab's ID (`cherry send
+            // 1F3E3828 …`, how agents shorten what `cherry ls` printed).
+            if let prefix = Self.tabIDPrefix(requestedName),
+               let resolved = try uniqueSession(withIDPrefix: prefix, workspace: workspace) {
+                mcpControlDebugLog("resolved process selector=name:\(requestedName) session=\(resolved.session.id.uuidString) kind=\(resolved.session.kind.rawValue) name=\(self.processName(for: resolved.session)) by its ID's start")
+                return resolved
+            }
             throw CherryControlError(code: "process_not_found", message: "No Cherry process exists with name \(requestedName).")
         }
         guard matches.count == 1 else {
@@ -2775,7 +2782,60 @@ final class CherryControlServer: @unchecked Sendable {
                 return (session, openWorkspace)
             }
         }
+        if let prefix = Self.tabIDPrefix(terminalID),
+           let resolved = try uniqueSession(withIDPrefix: prefix, workspace: workspace) {
+            return resolved
+        }
         throw CherryControlError(code: "terminal_not_found", message: "No Cherry terminal exists with id \(terminalID).")
+    }
+
+    /// The fewest characters of a tab's ID that find it: its first group,
+    /// as agents shorten the IDs `cherry ls` prints. Fewer could find
+    /// another tab than the one meant, which would get its input.
+    nonisolated static let minimumTabIDPrefixLength = 8
+
+    /// `text` as the start of a tab's ID (`1F3E3828`, `1f3e3828-1ee9`),
+    /// uppercased: at least `minimumTabIDPrefixLength` characters shaped
+    /// as a UUID's start. Nil for anything else, a whole UUID included.
+    nonisolated static func tabIDPrefix(_ text: String) -> String? {
+        let prefix = text.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let shape = "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+        guard prefix.count >= minimumTabIDPrefixLength, prefix.count < shape.count else { return nil }
+        for (character, expected) in zip(prefix, shape) {
+            guard expected == "-" ? character == "-" : character.isHexDigit else { return nil }
+        }
+        return prefix
+    }
+
+    /// The one tab, in any window the caller may reach, whose ID starts
+    /// with `prefix` (`tabIDPrefix`); nil when none does. Throws when
+    /// several do: the caller says which with more of the ID.
+    @MainActor
+    private func uniqueSession(
+        withIDPrefix prefix: String,
+        workspace: TerminalWorkspace
+    ) throws -> (session: TerminalSession, workspace: TerminalWorkspace)? {
+        // A caller on another Mac finds only its Mac's sessions, as
+        // `findSessionWithWorkspace` does.
+        let device = Self.remoteDevice
+        let windows = [workspace] + openWorkspacesProvider() + ProjectWindowRegistry.shared.workspacesByProjectRoot().map(\.workspace)
+        var seen = Set<ObjectIdentifier>()
+        var matches: [(session: TerminalSession, workspace: TerminalWorkspace)] = []
+        for window in windows {
+            for session in window.sessions
+            where session.id.uuidString.hasPrefix(prefix)
+                && (device.map { Self.isSession(session, in: window, onDevice: $0) } ?? true)
+                && seen.insert(ObjectIdentifier(session)).inserted {
+                matches.append((session, window))
+            }
+        }
+        guard matches.count <= 1 else {
+            throw CherryControlError(
+                code: "ambiguous_process_id",
+                message: "\(matches.count) Cherry tabs have IDs starting with \(prefix); give more of the ID."
+            )
+        }
+        return matches.first
     }
 
     /// The window a request scoped to `rawProjectRoot` goes to: of a

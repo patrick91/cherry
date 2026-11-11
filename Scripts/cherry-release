@@ -7,9 +7,9 @@
   cherry-release version check VERSION                     # exit 0 or 1
   cherry-release version compare A B                       # prints -1, 0 or 1
   cherry-release stamp --sha SHA --now EPOCH [--prev-build BUILD]   # prints build_id= and day=
-  cherry-release notes --repo R --tag T [--prev-tag P] --build B --md OUT --html OUT
+  cherry-release notes --repo R --tag T [--prev-tag P] --build B --md OUT --appcast OUT
   cherry-release appcast empty --output OUT
-  cherry-release appcast item --manifest M --channel prerelease|stable --tag T --repo R --notes HTML
+  cherry-release appcast item --manifest M --channel prerelease|stable --tag T --repo R --notes MARKDOWN
                               [--sign-update PATH] [--pub-date RFC2822] --output OUT
   cherry-release appcast promote ITEM --tag T --repo R [--zip Z] --output OUT
   cherry-release appcast merge FEED|- ITEM --output OUT [--keep-prereleases K] [--keep-stable M]

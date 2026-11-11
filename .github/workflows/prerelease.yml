@@ -201,7 +201,7 @@ jobs:
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
           Scripts/cherry-release appcast item --manifest "$WORK/out/release.json" --channel prerelease \
-            --tag "$TAG" --repo "$GH_REPO" --notes "$WORK/notes.html" --output "$WORK/out/appcast-item.xml"
+            --tag "$TAG" --repo "$GH_REPO" --notes "$WORK/notes-appcast.md" --output "$WORK/out/appcast-item.xml"
 
       - name: Keep the debug symbols
         if: steps.plan.outputs.build == 'true'

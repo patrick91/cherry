@@ -55,7 +55,15 @@ in concurrency group `cherry-prerelease`:
    `vV-pre` tag only makes the next N skip it), picks the build id, the
    version and the tag, and writes the release notes: the commit subjects
    since the previous pre-release, merges left out (bytes that are not UTF-8
-   become U+FFFD, and control characters XML cannot hold are dropped).
+   become U+FFFD, and control characters XML cannot hold are dropped):
+   `notes.md`, the release body, and `notes-appcast.md`, the appcast item's
+   `<description sparkle:format="markdown">` (a list of at most 50 commits;
+   Sparkle reads `sparkle:format`, not the `sparkle:descriptionFormat` its
+   header names). Markdown, not HTML: Sparkle lets the app rewrite only
+   markdown or plain-text notes, and Cherry's update window joins every
+   release's list between the running build and the update
+   (`UpdateReleaseNotes`). Items from before keep their HTML notes, which
+   Cherry links instead.
 4. With no secret in the environment yet (but on the runner the secret steps
    use later: the accepted risk under [Secrets and
    variables](#secrets-and-variables)), it selects Xcode, installs the host

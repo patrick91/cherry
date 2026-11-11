@@ -1155,7 +1155,7 @@ private func updatesStatus(
 }
 
 @Test @MainActor func sparkleBridgeRespondsToEverySelectorCherryReliesOn() {
-    #expect(SparkleBridge.requiredSelectors.count == 11)
+    #expect(SparkleBridge.requiredSelectors.count == 13)
     for selector in SparkleBridge.requiredSelectors {
         #expect(SparkleBridge.instancesRespond(to: NSSelectorFromString(selector)), Comment(rawValue: selector))
     }

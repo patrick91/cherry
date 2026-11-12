@@ -1027,4 +1027,25 @@ private func controlToolLayerProcess(id: String = controlToolLayerAgentID, kind:
     )
     #expect(add.requests == [.addProject(.init(path: "~/x", device: "patmini", create: true, open: nil))])
     #expect(CherryToolLayer.clientTimeout(for: "add_project", arguments: [:]) == 45)
+
+    // preview_files is unscoped too (files are the caller's Mac's), and a
+    // relative path is the caller's own directory's.
+    let preview = ControlToolLayerRecorder(answer: answering)
+    _ = await CherryToolLayer.call(
+        name: "preview_files",
+        arguments: [
+            "paths": .array([.string("shot.png"), .string(" /abs/a.pdf "), .string("~/b.txt"), .string("file:///c.png")]),
+            "open": .bool(true),
+        ],
+        caller: CherryToolCaller(projectRoot: "/mine", workingDirectory: "/Users/me/app/web"), transport: preview
+    )
+    #expect(preview.requests == [.previewFiles(.init(
+        paths: ["/Users/me/app/web/shot.png", "/abs/a.pdf", "~/b.txt", "file:///c.png"], message: nil, open: true
+    ))])
+    let unplaced = ControlToolLayerRecorder(answer: answering)
+    _ = await CherryToolLayer.call(
+        name: "preview_files", arguments: ["paths": .array([.string("shot.png")])], caller: CherryToolCaller(), transport: unplaced
+    )
+    #expect(unplaced.requests == [.previewFiles(.init(paths: ["shot.png"]))])
+    #expect(CherryToolLayer.clientTimeout(for: "preview_files", arguments: [:]) == 45)
 }

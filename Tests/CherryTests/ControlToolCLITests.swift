@@ -126,6 +126,8 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
         (["project", "add", "/Users/someone/app", "--no-open"], "add_project",
          ["path": .string("/Users/someone/app"), "open": .bool(false)]),
         (["devices"], "list_devices", [:]),
+        (["preview", "shot.png", "src/main.swift:12", "--message", "The render", "--open"], "preview_files",
+         ["paths": .array([.string("shot.png"), .string("src/main.swift:12")]), "message": .string("The render"), "open": .bool(true)]),
         (["spawn", "agent", "claude", "--device", "patmini", "--project-root", "~/app"], "spawn_agent",
          ["name": .string("claude"), "device": .string("patmini"), "project_root": .string("~/app")]),
         (["spawn", "terminal", "df -h", "--device", "patmini", "--project-root", "~/app"], "spawn_process",
@@ -272,11 +274,11 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
 
 @Test func ControlToolCLIGuideAndSkill() throws {
     let guide = CherryCLIGuide.guide
-    #expect(guide.utf8.count < 6_500, "\(guide.utf8.count) bytes")
+    #expect(guide.utf8.count < 6_700, "\(guide.utf8.count) bytes")
     for fact in [
         "cherry task report", "--awaiting-approval", "cherry answer", "<<'EOF'", "cherry task cancel TASK --close", "never your\nCLI's own subagents",
         "cherry devices", "cherry project add ~/app --device NAME", "--device NAME --project-root", "cherry spawn terminal CMD --device NAME",
-        "cherry ls --project-root ROOT", "cherry project ls",
+        "cherry ls --project-root ROOT", "cherry project ls", "cherry preview PATH…", "only if they asked",
     ] {
         #expect(guide.contains(fact), "\(fact)")
     }
@@ -612,6 +614,17 @@ private func runCommand(_ request: RunCommandRequest, on server: CherryControlSe
     let removed = try await runCherryCLI(cli, ["skill", "remove", "--agent", "claude", "--json"], environment: environment)
     #expect(removed.status == 0 && removed.output.contains(#""change":"removed""#), "\(removed.output) \(removed.error)")
     #expect(!FileManager.default.fileExists(atPath: skillFolder.path))
+}
+
+/// `cherry preview` at a terminal: each path, where it was found or not.
+@Test func ControlToolCLIPreviewPrintsWhatWasFound() {
+    let text = #"{"files":[{"path":"shot.png","found_path":"/Users/me/app/shot.png","kind":"file"},{"path":"gone.txt"}],"machine":"Studio","opened":false}"#
+    #expect(CherryCLIRunner.render(text, command: ["preview"]) == """
+    Offered in a toast (Studio): /Users/me/app/shot.png
+    not found on Studio: gone.txt
+    """)
+    #expect(CherryCLIGuide.guide.contains("cherry preview PATH…"))
+    #expect(CherrySkill.allowedWords.contains("preview"))
 }
 
 /// `cherry devices` at a terminal: each machine, then its projects' paths.

@@ -27,6 +27,7 @@ struct TerminalSettingsPage: View, SettingsPageContent {
         SettingsPageScroll(SettingsPage.terminal.title) {
             textSection
             keyboardSection
+            linksSection
             scrollbackSection
             ghosttyConfigSection
             SettingsPageFooter(caption: "Resets this page only. Values from your Ghostty config stay.") {
@@ -153,6 +154,24 @@ struct TerminalSettingsPage: View, SettingsPageContent {
         navigator.open(.page(.shortcuts), row: .shortcutsTerminalKeyBindings)
     }
 
+    // MARK: Links
+
+    private var linksSection: some View {
+        SettingsSection("Links") {
+            let quickView = SettingsSourceState.terminal(.quickViewFiles, in: settings)
+            SettingsItem(
+                id: .terminalQuickViewFiles,
+                TerminalSettings.Setting.quickViewFiles.title,
+                help: Self.quickViewFilesHelp,
+                source: quickView
+            ) {
+                Toggle(TerminalSettings.Setting.quickViewFiles.title, isOn: $settings.quickViewFiles)
+                    .settingsSwitch()
+                    .disabled(!quickView.source.isEditable)
+            }
+        }
+    }
+
     // MARK: Scrollback
 
     private var scrollbackSection: some View {
@@ -275,6 +294,7 @@ struct TerminalSettingsPage: View, SettingsPageContent {
     // MARK: Texts
 
     static let cursorBlinkHelp = "Blink the cursor while the terminal has focus."
+    static let quickViewFilesHelp = "⌘-click a file’s path in a terminal to preview it in Cherry, also when the tab runs on another Mac. Off, This Mac’s files open in their app."
     static let keyBindingsHelp = "Cherry's terminals use the text:, csi:, esc: and ignore bindings in your Ghostty config. App actions stay Cherry's."
     static let scrollbackHelp = "What a tab keeps while it's on screen."
     static let ghosttyConfigIntro = "Cherry reads these files when it opens, in Ghostty's order. Restart Cherry after you change them."
@@ -322,6 +342,15 @@ struct TerminalSettingsPage: View, SettingsPageContent {
                 keywords: ["keybind", "ghostty"]
             ),
             SettingsSearchRow(
+                id: .terminalQuickViewFiles,
+                route: .page(.terminal),
+                section: "Links",
+                title: TerminalSettings.Setting.quickViewFiles.title,
+                help: quickViewFilesHelp,
+                keywords: ["quick look", "preview", "file", "path", "cmd-click", "command-click", "link", "open"],
+                value: terminal.valueText(.quickViewFiles)
+            ),
+            SettingsSearchRow(
                 id: .terminalScrollback,
                 route: .page(.terminal),
                 section: "Scrollback",
@@ -345,6 +374,7 @@ struct TerminalSettingsPage: View, SettingsPageContent {
 extension SettingsRowID {
     static let terminalFontSize: Self = "terminal.fontSize"
     static let terminalCursorBlink: Self = "terminal.cursorBlink"
+    static let terminalQuickViewFiles: Self = "terminal.quickViewFiles"
     static let terminalOptionKey: Self = "terminal.optionKey"
     static let terminalScrollback: Self = "terminal.scrollback"
 }

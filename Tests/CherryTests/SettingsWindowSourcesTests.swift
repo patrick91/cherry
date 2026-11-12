@@ -147,6 +147,7 @@ private func ratioText(_ ratio: Double) -> String {
         .minimumContrast: ratioText(1.15),
         .fontSize: "14 pt",
         .cursorBlink: "On",
+        .quickViewFiles: "On",
         .notifyWhenBackgroundProgramNeedsInput: "On",
         .notifyWhenBackgroundProgramFinishes: "Off",
         .noticeBackgroundSessionsAtLaunch: "On",

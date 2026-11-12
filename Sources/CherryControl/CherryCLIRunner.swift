@@ -98,6 +98,15 @@ public enum CherryCLIRunner {
                     return ([header] + projects).joined(separator: "\n")
                 }.joined(separator: "\n")
             }
+        case ["preview"]:
+            if let object = value.objectValue, let files = object["files"]?.arrayValue?.compactMap(\.objectValue) {
+                let shown = object["opened"] == .bool(true) ? "Opened in Quick View" : "Offered in a toast"
+                let machine = string(object["machine"])
+                return files.map { file in
+                    guard let found = file["found_path"]?.stringValue else { return "not found on \(machine): \(string(file["path"]))" }
+                    return "\(shown) (\(machine)): \(found)"
+                }.joined(separator: "\n")
+            }
         case ["project", "add"]:
             if let object = value.objectValue {
                 return fields(object, keys: ["project_root", "device", "path", "created", "already_added", "opened"])

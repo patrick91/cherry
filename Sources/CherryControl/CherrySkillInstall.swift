@@ -52,8 +52,8 @@ public enum CherrySkill {
     /// `skill status` are allowed on their own, `allowedSkillWords`: they
     /// reach the app's socket too).
     public static let allowedWords = [
-        "agents", "answer", "close", "commands", "devices", "events", "help", "keys", "link", "ls", "ports", "project",
-        "read", "rename", "search", "select", "send", "services", "show", "spawn", "stop", "subscribe",
+        "agents", "answer", "close", "commands", "devices", "events", "help", "keys", "link", "ls", "ports", "preview",
+        "project", "read", "rename", "search", "select", "send", "services", "show", "spawn", "stop", "subscribe",
         "subscriptions", "task", "todo", "tool", "unsubscribe", "wait", "wait-port", "whoami",
     ]
 

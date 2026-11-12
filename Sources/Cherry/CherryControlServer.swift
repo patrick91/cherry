@@ -225,6 +225,10 @@ final class CherryControlServer: @unchecked Sendable {
     /// unless set (the app sets its store's, `ControlDeviceDirectory.app`).
     @MainActor var deviceDirectory: ControlDeviceDirectory = .none
 
+    /// Shows files an agent shared (preview_files): a toast in its window,
+    /// or Quick View at once; whether the panel opened. Tests record.
+    @MainActor var previewPresenter: @MainActor (QuickViewShare) -> Bool = QuickViewShare.present
+
     private struct DeviceListener {
         var url: URL
         var source: DispatchSourceRead
@@ -1053,6 +1057,8 @@ final class CherryControlServer: @unchecked Sendable {
             return .init(result: .listDevices(listDevices()))
         case .addProject(let request):
             return .init(result: .addProject(try await addProject(request)))
+        case .previewFiles(let request):
+            return .init(result: .previewFiles(try await previewFiles(request, workspace: workspace)))
         case .getProjectStatus:
             return .init(result: .getProjectStatus(projectStatus(workspace: workspace)))
         case .getPerformanceStatus:

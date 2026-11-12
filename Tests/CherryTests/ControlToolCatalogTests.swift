@@ -18,7 +18,8 @@ private let controlToolCatalogNames = [
     "list_subscriptions", "get_my_task", "report_result", "report_progress", "wait_for_tasks", "get_task",
     "list_tasks", "cancel_tasks", "get_process_ports", "services_list", "wait_for_bound_port",
     "spawn_process", "spawn_agent", "start_process", "stop_process", "restart_process", "close_process",
-    "rename_process", "select_process", "send_process_input", "send_agent_message", "answer_prompt", "start_all_commands",
+    "rename_process", "select_process", "preview_files", "send_process_input", "send_agent_message", "answer_prompt",
+    "start_all_commands",
     "stop_all_commands", "restart_all_commands", "list_agents", "list_todos", "create_todo", "get_todo",
     "update_todo", "move_todo", "delete_todo", "select_todo", "add_todo_comment", "list_todo_comments",
     "update_todo_comment", "delete_todo_comment", "bind_session_process",
@@ -37,7 +38,8 @@ private let controlToolCatalogReadOnly: Set<String> = [
 ]
 private let controlToolCatalogAdditive: Set<String> = [
     "open_project", "add_project", "subscribe", "unsubscribe", "report_result", "report_progress", "wait_for_bound_port",
-    "spawn_process", "spawn_agent", "start_process", "start_all_commands", "rename_process", "select_process", "create_todo",
+    "spawn_process", "spawn_agent", "start_process", "start_all_commands", "rename_process", "select_process",
+    "preview_files", "create_todo",
     "update_todo", "move_todo", "select_todo", "add_todo_comment", "update_todo_comment",
 ]
 private let controlToolCatalogDestructive: Set<String> = [
@@ -144,11 +146,11 @@ private func controlToolCatalogTool(_ name: String, for profile: ToolClientProfi
 
 private let controlToolCatalogClaude = ToolClientProfile(client: ToolClientInfo(name: "claude-code", version: "2.1.299"))
 
-@Test func controlToolCatalogListsTheFiftyFiveToolsInTodaysOrder() {
+@Test func controlToolCatalogListsTheFiftySixToolsInTodaysOrder() {
     let tools = CherryToolCatalog.tools(for: .unknown)
     #expect(tools.map(\.name) == controlToolCatalogNames)
     #expect(CherryToolCatalog.names == Set(controlToolCatalogNames))
-    #expect(CherryToolCatalog.names.count == 55)
+    #expect(CherryToolCatalog.names.count == 56)
 }
 
 @Test func controlToolCatalogEncodesTheFixtureByteForByte() throws {
@@ -244,7 +246,7 @@ private let controlToolCatalogClaude = ToolClientProfile(client: ToolClientInfo(
 
 @Test func controlToolCatalogAnnotatesEveryTool() throws {
     #expect(controlToolCatalogReadOnly.count == 25)
-    #expect(controlToolCatalogAdditive.count == 19)
+    #expect(controlToolCatalogAdditive.count == 20)
     #expect(controlToolCatalogDestructive.count == 11)
     #expect(controlToolCatalogReadOnly.union(controlToolCatalogAdditive).union(controlToolCatalogDestructive) == Set(controlToolCatalogNames))
     #expect(controlToolCatalogIdempotent.isSubset(of: controlToolCatalogAdditive))

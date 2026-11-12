@@ -415,6 +415,8 @@ public enum CherryToolLayer {
         // Devices are the caller's Macs, not a project's.
         if case .listDevices = request { return request }
         if case .addProject = request { return request }
+        // Files are the caller's Mac's, whichever project it works in.
+        if case .previewFiles = request { return request }
 
         if let projectRoot = explicitProjectRoot(in: arguments) ?? trimmedProjectRoot(caller.projectRoot) {
             return .scoped(.init(projectRoot: projectRoot, request: request))
@@ -512,6 +514,12 @@ public enum CherryToolLayer {
                 path: try requiredString("path", in: arguments),
                 device: stringArgument("device", in: arguments),
                 create: boolArgument("create", in: arguments),
+                open: boolArgument("open", in: arguments)
+            ))
+        case "preview_files":
+            return .previewFiles(.init(
+                paths: try stringArrayArgument("paths", in: arguments)?.map { pathArgument($0, caller: caller) } ?? [],
+                message: stringArgument("message", in: arguments),
                 open: boolArgument("open", in: arguments)
             ))
         case "get_project_status":
@@ -761,6 +769,8 @@ public enum CherryToolLayer {
             return try encodedResult(payload)
         case .addProject(let payload):
             return try encodedResult(payload)
+        case .previewFiles(let payload):
+            return try encodedResult(payload)
         case .getProjectStatus(let payload):
             return try encodedResult(payload)
         case .getPerformanceStatus(let payload):
@@ -946,6 +956,22 @@ public enum CherryToolLayer {
             return path
         }
         return base.hasSuffix("/") ? base + path : base + "/" + path
+    }
+
+    /// A path of the caller's Mac as the caller means it: a relative one is
+    /// its own directory's (`cherry preview shot.png`), joined, not
+    /// resolved; left as it is when that directory is unknown (the app
+    /// then looks from the caller's tab), and absolute, `~` and `file:`
+    /// paths as they are.
+    private static func pathArgument(_ path: String, caller: CherryToolCaller) -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("/"), !trimmed.hasPrefix("~"), !trimmed.hasPrefix("$"),
+              !trimmed.lowercased().hasPrefix("file:"),
+              let base = caller.workingDirectory?.nilIfEmpty, base.hasPrefix("/")
+        else {
+            return trimmed
+        }
+        return base.hasSuffix("/") ? base + trimmed : base + "/" + trimmed
     }
 
     /// A whole number, also when the client sent it as one with a
@@ -1188,9 +1214,9 @@ public enum CherryToolLayer {
             // (2 s), then `wait_ms`.
             let waitMilliseconds = min(max(intArgument("wait_ms", in: arguments) ?? 0, 0), 5_000)
             return TimeInterval(waitMilliseconds) / 1_000 + 20
-        case "add_project":
-            // Making and resolving the folder over the device's SSH
-            // connection, which may have to log in first.
+        case "add_project", "preview_files":
+            // Making and resolving the folder, or looking at the files, over
+            // the device's SSH connection, which may have to log in first.
             return 45
         case "spawn_agent", "spawn_process", "send_process_input":
             // Input waits until it reached the program: a persistent-session

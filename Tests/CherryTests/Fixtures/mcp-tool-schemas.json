@@ -624,6 +624,26 @@
     "required": []
   },
   {
+    "name": "preview_files",
+    "properties": {
+      "paths": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "message": {
+        "type": "string"
+      },
+      "open": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "paths"
+    ]
+  },
+  {
     "name": "send_process_input",
     "properties": {
       "line_limit": {

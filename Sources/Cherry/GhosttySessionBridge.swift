@@ -922,13 +922,15 @@ final class GhosttySessionBridge: NSObject, TerminalSurfaceCloseDelegate, Termin
 
     /// A click on a URL. In a tab of another Mac, a URL of that Mac's
     /// loopback opens through a forward of its port (`RemoteURLOpening`);
-    /// any other link terminal output chose is Cherry's to open, ask about
+    /// a file's path shows the file in Quick View (`QuickViewOpening`, on
+    /// the tab's Mac); any other link terminal output chose is Cherry's to open, ask about
     /// or refuse (`TerminalLinkOpening`), since Ghostty refuses those
     /// itself; a link Ghostty names (its own files) is Ghostty's.
     func terminalShouldHandleOpenURL(_ url: String, kind: TerminalOpenURLKind) -> Bool {
         let session = proxy.session
         let window = terminalView.window
         if let session, RemoteURLOpening.open(url, for: session, window: window) { return true }
+        if QuickViewOpening.open(url, kind: kind, session: session, window: window) { return true }
         return TerminalLinkOpening.open(url, kind: kind, filesOn: TerminalLinkOpening.fileMachine(of: session), window: window)
     }
 

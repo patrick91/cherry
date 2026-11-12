@@ -168,6 +168,7 @@ Agent commands (run `cherry skill show` for the full guide):
   ports, services, wait-port          localhost services
   todo, note, project, whoami
   devices                             This Mac and your other machines
+  preview PATH…                       show the user files of your Mac in Quick View
   skill                               set up, check, show or remove Cherry's agent skill
   tool NAME [JSON | -]                any Cherry tool by its MCP name
 

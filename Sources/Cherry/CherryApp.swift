@@ -1021,6 +1021,9 @@ struct CherryApp: App {
         // Native surfaces take the user's own Ghostty keybinds (read when
         // the first one needs them; tests never read the user's files).
         TerminalSettings.readsUserGhosttyConfiguration = true
+        // A ⌘-click on a file's path previews it while Settings › Terminal
+        // says so (tests' surfaces leave links to `TerminalLinkOpening`).
+        QuickViewOpening.followSettings()
         RemoteViewCrashGuard.installIfNeeded()
         // Helpers and adapters start with the last run's login environment
         // while this run's is captured (`LoginEnvironmentCache`).

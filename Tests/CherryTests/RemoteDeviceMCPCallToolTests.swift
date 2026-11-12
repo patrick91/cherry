@@ -755,3 +755,71 @@ private func remoteToolArguments(_ arguments: [String: JSONValue], _ extra: [Str
     )
     #expect(!output.isError && !output.text.contains("never-typed"), "\(output.text)")
 }
+
+/// What a device's files answered, for preview_files' stand-in source.
+private final class RemotePreviewLooks: @unchecked Sendable {
+    private let lock = NSLock()
+    private var asked: [(machine: QuickViewMachine, paths: [String])] = []
+
+    func record(_ machine: QuickViewMachine, _ candidates: [QuickViewCandidate]) {
+        lock.withLock { asked.append((machine, candidates.map(\.path))) }
+    }
+
+    var all: [(machine: QuickViewMachine, paths: [String])] { lock.withLock { asked } }
+}
+
+private struct RemotePreviewSource: QuickViewFileSource {
+    let machine: QuickViewMachine
+    let looks: RemotePreviewLooks
+
+    func look(at candidates: [QuickViewCandidate]) async -> QuickViewLook {
+        looks.record(machine, candidates)
+        guard let found = candidates.first(where: { $0.path.hasSuffix("shot.png") || $0.path.hasSuffix("a.md") }) else { return .missing }
+        return .file(QuickViewFoundFile(path: found.path, size: 4, modified: 1), line: found.line)
+    }
+
+    func copy(_ file: QuickViewFoundFile, refresh: Bool) async -> QuickViewCopy { .missing }
+}
+
+/// preview_files from a device tab: the files are that Mac's (its token's
+/// tab's), looked at there with its directory, never This Mac's.
+@Test @MainActor func RemoteDeviceMCPCallToolPreviewLooksOnlyOnTheCallersMac() async throws {
+    let harness = try DeviceMCPHarness()
+    defer { harness.stop() }
+    let listener = try harness.server.addDeviceListener(deviceID: harness.deviceID)
+    defer { harness.server.removeDeviceListener(deviceID: harness.deviceID) }
+    let looks = RemotePreviewLooks()
+    let savedSource = QuickViewOpening.remoteSource
+    QuickViewOpening.remoteSource = { name, destination in
+        RemotePreviewSource(machine: .remote(name: name, destination: destination), looks: looks)
+    }
+    defer { QuickViewOpening.remoteSource = savedSource }
+    var shared: [QuickViewShare] = []
+    harness.server.previewPresenter = { shared.append($0); return false }
+
+    let result = try await harness.callTool(
+        "preview_files",
+        ["paths": .array([.string("shot.png"), .string("/Users/them/work/app/docs/a.md:3"), .string("missing.txt")])],
+        context: ToolCallContext(workingDirectory: "/Users/them/work/app/web", interface: "cli"),
+        to: listener, credentials: harness.credentials
+    )
+    let payload = try remoteToolPayload(PreviewFilesResult.self, result)
+    #expect(payload.machine == "Studio" && !payload.opened)
+    #expect(payload.files.map(\.foundPath) == ["/Users/them/work/app/web/shot.png", "/Users/them/work/app/docs/a.md", nil])
+    let destination = try #require(harness.tab.persistentHosting?.profile.host.sshDestination)
+    let machine = QuickViewMachine.remote(name: "Studio", destination: destination)
+    #expect(looks.all.allSatisfy { $0.machine == machine } && looks.all.count == 3)
+    let share = try #require(shared.first)
+    #expect(share.source.machine == machine && share.sharer == harness.tab.title)
+    #expect(share.requests.map(\.candidates) == [
+        [QuickViewCandidate(path: "/Users/them/work/app/web/shot.png")],
+        [QuickViewCandidate(path: "/Users/them/work/app/docs/a.md", line: 3)],
+    ])
+
+    // Nothing there: file_not_found, nothing shown.
+    let none = try await harness.callTool(
+        "preview_files", ["paths": .array([.string("/Users/them/nothing.txt")])], to: listener, credentials: harness.credentials
+    )
+    #expect(remoteToolErrorCode(none) == "file_not_found")
+    #expect(shared.count == 1)
+}

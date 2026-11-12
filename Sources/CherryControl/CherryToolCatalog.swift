@@ -11,7 +11,7 @@ import os
 /// fields in get_process_status, the selection rule in the instructions and
 /// select_process, the Todos requirement in list_todos.
 public enum CherryToolCatalog {
-    /// The 55 tools, in the order clients list them.
+    /// The 56 tools, in the order clients list them.
     public static func tools(for profile: ToolClientProfile) -> [CherryToolDefinition] {
         let maximumWait = waitCap(for: profile)
         let defaultWait = CherryControl.defaultWaitMilliseconds
@@ -348,6 +348,17 @@ public enum CherryToolCatalog {
                 "Select a process in Cherry's UI; only select_ tools change the selection.",
                 properties: processSelectorProperties(),
                 annotations: idempotent
+            ),
+            tool(
+                "preview_files",
+                "Show the user files of your Mac in Cherry's Quick View (images, PDFs, text at path:LINE, folders): a toast in your window opens them. Errors: file_not_found (none found; the rest are listed in files).",
+                properties: [
+                    "paths": stringArray("Absolute, ~/…, or relative to your directory. At most 10."),
+                    "message": string("Shown with them."),
+                    "open": boolean("Open at once; only when the user asked to see them.")
+                ],
+                required: ["paths"],
+                annotations: additive
             ),
             tool(
                 "send_process_input",

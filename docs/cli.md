@@ -430,6 +430,30 @@ other Macs (docs/specs/remote-devices.md). The commands say "device", not
 Cherry has no Git worktree support: a worktree is a folder, opened as a
 project like any other.
 
+## Showing Files
+
+- `preview_files` (`cherry preview PATH… [--message TEXT] [--open]`) shows
+  the user files of the caller's own Mac in Cherry's Quick View, the panel
+  a Cmd-click on a path opens (AGENTS.md, Quick View): This Mac's for a tab
+  here, the device's for a tab of another Mac, which can name no file of
+  This Mac. `paths` (at most 10) are absolute, `~/…` or relative: the tool
+  layer joins a relative one with the caller's directory (the `cherry`
+  command's), and the app then tries it as a Cmd-click does (without a
+  `:line[:column]` suffix, which opens a text file at that line, or a
+  sentence's punctuation; from the caller's tab's directory, then its
+  project). Each is looked at on its Mac at once (over the device's SSH
+  connection, all paths together); a folder lists in the panel.
+- Then a toast in the caller's window ("Codex shared preview.png", with
+  `message` under it and View) opens them one after another (⌘← ⌘→);
+  its time runs only while the window is key. `open` opens the panel at
+  once instead, in front but without taking the keyboard from what the
+  user types in; agents pass it only when the user asked to see the files.
+  With no window to put a toast in, the panel opens so too.
+- The result lists each path (`path`, `found_path`, `kind` `file` or
+  `folder`, both nil when it was not found), the `machine` and `opened`.
+  Errors: `file_not_found` (none was found), `files_unreachable` (the
+  device did not answer), `invalid_argument` (no paths, more than 10).
+
 ## Process Tools
 
 Use process tools for new automation:
@@ -1323,7 +1347,7 @@ The tools, the control socket's tool requests and the `cherry` command
 have a group of their own in `Scripts/test-session-suites unit` (and CI),
 **ControlTool** (`--filter ControlTool`):
 
-- `ControlToolCatalogTests`: the 55 tools in their order, the list encoded
+- `ControlToolCatalogTests`: the 56 tools in their order, the list encoded
   byte for byte as `Fixtures/mcp-tools-list.json` (for a client Cherry
   knows nothing of) and the schemas as `Fixtures/mcp-tool-schemas.json`,
   the facts agents act on, the

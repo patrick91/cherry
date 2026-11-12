@@ -13,7 +13,7 @@ public enum CherryCLIGuide {
     /// The commands the guide lists one by one; it names the others.
     static let guideCommands: Set<String> = [
         "ls", "show", "read", "search", "wait", "send", "keys", "answer", "spawn",
-        "start", "stop", "restart", "close", "rename", "select", "task", "subscribe", "events", "unsubscribe",
+        "start", "stop", "restart", "close", "rename", "select", "preview", "task", "subscribe", "events", "unsubscribe",
     ]
 
     /// The guide (`cherry skill show`).

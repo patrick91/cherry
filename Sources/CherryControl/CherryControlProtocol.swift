@@ -197,6 +197,9 @@ public enum CherryControlRequest: Codable, Equatable, Sendable {
     /// Adds a folder of a device (or This Mac) as a project, making it
     /// first when asked, and opens it.
     case addProject(AddProjectRequest)
+    /// Shows files of the caller's Mac to the user in Quick View: a toast
+    /// in the caller's window that opens them, or the panel at once.
+    case previewFiles(PreviewFilesRequest)
 }
 
 public struct ScopedControlRequest: Codable, Equatable, Sendable {
@@ -734,6 +737,7 @@ public enum CherryControlResult: Codable, Equatable, Sendable {
     case runCommand(RunCommandResult)
     case listDevices(ListDevicesResult)
     case addProject(AddProjectResult)
+    case previewFiles(PreviewFilesResult)
 }
 
 public struct CherryControlError: Codable, Equatable, Error, Sendable {
@@ -1041,6 +1045,53 @@ public struct AddProjectResult: Codable, Equatable, Sendable {
         self.path = path
         self.created = created
         self.alreadyAdded = alreadyAdded
+        self.opened = opened
+    }
+}
+
+public struct PreviewFilesRequest: Codable, Equatable, Sendable {
+    /// Paths on the caller's Mac: absolute, `~/…`, or relative to the
+    /// caller's tab (its directory, then its project); `path:LINE` opens a
+    /// text file at that line.
+    public let paths: [String]
+    /// A line the toast shows under who shared them.
+    public let message: String?
+    /// Open Quick View at once instead of offering it in a toast.
+    public let open: Bool?
+
+    public init(paths: [String], message: String? = nil, open: Bool? = nil) {
+        self.paths = paths
+        self.message = message
+        self.open = open
+    }
+}
+
+public struct PreviewFilesResult: Codable, Equatable, Sendable {
+    public struct File: Codable, Equatable, Sendable {
+        /// The path as it was asked for.
+        public let path: String
+        /// Where it was found (absolute, on `machine`); nil when it was not.
+        public let foundPath: String?
+        /// `file` or `folder`; nil when it was not found.
+        public let kind: String?
+
+        public init(path: String, foundPath: String?, kind: String?) {
+            self.path = path
+            self.foundPath = foundPath
+            self.kind = kind
+        }
+    }
+
+    /// Each path, in order.
+    public let files: [File]
+    /// The Mac the files are on ("This Mac", or a device's name).
+    public let machine: String
+    /// The panel opened; false: a toast in the caller's window offers it.
+    public let opened: Bool
+
+    public init(files: [File], machine: String, opened: Bool) {
+        self.files = files
+        self.machine = machine
         self.opened = opened
     }
 }

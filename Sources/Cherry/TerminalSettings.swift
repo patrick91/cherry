@@ -425,6 +425,13 @@ final class TerminalSettings: ObservableObject {
         didSet { save(cursorBlink, for: .cursorBlink) }
     }
 
+    /// A ⌘-click on a file path in a terminal previews the file in Quick
+    /// View (`QuickViewOpening`), on This Mac or the Mac the tab runs on;
+    /// off, This Mac's files open in their app as Ghostty would open them.
+    @Published var quickViewFiles: Bool {
+        didSet { save(quickViewFiles, for: .quickViewFiles) }
+    }
+
     @Published var minimumContrast: Double {
         didSet { save(minimumContrast, for: .minimumContrast) }
     }
@@ -536,6 +543,7 @@ final class TerminalSettings: ObservableObject {
         }
         fontSize = stored(.fontSize) as? Double ?? Defaults.fontSize
         cursorBlink = stored(.cursorBlink) as? Bool ?? Defaults.cursorBlink
+        quickViewFiles = stored(.quickViewFiles) as? Bool ?? Defaults.quickViewFiles
         minimumContrast = stored(.minimumContrast) as? Double ?? Defaults.minimumContrast
         sidebarBackgroundDepth = stored(.sidebarBackgroundDepth) as? Double ?? Defaults.sidebarBackgroundDepth
         sidebarTerminalPathDisplayMode = (stored(.sidebarTerminalPathDisplayMode) as? String)
@@ -1063,6 +1071,7 @@ final class TerminalSettings: ObservableObject {
     private enum Defaults {
         static let fontSize = 14.0
         static let cursorBlink = true
+        static let quickViewFiles = true
         static let minimumContrast = 1.15
         static let sidebarBackgroundDepth = 0.08
         static let sidebarTerminalPathDisplayMode = SidebarTerminalPathDisplayMode.repoFocused
@@ -1112,6 +1121,7 @@ extension TerminalSettings {
         case minimumContrast = "terminal.minimumContrast"
         case fontSize = "terminal.fontSize"
         case cursorBlink = "terminal.cursorBlink"
+        case quickViewFiles = "terminal.quickViewFiles"
         case notifyWhenBackgroundProgramNeedsInput = "sessions.background.notifyNeedsInput"
         case notifyWhenBackgroundProgramFinishes = "sessions.background.notifyFinished"
         case noticeBackgroundSessionsAtLaunch = "sessions.backgroundNoticeAtLaunch"
@@ -1134,6 +1144,7 @@ extension TerminalSettings {
             case .minimumContrast: "Minimum contrast"
             case .fontSize: "Font size"
             case .cursorBlink: "Blink cursor"
+            case .quickViewFiles: "Quick View files on ⌘-click"
             case .notifyWhenBackgroundProgramNeedsInput: "Notify me when a background program needs me"
             case .notifyWhenBackgroundProgramFinishes: "Notify me when a background program finishes"
             case .noticeBackgroundSessionsAtLaunch: "Tell me about background sessions when Cherry opens"
@@ -1154,7 +1165,7 @@ extension TerminalSettings {
             case .appearance, .lightTerminalThemeName, .darkTerminalThemeName, .minimumContrast, .fontSize,
                  .cursorBlink:
                 true
-            case .sidebarTerminalPathDisplayMode, .projectColorDisplayMode, .sidebarBackgroundDepth,
+            case .sidebarTerminalPathDisplayMode, .projectColorDisplayMode, .sidebarBackgroundDepth, .quickViewFiles,
                  .notifyWhenBackgroundProgramNeedsInput, .notifyWhenBackgroundProgramFinishes,
                  .noticeBackgroundSessionsAtLaunch, .terminalBell, .workerNotifications, .persistLocalSessions,
                  .localSessionsOnQuit, .closeTabsOnCleanExit, .defaultEditorID:
@@ -1170,7 +1181,7 @@ extension TerminalSettings {
         static let themesPage: [Setting] = [.lightTerminalThemeName, .darkTerminalThemeName, .minimumContrast]
         /// What Reset Terminal… resets. Values from the user's Ghostty
         /// config are not settings: they stay.
-        static let terminalPage: [Setting] = [.fontSize, .cursorBlink]
+        static let terminalPage: [Setting] = [.fontSize, .cursorBlink, .quickViewFiles]
         /// What Reset Notifications… resets.
         static let notificationsPage: [Setting] = [
             .notifyWhenBackgroundProgramNeedsInput, .notifyWhenBackgroundProgramFinishes,
@@ -1188,7 +1199,7 @@ extension TerminalSettings {
             switch self {
             case .fontSize, .minimumContrast, .sidebarBackgroundDepth:
                 object is Double
-            case .cursorBlink, .notifyWhenBackgroundProgramNeedsInput, .notifyWhenBackgroundProgramFinishes,
+            case .cursorBlink, .quickViewFiles, .notifyWhenBackgroundProgramNeedsInput, .notifyWhenBackgroundProgramFinishes,
                  .noticeBackgroundSessionsAtLaunch, .persistLocalSessions, .closeTabsOnCleanExit:
                 object is Bool
             case .lightTerminalThemeName, .darkTerminalThemeName, .defaultEditorID:
@@ -1242,6 +1253,7 @@ extension TerminalSettings {
         case .minimumContrast: abs(minimumContrast - Defaults.minimumContrast) < 0.025
         case .fontSize: abs(fontSize - Defaults.fontSize) < 0.5
         case .cursorBlink: cursorBlink == Defaults.cursorBlink
+        case .quickViewFiles: quickViewFiles == Defaults.quickViewFiles
         case .notifyWhenBackgroundProgramNeedsInput:
             notifyWhenBackgroundProgramNeedsInput == Defaults.notifyWhenBackgroundProgramNeedsInput
         case .notifyWhenBackgroundProgramFinishes:
@@ -1311,6 +1323,7 @@ extension TerminalSettings {
         case .minimumContrast: assign(\.minimumContrast, Defaults.minimumContrast)
         case .fontSize: assign(\.fontSize, Defaults.fontSize)
         case .cursorBlink: assign(\.cursorBlink, Defaults.cursorBlink)
+        case .quickViewFiles: assign(\.quickViewFiles, Defaults.quickViewFiles)
         case .notifyWhenBackgroundProgramNeedsInput:
             assign(\.notifyWhenBackgroundProgramNeedsInput, Defaults.notifyWhenBackgroundProgramNeedsInput)
         case .notifyWhenBackgroundProgramFinishes:
@@ -1348,6 +1361,7 @@ extension TerminalSettings {
         case .minimumContrast: (Self.ratioText(minimumContrast), Self.ratioText(Defaults.minimumContrast))
         case .fontSize: (Self.pointText(fontSize), Self.pointText(Defaults.fontSize))
         case .cursorBlink: (SettingSource.onOff(cursorBlink), SettingSource.onOff(Defaults.cursorBlink))
+        case .quickViewFiles: (SettingSource.onOff(quickViewFiles), SettingSource.onOff(Defaults.quickViewFiles))
         case .notifyWhenBackgroundProgramNeedsInput:
             (
                 SettingSource.onOff(notifyWhenBackgroundProgramNeedsInput),

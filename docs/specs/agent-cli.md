@@ -49,6 +49,7 @@ cherry subscribe …, cherry events SUB [--cursor C], cherry unsubscribe SUB
 cherry ports [ID], cherry services, cherry wait-port …
 cherry todo ls|show|add|edit|move|rm|select|comment|comments, cherry project ls|open|add|show
 cherry devices                                     list_devices (--device D on project open|add, spawn agent)
+cherry preview PATH… [--message T] [--open]        preview_files (the caller's Mac's files, in Quick View)
 cherry commands start|stop|restart, cherry agents, cherry link LINK, cherry subscriptions
 cherry whoami
 cherry skill setup|status|show|remove [--agent A] [--dry-run] [--project] [--json]

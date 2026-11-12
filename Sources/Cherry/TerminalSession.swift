@@ -4292,6 +4292,24 @@ final class TerminalSession: ObservableObject, Identifiable {
         hostReportedSessionInfo?.bracketedPaste ?? true
     }
 
+    /// Whether the program took over its terminal, as an agent CLI's
+    /// interface does once it reads keys itself: it reported its status,
+    /// or (as its host reports) turned on bracketed paste, the kitty
+    /// keyboard protocol or the alternate screen. False while the host
+    /// reports none of them on: the login shell that starts the CLI, or
+    /// the CLI still loading, leaves the terminal's line editing on, which
+    /// turns an Enter typed then into a newline the CLI later puts in its
+    /// composer, and cuts a line longer than its 1 KiB buffer. Nil when
+    /// Cherry cannot tell: no host report (a native surface, a session
+    /// being created) or a holder that reports none of these modes.
+    var programTookTerminal: Bool? {
+        if reportsProgramStatus { return true }
+        guard let info = hostReportedSessionInfo,
+              info.bracketedPaste != nil || info.kittyKeyboardFlags != nil || info.alternateScreen != nil
+        else { return nil }
+        return info.bracketedPaste == true || (info.kittyKeyboardFlags ?? 0) > 0 || info.alternateScreen == true
+    }
+
     func bracketsPaste(_ text: String) -> Bool {
         guard persistentHosting != nil || hostedAttachment != nil else {
             return processor.usesBracketedPasteMode

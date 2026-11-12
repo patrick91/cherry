@@ -1,9 +1,10 @@
 import Foundation
 
 /// What an agent CLI's screen shows, for typing into it safely: whether a
-/// task's kickoff waits in its composer or was submitted, and whether it is
-/// at its composer before a kickoff into a CLI that reports no status
-/// (`AgentTasks`, `CherryControlServer.waitForTaskKickoffReadiness`). Never
+/// task's kickoff or a spawn's first message waits in its composer or was
+/// submitted, and whether it is at its composer before a kickoff or a first
+/// message into a CLI that reports no status (`AgentTasks`,
+/// `AgentFirstMessage`, `CherryControlServer.waitForAgentComposerReadiness`). Never
 /// an agent's state: that is only what it reports (OSC 7501,
 /// `TerminalSession.applyProgramStatus`). Pure functions over screen lines.
 ///
@@ -295,6 +296,86 @@ enum AgentScreenActivity {
             return true
         }
         return words.contains { ampLiveStatusWords.contains($0) }
+    }
+
+    // MARK: - What the composer holds
+
+    /// The characters a message's first line is told apart by in
+    /// `composerHolds`.
+    static let composerProbeLength = 24
+
+    /// What starts a composer's border row (Claude Code's `────` rule
+    /// below its prompt line, a box's bottom), which ends its text.
+    private static let composerBorderCharacters: Set<Character> = ["─", "━", "═", "╌", "┄", "╰", "╭", "└", "┌"]
+
+    /// What the composer shows typed and not sent: the text of its prompt
+    /// line (the last one among the screen's last `markerTailLineLimit`
+    /// lines, framed `│ > …` too) and of the rows below it that a long
+    /// text wraps over, up to a blank row or the composer's border; for
+    /// Amp, the rows inside its composer box. Nil when no composer shows.
+    static func composerText(in screen: [String], agent: String) -> String? {
+        var end = screen.count
+        while end > 0, screen[end - 1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            end -= 1
+        }
+        guard end > 0 else { return nil }
+        let lines = Array(screen[..<end])
+        if agent == "amp", let box = ampComposerBox(in: lines) {
+            guard box.lowerBound + 1 < box.upperBound else { return "" }
+            return lines[(box.lowerBound + 1)..<box.upperBound].map(unframed).joined(separator: "\n")
+        }
+        let tail = max(0, end - markerTailLineLimit)..<end
+        guard let promptRow = tail.last(where: { promptText(of: lines[$0], agent: agent) != nil }),
+              let typed = promptText(of: lines[promptRow], agent: agent)
+        else { return nil }
+        var rows = [typed]
+        for line in lines[(promptRow + 1)...] {
+            let row = unframed(line)
+            guard let first = row.first, !composerBorderCharacters.contains(first) else { break }
+            rows.append(row)
+        }
+        return rows.joined(separator: "\n")
+    }
+
+    /// Whether `message`, typed into the composer, sits there unsent
+    /// (whitespace aside, however a narrow tab wraps it): the composer
+    /// starts with the first `composerProbeLength` characters of its first
+    /// line; or it shows a part of the message at least that long, as a
+    /// CLI shows a message taller than its composer (Claude Code scrolls
+    /// it to the cursor, its prompt glyph on the first row it shows); or
+    /// it shows a CLI's placeholder for a paste in its place (Claude Code's
+    /// "[Pasted text #1 +12 lines]", Codex's "[Pasted Content 1234
+    /// chars]"). An empty composer, its ghost text, or another text does
+    /// not.
+    static func composerHolds(_ message: String, in screen: [String], agent: String) -> Bool {
+        guard let shown = composerText(in: screen, agent: agent) else { return false }
+        if shown.lowercased().contains("[pasted ") { return true }
+        func squeezed<S: StringProtocol>(_ text: S) -> String { String(text.filter { !$0.isWhitespace }) }
+        guard let firstLine = message.split(whereSeparator: \.isNewline).map(squeezed).first(where: { !$0.isEmpty })
+        else { return false }
+        let showing = squeezed(shown)
+        if showing.hasPrefix(firstLine.prefix(composerProbeLength)) { return true }
+        return showing.count >= composerProbeLength && squeezed(message).contains(showing)
+    }
+
+    /// The text after a composer's prompt glyph on `line`, framed or not;
+    /// nil for a line that is no prompt line.
+    private static func promptText(of line: String, agent: String) -> String? {
+        let row = unframed(line)
+        guard isInputPromptLine(row, agent: agent) else { return nil }
+        var glyphs = ["\u{203A}", "\u{00BB}", "\u{276F}"]
+        if agent == "claude" || agent == "gemini" || agent == "pi" { glyphs.append(">") }
+        guard let glyph = glyphs.first(where: { row.hasPrefix($0) }) else { return nil }
+        return String(row.dropFirst(glyph.count)).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// `line` trimmed, without a box's side borders (`│ … │`).
+    private static func unframed(_ line: String) -> String {
+        let frames: Set<Character> = ["│", "┃", "|"]
+        var row = Substring(line.trimmingCharacters(in: .whitespaces))
+        if let first = row.first, frames.contains(first) { row = row.dropFirst() }
+        if let last = row.last, frames.contains(last) { row = row.dropLast() }
+        return row.trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: -

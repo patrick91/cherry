@@ -168,6 +168,103 @@ private func typed(_ harness: PersistentHarness) -> [String] {
     #expect(typed(harness) == ["one\ntwo", "\r"])
 }
 
+// MARK: - A first message waits for the agent to take its terminal
+
+/// Answers the fake host's create with a session whose program has not
+/// taken its terminal (its login shell starts the CLI): bracketed paste,
+/// the kitty keyboard protocol and the alternate screen off.
+@MainActor
+private func createSessionsWithTheirTerminalNotTaken(_ harness: PersistentHarness) {
+    let fake = harness.fake
+    fake.respond = { request, _ in
+        guard request.op == "create" else { return nil }
+        let session = HostedSessionInfo(
+            id: "session-\(request.string("request_id") ?? "?")",
+            name: request.string("name") ?? "",
+            cwd: request.string("cwd") ?? "~",
+            command: request.json["command"] as? [String] ?? [],
+            pid: 42,
+            owner: request.string("owner"),
+            tags: request.json["tags"] as? [String: String] ?? [:],
+            alternateScreen: false, kittyKeyboardFlags: 0, applicationCursorKeys: false, bracketedPaste: false,
+            requestID: request.string("request_id")
+        )
+        fake.sessions = [session]
+        return .answer(.created(session))
+    }
+}
+
+/// A spawn's first message is typed only once the agent took over its
+/// terminal (here: turned bracketed paste on). Typed while its login shell
+/// or its loading left the terminal's line editing on, its Enter became a
+/// newline in its composer, and the message stayed there unsent.
+@Test @MainActor func aFirstMessageWaitsUntilTheAgentTookOverItsTerminal() async throws {
+    let harness = try PersistentHarness(configuration: safetyConfiguration())
+    let workspace = harness.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    defer {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    control.server.agentTerminalTakeoverWait = 20
+    harness.fake.screenText = claudeComposerScreen
+    createSessionsWithTheirTerminalNotTaken(harness)
+    try control.agentSettings.upsertAgent(AgentToolDefinition(name: "Claude", command: "claude"))
+
+    async let spawning = control.send(.spawnProcess(.init(
+        kind: "agent", name: "Claude", text: "Review the parser\nand the lexer", submit: true
+    )), timeout: 30)
+    #expect(await harness.fake.wait { harness.fake.sessions.count == 1 })
+    let info = try #require(harness.fake.sessions.first)
+    let agent = try #require(workspace.sessions.first { $0.kind == .agent })
+    #expect(await harness.fake.wait { agent.programTookTerminal == false })
+    // Past the 8.5 s the first message used to wait at most (2.5 s for an
+    // agent that shows nothing, then 6 s for its composer): it then went
+    // unbracketed, as the host reports bracketed paste off.
+    try await Task.sleep(for: .milliseconds(9_000))
+    #expect(typed(harness).isEmpty, "typed before the agent took over its terminal")
+
+    // The CLI's interface is up: bracketed paste on.
+    let tookOver = HostedSessionInfo(
+        id: info.id, name: info.name, cwd: info.cwd, command: info.command, pid: 42, owner: info.owner, tags: info.tags,
+        alternateScreen: true, kittyKeyboardFlags: 1, applicationCursorKeys: false, bracketedPaste: true
+    )
+    harness.fake.sessions = [tookOver]
+    harness.fake.connections.last(where: { !$0.isClosed })?.push(.event(.changed(tookOver)))
+    #expect(await harness.fake.wait { agent.programTookTerminal == true })
+
+    let spawned = try await spawning
+    #expect(spawned.error == nil)
+    guard case .spawnProcess(let result)? = spawned.result else {
+        Issue.record("Expected spawnProcess, got \(String(describing: spawned))")
+        return
+    }
+    #expect(result.sentBytes > 0)
+    #expect(typed(harness) == ["\u{1B}[200~Review the parser\nand the lexer\u{1B}[201~", "\r"])
+}
+
+/// An agent that never takes over its terminal (as the host tells) still
+/// gets its first message, once `agentTerminalTakeoverWait` passed.
+@Test @MainActor func aFirstMessageGoesAnywayWhenTheAgentNeverTakesItsTerminal() async throws {
+    let harness = try PersistentHarness(configuration: safetyConfiguration())
+    let workspace = harness.workspace()
+    let control = try ParityControlServer(workspace: workspace)
+    defer {
+        control.stop()
+        workspace.closeAllSessions(intent: .windowClosed)
+        harness.cleanUp()
+    }
+    control.server.agentTerminalTakeoverWait = 0.5
+    harness.fake.screenText = claudeComposerScreen
+    createSessionsWithTheirTerminalNotTaken(harness)
+    try control.agentSettings.upsertAgent(AgentToolDefinition(name: "Claude", command: "claude"))
+
+    let spawned = try await control.send(.spawnProcess(.init(kind: "agent", name: "Claude", text: "hello", submit: true)))
+    #expect(spawned.error == nil)
+    #expect(typed(harness) == ["hello", "\r"])
+}
+
 @Test func agentMessagePasteLeavesOneLineAloneAndStripsWhatWouldEndThePaste() throws {
     #expect(CherryControlServer.agentMessagePaste("hello", bracketed: true) == nil)
     #expect(CherryControlServer.agentMessagePaste("hello\n", bracketed: true) == nil)

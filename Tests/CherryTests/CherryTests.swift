@@ -1964,7 +1964,8 @@ private struct MCPWhoamiPayload: Decodable {
     printf 'boot\n'
     sleep 0.2
     while IFS= read -r -t 0.05 _; do :; done
-    printf 'ready\n'
+    # Ready: Codex's composer, which a first message waits for.
+    printf 'ready\n\342\200\272 \n'
     stty raw -echo
     /usr/bin/perl -e 'use strict; use warnings; $| = 1; my $buf = ""; while (1) { my $chunk = ""; my $n = sysread(STDIN, $chunk, 4096); last unless defined($n) && $n > 0; if ($chunk =~ /[\r\n]/) { if (length($chunk) > 1) { $chunk =~ s/[\r\n].*//s; $buf .= $chunk; print "typed:$buf\r\n"; } else { print "submitted:$buf\r\n"; } last; } $buf .= $chunk; print "typed:$buf\r\n"; }'
     """#

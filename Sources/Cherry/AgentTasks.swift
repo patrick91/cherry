@@ -1961,7 +1961,7 @@ extension CherryControlServer {
 
     /// The worker's screen has not changed for `interval`.
     @MainActor
-    private func screenIsStill(_ worker: TerminalSession, for interval: TimeInterval, now: Date) -> Bool {
+    func screenIsStill(_ worker: TerminalSession, for interval: TimeInterval, now: Date) -> Bool {
         let changedAt = worker.lastContentChangeAt ?? worker.startedAt ?? .distantPast
         return now.timeIntervalSince(changedAt) >= interval
     }
@@ -2055,7 +2055,7 @@ extension CherryControlServer {
     /// since, or it was at work when the kickoff was submitted (its CLI
     /// queued it).
     @MainActor
-    private func kickoffTurnStarted(_ worker: TerminalSession, since typedAt: Date) -> Bool {
+    func kickoffTurnStarted(_ worker: TerminalSession, since typedAt: Date) -> Bool {
         if let working = worker.lastWorkingReportAt, working >= typedAt { return true }
         if worker.agentWasWorkingAtLastSubmit, let submittedAt = worker.lastAgentSubmitAt, submittedAt >= typedAt { return true }
         return false

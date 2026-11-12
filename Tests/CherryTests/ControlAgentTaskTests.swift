@@ -1,6 +1,7 @@
 @testable import CherryControl
 import Darwin
 import Foundation
+import os
 import Testing
 @testable import Cherry
 
@@ -1367,5 +1368,249 @@ struct ControlAgentTaskKickoffTests {
         let events = try await harness.waitForTasks(.init(taskIDs: [taskID], timeoutMilliseconds: 0))
         #expect(events.events.contains { $0.kind == .kickoffRetry && $0.text?.contains("without asking for its task") == true })
         #expect(!events.events.contains { $0.kind == .nudged })
+    }
+}
+
+// MARK: - A spawn's first message, checked
+
+/// What a composer holds: a first message typed into it with its Enter
+/// lost (wrapped, framed, or as a CLI's paste placeholder) is there; an
+/// empty composer, its ghost text, the message among the sent ones, or
+/// another text is not.
+@Test func ControlAgentFirstMessageComposerHoldsTheMessageUntilItIsSent() {
+    let message = "Read the open and recently closed Strawberry PRs, issues and discussions about extending types.\n- Check merge_types."
+    func holds(_ lines: [String], agent: String = "claude") -> Bool {
+        AgentScreenActivity.composerHolds(message, in: lines, agent: agent)
+    }
+    let rule = String(repeating: "\u{2500}", count: 40)
+    let footer = "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)"
+    // Typed, its Enter lost: on the prompt line, wrapped (mid-word too, in
+    // a narrow tab), or framed.
+    #expect(holds(["Welcome back", "", rule, "\u{276F} Read the open and recently closed Strawberry PRs,", "  issues and discussions", rule, footer]))
+    #expect(holds([rule, "\u{276F} Read the open and rec", "ently closed Strawberry", rule]))
+    #expect(holds(["\u{256D}\u{2500}\u{256E}", "\u{2502} > Read the open and recently closed \u{2502}", "\u{2570}\u{2500}\u{256F}"]))
+    // Pasted: the CLI's placeholder.
+    #expect(holds([rule, "\u{276F} [Pasted text #1 +2 lines]", rule, footer]))
+    #expect(holds(["\u{203A} [Pasted Content 118 chars]", "", "  \u{23CE} send"], agent: "codex"))
+    // Not there: an empty composer, its ghost text, sent (above an empty
+    // composer), another text, no composer at all.
+    #expect(!holds([rule, "\u{276F} ", rule, footer]))
+    #expect(!holds([rule, "\u{276F}\u{00A0}Try \"fix lint errors\"", rule, footer]))
+    #expect(!holds(["> Read the open and recently closed Strawberry PRs,", "", "\u{23FA} On it.", "", rule, "\u{276F} ", rule, footer]))
+    #expect(!holds([rule, "\u{276F} fix the tests first", rule]))
+    #expect(!holds(["Loading\u{2026}"]))
+    #expect(AgentScreenActivity.composerText(in: ["Loading\u{2026}"], agent: "claude") == nil)
+    #expect(AgentScreenActivity.composerText(in: [rule, "\u{276F} one", "  two", rule, footer], agent: "claude") == "one\ntwo")
+    // Amp: inside its composer box.
+    func ampBox(_ rows: [String]) -> [String] {
+        ["\u{256D}\u{2500}\u{2500}\u{2500} high \u{2500}\u{256E}"]
+            + rows.map { "\u{2502} " + $0.padding(toLength: 60, withPad: " ", startingAt: 0) + " \u{2502}" }
+            + ["\u{2570}\u{2500}\u{2500} ~/project \u{2500}\u{256F}", ""]
+    }
+    #expect(holds(["Welcome to Amp", ""] + ampBox(["Read the open and recently closed Strawberry", "PRs, issues and discussions"]), agent: "amp"))
+    #expect(!holds(["Welcome to Amp", ""] + ampBox([""]), agent: "amp"))
+
+    // A message taller than the composer: Claude Code shows the rows
+    // around its cursor, its prompt glyph on the first one, so the first
+    // line is out of view; a part of the message long enough still says
+    // it is there.
+    let brief = """
+        Add user_can_authenticate to cross-auth.
+
+        ## Docs
+        - Update the docs:
+          - `session-authentication.md`, `security.md`, `oauth.md`, `django.md` as relevant;
+          - release notes the way this repo does them.
+        - Run the relevant tests and `ty check . --exclude website`.
+        - Commit locally in the repo's style.
+        """
+    let scrolled = [
+        " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259C}\u{258C}   Claude Code v2.1.322", "", "", rule,
+        "\u{276F}   - `session-authentication.md`, `security.md`, `oauth.md`, `django.md` as relevant;",
+        "    - release notes the way this repo does them.",
+        "  - Run the relevant tests and `ty check . --exclude website`.",
+        rule, footer,
+    ]
+    #expect(AgentScreenActivity.composerHolds(brief, in: scrolled, agent: "claude"))
+    // Another text, or too little of it to tell, is not the message.
+    #expect(!AgentScreenActivity.composerHolds(brief, in: [rule, "\u{276F}   - `README.md`, `CHANGELOG.md` and the release notes;", rule], agent: "claude"))
+    #expect(!AgentScreenActivity.composerHolds(brief, in: [rule, "\u{276F} - Commit locally", rule], agent: "claude"))
+}
+
+@MainActor
+private extension ControlAgentWaitHarness {
+    /// Spawns the agent `name` running `command` with `message` as its
+    /// first message.
+    func spawnWithMessage(agent name: String, command: String, message: String) async throws -> (session: TerminalSession, result: SpawnProcessResult) {
+        try settings.upsertAgent(AgentToolDefinition(name: name, command: command))
+        let response = try await send(.spawnProcess(.init(kind: "agent", name: name, text: message, submit: true)))
+        guard case .spawnProcess(let spawned)? = response.result else {
+            throw CherryControlError(code: "spawn_failed", message: "Expected spawnProcess result, got \(String(describing: response))")
+        }
+        return (try #require(workspace.session(id: spawned.process.id)), spawned)
+    }
+}
+
+/// The "[agent] first message of <tab>" lines Cherry logs from now on.
+private final class FirstMessageLog {
+    private let seen = OSAllocatedUnfairLock<[String]>(initialState: [])
+    private var token: UUID?
+
+    init() {
+        let seen = seen
+        token = SessionLog.observe { entry in seen.withLock { $0.append(entry.message) } }
+    }
+
+    deinit {
+        if let token { SessionLog.remove(token) }
+    }
+
+    @MainActor
+    func lines(of tab: TerminalSession) -> [String] {
+        seen.withLock { $0 }.filter { $0.hasPrefix("[agent] first message of \(tab.id.uuidString)") }
+    }
+
+    @MainActor
+    func enterPresses(in tab: TerminalSession) -> Int {
+        lines(of: tab).filter { $0.contains("pressed its Enter") }.count
+    }
+}
+
+@MainActor
+@Suite(.serialized)
+struct ControlAgentFirstMessageTests {
+    /// A spawn's first message whose text reached the composer but whose
+    /// Enter was lost (Claude Code while it loads) gets its Enter once the
+    /// composer is still, and is never typed a second time.
+    @Test func firstMessageLeftInTheComposerGetsItsEnter() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastKickoffChecks()
+        harness.server.start()
+        let log = FirstMessageLog()
+        // A composer that shows what is typed and loses its first Enter;
+        // it reports no status.
+        let script = try harness.script("lost-enter.pl", #"""
+        #!/usr/bin/perl
+        use strict;
+        use warnings;
+        $| = 1;
+        system("stty raw -echo 2>/dev/null");
+        my $composer = "\xe2\x9d\xaf ";
+        print $composer;
+        my $buffer = "";
+        my $lost = 0;
+        while (sysread(STDIN, my $byte, 1)) {
+          if ($byte eq "\r" || $byte eq "\n") {
+            if (!$lost) { $lost = 1; next; }
+            next if $buffer eq "";
+            print "\r\n> $buffer\r\n\r\n";
+            select(undef, undef, undef, 0.1);
+            print "\xe2\x9c\xb6 Reticulating\xe2\x80\xa6 (esc to interrupt)";
+            select(undef, undef, undef, 0.3);
+            print "\r\033[2K\xe2\x8f\xba handled $buffer\r\n\r\n$composer";
+            $buffer = "";
+          } else {
+            $buffer .= $byte;
+            print $byte;
+          }
+        }
+        """#)
+        let (agent, spawned) = try await harness.spawnWithMessage(agent: "Claude", command: script, message: "Review the parser")
+        #expect(spawned.sentBytes > 0)
+        #expect(spawned.inputError == nil)
+
+        let handled = try await harness.waitForOutput("handled Review the parser", in: agent, seconds: 20)
+        #expect(handled.contains("handled Review the parser"), "the message stayed in the composer: \(handled)")
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(try await harness.count("handled Review the parser", in: agent) == 1)
+        #expect(try await harness.count("> Review the parser", in: agent) == 1, "typed once")
+        #expect(log.enterPresses(in: agent) == 1, "\(log.lines(of: agent))")
+    }
+
+    /// An agent that reports its status as Claude Code does, and shows a
+    /// pasted message as a placeholder: a first message of several lines
+    /// whose Enter was lost gets its Enter while the agent reports idle
+    /// and its turn has not started, and the turn it then starts ends the
+    /// watch.
+    @Test func pastedFirstMessageLeftInTheComposerGetsItsEnter() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastKickoffChecks()
+        harness.server.start()
+        let log = FirstMessageLog()
+        let script = try harness.script("lost-paste-enter.pl", #"""
+        #!/usr/bin/perl
+        use strict;
+        use warnings;
+        $| = 1;
+        system("stty raw -echo 2>/dev/null");
+        my $composer = "\xe2\x9d\xaf ";
+        print "\e]7501;state=idle:app=fake\e\\" . $composer;
+        my ($buffer, $escape, $paste, $pasting, $pastes, $lost) = ("", "", "", 0, 0, 0);
+        while (sysread(STDIN, my $byte, 1)) {
+          if ($pasting) {
+            $paste .= $byte;
+            next unless $paste =~ s/\e\[201~\z//;
+            $pasting = 0;
+            $pastes += 1;
+            my $lines = () = $paste =~ /\n/g;
+            $buffer .= $paste;
+            $paste = "";
+            print "[Pasted text #$pastes +$lines lines]";
+            next;
+          }
+          if ($escape ne "" || $byte eq "\e") {
+            $escape .= $byte;
+            if ($escape eq "\e[200~") { $pasting = 1; $escape = ""; }
+            elsif (index("\e[200~", $escape) != 0) { $escape = ""; }
+            next;
+          }
+          if ($byte eq "\r" || $byte eq "\n") {
+            if (!$lost) { $lost = 1; next; }
+            next if $buffer eq "";
+            my ($first) = split /\n/, $buffer;
+            print "\r\n> $first\r\n\r\n\e]7501;state=working:app=fake\e\\";
+            select(undef, undef, undef, 0.3);
+            print "\xe2\x8f\xba handled $first\r\n\r\n\e]7501;state=done:app=fake\e\\$composer";
+            $buffer = "";
+          } else {
+            $buffer .= $byte;
+            print $byte;
+          }
+        }
+        """#)
+        let message = "Review the parser\nand the lexer\nthen report back"
+        let (agent, spawned) = try await harness.spawnWithMessage(agent: "Claude", command: script, message: message)
+        #expect(spawned.sentBytes > 0)
+        #expect(spawned.inputError == nil)
+
+        let handled = try await harness.waitForOutput("handled Review the parser", in: agent, seconds: 20)
+        #expect(handled.contains("handled Review the parser"), "the message stayed in the composer: \(handled)")
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(try await harness.count("handled Review the parser", in: agent) == 1)
+        #expect(try await harness.count("[Pasted text #", in: agent) == 1, "pasted once")
+        #expect(log.enterPresses(in: agent) == 1, "\(log.lines(of: agent))")
+        #expect(log.lines(of: agent).contains { $0.hasSuffix("its turn started") }, "\(log.lines(of: agent))")
+    }
+
+    /// A first message the agent took at once is left alone: its turn
+    /// starting ends the watch, and no Enter is pressed for it.
+    @Test func firstMessageTheAgentTookGetsNoOtherEnter() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastKickoffChecks()
+        harness.server.start()
+        let log = FirstMessageLog()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let (agent, spawned) = try await harness.spawnWithMessage(agent: "Claude", command: script, message: "hello there")
+        #expect(spawned.sentBytes > 0)
+
+        let handled = try await harness.waitForOutput("handled hello there", in: agent, seconds: 20)
+        #expect(handled.contains("handled hello there"), "\(handled)")
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(try await harness.count("handled hello there", in: agent) == 1)
+        #expect(log.lines(of: agent).contains { $0.hasSuffix("its turn started") }, "\(log.lines(of: agent))")
+        #expect(log.enterPresses(in: agent) == 0, "\(log.lines(of: agent))")
     }
 }

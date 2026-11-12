@@ -799,6 +799,11 @@ final class CherryControlServer: @unchecked Sendable {
     /// invalid_request, as an app from before control protocol 2 does.
     @MainActor var answersToolRequests = true
 
+    /// How long the first input to an agent this tab just started waits
+    /// for the agent to take over its terminal
+    /// (`TerminalSession.programTookTerminal`); tests lower it.
+    @MainActor var agentTerminalTakeoverWait: TimeInterval = 30
+
     /// Tests: the `toolsDigest` every callTool answers with, in place of the
     /// catalog's (as when the app's tools changed under a running client).
     @MainActor var toolsDigestOverrideForTesting: String?
@@ -2029,8 +2034,10 @@ final class CherryControlServer: @unchecked Sendable {
         let text = task != nil ? "" : request.text
         let submit = task != nil ? true : request.submit
         if (text != nil || request.rawBase64 != nil || submit == true), let agent {
-            if task != nil {
-                await waitForTaskKickoffReadiness(session: session, agent: agent)
+            if task != nil || text != nil {
+                // A kickoff or a first message: once the agent shows its
+                // composer, on a screen still for a second.
+                await waitForAgentComposerReadiness(session: session, agent: agent)
             } else {
                 await waitForAgentInitialInputReadiness(session: session, agent: agent)
             }
@@ -2062,6 +2069,14 @@ final class CherryControlServer: @unchecked Sendable {
                     sentBytes = 0
                 }
                 typingLock?.release(session.id)
+                // Typed is not sent: a first message is watched until its
+                // turn starts, and gets its Enter again when its CLI
+                // dropped it (`watchFirstMessage`), as a kickoff does.
+                if task == nil, inputError == nil, sentBytes > 0, let message = text, request.rawBase64 == nil,
+                   input.submit || input.payload.last == 0x0d || input.payload.last == 0x0a,
+                   shouldDeferInitialInput(for: agent) {
+                    watchFirstMessage(message, into: session, workspace: workspace, typedAt: typedSince)
+                }
             } else {
                 sentBytes = 0
             }
@@ -3516,23 +3531,24 @@ final class CherryControlServer: @unchecked Sendable {
         return " (it reports: \"\(message.prefix(300))\")"
     }
 
-    /// How long a task's first kickoff waits, after the agent's usual
-    /// readiness, for its composer on a still screen.
-    static let taskKickoffComposerWait: TimeInterval = 6
+    /// How long a task's first kickoff, or a spawn's first message, waits
+    /// after the agent's usual readiness for its composer on a still
+    /// screen.
+    static let agentComposerWait: TimeInterval = 6
 
-    /// Before a task's first kickoff into a CLI Cherry knows: its usual
-    /// readiness (its startup prompt answered) with a full second of a
-    /// still screen, then until it shows its composer on a screen still for
-    /// a second (at most `taskKickoffComposerWait` more). A CLI can show its
-    /// composer before it takes input (Claude Code while its MCP servers
-    /// load), so the kickoff is checked after it is typed too
-    /// (`checkKickoff`).
+    /// Before a task's first kickoff or a spawn's first message into a CLI
+    /// Cherry knows: its usual readiness (its startup prompt answered) with
+    /// a full second of a still screen, then until it shows its composer on
+    /// a screen still for a second (at most `agentComposerWait` more). A
+    /// CLI can show its composer before it takes input (Claude Code while
+    /// its MCP servers load), so what was typed is checked afterwards too
+    /// (a kickoff by `checkKickoff`, a message by `watchFirstMessage`).
     @MainActor
-    private func waitForTaskKickoffReadiness(session: TerminalSession, agent: AgentToolDefinition) async {
+    private func waitForAgentComposerReadiness(session: TerminalSession, agent: AgentToolDefinition) async {
         guard shouldDeferInitialInput(for: agent) else { return }
         await waitForDeferredAgentInputReadiness(session: session, quietInterval: 1)
         let key = AgentScreenActivity.agentKey(name: agent.name, commandLine: agent.commandLine)
-        let deadline = Date().addingTimeInterval(Self.taskKickoffComposerWait)
+        let deadline = Date().addingTimeInterval(Self.agentComposerWait)
         while Date() < deadline {
             switch session.state {
             case .disconnected where session.isPersistentLocalSession && session.isRunning, .launching, .live:
@@ -3556,6 +3572,15 @@ final class CherryControlServer: @unchecked Sendable {
         }
     }
 
+    /// The first input to an agent this tab just started waits until the
+    /// agent took over its terminal (`TerminalSession.programTookTerminal`,
+    /// at most `agentTerminalTakeoverWait` once its session exists; not when
+    /// Cherry cannot tell), then until its output is quiet for
+    /// `quietInterval` (at most 6 s more, 2.5 s when it shows nothing),
+    /// answering its startup prompt (trust this folder) at most twice.
+    /// Typed earlier, a message goes through the terminal's line editing:
+    /// the CLI later finds it in its composer with its Enter turned into a
+    /// newline, unsent.
     @MainActor
     private func waitForDeferredAgentInputReadiness(session: TerminalSession, quietInterval: TimeInterval = 0.75) async {
         var startedAt = Date()
@@ -3567,6 +3592,8 @@ final class CherryControlServer: @unchecked Sendable {
         var acknowledgedStartupPromptCount = 0
         var awaitingOutputAfterAcknowledgementVersion: Int?
         var startupPromptSearchStartLine = 0
+        var takeoverDeadline: Date?
+        var awaitedTakeover = false
 
         while true {
             switch session.state {
@@ -3587,6 +3614,28 @@ final class CherryControlServer: @unchecked Sendable {
                 continue
             }
             await session.refreshContentFromHostIfNeeded(maximumAge: session.hostContentPollInterval, recentOnly: true)
+
+            // The agent has not taken over its terminal yet (its login
+            // shell runs, or it loads): wait for it, then for the rest
+            // from then on.
+            let deadline = takeoverDeadline ?? startedAt.addingTimeInterval(agentTerminalTakeoverWait)
+            takeoverDeadline = deadline
+            if session.programTookTerminal == false {
+                if Date() < deadline {
+                    awaitedTakeover = true
+                    try? await Task.sleep(for: .milliseconds(50))
+                    continue
+                }
+                if awaitedTakeover {
+                    SessionLog.notice("[agent] \(session.id.uuidString) did not take over its terminal in \(Int(agentTerminalTakeoverWait)) s: its first input goes anyway")
+                    awaitedTakeover = false
+                    startedAt = Date()
+                }
+            } else if awaitedTakeover {
+                SessionLog.debug("[agent] \(session.id.uuidString) took over its terminal after \(String(format: "%.1f", Date().timeIntervalSince(startedAt))) s")
+                awaitedTakeover = false
+                startedAt = Date()
+            }
 
             if let outputVersion = awaitingOutputAfterAcknowledgementVersion,
                session.outputVersion > outputVersion {

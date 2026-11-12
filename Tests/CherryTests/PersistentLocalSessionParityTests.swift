@@ -126,6 +126,8 @@ private final class RecordingServiceDetector: ServiceDetecting, @unchecked Senda
 final class ParityControlServer {
     let server: CherryControlServer
     let socketURL: URL
+    /// The server's agents and projects (a test adds the agents it spawns).
+    let agentSettings: AgentSettings
     private let suite: String
 
     init(
@@ -136,6 +138,7 @@ final class ParityControlServer {
         let defaults = try #require(UserDefaults(suiteName: suite))
         let settings = AgentSettings(defaults: defaults)
         if let projectRoot = workspace.projectRoot { _ = settings.addProject(path: projectRoot) }
+        agentSettings = settings
         socketURL = URL(fileURLWithPath: "/tmp/cherry-control-\(UUID().uuidString.prefix(8))", isDirectory: true)
             .appendingPathComponent("control.sock")
         server = CherryControlServer(
@@ -155,6 +158,7 @@ final class ParityControlServer {
         for workspace in workspaces {
             if let projectRoot = workspace.projectRoot { _ = settings.addProject(path: projectRoot) }
         }
+        agentSettings = settings
         socketURL = URL(fileURLWithPath: "/tmp/cherry-control-\(UUID().uuidString.prefix(8))", isDirectory: true)
             .appendingPathComponent("control.sock")
         server = CherryControlServer(
@@ -172,12 +176,12 @@ final class ParityControlServer {
         server.start()
     }
 
-    func send(_ request: CherryControlRequest) async throws -> CherryControlResponse {
+    func send(_ request: CherryControlRequest, timeout: TimeInterval = 10) async throws -> CherryControlResponse {
         let socketURL = socketURL
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    continuation.resume(returning: try CherryControlClient(socketURL: socketURL).send(request))
+                    continuation.resume(returning: try CherryControlClient(socketURL: socketURL, timeout: timeout).send(request))
                 } catch {
                     continuation.resume(throwing: error)
                 }

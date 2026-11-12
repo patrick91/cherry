@@ -1130,6 +1130,29 @@ its tab just launched, never for a restored, adopted or attached agent, and
 never on a permission menu. A restored agent has been running for a while;
 input to it is checked as above.
 
+The first input to an agent its tab just launched waits until the agent took
+over its terminal: it reported its status, or turned on bracketed paste, the
+kitty keyboard protocol or the alternate screen, as its session host tells
+(at most 30 s; a tab whose host cannot tell does not wait). Before that the
+terminal's line editing is on (the login shell starting the CLI, or the CLI
+still loading): an Enter typed then reaches the CLI as a newline, which it
+puts in its composer, and a line longer than 1 KiB is cut.
+
+The first message of `cherry spawn agent NAME --message` (`spawn_agent` with
+`message`, or an agent's `text` in `spawn_process`) into a CLI Cherry knows
+then waits as a task's kickoff does: for its composer on a screen still for a
+second (an agent that reports its status: until it reports `idle`). Typed is
+not sent: an agent CLI can show its composer before it takes input (Claude
+Code while it loads) and drop the Enter. So for up to a minute after it was
+typed, until the agent's turn starts, Cherry looks at its screen once it has
+been still for a second, nobody types into the tab and the agent is idle: a
+message still in the composer (the start of its first line, a part of it at
+least 24 characters long when the composer shows only the rows around its
+cursor, or the CLI's placeholder for a paste, such as `[Pasted text #1 +12
+lines]`) gets its Enter, at most twice. Unlike a kickoff it is never typed
+again, and a message no longer in the composer counts as sent. `sent_bytes`
+says what was typed, not that it was submitted.
+
 ### Answering A Menu
 
 `answer_prompt` (`process_id` or `process_name`, and `choice`) picks an

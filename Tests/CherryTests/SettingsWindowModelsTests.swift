@@ -140,7 +140,7 @@ private func projectFileContents(_ directory: URL) throws -> String {
     #expect(brands.map(\.productName) == ["Claude Code", "Codex", "Pi", "Gemini CLI", "OpenCode", "Amp"])
     #expect(brands.map(\.programStatusSupport) == [
         .reports(minimumVersion: "2.1.295"),
-        .doesNotReport,
+        .reports(minimumVersion: "0.163.0"),
         .reports(minimumVersion: "1.1.0"),
         .unknown,
         .unknown,

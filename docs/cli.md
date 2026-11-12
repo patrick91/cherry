@@ -532,12 +532,16 @@ process tools include activity metadata:
 - `agent_activity_state` (agent processes only): what the agent reports with
   the program status protocol (OSC 7501,
   https://www.superlogical.com/rex/docs/build/program-status), which Claude
-  Code (2.1.295 and later) and Pi (1.1.0 and later) send: `working`, `idle`
-  (at its prompt, or done with a turn), `permission` (blocked waiting for an
-  approval), `needs_input` (blocked on a question to the user or a login:
-  the turn waits on an answer), `error`, or `unknown` while it reports
-  nothing. Cherry never guesses the state from the screen: an agent that does
-  not speak the protocol (Codex, Amp, older versions) stays `unknown`.
+  Code (2.1.295 and later), Pi (1.1.0 and later) and Codex (0.163 and later)
+  send: `working`, `idle` (at its prompt, or done with a turn), `permission`
+  (blocked waiting for an approval), `needs_input` (blocked on a question to
+  the user or a login: the turn waits on an answer), `error`, or `unknown`
+  while it reports nothing. Cherry never guesses the state from the screen:
+  an agent that does not speak the protocol (Amp, Codex before 0.163, older
+  versions) stays `unknown`, and one that reports `working` is working, even
+  when its screen looks done. Codex before 0.169 reports `working` after its
+  turn ended for as long as a background terminal runs (its footer says
+  "1 background terminal running"; `/stop` in Codex ends them).
 - `program_status` (any process whose program reports its status): the
   program's own record, `state` (`idle`, `working`, `done`, `blocked`,
   `error`), `kind` for `blocked` (`permission`, `question`, `auth`),
@@ -697,13 +701,13 @@ to their events and ends its turn; Cherry tells it when something happened.
   on screen when the watch began do not count). The default is all but
   `output_match`. Only processes the caller may reach can be watched: a
   caller on another Mac only its Mac's (`terminal_not_found` otherwise).
-- An agent that reports no status (Amp, Codex: `unknown`, which its status
-  stays) is `done` once its screen changed after a submitted turn and then
-  stayed still for 2 s, as `wait_for_process_idle` falls back to its output
-  going quiet; the event has `basis: "output_quiet"`. Once per turn: the
-  next one comes after another submitted turn (a turn submitted before its
-  program restarted never does). A program that pauses with a still screen
-  in the middle of its turn looks done too.
+- An agent that reports no status (Amp, Codex before 0.163: `unknown`, which
+  its status stays) is `done` once its screen changed after a submitted turn
+  and then stayed still for 2 s, as `wait_for_process_idle` falls back to
+  its output going quiet; the event has `basis: "output_quiet"`. Once per
+  turn: the next one comes after another submitted turn (a turn submitted
+  before its program restarted never does). A program that pauses with a
+  still screen in the middle of its turn looks done too.
 - A state that already holds when the subscription is made is reported at
   once with `initial: true`: an agent whose last turn completed is `done`
   (one that reports no status: quiet after its turn; a tab nothing read

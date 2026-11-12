@@ -34,14 +34,14 @@ private func agentSettings(_ agents: [AgentToolDefinition]) throws -> AgentSetti
     let pi = AgentSettingsPage.statusReporting(for: try preset("Pi"))
     #expect(pi.status == "Supported")
     #expect(pi.help.hasSuffix("Needs Pi 1.1.0 or later."))
+    let codex = AgentSettingsPage.statusReporting(for: try preset("Codex"))
+    #expect(codex.status == "Supported")
+    #expect(codex.help.hasSuffix("Needs Codex 0.163.0 or later."))
 
-    for name in ["Codex", "Amp"] {
-        let reporting = AgentSettingsPage.statusReporting(for: try preset(name))
-        #expect(reporting.status == "Not supported", "\(name)")
-        #expect(reporting.style == .neutral, "\(name)")
-    }
-    #expect(AgentSettingsPage.statusReporting(for: try preset("Codex")).help
-        == "Codex doesn't tell Cherry when it needs you, works or finishes.")
+    let amp = AgentSettingsPage.statusReporting(for: try preset("Amp"))
+    #expect(amp.status == "Not supported")
+    #expect(amp.style == .neutral)
+    #expect(amp.help == "Amp doesn't tell Cherry when it needs you, works or finishes.")
 
     for name in ["Gemini", "OpenCode"] {
         #expect(AgentSettingsPage.statusReporting(for: try preset(name)).status == "Not known", "\(name)")

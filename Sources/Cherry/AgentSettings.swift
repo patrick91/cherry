@@ -218,13 +218,14 @@ extension AgentToolBrand {
     }
 
     /// Whether the CLI reports its state (docs/cli.md › program status):
-    /// Claude Code from 2.1.295 and Pi from 1.1.0; Codex and Amp do not;
-    /// Gemini CLI and OpenCode are not known either way.
+    /// Claude Code from 2.1.295, Pi from 1.1.0 and Codex from 0.163.0; Amp
+    /// does not; Gemini CLI and OpenCode are not known either way.
     var programStatusSupport: ProgramStatusSupport {
         switch self {
         case .claude: .reports(minimumVersion: "2.1.295")
         case .pi: .reports(minimumVersion: "1.1.0")
-        case .codex, .amp: .doesNotReport
+        case .codex: .reports(minimumVersion: "0.163.0")
+        case .amp: .doesNotReport
         case .gemini, .openCode: .unknown
         }
     }

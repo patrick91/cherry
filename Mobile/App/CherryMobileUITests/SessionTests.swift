@@ -1,0 +1,230 @@
+import XCTest
+
+@MainActor
+final class SessionTests: XCTestCase {
+    private var app: XCUIApplication!
+    private var list: XCUIElement { app.descendants(matching: .any)["conversation"].firstMatch }
+    private var field: XCUIElement { app.descendants(matching: .any)["reply-field"].firstMatch }
+    private var send: XCUIElement { app.buttons["send-reply"] }
+    private let ending = "History end. Ready for your reply."
+
+    override func setUp() {
+        super.setUp()
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+    }
+
+    override func tearDown() {
+        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        app?.terminate()
+        super.tearDown()
+    }
+
+    private func launch(_ extra: [String] = [], claude: Bool = false) {
+        app = XCUIApplication()
+        app.launchArguments = ["-screen", "session:\(claude ? "demo-claude" : "demo-pi")", "-demoLongConversation", "YES"] + extra
+        if !extra.contains("-demoTurnSeconds") { app.launchArguments += ["-demoTurnSeconds", "4"] }
+        app.launch()
+        XCTAssertTrue(list.waitForExistence(timeout: 8))
+        if !claude { XCTAssertTrue(message(ending).waitForExistence(timeout: 5)) }
+    }
+
+    private func message(_ text: String) -> XCUIElement { app.staticTexts[text].firstMatch }
+
+    private func wait(_ predicate: String, on element: XCUIElement, timeout: TimeInterval = 8) {
+        XCTAssertTrue(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: predicate), object: element)], timeout: timeout) == .completed)
+    }
+
+    private func visible(_ element: XCUIElement, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(element.exists, file: file, line: line)
+        let frame = element.frame
+        XCTAssertGreaterThan(frame.height, 0, file: file, line: line)
+        XCTAssertGreaterThanOrEqual(frame.minY, list.frame.minY - 1, file: file, line: line)
+        XCTAssertLessThanOrEqual(frame.maxY, field.frame.minY, file: file, line: line)
+        XCTAssertTrue(element.isHittable, file: file, line: line)
+    }
+
+    private func reply(_ text: String) {
+        field.tap()
+        field.typeText(text)
+        let typed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", text), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [typed], timeout: 3), .completed)
+        send.tap()
+    }
+
+    private func answer(_ text: String) -> XCUIElement { message("(pi in the demo) Done: \(text)") }
+
+    func testOpeningShowsEnd() { launch(); visible(message(ending)) }
+
+    func testSendSubmitsAndFollowsAnswer() {
+        launch(["-demoTurnSeconds", "8"])
+        reply("UI reply")
+        XCTAssertTrue(app.descendants(matching: .any)["working-row"].firstMatch.waitForExistence(timeout: 4))
+        XCTAssertTrue(message("UI reply").waitForExistence(timeout: 4))
+        wait("value == '' OR value == 'Reply'", on: field, timeout: 3)
+        XCTAssertTrue(answer("UI reply").waitForExistence(timeout: 8))
+        visible(answer("UI reply"))
+    }
+
+    func testReturnMakesMultilineReply() {
+        launch()
+        field.tap(); field.typeText("First line\nSecond line")
+        XCTAssertEqual(field.value as? String, "First line\nSecond line")
+        XCTAssertFalse(message("First line").exists)
+        send.tap()
+        XCTAssertTrue(message("First line\nSecond line").waitForExistence(timeout: 4))
+        let response = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@ AND label CONTAINS %@", "(pi in the demo) Done: First line", "Second line")).firstMatch
+        XCTAssertTrue(response.waitForExistence(timeout: 8))
+    }
+
+    func testEmptyAndWhitespaceDisableSend() {
+        launch(); XCTAssertFalse(send.isEnabled)
+        field.tap(); field.typeText("   ")
+        XCTAssertFalse(send.isEnabled)
+    }
+
+    func testKeyboardPreservesEnd() {
+        launch(); field.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+        visible(message(ending))
+    }
+
+    func testConversationDragDismissesKeyboard() {
+        launch(); field.tap()
+        let keyboard = app.keyboards.firstMatch
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 3))
+        // As in Messages, the keyboard follows a drag that reaches it; a
+        // scroll through the history alone leaves it open.
+        let start = list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+        let end = keyboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.95))
+        start.press(forDuration: 0.1, thenDragTo: end)
+        wait("exists == false", on: keyboard, timeout: 3)
+    }
+
+    func testConversationTapDismissesKeyboard() {
+        launch(); field.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 3))
+        list.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4)).tap()
+        wait("exists == false", on: app.keyboards.firstMatch, timeout: 3)
+    }
+
+    func testIncomingEntriesFollowEnd() {
+        launch(["-demoIncremental", "YES", "-demoTurnSeconds", "6"])
+        reply("Stream reply")
+        let tool = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Streaming file 1.swift")).firstMatch
+        XCTAssertTrue(tool.waitForExistence(timeout: 5)); visible(tool)
+        XCTAssertTrue(answer("Stream reply").waitForExistence(timeout: 8)); visible(answer("Stream reply"))
+    }
+
+    func testIncomingEntriesPreserveReadingPosition() {
+        launch(["-demoIncremental", "YES", "-demoTurnSeconds", "10"])
+        reply("Read while working")
+        list.swipeDown(); list.swipeDown()
+        guard let anchor = app.staticTexts.allElementsBoundByIndex.first(where: { $0.label.hasPrefix("History message") && $0.isHittable }) else {
+            return XCTFail("Scrolling up should reveal a history message")
+        }
+        let before = anchor.frame
+        let moved = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            !anchor.exists || abs(anchor.frame.minY - before.minY) > 2
+        }, object: anchor)
+        moved.isInverted = true
+        XCTAssertEqual(XCTWaiter.wait(for: [moved], timeout: 12), .completed)
+        XCTAssertEqual(anchor.frame.minY, before.minY, accuracy: 2)
+        XCTAssertFalse(answer("Read while working").isHittable)
+    }
+
+    func testSendFromHistoryGoesToEnd() {
+        launch(); list.swipeDown(); list.swipeDown()
+        XCTAssertFalse(message(ending).isHittable)
+        reply("Return to end")
+        XCTAssertTrue(answer("Return to end").waitForExistence(timeout: 8)); visible(answer("Return to end"))
+    }
+
+    func testToolExpansionMovesRowsWithoutOverlap() {
+        launch()
+        var more: XCUIElement?
+        for _ in 0..<5 {
+            more = app.buttons.matching(identifier: "more-tool-calls").allElementsBoundByIndex.first { $0.isHittable }
+            if more != nil { break }
+            list.swipeDown()
+        }
+        guard let more else { return XCTFail("Scrolling should reveal a collapsed tool group") }
+        let before = app.buttons.matching(identifier: "tool-line").count
+        more.tap()
+        let rows = app.buttons.matching(identifier: "tool-line")
+        XCTAssertGreaterThan(rows.count, before)
+        let visibleRows = rows.allElementsBoundByIndex.filter { $0.isHittable }.sorted { $0.frame.minY < $1.frame.minY }
+        guard visibleRows.count >= 2 else { return XCTFail("Expanded tools should have two visible rows") }
+        let row = visibleRows[0]
+        let following = app.buttons.matching(identifier: "tool-line").matching(NSPredicate(format: "label == %@", visibleRows[1].label)).firstMatch
+        let previousY = following.frame.minY
+        row.tap()
+        let result = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "History result")).firstMatch
+        XCTAssertTrue(result.waitForExistence(timeout: 3))
+        let expandedRows = rows.allElementsBoundByIndex.filter { $0.isHittable }.sorted { $0.frame.minY < $1.frame.minY }
+        for (a, b) in zip(expandedRows, expandedRows.dropFirst()) { XCTAssertLessThanOrEqual(a.frame.maxY, b.frame.minY + 1) }
+        XCTAssertLessThanOrEqual(result.frame.maxY, following.frame.minY + 1)
+        XCTAssertGreaterThan(following.frame.minY, previousY + 1)
+    }
+
+    func testApprovalStartsTurnAndAnswers() {
+        launch(claude: true)
+        let card = app.descendants(matching: .any)["question-card"].firstMatch
+        XCTAssertTrue(card.waitForExistence(timeout: 4))
+        app.buttons["Option 1: Yes"].tap()
+        wait("exists == false", on: card, timeout: 4)
+        XCTAssertTrue(app.descendants(matching: .any)["working-row"].firstMatch.waitForExistence(timeout: 3))
+        XCTAssertTrue(message("All 16 key encoder tests passed.").waitForExistence(timeout: 8))
+    }
+
+    func testScreenRoundTripReturnsToEnd() {
+        launch(); list.swipeDown()
+        app.buttons["Show Screen"].tap(); app.buttons["Show Conversation"].tap()
+        XCTAssertTrue(message(ending).waitForExistence(timeout: 5)); visible(message(ending))
+    }
+
+    func testKeysCanBeTapped() {
+        launch(); app.buttons["show-keys"].tap()
+        for key in ["esc", "↑", "↓", "←", "→", "⏎", "⇥", "⌃C"] {
+            let button = app.buttons[key]
+            if !button.isHittable { app.scrollViews.containing(.button, identifier: "esc").firstMatch.swipeLeft() }
+            XCTAssertTrue(button.isHittable); button.tap()
+        }
+    }
+
+    func testRotationKeepsEndUncut() {
+        launch()
+        XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertTrue(message(ending).waitForExistence(timeout: 3))
+        visible(message(ending))
+        XCUIDevice.shared.orientation = .portrait
+        XCTAssertTrue(message(ending).waitForExistence(timeout: 3))
+        visible(message(ending))
+    }
+
+    func testAssistantTextOffersCopyOrSelection() {
+        launch(); message(ending).press(forDuration: 1)
+        let action = app.descendants(matching: .any).matching(NSPredicate(format: "label ==[c] 'Copy' OR label BEGINSWITH[c] 'Select'")).firstMatch
+        XCTAssertTrue(action.waitForExistence(timeout: 3))
+    }
+
+    func testReconnectKeepsConversationAndCanSend() {
+        launch(["-demoDropAfter", "5", "-demoTurnSeconds", "1"])
+        let note = message("Reconnecting to Demo Mac…")
+        XCTAssertTrue(note.waitForExistence(timeout: 7))
+        XCTAssertTrue(message(ending).exists)
+        wait("exists == false", on: note, timeout: 4)
+        reply("After reconnect")
+        XCTAssertTrue(answer("After reconnect").waitForExistence(timeout: 4))
+    }
+
+    func testDraftSurvivesScreenRoundTrip() {
+        launch(); field.tap(); field.typeText("Unsent draft")
+        app.buttons["Show Screen"].tap(); app.buttons["Show Conversation"].tap()
+        XCTAssertEqual(field.value as? String, "Unsent draft")
+        XCTAssertFalse(message("Unsent draft").exists)
+    }
+}

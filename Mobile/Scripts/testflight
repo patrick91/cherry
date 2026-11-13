@@ -1,0 +1,132 @@
+#!/bin/sh
+# Archives the iOS app for iPhone and iPad (Release) and uploads it to App
+# Store Connect for TestFlight, internal testers only:
+#
+#   CHERRY_MOBILE_TEAM=<team id> Mobile/Scripts/testflight [--export DIR]
+#   Mobile/Scripts/testflight --unsigned
+#
+# The app's record (bundle id dev.patrick.cherry.mobile) must exist in App
+# Store Connect. Signing is Xcode's automatic signing for the team
+# (-allowProvisioningUpdates), with the Apple ID Xcode is signed in to (Xcode ›
+# Settings › Accounts), or with an App Store Connect API key when
+# ASC_KEY_PATH, ASC_KEY_ID and ASC_ISSUER_ID are set. Either way it needs the
+# login keychain: run it in your own terminal, not over ssh or in a Cherry
+# device session. The build number is the UTC time (CHERRY_MOBILE_BUILD
+# overrides it), so a version's builds always go up. --export DIR writes the
+# signed .ipa to DIR instead of uploading it; --unsigned only checks that the
+# Release build for devices compiles and links (no team, no upload).
+set -eu
+
+mode=upload
+export_dir=
+case ${1:-} in
+    "") ;;
+    --export)
+        mode=export
+        export_dir=${2:-}
+        [ -n "$export_dir" ] || { echo "testflight: --export needs a directory" >&2; exit 2; }
+        mkdir -p "$export_dir"
+        export_dir=$(cd "$export_dir" && pwd)
+        ;;
+    --unsigned) mode=unsigned ;;
+    *) echo "usage: testflight [--export DIR | --unsigned]" >&2; exit 2 ;;
+esac
+
+team=${CHERRY_MOBILE_TEAM:-}
+if [ "$mode" != unsigned ] && [ -z "$team" ]; then
+    echo "testflight: set CHERRY_MOBILE_TEAM to your team id (Xcode › Settings › Accounts)" >&2
+    exit 1
+fi
+build=${CHERRY_MOBILE_BUILD:-$(date -u +%Y%m%d.%H%M%S)}
+
+app_dir=$(cd "$(dirname "$0")/../App" && pwd)
+cd "$app_dir"
+
+if ! command -v xcodegen >/dev/null 2>&1; then
+    echo "testflight: xcodegen is not installed (brew install xcodegen)" >&2
+    exit 1
+fi
+
+# The API key's arguments, when there is one, for both xcodebuild calls.
+set --
+if [ -n "${ASC_KEY_PATH:-}" ]; then
+    set -- \
+        -authenticationKeyPath "$ASC_KEY_PATH" \
+        -authenticationKeyID "${ASC_KEY_ID:?testflight: ASC_KEY_PATH needs ASC_KEY_ID}" \
+        -authenticationKeyIssuerID "${ASC_ISSUER_ID:?testflight: ASC_KEY_PATH needs ASC_ISSUER_ID}"
+fi
+
+archive=build/Archive/CherryMobile.xcarchive
+rm -rf "$archive"
+xcodegen generate --quiet
+
+if [ "$mode" = unsigned ]; then
+    xcodebuild \
+        -project CherryMobile.xcodeproj \
+        -scheme CherryMobile \
+        -configuration Release \
+        -destination 'generic/platform=iOS' \
+        -derivedDataPath build/DerivedData \
+        -archivePath "$archive" \
+        CODE_SIGNING_ALLOWED=NO \
+        CURRENT_PROJECT_VERSION="$build" \
+        -quiet \
+        archive
+    echo "testflight: archived build $build unsigned: $app_dir/$archive"
+    exit 0
+fi
+
+xcodebuild \
+    -project CherryMobile.xcodeproj \
+    -scheme CherryMobile \
+    -configuration Release \
+    -destination 'generic/platform=iOS' \
+    -derivedDataPath build/DerivedData \
+    -archivePath "$archive" \
+    -allowProvisioningUpdates \
+    "$@" \
+    CODE_SIGN_STYLE=Automatic \
+    DEVELOPMENT_TEAM="$team" \
+    CURRENT_PROJECT_VERSION="$build" \
+    -quiet \
+    archive
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+if [ "$mode" = upload ]; then destination=upload; else destination=export; fi
+cat >"$work/ExportOptions.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>method</key>
+    <string>app-store-connect</string>
+    <key>destination</key>
+    <string>$destination</string>
+    <key>teamID</key>
+    <string>$team</string>
+    <key>signingStyle</key>
+    <string>automatic</string>
+    <key>manageAppVersionAndBuildNumber</key>
+    <false/>
+    <key>testFlightInternalTestingOnly</key>
+    <true/>
+    <key>uploadSymbols</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+xcodebuild \
+    -exportArchive \
+    -archivePath "$archive" \
+    -exportOptionsPlist "$work/ExportOptions.plist" \
+    -exportPath "${export_dir:-$work/export}" \
+    -allowProvisioningUpdates \
+    "$@"
+
+if [ "$mode" = upload ]; then
+    echo "testflight: uploaded build $build; it shows in App Store Connect › TestFlight once processed"
+else
+    echo "testflight: exported build $build to $export_dir"
+fi

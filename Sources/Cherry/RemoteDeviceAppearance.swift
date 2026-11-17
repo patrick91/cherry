@@ -216,20 +216,23 @@ struct RemoteDeviceStatusReader<Content: View>: View {
 
     var body: some View {
         if let hosting {
-            Observing(hosting: hosting, control: hosting.control, content: content)
+            Observing(hosting: hosting, status: hosting.control.connectionStatus, content: content)
         } else {
             content(.normal)
         }
     }
 
+    /// Observes the connection's state alone (not the control), so a
+    /// session changing on that Mac (an agent's title spinner) does not
+    /// re-render the header.
     private struct Observing: View {
         let hosting: PersistentHostSessions
-        @ObservedObject var control: HostControl
+        @ObservedObject var status: HostControl.ConnectionStatus
         let content: (RemoteDeviceHeaderStatus) -> Content
 
         var body: some View {
             content(RemoteDeviceHeaderStatus.of(
-                control.state,
+                status.state,
                 // A device Cherry no longer knows: its stand-in says why.
                 installationProblem: hosting.profile.isKnownDevice ? nil : hosting.installationProblem(),
                 machine: hosting.profile.displayName

@@ -4816,6 +4816,25 @@ enum TrafficLightWindowLayout {
         NSWindow.didMiniaturizeNotification,
         NSWindow.didDeminiaturizeNotification
     ]
+
+    /// How many repositions moved the buttons (each one a transaction the
+    /// window server waits on): tests count them.
+    @MainActor static var placementCommitsForTesting = 0
+
+    /// Whether every button already sits at its placement, under `parent`:
+    /// then a reposition has nothing to do.
+    static func buttons(
+        _ buttons: [NSView],
+        in parent: NSView,
+        sitAt placements: [(origin: NSPoint, isHidden: Bool)]
+    ) -> Bool {
+        buttons.count == placements.count
+            && zip(buttons, placements).allSatisfy { button, placement in
+                button.superview === parent
+                    && button.frame.origin == placement.origin
+                    && button.isHidden == placement.isHidden
+            }
+    }
 }
 
 private struct TrafficLightOverlay: NSViewRepresentable {
@@ -4854,7 +4873,12 @@ private final class TrafficLightOverlayView: NSView {
     private var hostedButtons: [NSButton] = []
     private weak var attachedWindow: NSWindow?
     private var lastTranslationX: CGFloat = 0
-    private var windowObservers: Set<AnyCancellable> = []
+    /// Block observers of the window's notifications. Never Combine's
+    /// `NotificationCenter.publisher(for:object:)`: the publisher keeps its
+    /// object, and this view (inside that window) kept the subscription, so
+    /// a closed project window, with its workspace, tabs and SwiftUI graph,
+    /// was never freed. The center does not keep the object it filters on.
+    private nonisolated(unsafe) var windowObservers: [NSObjectProtocol] = []
     private var titleObservation: NSKeyValueObservation?
     private var lastAppliedPlacements: [(origin: NSPoint, isHidden: Bool)] = []
     private var stompRecheckScheduled = false
@@ -4888,7 +4912,7 @@ private final class TrafficLightOverlayView: NSView {
 
     @MainActor
     private func registerWindowObservers() {
-        windowObservers.removeAll()
+        removeWindowObservers()
         titleObservation?.invalidate()
         titleObservation = nil
 
@@ -4910,15 +4934,26 @@ private final class TrafficLightOverlayView: NSView {
         // — these are the moments when the standard buttons can get moved
         // back to default by AppKit's titlebar layout.
         for name in TrafficLightWindowLayout.refreshNotificationNames {
-            NotificationCenter.default.publisher(for: name, object: window)
-                .receive(on: RunLoop.main)
-                .sink { [weak self] _ in
+            let observer = NotificationCenter.default.addObserver(forName: name, object: window, queue: nil) { [weak self] _ in
+                // On a later pass of the run loop, as `receive(on:)` did:
+                // after AppKit's own handling of the change.
+                RunLoop.main.perform {
                     MainActor.assumeIsolated {
                         self?.refreshButtonState()
                     }
                 }
-                .store(in: &windowObservers)
+            }
+            windowObservers.append(observer)
         }
+    }
+
+    private func removeWindowObservers() {
+        windowObservers.forEach(NotificationCenter.default.removeObserver)
+        windowObservers = []
+    }
+
+    deinit {
+        windowObservers.forEach(NotificationCenter.default.removeObserver)
     }
 
     @MainActor
@@ -4950,11 +4985,13 @@ private final class TrafficLightOverlayView: NSView {
     private func configureButtons() {
         // Re-apply each call: AppKit can reset titlebar button chrome during
         // window state transitions, which would otherwise let the buttons
-        // drift back to the default position or vanish entirely.
+        // drift back to the default position or vanish entirely. Only what
+        // differs is written, so a check that finds nothing reset touches
+        // no view or layer.
         for button in hostedButtons {
-            button.autoresizingMask = []
-            button.wantsLayer = true
-            button.layer?.mask = nil
+            if !button.autoresizingMask.isEmpty { button.autoresizingMask = [] }
+            if !button.wantsLayer { button.wantsLayer = true }
+            if button.layer?.mask != nil { button.layer?.mask = nil }
         }
     }
 
@@ -5001,19 +5038,39 @@ private final class TrafficLightOverlayView: NSView {
             NSPoint(x: baseX, y: max(0, targetY)),
             to: parent
         )
+        let placements = hostedButtons.enumerated().map { index, button in
+            (
+                origin: NSPoint(
+                    x: originInParent.x + CGFloat(index) * buttonSpacing,
+                    y: originInParent.y + (controlHeight - button.frame.height) / 2
+                ),
+                isHidden: controlsAreFullyOffscreen
+            )
+        }
 
+        // This runs after every event in every window (`didUpdateNotification`)
+        // and on each SwiftUI update of the overlay. When the buttons are
+        // already where they belong, move nothing: the explicit transaction
+        // below commits to the window server and waits for it, which cost
+        // every keystroke and mouse move a round trip per window. AppKit can
+        // still put them back later in this turn (a title change does), so
+        // the recheck below runs either way; it commits only if they moved.
+        guard !TrafficLightWindowLayout.buttons(hostedButtons, in: parent, sitAt: placements) else {
+            lastAppliedPlacements = placements
+            stompRecheckBudget = 3
+            scheduleStompRecheck()
+            return
+        }
+
+        TrafficLightWindowLayout.placementCommitsForTesting += 1
         CATransaction.begin()
         CATransaction.setDisableActions(true)
 
-        lastAppliedPlacements = hostedButtons.enumerated().map { index, button in
-            let origin = NSPoint(
-                x: originInParent.x + CGFloat(index) * buttonSpacing,
-                y: originInParent.y + (controlHeight - button.frame.height) / 2
-            )
-            button.setFrameOrigin(origin)
-            button.isHidden = controlsAreFullyOffscreen
-            return (origin: origin, isHidden: controlsAreFullyOffscreen)
+        for (button, placement) in zip(hostedButtons, placements) {
+            button.setFrameOrigin(placement.origin)
+            button.isHidden = placement.isHidden
         }
+        lastAppliedPlacements = placements
 
         CATransaction.commit()
 
@@ -5062,7 +5119,7 @@ private final class TrafficLightOverlayView: NSView {
     func restore() {
         titleObservation?.invalidate()
         titleObservation = nil
-        windowObservers.removeAll()
+        removeWindowObservers()
         for button in hostedButtons {
             button.layer?.mask = nil
             button.isEnabled = true

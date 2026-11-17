@@ -1984,7 +1984,9 @@ final class ProjectWindowChromeState: ObservableObject {
     @Published var terminalSearchFocusRequest = 0
     @Published var isSidebarPlaygroundPresented = false
     @Published var isCommandPalettePlaygroundPresented = false
-    @Published var isCommandKeyPressed = false
+    /// ⌘ is held (the sidebar's shortcut hints). Set it with
+    /// `noteCommandKey(pressed:)`.
+    @Published private(set) var isCommandKeyPressed = false
     @Published var selectedTodoID: UUID?
     @Published var isTodoPanePresented = false
     @Published var selectedTodoTagFilterIDs: Set<String> = []
@@ -2090,6 +2092,15 @@ final class ProjectWindowChromeState: ObservableObject {
     }
 
     var isOmniBarPresented: Bool { omniBar != nil }
+
+    /// Records whether ⌘ is held, publishing only a change. Every window's
+    /// `AppShortcutMonitor` sees every key event, and `@Published` notifies
+    /// on each assignment, changed or not: writing it on each one re-rendered
+    /// and re-laid out every project window on every keystroke.
+    func noteCommandKey(pressed: Bool) {
+        guard isCommandKeyPressed != pressed else { return }
+        isCommandKeyPressed = pressed
+    }
 
     /// ⌘P: opens the Omni bar at its root, or closes it.
     func toggleOmniBar() {

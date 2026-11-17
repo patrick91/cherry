@@ -92,36 +92,22 @@ struct MenuBarAgentPresentation {
 
 // MARK: - Model
 
-/// Drives the working-state shimmer of the menu-bar glyph: small highlight
-/// sweeps across the stack layers.
+/// The working-state shimmer of the menu-bar glyph: a highlight sweeps down
+/// the stack's three plates, each riding its own staggered rest → peak → rest
+/// pulse.
 ///
-/// Two hard-won constraints shaped this (when the item was a SwiftUI
-/// `MenuBarExtra`; it is an AppKit status item now, `MenuBarStatusItem`, which
-/// sets each frame's image itself):
-/// - It must NOT be a `TimelineView` in a `MenuBarExtra` label: that livelocks
-///   SwiftUI's status-item update loop at launch (requestUpdate → setImage →
-///   requestUpdate never drains) and the app never finishes launching.
-/// - It must NOT publish through `MenuBarAgentsModel`: the dropdown panel observes
-///   that model, so every publish would re-evaluate it (and, while `CherryApp`
-///   held the model, the entire App body) — at pulse rate that cost ~11% CPU. A
-///   separate object keeps each tick to the item's image.
-///
-/// One timer tick per frame: quantizing the shimmer keeps the tick rate bounded
-/// and gives every frame a stable cache key, so the label can reuse a small set of
-/// NSImages instead of baking a fresh symbol image per timer tick.
-@MainActor
-final class MenuBarShimmerModel: ObservableObject {
-    static let shared = MenuBarShimmerModel()
-
-    @Published private(set) var frame = 0
-
-    private var timer: Timer?
-    private var step = 0
-    private var hasWorkingAgents = false
-    // A ~1.4s sweep at ~13 ticks/s: every status-item update costs real main-thread
-    // time (label snapshot → setImage → length adjust), so the shimmer is quantized to
-    // a fixed frame table — a bounded tick rate that still reads as motion, and a
-    // stable per-frame cache key so the label reuses a small set of NSImages.
+/// It is a Core Animation animation the render server plays (one repeating
+/// opacity animation per plate, `MenuBarStatusLabel.workingLayer`), not
+/// frames Cherry draws. A frame used to be an image set on the status item
+/// about 13 times a second; each one made AppKit re-measure the item,
+/// snapshot it for every menu bar's copy and wait on the menu bar's process,
+/// ~5% of the main thread while any agent worked, in front of keystrokes.
+/// Earlier still, as a SwiftUI `MenuBarExtra`, a `TimelineView` label
+/// livelocked the launch, and per-frame publishes through
+/// `MenuBarAgentsModel` re-rendered its panel.
+enum MenuBarShimmer {
+    // The static frames `MenuBarStatusLabel.icon(for:dark:shimmerFrame:)`
+    // draws (Settings' tile; tests).
     static let frameCount = 18
 
     // Baked from the in-app design panel (Speed 1.9×, Pulse 40%, Peak 93%, Base 59%,
@@ -131,43 +117,6 @@ final class MenuBarShimmerModel: ObservableObject {
     static let peakAlpha: Double = 0.93       // brightest alpha at the pulse peak
     static let baseAlpha: Double = 0.59       // resting alpha
     static let layerStagger: Double = 0.05    // delay between adjacent layers (drives top→bottom sweep)
-
-    func setWorkingAgentsActive(_ active: Bool) {
-        guard hasWorkingAgents != active else { return }
-        hasWorkingAgents = active
-        if active {
-            step = 0
-            frame = 0
-            if timer == nil {
-                startTimer()
-            }
-        } else {
-            stopTimer()
-        }
-    }
-
-    private func startTimer() {
-        let interval = max(0.05, Self.duration / Double(Self.frameCount))
-        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] timer in
-            guard let self else {
-                timer.invalidate()
-                return
-            }
-            MainActor.assumeIsolated {
-                self.step = (self.step + 1) % Self.frameCount
-                self.frame = self.step
-            }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
-    }
-
-    private func stopTimer() {
-        timer?.invalidate()
-        timer = nil
-        step = 0
-        frame = 0
-    }
 }
 
 @MainActor
@@ -279,7 +228,6 @@ final class MenuBarAgentsModel: ObservableObject {
         let aggregate = MenuBarAggregateState(items: groups.flatMap(\.items), background: background)
         if groups != self.groups { self.groups = groups }
         if aggregate != self.aggregate { self.aggregate = aggregate }
-        MenuBarShimmerModel.shared.setWorkingAgentsActive(aggregate == .working)
     }
 
     /// Shows the agent's tab in the window that has it.
@@ -329,7 +277,7 @@ enum MenuBarStatusLabel {
         dark: Bool,
         shimmerFrame: Int
     ) -> NSImage {
-        let normalizedFrame = state == .working ? shimmerFrame % MenuBarShimmerModel.frameCount : 0
+        let normalizedFrame = state == .working ? shimmerFrame % MenuBarShimmer.frameCount : 0
         let key = "\(state)|\(dark)|\(normalizedFrame)"
         if let cached = iconCache[key] { return cached }
         let image: NSImage
@@ -374,11 +322,11 @@ enum MenuBarStatusLabel {
     @MainActor
     private static func workingIcon(dark: Bool, frame: Int) -> NSImage {
         let glyph: NSColor = dark ? .white : NSColor(white: 0.12, alpha: 1)
-        let phase = CGFloat(frame) / CGFloat(MenuBarShimmerModel.frameCount)
-        let base = CGFloat(MenuBarShimmerModel.baseAlpha)
-        let peak = CGFloat(MenuBarShimmerModel.peakAlpha)
-        let width = CGFloat(MenuBarShimmerModel.pulseWidth)
-        let stagger = CGFloat(MenuBarShimmerModel.layerStagger)
+        let phase = CGFloat(frame) / CGFloat(MenuBarShimmer.frameCount)
+        let base = CGFloat(MenuBarShimmer.baseAlpha)
+        let peak = CGFloat(MenuBarShimmer.peakAlpha)
+        let width = CGFloat(MenuBarShimmer.pulseWidth)
+        let stagger = CGFloat(MenuBarShimmer.layerStagger)
 
         // Plate 0 is the top of the gem, so pulsing in plate order sweeps the highlight
         // top → bottom.
@@ -389,6 +337,104 @@ enum MenuBarStatusLabel {
             return glyph.withAlphaComponent(min(1, max(0, alpha)))
         }
         return glyphImage(layerColors: colors)
+    }
+
+    /// The size of every glyph image (the artwork plus padding).
+    static var glyphSize: NSSize {
+        NSSize(
+            width: brandmarkBounds.width * glyphScale + glyphPadding * 2,
+            height: brandmarkBounds.height * glyphScale + glyphPadding * 2
+        )
+    }
+
+    /// An empty image of the glyph's size: the status item keeps its length
+    /// while `workingLayer` draws the glyph over it.
+    static let placeholderIcon: NSImage = {
+        let image = NSImage(size: glyphSize, flipped: false) { _ in true }
+        image.isTemplate = false
+        return image
+    }()
+
+    /// The working glyph as layers: one shape per plate, each with its pulse
+    /// as a repeating opacity animation, which the render server plays with
+    /// nothing to do here per frame. The plates' resting opacity is the
+    /// base, which is what a snapshot of the item (another display's menu
+    /// bar) shows. `flipped`: the coordinates of the layer it goes in
+    /// (a flipped view's), y down; `scale`: its screen's. Its frame is the
+    /// glyph's size at the origin; its host centres it.
+    static func workingLayer(dark: Bool, flipped: Bool, scale: CGFloat = 2) -> CALayer {
+        let container = CALayer()
+        container.bounds = CGRect(origin: .zero, size: glyphSize)
+        container.anchorPoint = .zero
+        container.contentsScale = scale
+        let box = brandmarkBounds
+        // Source (y-down) → the host's coordinates: as `glyphImage` (y up),
+        // or with no flip when the host's are y down too.
+        let transform = flipped
+            ? AffineTransform(
+                m11: glyphScale, m12: 0, m21: 0, m22: glyphScale,
+                tX: glyphPadding - box.minX * glyphScale,
+                tY: glyphPadding - box.minY * glyphScale
+            )
+            : AffineTransform(
+                m11: glyphScale, m12: 0, m21: 0, m22: -glyphScale,
+                tX: glyphPadding - box.minX * glyphScale,
+                tY: glyphSize.height - glyphPadding + box.minY * glyphScale
+            )
+        let paths = brandmarkLayers()
+        // Painted bottom → top, like the source art.
+        for index in paths.indices.reversed() {
+            let path = paths[index]
+            path.transform(using: transform)
+            let plate = CAShapeLayer()
+            plate.frame = container.bounds
+            plate.contentsScale = scale
+            plate.path = path.cgPath
+            plate.opacity = Float(MenuBarShimmer.baseAlpha)
+            plate.add(pulseAnimation(plate: index), forKey: "pulse")
+            container.addSublayer(plate)
+        }
+        colorWorkingLayer(container, dark: dark)
+        return container
+    }
+
+    /// Sets the plates' colour for the appearance (`workingLayer`).
+    static func colorWorkingLayer(_ layer: CALayer, dark: Bool) {
+        let glyph: NSColor = dark ? .white : NSColor(white: 0.12, alpha: 1)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for case let plate as CAShapeLayer in layer.sublayers ?? [] {
+            plate.fillColor = glyph.cgColor
+        }
+        CATransaction.commit()
+    }
+
+    /// One plate's pulse over a cycle: the curve `workingIcon` samples per
+    /// frame, here sampled finely enough for the render server to play.
+    static func pulseOpacities(plate: Int, samples: Int = 60) -> [Float] {
+        let base = CGFloat(MenuBarShimmer.baseAlpha)
+        let peak = CGFloat(MenuBarShimmer.peakAlpha)
+        let width = CGFloat(MenuBarShimmer.pulseWidth)
+        let stagger = CGFloat(MenuBarShimmer.layerStagger)
+        return (0...samples).map { step in
+            let phase = wrappedPhase(CGFloat(step) / CGFloat(samples) - CGFloat(plate) * stagger)
+            return Float(min(1, max(0, base + (peak - base) * layerPulse(phase, width: width))))
+        }
+    }
+
+    private static func pulseAnimation(plate: Int) -> CAAnimation {
+        let values = pulseOpacities(plate: plate)
+        let animation = CAKeyframeAnimation(keyPath: "opacity")
+        animation.values = values
+        animation.keyTimes = values.indices.map { NSNumber(value: Double($0) / Double(values.count - 1)) }
+        animation.calculationMode = .linear
+        animation.duration = MenuBarShimmer.duration
+        animation.repeatCount = .infinity
+        animation.isRemovedOnCompletion = false
+        // A slow pulse: 30 frames a second is plenty, where a 120 Hz display
+        // would otherwise have the render server draw it 120 times.
+        animation.preferredFrameRateRange = CAFrameRateRange(minimum: 10, maximum: 30, preferred: 30)
+        return animation
     }
 
     // The prototype's `layer-wave` curve as a scalar: 0 at rest, ramps to 1 at 40% of

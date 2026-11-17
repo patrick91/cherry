@@ -200,12 +200,12 @@ struct AppShortcutMonitor: NSViewRepresentable {
 
         private func handle(_ event: NSEvent) -> Bool {
             guard event.window === window else {
-                chromeState?.isCommandKeyPressed = false
+                chromeState?.noteCommandKey(pressed: false)
                 return false
             }
 
             let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            chromeState?.isCommandKeyPressed = modifiers.contains(.command)
+            chromeState?.noteCommandKey(pressed: modifiers.contains(.command))
 
             guard event.type == .keyDown else { return false }
 

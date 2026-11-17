@@ -58,8 +58,8 @@ final class MenuBarStatusItem: NSObject, NSWindowDelegate {
                 DispatchQueue.main.async { MainActor.assumeIsolated { self?.updateIcon() } }
             }
             .store(in: &subscriptions)
-        MenuBarShimmerModel.shared.$frame
-            .removeDuplicates()
+        NSWorkspace.shared.notificationCenter
+            .publisher(for: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification)
             .sink { [weak self] _ in
                 DispatchQueue.main.async { MainActor.assumeIsolated { self?.updateIcon() } }
             }
@@ -68,15 +68,71 @@ final class MenuBarStatusItem: NSObject, NSWindowDelegate {
         LaunchTimeline.mark("menu bar item installed")
     }
 
+    /// The working shimmer's layers on the button while agents work
+    /// (`MenuBarStatusLabel.workingLayer`), and the appearance they were
+    /// coloured for.
+    private var workingLayer: CALayer?
+    private var workingLayerIsDark = false
+    private var buttonFrameObservation: NSKeyValueObservation?
+
     private func updateIcon() {
         guard let button = statusItem?.button, let model else { return }
         let dark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let image = MenuBarStatusLabel.icon(
-            for: model.aggregate,
-            dark: dark,
-            shimmerFrame: MenuBarShimmerModel.shared.frame
-        )
+        if model.aggregate == .working, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            showWorkingLayer(on: button, dark: dark)
+            let placeholder = MenuBarStatusLabel.placeholderIcon
+            if button.image !== placeholder { button.image = placeholder }
+            return
+        }
+        removeWorkingLayer()
+        let image = MenuBarStatusLabel.icon(for: model.aggregate, dark: dark, shimmerFrame: 0)
         if button.image !== image { button.image = image }
+    }
+
+    private func showWorkingLayer(on button: NSStatusBarButton, dark: Bool) {
+        if let workingLayer {
+            if workingLayerIsDark != dark {
+                MenuBarStatusLabel.colorWorkingLayer(workingLayer, dark: dark)
+                workingLayerIsDark = dark
+            }
+            return
+        }
+        button.wantsLayer = true
+        guard let host = button.layer else { return }
+        let layer = MenuBarStatusLabel.workingLayer(
+            dark: dark,
+            flipped: button.isFlipped,
+            scale: button.window?.backingScaleFactor ?? 2
+        )
+        host.addSublayer(layer)
+        workingLayer = layer
+        workingLayerIsDark = dark
+        placeWorkingLayer(in: button)
+        buttonFrameObservation = button.observe(\.frame) { [weak self, weak button] _, _ in
+            MainActor.assumeIsolated {
+                guard let self, let button else { return }
+                self.placeWorkingLayer(in: button)
+            }
+        }
+    }
+
+    /// Centred where the button draws its image, on whole points.
+    private func placeWorkingLayer(in button: NSStatusBarButton) {
+        guard let workingLayer else { return }
+        let size = MenuBarStatusLabel.glyphSize
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        workingLayer.position = CGPoint(
+            x: ((button.bounds.width - size.width) / 2).rounded(),
+            y: ((button.bounds.height - size.height) / 2).rounded()
+        )
+        CATransaction.commit()
+    }
+
+    private func removeWorkingLayer() {
+        buttonFrameObservation = nil
+        workingLayer?.removeFromSuperlayer()
+        workingLayer = nil
     }
 
     /// Shows the panel, unless it shows (Settings › Sessions › Show List:

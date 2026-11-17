@@ -338,7 +338,20 @@ final class HostControl: ObservableObject {
 
     let host: HostedSessionHost
     @Published private(set) var state: ConnectionState = .idle {
-        didSet { resumeSessionWaiters() }
+        didSet {
+            resumeSessionWaiters()
+            if connectionStatus.state != state { connectionStatus.state = state }
+        }
+    }
+    /// `state` alone, for views that show only whether the host answers:
+    /// observing the control re-renders them whenever `sessions` changes,
+    /// which on a Mac whose agent animates its title is many times a second.
+    let connectionStatus = ConnectionStatus()
+
+    /// Publishes `state` and nothing else (`connectionStatus`).
+    @MainActor
+    final class ConnectionStatus: ObservableObject {
+        @Published fileprivate(set) var state: ConnectionState = .idle
     }
     /// The host's sessions, kept current by events. Stale while not
     /// connected, including after another identity answered: they are the

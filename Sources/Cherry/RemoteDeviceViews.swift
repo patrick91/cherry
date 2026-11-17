@@ -954,7 +954,7 @@ struct RemoteHostStateBar: View {
     var body: some View {
         if session.remoteMachineName != nil, let hosting = session.persistentHosting,
            session.isRunning || session.persistentSession != nil {
-            RemoteHostStateBarContent(session: session, hosting: hosting, control: hosting.control)
+            RemoteHostStateBarContent(session: session, hosting: hosting, status: hosting.control.connectionStatus)
         }
     }
 }
@@ -962,14 +962,16 @@ struct RemoteHostStateBar: View {
 private struct RemoteHostStateBarContent: View {
     @ObservedObject var session: TerminalSession
     let hosting: PersistentHostSessions
-    @ObservedObject var control: HostControl
+    /// The connection's state alone: observing the control would re-render
+    /// the bar whenever a session on that Mac changes.
+    @ObservedObject var status: HostControl.ConnectionStatus
 
     private var availability: RemoteDeviceAvailability {
-        RemoteDeviceAvailability.of(control.state, installationProblem: nil)
+        RemoteDeviceAvailability.of(status.state, installationProblem: nil)
     }
 
     private var offline: Bool {
-        switch control.state {
+        switch status.state {
         case .connected: false
         case .waitingToReconnect, .failed: true
         case .idle, .connecting: session.state == .disconnected
@@ -1041,7 +1043,7 @@ struct RemoteWindowWaitingBar: View {
     var body: some View {
         if repository.remoteTabsWaitingCount > 0, let hosting = repository.deviceHosting {
             RemoteWindowWaitingBarContent(
-                count: repository.remoteTabsWaitingCount, hosting: hosting, control: hosting.control
+                count: repository.remoteTabsWaitingCount, hosting: hosting, status: hosting.control.connectionStatus
             )
         }
     }
@@ -1050,11 +1052,13 @@ struct RemoteWindowWaitingBar: View {
 private struct RemoteWindowWaitingBarContent: View {
     let count: Int
     let hosting: PersistentHostSessions
-    @ObservedObject var control: HostControl
+    /// The connection's state alone: observing the control would re-render
+    /// the bar whenever a session on that Mac changes.
+    @ObservedObject var status: HostControl.ConnectionStatus
 
     var body: some View {
         let availability = RemoteDeviceAvailability.of(
-            control.state,
+            status.state,
             installationProblem: hosting.profile.isKnownDevice ? nil : hosting.installationProblem()
         )
         HStack(spacing: 10) {
@@ -1099,7 +1103,6 @@ struct RemoteNotOpenSection: View {
     @ObservedObject var workspace: TerminalWorkspace
     let hosting: PersistentHostSessions
     @ObservedObject var control: HostControl
-    @State private var sessionToEnd: HostedSessionInfo?
 
     init(workspace: TerminalWorkspace, hosting: PersistentHostSessions) {
         self.workspace = workspace
@@ -1119,7 +1122,45 @@ struct RemoteNotOpenSection: View {
     }
 
     var body: some View {
-        let notOpen = notOpen
+        // Every change to a session of that Mac reaches this body (an
+        // agent's title spinner changes its title many times a second); the
+        // rows are re-rendered only when what they show changes.
+        RemoteNotOpenRows(notOpen: notOpen, workspace: workspace, hosting: hosting)
+            .equatable()
+    }
+
+    /// What ending a not-open session stops: another owner's is still
+    /// shown elsewhere (the other Mac's Cherry, another installation, the
+    /// CLI), which loses it too.
+    static func endMessage(_ info: HostedSessionInfo, ownOwner: String) -> String {
+        let stops = info.isRunning ? "Its program stops." : "Its output is removed."
+        guard info.owner != ownOwner else { return stops }
+        return "\(stops) It is not this Cherry's (\(ownerLabel(info, ownOwner: ownOwner))): wherever else it is open, it ends there too."
+    }
+
+    static func ownerLabel(_ info: HostedSessionInfo, ownOwner: String) -> String {
+        guard let owner = info.owner?.nilIfEmpty else { return "Another client's" }
+        if owner == ownOwner { return "This Cherry's" }
+        if owner.contains("@") { return "Another Cherry's" }
+        return "\(owner) on that Mac"
+    }
+}
+
+/// The rows of `RemoteNotOpenSection`, equal while they show the same
+/// (`NotOpenSessions.showsTheSameRows`).
+private struct RemoteNotOpenRows: View, Equatable {
+    let notOpen: RemoteDeviceDiscovery.NotOpenSessions
+    let workspace: TerminalWorkspace
+    let hosting: PersistentHostSessions
+    @State private var sessionToEnd: HostedSessionInfo?
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.workspace === rhs.workspace
+            && lhs.hosting === rhs.hosting
+            && lhs.notOpen.showsTheSameRows(as: rhs.notOpen)
+    }
+
+    var body: some View {
         if !notOpen.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Not open here")
@@ -1141,7 +1182,7 @@ struct RemoteNotOpenSection: View {
                 Button("End Session", role: .destructive) { end(info) }
                 Button("Cancel", role: .cancel) {}
             } message: { info in
-                Text(Self.endMessage(info, ownOwner: hosting.owner))
+                Text(RemoteNotOpenSection.endMessage(info, ownOwner: hosting.owner))
             }
         }
     }
@@ -1153,7 +1194,7 @@ struct RemoteNotOpenSection: View {
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 1) {
                 Text(info.displayName).font(.system(size: 12)).lineLimit(1)
-                Text(Self.ownerLabel(info, ownOwner: hosting.owner))
+                Text(RemoteNotOpenSection.ownerLabel(info, ownOwner: hosting.owner))
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -1183,28 +1224,20 @@ struct RemoteNotOpenSection: View {
         }
     }
 
-    /// What ending a not-open session stops: another owner's is still
-    /// shown elsewhere (the other Mac's Cherry, another installation, the
-    /// CLI), which loses it too.
-    static func endMessage(_ info: HostedSessionInfo, ownOwner: String) -> String {
-        let stops = info.isRunning ? "Its program stops." : "Its output is removed."
-        guard info.owner != ownOwner else { return stops }
-        return "\(stops) It is not this Cherry's (\(ownerLabel(info, ownOwner: ownOwner))): wherever else it is open, it ends there too."
-    }
-
     private func end(_ info: HostedSessionInfo) {
+        let info = current(info)
         guard let attachment = hosting.attachment(for: info) else { return }
         hosting.end(attachment)
     }
 
-    static func ownerLabel(_ info: HostedSessionInfo, ownOwner: String) -> String {
-        guard let owner = info.owner?.nilIfEmpty else { return "Another client's" }
-        if owner == ownOwner { return "This Cherry's" }
-        if owner.contains("@") { return "Another Cherry's" }
-        return "\(owner) on that Mac"
+    /// The session as the host lists it now: the rows keep the last
+    /// version they showed, whose title can be old.
+    private func current(_ info: HostedSessionInfo) -> HostedSessionInfo {
+        hosting.control.sessions.first { $0.id == info.id } ?? info
     }
 
     private func open(_ info: HostedSessionInfo) {
+        let info = current(info)
         if info.owner == hosting.owner, workspace.reopenNotOpenSession?(info) == true { return }
         guard let attachment = hosting.attachment(for: info) else { return }
         workspace.attachHostedSession(attachment, info: info)

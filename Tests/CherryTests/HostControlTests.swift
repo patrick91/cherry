@@ -1199,3 +1199,40 @@ private nonisolated func runningCopies(of sessions: [HostedSessionInfo]) -> [Hos
     }
     return copies
 }
+
+// Device windows' headers and bars show only whether the host answers. They
+// observe `connectionStatus`, which a session's change (an agent animating
+// its title many times a second) leaves alone; observing the control
+// re-rendered them, and re-measured their windows, on every one.
+@Test @MainActor func HostControlConnectionStatusPublishesTheStateAndNotSessionChanges() async throws {
+    let (store, defaults, suite) = try makeIsolatedHostedSessionHostStore()
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let fake = FakeControlHelper(sessions: [hostedSession("s1", title: "⠋ build")])
+    let control = makeFakeHostControl(fake, hostStore: store)
+    defer { control.disconnect() }
+    var statusChanges = 0
+    var controlChanges = 0
+    let watches = [
+        control.connectionStatus.objectWillChange.sink { statusChanges += 1 },
+        control.objectWillChange.sink { controlChanges += 1 },
+    ]
+    defer { watches.forEach { $0.cancel() } }
+
+    try await control.connect()
+    #expect(control.connectionStatus.state == .connected)
+    #expect(statusChanges > 0)
+    let connection = try #require(fake.connections.last)
+
+    statusChanges = 0
+    controlChanges = 0
+    for frame in ["⠙", "⠹", "⠸", "⠼"] {
+        connection.push(.event(.changed(hostedSession("s1", title: "\(frame) build"))))
+    }
+    #expect(await eventually { control.sessions.first?.title == "⠼ build" })
+    #expect(controlChanges > 0)
+    #expect(statusChanges == 0)
+
+    control.disconnect()
+    #expect(control.connectionStatus.state == control.state)
+    #expect(statusChanges > 0)
+}

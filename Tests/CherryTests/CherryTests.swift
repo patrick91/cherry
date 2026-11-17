@@ -929,6 +929,106 @@ private struct MCPWhoamiPayload: Decodable {
 // updates) have no animation ticks and no user event afterwards, so
 // AppKit's titlebar layout stomping our placement used to stick until
 // the next interaction — the "detached traffic lights" bug.
+// AppKit posts `didUpdateNotification` to every window after every event,
+// and each one re-placed the lights in an explicit transaction that waited
+// on the window server: a round trip per window per keystroke and mouse
+// move. Lights already in place are left alone; lights AppKit moved back
+// are still put right on the next update.
+@MainActor
+@Test func trafficLightsStayPutOnWindowUpdatesAndReturnAfterAStomp() async throws {
+    let host = try await makeHostedContentViewWindow(
+        styleMask: [.titled, .closable, .miniaturizable, .resizable]
+    )
+    defer { host.cleanup() }
+
+    let placed = try trafficLightButtons(in: host.window).map(\.frame.origin)
+    let commitsBefore = TrafficLightWindowLayout.placementCommitsForTesting
+    for _ in 0..<3 {
+        host.window.update()
+        try await Task.sleep(for: .milliseconds(30))
+    }
+    #expect(try trafficLightButtons(in: host.window).map(\.frame.origin) == placed)
+    #expect(TrafficLightWindowLayout.placementCommitsForTesting == commitsBefore, "updates with the lights in place committed a reposition")
+
+    // What AppKit's titlebar layout does: the standard buttons back at
+    // their default origin.
+    let close = try trafficLightButtons(in: host.window)[0]
+    close.setFrameOrigin(NSPoint(x: placed[0].x + 13, y: placed[0].y - 9))
+    host.window.update()
+    try await Task.sleep(for: .milliseconds(60))
+    #expect(try trafficLightButtons(in: host.window).map(\.frame.origin) == placed)
+    #expect(TrafficLightWindowLayout.placementCommitsForTesting > commitsBefore)
+}
+
+// The traffic-light overlay lives in the window it watches. Its observers
+// were Combine's `NotificationCenter.publisher(for:object: window)`, which
+// keeps the window, so a closed project window (its SwiftUI graph,
+// workspace, tabs and an app-wide key monitor) was never freed, and kept
+// re-rendering on every keystroke.
+@MainActor
+@Test func aClosedProjectWindowIsFreed() async throws {
+    weak var window: NSWindow?
+    weak var chromeState: ProjectWindowChromeState?
+    weak var workspace: TerminalWorkspace?
+    do {
+        let host = try await makeHostedContentViewWindow(
+            styleMask: [.titled, .closable, .miniaturizable, .resizable]
+        )
+        window = host.window
+        chromeState = host.chromeState
+        workspace = host.workspace
+        host.cleanup()
+    }
+    for _ in 0..<40 where window != nil || chromeState != nil || workspace != nil {
+        try await Task.sleep(for: .milliseconds(50))
+    }
+    #expect(window == nil, "the closed window is still alive")
+    #expect(chromeState == nil, "the closed window's chrome state is still alive")
+    #expect(workspace == nil, "the closed window's workspace is still alive")
+}
+
+@MainActor
+@Test func trafficLightPlacementCheckComparesParentOriginAndVisibility() {
+    let parent = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 40))
+    let other = NSView(frame: parent.frame)
+    let buttons = (0..<3).map { index in
+        let button = NSView(frame: NSRect(x: 10 + CGFloat(index) * 20, y: 12, width: 14, height: 14))
+        parent.addSubview(button)
+        return button
+    }
+    let placements = buttons.map { (origin: $0.frame.origin, isHidden: false) }
+
+    #expect(TrafficLightWindowLayout.buttons(buttons, in: parent, sitAt: placements))
+    #expect(!TrafficLightWindowLayout.buttons(buttons, in: other, sitAt: placements))
+    #expect(!TrafficLightWindowLayout.buttons(Array(buttons.prefix(2)), in: parent, sitAt: placements))
+    buttons[1].isHidden = true
+    #expect(!TrafficLightWindowLayout.buttons(buttons, in: parent, sitAt: placements))
+    buttons[1].isHidden = false
+    buttons[2].setFrameOrigin(NSPoint(x: 51, y: 12))
+    #expect(!TrafficLightWindowLayout.buttons(buttons, in: parent, sitAt: placements))
+}
+
+// Every window's shortcut monitor sees every key event; an unconditional
+// write of the published flag re-rendered every project window per key.
+@MainActor
+@Test func commandKeyFlagPublishesOnlyWhenItChanges() {
+    let chromeState = ProjectWindowChromeState()
+    var changes = 0
+    let subscription = chromeState.objectWillChange.sink { changes += 1 }
+    defer { subscription.cancel() }
+
+    chromeState.noteCommandKey(pressed: false)
+    chromeState.noteCommandKey(pressed: false)
+    #expect(changes == 0)
+    chromeState.noteCommandKey(pressed: true)
+    chromeState.noteCommandKey(pressed: true)
+    #expect(changes == 1)
+    #expect(chromeState.isCommandKeyPressed)
+    chromeState.noteCommandKey(pressed: false)
+    #expect(changes == 2)
+    #expect(!chromeState.isCommandKeyPressed)
+}
+
 @MainActor
 @Test func trafficLightsRecoverFromUnanimatedRevealToggle() async throws {
     let host = try await makeHostedContentViewWindow(

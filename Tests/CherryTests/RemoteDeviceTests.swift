@@ -394,6 +394,25 @@ private func session(
     #expect(RemoteNotOpenSection.ownerLabel(sessions[1], ownOwner: ours) == "Cherry on that Mac")
     #expect(RemoteNotOpenSection.ownerLabel(sessions[2], ownOwner: ours) == "Another Cherry's")
     #expect(RemoteNotOpenSection.ownerLabel(sessions[5], ownOwner: ours) == "Another client's")
+
+    // The rows show names, not titles: an agent animating its title on
+    // that Mac does not re-render them.
+    func copy(_ info: HostedSessionInfo, name: String? = nil, state: HostedSessionState? = nil, title: String? = nil) -> HostedSessionInfo {
+        HostedSessionInfo(
+            id: info.id, name: name ?? info.name, cwd: info.cwd, state: state ?? info.state, pid: info.pid,
+            exitCode: info.exitCode, title: title ?? info.title, owner: info.owner, tags: info.tags, createdAt: info.createdAt
+        )
+    }
+    var retitled = notOpen
+    retitled.own[0] = copy(notOpen.own[0], title: "⠦ Check availability")
+    #expect(retitled != notOpen)
+    #expect(retitled.showsTheSameRows(as: notOpen))
+    var renamed = notOpen
+    renamed.others[0] = copy(notOpen.others[0], name: "Renamed")
+    #expect(!renamed.showsTheSameRows(as: notOpen))
+    var ended = notOpen
+    ended.own[0] = copy(notOpen.own[0], state: .exited)
+    #expect(!ended.showsTheSameRows(as: notOpen))
 }
 
 // MARK: - Devices in the Omni bar

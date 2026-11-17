@@ -804,6 +804,28 @@ enum RemoteDeviceDiscovery {
         var others: [HostedSessionInfo] = []
 
         var isEmpty: Bool { own.isEmpty && others.isEmpty }
+
+        /// Whether "Not open here" shows the same rows for both: each
+        /// session's id, name, whether it runs and whose it is. A title
+        /// (which an agent can animate many times a second) is not shown.
+        nonisolated func showsTheSameRows(as other: Self) -> Bool {
+            own.map(Shown.init) == other.own.map(Shown.init)
+                && others.map(Shown.init) == other.others.map(Shown.init)
+        }
+
+        private struct Shown: Equatable {
+            let id: String
+            let displayName: String
+            let isRunning: Bool
+            let owner: String?
+
+            nonisolated init(_ info: HostedSessionInfo) {
+                id = info.id
+                displayName = info.displayName
+                isRunning = info.isRunning
+                owner = info.owner
+            }
+        }
     }
 
     /// `isShown`: an open tab shows the session, or is about to

@@ -65,3 +65,39 @@ import Testing
     #expect(kept.maxX <= screen.maxX - MenuBarPanelPlacement.gap)
     #expect(kept.maxY == (edge.minY - MenuBarPanelPlacement.gap).rounded())
 }
+
+// While agents work, the glyph's shimmer is Core Animation's: three plates,
+// each with a repeating opacity animation the render server plays. A frame
+// used to be an image set on the item about 13 times a second, each one a
+// re-measure and a snapshot of the item for every menu bar.
+@Test @MainActor func theWorkingGlyphIsThreePlatesTheRenderServerAnimates() throws {
+    let layer = MenuBarStatusLabel.workingLayer(dark: true, flipped: false)
+    #expect(layer.bounds.size == MenuBarStatusLabel.glyphSize)
+    let plates = try #require(layer.sublayers as? [CAShapeLayer])
+    #expect(plates.count == 3)
+    for plate in plates {
+        #expect(plate.path != nil)
+        // A snapshot (another display's menu bar) shows the resting glyph.
+        #expect(abs(Double(plate.opacity) - MenuBarShimmer.baseAlpha) < 0.001)
+        let pulse = try #require(plate.animation(forKey: "pulse") as? CAKeyframeAnimation)
+        #expect(pulse.keyPath == "opacity")
+        #expect(pulse.repeatCount == .infinity)
+        #expect(abs(pulse.duration - MenuBarShimmer.duration) < 0.001)
+    }
+    #expect(MenuBarStatusLabel.placeholderIcon.size == MenuBarStatusLabel.glyphSize)
+}
+
+@Test @MainActor func thePlatesPulseOneAfterAnotherBetweenBaseAndPeak() {
+    let samples = 60
+    let top = MenuBarStatusLabel.pulseOpacities(plate: 0, samples: samples)
+    let middle = MenuBarStatusLabel.pulseOpacities(plate: 1, samples: samples)
+    #expect(top.count == samples + 1)
+    #expect(abs(Double(top[0]) - MenuBarShimmer.baseAlpha) < 0.001)
+    #expect(abs(Double(top.max() ?? 0) - MenuBarShimmer.peakAlpha) < 0.01)
+    #expect(abs(Double(top.min() ?? 0) - MenuBarShimmer.baseAlpha) < 0.001)
+    // The middle plate is the top one, a stagger later.
+    let lag = Int((MenuBarShimmer.layerStagger * Double(samples)).rounded())
+    for step in lag...samples {
+        #expect(abs(middle[step] - top[step - lag]) < 0.001)
+    }
+}

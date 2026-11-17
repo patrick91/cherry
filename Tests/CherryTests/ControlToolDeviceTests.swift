@@ -20,6 +20,8 @@ private final class ControlToolDeviceHarness {
     let socketURL: URL
     let server: CherryControlServer
     var opened: [String] = []
+    /// Whether each open of `opened` asked to bring the window forward.
+    var focused: [Bool] = []
     var deviceProjects: [String] = ["/Users/pat/old"]
     var added: [(path: String, create: Bool)] = []
 
@@ -34,7 +36,7 @@ private final class ControlToolDeviceHarness {
         _ = settings.addProject(path: projectRoot.path)
         let workspace = TerminalWorkspace(projectRoot: projectRoot.path, launchBackend: .hostManaged)
         self.workspace = workspace
-        var openProject: (String) -> Void = { _ in }
+        var openProject: (String, Bool) -> Void = { _, _ in }
         server = CherryControlServer(
             workspaceProvider: { workspace },
             todoStoreProvider: { nil },
@@ -45,11 +47,14 @@ private final class ControlToolDeviceHarness {
             openProjectRootsProvider: { [workspace.projectRoot].compactMap { $0 } },
             openWorkspacesProvider: { [workspace] },
             chromeStateForWorkspaceProvider: { _ in nil },
-            openProjectProvider: { openProject($0) },
+            openProjectProvider: { openProject($0, $1) },
             socketURL: socketURL,
             agentSettings: settings
         )
-        openProject = { [weak self] in self?.opened.append($0) }
+        openProject = { [weak self] root, focus in
+            self?.opened.append(root)
+            self?.focused.append(focus)
+        }
         server.deviceDirectory = ControlDeviceDirectory(
             devices: { [weak self] in
                 [.init(id: controlToolDeviceID, name: "patmini", homeDirectory: "/Users/pat", projects: self?.deviceProjects ?? [])]
@@ -148,6 +153,11 @@ private func controlToolDeviceError(_ result: CallToolResult) -> String? {
     let byKey = try await harness.call("open_project", ["project_root": .string(key)])
     #expect(!byKey.isError, "\(byKey.text)")
     #expect(harness.opened == [key, key, key])
+    // An agent's window opens behind the user's unless it asks to show it.
+    #expect(harness.focused == [false, false, false])
+    let shown = try await harness.call("open_project", ["project_root": .string(key), "focus": .bool(true)])
+    #expect(!shown.isError, "\(shown.text)")
+    #expect(harness.focused == [false, false, false, true])
     let unknown = try await harness.call("open_project", ["project_root": .string("/Users/pat/never"), "device": .string("patmini")])
     #expect(controlToolDeviceError(unknown) == "project_not_found")
 
@@ -155,7 +165,7 @@ private func controlToolDeviceError(_ result: CallToolResult) -> String? {
     let closed = try await harness.call("add_project", ["path": .string("/Users/pat/old"), "device": .string("patmini"), "open": .bool(false)])
     #expect(closed.structured?.objectValue?["alreadyAdded"] == .bool(true))
     #expect(closed.structured?.objectValue?["opened"] == .bool(false))
-    #expect(harness.opened.count == 3)
+    #expect(harness.opened.count == 4)
     let dots = try await harness.call("add_project", ["path": .string("/Users/pat/../etc"), "device": .string("patmini")])
     #expect(controlToolDeviceError(dots) == "invalid_project_root")
     let nowhere = try await harness.call("add_project", ["path": .string("/x"), "device": .string("nowhere")])
@@ -181,10 +191,14 @@ private func controlToolDeviceError(_ result: CallToolResult) -> String? {
     #expect(FileManager.default.fileExists(atPath: folder))
     #expect(harness.settings.projects.contains { $0.root == folder })
     #expect(harness.opened == [folder])
+    #expect(harness.focused == [false])
 
-    let again = try await harness.call("add_project", ["path": .string(folder), "device": .string("this-mac"), "create": .bool(true)])
+    let again = try await harness.call(
+        "add_project", ["path": .string(folder), "device": .string("this-mac"), "create": .bool(true), "focus": .bool(true)]
+    )
     #expect(again.structured?.objectValue?["created"] == .bool(false))
     #expect(again.structured?.objectValue?["alreadyAdded"] == .bool(true))
+    #expect(harness.focused == [false, true])
 
     // Only the folder itself is made, never its parents.
     let deep = try await harness.call("add_project", ["path": .string(harness.home.path + "/a/b"), "create": .bool(true)])

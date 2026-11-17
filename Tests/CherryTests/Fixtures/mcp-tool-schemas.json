@@ -17,6 +17,9 @@
       },
       "device": {
         "type": "string"
+      },
+      "focus": {
+        "type": "boolean"
       }
     },
     "required": [
@@ -41,6 +44,9 @@
         "type": "boolean"
       },
       "open": {
+        "type": "boolean"
+      },
+      "focus": {
         "type": "boolean"
       }
     },

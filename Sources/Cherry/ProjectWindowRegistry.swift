@@ -152,6 +152,24 @@ final class ProjectWindowRegistry {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
+    /// Puts a window an agent opened (`openInBackground`) behind the window
+    /// the user was in, or behind every window when Cherry was not the
+    /// active app, and gives that window the keyboard back. Tests replace it.
+    var keepWindowBehind: @MainActor (_ window: NSWindow, _ userWindow: NSWindow?) -> Void = { window, userWindow in
+        if let userWindow, userWindow.isVisible, userWindow !== window {
+            if !userWindow.isKeyWindow { userWindow.makeKeyAndOrderFront(nil) }
+            window.order(.below, relativeTo: userWindow.windowNumber)
+        } else {
+            window.orderBack(nil)
+        }
+    }
+    /// The projects `openInBackground` opened a window for, by root, with
+    /// the window the user was in then: the window keeps behind it as it
+    /// registers (`register`).
+    private var backgroundOpenings: [String: BackgroundOpening] = [:]
+    private struct BackgroundOpening {
+        weak var userWindow: NSWindow?
+    }
     /// Whether a project window is on screen, not minimized: a toast about
     /// a window that closed goes only to one the user sees. Tests replace
     /// it, as their windows never come on screen.
@@ -1062,7 +1080,14 @@ final class ProjectWindowRegistry {
             pendingLaunchWindows.removeAll { self.key(for: $0) == key }
             carriedLaunchWindows.removeAll { self.key(for: $0) == key }
             launchWindowRecords = launchWindowRecords.filter { self.key(for: $0.key) != key }
-            let restoresFullScreen = adoptSavedFrame(of: window, key: key)
+            // An agent opened it: it goes behind the user's window, and
+            // enters no full screen of its own (a Space switch).
+            let opensInBackground = backgroundOpenings[key.root].map { opening in
+                keepBehindAsItComesOnScreen(window, userWindow: opening.userWindow)
+                return true
+            } ?? false
+            backgroundOpenings.removeValue(forKey: key.root)
+            let restoresFullScreen = adoptSavedFrame(of: window, key: key) && !opensInBackground
             let name = URL(fileURLWithPath: key.root).lastPathComponent
             LaunchTimeline.mark("window registered \(name) visible=\(window.isVisible)")
             // A window whose saved tabs are still being restored stays off
@@ -1446,6 +1471,64 @@ final class ProjectWindowRegistry {
                 let other = self.key(for: window)
                 return other.root == key.root && other != key && entries[other]?.window == nil
             }
+    }
+
+    /// Opens `projectRoot`'s project's primary window behind the window the
+    /// user is in, for an agent (`open_project` without `focus`): it never
+    /// takes the keyboard nor brings Cherry forward. Nothing when one of the
+    /// project's windows is open or the launch still opens one: it stays
+    /// where it is. True when `open` was called.
+    @discardableResult
+    func openInBackground(projectRoot: String, open: () -> Void) -> Bool {
+        pruneStaleWindows()
+        let root = repositoryRoot(for: projectRoot)
+        guard !hasWindow(for: projectRoot),
+              !pendingLaunchWindows.contains(where: { key(for: $0).root == root })
+        else { return false }
+        // Nil while Cherry is not the active app: the window goes behind
+        // every other.
+        let userWindow = NSApp?.keyWindow
+        backgroundOpenings[root] = BackgroundOpening(userWindow: userWindow)
+        open()
+        // SwiftUI makes the window it opens key at once: the user's window
+        // takes the keyboard back now, before a key they type reaches it.
+        if let userWindow, userWindow.isVisible, NSApp?.keyWindow !== userWindow {
+            userWindow.makeKeyAndOrderFront(nil)
+        }
+        return true
+    }
+
+    /// Keeps a window an agent opened behind the user's: now, and each time
+    /// AppKit orders it in or makes it key within `backgroundOpeningSettle`
+    /// (SwiftUI orders a window it opens in, at the front, after the
+    /// window registered).
+    private func keepBehindAsItComesOnScreen(_ window: NSWindow, userWindow: NSWindow?) {
+        keepWindowBehind(window, userWindow)
+        let center = NotificationCenter.default
+        let names: [Notification.Name] = [
+            NSWindow.didChangeOcclusionStateNotification, NSWindow.didBecomeKeyNotification,
+        ]
+        let observers = names.map { name in
+            center.addObserver(forName: name, object: window, queue: .main) { [weak self, weak window, weak userWindow] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let window else { return }
+                    self.keepWindowBehind(window, userWindow)
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.backgroundOpeningSettle) {
+            observers.forEach(center.removeObserver)
+        }
+    }
+
+    /// How long a window an agent opened is kept behind the user's as
+    /// AppKit orders it in (`keepBehindAsItComesOnScreen`).
+    static let backgroundOpeningSettle: TimeInterval = 1
+
+    /// The user asked to see `projectRoot`'s project: a window an agent
+    /// opened for it that has not registered yet comes forward as usual.
+    func cancelBackgroundOpening(projectRoot: String) {
+        backgroundOpenings.removeValue(forKey: repositoryRoot(for: projectRoot))
     }
 
     /// Brings `projectRoot`'s project's most recently active window

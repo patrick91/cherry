@@ -506,7 +506,10 @@ public enum CherryToolLayer {
         case "list_projects":
             return .listProjects
         case "open_project":
-            return .openProject(.init(projectRoot: try requiredString("project_root", in: arguments)))
+            return .openProject(.init(
+                projectRoot: try requiredString("project_root", in: arguments),
+                focus: boolArgument("focus", in: arguments)
+            ))
         case "list_devices":
             return .listDevices
         case "add_project":
@@ -514,7 +517,8 @@ public enum CherryToolLayer {
                 path: try requiredString("path", in: arguments),
                 device: stringArgument("device", in: arguments),
                 create: boolArgument("create", in: arguments),
-                open: boolArgument("open", in: arguments)
+                open: boolArgument("open", in: arguments),
+                focus: boolArgument("focus", in: arguments)
             ))
         case "preview_files":
             return .previewFiles(.init(

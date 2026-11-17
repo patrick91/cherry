@@ -30,10 +30,11 @@ public enum CherryToolCatalog {
             ),
             tool(
                 "open_project",
-                "Focus (or open) a saved project's window.",
+                "Open a saved project's window behind the user's, or bring it forward with focus.",
                 properties: [
                     "project_root": string("Absolute path."),
-                    "device": string(deviceParameter)
+                    "device": string(deviceParameter),
+                    "focus": boolean("Bring it forward; only when the user asks to see it.")
                 ],
                 required: ["project_root"],
                 annotations: idempotent
@@ -51,7 +52,8 @@ public enum CherryToolCatalog {
                     "path": string("Absolute or ~/…"),
                     "device": string("Default: yours."),
                     "create": boolean("Make the folder."),
-                    "open": boolean("Default true.")
+                    "open": boolean("Default true."),
+                    "focus": boolean("Bring its window forward; only when the user asks to see it.")
                 ],
                 required: ["path"],
                 annotations: additive

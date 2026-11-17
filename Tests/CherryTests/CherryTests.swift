@@ -3626,7 +3626,7 @@ private struct ProjectFeatureAvailabilityBeforeNotesWereRemoved: Decodable {
     let server = CherryControlServer(
         workspaceProvider: { workspace },
         openProjectRootsProvider: { openProjectRoots },
-        openProjectProvider: { projectRoot in
+        openProjectProvider: { projectRoot, _ in
             openedProjectRoots.append(projectRoot)
             if !openProjectRoots.contains(projectRoot) {
                 openProjectRoots.append(projectRoot)

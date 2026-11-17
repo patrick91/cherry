@@ -818,9 +818,14 @@ public struct ListTerminalsResult: Codable, Equatable, Sendable {
 
 public struct OpenProjectRequest: Codable, Equatable, Sendable {
     public let projectRoot: String
+    /// Bring the window forward and make it key. nil or false: a window
+    /// that is open stays where it is, and one that opens goes behind the
+    /// window the user is in, so an agent never takes the keyboard.
+    public let focus: Bool?
 
-    public init(projectRoot: String) {
+    public init(projectRoot: String, focus: Bool? = nil) {
         self.projectRoot = projectRoot
+        self.focus = focus
     }
 }
 
@@ -1019,12 +1024,15 @@ public struct AddProjectRequest: Codable, Equatable, Sendable {
     public let create: Bool?
     /// Open its window (default true).
     public let open: Bool?
+    /// Bring its window forward (`OpenProjectRequest.focus`).
+    public let focus: Bool?
 
-    public init(path: String, device: String? = nil, create: Bool? = nil, open: Bool? = nil) {
+    public init(path: String, device: String? = nil, create: Bool? = nil, open: Bool? = nil, focus: Bool? = nil) {
         self.path = path
         self.device = device
         self.create = create
         self.open = open
+        self.focus = focus
     }
 }
 

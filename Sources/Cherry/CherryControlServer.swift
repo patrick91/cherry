@@ -24,7 +24,10 @@ final class CherryControlServer: @unchecked Sendable {
     /// The chrome state of the window that shows a workspace, never another
     /// window of its project.
     private let chromeStateForWorkspaceProvider: @MainActor (TerminalWorkspace) -> ProjectWindowChromeState?
-    private let openProjectProvider: @MainActor (String) -> Void
+    /// Opens a project's window: forward and key with `focus`, else a
+    /// window that is open stays where it is and one that opens goes
+    /// behind the user's (`ProjectWindowRegistry.openInBackground`).
+    private let openProjectProvider: @MainActor (_ projectRoot: String, _ focus: Bool) -> Void
     private let agentSettings: AgentSettings
     private let serviceDetector: any ServiceDetecting
     /// Services of tabs of other Macs (docs/specs/remote-devices.md, phase 4a).
@@ -68,7 +71,7 @@ final class CherryControlServer: @unchecked Sendable {
             },
             openWorkspacesProvider: { [workspace] },
             chromeStateForWorkspaceProvider: { $0 === workspace ? chromeState : nil },
-            openProjectProvider: { _ in },
+            openProjectProvider: { _, _ in },
             socketURL: socketURL,
             agentSettings: agentSettings,
             serviceDetector: serviceDetector,
@@ -105,7 +108,7 @@ final class CherryControlServer: @unchecked Sendable {
         chromeStateForWorkspaceProvider: @escaping @MainActor (TerminalWorkspace) -> ProjectWindowChromeState? = {
             ProjectWindowRegistry.shared.chromeState(for: $0)
         },
-        openProjectProvider: @escaping @MainActor (String) -> Void = { _ in },
+        openProjectProvider: @escaping @MainActor (_ projectRoot: String, _ focus: Bool) -> Void = { _, _ in },
         socketURL: URL = CherryControlServer.appSocketURL(),
         agentSettings: AgentSettings = .shared,
         serviceDetector: any ServiceDetecting = MacOSServiceDetector(),
@@ -989,7 +992,7 @@ final class CherryControlServer: @unchecked Sendable {
             throw CherryControlError(code: "project_not_found", message: "Cherry project is not configured: \(request.projectRoot).")
         }
         let alreadyOpen = openProjectRootsProvider().contains(key)
-        openProjectProvider(key)
+        openProjectProvider(key, request.focus ?? false)
         return OpenProjectResult(projectRoot: key, alreadyOpen: alreadyOpen)
     }
 
@@ -1572,7 +1575,7 @@ final class CherryControlServer: @unchecked Sendable {
 
         let openRoots = Set(openProjectRootsProvider().map(CherryControl.standardizedProjectRoot))
         let alreadyOpen = openRoots.contains(CherryControl.standardizedProjectRoot(projectRoot))
-        openProjectProvider(projectRoot)
+        openProjectProvider(projectRoot, request.focus ?? false)
 
         return OpenProjectResult(projectRoot: projectRoot, alreadyOpen: alreadyOpen)
     }
@@ -1685,7 +1688,7 @@ final class CherryControlServer: @unchecked Sendable {
             alreadyAdded = added.alreadyAdded
         }
         let opens = request.open ?? true
-        if opens { openProjectProvider(key) }
+        if opens { openProjectProvider(key, request.focus ?? false) }
         return AddProjectResult(
             projectRoot: key, device: device.name, path: resolvedPath,
             created: created, alreadyAdded: alreadyAdded, opened: opens

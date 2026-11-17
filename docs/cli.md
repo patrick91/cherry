@@ -385,12 +385,18 @@ hand, as on This Mac.
 
 - `list_projects` lists the saved and open projects: each one's root, name,
   whether it is active or open, and its to-dos feature.
-- `open_project` focuses the project's most recently active window by
-  absolute `project_root`, opening it when the project is saved in Cherry
-  but none of its windows is open. A device's project is named by its key
-  (`device:<uuid>:/path`, matched by location, never as a path of This
-  Mac), or by its path there with `device` (`cherry project open
-  ~/code/app --device patmini`).
+- `open_project` opens a project saved in Cherry by absolute
+  `project_root` without taking the user's keyboard: a window of the
+  project that is open stays where it is, and when none is, its primary
+  window opens behind the window the user is in (behind every window when
+  Cherry is not the active app), entering no full screen
+  (`ProjectWindowRegistry.openInBackground`). With `focus` (`cherry
+  project open DIR --focus`, only when the user asks to see it) it brings
+  the project's most recently active window forward and makes it key, as
+  Open Project does, opening one first when none is. A device's project is
+  named by its key (`device:<uuid>:/path`, matched by location, never as a
+  path of This Mac), or by its path there with `device` (`cherry project
+  open ~/code/app --device patmini`).
 
 ## Devices
 
@@ -414,7 +420,8 @@ other Macs (docs/specs/remote-devices.md). The commands say "device", not
   `device_not_found` and `device_ambiguous` list the choices.
 - `add_project` (`cherry project add PATH [--device D] [--create]`) adds a
   folder of a device (default: the caller's) as a project and opens its
-  window (`open` false leaves it closed). On This Mac it is
+  window as `open_project` does, behind the user's unless `focus` (`open`
+  false leaves it closed). On This Mac it is
   `AgentSettings.addProject`; on a device, Add Project on <Mac>…'s
   `RemoteDeviceProjectAdding` over its SSH connection (`pwd -P`), and with
   `create` a missing folder is made first by the Omni bar's New folder

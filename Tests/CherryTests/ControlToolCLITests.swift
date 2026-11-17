@@ -119,6 +119,8 @@ private let cliTab = "3F2A0B4C-1D2E-4F50-8A6B-7C8D9E0F1A2B"
         (["project", "open", "/Users/someone/app"], "open_project", ["project_root": .string("/Users/someone/app")]),
         (["project", "open", "~/app", "--device", "patmini"], "open_project",
          ["project_root": .string("~/app"), "device": .string("patmini")]),
+        (["project", "open", "/Users/someone/app", "--focus"], "open_project",
+         ["project_root": .string("/Users/someone/app"), "focus": .bool(true)]),
         (["project", "add", "~/code/app", "--device", "patmini", "--create"], "add_project",
          ["path": .string("~/code/app"), "device": .string("patmini"), "create": .bool(true)]),
         (["project", "add", "/Users/someone/app", "--open", "false"], "add_project",

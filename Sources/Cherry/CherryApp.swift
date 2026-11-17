@@ -1130,7 +1130,11 @@ struct CherryApp: App {
                         ProjectWindowRegistry.shared.activeTodoStore
                     }, chromeStateProvider: {
                         ProjectWindowRegistry.shared.activeChromeState
-                    }, openProjectProvider: { projectRoot in
+                    }, openProjectProvider: { projectRoot, focus in
+                        guard focus else {
+                            showProjectInBackground(projectRoot)
+                            return
+                        }
                         showProject(projectRoot)
                     }, socketURL: socketURL)
                     // MCP tasks survive a relaunch: the last run's are read
@@ -1393,8 +1397,17 @@ struct CherryApp: App {
     /// forward, or opens its primary window.
     private func showProject(_ projectRoot: String) {
         agentSettings.markProjectOpened(projectRoot)
+        ProjectWindowRegistry.shared.cancelBackgroundOpening(projectRoot: projectRoot)
         guard !ProjectWindowRegistry.shared.focus(projectRoot: projectRoot) else { return }
         openWindow(id: Self.projectWindowSceneID, value: ProjectWindowValue.primary(projectRoot))
+    }
+
+    /// An agent's `open_project`: opens `projectRoot`'s project's primary
+    /// window behind the user's, and leaves an open one where it is.
+    private func showProjectInBackground(_ projectRoot: String) {
+        ProjectWindowRegistry.shared.openInBackground(projectRoot: projectRoot) {
+            openWindow(id: Self.projectWindowSceneID, value: ProjectWindowValue.primary(projectRoot))
+        }
     }
 }
 

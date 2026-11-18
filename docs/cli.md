@@ -803,7 +803,11 @@ to their events and ends its turn; Cherry tells it when something happened.
   refused the subscriber's input at that question or permission, or the
   subscriber read the process's status or output, after the event or while
   the process kept that state (`MonitorSubscription.processSeen`); or the
-  process no longer waits on it. The line
+  process no longer waits on it. Nothing about a process the subscriber
+  closed itself (`cherry close`, `cherry task cancel --close`) wakes it
+  either: neither what it did before (a `done` not yet read) nor its
+  `closed` or `exited`; they stay readable, and the tab's events are news
+  again if the close is undone. The line
   names only the subscription and event counts, never text a watched
   process controls (names, titles or output), so it cannot carry
   instructions from a worker. Settings › Agents › Monitors › Wake
@@ -956,7 +960,9 @@ Codex, Pi and others.
   monitors' rule: at its composer, screen still, nobody typing, not in a
   `wait_for_tasks` call on that run, never at a prompt), once per settle,
   unless it already read the settle with `wait_for_tasks` or caused it
-  with its own `cancel_tasks`:
+  with its own `cancel_tasks` or by closing the worker's tab (a task
+  cancelled because its worker's tab was closed is cancelled by whoever
+  closed it, so that agent's monitors get no settle `done` for it either):
 
   ```text
   [cherry] Run run-…: 3 tasks settled (2 reported, 1 failed). Run cherry task wait run-… to read them, and cherry task get for each result.

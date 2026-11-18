@@ -60,6 +60,11 @@ final class MonitorSubscription {
     /// the status it learned (the sampler had not noticed it yet), are not
     /// news to it.
     var processSeen: [String: (seq: Int, status: String?)] = [:]
+    /// Watched processes the subscriber closed itself (`close_process`,
+    /// `cancel_tasks` with `close`, as Cherry confirmed the caller): their
+    /// events, before the close and after (its `closed`, `exited`), stay
+    /// readable and wake it no more. Forgotten when the tab comes back.
+    var closedBySubscriber: Set<String> = []
     var lastWakeAt: Date?
     var isWaking = false
     var activeWaits = 0
@@ -757,6 +762,8 @@ extension CherryControlServer {
         let previous = watched.lastStatus
         let initial = previous == nil
         watched.lastStatus = current
+        // Its tab came back (⌘Z of the close): news again from now.
+        if previous == "closed", current != "closed" { subscription.closedBySubscriber.remove(watched.id) }
         // What the subscriber learned of it holds while it stays so.
         if let seen = subscription.processSeen[watched.id], let status = seen.status, status != current {
             subscription.processSeen[watched.id] = (seq: seen.seq, status: nil)
@@ -943,9 +950,11 @@ extension CherryControlServer {
         // question the subscriber already knows of or that is gone, are old
         // news: they stay readable and counted, but wake nobody.
         // A reply watch's `done` is the reply, whatever turn followed.
+        // So is anything about a process the subscriber closed itself.
         guard let newest = unread.last(where: {
                   (subscription.isReply || !Self.turnDoneIsSuperseded($0, in: subscription))
                       && !Self.questionIsOldNews($0, in: subscription)
+                      && !subscription.closedBySubscriber.contains($0.processID)
               }),
               newest.seq > subscription.lastWokenSeq
         else { return }
@@ -1016,6 +1025,26 @@ extension CherryControlServer {
                 seq: subscription.nextSeq - 1,
                 status: status?.rawValue ?? monitorStatus(of: watched)
             )
+        }
+    }
+
+    /// The caller closed `sessions` itself: its subscriptions' events about
+    /// them wake it no more (`closedBySubscriber`), and the tasks they
+    /// worked on, cancelled once their tabs are gone for good, count as
+    /// cancelled by it (`workerClosedBy`): no settle `done` for its own
+    /// monitors, and no run wake line when it owns the run.
+    @MainActor
+    func callerClosed(_ sessions: [TerminalSession]) {
+        guard let caller = verifiedCallerSession() else { return }
+        let ids = Set(sessions.filter { $0 !== caller }.map { $0.id.uuidString })
+        guard !ids.isEmpty else { return }
+        for subscription in monitors.subscriptions.values where subscription.subscriber === caller {
+            for watched in subscription.watched where ids.contains(watched.id) {
+                subscription.closedBySubscriber.insert(watched.id)
+            }
+        }
+        for task in tasks.openTasks where ids.contains(task.workerID.uuidString) {
+            task.workerClosedBy = caller.id
         }
     }
 

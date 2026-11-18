@@ -642,6 +642,83 @@ struct ControlAgentMonitorTests {
         #expect(events.events.first?.agentTurn == 1)
     }
 
+    /// The subscriber closes an agent it watches: what that agent did
+    /// before (a turn's `done` it never read) and its `closed` stay
+    /// readable but wake the subscriber no more. Another's close of an
+    /// agent it watches still wakes it.
+    @Test func anAgentTheSubscriberClosedItselfWakesItNoMore() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let orchestrator = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        let worker = try await harness.spawnAgent(named: "Claude")
+        let other = try await harness.spawnAgent(named: "Codex")
+        harness.server.callerSessionResolverForTesting = { _ in orchestrator }
+        harness.report("state=working:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(800))
+        let id = try await harness.subscribe(.init(
+            processIDs: [worker.id.uuidString, other.id.uuidString], subscriberProcessID: orchestrator.id.uuidString
+        )).subscription.subscriptionID
+
+        // The worker's turn ends while the orchestrator is busy, and the
+        // orchestrator closes it before it goes idle.
+        harness.report("state=working:app=fake", on: orchestrator)
+        harness.screen("⏺ Here is my plan.\n\n❯ \n", on: worker)
+        harness.report("state=done:app=claude-code", on: worker)
+        try await Task.sleep(for: .milliseconds(600))
+        #expect(try await harness.send(.closeProcess(.init(processID: worker.id.uuidString))).error == nil)
+        harness.report("state=done:app=fake", on: orchestrator)
+        try await Task.sleep(for: .milliseconds(1_500))
+        #expect(!(try await harness.output(of: orchestrator)).contains("[cherry] Monitor"))
+
+        // Still there to read.
+        let events = try await harness.events(id, cursor: 0, timeoutMilliseconds: 0)
+        #expect(events.events.filter { $0.processID == worker.id.uuidString }.map(\.type) == [.done, .closed], "\(events.events)")
+
+        // Closed by someone else: news.
+        harness.server.callerSessionResolverForTesting = nil
+        #expect(try await harness.send(.closeProcess(.init(processID: other.id.uuidString))).error == nil)
+        let typed = try await harness.handledWakeLine(of: orchestrator)
+        #expect(typed.contains("[cherry] Monitor \(id): 3 events ready (1 done, 2 closed)."), "\(typed)")
+    }
+
+    /// The owner closes its task's worker: the task, cancelled once the tab
+    /// is gone, is cancelled by the owner, as `cancel_tasks` would: no
+    /// settle `done` for the owner's monitor and no run wake line.
+    @Test func ownersCloseOfItsWorkerIsItsCancel() async throws {
+        let harness = try ControlAgentWaitHarness()
+        defer { harness.stop() }
+        harness.useFastMonitors()
+        harness.server.tasks.awayGrace = 0.2
+        harness.server.start()
+        let script = try harness.fakeAgentScript(thinking: 0.1, working: 0.3)
+        let owner = try await harness.spawnAgent(named: "Fakeagent", command: script)
+        harness.server.callerSessionResolverForTesting = { _ in owner }
+        let (worker, taskID) = try await harness.spawnTaskWorker(named: "Worker", task: "Review the parser")
+        harness.report("state=working:app=claude-code", on: worker)
+        let id = try await harness.subscribe(.init(
+            processIDs: [worker.id.uuidString], events: ["done"], subscriberProcessID: owner.id.uuidString
+        )).subscription.subscriptionID
+        _ = try await harness.events(id, untilStatus: "working")
+        let task = try #require(harness.server.tasks.tasks[taskID])
+        let run = try #require(harness.server.tasks.runs[task.runID])
+        #expect(run.ownerID == owner.id)
+
+        #expect(try await harness.send(.closeProcess(.init(processID: worker.id.uuidString))).error == nil)
+        for _ in 0..<100 where task.state != .cancelled {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(task.state == .cancelled)
+        #expect(task.cancelledBy == owner.id)
+        #expect(!harness.server.tasks.awaitsWake(run))
+        try await Task.sleep(for: .milliseconds(1_500))
+        let events = try await harness.events(id, timeoutMilliseconds: 0)
+        #expect(events.events.isEmpty, "\(events.events)")
+        #expect(!(try await harness.output(of: owner)).contains("[cherry]"))
+    }
+
     /// The worker asks a question while the subscriber is busy, and the
     /// subscriber learns of it from Cherry (its message is refused with
     /// agent_awaiting_input): the `needs_input` is old news by the time the

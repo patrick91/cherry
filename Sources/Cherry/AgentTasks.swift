@@ -133,6 +133,12 @@ final class AgentTask {
     /// The tab whose `cancel_tasks` cancelled it, when Cherry confirmed the
     /// caller: its own monitors are not told (in memory only, as they are).
     var cancelledBy: UUID?
+    /// The tab that closed its worker's tab (`close_process`, `cancel_tasks`
+    /// with `close`, as Cherry confirmed the caller) while the close may
+    /// still be undone: the cancel once the tab is gone for good is that
+    /// tab's (`cancelledBy`). Cleared when the worker's tab is found again
+    /// (in memory only).
+    var workerClosedBy: UUID?
     var result: AgentTaskResult?
     var progress: String?
     var progressAt: Date?
@@ -1674,6 +1680,7 @@ extension CherryControlServer {
         task.worker = worker
         task.workspace = workspace
         task.awaySince = nil
+        task.workerClosedBy = nil
         if let hosting = worker.persistentHosting, let sessionID = worker.persistentSession?.sessionID {
             task.hosting = hosting
             task.hostSessionID = sessionID
@@ -1817,7 +1824,15 @@ extension CherryControlServer {
             // Not listed (yet): the host may be catching up.
             if !ending, now.timeIntervalSince(awaySince) < tasks.awayGrace { return }
         }
+        // Closed by its orchestrator (or another agent Cherry confirmed):
+        // that agent cancelled it, and knows its run settled when it owns it.
+        let closer = task.workerClosedBy
+        if let closer { task.cancelledBy = closer }
         tasks.update(task, to: .cancelled, event: .cancelled, text: "The worker's tab was closed.", reason: "its tab was closed before it reported")
+        if let closer, let run = tasks.runs[task.runID], run.ownerID == closer, let settledSeq = run.settledSeq {
+            run.ownerReadSeq = max(run.ownerReadSeq, settledSeq)
+            tasks.scheduleSave()
+        }
     }
 
     /// The worker waits on a monitor of its own: a subscription that types

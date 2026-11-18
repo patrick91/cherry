@@ -2547,6 +2547,7 @@ final class CherryControlServer: @unchecked Sendable {
             guard workspace.sessions.count > 1 else {
                 throw CherryControlError(code: "last_process", message: "Cherry cannot close the last remaining process.")
             }
+            callerClosed([session])
             workspace.close(session, intent: .mcpClose)
             return
         }
@@ -2561,8 +2562,10 @@ final class CherryControlServer: @unchecked Sendable {
             guard workspace.sessions.count > descendants.count + 1 else {
                 throw CherryControlError(code: "last_process", message: "Cherry cannot close the last remaining process.")
             }
+            callerClosed([session] + descendants)
             workspace.closeAgentGroup(session, intent: .mcpClose)
         case .promoteSubAgents:
+            callerClosed([session])
             workspace.close(session, intent: .mcpClose)
         }
     }

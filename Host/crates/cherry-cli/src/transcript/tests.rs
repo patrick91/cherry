@@ -541,6 +541,86 @@ fn claude_code_names_the_session_of_its_process() {
     assert_eq!(found, Located::empty(Agent::Claude));
 }
 
+/// `time` as `ps -o lstart` writes it in local time (`procStart`), with
+/// `format`'s order.
+fn local_start(time: SystemTime, format: &str) -> String {
+    let seconds = time.duration_since(UNIX_EPOCH).unwrap().as_secs() as libc::time_t;
+    let format = std::ffi::CString::new(format).unwrap();
+    let mut buffer = [0 as libc::c_char; 64];
+    // SAFETY: `tm` is filled by `localtime_r`; `buffer` has room for the
+    // longest date these formats write.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&seconds, &mut tm);
+        let written = libc::strftime(buffer.as_mut_ptr(), buffer.len(), format.as_ptr(), &tm);
+        assert!(written > 0);
+        std::ffi::CStr::from_ptr(buffer.as_ptr())
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+}
+
+#[test]
+fn a_process_start_parses_in_either_order() {
+    let started = UNIX_EPOCH + Duration::from_secs(1_794_000_000);
+    for format in ["%a %b %e %H:%M:%S %Y", "%a %e %b %H:%M:%S %Y"] {
+        let text = local_start(started, format);
+        assert_eq!(parse_process_start(&text), Some(started), "{text}");
+    }
+    assert_eq!(parse_process_start("Thu Nov  5 18:48:54 2026 later"), None);
+    assert_eq!(parse_process_start("yesterday"), None);
+    assert_eq!(parse_process_start(""), None);
+}
+
+// A Claude Code that switched conversations (`/resume`, `/clear`) records
+// when the new one started (`startedAt`), days after its process did: its
+// `procStart` still names the process, and the record is its own.
+#[test]
+fn claude_code_that_switched_conversations_is_known_by_its_process_start() {
+    let directory = tempfile::tempdir().unwrap();
+    let dirs = dirs(directory.path());
+    let started = SystemTime::now() - Duration::from_secs(12 * 24 * 3600);
+    let switched = SystemTime::now() - Duration::from_secs(8 * 24 * 3600);
+    let millis = |time: SystemTime| time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+    let record = |process_start: SystemTime| {
+        json!({
+            "pid": 300, "sessionId": "abc", "cwd": "/work",
+            "startedAt": millis(switched),
+            "procStart": local_start(process_start, "%a %b %e %H:%M:%S %Y"),
+        })
+    };
+    write_lines(&dirs.claude.join("sessions/300.json"), &[record(started)]);
+    write_lines(
+        &dirs.claude.join("projects/-work/abc.jsonl"),
+        &[json!({"type": "mode"})],
+    );
+    let all = [
+        process(200, 1, started, "/bin/zsh -l"),
+        process(300, 200, started, "claude --resume abc"),
+    ];
+    let found = locate(&session(200, "/work"), &all, &dirs).unwrap();
+    assert_eq!(found.agent, Agent::Claude);
+    assert_eq!(found.session_id.as_deref(), Some("abc"));
+    assert_eq!(
+        found.path,
+        Some(dirs.claude.join("projects/-work/abc.jsonl"))
+    );
+
+    // A record whose process start is another process's (its pid came
+    // back) is not this one's, even when `startedAt` would match.
+    write_lines(
+        &dirs.claude.join("sessions/300.json"),
+        &[record(started - Duration::from_secs(3600))],
+    );
+    let reused = [
+        process(200, 1, switched, "/bin/zsh -l"),
+        process(300, 200, switched, "claude"),
+    ];
+    let found = locate(&session(200, "/work"), &reused, &dirs).unwrap();
+    assert_eq!(found, Located::empty(Agent::Claude));
+}
+
 #[test]
 fn a_codex_rollout_is_the_one_its_process_started_in_the_folder() {
     let directory = tempfile::tempdir().unwrap();

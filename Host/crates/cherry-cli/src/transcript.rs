@@ -50,9 +50,9 @@ const MAX_WINDOW: u64 = 64 << 20;
 /// A session file created this long before its process started (`ps`
 /// counts whole seconds) is still that process's.
 const START_SLACK: Duration = Duration::from_secs(5);
-/// How far Claude Code's record of when it started may be from when `ps`
-/// says its process did: a record left by a process that is gone, whose pid
-/// came back, is farther.
+/// How far Claude Code's record of when its process started may be from
+/// when `ps` says it did: a record left by a process that is gone, whose
+/// pid came back, is farther.
 const CLAUDE_START_SLACK: Duration = Duration::from_secs(120);
 /// The longest first line (a Codex rollout's `session_meta` carries its
 /// instructions) read to learn a session file's folder and id.
@@ -319,8 +319,21 @@ fn claude(dirs: &Dirs, process: &Process) -> Option<Located> {
     if record.get("pid").and_then(Value::as_u64) != Some(u64::from(process.pid)) {
         return None;
     }
-    if let Some(started) = record.get("startedAt").and_then(Value::as_u64) {
-        let started = UNIX_EPOCH + Duration::from_millis(started);
+    // `procStart` is when the process started. `startedAt` is when its
+    // conversation did, and moves when the process switches to another one
+    // (a Claude Code started on 5 November recorded 9 November): it is the
+    // check only for a record without a `procStart` (older versions).
+    let recorded = record
+        .get("procStart")
+        .and_then(Value::as_str)
+        .and_then(parse_process_start)
+        .or_else(|| {
+            record
+                .get("startedAt")
+                .and_then(Value::as_u64)
+                .map(|millis| UNIX_EPOCH + Duration::from_millis(millis))
+        });
+    if let Some(started) = recorded {
         let apart = started
             .duration_since(process.started)
             .or_else(|_| process.started.duration_since(started))
@@ -346,6 +359,30 @@ fn claude(dirs: &Dirs, process: &Process) -> Option<Located> {
         session_id: Some(session_id),
         amp: None,
     })
+}
+
+/// A process's start as Claude Code records it (`procStart`): `ps -o
+/// lstart` in local time, month first as the C locale writes it ("Thu Nov
+///  5 18:48:54 2026"), or day first as some locales do.
+fn parse_process_start(text: &str) -> Option<SystemTime> {
+    let text = std::ffi::CString::new(text.trim()).ok()?;
+    ["%a %b %e %H:%M:%S %Y", "%a %e %b %H:%M:%S %Y"]
+        .into_iter()
+        .find_map(|format| {
+            let format = std::ffi::CString::new(format).ok()?;
+            // SAFETY: both strings are NUL-terminated and outlive the
+            // calls; `tm` is a plain C struct zeroed before use.
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            let end = unsafe { libc::strptime(text.as_ptr(), format.as_ptr(), &mut tm) };
+            if end.is_null() || unsafe { *end } != 0 {
+                return None;
+            }
+            tm.tm_isdst = -1;
+            let seconds = unsafe { libc::mktime(&mut tm) };
+            u64::try_from(seconds)
+                .ok()
+                .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))
+        })
 }
 
 /// `projects/<folder>/<session>.jsonl`, the folder named as Claude Code

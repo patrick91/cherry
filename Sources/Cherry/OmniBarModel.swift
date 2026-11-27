@@ -167,9 +167,12 @@ struct OmniItem: Equatable, Identifiable {
     var id: String
     var kind: OmniKind
     var title: String
-    /// The one muted detail on the right (a project's path when another
-    /// project of its Mac has its name, a tab's place).
+    /// The one muted detail (a project's path when another project of its
+    /// Mac has its name, a tab's place): under the title for projects,
+    /// Macs, tabs and sessions (`showsDetailBelowTitle`), else on the right.
     var detail = ""
+    /// A command's key equivalent ("⌘T"), on the right.
+    var shortcut = ""
     var status: OmniStatus?
     /// An SF Symbol, shown when it has no `logo`.
     var symbol: String
@@ -214,6 +217,22 @@ struct OmniItem: Equatable, Identifiable {
         return nil
     }
 
+    /// Whether ↵ opens a list (a scope, a Mac's folders, a folder): the
+    /// row ends in a chevron.
+    var opensList: Bool {
+        switch primary {
+        case .drill, .browseFolders, .enterFolder: true
+        default: false
+        }
+    }
+
+    /// Projects, Macs, tabs and sessions show their detail and Mac on a
+    /// second line under the title.
+    var showsDetailBelowTitle: Bool {
+        guard !detail.isEmpty || !machineName.isEmpty else { return false }
+        return [.project, .mac, .tab, .session].contains(kind)
+    }
+
     var accessibilityLabel: String {
         var parts = [title]
         switch status {
@@ -224,6 +243,7 @@ struct OmniItem: Equatable, Identifiable {
         }
         if !detail.isEmpty { parts.append(detail) }
         if !machineName.isEmpty { parts.append(machineName) }
+        if !shortcut.isEmpty { parts.append(shortcut) }
         return parts.joined(separator: ", ")
     }
 }
@@ -858,7 +878,7 @@ enum OmniProviders {
             id: "command:\(command.rawValue)",
             kind: .command,
             title: title,
-            detail: shortcut,
+            shortcut: shortcut,
             symbol: symbol,
             primaryLabel: "Run",
             primary: .menu(command),
@@ -957,7 +977,7 @@ enum OmniProviders {
             id: "command:projects",
             kind: .command,
             title: "Projects",
-            detail: CherryShortcut.openProject.display,
+            shortcut: CherryShortcut.openProject.display,
             symbol: "folder",
             primaryLabel: "Show",
             primary: .drill(.projects)
@@ -1119,11 +1139,11 @@ enum OmniSections {
                 let rows = OmniRanking.recent(OmniProviders.recentCandidates(sources), frecency: frecency)
                 return rows.isEmpty ? [] : [OmniSection(title: "Recent", rows: rows)]
             }
-            var sections = ranked(OmniProviders.everything(sources), limit: rootResultLimit)
+            var rows = OmniRanking.rank(OmniProviders.everything(sources), query: query, frecency: frecency, limit: rootResultLimit)
             if let open = OmniProviders.openPathItem(query: query) {
-                sections.append(OmniSection(title: nil, rows: [OmniRow(item: open)]))
+                rows.append(OmniRow(item: open))
             }
-            return merged(sections)
+            return grouped(rows)
         case .projects?:
             if isEmpty {
                 return (OmniProviders.projectSections(sources) + [unadded(on: nil), browse(on: .thisMac)])
@@ -1191,6 +1211,29 @@ enum OmniSections {
             var section = section
             section.rows = section.rows.filter { seen.insert($0.id).inserted }
             return section.rows.isEmpty ? nil : section
+        }
+    }
+
+    /// The root's results under a header per kind ("Tabs", "Commands"),
+    /// the group with the best match first and each group in rank order.
+    static func grouped(_ rows: [OmniRow]) -> [OmniSection] {
+        var order: [String] = []
+        var groups: [String: [OmniRow]] = [:]
+        for row in rows {
+            let title = groupTitle(row.item.kind)
+            if groups[title] == nil { order.append(title) }
+            groups[title, default: []].append(row)
+        }
+        return order.map { OmniSection(title: $0, rows: groups[$0] ?? []) }
+    }
+
+    static func groupTitle(_ kind: OmniKind) -> String {
+        switch kind {
+        case .project: "Projects"
+        case .mac: "Macs"
+        case .tab, .session: "Tabs"
+        case .command, .agent: "Commands"
+        case .folder: "Folders"
         }
     }
 

@@ -2510,7 +2510,7 @@ struct CommandPaletteSearchField: NSViewRepresentable {
 
     private func configure(_ textField: NSTextField) {
         textField.placeholderString = placeholder
-        textField.font = .systemFont(ofSize: 17)
+        textField.font = .systemFont(ofSize: 15)
         textField.isBordered = false
         textField.isBezeled = false
         textField.drawsBackground = false

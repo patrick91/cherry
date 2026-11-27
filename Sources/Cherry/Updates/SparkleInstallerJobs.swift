@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-/// Sparkle 2.10.0 submits its installer and progress agent as launchd jobs named after the host
+/// Sparkle 2.10.1 submits its installer and progress agent as launchd jobs named after the host
 /// bundle (InstallerLauncher/SUInstallerLauncher.m). Removing them discards a staged update:
 /// the app's installer connection invalidates and Sparkle aborts the session (SUInstallationError).
 /// Sparkle-internal: re-check on every Sparkle upgrade (docs/releasing.md).

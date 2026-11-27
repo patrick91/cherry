@@ -164,7 +164,7 @@ private final class SparkleHandle {
 /// private) so AppUpdateTests can check its selectors.
 @MainActor
 final class SparkleBridge: NSObject, SPUUpdaterDelegate, @preconcurrency SPUStandardUserDriverDelegate {
-    /// The Objective-C selectors Cherry relies on, as Sparkle 2.10.0's headers name them.
+    /// The Objective-C selectors Cherry relies on, as Sparkle 2.10.1's headers name them.
     nonisolated static let requiredSelectors = [
         "allowedChannelsForUpdater:",
         "updater:willInstallUpdateOnQuit:immediateInstallationBlock:",

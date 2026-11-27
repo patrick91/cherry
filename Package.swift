@@ -15,7 +15,7 @@ let package = Package(
         .package(path: "ThirdParty/libghostty-spm"),
         // Exact: the framework, its tools (sign_update), the launchd job labels Cherry removes and
         // the delegate behaviour Cherry relies on (docs/releasing.md) move together; upgrade deliberately.
-        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.0"),
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.1"),
     ],
     targets: [
         .target(

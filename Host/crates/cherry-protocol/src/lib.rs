@@ -1965,7 +1965,7 @@ pub mod base64_bytes {
 
     pub fn decode(text: &str) -> Result<Vec<u8>, &'static str> {
         let text = text.as_bytes();
-        if text.len() % 4 != 0 {
+        if !text.len().is_multiple_of(4) {
             return Err("base64 length is not a multiple of 4");
         }
         let Some(split) = text.len().checked_sub(4) else {
@@ -1975,7 +1975,12 @@ pub mod base64_bytes {
         // character, and one check per group.
         let (body, last) = text.split_at(split);
         let mut out = vec![0u8; body.len() / 4 * 3];
-        for (group, bytes) in body.chunks_exact(4).zip(out.chunks_exact_mut(3)) {
+        for (group, bytes) in body
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(out.as_chunks_mut::<3>().0)
+        {
             let [a, b, c, d] = [0, 1, 2, 3].map(|i| VALUES[group[i] as usize]);
             if (a | b | c | d) & 0xc0 != 0 {
                 return Err("invalid base64");
@@ -2241,7 +2246,7 @@ mod tests {
     /// reject exactly what it did.
     fn reference_decode(text: &str) -> Result<Vec<u8>, &'static str> {
         let text = text.as_bytes();
-        if text.len() % 4 != 0 {
+        if !text.len().is_multiple_of(4) {
             return Err("base64 length is not a multiple of 4");
         }
         let mut out = Vec::with_capacity(text.len() / 4 * 3);

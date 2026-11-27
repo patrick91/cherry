@@ -1,4 +1,4 @@
-FROM rust:1.99-bookworm
+FROM rust:1.100-bookworm
 RUN apt-get update -qq && apt-get install -y --no-install-recommends openssh-server \
     && rm -rf /var/lib/apt/lists/* && mkdir -p /run/sshd
 # Debian's Neovim (0.7) predates the terminal queries current Neovim sends at

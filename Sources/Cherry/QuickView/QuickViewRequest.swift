@@ -80,9 +80,13 @@ enum QuickViewLink {
             let path = url.path(percentEncoded: false)
             return path.hasPrefix("/") ? path : nil
         }
-        // An OSC 8 target is a URL or nothing.
-        guard kind == .unknown else { return nil }
-        return text
+        guard kind == .osc8 else { return text }
+        // An OSC 8 target with no scheme is a relative reference: Markdown
+        // renderers (Amp's, Glow's) send a link's href as written, such as
+        // `preview.png` or `docs/a%20b.md#usage`, a file from where the
+        // program runs. Its path, percent-decoded, without query or fragment.
+        guard let components = URLComponents(string: text) else { return text }
+        return components.path.isEmpty ? nil : components.path
     }
 
     /// The forms of a printed path a click may mean, in order: as printed;

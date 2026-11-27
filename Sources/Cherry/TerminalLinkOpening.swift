@@ -127,8 +127,13 @@ struct UntrustedLink: Equatable {
             normalized = url.isFileURL
                 ? url.standardizedFileURL.resolvingSymlinksInPath().path
                 : string
-        } else {
+        } else if string.hasPrefix("/") {
             normalized = URL(filePath: string).standardizedFileURL.path
+        } else {
+            // A relative link (an OSC 8 Markdown href) as written: made
+            // absolute it would start from Cherry's own directory, `/`, not
+            // the tab's.
+            normalized = string
         }
         var result = ""
         result.reserveCapacity(normalized.count)

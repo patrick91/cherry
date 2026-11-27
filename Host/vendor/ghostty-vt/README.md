@@ -5,7 +5,7 @@ depend on AppKit, GhosttyTerminal's Swift wrapper, a display server, or a GPU.
 
 - Source: https://github.com/ghostty-org/ghostty
 - Revision: `83fb95624b0439ee660c2679b43b38c8b63769cd` (v1.4.0)
-- Zig: `0.17.0`; official download SHA256 values are pinned in `Scripts/build-host-vt`.
+- Zig: `0.17.1`; official download SHA256 values are pinned in `Scripts/build-host-vt`.
 - Source patches: none.
 - License: MIT; see `LICENSE`. The upstream build also bundles third-party
   dependencies identified by the pinned source's `build.zig.zon` and `vendor/`.

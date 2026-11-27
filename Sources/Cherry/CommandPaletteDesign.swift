@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 /// The Omni bar's design knobs (Prototype › Show Omni Bar Playground),
-/// defaulting to design D: 580 pt wide, 38 pt rows, a glass surface.
+/// defaulting to design D: 520 pt wide, 28 pt rows, a glass surface.
 enum CommandPaletteDesign {
     static let usesGlassKey = "omniBar.design.usesGlass"
     static let cornerRadiusKey = "omniBar.design.cornerRadius"
@@ -14,10 +14,10 @@ enum CommandPaletteDesign {
 
     static let defaultUsesGlass = true
     static let defaultCornerRadius = 14.0
-    static let defaultPanelWidth = 580.0
+    static let defaultPanelWidth = 520.0
     static let defaultScrimOpacity = 0.12
     static let defaultAnimatesEntrance = true
-    static let defaultRowHeight = 38.0
+    static let defaultRowHeight = 28.0
     static let defaultHighlightsMatches = true
 
     static func reset() {
@@ -59,12 +59,12 @@ struct CommandPalettePlaygroundOverlay: View {
             sectionTitle("Panel")
             Toggle("Liquid Glass", isOn: $usesGlass)
             slider("Corner Radius", value: $cornerRadius, in: 8...28, format: "%.0f")
-            slider("Width", value: $panelWidth, in: 520...700, format: "%.0f")
+            slider("Width", value: $panelWidth, in: 440...700, format: "%.0f")
             slider("Scrim", value: $scrimOpacity, in: 0...0.35, format: "%.2f")
             Toggle("Animate Entrance", isOn: $animatesEntrance)
 
             sectionTitle("Rows")
-            slider("Row Height", value: $rowHeight, in: 32...48, format: "%.0f")
+            slider("Row Height", value: $rowHeight, in: 24...48, format: "%.0f")
             Toggle("Bold Matches", isOn: $highlightsMatches)
         }
         .font(.system(size: 12))

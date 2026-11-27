@@ -2,9 +2,11 @@ import AppKit
 import SwiftUI
 
 // The Omni bar's view (design D): one floating bar with the search field
-// and the scope's crumb, one list of one-line rows, and a footer with a
-// hint, "↵ <primary>" and "⌘K Actions". Its keys come from the search
-// field's own commands (arrows, ↵, ⇥, ⌫, Esc) and ⌘K from
+// and the scope's crumb, one list of rows, and a footer with a hint and
+// key caps for "Actions ⌘K" and "<primary> ↵". Rows show a command's
+// shortcut, a chevron when ↵ opens a list, and a project's, Mac's or tab's
+// detail on a second line; root results are grouped by kind (`OmniSections.grouped`).
+// Its keys come from the search field's own commands (arrows, ↵, ⇥, ⌫, Esc) and ⌘K from
 // `AppShortcutMonitor` while it is open; it installs no key monitor.
 
 struct OmniBarOverlay: View {
@@ -183,11 +185,15 @@ private struct OmniBarPanel: View {
 
     private static let topMarkerID = "omni-bar-top"
     private static let maximumListHeight: CGFloat = 400
-    private static let headerHeight: CGFloat = 25
+    private static let headerHeight: CGFloat = 22
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
                 ForEach(Array(controller.stack.enumerated()), id: \.offset) { _, scope in
                     OmniBarCrumb(label: scope.label)
                 }
@@ -199,9 +205,20 @@ private struct OmniBarPanel: View {
                     onCommand: handleCommand
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if !controller.query.isEmpty {
+                    Button {
+                        controller.setQuery("")
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 14))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear search")
+                }
             }
-            .padding(.horizontal, 16)
-            .frame(height: 52)
+            .padding(.horizontal, 12)
+            .frame(height: 42)
 
             Divider().opacity(0.6)
 
@@ -226,9 +243,12 @@ private struct OmniBarPanel: View {
         let sections = controller.sections
         let rowCount = sections.reduce(0) { $0 + $1.rows.count }
         let headers = sections.filter { $0.title != nil }.count
+        let rowsHeight = sections.reduce(CGFloat(0)) { total, section in
+            section.rows.reduce(total) { $0 + Self.height(of: $1, rowHeight: CGFloat(rowHeight)) }
+        }
         let contentHeight = rowCount == 0
             ? 80
-            : CGFloat(rowCount) * CGFloat(rowHeight) + CGFloat(headers) * Self.headerHeight + 12
+            : rowsHeight + CGFloat(headers) * Self.headerHeight + 8
         // Tall enough for the ⌘K list over it.
         let actionListHeight = controller.isActionListOpen
             ? CGFloat(controller.selectedActions.count) * OmniBarActionList.rowHeight + 26
@@ -236,7 +256,7 @@ private struct OmniBarPanel: View {
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    Color.clear.frame(height: 6).id(Self.topMarkerID)
+                    Color.clear.frame(height: 4).id(Self.topMarkerID)
                     if rowCount == 0 {
                         HStack(spacing: 8) {
                             if controller.emptyState.isLoading {
@@ -257,23 +277,23 @@ private struct OmniBarPanel: View {
                             Text(title)
                                 .font(.system(size: 11, weight: .semibold))
                                 .foregroundStyle(.secondary)
-                                .padding(.horizontal, 12)
-                                .padding(.top, 8)
-                                .padding(.bottom, 4)
+                                .padding(.horizontal, 8)
+                                .padding(.top, 6)
+                                .padding(.bottom, 3)
                                 .frame(height: Self.headerHeight, alignment: .bottomLeading)
                                 .accessibilityAddTraits(.isHeader)
                         }
-                        ForEach(section.rows) { row in
+                        ForEach(section.rows, id: \.viewID) { row in
                             // The row reads the selection itself (by id), so
                             // exactly the selected row looks selected even
                             // when the lazy stack keeps a row's view.
                             OmniBarSelectableRow(
                                 controller: controller,
                                 row: row,
-                                height: CGFloat(rowHeight),
+                                height: Self.height(of: row, rowHeight: CGFloat(rowHeight)),
                                 highlightsMatches: highlightsMatches
                             )
-                            .id(row.id)
+                            .id(row.viewID)
                             .onContinuousHover(coordinateSpace: .local) { phase in
                                 guard case .active = phase, pointer.moved(to: NSEvent.mouseLocation) else { return }
                                 controller.hover(id: row.id)
@@ -289,8 +309,8 @@ private struct OmniBarPanel: View {
                         }
                     }
                 }
-                .padding(.horizontal, 6)
-                .padding(.bottom, 6)
+                .padding(.horizontal, 4)
+                .padding(.bottom, 4)
             }
             .scrollIndicators(.automatic)
             .frame(height: min(max(contentHeight, actionListHeight), Self.maximumListHeight))
@@ -300,8 +320,8 @@ private struct OmniBarPanel: View {
                 // scrolls to the top so its section's header shows too.
                 if controller.selection == 0 {
                     proxy.scrollTo(Self.topMarkerID, anchor: .top)
-                } else if let id = controller.selectedItem?.id {
-                    proxy.scrollTo(id, anchor: nil)
+                } else if let row = controller.rows.first(where: controller.isSelected) {
+                    proxy.scrollTo(row.viewID, anchor: nil)
                 }
             }
             .onChange(of: controller.resetScrollRequest) { _, _ in
@@ -310,19 +330,24 @@ private struct OmniBarPanel: View {
         }
     }
 
+    /// A row with its detail under the title is taller.
+    static func height(of row: OmniRow, rowHeight: CGFloat) -> CGFloat {
+        row.item.showsDetailBelowTitle ? rowHeight + 10 : rowHeight
+    }
+
     private var footer: some View {
         HStack(spacing: 12) {
             Text(controller.hint)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Text("↵ \(controller.primaryLabel)")
-            Text("⌘K Actions")
+            OmniFooterKey(label: "Actions", key: "⌘K")
                 .opacity(controller.selectedActions.isEmpty ? 0.45 : 1)
+            OmniFooterKey(label: controller.primaryLabel, key: "↵")
         }
-        .font(.system(size: 11.5))
+        .font(.system(size: 11))
         .foregroundStyle(.secondary)
         .lineLimit(1)
-        .padding(.horizontal, 16)
-        .frame(height: 36)
+        .padding(.horizontal, 12)
+        .frame(height: 30)
         .accessibilityElement(children: .combine)
     }
 
@@ -353,6 +378,12 @@ private struct OmniBarPanel: View {
         return true
     }
 
+}
+
+extension OmniRow {
+    /// The row's view in the list: a new match (or none) is a new view, so
+    /// the lazy list never keeps the bold of an earlier query.
+    var viewID: String { "\(id)|\(matched.map(String.init).joined(separator: ","))" }
 }
 
 /// Tells a hover event of the pointer moving from one of a row moving
@@ -445,10 +476,10 @@ private struct OmniBarCrumb: View {
 
     var body: some View {
         Text(label)
-            .font(.system(size: 13, weight: .semibold))
+            .font(.system(size: 12, weight: .semibold))
             .lineLimit(1)
-            .padding(.horizontal, 9)
-            .frame(height: 24)
+            .padding(.horizontal, 7)
+            .frame(height: 20)
             .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.primary.opacity(0.12)))
             .fixedSize()
             .accessibilityLabel("Scope: \(label)")
@@ -477,52 +508,90 @@ private struct OmniBarRow: View {
     let highlightsMatches: Bool
 
     var body: some View {
-        HStack(spacing: 11) {
+        HStack(spacing: 8) {
             icon
-                .frame(width: 18)
+                .frame(width: 16)
                 .accessibilityHidden(true)
-            title
-                .font(.system(size: 14))
-                // A new match (or none) is a new title: no bold kept from
-                // an earlier query.
-                .id(row.matched)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .layoutPriority(1)
+            VStack(alignment: .leading, spacing: 0) {
+                title
+                    .font(.system(size: 13))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                if row.item.showsDetailBelowTitle {
+                    subtitle
+                }
+            }
+            .layoutPriority(1)
             Spacer(minLength: 8)
             if let status = row.item.status {
                 Circle()
                     .fill(OmniBarColors.color(status))
                     .frame(width: 6, height: 6)
             }
-            if !row.item.detail.isEmpty {
-                Text(row.item.detail)
+            if !row.item.showsDetailBelowTitle {
+                if !row.item.detail.isEmpty {
+                    Text(row.item.detail)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .layoutPriority(0.5)
+                }
+                if !row.item.machineName.isEmpty {
+                    machineLabel
+                        // A path gives way before the Mac's name.
+                        .layoutPriority(0.6)
+                }
+            }
+            if !row.item.shortcut.isEmpty {
+                Text(row.item.shortcut)
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .layoutPriority(0.5)
+                    .fixedSize()
             }
-            if !row.item.machineName.isEmpty {
-                Text(row.item.machineName)
-                    .font(.system(size: 12, weight: row.item.machineColor == nil ? .regular : .medium))
-                    .foregroundStyle(machineStyle)
-                    .lineLimit(1)
-                    // A path gives way before the Mac's name.
-                    .layoutPriority(0.6)
+            if row.item.opensList {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.tertiary)
             }
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 8)
         .frame(height: height)
         .background {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .fill(isSelected ? Color.primary.opacity(0.1) : .clear)
         }
-        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(row.item.accessibilityLabel)
         .accessibilityHint(row.item.actions.isEmpty ? row.item.primaryLabel : "\(row.item.primaryLabel). Command-K for actions.")
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    /// The second line: the detail, then the Mac in its colour.
+    private var subtitle: some View {
+        HStack(spacing: 4) {
+            if !row.item.detail.isEmpty {
+                Text(row.item.detail)
+                    .foregroundStyle(.secondary)
+                    .truncationMode(.middle)
+            }
+            if !row.item.detail.isEmpty, !row.item.machineName.isEmpty {
+                Text("·").foregroundStyle(.tertiary)
+            }
+            if !row.item.machineName.isEmpty {
+                machineLabel
+            }
+        }
+        .font(.system(size: 11))
+        .lineLimit(1)
+    }
+
+    private var machineLabel: some View {
+        Text(row.item.machineName)
+            .font(.system(size: 11, weight: row.item.machineColor == nil ? .regular : .medium))
+            .foregroundStyle(machineStyle)
+            .lineLimit(1)
     }
 
     /// A row on another Mac names it in its colour.
@@ -542,35 +611,35 @@ private struct OmniBarRow: View {
                 .resizable()
                 .interpolation(.high)
                 .scaledToFit()
-                .frame(width: 16, height: 16)
+                .frame(width: 14, height: 14)
         case .logo(let image):
             Image(nsImage: image)
                 .resizable()
                 .renderingMode(.template)
                 .scaledToFit()
-                .frame(width: 15, height: 15)
+                .frame(width: 13, height: 13)
                 .foregroundStyle(.secondary)
         case .symbol(let name):
             Image(systemName: name)
-                .font(.system(size: 13, weight: .medium))
+                .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(.secondary)
         }
     }
 
     private var title: Text {
-        let characters = Array(row.item.title)
-        guard highlightsMatches, !row.matched.isEmpty else {
-            return Text(row.item.title).foregroundStyle(.primary)
-        }
-        let matched = Set(row.matched)
+        // Always one attributed text, every character's weight set: a
+        // plain `Text` in place of a highlighted one could keep its bold
+        // when the lazy list reuses the row.
+        let matched = highlightsMatches ? Set(row.matched) : []
         var attributed = AttributedString()
-        for (index, character) in characters.enumerated() {
+        for (index, character) in row.item.title.enumerated() {
             var piece = AttributedString(String(character))
             if matched.contains(index) {
                 piece.inlinePresentationIntent = .stronglyEmphasized
                 piece.foregroundColor = .primary
             } else {
-                piece.foregroundColor = Color.primary.opacity(0.82)
+                piece.inlinePresentationIntent = []
+                piece.foregroundColor = matched.isEmpty ? .primary : Color.primary.opacity(0.82)
             }
             attributed += piece
         }
@@ -578,9 +647,29 @@ private struct OmniBarRow: View {
     }
 }
 
+/// A footer hint: its label, then its key in a key cap.
+private struct OmniFooterKey: View {
+    let label: String
+    let key: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(label)
+            Text(key)
+                .font(.system(size: 11, weight: .medium))
+                .padding(.horizontal, 5)
+                .frame(minWidth: 20, minHeight: 18)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.22), lineWidth: 1)
+                }
+        }
+    }
+}
+
 /// ⌘K: the selected row's actions, over the list's bottom-trailing corner.
 private struct OmniBarActionList: View {
-    static let rowHeight: CGFloat = 30
+    static let rowHeight: CGFloat = 26
 
     @ObservedObject var controller: OmniBarController
 

@@ -237,14 +237,20 @@ private func select(_ title: String, machine: String? = nil, in controller: Omni
     #expect(fresh.rows.contains { $0.item.kind == .command })
 }
 
-@Test @MainActor func omniRootQueryIsOneFlatRankedListOfTen() {
+@Test @MainActor func omniRootQueryIsTenRankedRowsGroupedByKind() {
     let controller = OmniRecorder().controller()
     controller.setQuery("s")
-    #expect(controller.sections.count == 1)
-    #expect(controller.sections[0].title == nil)
     #expect(controller.rows.count == OmniSections.rootResultLimit)
+    // Each kind once, under its header.
+    let headers = controller.sections.compactMap(\.title)
+    #expect(headers.count == controller.sections.count && Set(headers).count == headers.count)
+    for section in controller.sections {
+        #expect(section.rows.allSatisfy { OmniSections.groupTitle($0.item.kind) == section.title })
+    }
     controller.setQuery("persistent")
-    // Every kind competes: a title that starts with the query first.
+    // Every kind competes: the group of the best match (a title that
+    // starts with the query) comes first.
+    #expect(controller.sections.map(\.title) == ["Commands", "Tabs"])
     #expect(titles(controller) == ["Persistent Sessions…", "Codex persistent-sessions multiplexer"])
     #expect(controller.rows.map(\.item.kind) == [.command, .tab])
     controller.setQuery("new claude")
@@ -392,7 +398,7 @@ private func select(_ title: String, machine: String? = nil, in controller: Omni
     let controller = OmniRecorder().controller()
     controller.open(at: .commands)
     let rows = controller.rows.map(\.item)
-    let shortcuts = Dictionary(rows.map { ($0.title, $0.detail) }, uniquingKeysWith: { first, _ in first })
+    let shortcuts = Dictionary(rows.map { ($0.title, $0.shortcut) }, uniquingKeysWith: { first, _ in first })
     #expect(shortcuts["New Tab"] == "⌘T")
     #expect(shortcuts["New Window"] == "⌘N")
     #expect(shortcuts["Split Right"] == "⇧⌘D")

@@ -264,9 +264,6 @@ private struct OmniBarPanel: View {
                             }
                             Text(controller.emptyState.text)
                                 .font(.system(size: 13))
-                    // A new match (or none) is a new title: no bold kept
-                    // from an earlier query.
-                    .id(row.matched)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
                                 .multilineTextAlignment(.center)
@@ -286,7 +283,7 @@ private struct OmniBarPanel: View {
                                 .frame(height: Self.headerHeight, alignment: .bottomLeading)
                                 .accessibilityAddTraits(.isHeader)
                         }
-                        ForEach(section.rows) { row in
+                        ForEach(section.rows, id: \.viewID) { row in
                             // The row reads the selection itself (by id), so
                             // exactly the selected row looks selected even
                             // when the lazy stack keeps a row's view.
@@ -296,7 +293,7 @@ private struct OmniBarPanel: View {
                                 height: Self.height(of: row, rowHeight: CGFloat(rowHeight)),
                                 highlightsMatches: highlightsMatches
                             )
-                            .id(row.id)
+                            .id(row.viewID)
                             .onContinuousHover(coordinateSpace: .local) { phase in
                                 guard case .active = phase, pointer.moved(to: NSEvent.mouseLocation) else { return }
                                 controller.hover(id: row.id)
@@ -323,8 +320,8 @@ private struct OmniBarPanel: View {
                 // scrolls to the top so its section's header shows too.
                 if controller.selection == 0 {
                     proxy.scrollTo(Self.topMarkerID, anchor: .top)
-                } else if let id = controller.selectedItem?.id {
-                    proxy.scrollTo(id, anchor: nil)
+                } else if let row = controller.rows.first(where: controller.isSelected) {
+                    proxy.scrollTo(row.viewID, anchor: nil)
                 }
             }
             .onChange(of: controller.resetScrollRequest) { _, _ in
@@ -381,6 +378,12 @@ private struct OmniBarPanel: View {
         return true
     }
 
+}
+
+extension OmniRow {
+    /// The row's view in the list: a new match (or none) is a new view, so
+    /// the lazy list never keeps the bold of an earlier query.
+    var viewID: String { "\(id)|\(matched.map(String.init).joined(separator: ","))" }
 }
 
 /// Tells a hover event of the pointer moving from one of a row moving
@@ -624,19 +627,19 @@ private struct OmniBarRow: View {
     }
 
     private var title: Text {
-        let characters = Array(row.item.title)
-        guard highlightsMatches, !row.matched.isEmpty else {
-            return Text(row.item.title).foregroundStyle(.primary)
-        }
-        let matched = Set(row.matched)
+        // Always one attributed text, every character's weight set: a
+        // plain `Text` in place of a highlighted one could keep its bold
+        // when the lazy list reuses the row.
+        let matched = highlightsMatches ? Set(row.matched) : []
         var attributed = AttributedString()
-        for (index, character) in characters.enumerated() {
+        for (index, character) in row.item.title.enumerated() {
             var piece = AttributedString(String(character))
             if matched.contains(index) {
                 piece.inlinePresentationIntent = .stronglyEmphasized
                 piece.foregroundColor = .primary
             } else {
-                piece.foregroundColor = Color.primary.opacity(0.82)
+                piece.inlinePresentationIntent = []
+                piece.foregroundColor = matched.isEmpty ? .primary : Color.primary.opacity(0.82)
             }
             attributed += piece
         }

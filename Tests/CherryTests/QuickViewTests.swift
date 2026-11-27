@@ -124,10 +124,14 @@ struct QuickViewTests {
         #expect(QuickViewLink.path(of: "/tmp/notes.md", kind: .unknown) == "/tmp/notes.md")
         #expect(QuickViewLink.path(of: "file:///tmp/a%20b.txt", kind: .unknown) == "/tmp/a b.txt")
         #expect(QuickViewLink.path(of: "file://studio.local/Users/me/a.png", kind: .osc8) == "/Users/me/a.png")
-        // Web links, other schemes and an OSC 8 path that is no URL name no file.
+        // An OSC 8 target with no scheme (a Markdown link's href) is a path.
+        #expect(QuickViewLink.path(of: "/tmp/notes.md", kind: .osc8) == "/tmp/notes.md")
+        #expect(QuickViewLink.path(of: "cat-preview.png", kind: .osc8) == "cat-preview.png")
+        #expect(QuickViewLink.path(of: "docs/a%20b.md#usage", kind: .osc8) == "docs/a b.md")
+        #expect(QuickViewLink.path(of: "#usage", kind: .osc8) == nil)
+        // Web links and other schemes name no file.
         #expect(QuickViewLink.path(of: "https://example.com/a.png", kind: .unknown) == nil)
         #expect(QuickViewLink.path(of: "vscode://file/tmp/a.swift", kind: .osc8) == nil)
-        #expect(QuickViewLink.path(of: "/tmp/notes.md", kind: .osc8) == nil)
         // Ghostty's own files are Ghostty's; hidden characters are refused elsewhere.
         #expect(QuickViewLink.path(of: "/tmp/config", kind: .text) == nil)
         #expect(QuickViewLink.path(of: "/tmp/a\u{202E}b.txt", kind: .unknown) == nil)

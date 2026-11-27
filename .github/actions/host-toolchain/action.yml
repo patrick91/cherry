@@ -23,8 +23,8 @@ runs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.cargo/bin:$PATH"
         fi
-        rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
-        rustup default 1.99.0
+        rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
+        rustup default 1.100.0
         # Scripts/build-host builds universal (arm64 and x86_64) helpers on
         # macOS: Cherry installs them on the user's other Macs of either kind.
         if [ "$(uname -s)" = Darwin ]; then

@@ -9,7 +9,7 @@ anyhow.workspace = true
 # Kitty graphics: PNG payloads are decoded for the host terminal, and the
 # images a snapshot re-sends are zlib-compressed.
 png = "0.18"
-miniz_oxide = "0.8"
+miniz_oxide = "0.9"
 # The output is scanned for the prompt redraw options (`PromptRedraw`).
 memchr = "2"
 

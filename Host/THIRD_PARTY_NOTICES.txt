@@ -8,7 +8,7 @@ each package; copyright text is preserved. Ghostty and its native
 dependencies are covered separately by vendor/ghostty-vt/LICENSE and
 vendor/ghostty-vt/THIRD_PARTY_NOTICES.txt.
 
-Cargo.lock SHA-256: 0e8aae62ac93223d1ec6e0e7c3637a1a1314e8407b51cc2cca02dd3ed18b4a7a
+Cargo.lock SHA-256: 390a7694a14126c9fb78882cd89998f18357d26acfc0d4cc76709186bef278d9
 
 PACKAGE INDEX
 
@@ -43,8 +43,8 @@ anstyle-query 1.1.5
   LICENSE-APACHE: NOTICE-004
   LICENSE-MIT: NOTICE-005
 
-anyhow 1.0.104
-  Package: https://crates.io/crates/anyhow/1.0.104
+anyhow 1.0.105
+  Package: https://crates.io/crates/anyhow/1.0.105
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-006
   LICENSE-MIT: NOTICE-003
@@ -55,8 +55,8 @@ bitflags 2.13.2
   LICENSE-APACHE: NOTICE-007
   LICENSE-MIT: NOTICE-008
 
-cc 1.8.0
-  Package: https://crates.io/crates/cc/1.8.0
+cc 1.12.0
+  Package: https://crates.io/crates/cc/1.12.0
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-007
   LICENSE-MIT: NOTICE-009
@@ -67,26 +67,26 @@ cfg-if 1.0.5
   LICENSE-APACHE: NOTICE-007
   LICENSE-MIT: NOTICE-009
 
-clap 4.6.7
-  Package: https://crates.io/crates/clap/4.6.7
+clap 4.6.10
+  Package: https://crates.io/crates/clap/4.6.10
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-010
   LICENSE-MIT: NOTICE-005
 
-clap_builder 4.6.7
-  Package: https://crates.io/crates/clap_builder/4.6.7
+clap_builder 4.6.10
+  Package: https://crates.io/crates/clap_builder/4.6.10
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-010
   LICENSE-MIT: NOTICE-005
 
-clap_derive 4.6.7
-  Package: https://crates.io/crates/clap_derive/4.6.7
+clap_derive 4.6.9
+  Package: https://crates.io/crates/clap_derive/4.6.9
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-010
   LICENSE-MIT: NOTICE-005
 
-clap_lex 1.1.1
-  Package: https://crates.io/crates/clap_lex/1.1.1
+clap_lex 1.1.2
+  Package: https://crates.io/crates/clap_lex/1.1.2
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-010
   LICENSE-MIT: NOTICE-005
@@ -97,14 +97,14 @@ colorchoice 1.0.5
   LICENSE-APACHE: NOTICE-004
   LICENSE-MIT: NOTICE-005
 
-crc32fast 1.5.2
-  Package: https://crates.io/crates/crc32fast/1.5.2
+crc32fast 1.5.6
+  Package: https://crates.io/crates/crc32fast/1.5.6
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-004
   LICENSE-MIT: NOTICE-011
 
-errno 0.3.14
-  Package: https://crates.io/crates/errno/0.3.14
+errno 0.3.15
+  Package: https://crates.io/crates/errno/0.3.15
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-007
   LICENSE-MIT: NOTICE-012
@@ -121,14 +121,14 @@ fdeflate 0.3.7
   LICENSE-APACHE: NOTICE-013
   LICENSE-MIT: NOTICE-014
 
-find-msvc-tools 0.1.14
-  Package: https://crates.io/crates/find-msvc-tools/0.1.14
+find-msvc-tools 0.1.16
+  Package: https://crates.io/crates/find-msvc-tools/0.1.16
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-007
   LICENSE-MIT: NOTICE-009
 
-flate2 1.1.10
-  Package: https://crates.io/crates/flate2/1.1.10
+flate2 1.1.11
+  Package: https://crates.io/crates/flate2/1.1.11
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-007
   LICENSE-MIT: NOTICE-015
@@ -151,14 +151,14 @@ is_terminal_polyfill 1.70.2
   LICENSE-APACHE: NOTICE-004
   LICENSE-MIT: NOTICE-005
 
-itoa 1.0.18
-  Package: https://crates.io/crates/itoa/1.0.18
+itoa 1.0.19
+  Package: https://crates.io/crates/itoa/1.0.19
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-006
   LICENSE-MIT: NOTICE-003
 
-libc 0.2.190
-  Package: https://crates.io/crates/libc/0.2.190
+libc 0.2.191
+  Package: https://crates.io/crates/libc/0.2.191
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-006
   LICENSE-MIT: NOTICE-019
@@ -217,8 +217,8 @@ quote 1.0.47
   LICENSE-APACHE: NOTICE-006
   LICENSE-MIT: NOTICE-003
 
-rustix 1.1.5
-  Package: https://crates.io/crates/rustix/1.1.5
+rustix 1.1.6
+  Package: https://crates.io/crates/rustix/1.1.6
   Declared license: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
   COPYRIGHT: NOTICE-028
   LICENSE-APACHE: NOTICE-007
@@ -265,8 +265,8 @@ strsim 0.11.1
   Declared license: MIT
   LICENSE: NOTICE-032
 
-syn 3.0.9
-  Package: https://crates.io/crates/syn/3.0.9
+syn 3.0.10
+  Package: https://crates.io/crates/syn/3.0.10
   Declared license: MIT OR Apache-2.0
   LICENSE-APACHE: NOTICE-006
   LICENSE-MIT: NOTICE-003
@@ -290,8 +290,8 @@ utf8parse 0.2.2
   LICENSE-APACHE: NOTICE-006
   LICENSE-MIT: NOTICE-035
 
-uuid 1.26.1
-  Package: https://crates.io/crates/uuid/1.26.1
+uuid 1.29.3
+  Package: https://crates.io/crates/uuid/1.29.3
   Declared license: Apache-2.0 OR MIT
   LICENSE-APACHE: NOTICE-007
   LICENSE-MIT: NOTICE-036

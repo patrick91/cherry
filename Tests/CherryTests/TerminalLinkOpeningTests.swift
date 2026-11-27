@@ -122,6 +122,8 @@ struct TerminalLinkOpeningTests {
         }
         #expect(UntrustedLink("https://example.com/a\u{202E}b").displayString == "https://example.com/a\\u{202E}b")
         #expect(UntrustedLink("https://example.com//a").displayString == "https://example.com//a")
+        // A relative OSC 8 target is shown as written, not from Cherry's own `/`.
+        #expect(UntrustedLink("docs/cat-preview.png").displayString == "docs/cat-preview.png")
     }
 
     // MARK: A Cmd-click's text

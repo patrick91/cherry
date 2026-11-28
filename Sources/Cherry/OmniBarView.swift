@@ -21,11 +21,10 @@ struct OmniBarOverlay: View {
     @Environment(\.colorScheme) private var colorScheme
 
     @AppStorage(CommandPaletteDesign.usesGlassKey) private var usesGlass = CommandPaletteDesign.defaultUsesGlass
-    @AppStorage(CommandPaletteDesign.cornerRadiusKey) private var cornerRadius = CommandPaletteDesign.defaultCornerRadius
-    @AppStorage(CommandPaletteDesign.panelWidthKey) private var panelWidth = CommandPaletteDesign.defaultPanelWidth
-    @AppStorage(CommandPaletteDesign.scrimOpacityKey) private var scrimOpacity = CommandPaletteDesign.defaultScrimOpacity
     @AppStorage(CommandPaletteDesign.animatesEntranceKey) private var animatesEntrance = CommandPaletteDesign.defaultAnimatesEntrance
 
+    /// The playground's sizes, read again when the defaults change.
+    @State private var metrics = OmniBarMetrics.current()
     @State private var didAppear = false
     @State private var focusRequest = 0
     @State private var editingAgent: AgentToolDefinition?
@@ -50,7 +49,7 @@ struct OmniBarOverlay: View {
 
     var body: some View {
         ZStack(alignment: .top) {
-            Color.black.opacity(scrimOpacity)
+            Color.black.opacity(metrics[.scrimOpacity])
                 .opacity(didAppear ? 1 : 0)
                 .ignoresSafeArea()
                 .onTapGesture(perform: dismiss)
@@ -58,18 +57,22 @@ struct OmniBarOverlay: View {
 
             OmniBarPanel(
                 controller: live.controller,
-                focusRequest: focusRequest,
-                panelWidth: CGFloat(panelWidth)
+                focusRequest: focusRequest
             )
             .modifier(CommandPaletteSurface(
                 usesGlass: usesGlass,
-                cornerRadius: CGFloat(cornerRadius),
+                cornerRadius: metrics[.cornerRadius],
                 colorScheme: colorScheme
             ))
             .scaleEffect(didAppear ? 1 : 0.97, anchor: .top)
             .opacity(didAppear ? 1 : 0)
             .padding(.horizontal, 20)
-            .padding(.top, 86)
+            .padding(.top, metrics[.topOffset])
+        }
+        .environment(\.omniBarMetrics, metrics)
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+            let current = OmniBarMetrics.current()
+            if current != metrics { metrics = current }
         }
         .onAppear {
             let controller = live.controller
@@ -173,9 +176,8 @@ struct OmniBarOverlay: View {
 private struct OmniBarPanel: View {
     @ObservedObject var controller: OmniBarController
     let focusRequest: Int
-    let panelWidth: CGFloat
 
-    @AppStorage(CommandPaletteDesign.rowHeightKey) private var rowHeight = CommandPaletteDesign.defaultRowHeight
+    @Environment(\.omniBarMetrics) private var metrics
     @AppStorage(CommandPaletteDesign.highlightsMatchesKey) private var highlightsMatches = CommandPaletteDesign.defaultHighlightsMatches
     /// Hover selects only when the pointer itself moves: a row that moves
     /// under a still pointer (keys scrolling the list, the rows changing)
@@ -184,14 +186,12 @@ private struct OmniBarPanel: View {
     @State private var pointer = OmniPointerTracker()
 
     private static let topMarkerID = "omni-bar-top"
-    private static let maximumListHeight: CGFloat = 400
-    private static let headerHeight: CGFloat = 22
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.system(size: metrics[.searchIconSize], weight: .medium))
                     .foregroundStyle(.secondary)
                     .accessibilityHidden(true)
                 ForEach(Array(controller.stack.enumerated()), id: \.offset) { _, scope in
@@ -202,6 +202,7 @@ private struct OmniBarPanel: View {
                     placeholder: controller.placeholder,
                     focusRequest: focusRequest,
                     accessibilityLabel: controller.scope.map { "Search \($0.label)" } ?? "Search everything",
+                    fontSize: metrics[.searchFontSize],
                     onCommand: handleCommand
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -210,15 +211,15 @@ private struct OmniBarPanel: View {
                         controller.setQuery("")
                     } label: {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 14))
+                            .font(.system(size: metrics[.searchIconSize] + 1))
                             .foregroundStyle(.tertiary)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Clear search")
                 }
             }
-            .padding(.horizontal, 12)
-            .frame(height: 42)
+            .padding(.horizontal, metrics[.searchPadding])
+            .frame(height: metrics[.searchHeight])
 
             Divider().opacity(0.6)
 
@@ -234,7 +235,7 @@ private struct OmniBarPanel: View {
 
             footer
         }
-        .frame(width: panelWidth)
+        .frame(width: metrics[.panelWidth])
         // Where the pointer rests as the bar opens selects nothing.
         .onAppear { pointer.reset(to: NSEvent.mouseLocation) }
     }
@@ -244,14 +245,14 @@ private struct OmniBarPanel: View {
         let rowCount = sections.reduce(0) { $0 + $1.rows.count }
         let headers = sections.filter { $0.title != nil }.count
         let rowsHeight = sections.reduce(CGFloat(0)) { total, section in
-            section.rows.reduce(total) { $0 + Self.height(of: $1, rowHeight: CGFloat(rowHeight)) }
+            section.rows.reduce(total) { $0 + Self.height(of: $1, metrics: metrics) }
         }
         let contentHeight = rowCount == 0
             ? 80
-            : rowsHeight + CGFloat(headers) * Self.headerHeight + 8
+            : rowsHeight + CGFloat(headers) * metrics[.headerHeight] + 4 + metrics[.listBottomPadding]
         // Tall enough for the ⌘K list over it.
         let actionListHeight = controller.isActionListOpen
-            ? CGFloat(controller.selectedActions.count) * OmniBarActionList.rowHeight + 26
+            ? CGFloat(controller.selectedActions.count) * metrics[.actionRowHeight] + 26
             : 0
         return ScrollViewReader { proxy in
             ScrollView {
@@ -275,12 +276,11 @@ private struct OmniBarPanel: View {
                     ForEach(sections) { section in
                         if let title = section.title {
                             Text(title)
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(.system(size: metrics[.headerFontSize], weight: .semibold))
                                 .foregroundStyle(.secondary)
-                                .padding(.horizontal, 8)
-                                .padding(.top, 6)
+                                .padding(.horizontal, metrics[.rowPadding])
                                 .padding(.bottom, 3)
-                                .frame(height: Self.headerHeight, alignment: .bottomLeading)
+                                .frame(height: metrics[.headerHeight], alignment: .bottomLeading)
                                 .accessibilityAddTraits(.isHeader)
                         }
                         ForEach(section.rows, id: \.viewID) { row in
@@ -290,7 +290,7 @@ private struct OmniBarPanel: View {
                             OmniBarSelectableRow(
                                 controller: controller,
                                 row: row,
-                                height: Self.height(of: row, rowHeight: CGFloat(rowHeight)),
+                                height: Self.height(of: row, metrics: metrics),
                                 highlightsMatches: highlightsMatches
                             )
                             .id(row.viewID)
@@ -309,11 +309,11 @@ private struct OmniBarPanel: View {
                         }
                     }
                 }
-                .padding(.horizontal, 4)
-                .padding(.bottom, 4)
+                .padding(.horizontal, metrics[.listInset])
+                .padding(.bottom, metrics[.listBottomPadding])
             }
             .scrollIndicators(.automatic)
-            .frame(height: min(max(contentHeight, actionListHeight), Self.maximumListHeight))
+            .frame(height: min(max(contentHeight, actionListHeight), metrics[.maximumListHeight]))
             .onChange(of: controller.scrollRequest) { _, _ in
                 // anchor nil: the least scrolling that shows the row whole
                 // (headers make offsets unpredictable). The first row
@@ -331,8 +331,8 @@ private struct OmniBarPanel: View {
     }
 
     /// A row with its detail under the title is taller.
-    static func height(of row: OmniRow, rowHeight: CGFloat) -> CGFloat {
-        row.item.showsDetailBelowTitle ? rowHeight + 10 : rowHeight
+    static func height(of row: OmniRow, metrics: OmniBarMetrics) -> CGFloat {
+        row.item.showsDetailBelowTitle ? metrics[.rowHeight] + metrics[.twoLineExtraHeight] : metrics[.rowHeight]
     }
 
     private var footer: some View {
@@ -343,11 +343,12 @@ private struct OmniBarPanel: View {
                 .opacity(controller.selectedActions.isEmpty ? 0.45 : 1)
             OmniFooterKey(label: controller.primaryLabel, key: "↵")
         }
-        .font(.system(size: 11))
+        .font(.system(size: metrics[.footerFontSize]))
         .foregroundStyle(.secondary)
         .lineLimit(1)
-        .padding(.horizontal, 12)
-        .frame(height: 30)
+        // Clear of the panel's rounded corners: at least half the radius in.
+        .padding(.horizontal, max(metrics[.footerPadding], metrics[.cornerRadius] * 0.6))
+        .frame(height: metrics[.footerHeight])
         .accessibilityElement(children: .combine)
     }
 
@@ -502,19 +503,20 @@ enum OmniBarColors {
 
 private struct OmniBarRow: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.omniBarMetrics) private var metrics
     let row: OmniRow
     let isSelected: Bool
     let height: CGFloat
     let highlightsMatches: Bool
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: metrics[.iconSpacing]) {
             icon
-                .frame(width: 16)
+                .frame(width: metrics[.iconColumnWidth])
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 0) {
                 title
-                    .font(.system(size: 13))
+                    .font(.system(size: metrics[.titleFontSize]))
                     .lineLimit(1)
                     .truncationMode(.tail)
                 if row.item.showsDetailBelowTitle {
@@ -531,7 +533,7 @@ private struct OmniBarRow: View {
             if !row.item.showsDetailBelowTitle {
                 if !row.item.detail.isEmpty {
                     Text(row.item.detail)
-                        .font(.system(size: 11.5))
+                        .font(.system(size: metrics[.detailFontSize] + 0.5))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -545,7 +547,7 @@ private struct OmniBarRow: View {
             }
             if !row.item.shortcut.isEmpty {
                 Text(row.item.shortcut)
-                    .font(.system(size: 12))
+                    .font(.system(size: metrics[.shortcutFontSize]))
                     .foregroundStyle(.secondary)
                     .fixedSize()
             }
@@ -555,13 +557,13 @@ private struct OmniBarRow: View {
                     .foregroundStyle(.tertiary)
             }
         }
-        .padding(.horizontal, 8)
+        .padding(.horizontal, metrics[.rowPadding])
         .frame(height: height)
         .background {
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(isSelected ? Color.primary.opacity(0.1) : .clear)
+            RoundedRectangle(cornerRadius: metrics[.rowCornerRadius], style: .continuous)
+                .fill(isSelected ? Color.primary.opacity(metrics[.selectionOpacity]) : .clear)
         }
-        .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: metrics[.rowCornerRadius], style: .continuous))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(row.item.accessibilityLabel)
         .accessibilityHint(row.item.actions.isEmpty ? row.item.primaryLabel : "\(row.item.primaryLabel). Command-K for actions.")
@@ -583,13 +585,13 @@ private struct OmniBarRow: View {
                 machineLabel
             }
         }
-        .font(.system(size: 11))
+        .font(.system(size: metrics[.detailFontSize]))
         .lineLimit(1)
     }
 
     private var machineLabel: some View {
         Text(row.item.machineName)
-            .font(.system(size: 11, weight: row.item.machineColor == nil ? .regular : .medium))
+            .font(.system(size: metrics[.detailFontSize], weight: row.item.machineColor == nil ? .regular : .medium))
             .foregroundStyle(machineStyle)
             .lineLimit(1)
     }
@@ -611,17 +613,17 @@ private struct OmniBarRow: View {
                 .resizable()
                 .interpolation(.high)
                 .scaledToFit()
-                .frame(width: 14, height: 14)
+                .frame(width: metrics[.iconSize] + 2.5, height: metrics[.iconSize] + 2.5)
         case .logo(let image):
             Image(nsImage: image)
                 .resizable()
                 .renderingMode(.template)
                 .scaledToFit()
-                .frame(width: 13, height: 13)
+                .frame(width: metrics[.iconSize] + 1.5, height: metrics[.iconSize] + 1.5)
                 .foregroundStyle(.secondary)
         case .symbol(let name):
             Image(systemName: name)
-                .font(.system(size: 11.5, weight: .medium))
+                .font(.system(size: metrics[.iconSize], weight: .medium))
                 .foregroundStyle(.secondary)
         }
     }
@@ -649,6 +651,7 @@ private struct OmniBarRow: View {
 
 /// A footer hint: its label, then its key in a key cap.
 private struct OmniFooterKey: View {
+    @Environment(\.omniBarMetrics) private var metrics
     let label: String
     let key: String
 
@@ -656,7 +659,7 @@ private struct OmniFooterKey: View {
         HStack(spacing: 6) {
             Text(label)
             Text(key)
-                .font(.system(size: 11, weight: .medium))
+                .font(.system(size: metrics[.keyCapFontSize], weight: .medium))
                 .padding(.horizontal, 5)
                 .frame(minWidth: 20, minHeight: 18)
                 .overlay {
@@ -669,9 +672,8 @@ private struct OmniFooterKey: View {
 
 /// ⌘K: the selected row's actions, over the list's bottom-trailing corner.
 private struct OmniBarActionList: View {
-    static let rowHeight: CGFloat = 26
-
     @ObservedObject var controller: OmniBarController
+    @Environment(\.omniBarMetrics) private var metrics
 
     var body: some View {
         VStack(spacing: 0) {
@@ -682,7 +684,7 @@ private struct OmniBarActionList: View {
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 10)
-                    .frame(height: Self.rowHeight)
+                    .frame(height: metrics[.actionRowHeight])
                     .background {
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .fill(index == controller.actionSelection ? Color.primary.opacity(0.12) : .clear)
@@ -697,7 +699,7 @@ private struct OmniBarActionList: View {
             }
         }
         .padding(5)
-        .frame(width: 240)
+        .frame(width: metrics[.actionListWidth])
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)

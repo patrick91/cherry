@@ -1,7 +1,14 @@
 import AppKit
 import SwiftUI
 
-/// The Omni bar's design knobs (Prototype › Show Omni Bar Playground).
+/// Whether the Tab menu offers the sidebar icon and Omni bar playgrounds
+/// (Settings › Interface › Design Playgrounds; off by default).
+enum DesignPlaygrounds {
+    static let showsKey = "interface.showsDesignPlaygrounds"
+}
+
+/// The Omni bar's design knobs (Tab › Show Omni Bar Playground, with
+/// Design Playgrounds on).
 /// The switches have their own keys; every size is a `Knob`, read by the
 /// bar through `OmniBarMetrics`.
 enum CommandPaletteDesign {

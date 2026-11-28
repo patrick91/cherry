@@ -993,6 +993,8 @@ struct CherryApp: App {
     /// Only the count: the list itself would re-evaluate the app's body.
     @StateObject private var backgroundSessions = BackgroundSessionsModel.shared.summary
     @State private var controlServer: CherryControlServer?
+    /// Settings › Interface › Design Playgrounds: the Tab menu's playground items.
+    @AppStorage(DesignPlaygrounds.showsKey) private var showsDesignPlaygrounds = false
     @Environment(\.openWindow) private var openWindow
     @FocusedValue(\.terminalWorkspace) private var focusedWorkspace
     @FocusedValue(\.projectWindowChromeState) private var focusedChromeState
@@ -1247,25 +1249,15 @@ struct CherryApp: App {
                 .disabled(focusedWorkspace?.selectedSession == nil || focusedChromeState == nil)
             }
 
-            CommandMenu("Prototype") {
+            CommandGroup(after: .sidebar) {
                 Button(focusedChromeState?.isSidebarHidden == true ? "Show Sidebar" : "Hide Sidebar") {
                     keyWindowChromeState?.toggleSidebar()
                 }
                 .keyboardShortcut(CherryShortcut.hideSidebar.keyboardShortcut)
                 .disabled(focusedChromeState == nil)
+            }
 
-                Button(focusedChromeState?.isSidebarPlaygroundPresented == true ? "Hide Sidebar Icon Playground" : "Show Sidebar Icon Playground") {
-                    keyWindowChromeState?.toggleSidebarPlayground()
-                }
-                .disabled(focusedChromeState == nil)
-
-                Button(focusedChromeState?.isCommandPalettePlaygroundPresented == true ? "Hide Omni Bar Playground" : "Show Omni Bar Playground") {
-                    keyWindowChromeState?.toggleCommandPalettePlayground()
-                }
-                .disabled(focusedChromeState == nil)
-
-                Divider()
-
+            CommandMenu("Tab") {
                 Button("New Tab") {
                     keyWindowWorkspace?.addSession()
                 }
@@ -1337,6 +1329,21 @@ struct CherryApp: App {
                 }
                 .keyboardShortcut(CherryShortcut.clearScrollback.keyboardShortcut)
                 .disabled(focusedWorkspace == nil)
+
+                // Settings › Interface › Design Playgrounds.
+                if showsDesignPlaygrounds {
+                    Divider()
+
+                    Button(focusedChromeState?.isSidebarPlaygroundPresented == true ? "Hide Sidebar Icon Playground" : "Show Sidebar Icon Playground") {
+                        keyWindowChromeState?.toggleSidebarPlayground()
+                    }
+                    .disabled(focusedChromeState == nil)
+
+                    Button(focusedChromeState?.isCommandPalettePlaygroundPresented == true ? "Hide Omni Bar Playground" : "Show Omni Bar Playground") {
+                        keyWindowChromeState?.toggleCommandPalettePlayground()
+                    }
+                    .disabled(focusedChromeState == nil)
+                }
             }
 
             CommandMenu("Agents") {

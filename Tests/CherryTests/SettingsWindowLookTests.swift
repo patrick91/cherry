@@ -343,8 +343,8 @@ private func lookSearchContext(_ settings: TerminalSettings, defaults: UserDefau
     let context = lookSearchContext(settings, defaults: defaults)
 
     let interface = InterfaceSettingsPage.searchRows(in: context)
-    #expect(interface.map(\.id) == [.interfaceColorScheme, .interfacePaths, .interfaceProjectColors, .interfaceSidebarContrast])
-    #expect(interface.map(\.value) == ["Auto", "Repo focused", "Accent", "8 %"])
+    #expect(interface.map(\.id) == [.interfaceColorScheme, .interfacePaths, .interfaceProjectColors, .interfaceSidebarContrast, .interfaceDesignPlaygrounds])
+    #expect(interface.map(\.value) == ["Auto", "Repo focused", "Accent", "8 %", nil])
     #expect(interface.allSatisfy { $0.route == .page(.interface) })
 
     let themes = ThemesSettingsPage.searchRows(in: context)

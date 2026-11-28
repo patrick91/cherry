@@ -132,8 +132,8 @@ private struct SettingsNoResults: View {
 
 /// The window's chrome, which SwiftUI has no modifier for on a Settings
 /// scene: the title shown, a unified toolbar without a separator, content
-/// under the title bar. Tells `windowDidBecomeKey` when the window comes to
-/// the front.
+/// under the title bar, a resizable window. Tells `windowDidBecomeKey` when
+/// the window comes to the front.
 private struct SettingsNativeWindowConfigurator: NSViewRepresentable {
     let windowDidBecomeKey: @MainActor () -> Void
 
@@ -177,6 +177,9 @@ private final class SettingsNativeWindowChromeView: NSView {
         if window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = false }
         if window.titlebarSeparatorStyle != .none { window.titlebarSeparatorStyle = .none }
         if !window.styleMask.contains(.fullSizeContentView) { window.styleMask.insert(.fullSizeContentView) }
+        // A Settings scene's window is never `.resizable`, whatever its
+        // content's frame and `windowResizability` allow.
+        if !window.styleMask.contains(.resizable) { window.styleMask.insert(.resizable) }
         if window.toolbarStyle != .unified { window.toolbarStyle = .unified }
         if let toolbar = window.toolbar, toolbar.showsBaselineSeparator {
             toolbar.showsBaselineSeparator = false

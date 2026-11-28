@@ -2475,6 +2475,7 @@ struct CommandPaletteSearchField: NSViewRepresentable {
     let placeholder: String
     let focusRequest: Int
     let accessibilityLabel: String
+    var fontSize: CGFloat = 15
     /// The field's key commands (`moveUp:`, `insertNewline:`,
     /// `cancelOperation:`…): true when handled.
     let onCommand: (Selector) -> Bool
@@ -2510,7 +2511,7 @@ struct CommandPaletteSearchField: NSViewRepresentable {
 
     private func configure(_ textField: NSTextField) {
         textField.placeholderString = placeholder
-        textField.font = .systemFont(ofSize: 15)
+        textField.font = .systemFont(ofSize: fontSize)
         textField.isBordered = false
         textField.isBezeled = false
         textField.drawsBackground = false

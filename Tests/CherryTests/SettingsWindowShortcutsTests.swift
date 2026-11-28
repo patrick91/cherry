@@ -176,7 +176,7 @@ private let takenByKeyCode: Set<String> = ["previousTab", "nextTab"]
     #expect(CherryShortcut.findNext.keyboardShortcut == KeyboardShortcut("g"))
     #expect(CherryShortcut.findPrevious.keyboardShortcut == KeyboardShortcut("g", modifiers: [.command, .shift]))
     #expect(CherryShortcut.hideFindBar.keyboardShortcut == KeyboardShortcut("f", modifiers: [.command, .shift]))
-    // Prototype
+    // View and Tab
     #expect(CherryShortcut.hideSidebar.keyboardShortcut == KeyboardShortcut("s"))
     #expect(CherryShortcut.newTab.keyboardShortcut == KeyboardShortcut("t"))
     #expect(CherryShortcut.splitRight.keyboardShortcut == KeyboardShortcut("d", modifiers: [.command, .shift]))

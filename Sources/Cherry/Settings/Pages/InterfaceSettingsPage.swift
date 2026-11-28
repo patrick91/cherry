@@ -9,6 +9,7 @@ struct InterfaceSettingsPage: View, SettingsPageContent {
 
     @ObservedObject private var settings: TerminalSettings
     @StateObject private var optionKey = OptionKeyObserver()
+    @AppStorage(DesignPlaygrounds.showsKey) private var showsDesignPlaygrounds = false
 
     init(settings: TerminalSettings = .shared) {
         self.settings = settings
@@ -73,6 +74,13 @@ struct InterfaceSettingsPage: View, SettingsPageContent {
                 }
             }
 
+            SettingsSection("Developer") {
+                SettingsItem(id: .interfaceDesignPlaygrounds, Self.playgroundsTitle, help: Self.playgroundsHelp) {
+                    Toggle(Self.playgroundsTitle, isOn: $showsDesignPlaygrounds)
+                        .settingsSwitch()
+                }
+            }
+
             SettingsPageFooter(caption: "Resets this page only.") {
                 SettingsPageResetButton("Reset Interface…", settings: Self.resetSettings, in: settings)
             }
@@ -105,6 +113,8 @@ struct InterfaceSettingsPage: View, SettingsPageContent {
     private static let pathsHelp = "How folder names appear in the sidebar's tab rows."
     private static let projectColorsHelp = "Uses each project's color in its windows and sidebar."
     private static let sidebarContrastHelp = "How far the sidebar's background is from the terminal's."
+    private static let playgroundsTitle = "Design Playgrounds"
+    private static let playgroundsHelp = "Adds the sidebar icon and Omni bar playgrounds to the Tab menu."
 
     static func searchRows(in context: SettingsSearchContext) -> [SettingsSearchRow] {
         let terminal = context.terminal
@@ -145,6 +155,14 @@ struct InterfaceSettingsPage: View, SettingsPageContent {
                 keywords: ["sidebar", "background", "depth"],
                 value: terminal.valueText(.sidebarBackgroundDepth)
             ),
+            SettingsSearchRow(
+                id: .interfaceDesignPlaygrounds,
+                route: .page(.interface),
+                section: "Developer",
+                title: playgroundsTitle,
+                help: playgroundsHelp,
+                keywords: ["prototype", "playground", "omni bar", "design", "debug"]
+            ),
         ]
     }
 }
@@ -154,6 +172,7 @@ extension SettingsRowID {
     static let interfacePaths: Self = "interface.paths"
     static let interfaceProjectColors: Self = "interface.projectColors"
     static let interfaceSidebarContrast: Self = "interface.sidebarContrast"
+    static let interfaceDesignPlaygrounds: Self = "interface.designPlaygrounds"
 }
 
 // MARK: - Color scheme thumbnails
